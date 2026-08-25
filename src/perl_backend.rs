@@ -1486,6 +1486,27 @@ impl Render {
             self.emit("print \"\";");
             return;
         };
+        // A1 Str values carry BACKSLASH ESCAPES raw (`printf '%s\n'` has a
+        // two-char \n): perl printf would print them literally. Decode the
+        // standard escape set once, then let %s/%d pass through to perl's
+        // sprintf (same conv set java renders).
+        if let IrExpr::Str(s, _) = fmt {
+            let un = s
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\r", "\r")
+                .replace("\\\\", "\\");
+            if un != *s {
+                let lit = Self::perl_str(&un);
+                let args: Vec<String> = words[1..].iter().map(|w| self.expr(w)).collect();
+                self.emit(&format!(
+                    "printf({}, {});",
+                    lit,
+                    args.join(", ")
+                ));
+                return;
+            }
+        }
         let fmt_str = self.expr(fmt);
         if words.len() == 1 {
             self.emit(&format!("print {fmt_str};"));
@@ -2333,11 +2354,71 @@ impl Render {
                 self.block_stmt(body);
             }
             IrStmt::Block(body) => self.block_stmt(body),
-            IrStmt::Redirect { inner, .. } => {
-                self.mark_todo("redirect stmt");
+            IrStmt::Redirect { inner, redirects } => {
+                // NATIVE redirection (no fork/exec): dup-save the affected
+                // filehandle, reopen it onto the target, run the inner
+                // statements, restore. Herestrings/heredocs feed their text
+                // through an IN-MEMORY file.
+                let mut supported = true;
+                let mut fds: Vec<i32> = Vec::new();
+                for r in redirects {
+                    let fd = r.fd.unwrap_or(0);
+                    match (fd, r.mode.as_str()) {
+                        (0, "r") | (0, "herestring") | (0, "heredoc") | (0, "heredoc-tabs")
+                            | (1, "w") | (1, "a") | (2, "w") | (2, "a") => {}
+                        _ => { supported = false; break; }
+                    }
+                    if !fds.contains(&fd) { fds.push(fd); }
+                }
+                if !supported || redirects.is_empty() {
+                    self.mark_todo("redirect stmt");
+                    for s in inner {
+                        self.stmt(s);
+                    }
+                    return;
+                }
+                self.emit("{");
+                self.depth += 1;
+                for fd in &fds {
+                    match *fd {
+                        0 => self.emit(r#"    open(my $__sv0, "<&", \*STDIN) or die;"#),
+                        1 => self.emit(r#"    open(my $__sv1, ">&", \*STDOUT) or die;"#),
+                        2 => self.emit(r#"    open(my $__sv2, ">&", \*STDERR) or die;"#),
+                        _ => {}
+                    }
+                }
+                for r in redirects {
+                    let fd = r.fd.unwrap_or(0);
+                    let mode = r.mode.as_str();
+                    let target = self.expr(&r.target);
+                    if fd == 0 && (mode == "herestring" || mode.starts_with("heredoc")) {
+                        self.emit(r#"    my $__hs = "#);
+                        if let Some(last) = self.out.last_mut() {
+                            last.push_str(&target);
+                            last.push(';');
+                        }
+                        self.emit(r#"    open(STDIN, "<", \$__hs) or die;"#);
+                    } else {
+                        let m2 = if fd == 0 {
+                            "<"
+                        } else if mode == "a" { ">>" } else { ">" };
+                        let fh = if fd == 0 { "STDIN" } else if fd == 2 { "STDERR" } else { "STDOUT" };
+                        self.emit(&format!("    open({}, \"{}\", {}) or die;", fh, m2, target));
+                    }
+                }
                 for s in inner {
                     self.stmt(s);
                 }
+                for fd in &fds {
+                    match *fd {
+                        0 => self.emit(r#"    open(STDIN, "<&", $__sv0);"#),
+                        1 => self.emit(r#"    open(STDOUT, ">&", $__sv1);"#),
+                        2 => self.emit(r#"    open(STDERR, ">&", $__sv2);"#),
+                        _ => {}
+                    }
+                }
+                self.depth -= 1;
+                self.emit("}");
             }
             IrStmt::Exec {
                 cmd, args, capture, ..
