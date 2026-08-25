@@ -50,6 +50,9 @@ pub struct Render {
     need_sys: bool,
     /// needs the `__sh_exec` subprocess helper
     need_subprocess: bool,
+    /// needs `__sh_run_status` (exec operand inside an &&/|| chain —
+    /// rc truth is inverted in python; backend/python 3a5f5d5d)
+    need_run_status: bool,
     need_capture_out: bool,
 }
 
@@ -754,14 +757,39 @@ impl Render {
                     // None; the truthy wrapper keeps `&&`/`||` status chaining
                     // bash-faithful (a successful echo always proceeds). Test/
                     // value operands stay as-is (`""` stays falsy).
+                    // bash-truth chaining: a native print renders None
+                    // (needs the truthy wrapper to keep the chain going),
+                    // but a fork/exec operand is RC-valued — and python
+                    // inverts rc truth (0=success must be True), so it
+                    // routes through __sh_run_status instead of the wrap
+                    // ('ls missing || echo' must still run the echo;
+                    // 'ls ok && echo' must NOT) — backend/python 3a5f5d5d
+                    let need_rs = std::cell::Cell::new(false);
                     let wrap = |x: &IrExpr, s: String| -> String {
                         if matches!(x, IrExpr::Call { func, .. } if func == "exec") {
-                            format!("({s} or 1)")
+                            if s.starts_with("__sh_exec(") {
+                                need_rs.set(true);
+                                // keep "(" from the original call: slice
+                                // after __sh_exec, not after its paren
+                                format!("__sh_run_status{}", &s["__sh_exec".len()..])
+                            } else {
+                                format!("({s} or 1)")
+                            }
                         } else {
                             s
                         }
                     };
-                    return format!("({} {py_op} {})", wrap(lhs, l), wrap(rhs, r));
+                    let chained = format!(
+                        "({} {py_op} {})",
+                        wrap(lhs, l.clone()),
+                        wrap(rhs, r)
+                    );
+                    #[cfg(feature="never")]
+                    eprintln!("DBG lhs=[{}] rhs=[{}] out=[{}]", l, r, chained);
+                    if need_rs.get() {
+                        self.need_run_status = true;
+                    }
+                    return chained;
                 }
                 format!("({l} {py_op} {r})")
             }
@@ -1727,6 +1755,12 @@ impl Render {
     /// printf can't handle (flags/width/prec, array args, f-string fmt).
     fn printf_fallback(&mut self, args: &[IrExpr]) -> String {
         if let Some(IrExpr::Array(items)) = args.get(1) {
+            if items.is_empty() {
+                // Foreign shared-core churn can feed transient malformed
+                // shapes; an empty operand array panicked items[0]
+                // (backend/python 2f44a673). Guard → the stub path.
+                return "None".into();
+            }
             let fmt = match &items[0] {
                 IrExpr::Str(s, _) => Some(s.clone()),
                 IrExpr::Interpolate(parts) => {
@@ -2883,6 +2917,22 @@ impl Render {
             self.emit("def __sh_exec(argv):");
             self.emit("    import subprocess");
             self.emit("    return subprocess.call(argv)");
+        }
+        if self.need_run_status {
+            // exec operand inside an &&/|| chain: bash truth (rc == 0),
+            // stdout captured then replayed in order (backend/python 3a5f5d5d)
+            self.emit("");
+            self.emit("def __sh_run_status(argv):");
+            self.emit("    import subprocess");
+            self.emit("    try:");
+            self.emit("        r = subprocess.run(argv, stdout=subprocess.PIPE)");
+            self.emit("        out = r.stdout.decode(errors='replace')");
+            self.emit("        if out:");
+            self.emit("            sys.stdout.write(out)");
+            self.emit("            sys.stdout.flush()");
+            self.emit("        return r.returncode == 0");
+            self.emit("    except OSError:");
+            self.emit("        return False");
         }
         if self.need_capture_out || self.sh2_calls.contains(&"line".to_string()) {
             self.emit("def __sh_lines(v):");
