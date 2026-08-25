@@ -1534,6 +1534,38 @@ impl Render {
                                 "(__a[{i} - 1] if len(__a) >= {i} else {q})"
                             );
                         }
+                        // ${var+word} family: the frontend folds
+                        // parameter expansions into the NAME ("MYVAR+set").
+                        // Decode the suffix; set-ness uses the collected
+                        // write sets (unset == never-written).
+                        n if self.in_function == 0
+                            && name.len() > 1
+                            && !name.starts_with('$')
+                            && name.contains("+-=?") =>
+                        {
+                            let pos = name.find("+-=?").unwrap();
+                            let root0 = &name[..pos];
+                            let rest = &name[pos..];
+                            let colon_form = root0.ends_with(":");
+                            let root = root0.trim_end_matches(":");
+                            let op_ch = &rest[..1];
+                            let word = &rest[1..];
+                            let is_set = self.written.contains(root)
+                                || self.store_written.contains(root);
+                            match (op_ch, colon_form) {
+                                ("+", false) | (":+", _) => {
+                                    return Self::py_str(word);
+                                }
+                                ("-", false) => {
+                                    return if is_set {
+                                        self.call("getVar", &[IrExpr::Str(root.to_string(), crate::ir::StrStyle::DoubleQuoted)])
+                                    } else {
+                                        Self::py_str(word)
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         "#" => return "str(len(sys.argv) - 1)".into(),
                         "@" | "*" => return "\" \".join(sys.argv[1:])".into(),
                         n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
@@ -1926,6 +1958,21 @@ impl Render {
             // split(getVar(name)) — IFS field-split of a scalar read is a
             // no-op (mirrors the estree nospace fold); the read's own
             // rendering is the value
+            // join(<inner>) — the core's StringPart lowering WRAPS every
+            // ${..} expansion in join(<expr>): unwrap and route.
+            "join" => {
+                match args.first() {
+                    // join(param(op, name, ..)) — any parameter expansion
+                    Some(IrExpr::Call { func, args: pargs }) if func == "param" => {
+                        self.call("param", pargs)
+                    }
+                    // join(getVar(name)) — plain scalar read
+                    Some(IrExpr::Call { func, args: gargs }) if func == "getVar" => {
+                        self.call("getVar", gargs)
+                    }
+                    _ => self.sh2_stub("join", args, "join"),
+                }
+            }
             "split" => {
                 if let Some(IrExpr::Call { func, args: inner }) = args.first() {
                     if func == "getVar" {
