@@ -178,6 +178,16 @@ pub struct Render {
     heredoc_nl: bool,
     /// emit the _sh_import_env runtime helper (source/eval state pull)
     need_state_import: bool,
+    /// emit the _sh_wc_words word-count helper (WordCount ext node)
+    need_wc_words: bool,
+    /// true when ALL capture-assigned vars in the current scope are
+    /// non-escaping → captures can share an arena freed at return
+    arena_safe: bool,
+    /// TRUST mode: skip defensive copies, null guards, const exclusions.
+    /// The input bash script is assumed correct — no runtime memory
+    /// safety checks in the generated C. Faster but silently corrupts
+    /// on buggy scripts.
+    trust_input: bool,
     /// vars assigned as SHELL TEXT in the current command buffer — the
     /// child bash owns their value for this site; re-exporting the stale
     /// C var inside the same buffer would clobber it (091_while_pipe_var:
