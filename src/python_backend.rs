@@ -50,6 +50,18 @@ pub struct Render {
     need_sys: bool,
     /// needs the `__sh_exec` subprocess helper
     need_subprocess: bool,
+    /// needs the `__sh_capture`/`__sh_capture_bash` helpers (bash $()
+    /// semantics: stdout only, trailing newlines stripped, never raises)
+    need_capture: bool,
+    /// needs __sh_cat (native file read for $(cat F))
+    need_cat: bool,
+    /// needs the fd-level `__sh_ctx_cap` context manager
+    need_capfd: bool,
+    /// counter for unique _capN fd-capture buffers
+    cap_seq: usize,
+    /// >0 while rendering inside an fd-capture block: nested pipelines
+    /// must CAPTURE their tail instead of writing to the terminal
+    cap_depth: usize,
     /// needs `__sh_run_status` (exec operand inside an &&/|| chain —
     /// rc truth is inverted in python; backend/python 3a5f5d5d)
     need_run_status: bool,
@@ -445,6 +457,122 @@ impl Render {
 
     /// A6-consistent Python-keyword mangling (renderers mangle the rest —
     /// the emitter's safe_ident only covers loop vars).
+    /// The shared capture-body ladder for `$()`/backtick/Arrow bodies —
+    /// native first: pure folds (echo/cat), single exec via __sh_capture,
+    /// pipeline/redirect bodies via their call arms, then ANY body renders
+    /// NATIVELY under the fd-level capture context (keeps python-side
+    /// state that a bash -c re-render would lose). Returns None only when
+    /// no shape applies at all.
+    fn capture_body_expr(&mut self, body: &[IrStmt]) -> Option<String> {
+        if let [IrStmt::Expr(e)] = body {
+            if let IrExpr::Call { func, args } = e {
+                if func == "exec" || func == "builtin" {
+                    // pure folds first: $(echo ..)/$(cat F) need no fork
+                    if let Some(IrExpr::Str(c, _)) = args.first() {
+                        if c == "echo" {
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                let flagged = items.iter().any(
+                                    |i| matches!(i, IrExpr::Str(s, _) if s.starts_with('-')),
+                                );
+                                if !flagged {
+                                    let parts: Vec<String> = items
+                                        .iter()
+                                        .map(|i| self.py_value(i))
+                                        .collect();
+                                    return Some(if parts.is_empty() {
+                                        "\"\"".into()
+                                    } else {
+                                        let mut js = String::from("\" \".join([");
+                                        js.push_str(&parts.join(", "));
+                                        js.push_str("])");
+                                        js
+                                    });
+                                }
+                            }
+                        }
+                        if c == "cat" {
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                let files: Vec<String> = items
+                                    .iter()
+                                    .filter_map(|i| match i {
+                                        IrExpr::Str(s, _)
+                                            if s.starts_with('-') =>
+                                        {
+                                            None
+                                        }
+                                        other => Some(self.py_value(other)),
+                                    })
+                                    .collect();
+                                if files.len() == 1 && files[0].starts_with('"') {
+                                    self.need_cat = true;
+                                    return Some(format!("__sh_cat({})", files[0]));
+                                }
+                            }
+                        }
+                    }
+                    let argv = self.build_argv(args);
+                    self.need_subprocess = true;
+                    self.need_capture = true;
+                    return Some(format!(
+                        "__sh_capture([{}])",
+                        argv.join(", ")
+                    ));
+                }
+                if func == "pipeline" {
+                    return Some(self.call("pipeline", args));
+                }
+                if func == "redirect" {
+                    return self.capture_redirect(args);
+                }
+            }
+        }
+        if let [IrStmt::Pipeline { stages, cmd_str, .. }] = body {
+            if let Some(text) = cmd_str {
+                self.need_subprocess = true;
+                self.need_capture = true;
+                return Some(format!(
+                    "__sh_capture_bash({})",
+                    Self::py_str(text)
+                ));
+            }
+            let stage_arrows: Vec<IrExpr> =
+                stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
+            return Some(self.call("pipeline", &[IrExpr::Array(stage_arrows)]));
+        }
+        // NATIVE-FIRST CAPTURE FALLBACK via FD-LEVEL redirection: the body
+        // renders NATIVELY while fd 1 points at a temp file, so BOTH python
+        // prints AND external commands land in the $(...) value. Keeps
+        // python-side state that a bash -c re-render would lose.
+        self.cap_seq += 1;
+        self.cap_depth += 1;
+        self.need_capfd = true;
+        let bname = format!("_cap{}", self.cap_seq);
+        self.emit(&format!("{bname} = tempfile.TemporaryFile(mode='w+b')"));
+        self.emit(&format!("with __sh_ctx_cap({bname}):"));
+        self.depth += 1;
+        for s in body.iter() {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        self.cap_depth -= 1;
+        // bash $() strips ALL trailing newlines; seek(0) because external
+        // stages advanced the SHARED file offset
+        Some(format!(
+            "({bname}.seek(0) or {bname}.read().decode(errors='replace').rstrip(\"\\n\"))"
+        ))
+    }
+
+    /// An IR expression as a python STR-typed runtime value expression
+    /// (string literals stay literals; vars/numbers coerce via str()).
+    fn py_value(&mut self, e: &IrExpr) -> String {
+        let x = self.expr(e);
+        if x.starts_with('"') {
+            x
+        } else {
+            format!("str({x})")
+        }
+    }
+
     fn py_ident(&self, name: &str) -> String {
         const PY_KEYWORDS: &[&str] = &[
             "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
@@ -879,13 +1007,9 @@ impl Render {
                 "None".into()
             }
             IrExpr::Arrow(body) => {
-                // a command body as a value — bash -c capture fallback
-                if let Some(text) = self.body_shell_text(body) {
-                    self.need_subprocess = true;
-                    return format!(
-                        "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
-                        Self::py_str(&text)
-                    );
+                // a command body as a value — the shared capture ladder
+                if let Some(c) = self.capture_body_expr(body) {
+                    return c;
                 }
                 self.sh2_stub("arrow", &[], "arrow")
             }
@@ -1098,6 +1222,14 @@ impl Render {
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
             // python `PAT in STR`.
             "capture" => {
+                // Generic body first (exec/pipeline/redirect/native fd-
+                // fallback) — the fnCall outparam channel below only fits
+                // function calls.
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
+                }
                 // The C frontend's outparam channel: capture(Arrow[
                 // fnCall(..)]) — the callee echoes its out-params, the
                 // caller captures STDOUT.
@@ -1135,6 +1267,16 @@ impl Render {
             }
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
             // python `PAT in STR`.
+            // captureWords(`cmd`) — backtick command substitution: the
+            // SAME ladder as the $() Capture form
+            "captureWords" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
+                }
+                self.sh2_stub("captureWords", args, "captureWords")
+            }
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
                     let needle = self.expr(needle);
@@ -2914,9 +3056,61 @@ impl Render {
         }
         if self.need_subprocess {
             self.emit("");
+            // bash truth convention (rc == 0 = success = True) and
+            // non-raising: command-not-found yields False and the script
+            // CONTINUES, like bash
             self.emit("def __sh_exec(argv):");
             self.emit("    import subprocess");
-            self.emit("    return subprocess.call(argv)");
+            self.emit("    sys.stdout.flush()");
+            self.emit("    try:");
+            self.emit("        return subprocess.call(argv) == 0");
+            self.emit("    except OSError:");
+            self.emit("        return False");
+        }
+        if self.need_capture {
+            self.emit("");
+            // bash $() semantics as a helper: stdout only, ALL trailing
+            // newlines stripped, never raises \u2014 failure yields "" and the
+            // script continues, like bash
+            self.emit("def __sh_capture(argv):");
+            self.emit("    import subprocess");
+            self.emit("    sys.stdout.flush()");
+            self.emit("    try:");
+            self.emit("        r = subprocess.run(argv, stdout=subprocess.PIPE)");
+            self.emit("        return r.stdout.decode(errors='replace').rstrip('\\n')");
+            self.emit("    except OSError:");
+            self.emit("        return \"\"");
+            self.emit("");
+            self.emit("def __sh_capture_bash(script):");
+            self.emit("    return __sh_capture([\"bash\", \"-c\", script])");
+        }
+        if self.need_cat {
+            self.emit("");
+            self.emit("def __sh_cat(path):");
+            self.emit("    try:");
+            self.emit("        with open(path, errors='replace') as fh:");
+            self.emit("            return fh.read().rstrip('\\n')");
+            self.emit("    except OSError:");
+            self.emit("        return \"\"");
+        }
+        if self.need_capfd {
+            self.emit("");
+            self.emit("import contextlib");
+            self.emit("import tempfile");
+            // FD-level stdout capture for $( ...) bodies: BOTH python
+            // prints AND external commands land in the temp file (the
+            // io-level redirect_stdout cannot see subprocess output)
+            self.emit("@contextlib.contextmanager");
+            self.emit("def __sh_ctx_cap(f):");
+            self.emit("    sys.stdout.flush()");
+            self.emit("    saved = os.dup(1)");
+            self.emit("    os.dup2(f.fileno(), 1)");
+            self.emit("    try:");
+            self.emit("        yield");
+            self.emit("    finally:");
+            self.emit("        sys.stdout.flush()");
+            self.emit("        os.dup2(saved, 1)");
+            self.emit("        os.close(saved)");
         }
         if self.need_run_status {
             // exec operand inside an &&/|| chain: bash truth (rc == 0),
