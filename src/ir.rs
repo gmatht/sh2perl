@@ -190,6 +190,53 @@ pub enum VarKind {
     Var,
 }
 
+/// Storage-class selection for string variables in statically-typed
+/// backends (C, Zig, Rust). Computed by `select_storage_class` from the
+/// union of existing analyses (var_lengths, var_lifetimes, var_const,
+/// capture_vars, escape_classes). Each backend maps the class to its own
+/// native representation:
+///
+/// | Class | C | JS/Estree | Perl |
+/// |---|---|---|---|
+/// | Numeric | long long / int | number | integer |
+/// | InlineBuffer | char x[N+1] | N/A (JS strings are GC) | N/A |
+/// | ManagedString | sh2_str { ptr } | sh2.vars.x | $x |
+/// | CaptureResult | char *x = NULL + strdup | sh2.vars.x | $x |
+/// | Escaped | char *x = NULL (must survive) | sh2.vars.x | $x |
+/// | ConstLiteral | const char x[N] = "..." | const | use constant |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StorageClass {
+    /// Range/provenance analysis proves integers only → immediate numeric.
+    Numeric,
+    /// Length provably bounded ≤ threshold AND non-escaping AND non-capture
+    /// → stack-allocated fixed buffer. Fast: zero malloc, dies with scope.
+    InlineBuffer,
+    /// Unbounded string, local scope, no capture, no escape, not exported
+    /// → managed owning pointer (sh2_str in C; plain variable in GC'd langs).
+    ManagedString,
+    /// Assigned from a command capture or read — unbounded length unknown,
+    /// must be a raw pointer that popen/fread can fill.
+    CaptureResult,
+    /// Exported, stored in a global, or otherwise escapes the enclosing
+    /// scope → raw heap pointer that must survive scope exit.
+    Escaped,
+    /// Single-assignment literal, const-marked → read-only declaration.
+    ConstLiteral,
+}
+
+impl std::fmt::Display for StorageClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageClass::Numeric => write!(f, "Numeric"),
+            StorageClass::InlineBuffer => write!(f, "InlineBuffer"),
+            StorageClass::ManagedString => write!(f, "ManagedString"),
+            StorageClass::CaptureResult => write!(f, "CaptureResult"),
+            StorageClass::Escaped => write!(f, "Escaped"),
+            StorageClass::ConstLiteral => write!(f, "ConstLiteral"),
+        }
+    }
+}
+
 // ── Lifetime annotations (the variable-lifetime analysis) ────────────
 //
 // Conservative lifetime verdicts for static backends (C): per variable,
@@ -825,6 +872,10 @@ pub struct IrProgram {
     /// ignore it are unaffected. Sorted by name for deterministic
     /// serialization.
     pub var_nospace: Vec<(String, bool)>,
+    /// Unified storage-class selection per string variable. Populated by
+    /// `select_storage_classes` from the union of existing analyses.
+    /// Backends consult this instead of re-deriving from scattered checks.
+    pub var_storage: Vec<(String, StorageClass)>,
     /// Bash-identity variables the program REFERENCES that bash sets ITSELF
     /// at startup (never inherited from the environment): HOSTNAME, USER's
     /// siblings like BASH_VERSION/ZSH_VERSION.  Populated by
@@ -7590,6 +7641,7 @@ impl IrProgram {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         }
     }
@@ -7827,6 +7879,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let perl = shir_to_perl(&prog);

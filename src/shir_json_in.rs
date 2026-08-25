@@ -156,6 +156,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         var_lifetimes,
         var_nospace,
         var_bash_env,
+        var_storage: Vec::new(),
     })
 }
 
@@ -1436,6 +1437,8 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+        var_storage: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
@@ -1481,6 +1484,7 @@ mod tests {
                 var_const: vec![],
                 var_lifetimes: vec![],
                 var_nospace: vec![],
+                var_storage: vec![],
                 var_bash_env: vec![],
             };
             let json = crate::shir_json::shir_to_shir_json_raw(&prog);
@@ -1558,6 +1562,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
@@ -1698,6 +1703,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = shir_to_shir_json(&prog);
@@ -1784,6 +1790,7 @@ mod tests {
                 var_const: vec![],
                 var_lifetimes: vec![],
                 var_nospace: vec![],
+                var_storage: vec![],
                 var_bash_env: vec![],
             }
         }
@@ -1950,6 +1957,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
@@ -2013,6 +2021,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
