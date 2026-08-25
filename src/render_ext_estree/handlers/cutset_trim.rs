@@ -58,7 +58,11 @@ pub(crate) fn render(node: &CutsetTrim) -> Option<Expr> {
         }],
         kind: "let",
     };
-    let stmts: Vec<Stmt> = vec![
+    // side: "left" = leading only, "right" = trailing only,
+    // absent/other = both ends (strings.Trim)
+    let trim_leading = node.side.as_deref() != Some("right");
+    let trim_trailing = node.side.as_deref() != Some("left");
+    let mut stmts: Vec<Stmt> = vec![
         decl_r(Expr::CallExpression {
             callee: Box::new(ident("String")),
             arguments: vec![ident("_t")],
@@ -80,11 +84,11 @@ pub(crate) fn render(node: &CutsetTrim) -> Option<Expr> {
             }],
             kind: "let",
         },
-        Stmt::ExpressionStatement {
-            expression: assign(ident("i"), num(0)),
-        },
-        // while (i < r.length && _cs.includes(r[i])) i = i + 1;
-        Stmt::WhileStatement {
+    ];
+    // while (i < r.length && _cs.includes(r[i])) i = i + 1;
+    // (skipped when side == "right": leading chars are kept)
+    if trim_leading {
+        stmts.push(Stmt::WhileStatement {
             test: bin(
                 "&&",
                 bin("<", ident("i"), r_len()),
@@ -95,12 +99,15 @@ pub(crate) fn render(node: &CutsetTrim) -> Option<Expr> {
                     expression: inc("i"),
                 }],
             }),
-        },
-        Stmt::ExpressionStatement {
-            expression: assign(ident("j"), r_len()),
-        },
-        // while (j > i && _cs.includes(r[j - 1])) j = j - 1;
-        Stmt::WhileStatement {
+        });
+    }
+    stmts.push(Stmt::ExpressionStatement {
+        expression: assign(ident("j"), r_len()),
+    });
+    // while (j > i && _cs.includes(r[j - 1])) j = j - 1;
+    // (skipped when side == "left": trailing chars are kept)
+    if trim_trailing {
+        stmts.push(Stmt::WhileStatement {
             test: bin(
                 "&&",
                 bin(">", ident("j"), ident("i")),
@@ -111,15 +118,15 @@ pub(crate) fn render(node: &CutsetTrim) -> Option<Expr> {
                     expression: dec("j"),
                 }],
             }),
-        },
-        Stmt::ReturnStatement {
-            argument: Some(crate::estree::method_call(
-                ident("r"),
-                "slice",
-                vec![ident("i"), ident("j")],
-            )),
-        },
-    ];
+        });
+    }
+    stmts.push(Stmt::ReturnStatement {
+        argument: Some(crate::estree::method_call(
+            ident("r"),
+            "slice",
+            vec![ident("i"), ident("j")],
+        )),
+    });
     let arrow = Expr::ArrowFunctionExpression {
         params: vec![ident("_t"), ident("_cs")],
         body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: stmts })),

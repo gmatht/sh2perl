@@ -423,19 +423,35 @@ pub fn cutset_trim(node: &CutsetTrim, ctx: &ExprRenderCtx) -> Option<String> {
     match ctx.backend {
         Backend::Perl => {
             // strip ALL leading/trailing chars present in the cutset;
-            // \Q..\E quotes the set so metachars stay literal
+            // \Q..\E quotes the set so metachars stay literal.
+            // side: "left" = leading only, "right" = trailing only
+            // (Go strings.TrimLeft / strings.TrimRight).
             let text = crate::ir::ir_expr_to_perl(&node.text);
             let cut = crate::ir::ir_expr_to_perl(&node.cutset);
-            Some(format!(
-                "do {{ my $t = {}; my $c = {}; $t =~ s/^[\\Q$c\\E]+//; $t =~ s/[\\Q$c\\E]+$//; $t }}",
-                text, cut
-            ))
+            let strip_leading = node.side.as_deref() != Some("right");
+            let strip_trailing = node.side.as_deref() != Some("left");
+            let mut body = String::from("do { my $t = ");
+            body.push_str(&text);
+            body.push_str("; my $c = ");
+            body.push_str(&cut);
+            if strip_leading {
+                body.push_str("; $t =~ s/^[\\Q$c\\E]+//");
+            }
+            if strip_trailing {
+                body.push_str("; $t =~ s/[\\Q$c\\E]+$//");
+            }
+            body.push_str("; $t }");
+            Some(body)
         }
         Backend::Estree => None,
         Backend::Go => {
             let text = render_child(&node.text, ctx)?;
             let cut = render_child(&node.cutset, ctx)?;
-            Some(format!("strings.Trim({}, {})", text, cut))
+            match node.side.as_deref() {
+                Some("left") => Some(format!("strings.TrimLeft({}, {})", text, cut)),
+                Some("right") => Some(format!("strings.TrimRight({}, {})", text, cut)),
+                _ => Some(format!("strings.Trim({}, {})", text, cut)),
+            }
         }
         Backend::Rust => {
             let text = render_child(&node.text, ctx)?;
