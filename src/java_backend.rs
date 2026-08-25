@@ -31,6 +31,7 @@ struct JavaRender {
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
     redir_seq: usize,
+    tmp_seq: usize,
     out: Vec<String>,
     depth: usize,
 }
@@ -46,7 +47,7 @@ fn sanitize(name: &str) -> String {
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
-                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0,
+                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
                      out: Vec::new(), depth: 2 }
     }
 
@@ -339,13 +340,15 @@ impl JavaRender {
                 // bash: the loop's status is the last BODY command's status
                 // (or 0), never the terminating condition's — keep a
                 // shadow and restore it when the condition turns false.
-                self.emit("long __lastBody = __SH_RC;");
+                self.tmp_seq += 1;
+                let lb = format!("__lastBody{}", self.tmp_seq);
+                self.emit(&format!("long {lb} = __SH_RC;"));
                 self.block_open("while (true) {");
                 let c = self.cond_bool(cond)?;
                 self.emit(&format!("boolean __c = {c};"));
-                self.emit("if (!__c) { __SH_RC = __lastBody; break; }");
+                self.emit(&format!("if (!__c) {{ __SH_RC = {lb}; break; }}"));
                 for b in body { self.stmt(b)?; }
-                self.emit("__lastBody = __SH_RC;");
+                self.emit(&format!("{lb} = __SH_RC;"));
                 self.block_close();
                 Ok(())
             }
@@ -367,6 +370,8 @@ impl JavaRender {
             IrStmt::For { var, iter, body } => {
                 let items = self.for_items(iter)?;
                 self.fields.insert(sanitize(var));
+                self.tmp_seq += 1;
+                let itv = format!("__it{}", self.tmp_seq);
                 self.emit(&format!("__v_{} = \"\";", sanitize(var)));
                 let runtime_list = items.contains('\u{1}') || items.contains("shSplit(")
                    || items.contains("__SH_ARGV");
@@ -375,17 +380,21 @@ impl JavaRender {
                     self.emit("List<String> __items = new ArrayList<>();");
                     for piece in items.split('\u{1}') {
                         if piece.is_empty() { continue; }
-                        if piece.starts_with('"') || piece.starts_with('(') {
+                        if let Some(r) = piece.strip_prefix("String.join(\" \", shSplit(") {
+                            // join-wrapped split → the bare runtime list
+                            let inner = r.strip_suffix("))").unwrap_or(r);
+                            self.emit(&format!("__items.addAll(shSplit({inner}));"));
+                        } else if piece.starts_with('"') || piece.starts_with('(') {
                             self.emit(&format!("__items.add({piece});"));
                         } else {
                             self.emit(&format!("__items.addAll({piece});"));
                         }
                     }
-                    self.block_open("for (String __it : __items) {");
+                    self.block_open(&format!("for (String {itv} : __items) {{"));
                 } else {
-                    self.block_open(&format!("for (String __it : new String[] {{{items}}}) {{"));
+                    self.block_open(&format!("for (String {itv} : new String[] {{{items}}}) {{"));
                 }
-                self.emit(&format!("__v_{} = __it;", sanitize(var)));
+                self.emit(&format!("__v_{} = {itv};", sanitize(var)));
                 for b in body { self.stmt(b)?; }
                 self.block_close();
                 Ok(())
@@ -399,11 +408,13 @@ impl JavaRender {
             IrStmt::Subshell(body) => {
                 // copy semantics: snapshot scalars+argv, run, restore
                 self.helper("snapshot");
-                self.emit("String __snap = shSnapshot(); List<String> __snapArgv = new ArrayList<>(__SH_ARGV); long __snapRc = __SH_RC;");
+                self.tmp_seq += 1;
+                let k = self.tmp_seq;
+                self.emit(&format!("String __snap{k} = shSnapshot(); List<String> __snapArgv{k} = new ArrayList<>(__SH_ARGV); long __snapRc{k} = __SH_RC;"));
                 self.block_open("{");
                 for b in body { self.stmt(b)?; }
                 self.block_close();
-                self.emit("shRestore(__snap); __SH_ARGV = __snapArgv; __SH_RC = __snapRc;");
+                self.emit(&format!("shRestore(__snap{k}); __SH_ARGV = __snapArgv{k}; __SH_RC = __snapRc{k};"));
                 Ok(())
             }
             IrStmt::Case { discriminant, clauses } => self.case(discriminant, clauses),
@@ -491,7 +502,9 @@ impl JavaRender {
                 // real thread; statics are shared (documented limitation:
                 // bash copies state at fork — corpus background jobs that
                 // mutate parent state would need per-job snapshots)
-                self.block_open("Thread __bg = new Thread(() -> { try {");
+                self.tmp_seq += 1;
+                let bg = format!("__bg{}", self.tmp_seq);
+                self.block_open(&format!("Thread {bg} = new Thread(() -> {{ try {{"));
                 for b in body { self.stmt(b)?; }
                 self.depth -= 1;
                 {
@@ -500,7 +513,7 @@ impl JavaRender {
                     l.push_str("} catch (Exception __e) { throw new RuntimeException(__e); } });");
                     self.out.push(l);
                 }
-                self.emit("__bg.start();");
+                self.emit(&format!("{}.start();", bg));
                 self.emit("__SH_RC = 0;");
                 Ok(())
             }
@@ -3067,7 +3080,8 @@ fn helper_src(name: &str) -> Option<&'static str> {
         } catch (Exception e) { return null; }
     }
 "#,
-        "split" => r#"    static List<String> shSplit(String s) {
+        "split" => r#"    static List<String> shSplit(long v) { return shSplit(String.valueOf(v)); }
+    static List<String> shSplit(String s) {
         if (s.isEmpty()) return new ArrayList<>();
         List<String> out = new ArrayList<>(Arrays.asList(s.split("[ \\t\\n]+")));
         // trailing separators produce a trailing "" in Java's split
