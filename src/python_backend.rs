@@ -939,39 +939,13 @@ impl Render {
             }
             IrExpr::Interpolate(parts) => self.interp(parts),
             IrExpr::Capture { expr, .. } => {
-                // `$(cmd args)` with a single exec body -> native capture
+                // $(...) bodies: fnCall outparam channel first (C frontend),
+                // then the shared native-first ladder via capture_body_expr.
                 if let IrExpr::Arrow(body) = expr.as_ref() {
-                    if let [IrStmt::Expr(e)] = body.as_slice() {
-                        if let IrExpr::Call { func, args } = e {
-                            if func == "exec" {
-                                let argv = self.build_argv(args);
-                                self.need_subprocess = true;
-                                return format!(
-                                    "subprocess.check_output([{}]).decode()",
-                                    argv.join(", ")
-                                );
-                            }
-                            // `$(cmd1 | cmd2)` — a pipeline body
-                            if func == "pipeline" {
-                                return self.call("pipeline", args);
-                            }
-                            // `$(cmd < file)` — a redirect body -> bash -c
-                            if func == "redirect" {
-                                if let Some(c) = self.capture_redirect(args) {
-                                    return c;
-                                }
-                            }
-                        }
-                    }
-                }
-                // The C frontend's outparam channel: capture(Arrow[
-                // fnCall(..)]) — the callee echoes its out-params, the
-                // caller captures STDOUT.
-                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    // fnCall channel
                     let mut call: Option<(String, Vec<String>)> = None;
                     for st in body.iter() {
-                        if let IrStmt::Expr(IrExpr::Call { func, args })
-                        = st {
+                        if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
                             if func == "fnCall" || func == "$fn_call" {
                                 let name = args.first().and_then(|a| match a {
                                     IrExpr::Str(n, _) => Some(n.clone()),
@@ -997,9 +971,15 @@ impl Render {
                             call_args.join(", ")
                         );
                     }
+                    // shared native-first ladder (folds/exec/pipeline/
+                    // redirect/native fd-fallback)
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
                 }
                 self.sh2_stub("capture", &[], "capture")
             },
+
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
             IrExpr::Range { start, end } => format!("range({}, {})", start, end + 1),
             IrExpr::RawExpr(s) => {
