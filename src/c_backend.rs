@@ -4225,6 +4225,22 @@ impl Render {
             "let" => {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(IrExpr::Str(expr, _)) = items.first() {
+                        // ${#arr[@]} counts inside let-text go NATIVE:
+                        // substitute tokens, parse, then rewrite to C
+                        // count members instead of shelling out (the
+                        // child bash cannot see C-side arrays)
+                        let substituted = subst_array_counts(expr);
+                        if substituted != *expr {
+                            if let Some(ast) = crate::shir::parse_arith(&substituted) {
+                                let cexpr = self.arith(&ast);
+                                let cexpr = self.apply_array_counts(&cexpr);
+                                self.need_sh = true;
+                                return format!(
+                                    "({{ long long _r = ({cexpr}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
+                                );
+                            }
+                            // parse failed — restore and fall through
+                        }
                         if let Some(c) = self.let_render(expr) {
                             self.need_sh = true;
                             // `let` succeeds (rc 0) iff the arith is nonzero
@@ -4875,6 +4891,33 @@ impl Render {
     /// and writes the string form back (an array/buffer cannot be the
     /// target of `+=`).
     fn let_render(&mut self, s: &str) -> Option<String> {
+        let trimmed = s.trim();
+        // ${#arr[@]} counts go NATIVE: substitute tokens, register them
+        // Int, then let the comparison/arith renderers treat them as
+        // plain numeric idents (apply_array_counts rewrites at the end)
+        if trimmed.contains("${#") {
+            let substituted = subst_array_counts(trimmed);
+            for tok in substituted.split(|c: char|
+                !c.is_ascii_alphanumeric() && c != '_')
+            {
+                if let Some(name) = tok.strip_prefix("__SHCNT_") {
+                    self.var_types.insert(name.to_string(), IrType::Int);
+                }
+            }
+            if let Some(c) = self.let_compare(&substituted) {
+                return Some(self.apply_array_counts(&c));
+            }
+            // op-assign shapes with counts (`j += ${#flags}`)
+            for op in ["+=", "-=", "*=", "/=", "%="] {
+                if let Some((l, r)) = substituted.split_once(op) {
+                    if is_ident(l.trim()) && r.contains("__SHCNT_") {
+                        if let Some(c) = self.let_render(&substituted) {
+                            return Some(self.apply_array_counts(&c));
+                        }
+                    }
+                }
+            }
+        }
         let s = s.trim();
         // plain comparisons (`i <= n`, `x == 3`) — the ForInit conds
         if let Some(c) = self.let_compare(s) {
@@ -6559,6 +6602,24 @@ impl Render {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
         let v = self.value_c(val);
+        if let IrExpr::Str(kraw, _) = key {
+            // bash strips subscript quotes at parse time
+            let kq = kraw.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            let k = &kq;
+            // a key carrying $expansions (`options["$key"]=v`,
+            // `m["${flags:j:1}"]=v`) resolves at RUNTIME — storing the raw
+            // text made every lookup miss
+            if k.contains('$')
+                && (self.assoc_arrays.contains(var) || k.starts_with("${"))
+            {
+                self.assoc_arrays.insert(var.to_string());
+                let kv = self.heredoc_body_c(key);
+                self.emit(&format!(
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {kv}, {v});"
+                ));
+                return;
+            }
+        }
         if let IrExpr::Str(k, _) = key {
             // a literal key: numeric for indexed arrays, string for assoc
             if let Ok(i) = k.trim().parse::<i64>() {
@@ -6649,6 +6710,24 @@ impl Render {
         self.emit(&format!("size_t {ai} = 0;"));
         for (i, it) in items.iter().enumerate() {
             let _ = i;
+            // `arr=("$@")` — EACH positional is its own element (a joined
+            // single element made `${#args[@]}` read 1 forever)
+            if let IrExpr::Call { func, args } = it {
+                if (func == "listVar" || func == "arrayItems")
+                    && matches!(Self::str_arg(args, 0).as_deref(), Some("@"))
+                {
+                    self.emit(&format!(
+                        "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = strdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
+                    ));
+                    self.emit(&format!(
+                        "{id}_len = {ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
+                    ));
+                    self.emit(&format!(
+                        "{ai} += ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
+                    ));
+                    continue;
+                }
+            }
             // `arr=($x)` — a split element field-splits at runtime (the
             // core's A1 split marker on an array literal element)
             if let IrExpr::Call { func, args } = it {
@@ -7348,6 +7427,62 @@ impl Render {
             }
         }
         s.to_string()
+    }
+
+    /// Rewrite `__SHCNT_name` tokens (from subst_array_counts) in a
+    /// generated C expression to the array-count member expression.
+    fn apply_array_counts(&mut self, cexpr: &str) -> String {
+        let mut toks: Vec<String> = Vec::new();
+        let bytes = cexpr.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'_' && cexpr[i..].starts_with("__SHCNT_") {
+                let mut j = i + 8;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                let tok = cexpr[i..j].to_string();
+                if !toks.contains(&tok) {
+                    toks.push(tok);
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        let mut out = cexpr.to_string();
+        for t in toks {
+            let name = t.trim_start_matches("__SHCNT_");
+            let id = self.c_ident(name);
+            // assoc arrays count via _n; indexed via _len; a SCALAR var
+            // (${#flags} on a Str) is its strlen
+            let expr = if self.assoc_arrays.contains(name) {
+                format!("((long long){id}_n)")
+            } else if self.arrays.contains(name) {
+                format!("((long long){id}_len)")
+            } else {
+                let v = self.store_read(name);
+                format!("((long long)strlen({v} ? {v} : \"\"))")
+            };
+            // unknown-ident fallbacks may have wrapped the token in
+            // getenv forms (bare, NULL-guarded) — rewrite all to the
+            // bare count expression
+            out = out.replace(
+                &format!("(getenv(\"{t}\") ? getenv(\"{t}\") : \"\")"),
+                &expr,
+            );
+            // atoll(getenv("T")) — the numeric-read wrapper
+            out = out.replace(
+                &format!("atoll((getenv(\"{t}\") ? getenv(\"{t}\") : \"\"))"),
+                &expr,
+            );
+            // atoll(EXPR) where EXPR is already a native count — strip
+            out = out.replace(&format!("atoll({expr})"), &expr);
+            out = out.replace(&t, &expr);
+        }
+        out
     }
 
     fn stmt(&mut self, s: &IrStmt) {
@@ -11349,6 +11484,46 @@ impl Render {
         Some((vars, ifs_spec, rest))
     }
 }
+
+/// Replace `${#arr[@]}` / `${#arr}` array-count expansions with a
+/// reserved identifier token (`__SHCNT_arr`) that survives arith parsing;
+/// [`Render::apply_array_counts`] rewrites the token to the C count
+/// expression after rendering.
+fn subst_array_counts(s: &str) -> String {
+    let mut out = String::new();
+    let ch: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '$' && i + 1 < ch.len() && ch[i + 1] == '{'
+            && i + 2 < ch.len() && ch[i + 2] == '#'
+        {
+            // find closing brace
+            let mut j = i + 3;
+            while j < ch.len() && ch[j] != '}' {
+                j += 1;
+            }
+            if j < ch.len() {
+                let inner: String = ch[i + 3..j].iter().collect();
+                let name = inner
+                    .trim_end_matches("[@]")
+                    .trim_end_matches("[*]")
+                    .to_string();
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push_str(&format!("__SHCNT_{}", name));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
+
+
 
 /// A Redirect whose inner command is `mapfile`/`readarray` reading stdin
 /// from a FILE — renderable natively (arrays cannot cross exec).
