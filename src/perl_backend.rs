@@ -144,6 +144,8 @@ pub struct Render {
     fh_counter: usize,
     /// WalkDir used → __sh2_walk preamble helper needed.
     need_walk: bool,
+    /// rm -r used → File::Path remove_tree import needed.
+    need_rm_r: bool,
     /// ReadLine used → __sh2_read_line preamble helper needed.
     need_readline: bool,
 }
@@ -255,6 +257,10 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             r.emit(line);
         }
         r.emit("");
+    }
+    if r.need_rm_r {
+        r.emit("");
+        r.emit("use File::Path ();");
     }
     let scalars: Vec<String> = r
         .scalars
@@ -1424,7 +1430,11 @@ impl Render {
                     matches!(w, IrExpr::Str(s, _) if s == "-r" || s == "-R" || s == "-rf" || s == "-fr")
                 });
                 if recursive {
-                    self.mark_todo("rm -r");
+                    self.need_rm_r = true;
+                    for f in &files {
+                        self.emit(&format!("File::Path::remove_tree({}, undef);", f));
+                    }
+                    return;
                 }
                 self.emit(&format!("unlink {};", files.join(", ")));
             }
@@ -1559,6 +1569,21 @@ impl Render {
         // two-char \n): perl printf would print them literally. Decode the
         // standard escape set once, then let %s/%d pass through to perl's
         // sprintf (same conv set java renders).
+        if let IrExpr::Interpolate(parts) = fmt {
+            // single-Lit / all-Lit formats: decode escapes per part
+            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) {
+                let mut decoded = String::new();
+                for p in parts {
+                    if let InterpPart::Lit(s) = p {
+                        decoded.push_str(&unescape_perl(s));
+                    }
+                }
+                let args: Vec<String> = words[1..].iter().map(|w| self.expr(w)).collect();
+                let lit = Self::perl_str(&decoded);
+                self.emit(&format!("printf({}, {});", lit, args.join(", ")));
+                return;
+            }
+        }
         if let IrExpr::Str(s, _) = fmt {
             let un = s
                 .replace("\\n", "\n")
@@ -2662,6 +2687,14 @@ impl Render {
 /// Sanitize a shell variable name into a Perl identifier.
 /// Value expressions are native when they contain no external-command
 /// exec (child processes escape select()-based capture).
+/// Decode the standard backslash escapes an A1 Str carries raw.
+fn unescape_perl(s: &str) -> String {
+    s.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\\\", "\\")
+}
+
 fn capture_body_expr_native(e: &IrExpr) -> bool {
     match e {
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
