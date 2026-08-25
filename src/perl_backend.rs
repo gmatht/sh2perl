@@ -726,11 +726,80 @@ impl Render {
         }
     }
 
+    /// Does this capture body render ENTIRELY natively (no child process
+    /// whose fd-1 output would escape select()-based capture)?
+    fn capture_body_is_native(stmts: &[IrStmt]) -> bool {
+        stmts.iter().all(|s| match s {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "exec" || func == "builtin" =>
+            {
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) => matches!(
+                        c.as_str(),
+                        "echo" | "printf" | "cd" | "exit" | "mkdir" | "touch" | "rm"
+                            | "read" | "shift" | "let" | "true" | "false" | "local"
+                            | "declare" | "set" | "test"
+                    ),
+                    _ => true,
+                }
+            }
+            IrStmt::Assign { expr, .. } => capture_body_expr_native(expr),
+            IrStmt::Output { value, .. } => capture_body_expr_native(value),
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                capture_body_expr_native(cond) && Self::capture_body_is_native(body)
+            }
+            IrStmt::Block(b) => Self::capture_body_is_native(b),
+            IrStmt::Expr(IrExpr::Call { func, .. }) if func == "test" => true,
+            _ => false,
+        })
+    }
+
     fn capture_from_expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Arrow(stmts) => {
-                let cmd = self.shell_cmd(stmts, "; ");
-                self.qx(&cmd)
+                // Native capture requires every body command to be one the
+                // renderer lowers NATIVELY (echo/printf/…) — child processes
+                // write to fd 1, which select()-based capture cannot see.
+                // Anything external → the qx fallback (fork/exec is then
+                // unavoidable; bash semantics beat purity).
+                if !Self::capture_body_is_native(stmts) {
+                    // qx fallback (fork/exec unavoidable): still apply the
+                    // command-substitution trailing-newline strip
+                    let cmd = self.shell_cmd(stmts, "; ");
+                    let k = self.fh_counter;
+                    self.fh_counter += 1;
+                    return format!(
+                        "do {{ my $__qx{k} = {}; $__qx{k} =~ s/\\n+$//; $__qx{k} }}",
+                        self.qx(&cmd)
+                    );
+                }
+                // NATIVE capture (no fork/exec): redirect STDOUT into an
+                // IN-MEMORY scalar, run the body's OWN statements, restore,
+                // strip trailing newlines ($() semantics). The body renders
+                // into a TEMP BUFFER so the whole capture becomes one
+                // do{…} BLOCK EXPRESSION usable in value position.
+                let k = self.fh_counter;
+                self.fh_counter += 1;
+                let mut saved = std::mem::take(&mut self.out);
+                for s in stmts {
+                    self.stmt(s);
+                }
+                let body_lines = std::mem::take(&mut self.out);
+                self.out = saved;
+                let mut blk = String::from("do {\n");
+                blk.push_str(&format!("my $__cap{k} = '';\n"));
+                blk.push_str(&format!("open(my $__mem{k}, '>', \\$__cap{k}) or die;\n"));
+                blk.push_str(&format!("my $__sel{k} = select($__mem{k});\n"));
+                for l in &body_lines {
+                    blk.push_str(l);
+                    blk.push('\n');
+                }
+                blk.push_str(&format!("close($__mem{k});\n"));
+                blk.push_str(&format!("select($__sel{k});\n"));
+                blk.push_str(&format!("$__cap{k} =~ s/\\n+$//;\n"));
+                blk.push_str(&format!("$__cap{k}\n"));
+                blk.push('}');
+                blk
             }
             other => {
                 self.mark_todo("capture expr");
@@ -2591,6 +2660,35 @@ impl Render {
 // ── free helpers ─────────────────────────────────────────────────────
 
 /// Sanitize a shell variable name into a Perl identifier.
+/// Value expressions are native when they contain no external-command
+/// exec (child processes escape select()-based capture).
+fn capture_body_expr_native(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            match args.first() {
+                Some(IrExpr::Str(c, _)) => matches!(
+                    c.as_str(),
+                    "echo" | "printf" | "cd" | "exit" | "mkdir" | "touch" | "rm"
+                        | "read" | "shift" | "let" | "true" | "false"
+                ),
+                _ => true,
+            }
+        }
+        IrExpr::Call { args, .. } => args.iter().all(capture_body_expr_native),
+        IrExpr::Array(items) => items.iter().all(capture_body_expr_native),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            capture_body_expr_native(lhs) && capture_body_expr_native(rhs)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            InterpPart::Lit(_) => true,
+            InterpPart::Expr(x) => capture_body_expr_native(x),
+        }),
+        IrExpr::Ext(n) => n.children().iter().all(|c| capture_body_expr_native(c)),
+        IrExpr::Capture { .. } => false,
+        _ => true,
+    }
+}
+
 fn ident(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {

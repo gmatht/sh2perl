@@ -578,5 +578,30 @@ mod tests {
             IrStmt::Expr(IrExpr::Call { func, .. }) => assert_eq!(func, "exec"),
             _ => panic!(),
         }
+        let mut prog2 = crate::ir::IrProgram {
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "builtin".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        fallback_builtin_to_exec(&mut prog);
+        match &prog.stmts[0] {
+            IrStmt::Expr(IrExpr::Call { func, .. }) => assert_eq!(func, "exec"),
+            _ => panic!(),
+        
+    }
     }
 }
