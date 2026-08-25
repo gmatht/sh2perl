@@ -576,7 +576,7 @@ impl Render {
             self.emit("  v->p = val ? strdup(val) : NULL;");
             self.emit("}");
             self.emit("static const char *sh2_str_get(const sh2_str *v) {");
-            self.emit("  return (v->p) ? v->p : \"\"");
+            self.emit("  return (v->p) ? v->p : \"\";");
             self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
