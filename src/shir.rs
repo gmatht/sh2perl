@@ -16749,6 +16749,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         left: Box::new(expr_to_estree(lhs)),
                         right: Box::new(expr_to_estree(rhs)),
                     },
+                    // `s = ${s%/}` — a param source on a lifted var: the
+                    // runtime reads the value from the STORE by string
+                    // name, but the lifted binding is not there. Delegate
+                    // to the general param emission, which injects the
+                    // native value as the trailing override arg (the
+                    // same path as expression-position param on lifted
+                    // vars — the local-lift walker already skips the
+                    // store mark for param name args on this assumption)
+                    // and returns the computed string into the binding.
+                    IrExpr::Call { func, .. } if func == "param" => expr_to_estree(expr),
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
