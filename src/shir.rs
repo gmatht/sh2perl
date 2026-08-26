@@ -27001,7 +27001,7 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 // split would compare garbage text. Refuse (the scan
                 // continues; a `$(( ... ))` whole-test operand stays on
                 // the runtime).
-                if lhs.contains(['(', ')']) || rhs.contains(['(', ')']) {
+                if has_unquoted_paren(lhs) || has_unquoted_paren(rhs) {
                     idx += 1;
                     continue;
                 }
@@ -27091,6 +27091,38 @@ fn native_test_statused(t: Expr) -> Expr {
     ])
 }
 
+/// True when the test string contains a GROUPING paren OUTSIDE quotes
+/// (single or double). Quoted paren literals (`[[ "$c" == '(' ]]`) are
+/// operands — the runtime's tokenizer would mis-parse them, so the
+/// emitter must lower those natively; only real grouping parens refuse
+/// the native compound path.
+fn has_unquoted_paren(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut in_dq = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            // single-quoted region: skip to the close (no escapes in sh)
+            if let Some(close) = s[i + 1..].find('\'') {
+                i += close + 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'"' {
+            in_dq = !in_dq;
+            i += 1;
+            continue;
+        }
+        if !in_dq && (b[i] == b'(' || b[i] == b')') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Split on a top-level ` -conn ` connector (outside quotes and parens),
 /// returning the parts. None when the connector does not appear.
 fn split_test_connector<'a>(s: &'a str, conn: &str) -> Option<Vec<&'a str>> {
@@ -27102,6 +27134,17 @@ fn split_test_connector<'a>(s: &'a str, conn: &str) -> Option<Vec<&'a str>> {
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
+            b'\'' => {
+                // single-quoted region: skip to the close (no escapes in
+                // sh) — a quoted `(`/`)` is a LITERAL operand, not a
+                // grouping paren (the runtime tokenizer would mis-parse
+                // it; the emitter lowers those natively)
+                if let Some(close) = s[i + 1..].find('\'') {
+                    i += close + 2;
+                    continue;
+                }
+                i += 1;
+            }
             b'"' => {
                 in_q = !in_q;
                 i += 1;
@@ -27205,7 +27248,7 @@ fn test_has_op_token(s: &str) -> bool {
 
 fn try_native_compound_test(s: &str) -> Option<Expr> {
     let s = s.trim();
-    if s.contains(['(', ')']) {
+    if has_unquoted_paren(s) {
         return None; // paren-grouped compounds stay on the runtime
     }
     // Compose a compound native; refuse it when its sh2.* CALL count
