@@ -2130,10 +2130,16 @@ impl Render {
                 // primitive; subprocess pipe wiring per stage would be a
                 // large subsystem for little idiomatic gain.
                 if let Some(IrExpr::Array(stages)) = args.first() {
+                    if std::env::var("PL_DEBUG").is_ok() {
+                        eprintln!("PIPE_ARM stages={}", stages.len());
+                    }
                     let mut parts = Vec::new();
                     let mut ok = true;
                     for stage in stages {
                         if let IrExpr::Arrow(body) = stage {
+                            if std::env::var("PL_DEBUG").is_ok() {
+                                eprintln!("STAGE body0={:?}", body.first().map(|s| s).is_some());
+                            }
                             // single exec stage -> plain argv words
                             let mut simple = false;
                             if let [IrStmt::Expr(e)] = body.as_slice() {
@@ -2142,6 +2148,16 @@ impl Render {
                                         let argv = self.build_argv(args);
                                         parts.push(argv.join(" "));
                                         simple = true;
+                                    } else if func == "redirect" {
+                                        // <(...) process-substitution stage:
+                                        // the tmp-file path vars are python
+                                        // values — render via shell text
+                                        if let Some(IrExpr::Arrow(ib)) = args.first() {
+                                            if let Some(t) = self.body_shell_text(ib) {
+                                                parts.push(format!("( {t} )"));
+                                                simple = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2149,9 +2165,20 @@ impl Render {
                                 continue;
                             }
                             // richer stages: shell-text re-render
+                            if std::env::var("PL_DEBUG").is_ok() {
+                                if let Some(IrStmt::Expr(e)) = body.first() {
+                                    eprintln!("BST_FAIL expr={:?}", e);
+                                }
+                            }
                             if let Some(t) = self.body_shell_text(body) {
+                                if std::env::var("PL_DEBUG").is_ok() {
+                                    eprintln!("STAGE_SHELL: {}", t);
+                                }
                                 parts.push(t);
                                 continue;
+                            }
+                            if std::env::var("PL_DEBUG").is_ok() {
+                                eprintln!("STAGE_FAILED");
                             }
                         }
                         ok = false;
@@ -2192,6 +2219,82 @@ impl Render {
     }
     /// Render a single-exec/pipeline Arrow body to shell text (for the
     /// bash -c capture fallback). None for anything else.
+    /// Render an exec-call EXPRESSION tree (BinOp &&/|| chains over exec
+    /// leaves) back to shell text for the bash -c fallback.
+    fn expr_shell_text(&self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Call { func, args } if func == "exec" => {
+                let mut one = Vec::new();
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    one.push(Self::sh_quote(cmd));
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        one.push(self.sh_arg(it)?);
+                    }
+                }
+                Some(one.join(" "))
+            }
+            IrExpr::Call { func, args } if func == "redirect" => {
+                let ib = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(b) => Some(b.as_slice()),
+                    _ => None,
+                })?;
+                let inner_t = self.body_shell_text(ib)?;
+                let mut text = format!("( {inner_t} )");
+                if let Some(IrExpr::Array(rds)) = args.get(1) {
+                    for rd in rds.iter() {
+                        text.push(' ');
+                        text.push_str(&self.redirect_shell_text(rd)?);
+                    }
+                }
+                Some(text)
+            }
+            IrExpr::Call { func, args } if func == "pipeline" => {
+                let sts = args.first()?;
+                let sts = match sts {
+                    IrExpr::Array(a) => a,
+                    _ => return None,
+                };
+                let mut ss = Vec::new();
+                for st in sts.iter() {
+                    match st {
+                        IrExpr::Arrow(b) => ss.push(self.body_shell_text(b)?),
+                        other => ss.push(self.expr_shell_text(other)?),
+                    }
+                }
+                Some(ss.join(" | "))
+            }
+            // and(Arrow, ..) — &&-chained statement groups (the
+            // process-substitution lowering): render each group via
+            // body_shell_text joined by &&
+            IrExpr::Call { func, args } if func == "and" => {
+                let mut ss = Vec::new();
+                for a in args.iter() {
+                    match a {
+                        IrExpr::Arrow(b) => ss.push(self.body_shell_text(b)?),
+                        _ => return None,
+                    }
+                }
+                Some(ss.join(" && "))
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                let op_text = match op {
+                    crate::ir::BinOpKind::And => "&&",
+                    crate::ir::BinOpKind::Or => "||",
+                    _ => return None,
+                };
+                Some(format!(
+                    "{} {} {}",
+                    self.expr_shell_text(lhs)?,
+                    op_text,
+                    self.expr_shell_text(rhs)?
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
         let mut parts = Vec::new();
         for st in body {
@@ -2210,6 +2313,17 @@ impl Render {
                             }
                             parts.push(one.join(" "));
                             continue;
+                        }
+                        // redirect(inner_arrow, [redirect objects]) — the
+                        // process-substitution shape: inner + fd renders
+                        if func == "redirect" || func == "pipeline" {
+                            // redirect/pipeline CALL forms inside stage
+                            // bodies: render recursively as shell text
+                            if let Some(t) = self.expr_shell_text(e) {
+                                parts.push(t);
+                                continue;
+                            }
+                            return None;
                         }
                     }
                     return None;
