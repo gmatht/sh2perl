@@ -84,16 +84,16 @@ impl Render {
     const RUNTIME: &[(&str, &str)] = &[
         (
             "getVar",
-            "def sh2_getVar(name):\n    return __sh_store.get(name, \"\")\n",
+            "def __sh_getVar(name):\n    return __sh_store.get(name, \"\")\n",
         ),
         (
             "setVar",
-            "def sh2_setVar(name, value):\n    __sh_store[name] = \"\" if value is None else str(value)\n",
+            "def __sh_setVar(name, value):\n    __sh_store[name] = \"\" if value is None else str(value)\n",
         ),
         (
             "strip",
             concat!(
-                "def sh2_strip(v, pat, which):\n",
+                "def __sh_strip(v, pat, which):\n",
                 "    import fnmatch\n",
                 "    if which == 'p':\n",
                 "        m = 0\n",
@@ -124,7 +124,7 @@ impl Render {
         (
             "memAlloc",
             concat!(
-                "def sh2_memAlloc(size):\n",
+                "def __sh_memAlloc(size):\n",
                 "    global __sh_mem_seq\n",
                 "    __sh_mem_seq += 1\n",
                 "    n = int(float(str(size or 0)))\n",
@@ -136,7 +136,7 @@ impl Render {
         (
             "memElemSize",
             concat!(
-                "def sh2_memElemSize(t):\n",
+                "def __sh_memElemSize(t):\n",
                 "    sizes = {'char': 1, 'signed char': 1, 'unsigned char': 1, 'short': 2, ",
                 "'short int': 2, 'int': 4, 'unsigned int': 4, 'unsigned': 4, 'long': 8, ",
                 "'long int': 8, 'long long': 8, 'unsigned long': 8, 'unsigned long long': 8, ",
@@ -152,11 +152,11 @@ impl Render {
                 // `memLoad(h)` — t83_const_ptr.c, the estree reference's
                 // slice-2 override defaults offset/type the same way);
                 // the arena lookup fails on a null handle → "".
-                "def sh2_memLoad(h, offset=0, t=4):\n",
+                "def __sh_memLoad(h, offset=0, t=4):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is None or p[0] not in __sh_mem:\n",
                 "        return \"\"\n",
-                "    i = (p[1] + int(offset or 0)) * sh2_memElemSize(t)\n",
+                "    i = (p[1] + int(offset or 0)) * __sh_memElemSize(t)\n",
                 "    a = __sh_mem[p[0]]\n",
                 "    return str(a[i]) if 0 <= i < len(a) else \"\"\n",
             ),
@@ -164,11 +164,11 @@ impl Render {
         (
             "memStore",
             concat!(
-                "def sh2_memStore(h, offset=0, t=4, v=None):\n",
+                "def __sh_memStore(h, offset=0, t=4, v=None):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is None or p[0] not in __sh_mem:\n",
                 "        return\n",
-                "    i = (p[1] + int(offset or 0)) * sh2_memElemSize(t)\n",
+                "    i = (p[1] + int(offset or 0)) * __sh_memElemSize(t)\n",
                 "    a = __sh_mem[p[0]]\n",
                 "    if 0 <= i < len(a):\n",
                 "        a[i] = \"\" if v is None else str(v)\n",
@@ -177,7 +177,7 @@ impl Render {
         (
             "memAdvance",
             concat!(
-                "def sh2_memAdvance(h, n):\n",
+                "def __sh_memAdvance(h, n):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is None:\n",
                 "        return h\n",
@@ -187,7 +187,7 @@ impl Render {
         (
             "memFree",
             concat!(
-                "def sh2_memFree(h):\n",
+                "def __sh_memFree(h):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is not None and p[0] in __sh_mem:\n",
                 "        del __sh_mem[p[0]]\n",
@@ -252,7 +252,7 @@ impl Render {
                 "def __sh_test_val(x):\n",
                 "    x = str(x).strip().strip(\"\\\"\")\n",
                 "    if x.startswith('$'):\n",
-                "        return sh2_getVar(x[1:])\n",
+                "        return __sh_getVar(x[1:])\n",
                 "    try:\n",
                 "        return int(x)\n",
                 "    except ValueError:\n",
@@ -1170,7 +1170,7 @@ impl Render {
                 // store and coerce.
                 if self.store_written.contains(name) {
                     self.sh2_calls.insert("getVar".into());
-                    return format!("__sh_atoi(sh2_getVar({}))", Self::py_str(name));
+                    return format!("__sh_atoi(__sh_getVar({}))", Self::py_str(name));
                 }
                 format!("int({})", self.py_ident(name))
             }
@@ -1262,7 +1262,7 @@ impl Render {
             IrExpr::Var(_, _) | IrExpr::Ident(_) | IrExpr::Int(_) | IrExpr::Bool(_) => true,
             IrExpr::Arith(a) => self.arith_safe(a),
             IrExpr::Call { func, args } if func == "getVar" => {
-                // known vars render to bare idents; unknown → sh2_getVar("..")
+                // known vars render to bare idents; unknown → __sh_getVar("..")
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if self.var_types.contains_key(name))
             }
             _ => false,
@@ -1605,7 +1605,7 @@ impl Render {
                         return format!("os.chdir({dir})");
                     }
                     if cmd == "read" {
-                        // `read var` — read a line into the store (sh2_setVar
+                        // `read var` — read a line into the store (__sh_setVar
                         // triggers the store runtime).
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             if let Some(IrExpr::Str(v, _)) = items.first() {
@@ -1957,7 +1957,7 @@ impl Render {
                                     ),
                                 };
                             }
-                            // glob pattern — runtime sh2_strip
+                            // glob pattern — runtime __sh_strip
                             let which = match op.as_str() {
                                 "#" => "p",
                                 "##" => "P",
@@ -3263,7 +3263,7 @@ impl Render {
                     self.expr(expr)
                 };
                 // a STORE-resident target: the native binding is not the
-                // var's home — the store read (sh2_getVar) must observe
+                // var's home — the store read (__sh_getVar) must observe
                 // the write (the C frontend's outparam channel assigns
                 // out-targets from line() captures here)
                 if !self.is_num(&t.var) && self.store_written.contains(&t.var) {
@@ -3277,7 +3277,7 @@ impl Render {
                 self.emit(&format!("{name} = {rhs}"));
             }
             IrStmt::Declare { vars, init, .. } => {
-                // store-resident names (written via sh2_setVar elsewhere)
+                // store-resident names (written via __sh_setVar elsewhere)
                 // have NO native home — a raw `p.y = ""` declaration is
                 // an unbound NameError; skip them
                 let vars: Vec<_> = vars
@@ -3556,7 +3556,7 @@ impl Render {
                     };
                     if e.as_name.is_some() {
                         // bind the caught value for the arm's `as` binding
-                        // (sh2_setVar below reads __sh_exc)
+                        // (__sh_setVar below reads __sh_exc)
                         clause = format!("{} as __sh_exc", clause.trim_end_matches(':'));
                     }
                     if e.match_expr.is_none() && ei + 1 < excepts.len() {
@@ -3730,7 +3730,7 @@ impl Render {
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
             // store-resident names (dotted struct fields written via
-            // sh2_setVar) have no native binding — hoisting `p.y = ""`
+            // __sh_setVar) have no native binding — hoisting `p.y = ""`
             // would be an unbound NameError
             if self.store_written.contains(v) || v.contains('[') {
                 // store-resident names and baked array-element keys
