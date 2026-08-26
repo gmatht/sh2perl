@@ -1131,6 +1131,20 @@ impl Render {
                     }
                 }
                 serde_json::Value::Null => "None".into(),
+                serde_json::Value::Array(items) => {
+                    let elems: Vec<String> = items
+                        .iter()
+                        .map(|e| match e.as_str() {
+                            Some(s) => Self::py_str(s),
+                            None => "None".into(),
+                        })
+                        .collect();
+                    format!("[{}]", elems.join(", "))
+                }
+                serde_json::Value::Object(_) => {
+                    self.mark_todo("Json expr (object)");
+                    "None".into()
+                }
                 _ => {
                     self.mark_todo("Json expr");
                     "None".into()
@@ -1160,9 +1174,11 @@ impl Render {
                 }
                 format!("int({})", self.py_ident(name))
             }
-            ArithAst::Index { .. } => {
-                self.mark_todo("arith Index");
-                "0".into()
+            ArithAst::Index { var, key, .. } => {
+                // arithmetic array subscript: a[1] — native list subscript
+                let r = self.py_ident(var);
+                let k = self.arith(key);
+                format!("int({r}[{k}] if len({r}) > {k} else 0)")
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -3457,14 +3473,18 @@ impl Render {
                 self.in_function -= 1;
             }
             IrStmt::Return(e) => {
+                let x = e
+                    .as_ref()
+                    .map(|x| self.expr(x))
+                    .unwrap_or_else(|| "None".into());
                 if self.in_function > 0 {
-                    let x = e
-                        .as_ref()
-                        .map(|x| self.expr(x))
-                        .unwrap_or_else(|| "None".into());
                     self.emit(&format!("return {x}"));
                 } else {
-                    self.mark_todo("top-level return");
+                    // top-level return: bash `return` outside a function
+                    // is equivalent to exit with the return value's status.
+                    // Emit sys.exit to preserve semantics (script stops).
+                    self.need_sys = true;
+                    self.emit(&format!("sys.exit({x})"));
                 }
             }
             IrStmt::Exec {
