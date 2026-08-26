@@ -1660,7 +1660,7 @@ impl Render {
         for v in vars {
             if let Some(b) = self.buf_bound(v) {
                 let name = self.c_ident(v);
-                self.emit(&format!("assert(strlen({name}) <= {b});"));
+                self.emit(&format!("if ({name}) assert(strlen({name}) <= {b});"));
             }
         }
     }
