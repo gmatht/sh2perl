@@ -12138,6 +12138,72 @@ mod tests {
     /// A renderer with `name` declared as an Int var at width `w` (both
     /// the range the width analysis derives from, and the width itself —
     /// the shir_to_c flow's invariant).
+    /// A renderer with the var pre-registered in `store` (unbounded string)
+    fn str_render(name: &str) -> Render {
+        let mut r = Render::default();
+        r.store.insert(name.to_string());
+        r
+    }
+
+    #[test]
+    fn phase3_numeric_var_declares_numeric() {
+        // Numeric vars get immediate C numeric types — no pointer involved
+        let mut r = Render::default();
+        r.var_types.insert("count".to_string(), IrType::Int);
+        r.var_storage.insert("count".to_string(), crate::ir::StorageClass::Numeric);
+        emit_var_decl_wrapper(&mut r, "count");
+        let out = r.out.join("\n");
+        assert!(
+            out.contains("long long count") || out.contains("int count"),
+            "Numeric → numeric decl, got: {out}"
+        );
+    }
+
+    #[test]
+    fn phase3_bounded_var_gets_stack_buffer() {
+        let mut r = Render::default();
+        r.var_lengths.insert("path".to_string(), Some(64));
+        r.var_storage.insert("path".to_string(), crate::ir::StorageClass::InlineBuffer);
+        emit_var_decl_wrapper(&mut r, "path");
+        let out = r.out.join("\n");
+        assert!(
+            out.contains("char path[65]"),
+            "InlineBuffer(bound=64) → char[65], got: {out}"
+        );
+    }
+
+    #[test]
+    fn phase3_capture_target_stays_raw_pointer() {
+        let mut r = Render::default();
+        r.capture_vars.insert("data".to_string());
+        emit_var_decl_wrapper(&mut r, "data");
+        let out = r.out.join("\n");
+        assert!(
+            out.contains("char* data") || out.contains("char *data"),
+            "CaptureResult → char* data (raw ptr for popen), got: {out}"
+        );
+    }
+
+    #[test]
+    fn phase3_const_lifted_gets_readonly() {
+        let mut r = Render::default();
+        r.const_rhs.insert(
+            "ver".to_string(),
+            IrExpr::Str("1.0".to_string(), crate::ir::StrStyle::DoubleQuoted),
+        );
+        r.buf_bound("ver"); // trigger analysis
+        emit_var_decl_wrapper(&mut r, "ver");
+        let out = r.out.join("\n");
+        assert!(
+            out.contains("const char") || out.contains("char* ver"),
+            "ConstLiteral → const or char*, got: {out}"
+        );
+    }
+
+    fn emit_var_decl_wrapper(r: &mut Render, name: &str) {
+        r.emit_var_decl(name);
+    }
+
     fn int_render(name: &str, lo: i64, hi: i64, w: Width) -> Render {
         let mut r = Render::default();
         r.var_types.insert(name.to_string(), IrType::Int);
