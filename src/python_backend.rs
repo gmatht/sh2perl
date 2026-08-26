@@ -819,10 +819,12 @@ impl Render {
                     "setVar" => {
                         if let Some(IrExpr::Str(name, _)) = args.first() {
                             self.written.insert(name.clone());
-                            // setVar writes go through the runtime STORE,
-                            // not a python binding — getVar of the same
-                            // name must read the store back.
-                            self.store_written.insert(name.clone());
+                            // Dotted/complex names MUST round-trip through
+                            // the store (no native binding). Plain names use
+                            // the python binding natively on both sides.
+                            if !Self::is_plain_name(name) {
+                                self.store_written.insert(name.clone());
+                            }
                         }
                     }
                     // read/readarray/mapfile/getLine: every Str arg is a
