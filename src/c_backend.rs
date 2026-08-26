@@ -320,6 +320,18 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
+    // Arena-scope safety: if ALL capture-assigned vars are non-escaping,
+    // captures can share an arena freed at scope exit
+    {
+        let mut all_non_esc = true;
+        for (vn, vl) in &prog.var_lifetimes {
+            if capture_vars.contains(vn) && vl.escapes {
+                all_non_esc = false;
+                break;
+            }
+        }
+        r.arena_safe = all_non_esc && !capture_vars.is_empty();
+    }
     r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
