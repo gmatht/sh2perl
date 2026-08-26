@@ -704,6 +704,15 @@ impl Render {
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
             self.emit("  return \"\";");
             self.emit("}");
+            self.emit("static void _sh_join_arr_nl(char *d, size_t cap, char **a, size_t n) {");
+            self.emit("  size_t dn = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = '\\n';");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    for (const char *s = a[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
+            self.emit("}");
             self.emit("static void _sh_join_arr(char *d, size_t cap, char **a, size_t n) {");
             self.emit("  size_t dn = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
@@ -6890,7 +6899,10 @@ impl Render {
         let id = self.c_ident(var);
         let t = self.str_temp(65536);
         if self.assoc_arrays.contains(var) {
-            self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}_v, {id}_n);"));
+            // assoc array VALUES: join with NEWLINES so downstream sort
+            // pipelines can sort individual values (space-joined text
+            // is one line and passes through sort unchanged)
+            self.emit(&format!("_sh_join_arr_nl({t}, sizeof {t}, {id}_v, {id}_n);"));
         } else {
             self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}, {id}_len);"));
         }
