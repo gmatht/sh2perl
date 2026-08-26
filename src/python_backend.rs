@@ -4115,6 +4115,26 @@ fn py_brace_words(args: &[IrExpr]) -> Option<String> {
                             let (Ok(a), Ok(b)) =
                                 (start.parse::<i64>(), end.parse::<i64>())
                             else {
+                                // CHAR RANGE {a..z} / {A..E}: single-letter
+                                // alpha endpoints expand as characters
+                                if start.len() == 1
+                                    && end.len() == 1
+                                    && start.chars().all(|c| c.is_ascii_alphabetic())
+                                    && end.chars().all(|c| c.is_ascii_alphabetic())
+                                {
+                                    let s0 = start.chars().next().unwrap() as u8;
+                                    let e0 = end.chars().next().unwrap() as u8;
+                                    if s0 <= e0 {
+                                        for c in s0..=e0 {
+                                            one.push((c as char).to_string());
+                                        }
+                                    } else {
+                                        for c in (e0..=s0).rev() {
+                                            one.push((c as char).to_string());
+                                        }
+                                    }
+                                    continue;
+                                }
                                 return None;
                             };
                             let pad = if start.len() > 1 && start.starts_with('0') {
@@ -4160,6 +4180,18 @@ fn py_brace_words(args: &[IrExpr]) -> Option<String> {
     };
     let suf = match args.get(3)? {
         IrExpr::Str(s, _) => s.clone(),
+        // suffix as a Json array of literal parts (the frontend's encoding
+        // of an empty/expanded suffix list)
+        IrExpr::Json(serde_json::Value::Array(items)) => {
+            let mut t = String::new();
+            for e in items.iter() {
+                match e.as_str() {
+                    Some(s) => t.push_str(s),
+                    None => return None,
+                }
+            }
+            t
+        }
         _ => return None,
     };
     // cartesian product of the groups; prefix + concat + suffix per combo
