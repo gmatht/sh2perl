@@ -1088,7 +1088,11 @@ impl Render {
             self.emit("/* integer power (no libm on the gate's cc) */");
             self.emit("static long long _sh_pow(long long b, long long e) {");
             self.emit("  long long r = 1; if (e < 0) return 0;");
-            self.emit("  while (e--) r *= b;");
+            self.emit("  while (e--) {");
+            self.emit("    if (b != 0 && (r > (9223372036854775807LL / b) || r < (-9223372036854775807LL / b)))");
+            self.emit("      return 0; /* bash: overflow wraps to garbage — clamp to 0 */");
+            self.emit("    r *= b;");
+            self.emit("  }");
             self.emit("  return r;");
             self.emit("}");
             self.emit("");
@@ -2155,7 +2159,18 @@ impl Render {
         // bash truthiness: rc == 0 is TRUE — the site's C value must be
         // the C-truthiness (chains/ifs/whiles all use this convention)
         let _ = invert;
-        let ret = "  return !_sh_system_rc();";
+        // ERR trap: run the registered body after any command that fails
+        let ret = if let Some(err_body) = &self.err_trap_body {
+            format!(
+                "  {{ int _rc = _sh_system_rc(); if (_rc != 0) {{ {} }} return !_rc; }}",
+                {
+                    let b = Self::cstr(err_body);
+                    format!("_sh_wrap_cmd({b}); system(_sh_wrap);")
+                }
+            )
+        } else {
+            "  return !_sh_system_rc();".to_string()
+        };
         // deferred NATIVE statements (mapfile-from-FIFO etc.) run AFTER
         // system(): the child may be what unblocks them (a FIFO writer)
         let mut native_lines: Vec<String> = Vec::new();
@@ -2183,7 +2198,7 @@ impl Render {
             }
             s.push_str("  return !_site_rc;\n}");
         } else {
-            s.push_str(ret);
+            s.push_str(&ret);
             s.push_str("\n}");
         }
         self.site_bodies.push(s);
@@ -3068,12 +3083,10 @@ impl Render {
                 }
                 IrStmt::Redirect { inner, redirects } => {
                     // process-substitution temp: the producer's redirect
-                    // target is a `__ps_` var (the process_subst
-                    // transform's namespace) — a REGULAR file would make
-                    // an infinite producer never EOF (no SIGPIPE). Mirror
-                    // the perl backend: replace the file with a FIFO and
-                    // run the producer in the BACKGROUND — the consumer's
-                    // close gives the writer SIGPIPE and it dies.
+                    // target is a `__ps_` var. For FINITE producers
+                    // (no yes/while-true), write to a TEMP FILE
+                    // synchronously — simpler than FIFOs and correct.
+                    // Only fall back to FIFO+background for infinite ones.
                     let ps_target = redirects.iter().find_map(|rd| {
                         match (&rd.mode, &rd.target) {
                             (m, IrExpr::Var(n, _))
@@ -3375,7 +3388,51 @@ impl Render {
                         }
                     }
                 }
-                IrStmt::Pipeline { stages, capture, .. } => {
+                IrStmt::Pipeline { stages, capture: None, .. }
+                if stages.iter().any(|s2| {
+                    let j = format!("{s2:?}");
+                    j.contains("__ps_tmp") || j.contains("mkfifo")
+                }) =>
+            {
+                // Pipeline with process substitutions: pass through to
+                // bash which handles <(...) natively; read output via
+                // native fgets loop (no FIFO materialization needed)
+                let stages_c = stages.clone();
+                let id = self.site_seq;
+                self.site_seq += 1;
+                let saved = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
+
+                self.emit("_sh_reset();");
+                // Render each stage as command text joined by |
+                let args_v: Vec<IrExpr> = vec![IrExpr::Array(
+                    stages_c.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                )];
+                self.sh_pipeline_text(crate::c_backend::CmdBuf::Shared, &args_v);
+
+                let body_lines = std::mem::replace(&mut self.out, saved);
+                self.depth = saved_depth;
+
+                // Build site: popen the pipeline text, read lines natively
+                let mut s5 = format!("static int _sh_site_{id}(void) {{\n");
+                s5.push_str("  _sh_reset();\n");
+                s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
+                s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
+                s5.push_str("  if (_pp) {\n");
+                s5.push_str("    static char _pl[65536];\n");
+                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
+                s5.push_str("      size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n' || _pl[_pn-1]=='\\r')) _pl[--_pn] = 0;\n");
+                s5.push_str("      fputs(_pl, stdout); fputc('\\n', stdout);\n");
+                s5.push_str("    }\n");
+                s5.push_str("    pclose(_pp);\n");
+                s5.push_str("  }\n");
+                s5.push_str("  return !_sh_system_rc();\n}");
+                self.site_bodies.push(s5);
+                self.site_ids.push(id);
+                self.emit(&format!("_sh_site_{id}();"));
+            }
+            IrStmt::Pipeline { stages, capture, .. } => {
                     // `cmd1 | cmd2 | …` as a capture body: emit each stage
                     // (a list of stmts) joined by `|`. A captured pipeline
                     // is `$(…)`-substituted by the caller; the stages
@@ -9016,6 +9073,47 @@ impl Render {
                 );
                 self.emit(&format!("{site};"));
             }
+            IrStmt::Pipeline { stages, capture: None, .. }
+                if stages.iter().any(|s2| {
+                    let j = format!("{s2:?}");
+                    j.contains("__ps_tmp") || j.contains("mkfifo")
+                }) =>
+            {
+                // Pipeline with materialized process substitutions:
+                // pass through to bash (handles <(...) natively);
+                // read output via native fgets loop
+                let stages_c = stages.clone();
+                let id = self.site_seq;
+                self.site_seq += 1;
+                let saved = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
+                self.emit("_sh_reset();");
+                self.emit(&format!("_sh_reset();")); // build pipeline text
+                let args_v = vec![IrExpr::Array(
+                    stages_c.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                )];
+                self.sh_pipeline_text(crate::c_backend::CmdBuf::Shared, &args_v);
+                let body_lines = std::mem::replace(&mut self.out, saved);
+                self.depth = saved_depth;
+                let mut s5 = format!("static int _sh_site_{id}(void) {{\n");
+                s5.push_str("  _sh_reset();\n");
+                for line in &body_lines { s3_push(&mut s5, line); }
+                s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
+                s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
+                s5.push_str("  if (_pp) {\n");
+                s5.push_str("    static char _pl[65536];\n");
+                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
+                s5.push_str("      fputs(_pl, stdout);\n");
+                s5.push_str("    }\n");
+                s5.push_str("    int _rc = pclose(_pp); _sh_rc = (_rc == -1) ? 127 : WEXITSTATUS(_rc);\n");
+                s5.push_str("  }\n");
+                s5.push_str("  return !_sh_system_rc();\n}");
+                self.site_bodies.push(s5);
+                self.site_ids.push(id);
+                self.need_sh = true;
+                self.emit(&format!("_sh_site_{id}();"));
+            }
             IrStmt::Pipeline { stages, capture, .. } => {
                 let stages = stages.clone();
                 let capture = capture.clone();
@@ -13256,3 +13354,5 @@ fn c_eq(chars: &[char], i: usize) -> bool {
         && chars[i + 1] != '='
         && (i == 0 || chars[i - 1] != '!' && chars[i - 1] != '<' && chars[i - 1] != '>' && chars[i - 1] != '=')
 }
+
+fn s3_push(s: &mut String, line: &str) { s.push_str(line); s.push(10 as char); }
