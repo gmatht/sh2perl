@@ -223,6 +223,16 @@ fn census_expr(
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
                     reads.insert(n.clone());
+                    // An ELEMENT read (`arr[1]` — the index baked into
+                    // the name) also reads the array NAME (`arr`): the
+                    // `arr=(...)` setArray/DeclareArray write is live
+                    // (array-subscript.sh).
+                    if let Some(base) = n.split('[').next() {
+                        reads.insert(base.to_string());
+                        if escaping {
+                            escapes.insert(base.to_string());
+                        }
+                    }
                 }
             }
             for a in args {
