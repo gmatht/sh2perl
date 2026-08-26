@@ -9,3 +9,4 @@
 node ReadLine
 tag "ReadLine"
 kind expr
+# storage_class str_bounded

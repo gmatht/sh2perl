@@ -8,5 +8,6 @@
 node PathName
 tag "PathName"
 kind expr
+# storage_class str_bounded
 field text: expr
 field which: string

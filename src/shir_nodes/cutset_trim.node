@@ -15,6 +15,7 @@
 node CutsetTrim
 tag "CutsetTrim"
 kind expr
+# storage_class str_bounded
 field text: expr
 field cutset: expr
 field side: optional_string

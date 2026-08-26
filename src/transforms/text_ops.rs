@@ -2264,48 +2264,67 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
     // remaining parts concatenate into the value (captures included).
     if cmd == "local" {
         let mut stmts: Vec<IrStmt> = Vec::new();
-        for w in cmd_args {
-            let (name, value): (String, Option<IrExpr>) = match w {
-                IrExpr::Str(s, _) => match s.split_once('=') {
-                    Some((n, v)) => (
-                        n.to_string(),
-                        Some(IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)),
-                    ),
-                    None => (s.clone(), None),
-                },
+        let mut failed_words: Vec<IrExpr> = Vec::new();
+        let mut wi = 0usize;
+        while wi < cmd_args.len() {
+            let mut skip_next = false;
+            let (name, value): (String, Option<IrExpr>) = match &cmd_args[wi] {
+                // positional form: [Str("v="), <value expr>]
+                IrExpr::Str(s, _) if s.ends_with('=') && wi + 1 < cmd_args.len() => {
+                    let n = s[..s.len() - 1].to_string();
+                    if n.is_empty()
+                        || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return None;
+                    }
+                    skip_next = true;
+                    (n, Some(cmd_args[wi + 1].clone()))
+                }
+                IrExpr::Str(s, _) => {
+                    skip_next = false;
+                    match s.split_once('=') {
+                        Some((n, v)) => (
+                            n.to_string(),
+                            Some(IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)),
+                        ),
+                        None => (s.clone(), None),
+                    }
+                }
                 IrExpr::Interpolate(parts) => {
-                    // find '=' inside a Lit part; everything from there on
-                    // is the value
-                    let mut done = false;
+                    // literal prefix names the variable; remaining parts
+                    // concatenate into the value (captures included).
+                    // Dynamic part BEFORE any '=' → ambiguous: per-word fail.
+                    skip_next = false;
                     let mut name: Option<String> = None;
                     let mut rest: Vec<InterpPart> = Vec::new();
-                    for p in parts {
-                        if done {
+                    let mut ambiguous = false;
+                    for p in parts.iter() {
+                        if ambiguous {
+                            break;
+                        }
+                        if name.is_some() {
                             rest.push(p.clone());
                             continue;
                         }
                         if let InterpPart::Lit(s) = p {
-                            if let Some(eq) = s.find('=') {
-                                name = Some(s[..eq].to_string());
-                                if eq + 1 < s.len() {
-                                    rest.push(InterpPart::Lit(s[eq + 1..].to_string()));
+                            match s.find('=') {
+                                Some(eq) => {
+                                    name = Some(s[..eq].to_string());
+                                    if eq + 1 < s.len() {
+                                        rest.push(InterpPart::Lit(s[eq + 1..].to_string()));
+                                    }
                                 }
-                                done = true;
-                                continue;
-                            }
-                        }
-                        if name.is_some() {
-                            rest.push(p.clone());
-                        } else if let InterpPart::Lit(pre) = p {
-                            // literal text BEFORE any '=' joins the name search:
-                            // multi-lit names are not a thing — bail
-                            if !pre.is_empty() && pre.chars().all(|c| c != '=') {
-                                name = Some(String::new());
-                                break;
+                                None => { ambiguous = true; }
                             }
                         } else {
-                            return None; // dynamic part before the '=' — ambiguous
+                            ambiguous = true;
                         }
+                    }
+                    if ambiguous {
+                        // keep this word for the residual runtime call
+                        failed_words.push(cmd_args[wi].clone());
+                        wi += 1;
+                        continue;
                     }
                     match name {
                         Some(n) if !n.is_empty()
@@ -2320,15 +2339,50 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
                                     )),
                                     InterpPart::Expr(x) => Some(x.as_ref().clone()),
                                 },
-                                _ => Some(IrExpr::Interpolate(rest)),
+                                _ => {
+                                    let mut it = rest.into_iter();
+                                    let first = it.next().unwrap();
+                                    let mut acc = match first {
+                                        InterpPart::Lit(s) => IrExpr::Str(
+                                            s,
+                                            StrStyle::DoubleQuoted,
+                                        ),
+                                        InterpPart::Expr(x) => x.as_ref().clone(),
+                                    };
+                                    for part in it {
+                                        let piece = match part {
+                                            InterpPart::Lit(s) => IrExpr::Str(
+                                                s,
+                                                StrStyle::DoubleQuoted,
+                                            ),
+                                            InterpPart::Expr(x) => x.as_ref().clone(),
+                                        };
+                                        acc = IrExpr::BinOp {
+                                            lhs: Box::new(acc),
+                                            op: crate::ir::BinOpKind::Concat,
+                                            rhs: Box::new(piece),
+                                        };
+                                    }
+                                    Some(acc)
+                                }
                             };
-                            (n, value)
+                            (n, Some(value.unwrap_or_else(|| {
+                                IrExpr::Str(String::new(), StrStyle::DoubleQuoted)
+                            })))
                         }
                         _ => return None,
                     }
                 }
-                _ => return None,
+                // array-valued / other complex words: per-word fallback —
+                // they stay in a residual exec("local") so SIBLING words
+                // still normalise instead of losing the whole statement
+                _ => ("\u{0}FAILED".to_string(), None),
             };
+            if name == "\u{0}FAILED" {
+                failed_words.push(cmd_args[wi].clone());
+                wi += 1;
+                continue;
+            }
             stmts.push(IrStmt::Assign {
                 targets: vec![AssignTarget { var: name, sigil: None, indices: vec![] }],
                 expr: value.unwrap_or_else(|| {
@@ -2336,7 +2390,19 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
                 }),
                 asm: None,
             });
+            if skip_next { wi += 1; }
+            wi += 1;
         }
+        if failed_words.is_empty() {
+            return Some(IrStmt::Block(stmts));
+        }
+        stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("local".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(failed_words),
+            ],
+        }));
         return Some(IrStmt::Block(stmts));
     }
 

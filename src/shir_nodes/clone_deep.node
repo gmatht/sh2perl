@@ -13,4 +13,5 @@
 node CloneDeep
 tag "CloneDeep"
 kind expr
+# storage_class str_bounded
 field value: expr

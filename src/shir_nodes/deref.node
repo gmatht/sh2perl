@@ -13,4 +13,5 @@
 node Deref
 tag "Deref"
 kind expr
+# storage_class str_bounded
 field pointer: expr

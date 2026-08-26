@@ -11,5 +11,6 @@
 node ElementRead
 tag "ElementRead"
 kind expr
+# storage_class str_bounded
 field coll: expr
 field key: expr

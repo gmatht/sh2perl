@@ -513,11 +513,11 @@ Escape analysis must account for frontend-specific lifetime rules:
 |---|---|---|---|
 | bash | mutable (in-place split OK) | scope-bounded | usually yes |
 | C | mutable (by design) | manual | yes if no escape |
-| Go | immutable | GC-tracked | unnecessary |
+| Go | immutable | IR-provable (lifetime known) | usually unnecessary — most vars become InlineBuffer or ManagedString |
 | Rust | depends on type | ownership-checked | unnecessary |
 | Zsh | mutable like bash | scope-bounded | usually yes |
 | Fish | immutable lists | GC | unnecessary |
-| PowerShell | objects, mutable properties | GC | unnecessary |
+| PowerShell | objects, mutable properties | IR-provable for scalars | usually unnecessary |
 
 For backends targeting GC'd languages (JS, Go), arena allocation and
 in-place mutation are unnecessary complexity — the runtime handles it.
@@ -644,3 +644,116 @@ formatting, substring extraction). It does NOT work for command output
 | Per-site static buffer | Pattern-enforced (build→use→discard) | Yes within pattern | Capture results |
 | Shared global buffer | YES — full alias + liveness analysis | No | Avoid until analysis exists |
 | Caller-allocated buffer | Caller controls lifetime | Yes if bounded | Provably-bounded results |
+
+## Trust boundary: source language determines optimisation safety
+
+### The core insight
+
+Storage-class selection AND optimisation safety depend on which FRONTEND
+produced the IR — not just on the IR shape itself. The same Ext(Split)
+node has different safety implications depending on whether a bash or C
+frontend emitted it:
+
+| Guarantee | sh/bash/zsh | C/C++ | Rust | Go | Python |
+|---|---|---|---|---|---|
+| Copy-on-assign at SOURCE level | ✅ guaranteed | ❌ pointers alias | per-type | strings immutable | strings immutable |
+| In-place mutation safe at SOURCE level? | if liveness-proven | needs alias analysis | borrow checker | N/A for source strings | N/A |
+| **After shIR analysis: uniqueness provable?** | **YES** | **usually yes** (most vars don't alias) | **YES** | **YES** (IR tracks lifetime) | **YES** (IR tracks lifetime) |
+
+**The compiler advantage**: the SOURCE language needs GC/runtime tracking
+because it cannot analyse the program at parse time. The shIR CAN — it
+sees every assignment, every read, and every scope boundary. A variable
+that a Python runtime must GC-track because its type is unknown at
+parse time has a KNOWN type in our IR (from usage patterns). The GC
+was compensating for missing compile-time information that we now have.
+
+For sh/bash frontends: every assignment does strdup/copy. Two variables
+NEVER share the same buffer. So in-place mutation of one variable cannot
+affect another — the only precondition is liveness (the var is dead after).
+
+For C/C++ frontends: `char *a = b` creates an ALIAS, not a copy.
+Mutating through `a` changes what `b` sees. In-place mutation requires
+proving that NO other pointer aliases the buffer — which requires
+interprocedural alias analysis that we don't have.
+
+### Implementation: frontend trust level
+
+Each frontend should declare a trust level that the storage selector
+consults:
+
+```rust
+pub enum FrontendTrust {
+    /// Source language guarantees copy-on-assign (bash family).
+    /// In-place mutation safe when liveness-proven.
+    CopyOnAssign,
+    /// Source language allows pointer aliasing (C family).
+    /// In-place mutation requires explicit non-alias proof.
+    PointerAliasing,
+    /// Source language has GC / immutable strings (Go, JS, Python).
+    /// No in-place mutation needed; GC handles lifetime.
+    Managed,
+    /// Source language tracks ownership (Rust).
+    /// Borrow checker verdicts are authoritative.
+    OwnershipTracked,
+}
+```
+
+Stored as a field on IrProgram:
+
+```rust
+pub frontend_trust: FrontendTrust,
+```
+
+Populated by each frontend when it emits A1 JSON:
+
+```json
+{"type":"Program", "frontend_trust": "CopyOnAssign", ...}
+```
+
+### Effect on optimisation passes
+
+| Pass | CopyOnAssign | PointerAliasing | Managed |
+|---|---|---|---|
+| split-inplace | fire when liveness-proven | NEVER (aliasing risk) | skip (no mutable bufs) |
+| const-lift exclusion for split targets | needed | not needed (already conservative) | not needed |
+| arena allocation | safe if all non-escaping | needs full graph analysis | unnecessary (GC) |
+| managed string (sh2_str) | for unbounded locals | for unbounded locals | unnecessary |
+
+### What this means for the current implementation
+
+The split-inplace pass and managed-string wiring are currently SAFE
+because only the bash frontend produces these IR shapes. When the C
+and C++ frontends mature, they must either:
+1. Declare `PointerAliasing` trust → the pass skips their statements
+2. Or provide their own non-alias proofs per-variable
+
+Without this trust boundary, enabling the transform globally would be
+UNSOUND for C-frontend scripts that use pointer aliasing.
+
+### The compiler advantage: eliminating runtime machinery through analysis
+
+The source language needs GC/runtime tracking because the RUNTIME cannot
+analyse the program — it discovers types and lifetimes during execution.
+Our shIR pipeline sees the ENTIRE program at translation time:
+
+| Runtime mechanism in source lang | Why the source needs it | Why our IR doesn't |
+|---|---|---|
+| Python `gc.collect()` | Types unknown at parse time | `var_types` + usage patterns determine type per var |
+| Go `runtime.GC()` | Escape analysis too expensive at compile time | `var_lifetimes.escapes` proves scope-boundedness per var |
+| JS garbage collector | Closures create unbounded lifetimes | `escape_classes` classifies each capture as Local/Store |
+| Perl SV refcounting | Dynamic sigils defeat static typing | Each var has ONE sigil, known from declaration |
+
+**The translator's advantage**: we see the whole program. The source
+runtime only sees one variable at a time. Every "the compiler can't
+know this" in the source language becomes "we computed this" in the IR.
+
+This means: for MOST variables from ANY frontend, the storage-class
+selector should find InlineBuffer or ManagedString — NOT "needs GC."
+The GC was compensating for missing compile-time information that our
+IR now provides. Only genuinely dynamic constructs (eval, indirect
+access through data-driven names) require runtime-managed storage.
+
+**Practical implication**: the default storage class should be
+InlineBuffer or ManagedString for ALL frontends, not just bash.
+The "unnecessary (GC)" classification was premature — it gave up on
+analysis that our IR actually supports.

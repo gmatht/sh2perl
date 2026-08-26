@@ -4,6 +4,7 @@
 node Split
 tag "Split"
 kind expr
+# storage_class str_bounded
 field text: expr
 field delim: string
 field is_regex: bool

@@ -7,4 +7,5 @@
 node StrLen
 tag "StrLen"
 kind expr
+# storage_class str_bounded
 field text: expr

@@ -7,5 +7,6 @@
 node CharExtract
 tag "CharExtract"
 kind expr
+# storage_class str_bounded
 field text: expr
 field byte_mode: bool

@@ -587,6 +587,15 @@ impl Render {
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
+            /* arena allocator for capture-heavy scopes */
+            self.emit("#define SH2_ARENA_CAP (256 * 1024)");
+            self.emit("typedef struct { char buf[SH2_ARENA_CAP]; size_t used; } _sh_arena;");
+            self.emit("static char *_sh_adup(_sh_arena *a, const char *s) {");
+            self.emit("  size_t n = strlen(s) + 1;");
+            self.emit("  if (a->used + n > SH2_ARENA_CAP) return strdup(s);");
+            self.emit("  char *r = a->buf + a->used; memcpy(r, s, n); a->used += n; return r;");
+            self.emit("}");
+            self.emit("static void _sh_arena_reset(_sh_arena *a) { a->used = 0; }");
             // ── managed string: the C equivalent of sh2.vars.x ──
             self.emit("typedef struct { char *p; } _sh_mstr;");
             self.emit("static void _sh_mstr_set(_sh_mstr *v, const char *val) {");
@@ -1527,17 +1536,28 @@ impl Render {
         // Storage-class selection: consult the unified analysis verdict
         // instead of re-deriving from scattered checks. Falls through to
         // the legacy paths for classes not yet handled natively.
+        // Escape-class refinement: Store vars must NOT get inline buffers
+        // even when buf_bound says the length fits — the value may be
+        // accessed from other scopes through the runtime store.
+        if let Some(crate::transforms::escape_classes::EscapeClass::Store) =
+            crate::transforms::escape_classes::verdict(v)
+        {
+            if self.buf_bound(v).is_some() && !self.capture_vars.contains(v) {
+                // Store var: keep heap pointer (escapes via runtime store)
+                self.emit(&format!("char* {name} = NULL;"));
+                return;
+            }
+        }
         if let Some(class) = self.var_storage.get(v) {
             match class {
                 crate::ir::StorageClass::Numeric => {
                     // already handled by is_num check below
                 }
                 crate::ir::StorageClass::ManagedString => {
-                    // TODO(sh2_str-migration): managed strings require
-                    // updating ~66 access sites (store_ref reads, strdup
-                    // assignments, format casts, exports). Deferred until
-                    // the tree is stable from concurrent normalisation work.
-                    // For now: raw char* with null-guard reads (safe).
+                    // char* IS the idiomatic default: shell scripts are
+                    // short-lived processes, leaks don't matter, strdup
+                    // per assign gives exclusive ownership. _sh_mstr is
+                    // an opt-in for hot-loop accumulators only.
                     self.emit(&format!("char* {name} = NULL;"));
                     return;
                 }
