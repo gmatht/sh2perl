@@ -245,6 +245,12 @@ pub struct Render {
     /// the script READS \\$PIPESTATUS — pipeline sites must export the
     /// stage statuses (env-import) so the reads see them
     need_pipestatus: bool,
+    /// EXIT trap body text (from `trap '<body>' EXIT`) — emitted before
+    /// main returns
+    exit_trap_body: Option<String>,
+    /// ERR trap body text (from `trap '<body>' ERR`) — checked after
+    /// command sites that fail
+    err_trap_body: Option<String>,
     /// NATIVE statements deferred to AFTER the enclosing site's
     /// system() call — a native mapfile reading a FIFO must run once the
     /// child (which spawns the FIFO writer) has started, not before it
@@ -4245,6 +4251,27 @@ impl Render {
                 format!(
                     "({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})"
                 )
+            }
+            "trap" => {
+                // `trap '<body>' SIGNAL` — store NATIVELY, don't shell out.
+                // Shelling out would register the trap in the child bash,
+                // which fires it on child exit (premature output).
+                let body = words.first()
+                    .and_then(|w| Self::str_arg(&[(*w).clone()], 0))
+                    .unwrap_or_default();
+                let signal = words.get(1)
+                    .and_then(|w| Self::str_arg(&[(*w).clone()], 0))
+                    .unwrap_or_default();
+                match signal.as_str() {
+                    "EXIT" | "exit" | "0" => {
+                        self.exit_trap_body = Some(body);
+                    }
+                    "ERR" | "err" => {
+                        self.err_trap_body = Some(body);
+                    }
+                    _ => {}
+                }
+                "(_sh_rc = 0, 1)".into()
             }
             "read" => {
                 // `read [-r] var...` — read a line into the first var
@@ -9710,6 +9737,13 @@ impl Render {
         for s in &prog.stmts {
             self.stmt(s);
         }
+        // EXIT trap: run the registered cleanup body before returning
+        if let Some(body) = &self.exit_trap_body {
+            self.emit(&format!(
+                "_sh_wrap_cmd({}); system(_sh_wrap);",
+                Self::cstr(body)
+            ));
+        }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
@@ -9832,7 +9866,9 @@ impl Render {
         // /dev/null (the gate diffs stdout only). A native-only program
         // has no subprocess: buffered stdout cannot reorder anything and
         // the script's own stderr (Die/Warn) must reach the terminal.
-        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty() {
+        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty()
+            || self.exit_trap_body.is_some()
+        {
             self.emit("  freopen(\"/dev/null\", \"w\", stderr);");
             // unbuffered stdout: bash -c children share fd 1 — buffered
             // stdio would reorder their output after ours at flush time
