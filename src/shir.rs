@@ -13134,6 +13134,26 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // stay store-bound — a native binding would never see the
                 // write (and the native binding's value would be stale for
                 // every later read). Mirror of the string-lift walker.
+                // The go-sh self-hosting helpers (byteAt / jsonGet /
+                // jsonSet / jsonArrGet / jsonArrSet / jsonArrAppend) read
+                // their name arg from the STORE (byteAt("src", "i") — the
+                // runtime resolves "src" via getVar) — a lifted binding
+                // would desync, so mark the name arg (and byteAt's index
+                // identifiers) as store-read.
+                if matches!(
+                    func.as_str(),
+                    "byteAt" | "jsonGet" | "jsonSet" | "jsonArrGet" | "jsonArrSet"
+                        | "jsonArrAppend"
+                ) {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        string_ctx.insert(n.clone());
+                    }
+                    if func == "byteAt" {
+                        if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                            mark_all_idents(t, string_ctx);
+                        }
+                    }
+                }
                 if func == "exec" || func == "builtin" {
                     // `builtin` is the sync-builtin-dispatch callee (M8) —
                     // same write-builtin semantics as exec-lowered builtins
@@ -28751,6 +28771,24 @@ fn lift_walk_expr(
                         if store_default || in_copy {
                             string_ctx.insert(name.clone());
                         }
+                    }
+                }
+            }
+            // the go-sh self-hosting helpers read their name arg from the
+            // STORE (byteAt("src", "i") — the runtime resolves "src" via
+            // getVar) — a lifted binding would desync, so mark the name
+            // arg (and byteAt's index identifiers) as store-read.
+            if matches!(
+                func.as_str(),
+                "byteAt" | "jsonGet" | "jsonSet" | "jsonArrGet" | "jsonArrSet"
+                    | "jsonArrAppend"
+            ) {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    string_ctx.insert(n.clone());
+                }
+                if func == "byteAt" {
+                    if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                        lift_mark_all_idents(t, string_ctx);
                     }
                 }
             }

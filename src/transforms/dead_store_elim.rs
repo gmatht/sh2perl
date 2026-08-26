@@ -218,8 +218,16 @@ fn census_expr(
         IrExpr::Call { func, args } => {
             // getVar / arrayIndex / param read their name args;
             // setVar / setArray / SetChildError-style writes are
-            // recorded by their targets
-            if matches!(func.as_str(), "getVar" | "arrayIndex" | "param") {
+            // recorded by their targets. The go-sh self-hosting helpers
+            // (byteAt / jsonGet / jsonSet / jsonArrGet / jsonArrSet /
+            // jsonArrAppend) read their name arg (args[0]) — byteAt also
+            // reads the index vars in args[1] — and the json* writers
+            // WRITE the resolved var, so their stores stay live.
+            if matches!(
+                func.as_str(),
+                "getVar" | "arrayIndex" | "param" | "byteAt" | "jsonGet" | "jsonSet"
+                    | "jsonArrGet" | "jsonArrSet" | "jsonArrAppend"
+            ) {
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
                     reads.insert(n.clone());
@@ -233,6 +241,24 @@ fn census_expr(
                             escapes.insert(base.to_string());
                         }
                     }
+                }
+                // byteAt's index arg is arithmetic text naming vars
+                // (`byteAt("src", "i+1")`) — read those too.
+                if func == "byteAt" {
+                    if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                        for w in t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                            if !w.is_empty() && w.chars().next().unwrap().is_ascii_alphabetic() {
+                                reads.insert(w.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // the json* writers write the resolved var (the receiver
+            // name arg) — the store must stay live.
+            if matches!(func.as_str(), "jsonSet" | "jsonArrSet" | "jsonArrAppend") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    writes.insert(n.clone());
                 }
             }
             for a in args {
