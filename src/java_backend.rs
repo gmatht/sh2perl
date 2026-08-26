@@ -776,14 +776,12 @@ impl JavaRender {
                 // assign("name", value) runtime form
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
                 let v = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
-                self.ensure_field(name);
                 self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
                 Ok(())
             }
             IrExpr::Call { func, args, .. } if func == "setVar" => {
                 let name = str_arg(args, 0).ok_or("setVar: no name")?;
                 let v = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
-                self.ensure_field(name);
                 self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
                 Ok(())
             }
@@ -1252,7 +1250,7 @@ impl JavaRender {
             IrExpr::Range { start, end } => {
                 let mut parts = Vec::new();
                 let mut i = *start;
-                while i <= *end { parts.push(jstr(&i.to_string())); i += 1; }
+                while i <= *end { parts.push(i.to_string()); i += 1; }
                 Ok(parts.join(", "))
             }
             IrExpr::Call { func, args, .. } if func == "listVar" => {
@@ -2101,19 +2099,6 @@ impl JavaRender {
                 Ok(format!("({base}.isEmpty() ? \"\" : {a})"))
             }
             "slice" => {
-   // ${#arr} / ${#arr[@]} arrive as slice-with-empty offsets:
-                // length semantics
-                let off_s0 = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
-                let len_s0 = args.get(3).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
-                if (off_s0 == "@" || off_s0.is_empty()) && len_s0.is_empty() {
-                    // name may carry the '#' length marker (${#arr[@]}):
-                    let bare = name.trim_start_matches('#').trim_end_matches("[@]").to_string();
-                    if self.arrays.contains(&sanitize(&bare)) {
-                        return Ok(format!("String.valueOf(__a_{}.size())", sanitize(&bare)));
-                    }
-                    self.helper("len");
-                    return Ok(format!("String.valueOf(shLen({}))", self.getvar_str(if name.starts_with('#') { &name[1..] } else { name })?));
-                }
                 // ARRAY slice: ${arr[@]:off:len} — element join, not string.
                 // The core drops the @ marker when the var is a known array,
                 // so array-ness alone selects this path.
@@ -2752,11 +2737,6 @@ fn stmt_children(st: IrStmt) -> Vec<IrStmt> {
         }
         IrStmt::While { body, .. } | IrStmt::Block(body) | IrStmt::Subshell(body)
         | IrStmt::Background(body) | IrStmt::DoWhile { body, .. } => body,
-        IrStmt::Case { clauses, .. } => {
-            let mut v = Vec::new();
-            for c in clauses { v.extend(c.body.clone()); }
-            v
-        }
         IrStmt::For { body, .. } => body,
         IrStmt::Redirect { inner, .. } => inner,
         IrStmt::Pipeline { stages, .. } => stages.into_iter().flatten().collect(),
