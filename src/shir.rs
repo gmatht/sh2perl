@@ -19595,6 +19595,42 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
                     no_newline = true;
                 }
             }
+            // UNQUOTED $var wrapped by the core parser's field-split
+            // marker: split(getVar(x)) — bash word-splits on IFS and DROPS
+            // empty fields — `echo got $v` with v="" prints "got".
+            IrExpr::Call { func, args } if func == "split" => {
+                if let [inner] = args.as_slice() {
+                    if matches!(inner, IrExpr::Call { func: f, .. } if f == "getVar") {
+                        flat = true;
+                        flag_done = true;
+                        let scalar = echo_arg_scalar(a);
+                        let sep_re = regex_lit_flags("[ \\t\\n]+", "");
+                        let w_id = "w".to_string();
+                        let split_call = crate::estree::method_call(
+                            scalar,
+                            "split",
+                            vec![sep_re],
+                        );
+                        let filtered = crate::estree::method_call(
+                            split_call,
+                            "filter",
+                            vec![Expr::ArrowFunctionExpression {
+                                params: vec![crate::estree::ident(&w_id)],
+                                body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                                    operator: "!==".to_string(),
+                                    left: Box::new(Expr::Identifier { name: w_id }),
+                                    right: Box::new(str_lit("")),
+                                })),
+                                expression: true,
+                                r#async: false,
+                            }],
+                        );
+                        arg_exprs.push(filtered);
+                        continue;
+                    }
+                }
+            }
+
             other => {
                 flag_done = true;
                 if exec_arg_is_array_valued(other) {
@@ -36313,7 +36349,11 @@ mod const_analysis_tests {
 
     fn consts_of(src: &str) -> Vec<(String, crate::ir::VarKind)> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR: these tests pin the ANALYZER's verdict on the source
+        // script — worker-registered transforms (copy-propagation,
+        // dead-store-elim, …) legitimately rewrite shapes first and would
+        // change what the analyzer sees without changing bash behaviour.
+        let prog = ast_to_ir_raw(&cmds);
         analyze_var_const(&prog)
     }
 
@@ -36401,7 +36441,8 @@ mod range_analysis_tests {
 
     fn ranges_of(src: &str) -> HashMap<String, (i128, i128)> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR — see consts_of rationale
+        let prog = ast_to_ir_raw(&cmds);
         analyze_var_ranges(&prog)
     }
 
@@ -36793,7 +36834,10 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(big.contains("y"));
         // a string write mixed in rejects the escalation (the BigInt home
         // must never see a non-integer: BigInt("") throws)
-        let prog3 = ast_to_ir(
+        // RAW IR: dead-store-elim legitimately removes the overwritten
+        // `x=abc`, after which the escalation is correct — the rejection
+        // premise only exists on the UNTRANSFORMED program.
+        let prog3 = ast_to_ir_raw(
             &crate::Parser::new("x=abc\nx=9007199254740993\necho $((x+1))")
                 .parse()
                 .expect("parse"),
@@ -36902,7 +36946,8 @@ mod length_analysis_tests {
 
     fn lens_of(src: &str) -> std::collections::HashMap<String, Option<u64>> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR — see consts_of rationale (analyzer pins source shapes)
+        let prog = ast_to_ir_raw(&cmds);
         analyze_string_lengths(&prog).into_iter().collect()
     }
 

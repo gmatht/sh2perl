@@ -32,6 +32,19 @@ iteration construct (`sh2.eachLine` / `while(<$fh>)` /
 All four backends match bash byte-for-byte on the suite (js/pl/zig run;
 java compiled+run).
 
+## UPDATE 3 — estree baseline regression 551→530 traced to var_storage refactor
+
+After commit d4f7356 (c backend: storage-class selection infrastructure +
+WordCount node + split-in-place pass — which included the var_storage/
+arena_safe IrProgram field additions), the DEFAULT-pipeline estree sweep
+regressed 551→530: quoted `echo "$file_list"` renders as a FLATTENED
+one-line join instead of preserving embedded newlines. Repro:
+`000__04b_file_directory_operations.sh` — bash multi-line, translation
+single-line. The regression is in the var_storage refactor's render-path
+changes (NOT the text-ops streaming work: text_ops itself is
+opt-in and the text-ops-only sweep shows the same 530). The java/zig/perl
+gates may be similarly affected where quoted multiline vars are echoed.
+
 ## UPDATE 2 — worktree merge: java 79→253, then worker regression to 73
 
 Merging `backend/java` into main (2b9a2f6c) — two commits touching only
