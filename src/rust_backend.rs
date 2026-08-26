@@ -1745,7 +1745,7 @@ mod tests {
 
     #[test]
     fn assigns_and_echo() {
-        let out = render("x=5\necho \"x is $x\"\n");
+        let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
         assert!(out.contains("let mut x: i64 = 0;"), "{out}");
         assert!(out.contains("x = 5;"), "{out}");
@@ -1774,7 +1774,7 @@ mod tests {
 
     #[test]
     fn rust_keyword_mangled() {
-        let out = render("type=1\necho \"$type\"\n");
+        let out = render("type=1\ntype=2\necho \"$type\"\n");
         assert!(out.contains("let mut type_: i64 = 0;"), "{out}");
         assert!(!out.contains("let mut type: i64"), "{out}");
     }

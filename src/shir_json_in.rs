@@ -1654,8 +1654,11 @@ mod tests {
 
     #[test]
     fn var_const_roundtrip() {
+        // LIMIT is read in arithmetic (`$((LIMIT * 2))`) — copy-propagation
+        // cannot fold a Str def into an arith read (only Int literals), so
+        // the single-assignment LIMIT survives as a Const verdict.
         let json =
-            round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $LIMIT $sum");
+            round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $((LIMIT * 2)) $sum");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let vc = v.get("var_const").and_then(|x| x.as_array());
         assert!(

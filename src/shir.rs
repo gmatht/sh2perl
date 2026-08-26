@@ -35616,7 +35616,10 @@ mod const_analysis_tests {
 
     #[test]
     fn single_assignment_is_const() {
-        let v = consts_of("x=5\necho $x");
+        // a capture def survives copy-propagation (not a literal — the
+        // fold refuses), so the single-assignment const verdict is what
+        // the analysis records, not the folded/eliminated store
+        let v = consts_of("x=$(echo 5)\necho $x");
         assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Const));
     }
 

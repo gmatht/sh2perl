@@ -6223,7 +6223,7 @@ mod tests {
 
     #[test]
     fn assigns_and_echo() {
-        let out = render("x=5\necho \"x is $x\"\n");
+        let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("package main"), "{out}");
         assert!(out.contains("var x int64"), "{out}");
         assert!(out.contains("x = 5"), "{out}");
@@ -6252,7 +6252,7 @@ mod tests {
 
     #[test]
     fn go_keyword_mangled() {
-        let out = render("type=1\necho \"$type\"\n");
+        let out = render("type=1\ntype=2\necho \"$type\"\n");
         assert!(out.contains("var type_ int64"), "{out}");
         assert!(!out.contains("var type int64"), "{out}");
     }

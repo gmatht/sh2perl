@@ -6156,7 +6156,9 @@ mod tests {
         // too. An un-scalarizable split (unknown/multi-word value) or an
         // array-valued arg keeps the flat/join path (the shortcut would
         // comma-join a multi-word value).
-        let json = to_json("i=42; echo \"$i\"");
+        // multi-def (i is re-assigned) so copy-propagation keeps the
+        // read — the emitter's single-scalar unwrap is what's exercised
+        let json = to_json("i=42; i=$((i+1)); echo \"$i\"");
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
         assert!(
@@ -6166,14 +6168,14 @@ mod tests {
         assert!(!json.contains("unsupported"));
         // unquoted but numeric: the field-split is a provable no-op (i is
         // a numeric var) — the single scalar arg unwraps, no flat/join
-        let json_unq = to_json("i=42; echo $i");
+        let json_unq = to_json("i=42; i=$((i+1)); echo $i");
         assert!(!json_unq.contains("\"name\":\"join\""), "numeric single arg: no join");
         assert!(
             !json_unq.contains("\"type\":\"ArrayExpression\""),
             "numeric single arg: no array"
         );
         // two args keep the word-join
-        let json2 = to_json("i=42; echo $i $i");
+        let json2 = to_json("i=42; i=$((i+1)); echo $i $i");
         assert!(json2.contains("\"name\":\"join\""));
         assert!(json2.contains("\"type\":\"ArrayExpression\""));
         assert!(!json2.contains("unsupported"));
@@ -8103,7 +8105,8 @@ mod migrated_passes_tests {
     /// arg (${arr[@]}) keeps the flat/join splice.
     #[test]
     fn single_scalar_echo_arg_drops_join_machinery() {
-        let json = to_json("i=5; echo $i");
+        // multi-def (i is re-assigned) so copy-propagation keeps the read
+        let json = to_json("i=5; i=$((i+1)); echo $i");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let s = serde_json::to_string(&v).unwrap();
         assert!(!s.contains("\"name\":\"flat\""), "no flat: {json}");
