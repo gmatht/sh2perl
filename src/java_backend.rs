@@ -284,6 +284,9 @@ impl JavaRender {
             IrStmt::Expr(e) => self.expr_stmt(e),
             IrStmt::Assign { targets, expr, .. } => {
                 let t = targets.first().ok_or("assign: no target")?;
+                if t.indices.is_empty() && !t.var.contains('[') {
+                    self.ensure_field(&t.var);
+                }
                 if t.indices.is_empty() && t.var.contains('[') && t.var.ends_with(']') {
                     // arr[N]=value (the parser keeps the subscript in the name)
                     let lb = t.var.find('[').unwrap();
@@ -364,8 +367,10 @@ impl JavaRender {
                 self.emit(&format!("long {lb} = __SH_RC;"));
                 self.block_open("while (true) {");
                 let c = self.cond_bool(cond)?;
-                self.emit(&format!("boolean __c = {c};"));
-                self.emit(&format!("if (!__c) {{ __SH_RC = {lb}; break; }}"));
+                self.tmp_seq += 1;
+                let cv = format!("__c{}", self.tmp_seq);
+                self.emit(&format!("boolean {cv} = {c};"));
+                self.emit(&format!("if (!{cv}) {{ __SH_RC = {lb}; break; }}"));
                 for b in body { self.stmt(b)?; }
                 self.emit(&format!("{lb} = __SH_RC;"));
                 self.block_close();
@@ -396,20 +401,22 @@ impl JavaRender {
                    || items.contains("__SH_ARGV");
                 if runtime_list {
                     // mixed literal + runtime-list iterable
-                    self.emit("List<String> __items = new ArrayList<>();");
+                    self.tmp_seq += 1;
+                    let iv = format!("__items{}", self.tmp_seq);
+                    self.emit(&format!("List<String> {iv} = new ArrayList<>();"));
                     for piece in items.split('\u{1}') {
                         if piece.is_empty() { continue; }
                         if let Some(r) = piece.strip_prefix("String.join(\" \", shSplit(") {
                             // join-wrapped split → the bare runtime list
                             let inner = r.strip_suffix("))").unwrap_or(r);
-                            self.emit(&format!("__items.addAll(shSplit({inner}));"));
+                            self.emit(&format!("{iv}.addAll(shSplit({inner}));"));
                         } else if piece.starts_with('"') || piece.starts_with('(') {
-                            self.emit(&format!("__items.add({piece});"));
+                            self.emit(&format!("{iv}.add({piece});"));
                         } else {
-                            self.emit(&format!("__items.addAll({piece});"));
+                            self.emit(&format!("{iv}.addAll({piece});"));
                         }
                     }
-                    self.block_open(&format!("for (String {itv} : __items) {{"));
+                    self.block_open(&format!("for (String {itv} : {iv}) {{"));
                 } else {
                     self.block_open(&format!("for (String {itv} : new String[] {{{items}}}) {{"));
                 }
@@ -2101,6 +2108,19 @@ impl JavaRender {
                 Ok(format!("({base}.isEmpty() ? \"\" : {a})"))
             }
             "slice" => {
+                // ${#arr} / ${#arr[@]} arrive as slice-with-empty offset or
+                // "@"-offset + empty len: length semantics
+                let off_s = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
+                let len_s = args.get(3).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
+                if (off_s == "@" || off_s.is_empty()) && len_s.is_empty() {
+                    let bare = name.trim_start_matches('#').to_string();
+                    if self.arrays.contains(&sanitize(&bare)) {
+                        return Ok(format!("String.valueOf(__a_{}.size())", sanitize(&bare)));
+                    }
+                    self.helper("len");
+                    let bare2 = name.trim_start_matches('#').to_string();
+                    return Ok(format!("String.valueOf(shLen({}))", self.getvar_str(&bare2)?));
+                }
                 // ARRAY slice: ${arr[@]:off:len} — element join, not string.
                 // The core drops the @ marker when the var is a known array,
                 // so array-ness alone selects this path.
