@@ -68,6 +68,7 @@ pub struct Render {
     /// inside a hoisted user-function body: Return writes __SH_RET
     in_function: bool,
     /// var name -> type verdict (A2); missing = Any (runtime store)
+    var_storage: std::collections::HashMap<String, crate::ir::StorageClass>,
     var_types: HashMap<String, IrType>,
     /// vars written anywhere (declared at the top of main)
     written: BTreeSet<String>,
