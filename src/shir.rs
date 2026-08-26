@@ -455,7 +455,26 @@ static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 /// status ternary + lastExit writes when a statement's write is dead (keep
 /// the side effect). Unset → conservative.
 static LASTEXIT_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+/// The FUNCTION-BODY deadness during the define-arrow construction: the
+/// function body is CLONED into the arrow (`IrExpr::Arrow(body.clone())`
+/// in the Function arm), so the global map's pointer keys (computed on
+/// the ORIGINAL tree) never match the clone. The Function arm computes
+/// the clone's deadness into this static for the duration of the arrow
+/// construction (the clone's statements are alive then — their pointer
+/// keys cannot collide) and restores the previous value after (no stale
+/// keys for a later allocation's reuse). Only function bodies: loop /
+/// subshell / capture arrows are built from the ORIGINAL body references
+/// (never cloned), so the global map covers them.
+static ARROW_BODY_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
+    // The active function-arrow construction's map wins (its pointers are
+    // the exact statements being emitted); fall back to the global map
+    // (original-tree pointers — loops/subshells/redirects).
+    if let Some(m) = ARROW_BODY_DEAD.lock().unwrap().as_ref() {
+        if let Some(&dead) = m.get(&(stmt as *const IrStmt as usize)) {
+            return dead;
+        }
+    }
     LASTEXIT_DEAD
         .lock()
         .unwrap()
@@ -476,7 +495,17 @@ fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
 /// [`compute_lastexit_deadness`] (which owns the live set). Unset →
 /// conservative (statused).
 static TEST_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+/// The function-arrow twin of [`TEST_COND_DEAD`] (same clone-pointer gap
+/// as [`ARROW_BODY_DEAD`] — the clone's if/while conditions' `_g` status
+/// protocol is dropped only when the clone's own liveness says the write
+/// is unread). Active only during the define-arrow construction.
+static ARROW_BODY_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 fn test_cond_write_is_dead(stmt: &IrStmt) -> bool {
+    if let Some(m) = ARROW_BODY_COND_DEAD.lock().unwrap().as_ref() {
+        if let Some(dead) = m.get(&(stmt as *const IrStmt as usize)) {
+            return *dead;
+        }
+    }
     TEST_COND_DEAD
         .lock()
         .unwrap()
@@ -517,7 +546,7 @@ fn loop_persist_needed(stmt: &IrStmt, var: &str) -> bool {
 /// reached through fnCall dispatch). An over-approximated writer would
 /// shadow a LIVE write and break `$?`, so the set is exactly the runtime
 /// truth.
-fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
+pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::Exec {
             cmd,
@@ -565,7 +594,7 @@ fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
 /// string stays the literal text (the runtime evalArith reads the status).
 /// Over-approximated (single-quoted literal "$?" text included) — a
 /// spurious reader only keeps a write live (safe).
-fn ir_expr_reads_status(e: &IrExpr) -> bool {
+pub(crate) fn ir_expr_reads_status(e: &IrExpr) -> bool {
     match e {
         IrExpr::Var(name, _) => name == "?",
         IrExpr::Str(s, _) => s.contains("$?"),
@@ -604,7 +633,7 @@ fn ir_expr_reads_status(e: &IrExpr) -> bool {
     }
 }
 
-fn ir_stmts_read_status(stmts: &[IrStmt]) -> bool {
+pub(crate) fn ir_stmts_read_status(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(ir_stmt_reads_status)
 }
 
@@ -615,7 +644,7 @@ fn ir_stmts_read_status(stmts: &[IrStmt]) -> bool {
 /// a subshell/function/background body whose first actions may read the
 /// inherited status. Over-approximated: a spurious reader keeps a write
 /// live (safe); a MISSED reader would drop a live write (never).
-fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
+pub(crate) fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::Exec { cmd, args, .. } => {
             if args.iter().any(ir_expr_reads_status) || ir_expr_reads_status(cmd) {
@@ -699,7 +728,7 @@ fn is_native_let_stmt(stmt: &IrStmt) -> bool {
 /// writer. `end_live`: does the BLOCK's consumer read the block's final
 /// status? (loop runtime reads `this.lastExit` after the body; the program
 /// runner's final status; if-arm flows to the if's own liveness...)
-fn scan_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
+pub(crate) fn scan_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
     let mut read_pending = end_live;
     for stmt in stmts.iter().rev() {
         if ir_stmt_writes_lastexit(stmt) {
@@ -716,7 +745,7 @@ fn scan_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<u
     }
 }
 
-fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
+pub(crate) fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
     scan_lastexit_liveness(stmts, end_live, live);
     for stmt in stmts {
         let self_live = live.contains(&(stmt as *const IrStmt as usize));
@@ -811,6 +840,26 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
         if is_native_echo_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
             dead.insert(stmt as *const IrStmt as usize, true);
         }
+        // The native-decl `local`/`declare` path
+        // (`try_native_local_decl_stmt`'s trailing `(sh2.lastExit = 0,
+        // true)`): a statement-position pure-value decl whose names are
+        // all local-lifted. When its status write is unread the trailing
+        // seq is droppable (the polyfill's per-function `local s="$1"`
+        // decls are exactly this shape). Only when the decl's args
+        // actually parse (`declare_sources_dyn` — the dead twin would
+        // refuse otherwise).
+        if let IrStmt::Expr(IrExpr::Call { func, args, .. }) = stmt {
+            if matches!(func.as_str(), "builtin" | "exec")
+                && matches!(args.first(), Some(IrExpr::Str(n, _))
+                    if matches!(n.as_str(), "local" | "declare" | "typeset"))
+            {
+                if !live.contains(&(stmt as *const IrStmt as usize))
+                    && declare_sources_dyn(args).is_some()
+                {
+                    dead.insert(stmt as *const IrStmt as usize, true);
+                }
+            }
+        }
         // A bare `[ ]`-test STATEMENT (`IrStmt::Expr(Call{func:"test"})`
         // — the `[ ]` lowering; the `[[ ]]` tag form carries the extra
         // Str arg) whose status write is unread: the native lowering's
@@ -895,7 +944,7 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
 /// Mirrors `scan_lastexit_liveness`'s read/write evolution exactly (the
 /// same writer/reader predicates — the `live` inserts are irrelevant
 /// here).
-fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
+pub(crate) fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
     let mut read_pending = end_live;
     for stmt in stmts.iter().rev() {
         if ir_stmt_writes_lastexit(stmt) {
@@ -925,7 +974,7 @@ fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
 /// tree whose leaves are all `test` calls (a test's VALUE equals its exit
 /// status, so a native JS `&&`/`||` on the test values matches bash — the
 /// reason the chain's status protocol is droppable when unread).
-fn is_pure_test_chain(e: &IrExpr) -> bool {
+pub(crate) fn is_pure_test_chain(e: &IrExpr) -> bool {
     match e {
         IrExpr::Call { func, .. } => func == "test",
         IrExpr::BinOp { op, lhs, rhs } => {
@@ -12045,6 +12094,16 @@ fn try_native_export(args: &[IrExpr]) -> Option<Expr> {
 /// numbers); all other lifted names hold the STRING (bash's value model
 /// — `local v=01; echo $v` must print "01").
 fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
+    try_native_local_decl_stmt_dead(args, false)
+}
+
+/// Plan 4 dead-write twin of [`try_native_local_decl_stmt`]: the same
+/// native decls WITHOUT the trailing `(sh2.lastExit = 0, true)` status
+/// write — the statement's status is provably unread (a `local x=...`
+/// whose status is never observed; the polyfill's per-function `local
+/// s="$1"` decls are exactly this shape). The decl side effects (the
+/// `let` bindings / store writes) are unchanged.
+fn try_native_local_decl_stmt_dead(args: &[IrExpr], dead: bool) -> Option<Vec<Stmt>> {
     // The DYNAMIC-VALUE widening (declare_sources_dyn): the value shapes
     // the runtime builtin receives pre-evaluated (captures, param ops,
     // arith, dynamic interpolates, `$?`) lift exactly like the pure
@@ -12100,20 +12159,22 @@ fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
         });
     }
     out.extend(assigns);
-    out.push(Stmt::ExpressionStatement {
-        expression: seq(vec![
-            Expr::AssignmentExpression {
-                operator: "=".to_string(),
-                left: Box::new(sh2_member("lastExit")),
-                right: Box::new(Expr::Literal {
-                    value: serde_json::Value::from(0),
-                    raw: None,
-                    regex: None,
-                }),
-            },
-            bool_lit(true),
-        ]),
-    });
+    if !dead {
+        out.push(Stmt::ExpressionStatement {
+            expression: seq(vec![
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                        regex: None,
+                    }),
+                },
+                bool_lit(true),
+            ]),
+        });
+    }
     // The non-lifted names of a mixed decl stay on the runtime local
     // builtin (their store writes are the exact model the runtime
     // provides; the lifted names' native bindings above are untouched).
@@ -16449,6 +16510,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             return Some(Stmt::ExpressionStatement { expression: dead });
                         }
                     }
+                    // Plan 4 dead-write twin for the native-decl `local`/
+                    // `declare` path: the same native `let`/assignments
+                    // WITHOUT the trailing `(sh2.lastExit = 0, true)` (the
+                    // polyfill's per-function `local s="$1"` decls — the
+                    // status write is provably unread there).
+                    if let Some(dead) = try_native_local_decl_stmt_dead(args, true) {
+                        return Some(if dead.len() == 1 {
+                            dead.into_iter().next().unwrap()
+                        } else {
+                            Stmt::BlockStatement { body: dead }
+                        });
+                    }
                     // status_exec marker (shir-native-stmt's
                     // `exec("true"/"false", [])`): a PURE lastExit writer.
                     // When the write is dead (never read) the marker has no
@@ -18022,6 +18095,38 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // run `sh2.callDirect(__fn_f, args)` — no Map lookup, no arg
             // flatten, no positional save/restore (the body is
             // positional-free by construction).
+            // Plan 4 clone-aware deadness: the body is CLONED into the
+            // define arrow below, so the global LASTEXIT_DEAD pointer keys
+            // (computed on the ORIGINAL tree in shir_to_estree) never
+            // match the clone's statements — the dead-write drops (echo/
+            // `(( ))`/bare-test/native-decl `local`) never fired inside
+            // function bodies. The function's final status is ALWAYS
+            // consumed (fnCall), so the clone's liveness is the same walk
+            // as the original's with end_live=true — computed into the
+            // ARROW_BODY_DEAD statics for the duration of the arrow
+            // construction below (the clone's statements are alive then —
+            // the pointer keys cannot collide — and the statics are
+            // save/restored so a nested function's own arrow construction
+            // does not clobber this one). Named-block functions skip (the
+            // block wrapper re-lowers its own bodies); the OPTIMISTIC
+            // body emission (`fn_call_sync_set`) skips too (its clones
+            // are dropped after the scan — no marked pointers may outlive
+            // their objects).
+            let cloned_body = body.clone();
+            let saved_body_dead = ARROW_BODY_DEAD.lock().unwrap().take();
+            let saved_cond_dead = ARROW_BODY_COND_DEAD.lock().unwrap().take();
+            if named_blocks.is_empty()
+                && !MAY_ERREXIT.lock().unwrap().unwrap_or(true)
+                && LASTEXIT_DEAD.lock().unwrap().is_some()
+            {
+                let mut live: HashSet<usize> = HashSet::new();
+                walk_lastexit_liveness(&cloned_body, true, &mut live);
+                let mut dead = HashMap::new();
+                mark_lastexit_dead(&cloned_body, &live, &mut dead);
+                *ARROW_BODY_DEAD.lock().unwrap() = Some(dead);
+                *ARROW_BODY_COND_DEAD.lock().unwrap() =
+                    Some(compute_test_cond_deadness(&cloned_body, &live));
+            }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
                 // powershell-sh-go): the define arrow wraps the blocks in
@@ -18035,15 +18140,20 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
                     // (see [`native_echo_fn_set`])
-                    arrow_native_echo_sync(vec![], IrExpr::Arrow(body.clone()))
+                    arrow_native_echo_sync(vec![], IrExpr::Arrow(cloned_body))
                 } else {
-                    arrow_sink_sync(vec![], IrExpr::Arrow(body.clone()))
+                    arrow_sink_sync(vec![], IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
-                arrow_native_echo(vec![], IrExpr::Arrow(body.clone()))
+                arrow_native_echo(vec![], IrExpr::Arrow(cloned_body))
             } else {
-                arrow_sink(vec![], IrExpr::Arrow(body.clone()))
+                arrow_sink(vec![], IrExpr::Arrow(cloned_body))
             };
+            // The arrow construction is complete — restore the previous
+            // arrow-body deadness (the clone's statements are dropped with
+            // the arrow's IrExpr; their keys must not outlive them).
+            *ARROW_BODY_DEAD.lock().unwrap() = saved_body_dead;
+            *ARROW_BODY_COND_DEAD.lock().unwrap() = saved_cond_dead;
             FUNCTION_STACK.lock().unwrap().pop();
             let binding = fn_call_is_direct(name)
                 .then(|| direct_binding_name(name).expect("direct set is binding-valid"));
@@ -19128,7 +19238,11 @@ fn str_operand(e: &str) -> Option<Expr> {
     let e = e.trim();
     if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
         let bare = inner.strip_prefix('$').unwrap_or(inner);
-        if is_lifted_str(bare) {
+        if is_lifted_str(bare) || is_local_lifted(bare) {
+            // A local-lifted var (the polyfill's `local s="$1"`) is a
+            // native `let` binding in the current function scope — the
+            // same native read as a module-lifted var (the runtime would
+            // read the STORE, which the lifted binding is not in).
             return Some(Expr::Identifier {
                 name: bare.to_string(),
             });
@@ -19152,7 +19266,7 @@ fn str_operand(e: &str) -> Option<Expr> {
         return fold_cmdsub_test_operand(e);
     }
     if let Some(rest) = e.strip_prefix('$') {
-        if is_lifted_str(rest) {
+        if is_lifted_str(rest) || is_local_lifted(rest) {
             return Some(Expr::Identifier {
                 name: rest.to_string(),
             });
@@ -32934,9 +33048,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
             }
             // `echo X | grep PAT` lowers to a `contains` call — the runtime
-            // impl is String(h).includes(n), so emit it NATIVE (no dispatch)
-            if func == "contains" {
+            // impl is String(h).includes(n), so emit it NATIVE (no dispatch).
+            // The strHasPrefix/strHasSuffix twins (the test-lowering
+            // transform's glob-affix rewrites) lower the same way:
+            // String(s).startsWith(p) / String(s).endsWith(p).
+            if matches!(func.as_str(), "contains" | "strHasPrefix" | "strHasSuffix") {
                 if let [h, n] = args.as_slice() {
+                    let method = match func.as_str() {
+                        "contains" => "includes",
+                        "strHasPrefix" => "startsWith",
+                        _ => "endsWith",
+                    };
                     let native = Expr::CallExpression {
                         callee: Box::new(Expr::MemberExpression {
                             object: Box::new(Expr::CallExpression {
@@ -32947,7 +33069,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 optional: false,
                             }),
                             property: Box::new(Expr::Identifier {
-                                name: "includes".to_string(),
+                                name: method.to_string(),
                             }),
                             computed: false,
                             optional: false,

@@ -54,6 +54,7 @@ pub mod merge_init_assignments;
 pub mod redundant_store_elim;
 pub mod string_accumulator;
 pub mod test_simplification;
+pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix/contains (polyfill speedup, CROSS_BACKEND_RUNTIME.md §8.1)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
 
 
@@ -105,6 +106,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("redundant-store-elim", redundant_store_elim::transform),
         ("string-accumulator", string_accumulator::transform),
         ("test-simplification", test_simplification::transform),
+        ("test-lowering", test_lowering::transform),
         ("unreachable-after-exit", unreachable_after_exit::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
