@@ -283,8 +283,12 @@ fn arith_census(
                 escapes.insert(v.clone());
             }
         }
-        ArithAst::Index { var, .. } => {
+        ArithAst::Index { var, key } => {
             reads.insert(var.clone());
+            // the KEY expression reads its vars too (`$(( arr[i] * 2 ))`
+            // reads `i` — without this, `i=1` is misclassified dead and
+            // dropped, arith-array-index-expr.sh)
+            arith_census(key, reads, writes, escapes, escaping);
         }
         ArithAst::Bin { lhs, rhs, .. } => {
             arith_census(lhs, reads, writes, escapes, escaping);
