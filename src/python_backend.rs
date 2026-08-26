@@ -3616,6 +3616,44 @@ impl Render {
                     }
                 }
             }
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // STREAMING line iteration over a file — the generic
+                // ForEachLine node (text_ops family: tr/wc/cut/cat-read
+                // lifts). Native python: open + for-in; the loop var is the
+                // line WITHOUT its trailing newline (the perl/estree chomp
+                // convention). Optional limit = streaming head.
+                if let Some(fl) = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>() {
+                    self.cap_seq += 1;
+                    let k = self.cap_seq;
+                    let fh = format!("_fh{k}");
+                    let cnt = format!("_fl{k}");
+                    let src_e = self.expr(&fl.source);
+                    self.emit(&format!("{fh} = open({src_e})"));
+                    let v = self.py_ident(&fl.var);
+                    self.emit(&format!("for {v} in {fh}:"));
+                    self.depth += 1;
+                    if let Some(lim) = &fl.limit {
+                        let le = self.expr(lim);
+                        self.emit(&format!("if {cnt} >= ({le}):"));
+                        self.depth += 1;
+                        self.emit("break");
+                        self.depth -= 1;
+                    }
+                    // chomp: consumers see lines WITHOUT the trailing
+                    // newline (bash/cut/grep convention)
+                    self.emit(&format!("{v} = {v}.rstrip(\"\\n\")"));
+                    if fl.limit.is_some() {
+                        self.emit(&format!("{cnt} += 1"));
+                    }
+                    for s in fl.body.iter() {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit(&format!("{fh}.close()"));
+                } else {
+                    self.mark_todo("Ext ForEachLine (downcast failed)");
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
