@@ -910,6 +910,24 @@ impl Render {
     /// A plain identifier-shaped name (excludes `?`/`$`/`#`/`@`/`*`/`-`,
     /// positionals `1`-`9` and index reads `arr[1]`) — the only names the
     /// unset-read fold may flatten to "".
+    /// Split a bracket target name into (root, key-text): `map[$k]` ->
+    /// ("map", "$k"); `arr[1]` -> ("arr", "1"). None for plain names.
+    fn split_target(name: &str) -> Option<(&str, &str)> {
+        let open = name.find('[')?;
+        if !name.ends_with(']') || open + 1 >= name.len() - 1 {
+            return None;
+        }
+        Some((&name[..open], &name[open + 1..name.len() - 1]))
+    }
+
+    /// Render a bracket key text to a python subscript expression.
+    fn render_array_key(&self, key: &str) -> String {
+        if let Some(stripped) = key.strip_prefix('$') {
+            return self.py_ident(stripped);
+        }
+        Self::py_str(key)
+    }
+
     fn is_plain_name(name: &str) -> bool {
         let mut cs = name.chars();
         match cs.next() {
@@ -1347,6 +1365,95 @@ impl Render {
                     }
                 }
                 self.sh2_stub("captureWords", args, "captureWords")
+            }
+            // redirect(inner, [redirect objects]) used in expression
+            // chains (`cmd 2>/dev/null || echo`): run the inner body under
+            // bash -c and return its bash-truth STATUS. stderr is discarded
+            // by the runtime contract, so fd-2 redirects need no code.
+            "redirect" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(text) = self.body_shell_text(body) {
+                        self.need_run_status = true;
+                        return format!(
+                            "__sh_run_status([\"bash\", \"-c\", {}])",
+                            Self::py_str(&text)
+                        );
+                    }
+                }
+                self.sh2_stub("redirect", args, "redirect")
+            }
+            // join(<inner>) — the core's StringPart lowering WRAPS every
+            // ${..} expansion in join(<expr>): unwrap and route.
+            "join" => {
+                match args.first() {
+                    Some(IrExpr::Call { func, args: pargs }) if func == "param" => {
+                        self.call("param", pargs)
+                    }
+                    Some(IrExpr::Call { func, args: gargs }) if func == "getVar" => {
+                        self.call("getVar", gargs)
+                    }
+                    _ => self.sh2_stub("join", args, "join"),
+                }
+            }
+            // and(Arrow, Arrow, ..) — &&-chained STATEMENT groups render
+            // as plain statements (process-substitution lowering family)
+            "and" => {
+                if !args.is_empty() && args.iter().all(|a| matches!(a, IrExpr::Arrow(_))) {
+                    for a in args.iter() {
+                        if let IrExpr::Arrow(body) = a {
+                            for s in body.iter() {
+                                self.stmt(s);
+                            }
+                        }
+                    }
+                    "True".into()
+                } else {
+                    self.sh2_stub("and", args, "and")
+                }
+            }
+            // shopt [-s|-u] OPT — bash shell OPTION toggle: no python
+            // equivalent; the equivalence gate validates the no-op choice
+            "shopt" => "True".into(),
+            // listVar("@"/"*") — positional parameters joined (scalar
+            // form; for-iteration handles the list natively)
+            "listVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(sel, _)) if sel == "@" || sel == "*" => {
+                        "\" \".join(sys.argv[1:])".into()
+                    }
+                    _ => self.sh2_stub("listVar", args, "listVar"),
+                }
+            }
+            // assign(name, op, value) — the A1 compound-assignment call
+            // form (`y += 2`): native python augmented assignment
+            "assign" => {
+                if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(op, _)), Some(val)) =
+                    (args.first(), args.get(1), args.get(2))
+                {
+                    let py_op = match op.as_str() {
+                        "+=" | "-=" | "*=" | "/=" | "%=" | "=" => op.as_str(),
+                        _ => return self.sh2_stub("assign", args, "assign"),
+                    };
+                    let v = self.expr(val);
+                    if let Some((root, key)) = Self::split_target(name) {
+                        let ke = self.render_array_key(key);
+                        return format!("{}[{ke}] {py_op}= {v}", self.py_ident(root));
+                    }
+                    let n = self.py_ident(name);
+                    if py_op == "=" {
+                        return format!("{n} = {v}");
+                    }
+                    if self.is_num(name) {
+                        return format!("{n} {py_op} {v}");
+                    }
+                    if py_op == "+=" {
+                        return format!("{n} += {v}");
+                    }
+                    self.need_atoi = true;
+                    let bare = py_op.trim_end_matches('=');
+                    return format!("{n} = __sh_atoi({n}) {bare} {v}");
+                }
+                self.sh2_stub("assign", args, "assign")
             }
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
@@ -2223,10 +2330,30 @@ impl Render {
         let Some(IrExpr::Array(items)) = args.get(1) else {
             return self.printf_fallback(args);
         };
-        let Some(IrExpr::Str(fmt, _)) = items.first() else {
+        // The format may be a bare Str OR a single-lit Interpolate (the
+        // frontends wrap every word in interpolation parts) — normalize.
+        let fmt_owned: Option<String> = match items.first() {
+            Some(IrExpr::Str(s, _)) => Some(s.clone()),
+            Some(IrExpr::Interpolate(parts)) if !parts.is_empty() => {
+                let mut t = String::new();
+                let mut all_lit = true;
+                for p in parts {
+                    match p {
+                        crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                        _ => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+                if all_lit { Some(t) } else { None }
+            }
+            _ => None,
+        };
+        let Some(fmt) = fmt_owned else {
             return self.printf_fallback(args);
         };
-        let parsed = match Self::printf_parse(fmt) {
+        let parsed = match Self::printf_parse(&fmt) {
             Some(p) => p,
             None => return self.printf_fallback(args),
         };
@@ -2257,7 +2384,7 @@ impl Render {
         let mut pieces: Vec<String> = Vec::new();
         if n_specs == 0 {
             // no specs: the format text repeats once per arg
-            let text = Self::py_str(&Self::printf_unescape(fmt));
+            let text = Self::py_str(&Self::printf_unescape(&fmt));
             if passes > 1 {
                 pieces.push(format!("({text} * {passes})"));
             } else {
