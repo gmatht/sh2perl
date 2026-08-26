@@ -2123,25 +2123,41 @@ impl Render {
                 rc
             }
             "pipeline" => {
-                // `cmd1 | cmd2` — bash -c fork/exec fallback (a pipeline is
-                // a shell primitive; subprocess pipes would need stage wiring).
+                // `cmd1 | cmd2` — re-render each stage as shell text (the
+                // generalized body_shell_text handles for/while/redirect
+                // stages too) and run the joined pipeline under bash -c.
+                // Documented fork/exec escape: a pipeline is a shell
+                // primitive; subprocess pipe wiring per stage would be a
+                // large subsystem for little idiomatic gain.
                 if let Some(IrExpr::Array(stages)) = args.first() {
                     let mut parts = Vec::new();
+                    let mut ok = true;
                     for stage in stages {
                         if let IrExpr::Arrow(body) = stage {
+                            // single exec stage -> plain argv words
+                            let mut simple = false;
                             if let [IrStmt::Expr(e)] = body.as_slice() {
                                 if let IrExpr::Call { func, args } = e {
                                     if func == "exec" {
                                         let argv = self.build_argv(args);
                                         parts.push(argv.join(" "));
-                                        continue;
+                                        simple = true;
                                     }
                                 }
                             }
+                            if simple {
+                                continue;
+                            }
+                            // richer stages: shell-text re-render
+                            if let Some(t) = self.body_shell_text(body) {
+                                parts.push(t);
+                                continue;
+                            }
                         }
-                        return self.sh2_stub("pipeline", args, "pipeline");
+                        ok = false;
+                        break;
                     }
-                    if !parts.is_empty() {
+                    if ok && !parts.is_empty() {
                         self.need_subprocess = true;
                         return format!(
                             "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
@@ -2202,6 +2218,40 @@ impl Render {
                     let var = targets.first()?.var.clone();
                     let val = self.sh_arg(expr)?;
                     parts.push(format!("{var}={val}"));
+                }
+                IrStmt::For { var, iter, body } => {
+                    let it = self.sh_arg(iter)?;
+                    let b = self.body_shell_text(body)?;
+                    parts.push(format!("for {var} in {it}; do {b}; done"));
+                }
+                IrStmt::While { cond, body } => {
+                    let c = self.sh_arg(cond)?;
+                    let b = self.body_shell_text(body)?;
+                    parts.push(format!("while {c}; do {b}; done"));
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    let t = self.body_shell_text(inner)?;
+                    let mut text = format!("( {t} )");
+                    for r in redirects.iter() {
+                        let tgt = match &r.target {
+                            IrExpr::Str(s, _) => Some(Self::sh_quote(s)),
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                args.first().and_then(|a| match a {
+                                    IrExpr::Str(n, _) => Some(format!("$\"{}\"", n)),
+                                    _ => None,
+                                })
+                            }
+                            _ => None,
+                        };
+                        let tgt = tgt?;
+                        match r.mode.as_str() {
+                            "w" => text.push_str(&format!(">{tgt}")),
+                            "a" => text.push_str(&format!(">>{tgt}")),
+                            "r" => text.push_str(&format!("<{tgt}")),
+                            _ => {}
+                        }
+                    }
+                    parts.push(text);
                 }
                 _ => return None,
             }
