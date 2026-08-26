@@ -119,15 +119,45 @@ fn stmt_reads(st: &IrStmt, var: &str) -> bool {
     match st {
         IrStmt::Assign { expr, .. } => expr_reads(expr, var),
         IrStmt::Output { value, .. } => expr_reads(value, var),
+        IrStmt::WriteFile { path, content, .. } => expr_reads(path, var) || expr_reads(content, var),
         IrStmt::Declare { init, .. } => init.as_ref().map(|i| expr_reads(i, var)).unwrap_or(false),
+        IrStmt::DeclareArray { elements, .. } => elements.iter().any(|e| expr_reads(e, var)),
         IrStmt::If { cond, then, elsifs, else_, .. } => {
             expr_reads(cond, var)
                 || then.iter().any(|s| stmt_reads(s, var))
                 || elsifs.iter().any(|(c, b)| expr_reads(c, var) || b.iter().any(|s| stmt_reads(s, var)))
                 || else_.iter().any(|s| stmt_reads(s, var))
         }
-        IrStmt::While { cond, body } | IrStmt::For { iter: cond, body, var: _ } => {
+        IrStmt::While { cond, body } | IrStmt::For { iter: cond, body, .. } => {
             expr_reads(cond, var) || body.iter().any(|s| stmt_reads(s, var))
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            body.iter().any(|s| stmt_reads(s, var)) || expr_reads(cond, var)
+        }
+        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+            expr_reads(cmd, var)
+                || args.iter().any(|a| expr_reads(a, var))
+                || redirects.iter().any(|r| expr_reads(r, var))
+                || env.iter().any(|(_, e)| expr_reads(e, var))
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            stages.iter().any(|s| s.iter().any(|st| stmt_reads(st, var)))
+        }
+        IrStmt::Return(e) => e.as_ref().map(|e| expr_reads(e, var)).unwrap_or(false),
+        IrStmt::Exit(e) => e.as_ref().map(|e| expr_reads(e, var)).unwrap_or(false),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_reads(expr, var),
+        IrStmt::SetChildError(e) => expr_reads(e, var),
+        IrStmt::Case { discriminant, clauses, .. } => {
+            expr_reads(discriminant, var)
+                || clauses.iter().any(|c| c.body.iter().any(|s| stmt_reads(s, var)))
+        }
+        IrStmt::Redirect { inner, redirects, .. } => {
+            inner.iter().any(|s| stmt_reads(s, var))
+                || redirects.iter().any(|r| expr_reads(&r.target, var))
+        }
+        IrStmt::Function { body, .. } => body.iter().any(|s| stmt_reads(s, var)),
+        IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+            b.iter().any(|s| stmt_reads(s, var))
         }
         IrStmt::Expr(e) => expr_reads(e, var),
         _ => false,
@@ -137,25 +167,94 @@ fn stmt_reads(st: &IrStmt, var: &str) -> bool {
 fn expr_reads(e: &IrExpr, var: &str) -> bool {
     match e {
         IrExpr::Var(v, _) | IrExpr::Ident(v) => v == var,
-        IrExpr::Index { var: v, .. } => v == var,
+        IrExpr::Index { var: v, key, .. } => v == var || expr_reads(key, var),
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
         IrExpr::Arith(a) => arith_reads(a, var),
+        IrExpr::Call { func, args, .. } => {
+            call_reads_var(func, args, var) || args.iter().any(|a| expr_reads(a, var))
+        }
+        IrExpr::MethodCall { obj, args, .. } => expr_reads(obj, var) || args.iter().any(|a| expr_reads(a, var)),
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            expr_reads(cond, var) || expr_reads(then, var) || expr_reads(else_, var)
+        }
+        IrExpr::DefinedOr { expr, default, .. } => expr_reads(expr, var) || expr_reads(default, var),
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
             crate::ir::InterpPart::Expr(x) => expr_reads(x, var),
             _ => false,
         }),
+        IrExpr::Capture { expr, .. } => expr_reads(expr, var),
+        IrExpr::Arrow(body) => body.iter().any(|s| stmt_reads(s, var)),
+        IrExpr::Array(elems) => elems.iter().any(|e| expr_reads(e, var)),
+        IrExpr::Object(fields) => fields.iter().any(|(_, e)| expr_reads(e, var)),
         _ => false,
     }
 }
 
 fn arith_reads(a: &ArithAst, var: &str) -> bool {
     match a {
-        ArithAst::Var(v) => v == var,
-        ArithAst::Index { var: v, .. } => v == var,
+        ArithAst::Var(v) | ArithAst::Ident(v) => v == var,
+        ArithAst::Index { var: v, key, .. } => v == var || arith_reads(key, var),
         ArithAst::Bin { lhs, rhs, .. } => arith_reads(lhs, var) || arith_reads(rhs, var),
         ArithAst::Un { arg, .. } => arith_reads(arg, var),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_reads(test, var) || arith_reads(then, var) || arith_reads(else_, var)
+        }
+        ArithAst::Assign { rhs, .. } => arith_reads(rhs, var),
+        ArithAst::IncDec { var: v, .. } => v == var,
+        ArithAst::Cast { arg, .. } => arith_reads(arg, var),
         _ => false,
     }
+}
+
+/// Runtime-call variable access: `getVar`/`arrayIndex` read their name
+/// arg, `param` reads its second arg, and the string-eval calls
+/// (`arith`/`test`/`caseMatch`) may reference vars by name inside their
+/// string payloads.
+fn call_reads_var(func: &str, args: &[IrExpr], var: &str) -> bool {
+    if matches!(func, "getVar" | "arrayIndex") {
+        if let Some(IrExpr::Str(n, _)) = args.first() {
+            return n == var;
+        }
+    }
+    if func == "param" {
+        if let Some(IrExpr::Str(n, _)) = args.get(1) {
+            return n == var;
+        }
+    }
+    if matches!(func, "arith" | "test" | "caseMatch") {
+        return args.iter().any(|a| match a {
+            IrExpr::Str(s, _) => str_maybe_reads(s, var),
+            _ => false,
+        });
+    }
+    false
+}
+
+/// Does the string reference `var` as a standalone token?
+fn str_maybe_reads(s: &str, var: &str) -> bool {
+    if var.is_empty() {
+        return false;
+    }
+    let mut rest = s;
+    while let Some(pos) = rest.find(var) {
+        let before = pos == 0
+            || !rest[..pos]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric())
+                .unwrap_or(false);
+        let after = pos + var.len() >= rest.len()
+            || !rest[pos + var.len()..]
+                .chars()
+                .next()
+                .map(|c| c.is_alphanumeric())
+                .unwrap_or(false);
+        if before && after {
+            return true;
+        }
+        rest = &rest[pos + var.len()..];
+    }
+    false
 }
 
 /// A statement that could read `x` indirectly (a call/capture/subshell/
@@ -174,4 +273,138 @@ fn indirect_observer(st: &IrStmt) -> bool {
                     | IrExpr::Arrow(_)
             )
     ) || (matches!(st, IrStmt::Return(_) | IrStmt::Exit(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, StrStyle};
+
+    fn assign(var: &str, expr: IrExpr) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr,
+            asm: None,
+        }
+    }
+
+    fn str_lit(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn int_lit(n: i64) -> IrExpr {
+        IrExpr::Int(n)
+    }
+
+    fn getvar(var: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![str_lit(var)],
+        }
+    }
+
+    fn expr_stmt(e: IrExpr) -> IrStmt {
+        IrStmt::Expr(e)
+    }
+
+    /// `x=A; y="v$x"; x=B` — the intermediate `y="v$x"` READS x via a
+    /// getVar call inside an interpolation; the scan must stop there and
+    /// keep the `x=A` store (its value is observed).
+    #[test]
+    fn keeps_store_read_via_getvar_in_assign_rhs() {
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            assign(
+                "y",
+                IrExpr::Interpolate(vec![
+                    crate::ir::InterpPart::Lit("v".to_string()),
+                    crate::ir::InterpPart::Expr(Box::new(getvar("x"))),
+                ]),
+            ),
+            assign("x", int_lit(6)),
+        ];
+        // the first store must survive: y observes x=5
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[0], assign("x", int_lit(5)));
+        assert_eq!(stmts.len(), 3);
+    }
+
+    /// `x=A; x=B` with NO read between — the intermediate store drops.
+    #[test]
+    fn drops_store_with_no_read_between() {
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            assign("x", int_lit(6)),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts.len(), 1);
+        if let IrStmt::Assign { expr, .. } = &stmts[0] {
+            assert_eq!(expr, &int_lit(6));
+        } else {
+            panic!("expected Assign");
+        }
+    }
+
+    /// `x=A; echo $y` where the echo reads x via getVar inside an exec
+    /// arg — the store must survive.
+    #[test]
+    fn keeps_store_read_via_exec_arg() {
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            expr_stmt(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    str_lit("echo"),
+                    IrExpr::Array(vec![IrExpr::Interpolate(vec![
+                        crate::ir::InterpPart::Lit("v".to_string()),
+                        crate::ir::InterpPart::Expr(Box::new(getvar("x"))),
+                    ])]),
+                ],
+            }),
+            assign("x", int_lit(6)),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[0], assign("x", int_lit(5)));
+    }
+
+    /// `x=A; if cond; then echo $x; fi; x=B` — the conditional read of x
+    /// must stop the scan.
+    #[test]
+    fn keeps_store_read_inside_if() {
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            IrStmt::If {
+                cond: getvar("c"),
+                then: vec![expr_stmt(getvar("x"))],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            assign("x", int_lit(6)),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[0], assign("x", int_lit(5)));
+    }
+
+    /// `x=A; y=$((x+1)); x=B` — the RHS reads x via native arith.
+    #[test]
+    fn keeps_store_read_via_arith() {
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            assign(
+                "y",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+            ),
+            assign("x", int_lit(6)),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[0], assign("x", int_lit(5)));
+    }
 }
