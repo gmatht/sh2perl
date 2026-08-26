@@ -1533,46 +1533,11 @@ impl Render {
     /// per-function hoists.
     fn emit_var_decl(&mut self, v: &str) {
         let name = self.c_ident(v);
-        // Storage-class selection: consult the unified analysis verdict
-        // instead of re-deriving from scattered checks. Falls through to
-        // the legacy paths for classes not yet handled natively.
-        // Escape-class refinement: Store vars must NOT get inline buffers
-        // even when buf_bound says the length fits — the value may be
-        // accessed from other scopes through the runtime store.
-        if let Some(crate::transforms::escape_classes::EscapeClass::Store) =
-            crate::transforms::escape_classes::verdict(v)
-        {
-            if self.buf_bound(v).is_some() && !self.capture_vars.contains(v) {
-                // Store var: keep heap pointer (escapes via runtime store)
-                self.emit(&format!("char* {name} = NULL;"));
-                return;
-            }
-        }
-        if let Some(class) = self.var_storage.get(v) {
-            match class {
-                crate::ir::StorageClass::Numeric => {
-                    // already handled by is_num check below
-                }
-                crate::ir::StorageClass::ManagedString => {
-                    // char* IS the idiomatic default: shell scripts are
-                    // short-lived processes, leaks don't matter, strdup
-                    // per assign gives exclusive ownership. _sh_mstr is
-                    // an opt-in for hot-loop accumulators only.
-                    self.emit(&format!("char* {name} = NULL;"));
-                    return;
-                }
-                crate::ir::StorageClass::CaptureResult => {
-                    // capture targets stay raw char* for popen/fread
-                }
-                crate::ir::StorageClass::Escaped => {
-                    // must survive scope exit: raw heap pointer
-                    self.emit(&format!("char* {name} = NULL;"));
-                    return;
-                }
-                _ => {}
-            }
-        }
-                // const-markup lift: a Const var whose single top-level
+        // Storage-class selection is ADVISORY here — the buf_bound /
+        // capture_vars checks below determine the actual declaration.
+        // Early returns based on storage class caused mismatches where
+        // the decl said char* but the assign used strncpy (fixed-buffer
+        // semantics), producing NULL-pointer segfaults.                // const-markup lift: a Const var whose single top-level
         // assignment is a literal renders as a const declaration
         // initialized from that literal; the Assign stmt is dropped
         // (see the Assign arm). Only literal RHSs are lifted — a
