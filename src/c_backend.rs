@@ -1603,16 +1603,12 @@ impl Render {
             // the fixed-buffer transform: the var_lengths analysis
             // proves len(v) <= b, so the buffer is b+1 bytes
             self.emit(&format!("char {name}[{}] = \"\";", b + 1));
-        } else if self.capture_vars.contains(v) {
-            // capture targets stay raw char*: the capture helper fills
-            // a static buffer and the assign strdups from it
-            self.emit(&format!("char* {name} = NULL;"));
         } else {
-            // managed string: owns its storage, grows on demand,
-            // no leak on reassign (the raw char* default leaked on
-            // every reassignment because strdup replaced the pointer)
-            self.emit(&format!("_sh_mstr {name} = {{0}};"));
-            self.managed_strings.insert(name.clone());
+            // raw char* — the _sh_mstr managed-string type requires
+            // updating ~66 access sites (reads via .p, writes via
+            // _sh_mstr_set, format casts); deferred until stable.
+            // Raw char* with null-guard reads is correct today.
+            self.emit(&format!("char* {name} = NULL;"));
         }
     }
 
