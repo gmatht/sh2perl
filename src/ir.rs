@@ -1879,6 +1879,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             rest.join(", ")
                         ));
                     }
+                    "fnValue" => {
+                        // VALUE-returning function call (the echo-return
+                        // transform's convention — CROSS_BACKEND_RUNTIME.md
+                        // §8.3): a Perl sub call whose value is the
+                        // function's `return` — an expression, no status
+                        // write (the caller consumes the value, e.g. the
+                        // rewritten `print(fnValue(...), "\n")` echo).
+                        let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                        let words = exec_word_args(args);
+                        let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
+                        out.push_str(&format!("{}({})", name, rest.join(", ")));
+                    }
                     "test" => {
                         // Bare `[ cond ]` as a statement: the exit status is the
                         // condition's truth.
@@ -6454,10 +6466,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                     }
                 },
-                // The C frontend's user-function dispatch (the estree
-                // lowers the same A1 to sh2.fnCall) — a direct Perl sub
+                // The C frontend's user-shell dispatch (the estree
+                // lowers the same tree to sh2.fnCall) — a direct Perl sub
                 // call: fnCall(name, [args...]) → name(args...).
-                "fnCall" => {
+                // `fnValue` (the echo-return transform's value-returning
+                // convention) renders the same — the sub returns the
+                // value, no status channel.
+                "fnCall" | "fnValue" => {
                     let name = args.first().and_then(call_arg_str).unwrap_or_default();
                     let call_args: Vec<String> = match args.get(1) {
                         Some(IrExpr::Array(elems)) => {
