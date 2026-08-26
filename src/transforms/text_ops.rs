@@ -2264,9 +2264,10 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
     // remaining parts concatenate into the value (captures included).
     if cmd == "local" {
         let mut stmts: Vec<IrStmt> = Vec::new();
+        let mut failed_words: Vec<IrExpr> = Vec::new();
         let mut wi = 0usize;
         while wi < cmd_args.len() {
-            let skip_next;
+            let mut skip_next = false;
             let (name, value): (String, Option<IrExpr>) = match &cmd_args[wi] {
                 // positional form: [Str("v="), <value expr>]
                 IrExpr::Str(s, _) if s.ends_with('=') && wi + 1 < cmd_args.len() => {
@@ -2292,26 +2293,38 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
                 IrExpr::Interpolate(parts) => {
                     // literal prefix names the variable; remaining parts
                     // concatenate into the value (captures included).
-                    // Dynamic part BEFORE any '=' → ambiguous, refuse.
+                    // Dynamic part BEFORE any '=' → ambiguous: per-word fail.
                     skip_next = false;
                     let mut name: Option<String> = None;
                     let mut rest: Vec<InterpPart> = Vec::new();
+                    let mut ambiguous = false;
                     for p in parts.iter() {
+                        if ambiguous {
+                            break;
+                        }
                         if name.is_some() {
                             rest.push(p.clone());
                             continue;
                         }
                         if let InterpPart::Lit(s) = p {
-                            if let Some(eq) = s.find('=') {
-                                name = Some(s[..eq].to_string());
-                                if eq + 1 < s.len() {
-                                    rest.push(InterpPart::Lit(s[eq + 1..].to_string()));
+                            match s.find('=') {
+                                Some(eq) => {
+                                    name = Some(s[..eq].to_string());
+                                    if eq + 1 < s.len() {
+                                        rest.push(InterpPart::Lit(s[eq + 1..].to_string()));
+                                    }
                                 }
-                                continue;
+                                None => { ambiguous = true; }
                             }
-                            return None; // literal before '=' with no '=' → no name
+                        } else {
+                            ambiguous = true;
                         }
-                        return None; // dynamic part before '=' — ambiguous
+                    }
+                    if ambiguous {
+                        // keep this word for the residual runtime call
+                        failed_words.push(cmd_args[wi].clone());
+                        wi += 1;
+                        continue;
                     }
                     match name {
                         Some(n) if !n.is_empty()
@@ -2353,13 +2366,23 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
                                     Some(acc)
                                 }
                             };
-                            (n, value)
+                            (n, Some(value.unwrap_or_else(|| {
+                                IrExpr::Str(String::new(), StrStyle::DoubleQuoted)
+                            })))
                         }
                         _ => return None,
                     }
                 }
-                _ => return None,
+                // array-valued / other complex words: per-word fallback —
+                // they stay in a residual exec("local") so SIBLING words
+                // still normalise instead of losing the whole statement
+                _ => ("\u{0}FAILED".to_string(), None),
             };
+            if name == "\u{0}FAILED" {
+                failed_words.push(cmd_args[wi].clone());
+                wi += 1;
+                continue;
+            }
             stmts.push(IrStmt::Assign {
                 targets: vec![AssignTarget { var: name, sigil: None, indices: vec![] }],
                 expr: value.unwrap_or_else(|| {
@@ -2370,6 +2393,16 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
             if skip_next { wi += 1; }
             wi += 1;
         }
+        if failed_words.is_empty() {
+            return Some(IrStmt::Block(stmts));
+        }
+        stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("local".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(failed_words),
+            ],
+        }));
         return Some(IrStmt::Block(stmts));
     }
 
