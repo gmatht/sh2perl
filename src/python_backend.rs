@@ -3619,9 +3619,33 @@ impl Render {
                 }
             }
             IrStmt::Redirect { inner, redirects } => {
-                // render the inner commands; apply a simple fd-1 write
-                // redirect (`> file`) by writing to the file (capture-free
-                // approximation for the v1 subset).
+                // `cmd > file`: redirect python sys.stdout to the target
+                // file for the duration of the inner statements. This
+                // handles echo/printf/capture — anything that prints.
+                // stderr (fd 2) redirects are no-ops (discarded by contract).
+                let mut fd1_target: Option<String> = None;
+                let mut fd1_mode = "w";
+                for r in redirects.iter() {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        fd1_target = Some(self.expr(&r.target));
+                        fd1_mode = if r.mode == "a" { "a" } else { "w" };
+                    }
+                }
+                if let Some(p) = &fd1_target {
+                    self.need_sys = true;
+                    self.emit(&format!(
+                        "_old = sys.stdout; sys.stdout = open({p}, '{fd1_mode}')",
+                        p = p, fd1_mode = fd1_mode
+                    ));
+                    self.depth += 1;
+                    for s in inner.iter() {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("sys.stdout.close()");
+                    self.emit("sys.stdout = _old");
+                    return;
+                }
                 for s in inner {
                     self.stmt(s);
                 }
