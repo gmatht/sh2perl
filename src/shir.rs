@@ -14874,6 +14874,56 @@ fn glob_to_regex_segs(cs: &[char], i: &mut usize, out: &mut String) -> Option<()
 /// Lower a `case` whose EVERY pattern is one of the [`CasePat`] shapes to a
 /// native if/else-if chain: `String(disc).includes(lit)` for substring
 /// globs, `String(disc) === lit` for exact literals, `true` for `*` — no
+/// Split a bash case pattern on UNQUOTED, UNESCAPED, top-level `|` —
+/// the alternation operator (`a|b` matches `a` or `b`). An escaped
+/// `\|` stays (a literal pipe); `|` inside `@(a|b)`-style parens stays
+/// (the extglob group's intrinsic alternation); quoted `|` stays.
+fn split_case_alternatives(pat: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_q: Option<char> = None;
+    let mut esc = false;
+    for c in pat.chars() {
+        if esc {
+            cur.push(c);
+            esc = false;
+            continue;
+        }
+        if c == '\\' {
+            cur.push(c);
+            esc = true;
+            continue;
+        }
+        if let Some(q) = in_q {
+            cur.push(c);
+            if c == q {
+                in_q = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            in_q = Some(c);
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            '|' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// `sh2.caseMatch` dispatch, no glob engine, no per-pattern string parsing.
 /// bash `case` is first-match-wins, which is exactly an if/else-if chain;
 /// the discriminant is bound once to a temp const (the switch form
@@ -14888,10 +14938,18 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
     let pats: Vec<Vec<CasePat>> = clauses
         .iter()
         .map(|c| {
-            c.patterns
-                .iter()
-                .map(|p| classify_case_pat(p))
-                .collect::<Option<Vec<_>>>()
+            let mut out = Vec::new();
+            for p in &c.patterns {
+                // bash `case` patterns are ALTERNATIONS on unquoted `|`
+                // (`==|=` matches `==` or `=`): split before classifying
+                // so each alternative lowers to its own test (the clause
+                // ORs them). Without the split, `==|=` was classified as
+                // an Exact literal and emitted `String(x) === "==|="`.
+                for alt in split_case_alternatives(p) {
+                    out.push(classify_case_pat(&alt)?);
+                }
+            }
+            Some(out)
         })
         .collect::<Option<Vec<_>>>()?;
     // `String($sh_case ?? '')` — the runtime's caseMatch coercion.
@@ -37826,5 +37884,36 @@ mod clobber_redirect_tests {
         let back = crate::shir_json_in::shir_json_to_ir(&s).expect("ingress");
         let s2 = crate::shir_json::shir_to_shir_json(&back);
         assert!(s2.contains("\"mode\":\"wc\""), "round-trip lost clobber: {s2}");
+    }
+}
+
+#[cfg(test)]
+mod case_alternation_tests {
+    use super::*;
+
+    #[test]
+    fn splits_plain_alternation() {
+        assert_eq!(split_case_alternatives("==|="), vec!["==", "="]);
+        assert_eq!(split_case_alternatives("a|b|c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn keeps_quoted_and_escaped_pipes() {
+        // quoted | stays in one alternative
+        let q = split_case_alternatives("\"a|b\"");
+        assert_eq!(q, vec!["\"a|b\""], "quoted pipe must not split");
+        // escaped \| stays literal (the backslash rides along for the
+        // glob translation)
+        let e = split_case_alternatives("a\\|b");
+        assert_eq!(e.len(), 1, "escaped pipe must not split");
+        // paren-grouped extglob alternation stays intact
+        let g = split_case_alternatives("@(a|b)");
+        assert_eq!(g, vec!["@(a|b)"], "paren-grouped alternation must not split");
+    }
+
+    #[test]
+    fn no_pipe_returns_whole() {
+        assert_eq!(split_case_alternatives("*.txt"), vec!["*.txt"]);
+        assert_eq!(split_case_alternatives(""), vec![""]);
     }
 }

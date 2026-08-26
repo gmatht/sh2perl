@@ -95,7 +95,12 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
                 body.iter().any(walk_stmt)
             }
             IrStmt::Pipeline { stages, .. } => stages.iter().any(|st| st.iter().any(walk_stmt)),
-            IrStmt::Redirect { inner, .. } => inner.iter().any(walk_stmt),
+            IrStmt::Redirect { inner, redirects } => {
+                // redirect targets are reads (`<<< "$var"`, `> "$f"`) —
+                // a var read ONLY there must not be judged dead
+                redirects.iter().any(|r| walk_expr(&r.target))
+                    || inner.iter().any(walk_stmt)
+            }
             IrStmt::Expr(e) => walk_expr(e),
             IrStmt::Output { value, .. } => walk_expr(value),
             IrStmt::WriteFile { path, content, .. } => walk_expr(path) || walk_expr(content),
@@ -276,7 +281,8 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
             IrStmt::Pipeline { stages, .. } => {
                 for stage in stages { for b in stage { walk_stmt(b, counts); } }
             }
-            IrStmt::Redirect { inner, .. } => {
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects { walk_expr(&r.target, counts); }
                 for b in inner { walk_stmt(b, counts); }
             }
             IrStmt::Expr(e) => walk_expr(e, counts),
@@ -433,7 +439,10 @@ fn census_stmt(
                 }
             }
         }
-        IrStmt::Redirect { inner, .. } => {
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects {
+                census_expr(&r.target, reads, writes, escapes, escaping);
+            }
             for s in inner {
                 census_stmt(s, reads, writes, escapes, escaping);
             }

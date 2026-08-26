@@ -6968,10 +6968,22 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         IrStmt::Label(_) | IrStmt::Goto(_) => {} // no variables
         // Neutral ESTree-path-only nodes carry no Perl variables.
         IrStmt::Case { .. }
-        | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => {}
+        // Redirect TARGETS are reads (heredoc/herestring `<<< "$var"`,
+        // `> "$f"`, `2> "$err"`): a var read ONLY there must not be
+        // dead-eliminated (the dead-store-elim / never-written analyses
+        // consulted this same walker and dropped the assignment, folding
+        // the read to "").
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects {
+                collect_vars_in_expr(&r.target, vars);
+            }
+            for st in inner {
+                collect_vars_in_stmt(st, vars);
+            }
+        }
         // Select comm clauses may carry channel/value exprs + bodies.
         IrStmt::Select { clauses } => {
             for c in clauses {
@@ -7175,11 +7187,18 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
         }
         IrExpr::Capture { expr, .. } => collect_vars_in_expr(expr, vars),
         IrExpr::Call { func, args, .. } => {
-            // param calls reference a variable by name (args[1] is the
-            // Str literal name) — register it so the optimizer doesn't
-            // dead-eliminate the var's assignment.
-            if func == "param" {
-                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+            // param / getVar calls reference a variable by name
+            // (param: args[1], getVar: args[0]) — register it so the
+            // optimizer doesn't dead-eliminate the var's assignment.
+            let name_idx = if func == "param" {
+                Some(1)
+            } else if func == "getVar" {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(idx) = name_idx {
+                if let Some(IrExpr::Str(name, _)) = args.get(idx) {
                     vars.insert(name.clone());
                 }
             }
