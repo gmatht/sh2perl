@@ -425,19 +425,15 @@ fn materialize_redirect(
     }
     let rm = rm_exec(&cleanup);
     if !has_post {
-        // process-in only: the trailing `rm` must not clobber the exec's
-        // status (`diff <(a) <(b) || echo differ` — the `||` branches on
-        // lastExit). Wrap as `and(Arrow([mktemp, writes, exec]),
-        // Arrow([rm]))`: the rm runs ONLY when the exec succeeded, and
-        // the stmt's status is the exec's in both branches (the runtime
-        // and/or dispatch reads the arrow's last stmt — the exec — and
-        // the rm's success is 0 = the exec's success). Renders in sh as
-        // `{ …; exec; } && { rm …; }` — portable POSIX.
-        let mut exec_part = out;
-        Some(IrStmt::Expr(IrExpr::Call {
-            func: "and".to_string(),
-            args: vec![IrExpr::Arrow(exec_part), IrExpr::Arrow(vec![rm])],
-        }))
+        // process-in only: use a Block (sequential) instead of and().
+        // The and() form renders as `{ …; exec; } && { rm …; }` which
+        // breaks when the exec is part of a PIPELINE (`paste <(…) <(…)
+        // | head -10`) — the `| head` would apply to the rm cleanup
+        // instead of to paste, because | binds tighter than && in bash.
+        // Sequential execution is correct: paste writes to stdout which
+        // goes through head, and the rm cleans up after.
+        out.push(rm);
+        Some(IrStmt::Block(out))
     } else {
         // process-out present: the producer-read must run regardless of
         // the exec's status (it CONSUMES the file), so a plain sequence

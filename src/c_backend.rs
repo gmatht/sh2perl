@@ -12391,3 +12391,9 @@ fn c_eq(chars: &[char], i: usize) -> bool {
         && chars[i + 1] != '='
         && (i == 0 || chars[i - 1] != '!' && chars[i - 1] != '<' && chars[i - 1] != '>' && chars[i - 1] != '=')
 }
+
+#[cfg(test)]
+fn probe_parse_arith() {
+    let r = crate::shir::parse_arith("j+(100/__SHCNT_arr)");
+    println!("parse_arith j+(100/__SHCNT_arr): {:?}", r.map(|a| format!("{a:?}")));
+}

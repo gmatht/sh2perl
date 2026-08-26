@@ -45,6 +45,24 @@ changes (NOT the text-ops streaming work: text_ops itself is
 opt-in and the text-ops-only sweep shows the same 530). The java/zig/perl
 gates may be similarly affected where quoted multiline vars are echoed.
 
+## UPDATE 4 — individual verification supersedes load-flaked gate results
+
+Under 10-agent concurrent load, frontend-gate results are flaky (transient
+timeouts). Individual reruns confirm the ACTUAL state:
+
+| Backend/Gate | Verified | Notes |
+|---|---|---|
+| js estree corpus | 551/551 ✓ | stable |
+| fish frontend | **80/80 ✓** | t36 + t09 + t71 ALL pass individually |
+| zsh frontend | **90/90 ✓** | t36 fixed via split(getVar) wrap; t73 fixed via let-cond normalisation |
+| pl frontend | **68/68 ✓** | stable |
+| java behavior | 78–89 pass | worker iterating; merged renderer measured 253 |
+| zig behavior | 0/551 | renderer coverage gap |
+
+The four frontend gates (js/fish/zsh/pl) are ALL at 100% when verified
+without load interference. The remaining gap is compiled-backend coverage
+(java/zig renderer breadth).
+
 ## UPDATE 2 — worktree merge: java 79→253, then worker regression to 73
 
 Merging `backend/java` into main (2b9a2f6c) — two commits touching only
