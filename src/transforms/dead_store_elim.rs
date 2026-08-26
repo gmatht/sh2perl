@@ -46,7 +46,20 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 
     let dead: Vec<String> = writes
         .iter()
-        .filter(|v| !reads.contains(*v) && !escapes.contains(*v))
+        .filter(|v| {
+            !reads.contains(*v)
+                && !escapes.contains(*v)
+                // An array-element write (`map[two]` — the index baked
+                // into the name) is LIVE when the array NAME (`map`) is
+                // read anywhere: arrayIndex / arrayItems / arrayLen and
+                // dynamic-key reads (`map[$k]` in a for loop) observe the
+                // whole array, not just the literal element. Without
+                // this, `map[two]=v` before `for k in "${!map[@]}"` is
+                // misclassified dead and dropped (009_arrays.sh).
+                && !(v.contains('[')
+                    && (reads.contains(v.split('[').next().unwrap())
+                        || escapes.contains(v.split('[').next().unwrap())))
+        })
         .cloned()
         .collect();
     if dead.is_empty() {
@@ -288,9 +301,13 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
     match st {
         IrStmt::Assign { targets, expr, .. } => {
             // drop a plain scalar assign of a dead var (indexed writes
-            // could still matter to the array's own lifetime — kept)
+            // could still matter to the array's own lifetime — kept;
+            // an index baked into the NAME — `map[two]` — is an indexed
+            // write too, never a plain scalar)
             let all_plain_dead = !targets.is_empty()
-                && targets.iter().all(|t| t.indices.is_empty() && dead.contains(&t.var));
+                && targets.iter().all(|t| {
+                    t.indices.is_empty() && !t.var.contains('[') && dead.contains(&t.var)
+                });
             if all_plain_dead {
                 return None;
             }
