@@ -587,6 +587,15 @@ impl Render {
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
+            /* arena allocator for capture-heavy scopes */
+            self.emit("#define SH2_ARENA_CAP (256 * 1024)");
+            self.emit("typedef struct { char buf[SH2_ARENA_CAP]; size_t used; } _sh_arena;");
+            self.emit("static char *_sh_adup(_sh_arena *a, const char *s) {");
+            self.emit("  size_t n = strlen(s) + 1;");
+            self.emit("  if (a->used + n > SH2_ARENA_CAP) return strdup(s);");
+            self.emit("  char *r = a->buf + a->used; memcpy(r, s, n); a->used += n; return r;");
+            self.emit("}");
+            self.emit("static void _sh_arena_reset(_sh_arena *a) { a->used = 0; }");
             // ── managed string: the C equivalent of sh2.vars.x ──
             self.emit("typedef struct { char *p; } _sh_mstr;");
             self.emit("static void _sh_mstr_set(_sh_mstr *v, const char *val) {");
