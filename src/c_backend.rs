@@ -1987,12 +1987,29 @@ impl Render {
                 },
                 "join" => self.join_value(args),
                 "arith" => {
+                    if std::env::var("SH2_DBG_VARS").is_ok() {
+                        eprintln!("DBG value_c arith s={:?}", Self::str_arg(args, 0));
+                    }
                     // VALUE context `x=$(( dyn ))`: NATIVE evaluation
                     // first (parse_arith → the typed arith renderer —
                     // no fork/exec emulation); the child-bash capture
                     // (`echo "$(( ))"`) is the fallback for texts the
                     // parser cannot handle.
                     if let Some(s) = Self::str_arg(args, 0) {
+                        // ${#arr[@]} counts go NATIVE
+                        let substituted = subst_array_counts(&s);
+                        if substituted != *s {
+                            if let Some(ast) = crate::shir::parse_arith(&substituted) {
+                                // NOTE: do NOT register the base array
+                                // name as Int here — it's already an
+                                // indexed array of char*. The __SHCNT_
+                                // token is rewritten textually by
+                                // apply_array_counts.
+                                let native_cexpr = self.arith(&ast);
+                                let v2 = self.apply_array_counts(&native_cexpr);
+                                return self.num_temp(&v2);
+                            }
+                        }
                         let pre = Self::arith_subst_specials(&s);
                         if let Some(ast) = crate::shir::parse_arith(&pre) {
                             let v = if Self::arith_has_side_effects(&ast) {
@@ -3087,6 +3104,9 @@ impl Render {
                     // (no yes/while-true), write to a TEMP FILE
                     // synchronously — simpler than FIFOs and correct.
                     // Only fall back to FIFO+background for infinite ones.
+                    // FINITE producers write SYNCHRONOUSLY to temp files —
+                    // simpler than FIFOs and correct for any downstream
+                    // consumer including head/tail early-exit
                     let ps_target = redirects.iter().find_map(|rd| {
                         match (&rd.mode, &rd.target) {
                             (m, IrExpr::Var(n, _))
@@ -3099,19 +3119,13 @@ impl Render {
                     });
                     if let Some(target) = ps_target {
                         let tv = IrExpr::Var(target.clone(), None);
-                        self.sh_raw(buf, "rm -f");
-                        self.sh_word(buf, &tv);
-                        self.sh_raw(buf, ";");
-                        self.sh_raw(buf, "mkfifo");
-                        self.sh_word(buf, &tv);
-                        self.sh_raw(buf, ";");
                         self.sh_raw(buf, "{");
                         self.sh_raw(buf, "(");
                         self.sh_stage(buf, inner);
                         self.sh_raw(buf, ")");
                         self.sh_raw(buf, ">");
                         self.sh_word(buf, &tv);
-                        self.sh_raw(buf, "&");
+                        self.sh_raw(buf, ";");
                         self.sh_raw(buf, "}");
                     } else {
                         self.sh_stage(buf, inner);
@@ -3921,14 +3935,17 @@ impl Render {
                     self.sh_word(buf, &rd.target);
                 }
                 "process-in" => {
-                    raw(self, "<");
+                    // bash <(...) process substitution: pass through
+                    raw(self, "<(");
                     let v = self.value_c(&rd.target);
                     addv(self, &v);
+                    raw(self, ")");
                 }
                 "process-out" => {
-                    raw(self, ">");
+                    raw(self, ">(");
                     let v = self.value_c(&rd.target);
                     addv(self, &v);
+                    raw(self, ")");
                 }
                 _ => {
                     self.mark_todo(&format!("redirect mode {mode}"));
@@ -4668,6 +4685,25 @@ impl Render {
     /// Positional/special params are substituted textually first (bash
     /// expands them before the arithmetic parses).
     fn arith_text(&mut self, s: &str) -> String {
+        // ${#arr[@]} / ${#arr} counts go NATIVE: substitute to __SHCNT_
+        // tokens, register as Int, parse_arith handles them, then
+        // apply_array_counts rewrites to the C count expression
+        let dbg_s = s.to_string();
+        let after_specials = Self::arith_subst_specials(s);
+        let pre_sub = subst_array_counts(&after_specials);
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG arith_text s={s} after_specials={after_specials} pre_sub={pre_sub}");
+        }
+        for tok in pre_sub.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if let Some(name) = tok.strip_prefix("__SHCNT_") {
+                self.var_types.insert(name.to_string(), IrType::Int);
+            }
+        }
+        if let Some(ast) = crate::shir::parse_arith(&pre_sub) {
+            let cexpr = self.arith(&ast);
+            let cexpr = self.apply_array_counts(&cexpr);
+            return self.num_temp(&cexpr);
+        }
         let pre = Self::arith_subst_specials(s);
         if let Some(ast) = crate::shir::parse_arith(&pre) {
             if Self::arith_has_side_effects(&ast) {
@@ -4754,6 +4790,20 @@ impl Render {
                             i += 3 + end;
                             continue;
                         }
+                        // ${#arr[@]} / ${#arr} — array/scalar count
+                        if name.starts_with('#') {
+                            let arr_name = name[1..]
+                                .trim_end_matches("[@]")
+                                .trim_end_matches("[*]")
+                                .to_string();
+                            if !arr_name.is_empty()
+                                && arr_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                out.push_str(&format!("__SHCNT_{}", arr_name));
+                                i += 3 + end;
+                                continue;
+                            }
+                        }
                     }
                 } else if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
                     let mut j = i + 1;
@@ -4764,6 +4814,27 @@ impl Render {
                     out.push_str(&Self::positional_read(&n));
                     i = j;
                     continue;
+                } else if rest.starts_with('{') {
+                    // already consumed by the digits check above if
+                    // numeric — here we handle non-numeric ${...}
+                    // including ${#arr[@]}
+                    let inner_full: String = rest.chars().skip(1).collect();
+                    if let Some(end) = inner_full.find('}') {
+                        let name = &inner_full[..end];
+                        if name.starts_with('#') {
+                            let arr_name = name[1..]
+                                .trim_end_matches("[@]")
+                                .trim_end_matches("[*]")
+                                .to_string();
+                            if !arr_name.is_empty()
+                                && arr_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                out.push_str(&format!("__SHCNT_{}", arr_name));
+                                i += 2 + end + 1;
+                                continue;
+                            }
+                        }
+                    }
                 } else if rest.starts_with('#') {
                     out.push_str("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
                     i += 2;
@@ -13356,3 +13427,4 @@ fn c_eq(chars: &[char], i: usize) -> bool {
 }
 
 fn s3_push(s: &mut String, line: &str) { s.push_str(line); s.push(10 as char); }
+
