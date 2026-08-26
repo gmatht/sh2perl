@@ -2124,9 +2124,16 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                 cmd,
                 args,
                 redirects,
+                capture,
                 ..
             } => {
-                let site_swapped = swapped || !redirects.is_empty();
+                // a `$(...)` capture site swaps fdTargets[1] — the
+                // function's native echo would bypass the capture. The
+                // capture field was ignored, so a function called ONLY
+                // inside command substitution was marked native-echo and
+                // its output leaked (the cross-backend runtime extglob
+                // matcher's recursion).
+                let site_swapped = swapped || !redirects.is_empty() || capture.is_some();
                 match cmd {
                     IrExpr::Str(name, _) => {
                         if functions.contains(name) {
@@ -2364,7 +2371,213 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
     if bad_all {
         return HashSet::new();
     }
+    // Call-graph closure: a function whose output is captured (bad)
+    // calls OTHER functions whose echoes become part of ITS output —
+    // those callees' native echo would bypass the enclosing capture
+    // through the caller. Propagate badness down the call graph to a
+    // fixpoint (the cross-backend runtime's recursive extglob matcher:
+    // globMatch is captured, ext_match/globMatch2 are called BY it).
+    loop {
+        let mut changed = false;
+        let bad_now: Vec<String> = bad.iter().cloned().collect();
+        for f in &bad_now {
+            for st in &prog.stmts {
+                if let IrStmt::Function { name, body, .. } = st {
+                    if name == f {
+                        collect_body_callees(body, functions, &mut bad, &mut changed);
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     functions.difference(&bad).cloned().collect()
+}
+
+/// Collect the defined-function calls inside a statement list into
+/// `out`; set `changed` when a new name is added (the closure fixpoint).
+fn collect_body_callees(
+    stmts: &[IrStmt],
+    functions: &HashSet<String>,
+    out: &mut HashSet<String>,
+    changed: &mut bool,
+) {
+    fn walk_stmt(
+        st: &IrStmt,
+        functions: &HashSet<String>,
+        out: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        match st {
+            IrStmt::Exec { cmd, args, .. } => {
+                if let IrExpr::Str(name, _) = cmd {
+                    if functions.contains(name) && !out.contains(name) {
+                        out.insert(name.clone());
+                        *changed = true;
+                    }
+                }
+                for a in args {
+                    walk_expr(a, functions, out, changed);
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, functions, out, changed),
+            IrStmt::Assign { expr, .. } => walk_expr(expr, functions, out, changed),
+            IrStmt::Output { value, .. } => walk_expr(value, functions, out, changed),
+            IrStmt::While { cond, body, .. }
+            | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, functions, out, changed);
+                for b in body {
+                    walk_stmt(b, functions, out, changed);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                walk_expr(cond, functions, out, changed);
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, functions, out, changed);
+                }
+                for (_, arm) in elsifs {
+                    for b in arm {
+                        walk_stmt(b, functions, out, changed);
+                    }
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, functions, out, changed);
+                for b in body {
+                    walk_stmt(b, functions, out, changed);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+                ..
+            } => {
+                walk_expr(discriminant, functions, out, changed);
+                for c in clauses {
+                    for b in &c.body {
+                        walk_stmt(b, functions, out, changed);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    walk_expr(&r.target, functions, out, changed);
+                }
+                for b in inner {
+                    walk_stmt(b, functions, out, changed);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        walk_stmt(b, functions, out, changed);
+                    }
+                }
+            }
+            IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. } => {
+                for b in body {
+                    walk_stmt(b, functions, out, changed);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    walk_stmt(b, functions, out, changed);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        walk_stmt(b, functions, out, changed);
+                    }
+                }
+                for b in else_body {
+                    walk_stmt(b, functions, out, changed);
+                }
+                for b in finally_body {
+                    walk_stmt(b, functions, out, changed);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(
+        e: &IrExpr,
+        functions: &HashSet<String>,
+        out: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        match e {
+            IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+                for st in stmts {
+                    walk_stmt(st, functions, out, changed);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if func == "exec" || func == "fnCall" || func == "fnValue" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if functions.contains(name) && !out.contains(name) {
+                            out.insert(name.clone());
+                            *changed = true;
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, functions, out, changed);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_expr(it, functions, out, changed);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, functions, out, changed);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Ternary { cond: lhs, then: rhs, .. } => {
+                walk_expr(lhs, functions, out, changed);
+                walk_expr(rhs, functions, out, changed);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(inner) = p {
+                        walk_expr(inner, functions, out, changed);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, functions, out, changed),
+            IrExpr::Index { key, .. } => walk_expr(key, functions, out, changed),
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, functions, out, changed);
+                for a in args {
+                    walk_expr(a, functions, out, changed);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, functions, out, changed);
+                walk_expr(default, functions, out, changed);
+            }
+            _ => {}
+        }
+    }
+    for st in stmts {
+        walk_stmt(st, functions, out, changed);
+    }
 }
 
 /// `(cmd)` subshell / `(cmd) &` background STATEMENTS and expr-position
