@@ -34064,6 +34064,35 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
         // ONE line from stdin, newline stripped; EOF → "" (bash read
         // semantics for the single-variable subset). Awaited — stdin is
         // async in the JS runtime.
+        // wc -w as a first-class primitive: word count via whitespace
+        // split + empty drop + length — native JS, no runtime call
+        "WordCount" => {
+            let children_vec = n.children();
+            let text = children_vec.first()?;
+            Some(Expr::MemberExpression {
+                object: Box::new(crate::estree::method_call(
+                    crate::estree::method_call(
+                        expr_to_estree(text),
+                        "split",
+                        vec![regex_lit_flags("\\s+", "")],
+                    ),
+                    "filter",
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![crate::estree::ident("w")],
+                        body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                            operator: "!==".to_string(),
+                            left: Box::new(Expr::Identifier { name: "w".to_string() }),
+                            right: Box::new(str_lit("")),
+                        })),
+                        expression: true,
+                        r#async: false,
+                    }],
+                )),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false,
+                optional: false,
+            })
+        }
         "ReadLine" => {
             let call = crate::estree::sh2_call("readLine", vec![]);
             Some(Expr::AwaitExpression { argument: Box::new(call) })
