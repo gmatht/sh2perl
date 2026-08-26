@@ -4426,7 +4426,10 @@ impl Render {
                         };
                         if let Some(e) = value_expr {
                             let v = self.value_c(e);
-                            if self.is_num(name) {
+                            if self.managed_strings.contains(name) {
+                                // managed-string var: use the struct setter
+                                self.emit(&format!("_sh_mstr_set(&{id}, {v});"));
+                            } else if self.is_num(name) {
                                 let n = self.expr_as_num(e);
                                 self.emit(&format!("{id} = {n};"));
                             } else if let Some(b) = self.buf_bound(name) {
@@ -9019,7 +9022,11 @@ impl Render {
                             .collect(),
                     )];
                     let cap = self.capture_call(&args);
-                    self.emit(&format!("{id} = {cap};"));
+                    if self.managed_strings.contains(var.as_str()) {
+                        self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
+                    } else {
+                        self.emit(&format!("{id} = {cap};"));
+                    }
                 } else {
                     let args = vec![IrExpr::Array(
                         stages
@@ -9248,7 +9255,11 @@ impl Render {
                     self.store.insert(var.clone());
                     let id = self.c_ident(var);
                     let cap = self.capture_call(&call_args);
-                    self.emit(&format!("{id} = {cap};"));
+                    if self.managed_strings.contains(var) {
+                        self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
+                    } else {
+                        self.emit(&format!("{id} = {cap};"));
+                    }
                 } else if !redirects.is_empty() {
                     let stmts = vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
