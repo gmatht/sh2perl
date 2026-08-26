@@ -15,5 +15,6 @@
 node TypeAssert
 tag "TypeAssert"
 kind expr
+# storage_class str_bounded
 field expr: expr
 field kind: string

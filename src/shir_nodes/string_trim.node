@@ -7,6 +7,7 @@
 node StringTrim
 tag "StringTrim"
 kind expr
+# storage_class str_bounded
 field text: expr
 field leading: bool
 field trailing: bool

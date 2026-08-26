@@ -7,6 +7,7 @@
 node SubStrExtract
 tag "SubStrExtract"
 kind expr
+# storage_class str_bounded
 field text: expr
 field offset: expr
 field length: optional_expr

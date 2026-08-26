@@ -7,6 +7,7 @@
 node FieldExtract
 tag "FieldExtract"
 kind expr
+# storage_class str_bounded
 field text: expr
 field delimiter: string
 field fields: vec_field_range

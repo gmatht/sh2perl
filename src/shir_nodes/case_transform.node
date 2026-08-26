@@ -7,5 +7,6 @@
 node CaseTransform
 tag "CaseTransform"
 kind expr
+# storage_class str_bounded
 field text: expr
 field upper: bool

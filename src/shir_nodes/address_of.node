@@ -13,4 +13,5 @@
 node AddressOf
 tag "AddressOf"
 kind expr
+# storage_class str_bounded
 field operand: expr

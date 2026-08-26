@@ -14,6 +14,7 @@
 node AffixStrip
 tag "AffixStrip"
 kind expr
+# storage_class str_bounded
 field text: expr
 field pattern: expr
 field prefix: bool

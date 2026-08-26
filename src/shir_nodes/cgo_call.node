@@ -21,5 +21,6 @@
 node CgoCall
 tag "CgoCall"
 kind expr
+# storage_class str_bounded
 field target: string
 field args: exprs

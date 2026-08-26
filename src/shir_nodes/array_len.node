@@ -4,4 +4,5 @@
 node ArrayLen
 tag "ArrayLen"
 kind expr
+# storage_class str_bounded
 field array: expr

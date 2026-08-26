@@ -7,6 +7,7 @@
 node TakeLines
 tag "TakeLines"
 kind expr
+# storage_class str_bounded
 field text: expr
 field count: expr
 field from_end: bool
