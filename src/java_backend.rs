@@ -773,9 +773,11 @@ impl JavaRender {
                 self.command(args)
             }
             IrExpr::Call { func, args, .. } if func == "assign" => {
-                // assign("name", value) runtime form
+                // assign("name", value) or assign("name", "=", value)
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
-                let v = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                let vi = if str_arg(args, 1) == Some("=") { 2 } else { 1 };
+                let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                self.ensure_field(name);
                 self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
                 Ok(())
             }
@@ -3258,25 +3260,28 @@ fn split_test_text(t: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut quote: Option<char> = None;
     let ch: Vec<char> = t.chars().collect();
-    let mut i = 0;
+    let mut i = 0usize;
     while i < ch.len() {
         let c = ch[i];
         match quote {
-            Some(q) => {
-                cur.push(c);
-                if c == q { quote = None; }
-            }
+            Some(q) => { if c == q { quote = None; } cur.push(c); }
             None => {
                 if c == '"' || c == '\'' {
                     quote = Some(c);
                     cur.push(c);
-                } else if c == '$' && i + 1 < ch.len() && ch[i + 1] == '{' {
-                    // ${...}: copy verbatim until the matching '}'
+                } else if c == '$' && i + 1 < ch.len() && (ch[i + 1] == '(' || ch[i + 1] == '{') {
+                    // $(cmd) / ${var}: copy ATOMICALLY — internal whitespace
+                    // and quotes belong to one operand
+                    let open = ch[i + 1];
+                    let close = if open == '(' { ')' } else { '}' };
                     let mut depth = 0i32;
                     while i < ch.len() {
                         cur.push(ch[i]);
-                        if ch[i] == '{' { depth += 1; }
-                        if ch[i] == '}' { depth -= 1; if depth == 0 { i += 1; break; } }
+                        if ch[i] == open { depth += 1; }
+                        if ch[i] == close {
+                            depth -= 1;
+                            if depth == 0 { i += 1; break; }
+                        }
                         i += 1;
                     }
                     continue;
