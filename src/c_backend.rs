@@ -1505,6 +1505,18 @@ impl Render {
         // Storage-class selection: consult the unified analysis verdict
         // instead of re-deriving from scattered checks. Falls through to
         // the legacy paths for classes not yet handled natively.
+        // Escape-class refinement: Store vars must NOT get inline buffers
+        // even when buf_bound says the length fits — the value may be
+        // accessed from other scopes through the runtime store.
+        if let Some(crate::transforms::escape_classes::EscapeClass::Store) =
+            crate::transforms::escape_classes::verdict(v)
+        {
+            if self.buf_bound(v).is_some() && !self.capture_vars.contains(v) {
+                // Store var: keep heap pointer (escapes via runtime store)
+                self.emit(&format!("char* {name} = NULL;"));
+                return;
+            }
+        }
         if let Some(class) = self.var_storage.get(v) {
             match class {
                 crate::ir::StorageClass::Numeric => {
