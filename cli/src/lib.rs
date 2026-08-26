@@ -1150,8 +1150,14 @@ exit $main_exit_code;
             debashl::transforms::process_subst::transform_program(&mut prog);
             // C frontend's ternary call → backend-neutral Ternary + test-call
             // (the estree arm keeps its native ternary lowering — byte-pinned)
-            debashl::transforms::ternary_desugar::transform_program(&mut prog);
-            debashl::shir_passes::optimize::optimize(&mut prog);
+            // TERNARY_DESUGAR can be disabled to isolate regressions
+            if std::env::var("SH2_NO_TERNARY").is_err() {
+                debashl::transforms::ternary_desugar::transform_program(&mut prog);
+            }
+            // OPTIMIZE can be disabled to isolate regressions
+            if std::env::var("SH2_NO_OPTIMIZE").is_err() {
+                debashl::shir_passes::optimize::optimize(&mut prog);
+            }
             let out = match args[1].as_str() {
                 "--shir-in-c" => Ok(debashl::c_backend::shir_to_c(&prog)),
                 "--shir-in-go" => Ok(debashl::go_backend::shir_to_go(&prog)),
