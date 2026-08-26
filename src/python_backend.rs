@@ -1215,7 +1215,7 @@ impl Render {
             ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
                 // runtime setVar semantics (x+=, x++) — sh2.arith stub
                 self.sh2_calls.insert("arith".into());
-                format!("sh2_arith()")
+                format!("__sh_arith()")
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
@@ -1611,7 +1611,7 @@ impl Render {
                             if let Some(IrExpr::Str(v, _)) = items.first() {
                                 self.sh2_calls.insert("setVar".into());
                                 return format!(
-                                    "sh2_setVar({}, sys.stdin.readline().rstrip(\"\\n\"))",
+                                    "__sh_setVar({}, sys.stdin.readline().rstrip(\"\\n\"))",
                                     Self::py_str(v)
                                 );
                             }
@@ -1721,7 +1721,7 @@ impl Render {
                     }
                     if self.store_written.contains(name) {
                         self.sh2_calls.insert("getVar".into());
-                        return format!("sh2_getVar({})", Self::py_str(name));
+                        return format!("__sh_getVar({})", Self::py_str(name));
                     }
                     if self.written.contains(name) && Self::is_plain_name(name) {
                         return self.py_ident(name);
@@ -1746,14 +1746,14 @@ impl Render {
                     // struct names ("c.hits") have no native binding
                     if self.store_written.contains(name) {
                         self.sh2_calls.insert("setVar".into());
-                        return format!("sh2_setVar({}, {value})", Self::py_str(name));
+                        return format!("__sh_setVar({}, {value})", Self::py_str(name));
                     }
                     if self.var_types.contains_key(name) {
                         return format!("{} = {value}", self.py_ident(name));
                     }
                     if Self::is_plain_name(name) {
                         self.sh2_calls.insert("setVar".into());
-                        return format!("sh2_setVar({}, {value})", Self::py_str(name));
+                        return format!("__sh_setVar({}, {value})", Self::py_str(name));
                     }
                 }
                 self.sh2_stub("setVar", args, "setVar")
@@ -1767,7 +1767,7 @@ impl Render {
                     Some(IrExpr::Str(s, _)) => self.test_render(s).unwrap_or_else(|| {
                         // unrenderable test string: the runtime fallback
                         self.sh2_calls.insert("test".into());
-                        format!("sh2_test({})", Self::py_str(s))
+                        format!("__sh_test({})", Self::py_str(s))
                     }),
                     _ => return self.sh2_stub("ternary", args, "ternary"),
                 };
@@ -1966,7 +1966,7 @@ impl Render {
                             };
                             self.sh2_calls.insert("strip".into());
                             return format!(
-                                "sh2_strip({v}, {}, {})",
+                                "__sh_strip({v}, {}, {})",
                                 Self::py_str(pat),
                                 Self::py_str(which)
                             );
@@ -3269,7 +3269,7 @@ impl Render {
                 if !self.is_num(&t.var) && self.store_written.contains(&t.var) {
                     self.sh2_calls.insert("setVar".into());
                     self.emit(&format!(
-                        "sh2_setVar({}, {rhs})",
+                        "__sh_setVar({}, {rhs})",
                         Self::py_str(&t.var)
                     ));
                     return;
@@ -3317,7 +3317,7 @@ impl Render {
                 if let Some(t) = target {
                     self.sh2_calls.insert("output".into());
                     self.mark_todo("output to filehandle");
-                    self.emit(&format!("sh2_output({}, {v})", Self::py_str(t)));
+                    self.emit(&format!("__sh_output({}, {v})", Self::py_str(t)));
                 } else if *newline {
                     self.emit(&format!("print({v})"));
                 } else {
@@ -3575,7 +3575,7 @@ impl Render {
                     if let Some(asn) = &e.as_name {
                         self.sh2_calls.insert("setVar".into());
                         self.emit(&format!(
-                            "sh2_setVar({}, str(__sh_exc))",
+                            "__sh_setVar({}, str(__sh_exc))",
                             Self::py_str(asn)
                         ));
                     }
