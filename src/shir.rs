@@ -19601,6 +19601,16 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
             IrExpr::Call { func, args } if func == "split" => {
                 if let [inner] = args.as_slice() {
                     if matches!(inner, IrExpr::Call { func: f, .. } if f == "getVar") {
+                        // PROVABLY-NUMERIC vars: the field-split of a number
+                        // is a no-op (no whitespace in an integer) — skip
+                        // the array/join machinery entirely.
+                        let rendered = expr_to_estree(inner);
+                        if let Expr::Identifier { .. } = &rendered {
+                            flat = true;
+                            flag_done = true;
+                            arg_exprs.push(rendered);
+                            continue;
+                        }
                         flat = true;
                         flag_done = true;
                         let scalar = echo_arg_scalar(a);
