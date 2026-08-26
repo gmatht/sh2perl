@@ -331,14 +331,71 @@ fn materialize_redirect(
     redirects: &mut Vec<IrRedirect>,
     n: &mut usize,
 ) -> Option<IrStmt> {
-    // The inner must be a single appendable exec (an exec call or an
-    // `IrStmt::Exec`); anything else is left for the renderer.
+    // Two consumer shapes are materialized:
+    //
+    // 1. Single appendable exec (diff <(a) <(b)) — the temp path is
+    //    appended as an argument (bash's /dev/fd/N argument passing).
+    // 2. ANY other consumer shape (while … done < <(cmd), compound
+    //    bodies) — the fd-0/fd-1 process redirect is REWRITTEN to a
+    //    plain temp-file redirect on the same fd; the consumer keeps its
+    //    original statements and reads the materialized file. Semantically
+    //    equal unless producer and consumer interact through the stream.
     let appendable = matches!(
         inner.as_slice(),
         [IrStmt::Expr(IrExpr::Call { func, .. })] if func == "exec"
     ) || matches!(inner.as_slice(), [IrStmt::Exec { .. }]);
+    let has_process = redirects
+        .iter()
+        .any(|r| r.mode == "process-in" || r.mode == "process-out");
     if !appendable {
-        return None;
+        if !has_process {
+            return None;
+        }
+        // Non-exec consumer: retarget each process redirect at a fresh
+        // temp file, pre-run the producers, clean up after.
+        let mut pre: Vec<IrStmt> = Vec::new();
+        let mut post: Vec<IrStmt> = Vec::new();
+        let mut cleanup: Vec<IrExpr> = Vec::new();
+        let mut new_redirects: Vec<IrRedirect> = Vec::new();
+        for r in redirects.iter_mut() {
+            if r.mode != "process-in" && r.mode != "process-out" {
+                new_redirects.push(r.clone());
+                continue;
+            }
+            let text = match &r.target {
+                IrExpr::Str(s, _) => s.clone(),
+                _ => return None,
+            };
+            let mut producer = parse_producer(&text)?;
+            materialize(&mut producer, n);
+            let tmp = format!("__ps_tmp{n}");
+            *n += 1;
+            let tmp_v = var(&tmp);
+            pre.push(mktemp_assign(&tmp));
+            cleanup.push(tmp_v.clone());
+            let (fd, mode) = if r.mode == "process-in" {
+                (Some(0), "r")
+            } else {
+                (Some(0), "w")
+            };
+            new_redirects.push(IrRedirect {
+                fd,
+                mode: mode.to_string(),
+                target: tmp_v.clone(),
+                interpolate: false,
+            });
+            pre.push(producer_redirect(producer, &tmp_v, mode, fd));
+        }
+        if !cleanup.is_empty() {
+            post.push(rm_exec(&cleanup));
+        }
+        let mut out = pre;
+        out.push(IrStmt::Redirect {
+            inner: std::mem::take(inner),
+            redirects: new_redirects,
+        });
+        out.extend(post);
+        return Some(IrStmt::Block(out));
     }
     let cmd_name = exec_cmd_name(inner);
     let stdin_only = cmd_name.as_deref().map(stdin_only_command).unwrap_or(false);

@@ -886,6 +886,17 @@ impl JavaRender {
                     Ok(())
             }
 
+            IrExpr::Call { func, args, .. } if func == "block" => {
+                // block(Arrow(body)) in value position: render the body's
+                // statements (side effects) — value is empty
+                for a in args.iter() {
+                    if let IrExpr::Arrow(stmts) = a {
+                        for st in stmts.iter() { self.stmt(st)?; }
+                    }
+                }
+                self.emit("__SH_RC = 0;");
+                Ok(())
+            }
             IrExpr::Call { func, .. } if func == "continue" => { self.emit("continue;"); Ok(()) }
             IrExpr::Call { func, .. } if func == "break" => { self.emit("break;"); Ok(()) }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
@@ -1206,6 +1217,10 @@ impl JavaRender {
                 IrExpr::Array(items) => {
                     for it in items { out.push(self.expr_str(it)?); }
                 }
+                // command-scoped env object (VAR=x cmd): tracked exports
+                // cover the child-env case; per-command overrides are a
+                // documented limitation
+                IrExpr::Object(_) => {}
                 other => out.push(self.expr_str(other)?),
             }
         }
@@ -2287,6 +2302,13 @@ impl JavaRender {
                     let mut parts_v = vec![format!("shQuote({})", words[0])];
                     for w in words.iter().skip(1) { parts_v.push(format!("shQuote({w})")); }
                     parts.push(parts_v.join(" + \" \" + "));
+                }
+                IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "block" => {
+                    let mut sub = Vec::new();
+                    if let Some(IrExpr::Arrow(body)) = args.first() {
+                        sub.push(self.arrow_expr(body)?);
+                    }
+                    parts.push(sub.join(" + \" ; \" + "));
                 }
                 IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "pipeline" => {
                     let mut sp = Vec::new();
