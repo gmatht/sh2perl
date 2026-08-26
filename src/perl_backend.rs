@@ -489,6 +489,57 @@ impl Render {
                         parts.push(format!("test {}", t));
                     }
                 }
+                // nested pipeline EXPRESSION inside the capture body:
+                // `echo x | grep y` → stage words joined with |
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+                    if let Some(IrExpr::Array(stages)) = args.get(0) {
+                        let mut stage_parts: Vec<String> = Vec::new();
+                        for st in stages.iter() {
+                            if let IrExpr::Arrow(body) = st {
+                                stage_parts.push(self.shell_cmd(body, "; "));
+                            } else {
+                                stage_parts.push(String::new());
+                            }
+                        }
+                        if stage_parts.iter().any(|s| s.is_empty()) {
+                            self.mark_todo("capture body stmt");
+                        }
+                        parts.push(stage_parts.join(" | "));
+                    }
+                }
+                // builtin statements render as their shell words too — the
+                // qx capture runs them through /bin/sh where echo/printf/
+                // cd behave identically (the capture needs their OUTPUT,
+                // which only a real process produces when external commands
+                // are also in the body)
+                IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })
+                    if f2 == "builtin"
+                        && matches!(
+                            a2.first(),
+                            Some(IrExpr::Str(c, _))
+                                if matches!(c.as_str(), "echo" | "printf")
+                        ) =>
+                {
+                    let mut words: Vec<String> = Vec::new();
+                    if let Some(IrExpr::Array(items)) = a2.get(1) {
+                        for w in items {
+                            words.push(self.shell_word(w));
+                        }
+                    }
+                    parts.push(words.join(" "));
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    // each stage is an Arrow(body): render its statements
+                    // into this same shell-string machinery
+                    let mut stage_parts: Vec<String> = Vec::new();
+                    for st in stages.iter() {
+                        stage_parts.push(self.shell_cmd(st, "; "));
+                    }
+                    if stage_parts.iter().any(|s| s.is_empty()) {
+                        self.mark_todo("capture body stmt");
+                    }
+                    parts.push(stage_parts.join(" | "));
+                }
                 _ => {
                     self.mark_todo("capture body stmt");
                 }
