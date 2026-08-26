@@ -513,11 +513,11 @@ Escape analysis must account for frontend-specific lifetime rules:
 |---|---|---|---|
 | bash | mutable (in-place split OK) | scope-bounded | usually yes |
 | C | mutable (by design) | manual | yes if no escape |
-| Go | immutable | GC-tracked | unnecessary |
+| Go | immutable | IR-provable (lifetime known) | usually unnecessary — most vars become InlineBuffer or ManagedString |
 | Rust | depends on type | ownership-checked | unnecessary |
 | Zsh | mutable like bash | scope-bounded | usually yes |
 | Fish | immutable lists | GC | unnecessary |
-| PowerShell | objects, mutable properties | GC | unnecessary |
+| PowerShell | objects, mutable properties | IR-provable for scalars | usually unnecessary |
 
 For backends targeting GC'd languages (JS, Go), arena allocation and
 in-place mutation are unnecessary complexity — the runtime handles it.
@@ -656,9 +656,16 @@ frontend emitted it:
 
 | Guarantee | sh/bash/zsh | C/C++ | Rust | Go | Python |
 |---|---|---|---|---|---|
-| Copy-on-assign | ✅ guaranteed | ❌ pointers alias | per-type | strings immutable | strings immutable |
-| In-place mutation safe? | if liveness-proven | needs alias analysis | borrow checker | N/A for strings | N/A |
-| Uniqueness provable at compile time? | YES (each assign copies) | NO (aliasing possible) | YES (borrow checker) | YES (immutable) | YES (immutable) |
+| Copy-on-assign at SOURCE level | ✅ guaranteed | ❌ pointers alias | per-type | strings immutable | strings immutable |
+| In-place mutation safe at SOURCE level? | if liveness-proven | needs alias analysis | borrow checker | N/A for source strings | N/A |
+| **After shIR analysis: uniqueness provable?** | **YES** | **usually yes** (most vars don't alias) | **YES** | **YES** (IR tracks lifetime) | **YES** (IR tracks lifetime) |
+
+**The compiler advantage**: the SOURCE language needs GC/runtime tracking
+because it cannot analyse the program at parse time. The shIR CAN — it
+sees every assignment, every read, and every scope boundary. A variable
+that a Python runtime must GC-track because its type is unknown at
+parse time has a KNOWN type in our IR (from usage patterns). The GC
+was compensating for missing compile-time information that we now have.
 
 For sh/bash frontends: every assignment does strdup/copy. Two variables
 NEVER share the same buffer. So in-place mutation of one variable cannot
@@ -722,3 +729,31 @@ and C++ frontends mature, they must either:
 
 Without this trust boundary, enabling the transform globally would be
 UNSOUND for C-frontend scripts that use pointer aliasing.
+
+### The compiler advantage: eliminating runtime machinery through analysis
+
+The source language needs GC/runtime tracking because the RUNTIME cannot
+analyse the program — it discovers types and lifetimes during execution.
+Our shIR pipeline sees the ENTIRE program at translation time:
+
+| Runtime mechanism in source lang | Why the source needs it | Why our IR doesn't |
+|---|---|---|
+| Python `gc.collect()` | Types unknown at parse time | `var_types` + usage patterns determine type per var |
+| Go `runtime.GC()` | Escape analysis too expensive at compile time | `var_lifetimes.escapes` proves scope-boundedness per var |
+| JS garbage collector | Closures create unbounded lifetimes | `escape_classes` classifies each capture as Local/Store |
+| Perl SV refcounting | Dynamic sigils defeat static typing | Each var has ONE sigil, known from declaration |
+
+**The translator's advantage**: we see the whole program. The source
+runtime only sees one variable at a time. Every "the compiler can't
+know this" in the source language becomes "we computed this" in the IR.
+
+This means: for MOST variables from ANY frontend, the storage-class
+selector should find InlineBuffer or ManagedString — NOT "needs GC."
+The GC was compensating for missing compile-time information that our
+IR now provides. Only genuinely dynamic constructs (eval, indirect
+access through data-driven names) require runtime-managed storage.
+
+**Practical implication**: the default storage class should be
+InlineBuffer or ManagedString for ALL frontends, not just bash.
+The "unnecessary (GC)" classification was premature — it gave up on
+analysis that our IR actually supports.
