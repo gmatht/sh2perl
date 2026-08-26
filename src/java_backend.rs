@@ -87,10 +87,12 @@ impl JavaRender {
     }
 
     fn decl_target(&mut self, t: AssignTarget) -> Result<(), String> {
-        if t.indices.is_empty() {
-            self.fields.insert(sanitize(&t.var));
+        if !t.indices.is_empty() || t.var.contains('[') {
+            // arr[i]=v arrives as var="arr[1]", indices empty
+            let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+            self.arrays.insert(sanitize(&base));
         } else {
-            self.arrays.insert(sanitize(&t.var));
+            self.fields.insert(sanitize(&t.var));
         }
         Ok(())
     }
@@ -264,6 +266,7 @@ impl JavaRender {
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
+        "aslice",
         ];
         for h in all_helpers {
             if let Some(src) = helper_src(h) {
@@ -281,6 +284,22 @@ impl JavaRender {
             IrStmt::Expr(e) => self.expr_stmt(e),
             IrStmt::Assign { targets, expr, .. } => {
                 let t = targets.first().ok_or("assign: no target")?;
+                if t.indices.is_empty() && t.var.contains('[') && t.var.ends_with(']') {
+                    // arr[N]=value (the parser keeps the subscript in the name)
+                    let lb = t.var.find('[').unwrap();
+                    let base = &t.var[..lb];
+                    let idx = &t.var[lb + 1..t.var.len() - 1];
+                    let val = self.expr_str(expr)?;
+                    if let Ok(k) = idx.trim().parse::<i64>() {
+                        self.helper("aset");
+                        self.emit(&format!("shAset(__a_{}, {k}L, {val});", sanitize(base)));
+                    } else {
+                        // assoc-style key: hash by key into the list (approx)
+                        self.helper("aset");
+                        self.emit(&format!("shAset(__a_{}, shNum({}), {val});", sanitize(base), jstr(idx.trim())));
+                    }
+                    return Ok(());
+                }
                 if !t.indices.is_empty() {
                     // arr[i] = value → list set (grow with empties)
                     let idx = self.expr_num(&t.indices[0])?;
@@ -735,7 +754,7 @@ impl JavaRender {
                 self.arrays.insert(sanitize(name));
                 self.emit(&format!("__a_{} = new ArrayList<>(List.of(new String[]{{{parts}}}));", sanitize(name)));
                 self.emit("__SH_RC = 0;");
-                Ok(())
+                return Ok(());
             }
             IrExpr::Call { func, args, .. } if func == "setArrayAppend" => {
                 let name = str_arg(args, 0).ok_or("setArrayAppend: no name")?;
@@ -1068,7 +1087,7 @@ impl JavaRender {
                 Ok(())
             }
             "unset" => {
-                for w in rest {
+                for w in flatten_words(rest) {
                     if let IrExpr::Str(s, _) = w {
                         let n = s.trim_start_matches("$");
                         self.ensure_field(n);
@@ -1081,7 +1100,15 @@ impl JavaRender {
             "local" | "typeset" | "declare" => {
                 // bash locals are function-scoped dynamics; java fields are
                 // global — same-store approximation (documented limitation)
-                for w in rest {
+                for w in flatten_words(rest) {
+                    if matches!(w, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
+                        // declare arr=(elems): nested setArray call
+                        self.expr_stmt(w)?;
+                        continue;
+                    }
+                    if let IrExpr::Array(items) = w {
+                        continue; // bare array literal without name: nothing to bind
+                    }
                     if let IrExpr::Str(s, _) = w {
                         let n = s.trim_start_matches("declare ").split('=').next().unwrap_or(s).trim().to_string();
                         if let Some(eq) = s.find('=') {
@@ -2072,6 +2099,26 @@ impl JavaRender {
                 Ok(format!("({base}.isEmpty() ? \"\" : {a})"))
             }
             "slice" => {
+                // ARRAY slice: ${arr[@]:off:len} — element join, not string.
+                // The core drops the @ marker when the var is a known array,
+                // so array-ness alone selects this path.
+                if args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)) == Some("@")
+                    || (self.arrays.contains(&sanitize(&name))
+                        && !args.get(2).map(|e| str_arg(std::slice::from_ref(e), 0).unwrap_or_default().is_empty()).unwrap_or(true))
+                {
+                    let has_at = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)) == Some("@");
+                    let (oi, li) = if has_at { (3usize, 4usize) } else { (2usize, 3usize) };
+                    let off = match args.get(oi) {
+                        Some(e) => self.expr_num(e)?,
+                        None => "0L".to_string(),
+                    };
+                    let len = match args.get(li) {
+                        Some(e) => self.expr_num(e)?,
+                        None => "-1L".to_string(),
+                    };
+                    self.helper("aslice");
+                    return Ok(format!("shAslice(__a_{}, {off}, {len})", sanitize(&name)));
+                }
                 // offsets may arrive as raw "$i" text — expand natively
                 let num_of = |r: &mut Self, e: Option<&IrExpr>| -> Result<String, String> {
                     match e {
@@ -2424,6 +2471,27 @@ impl JavaRender {
             }
             other => Err(format!("command-chain side not representable: {other:?}")),
         }
+    }
+
+    /// Emit population of array field __a_<name> from item expressions;
+    /// shSplit-wrapped items become addAll (word splitting).
+    fn emit_array_populate(&mut self, name: &str, items: &[IrExpr], clear: bool) -> Result<(), String> {
+        self.arrays.insert(sanitize(name));
+        if clear {
+            self.emit(&format!("__a_{} = new ArrayList<>();", sanitize(name)));
+        }
+        for w in flatten_words(items) {
+            let e = self.expr_str(w)?;
+            if let Some(r) = e.strip_prefix("String.join(\" \", shSplit(") {
+                let inner = r.strip_suffix("))").unwrap_or(r);
+                self.emit(&format!("__a_{}.addAll(shSplit({inner}));", sanitize(name)));
+            } else if e.starts_with("shSplit(") {
+                self.emit(&format!("__a_{}.addAll({e});", sanitize(name)));
+            } else {
+                self.emit(&format!("__a_{}.add({e});", sanitize(name)));
+            }
+        }
+        Ok(())
     }
 
     /// One arg → pieces (java expr, needs_quotes). Glob-marked patterns and
@@ -3148,6 +3216,15 @@ fn helper_src(name: &str) -> Option<&'static str> {
         "regex" => r#"    static boolean shRegex(String pat, String flags) { return false; }
 "#,
         "incdec" => "",
+        "aslice" => r#"    static String shAslice(List<String> a, long off, long len) {
+        long start = off < 0 ? a.size() + off : off;
+        if (start < 0) start = 0;
+        long end = len < 0 ? a.size() : start + len;
+        if (end > a.size()) end = a.size();
+        if (end <= start) return "";
+        return String.join(" ", a.subList((int) start, (int) end));
+    }
+"#,
         "testrc" => r#"    static boolean shTestRc(boolean b) {
         __SH_RC = b ? 0 : 1;
         return b;
@@ -3417,3 +3494,16 @@ fn unbalanced_cmdsub(s: &str) -> bool {
 }
 
 fn sep_of(func: &str) -> &'static str { if func == "and" { " && " } else { " || " } }
+
+/// Element slice of a bash array: ${arr[@]:off:len} joined with spaces.
+fn sh_aslice_src() -> &'static str {
+    r#"    static String shAslice(List<String> a, long off, long len) {
+        long start = off < 0 ? a.size() + off : off;
+        if (start < 0) start = 0;
+        long end = len < 0 ? a.size() : start + len;
+        if (end > a.size()) end = a.size();
+        if (end <= start) return "";
+        return String.join(" ", a.subList((int) start, (int) end));
+    }
+"#
+}
