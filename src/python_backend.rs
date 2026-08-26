@@ -2177,9 +2177,21 @@ impl Render {
                             let mut simple = false;
                             if let [IrStmt::Expr(e)] = body.as_slice() {
                                 if let IrExpr::Call { func, args } = e {
-                                    if func == "exec" {
-                                        let argv = self.build_argv(args);
-                                        parts.push(argv.join(" "));
+                                    if func == "exec" || func == "builtin" {
+                                        // SHELL words via sh_arg (not python
+                                        // expr which can leak f-string syntax)
+                                        let mut one = Vec::new();
+                                        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                            one.push(Self::sh_quote(cmd));
+                                        }
+                                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                                            for it in items.iter() {
+                                                if let Some(w) = self.sh_arg(it) {
+                                                    one.push(w);
+                                                }
+                                            }
+                                        }
+                                        parts.push(one.join(" "));
                                         simple = true;
                                     } else if func == "redirect" {
                                         // <(...) process-substitution stage:
@@ -2246,6 +2258,17 @@ impl Render {
                 } else {
                     None
                 }
+            }
+            // Interpolate with only Lit parts: the joined text (shell-quoted)
+            IrExpr::Interpolate(parts) => {
+                let mut t = String::new();
+                for p in parts.iter() {
+                    match p {
+                        crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                        _ => return None,
+                    }
+                }
+                Some(Self::sh_quote(&t))
             }
             _ => None,
         }
