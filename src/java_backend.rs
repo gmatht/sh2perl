@@ -1118,22 +1118,44 @@ impl JavaRender {
                 Ok(())
             }
             "local" | "typeset" | "declare" => {
-                // bash locals are function-scoped dynamics; java fields are
-                // global — same-store approximation (documented limitation)
-                for w in flatten_words(rest) {
+                for w in rest.iter() {
                     if matches!(w, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
                         // declare arr=(elems): nested setArray call
                         self.expr_stmt(w)?;
                         continue;
                     }
+                    // composite word: Array([Str("name="), value-exprs...])
                     if let IrExpr::Array(items) = w {
-                        continue; // bare array literal without name: nothing to bind
+                        let mut nm: Option<String> = None;
+                        for it in items.iter() {
+                            match it {
+                                IrExpr::Str(t, _) => {
+                                    if let Some(eq) = t.find('=') {
+                                        let (n0, v0) = (&t[..eq], &t[eq + 1..]);
+                                        self.ensure_field(n0);
+                                        if !v0.is_empty() {
+                                            self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0)));
+                                        } else {
+                                            nm = Some(n0.to_string());
+                                        }
+                                    } else if nm.is_none() {
+                                        nm = Some(t.clone());
+                                    }
+                                }
+                                other => {
+                                    if let Some(base) = &nm {
+                                        let v = self.expr_str(other)?;
+                                        self.emit(&format!("__v_{} = {v};", sanitize(base)));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
                     }
-                    if let IrExpr::Str(s, _) = w {
-                        let n = s.trim_start_matches("declare ").split('=').next().unwrap_or(s).trim().to_string();
-                        if let Some(eq) = s.find('=') {
-                            self.ensure_field(&s[..eq]);
-                            self.emit(&format!("__v_{} = {};", sanitize(&s[..eq]), jstr(&s[eq + 1..])));
+                    if let IrExpr::Str(s2, _) = w {
+                        if let Some(eq) = s2.find('=') {
+                            self.ensure_field(&s2[..eq]);
+                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(&s2[eq + 1..])));
                         }
                     }
                 }
@@ -1447,6 +1469,37 @@ impl JavaRender {
 
     /// Expand $name/${name}/$#/$?/$N in raw shell text to a Java
     /// concatenation expression.
+    /// True when every $-form in s is one expand_dollars understands.
+    fn dollar_expand_ok(&self, s: &str) -> bool {
+        let ch: Vec<char> = s.chars().collect();
+        let mut i = 0usize;
+        while i < ch.len() {
+            if ch[i] != '$' { i += 1; continue; }
+            if i + 1 >= ch.len() { return false; }
+            match ch[i + 1] {
+                '{' => {
+                    let mut j = i + 2;
+                    while j < ch.len() && ch[j] != '}' { j += 1; }
+                    if j >= ch.len() { return false; }
+                    let inner: String = ch[i + 2..j].iter().collect();
+                    let ok = inner.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                        || inner.chars().all(|c| c.is_ascii_digit())
+                        || matches!(inner.as_str(), "?" | "#" | "@" | "*" | "$");
+                    if !ok { return false; }
+                    i = j + 1;
+                }
+                '(' => return false, // command substitution needs the child path
+                c if c.is_ascii_digit() || matches!(c, '?' | '#' | '@' | '*' | '!' | '$') => i += 1,
+                c if c.is_ascii_alphabetic() || c == '_' => {
+                    i += 1;
+                    while i < ch.len() && (ch[i].is_ascii_alphanumeric() || ch[i] == '_') { i += 1; }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     fn expand_dollars(&mut self, raw: &str) -> Result<String, String> {
         // strip shell-quote artifacts around the operand
         let t = raw.trim();
@@ -1754,10 +1807,21 @@ impl JavaRender {
 
     fn expr_str_inner(&mut self, e: &IrExpr) -> Result<String, String> {
         match e {
-            IrExpr::Str(s, _) => {
+            IrExpr::Str(s, style) => {
                 // \u{1}SH2GLOB\u{1} marks glob-to-expand patterns; bash-text
                 // children glob the bare pattern naturally
                 let cleaned = s.replace("\u{1}SH2GLOB\u{1}", "");
+                // Double-quoted strings carrying raw $refs ($1, ${x:-d},
+                // $(cmd)) expand natively — mirrors estree emitting
+                // template-literal interpolation. Single-quoted stays literal.
+                if cleaned.contains('$')
+                    && !matches!(style, StrStyle::SingleQuoted)
+                    && self.dollar_expand_ok(&cleaned)
+                {
+                    if let Ok(expanded) = self.expand_dollars(&cleaned) {
+                        return Ok(expanded);
+                    }
+                }
                 Ok(jstr(&cleaned))
             }
             IrExpr::Int(i) => Ok(format!("String.valueOf((long) {i})")),
