@@ -2081,6 +2081,34 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             out.push_str(";\n");
             return Ok(());
         }
+        IrExpr::Interpolate(parts) => {
+            // `"text"` / `""` — concatenate Lit parts into one string
+            let mut lit = String::new();
+            let mut has_expr = false;
+            let mut out_parts: Vec<String> = Vec::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(s) => lit.push_str(s),
+                    crate::ir::InterpPart::Expr(x) => {
+                        if !lit.is_empty() {
+                            out_parts.push(java_str_lit(&lit));
+                            lit.clear();
+                        }
+                        has_expr = true;
+                        let mut sub = String::new();
+                        expr_to_java(x, &mut sub)?;
+                        out_parts.push(sub);
+                    }
+                }
+            }
+            if !has_expr {
+                out.push_str(&java_str_lit(&lit));
+            } else {
+                if !lit.is_empty() { out_parts.push(java_str_lit(&lit)); }
+                out.push_str(&out_parts.join(" + "));
+            }
+            Ok(())
+        }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
     }
 }
