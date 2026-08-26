@@ -1410,12 +1410,12 @@ impl JavaRender {
                     for it in items {
                         match it {
                             IrExpr::Str(s, _) => self.push_test_str(&mut w, s),
-                            other => w.push(TestTok::E(self.expr_str(other)?)),
+                            other => w.push(TestTok::E(self.expr_str(other)?, false)),
                         }
                     }
                 }
                 IrExpr::Str(s, _) => self.push_test_str(&mut w, s),
-                other => w.push(TestTok::E(self.expr_str(other)?)),
+                other => w.push(TestTok::E(self.expr_str(other)?, false)),
             }
         }
         self.test_tokens(&w)
@@ -1432,8 +1432,20 @@ impl JavaRender {
                 // trailing $ anchor must not be treated as a variable
                 w.push(TestTok::S(piece));
             } else if piece.contains('$') {
-                match self.expand_dollars(&piece) {
-                    Ok(e) => w.push(TestTok::E(e)),
+                // glob-ness judged on the QUOTE-STRIPPED form: "$p"* is an
+                // unquoted glob even though the raw token starts with a quote
+                let stripped = {
+                    let t = piece.trim();
+                    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') { &t[1..t.len() - 1] }
+                    else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') { &t[1..t.len() - 1] }
+                    else { t }
+                };
+                let is_glob = stripped.contains('*') || stripped.contains('?');
+                // test-operand quotes are word-quoting, not data: strip them
+                // so the expanded Java string holds the bare operand
+                let bare = piece.replace('"', "");
+                match self.expand_dollars(&bare) {
+                    Ok(e) => w.push(TestTok::E(e, is_glob)),
                     Err(_) => w.push(TestTok::S(piece)),
                 }
             } else {
@@ -1653,7 +1665,8 @@ impl JavaRender {
                         Ok(format!("(shNum({l}) {cmp} shNum({r}))"))
                     }
                     "=" | "=~" | "==" | "!=" if matches!(&w[2], TestTok::S(txt) if
-                        txt.starts_with('~') || txt.chars().any(|c| matches!(c, '*' | '?' | '['))) =>
+                        txt.chars().any(|c| matches!(c, '*' | '?' | '[')))
+                        || matches!(&w[2], TestTok::E(_, true)) =>
                     {
                         let neg = op == "!=";
                         if let TestTok::S(txt) = &w[2] {
@@ -2497,7 +2510,7 @@ impl JavaRender {
                         IrExpr::Str(t2, _) => self.push_test_str(&mut toks, t2),
                         other => {
                             let x = self.expr_str(other)?;
-                            toks.push(TestTok::E(x));
+                            toks.push(TestTok::E(x, false));
                         }
                     }
                 }
@@ -2773,12 +2786,12 @@ impl JavaRender {
 }
 
 #[derive(Debug, Clone)]
-enum TestTok { S(String), E(String) }
+enum TestTok { S(String), E(String, bool) } /* bool = original was an unquoted glob pattern */
 
 fn tok_str(t: &TestTok) -> String {
     match t {
         TestTok::S(s) => jstr(s),
-        TestTok::E(e) => e.clone(),
+        TestTok::E(e, _) => e.clone(),
     }
 }
 
