@@ -8580,6 +8580,7 @@ impl Render {
                 self.emit("{");
                 self.depth += 1;
                 let mut saves: Vec<String> = Vec::new();
+        let mut restores: Vec<String> = Vec::new();
                 for v in &assigned {
                     let id = self.c_ident(v);
                     if self.is_num(v) {
@@ -8590,7 +8591,10 @@ impl Render {
                         saves.push(format!("char _sv_{id}[{}];", b + 1));
                         saves.push(format!("strcpy(_sv_{id}, {id});"));
                     } else {
-                        saves.push(format!("char* _sv_{id} = {id};"));
+                        // deep copy for unbounded char* — an alias would
+                        // let body mutations leak through the restore
+                        saves.push(format!("char* _sv_{id} = {id} ? strdup({id}) : NULL;"));
+                        restores.push(format!("free({id}); {id} = _sv_{id};"));
                     }
                 }
                 for s in &saves {
