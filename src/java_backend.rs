@@ -1811,17 +1811,6 @@ impl JavaRender {
                 // \u{1}SH2GLOB\u{1} marks glob-to-expand patterns; bash-text
                 // children glob the bare pattern naturally
                 let cleaned = s.replace("\u{1}SH2GLOB\u{1}", "");
-                // Double-quoted strings carrying raw $refs ($1, ${x:-d},
-                // $(cmd)) expand natively — mirrors estree emitting
-                // template-literal interpolation. Single-quoted stays literal.
-                if cleaned.contains('$')
-                    && !matches!(style, StrStyle::SingleQuoted)
-                    && self.dollar_expand_ok(&cleaned)
-                {
-                    if let Ok(expanded) = self.expand_dollars(&cleaned) {
-                        return Ok(expanded);
-                    }
-                }
                 Ok(jstr(&cleaned))
             }
             IrExpr::Int(i) => Ok(format!("String.valueOf((long) {i})")),
