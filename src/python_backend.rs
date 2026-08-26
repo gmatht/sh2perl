@@ -3637,11 +3637,12 @@ impl Render {
                         "_old = sys.stdout; sys.stdout = open({p}, '{fd1_mode}')",
                         p = p, fd1_mode = fd1_mode
                     ));
-                    self.depth += 1;
+                    // NO extra indent: the swap/restore is not a python
+                    // block opener — inner statements stay at the same
+                    // level as the surrounding code
                     for s in inner.iter() {
                         self.stmt(s);
                     }
-                    self.depth -= 1;
                     self.emit("sys.stdout.close()");
                     self.emit("sys.stdout = _old");
                     return;
