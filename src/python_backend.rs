@@ -527,7 +527,12 @@ impl Render {
                     return Some(self.call("pipeline", args));
                 }
                 if func == "redirect" {
-                    return self.capture_redirect(args);
+                    // fall through to the native fd-fallback when the
+                    // redirect shape doesn't match (None), rather than
+                    // returning None from the whole ladder
+                    if let Some(c) = self.capture_redirect(args) {
+                        return Some(c);
+                    }
                 }
             }
         }
