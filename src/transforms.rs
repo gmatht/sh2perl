@@ -42,7 +42,19 @@ pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process 
 pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
 pub mod for_recovery; // counter-while → native For recovery
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
-pub mod i32_provable; // PROVABLY-32-bit arith annotations
+pub mod i32_provable;
+pub mod const_capture_fold;
+pub mod const_condition_elim;
+pub mod copy_propagation;
+pub mod counted_while_forinit;
+pub mod dead_store_elim;
+pub mod div_mod_pow2;
+pub mod hoist_loop_invariants;
+pub mod merge_init_assignments;
+pub mod redundant_store_elim;
+pub mod string_accumulator;
+pub mod test_simplification;
+pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -81,6 +93,19 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
         ("text-ops", text_ops::transform),
+        // core-requests/transforms/done batch merge (12 orphaned submissions)
+        ("const-capture-fold", const_capture_fold::transform),
+        ("const-condition-elim", const_condition_elim::transform),
+        ("copy-propagation", copy_propagation::transform),
+        ("counted-while-forinit", counted_while_forinit::transform),
+        ("dead-store-elim", dead_store_elim::transform),
+        ("div-mod-pow2", div_mod_pow2::transform),
+        ("hoist-loop-invariants", hoist_loop_invariants::transform),
+        ("merge-init-assignments", merge_init_assignments::transform),
+        ("redundant-store-elim", redundant_store_elim::transform),
+        ("string-accumulator", string_accumulator::transform),
+        ("test-simplification", test_simplification::transform),
+        ("unreachable-after-exit", unreachable_after_exit::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
         // GC'd languages ignore the flag — see shir_passes/split_inplace)

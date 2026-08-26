@@ -1,0 +1,1 @@
+{"contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"mm5.sh"},{"elements":[],"type":"Array"}],"func":"exec","purity":"Spawn","type":"Call"},"type":"Expr"}],"subs":[],"type":"Program","var_bash_env":[],"var_const":[],"var_lengths":[],"var_lifetimes":[],"var_nospace":[],"var_types":[]}

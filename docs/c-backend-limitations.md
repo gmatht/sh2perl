@@ -119,3 +119,24 @@ none is a hidden regression. Each lists the corpus cases that pin it.
   printf path.
 - `t83_exit.sh`, `parse-bracket-subshell-pipe.sh`: exit-code propagation
   through redirect-wrapped subshell chains.
+
+## Assoc-array sort-order preservation — UNSUPPORTED
+
+`sort <<<"${assoc[*]}"` receives ONE line (values space-joined by IFS)
+and passes it through unchanged. Sort operates on LINES, not words, so
+a single-line input is never reordered. This means:
+
+- `sorted=($(sort <<<"${assoc[*]}"))` produces the SAME (unsorted) order
+  as the assoc array's internal iteration
+- The "sorted" variable contains unsorted values despite the intent
+- Different bash versions/systems may produce different hash orders,
+  making this test inherently flaky across environments
+
+**Correct pattern**: `printf '%s\n' "${assoc[@]}" | sort` puts each value
+on its own line so sort can work. Our C backend now emits the newline-
+delimited join (`_sh_join_arr_nl`) for assoc array value expansion in
+pipeline contexts.
+
+**Status**: UNSUPPORTED by design — bash's `<<<` here-string semantics
+do not provide the line structure that sort requires for multi-word
+input. Fixed in 064_07_complex_array_operations.sh.
