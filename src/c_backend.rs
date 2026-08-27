@@ -6481,6 +6481,30 @@ impl Render {
                 }
             }
             "param" => self.param_call(args),
+            // Native lowering of the test-lowering transform's glob-affix
+            // primitives (CROSS_BACKEND_RUNTIME.md §8.1 — ESTree already
+            // lowers these; C must too, else a function whose own body
+            // lowers to `$(strHasPrefix …)` recurses infinitely with the
+            // pseudo-global model). These mirror bash `[[ "$s" ==
+            // "$p"* ]]` / `*"$p"` / `*"$p"*` exactly (empty pattern ⇒
+            // always true, matching bash).
+            "strHasPrefix" => {
+                let s = self.value_c(&args[0]);
+                let p = self.value_c(&args[1]);
+                format!("(strncmp({s}, {p}, strlen({p})) == 0)")
+            }
+            "strHasSuffix" => {
+                let s = self.value_c(&args[0]);
+                let p = self.value_c(&args[1]);
+                format!(
+                    "(strlen({s}) >= strlen({p}) && strcmp({s} + strlen({s}) - strlen({p}), {p}) == 0)"
+                )
+            }
+            "contains" => {
+                let s = self.value_c(&args[0]);
+                let p = self.value_c(&args[1]);
+                format!("(strstr({s}, {p}) != NULL)")
+            }
             "setVar" => {
                 let (Some(name), Some(value)) = (Self::str_arg(args, 0), args.get(1)) else {
                     return "0".into();
