@@ -56,18 +56,38 @@ enum EchoState {
 
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
-    // Pass 1 — recognition, to a FIXPOINT: a function whose body captures
-    // an ALREADY-eligible function (e.g. wcLines' `r=$(strCount ...)`) is
+    // Pass 1 — recognition, to a FIXPOINT over the call graph's STRONGLY
+    // CONNECTED COMPONENTS. A function whose body captures an
+    // ALREADY-eligible function (e.g. wcLines' `r=$(strCount ...)`) is
     // itself eligible once the callee is (the capture is then a pure value
-    // read — pass 3 collapses it to the bare fnValue). Iterate until no
-    // new names appear.
+    // read — pass 3 collapses it to the bare fnValue). The matchers'
+    // MUTUAL recursion (globMatch ↔ ext_alt_match ↔ ext_match) forms an
+    // SCC that a single-function fixpoint can never break — neither is
+    // eligible on the first pass, so neither ever becomes eligible. The
+    // SCC is recognized as a WHOLE: every function in it must pass with
+    // the coinductive assumption that captures of functions in the SAME
+    // SCC are pure (the recursion is a value read of the same pure
+    // functions), plus the eligible set for captures of OTHER SCCs (the
+    // condensation is a DAG — the fixpoint terminates). The SCC
+    // recognition is the SHARED analysis (`shir_passes::scc` — the same
+    // call-graph Tarjan the test-parser work and the glob-matcher lift
+    // consume).
+    let graph = crate::shir_passes::scc::build_call_graph_stmts(stmts);
+    let sccs = crate::shir_passes::scc::tarjan_sccs(&graph);
     let mut eligible: HashSet<String> = HashSet::new();
     loop {
         let mut grew = false;
-        for st in stmts.iter() {
-            if let IrStmt::Function { name, body, .. } = st {
-                if !eligible.contains(name) && body_echo_ok(body, &eligible) {
-                    eligible.insert(name.clone());
+        for scc in &sccs {
+            if scc.iter().any(|n| !eligible.contains(n)) {
+                let ok = scc.iter().all(|name| {
+                    let body = function_body(stmts, name);
+                    let scc_set: HashSet<String> = scc.iter().cloned().collect();
+                    body.map(|b| body_echo_ok(b, &eligible, &scc_set)).unwrap_or(false)
+                });
+                if ok {
+                    for n in scc {
+                        eligible.insert(n.clone());
+                    }
                     grew = true;
                 }
             }
@@ -100,10 +120,13 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 
 /// Is a statement list "echo-return": every path from the start to the
 /// block end (or a `return`) emits EXACTLY one single-arg echo?
-fn body_echo_ok(body: &[IrStmt], eligible: &HashSet<String>) -> bool {
+/// `scc` is the function's strongly connected component — captures of
+/// functions in the SAME scc are pure (the coinductive assumption for
+/// the mutual recursion).
+fn body_echo_ok(body: &[IrStmt], eligible: &HashSet<String>, scc: &HashSet<String>) -> bool {
     let mut states: HashSet<EchoState> = HashSet::new();
     states.insert(EchoState::Need);
-    let Some(final_states) = parse_stmts(body, &states, eligible) else {
+    let Some(final_states) = parse_stmts(body, &states, eligible, scc) else {
         return false;
     };
     // Every live path at the block end must have echoed (Done) or ended
@@ -120,10 +143,11 @@ fn parse_stmts(
     stmts: &[IrStmt],
     incoming: &HashSet<EchoState>,
     eligible: &HashSet<String>,
+    scc: &HashSet<String>,
 ) -> Option<HashSet<EchoState>> {
     let mut cur = incoming.clone();
     for st in stmts {
-        cur = parse_stmt(st, &cur, eligible)?;
+        cur = parse_stmt(st, &cur, eligible, scc)?;
         if cur.is_empty() {
             // every path ended (all returned) — the rest is unreachable
             return Some(cur);
@@ -136,13 +160,39 @@ fn parse_stmt(
     st: &IrStmt,
     states: &HashSet<EchoState>,
     eligible: &HashSet<String>,
+    scc: &HashSet<String>,
 ) -> Option<HashSet<EchoState>> {
     match st {
         // A single-arg value echo: Need → Done; Dead paths stay dead
         // (unreachable); a Done path would echo a second value → refuse.
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "builtin" | "exec")
-                && value_echo(args, eligible).is_some() =>
+                && value_echo(args, eligible, scc).is_some() =>
+        {
+            let mut out = HashSet::new();
+            for s in states {
+                match s {
+                    EchoState::Need => {
+                        out.insert(EchoState::Done);
+                    }
+                    EchoState::Dead => {
+                        out.insert(EchoState::Dead);
+                    }
+                    EchoState::Done => return None,
+                }
+            }
+            Some(out)
+        }
+        // A bare call to a function in the SAME SCC or an already-eligible
+        // function (the matchers' bare-statement recursion —
+        // `ext_match "$c" "$p" "$v"; return`): the callee ECHOES its
+        // value, so the path's output is the callee's value — an echo
+        // (Need → Done). The rewrite turns it into a value return of the
+        // fnValue result.
+        IrStmt::Expr(IrExpr::Call { func, args, .. })
+            if matches!(func.as_str(), "exec" | "fnCall")
+                && matches!(args.first(), Some(IrExpr::Str(fname, _))
+                    if scc.contains(fname) || eligible.contains(fname)) =>
         {
             let mut out = HashSet::new();
             for s in states {
@@ -170,7 +220,7 @@ fn parse_stmt(
         }
         // Silent statements (pure assignments/decls/loops/ifs) pass
         // through unchanged.
-        _ if stmt_silent(st, eligible) => Some(states.clone()),
+        _ if stmt_silent(st, eligible, scc) => Some(states.clone()),
         // A conditional: every arm must satisfy the discipline; the
         // outcomes union. An empty else falls through (state unchanged).
         IrStmt::If {
@@ -179,30 +229,47 @@ fn parse_stmt(
             elsifs,
             else_,
         } => {
-            if !expr_pure(cond, eligible) {
+            if !expr_pure(cond, eligible, scc) {
                 return None;
             }
             let mut out = HashSet::new();
-            out.extend(parse_stmts(then, states, eligible)?);
+            out.extend(parse_stmts(then, states, eligible, scc)?);
             for (ec, eb) in elsifs {
-                if !expr_pure(ec, eligible) {
+                if !expr_pure(ec, eligible, scc) {
                     return None;
                 }
-                out.extend(parse_stmts(eb, states, eligible)?);
+                out.extend(parse_stmts(eb, states, eligible, scc)?);
             }
-            out.extend(parse_stmts(else_, states, eligible)?);
+            out.extend(parse_stmts(else_, states, eligible, scc)?);
+            Some(out)
+        }
+        // the matchers' `case` dispatch — parse each clause body, union
+        // the outcomes (any clause may match at runtime; the last `*)`
+        // default always matches)
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
+            if !expr_pure(discriminant, eligible, scc) {
+                return None;
+            }
+            let mut out = HashSet::new();
+            for clause in clauses {
+                let r = parse_stmts(&clause.body, states, eligible, scc);
+                out.extend(r?);
+            }
             Some(out)
         }
         // Loops: the body may not reach `Done` (an echo without a return
         // would re-echo on the next iteration — 2+ echoes). A Need-iteration
         // loops on; a Dead iteration ends the path. 0 iterations → Need
         // (the state passes through).
-        IrStmt::While { cond, body } => loop_states(cond, body, states, eligible),
+        IrStmt::While { cond, body } => loop_states(cond, body, states, eligible, scc),
         IrStmt::For { iter, body, .. } => {
-            if !expr_pure(iter, eligible) {
+            if !expr_pure(iter, eligible, scc) {
                 return None;
             }
-            loop_body_states(body, states, eligible)
+            loop_body_states(body, states, eligible, scc)
         }
         IrStmt::ForInit {
             init,
@@ -210,15 +277,15 @@ fn parse_stmt(
             step,
             body,
         } => {
-            if init.iter().any(|s| !stmt_silent(s, eligible))
-                || !expr_pure(cond, eligible)
-                || step.iter().any(|s| !stmt_silent(s, eligible))
+            if init.iter().any(|s| !stmt_silent(s, eligible, scc))
+                || !expr_pure(cond, eligible, scc)
+                || step.iter().any(|s| !stmt_silent(s, eligible, scc))
             {
                 return None;
             }
-            loop_body_states(body, states, eligible)
+            loop_body_states(body, states, eligible, scc)
         }
-        _ => None,
+        other => None,
     }
 }
 
@@ -227,11 +294,12 @@ fn loop_states(
     body: &[IrStmt],
     states: &HashSet<EchoState>,
     eligible: &HashSet<String>,
+    scc: &HashSet<String>,
 ) -> Option<HashSet<EchoState>> {
-    if !expr_pure(cond, eligible) {
+    if !expr_pure(cond, eligible, scc) {
         return None;
     }
-    loop_body_states(body, states, eligible)
+    loop_body_states(body, states, eligible, scc)
 }
 
 /// The loop body's per-iteration outcomes must be ⊆ {Need} — an echo
@@ -244,8 +312,13 @@ fn loop_body_states(
     body: &[IrStmt],
     states: &HashSet<EchoState>,
     eligible: &HashSet<String>,
+    scc: &HashSet<String>,
 ) -> Option<HashSet<EchoState>> {
-    let iter = parse_stmts(body, states, eligible)?;
+    let iter = parse_stmts(body, states, eligible, scc);
+    if iter.is_none() {
+        return None;
+    }
+    let iter = iter.unwrap();
     if iter.contains(&EchoState::Done) || iter.contains(&EchoState::Dead) {
         return None;
     }
@@ -255,7 +328,11 @@ fn loop_body_states(
 /// A single-arg value echo: `builtin("echo", [Array([word])])` /
 /// `exec("echo", [Array([word])])` — one word, no `-n`/`-e` flags. The
 /// word must be a pure value expression (the returned value).
-fn value_echo<'a>(args: &'a [IrExpr], eligible: &HashSet<String>) -> Option<&'a IrExpr> {
+fn value_echo<'a>(
+    args: &'a [IrExpr],
+    eligible: &HashSet<String>,
+    scc: &HashSet<String>,
+) -> Option<&'a IrExpr> {
     let [IrExpr::Str(n, _), IrExpr::Array(words)] = args else {
         return None;
     };
@@ -265,7 +342,7 @@ fn value_echo<'a>(args: &'a [IrExpr], eligible: &HashSet<String>) -> Option<&'a 
     let [word] = words.as_slice() else {
         return None;
     };
-    if !expr_pure(word, eligible) {
+    if !expr_pure(word, eligible, scc) {
         return None;
     }
     Some(word)
@@ -273,11 +350,15 @@ fn value_echo<'a>(args: &'a [IrExpr], eligible: &HashSet<String>) -> Option<&'a 
 
 /// Is the statement side-effect-free beyond the local store (no stdout,
 /// no exec/capture/redirect/background/subshell, no status reads)?
-fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
+fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>, scc: &HashSet<String>) -> bool {
     match st {
-        IrStmt::Assign { expr, .. } => expr_pure(expr, eligible),
-        IrStmt::Declare { init, .. } => init.as_ref().map(|i| expr_pure(i, eligible)).unwrap_or(true),
-        IrStmt::DeclareArray { elements, .. } => elements.iter().all(|e| expr_pure(e, eligible)),
+        IrStmt::Assign { expr, .. } => expr_pure(expr, eligible, scc),
+        IrStmt::Declare { init, .. } => {
+            init.as_ref().map(|i| expr_pure(i, eligible, scc)).unwrap_or(true)
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            elements.iter().all(|e| expr_pure(e, eligible, scc))
+        }
         // `local x="$1"` / `declare -i n` / `shift` — the runtime decl
         // builtins with pure value args are silent (function-scoped store
         // writes).
@@ -286,7 +367,13 @@ fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
         {
             if let Some(IrExpr::Str(n, _)) = args.first() {
                 if matches!(n.as_str(), "local" | "declare" | "typeset" | "readonly" | "shift") {
-                    return args.iter().skip(1).all(|a| expr_pure(a, eligible));
+                    return args.iter().skip(1).all(|a| expr_pure(a, eligible, scc));
+                }
+                // a call to a function in the SAME SCC (the matchers'
+                // mutual recursion) or an already-eligible function — a
+                // pure value read
+                if scc.contains(n) || eligible.contains(n) {
+                    return args.iter().skip(1).all(|a| expr_pure(a, eligible, scc));
                 }
             }
             false
@@ -294,11 +381,12 @@ fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
         // A `while IFS= read -r line` loop (line_count's shape): the read
         // builtin consumes stdin, emits nothing — silent when the body is.
         IrStmt::While { cond, body } => {
-            (is_read_loop(cond) || expr_pure(cond, eligible))
-                && body.iter().all(|s| stmt_silent(s, eligible))
+            (is_read_loop(cond) || expr_pure(cond, eligible, scc))
+                && body.iter().all(|s| stmt_silent(s, eligible, scc))
         }
         IrStmt::For { iter, body, .. } => {
-            expr_pure(iter, eligible) && body.iter().all(|s| stmt_silent(s, eligible))
+            expr_pure(iter, eligible, scc)
+                && body.iter().all(|s| stmt_silent(s, eligible, scc))
         }
         IrStmt::If {
             cond,
@@ -306,14 +394,15 @@ fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
             elsifs,
             else_,
         } => {
-            expr_pure(cond, eligible)
-                && then.iter().all(|s| stmt_silent(s, eligible))
-                && elsifs
-                    .iter()
-                    .all(|(c, b)| expr_pure(c, eligible) && b.iter().all(|s| stmt_silent(s, eligible)))
-                && else_.iter().all(|s| stmt_silent(s, eligible))
+            expr_pure(cond, eligible, scc)
+                && then.iter().all(|s| stmt_silent(s, eligible, scc))
+                && elsifs.iter().all(|(c, b)| {
+                    expr_pure(c, eligible, scc)
+                        && b.iter().all(|s| stmt_silent(s, eligible, scc))
+                })
+                && else_.iter().all(|s| stmt_silent(s, eligible, scc))
         }
-        IrStmt::Block(body) => body.iter().all(|s| stmt_silent(s, eligible)),
+        IrStmt::Block(body) => body.iter().all(|s| stmt_silent(s, eligible, scc)),
         // a `break` (the loop-return-lift transform's flag+break) exits
         // the loop — no output, silent
         IrStmt::Break => true,
@@ -322,8 +411,8 @@ fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
         IrStmt::Redirect { inner, redirects } => {
             redirects.iter().all(|r| {
                 matches!(r.mode.as_str(), "herestring" | "heredoc")
-                    && expr_pure(&r.target, eligible)
-            }) && inner.iter().all(|s| stmt_silent(s, eligible))
+                    && expr_pure(&r.target, eligible, scc)
+            }) && inner.iter().all(|s| stmt_silent(s, eligible, scc))
         }
         _ => false,
     }
@@ -345,25 +434,29 @@ fn is_read_loop(cond: &IrExpr) -> bool {
 /// exec/capture/pipeline/background/subshell/file-write/`$?`; the pure
 /// sh2.* namespace calls (param/join/contains/strLen/…) and the local
 /// store reads (getVar) pass.
-fn expr_pure(e: &IrExpr, eligible: &HashSet<String>) -> bool {
+fn expr_pure(e: &IrExpr, eligible: &HashSet<String>, scc: &HashSet<String>) -> bool {
     match e {
         // A capture of an ALREADY-eligible function is a pure value read
         // (pass 3 collapses it to the bare fnValue) — the fixpoint lets
         // wcLines' `r=$(strCount ...)` through once strCount is eligible.
-        // The callee may be a bare Call (the direct_calls collapse) or an
-        // Arrow wrapping a single call statement (a loop-bearing callee
-        // like strCount stays an Arrow — direct_calls refuses loops).
+        // A capture of a function in the SAME SCC (the matchers' mutual
+        // recursion — globMatch calls `$(ext_alt_match ...)` and vice
+        // versa) is pure too: the recursion is a value read of the same
+        // pure functions (the coinductive assumption — the SCC is
+        // recognized as a whole). The callee may be a bare Call (the
+        // direct_calls collapse) or an Arrow wrapping a single call
+        // statement (a loop-bearing callee like strCount stays an Arrow).
         IrExpr::Capture { expr, .. } => match expr.as_ref() {
             IrExpr::Call { func, args } if matches!(func.as_str(), "exec" | "fnCall") => {
                 matches!(args.as_slice(), [IrExpr::Str(fname, _), IrExpr::Array(_)]
-                    if eligible.contains(fname))
+                    if scc.contains(fname) || eligible.contains(fname))
             }
             IrExpr::Arrow(stmts) => matches!(
                 stmts.as_slice(),
                 [IrStmt::Expr(IrExpr::Call { func, args })]
                     if matches!(func.as_str(), "exec" | "fnCall")
                         && matches!(args.as_slice(), [IrExpr::Str(fname, _), IrExpr::Array(_)]
-                            if eligible.contains(fname))
+                            if scc.contains(fname) || eligible.contains(fname))
             ),
             _ => false,
         },
@@ -384,7 +477,7 @@ fn expr_pure(e: &IrExpr, eligible: &HashSet<String>) -> bool {
                 if matches!(func.as_str(), "builtin" | "exec") {
                     if let Some(IrExpr::Str(n, _)) = args.first() {
                         if matches!(n.as_str(), "test" | "let" | "[" | "[[" | ":" | "true" | "false") {
-                            return args.iter().skip(1).all(|a| expr_pure(a, eligible));
+                            return args.iter().skip(1).all(|a| expr_pure(a, eligible, scc));
                         }
                     }
                 }
@@ -394,23 +487,26 @@ fn expr_pure(e: &IrExpr, eligible: &HashSet<String>) -> bool {
             if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == "?") {
                 return false;
             }
-            args.iter().all(|a| expr_pure(a, eligible))
+            args.iter().all(|a| expr_pure(a, eligible, scc))
         }
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             InterpPart::Lit(s) => !s.contains("$?"),
-            InterpPart::Expr(ie) => expr_pure(ie, eligible),
+            InterpPart::Expr(ie) => expr_pure(ie, eligible, scc),
         }),
-        IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs, eligible) && expr_pure(rhs, eligible),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            expr_pure(lhs, eligible, scc) && expr_pure(rhs, eligible, scc)
+        }
         IrExpr::MethodCall { obj, args, .. } => {
-            expr_pure(obj, eligible) && args.iter().all(|a| expr_pure(a, eligible))
+            expr_pure(obj, eligible, scc)
+                && args.iter().all(|a| expr_pure(a, eligible, scc))
         }
-        IrExpr::Index { key, .. } => expr_pure(key, eligible),
+        IrExpr::Index { key, .. } => expr_pure(key, eligible, scc),
         IrExpr::DefinedOr { expr, default } => {
-            expr_pure(expr, eligible) && expr_pure(default, eligible)
+            expr_pure(expr, eligible, scc) && expr_pure(default, eligible, scc)
         }
-        IrExpr::Array(items) => items.iter().all(|i| expr_pure(i, eligible)),
-        IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_silent(s, eligible)),
-        IrExpr::Lambda { body, .. } => body.iter().all(|s| stmt_silent(s, eligible)),
+        IrExpr::Array(items) => items.iter().all(|i| expr_pure(i, eligible, scc)),
+        IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_silent(s, eligible, scc)),
+        IrExpr::Lambda { body, .. } => body.iter().all(|s| stmt_silent(s, eligible, scc)),
         // literals, arith, ranges, bools, idents, objects, json — pure
         _ => true,
     }
@@ -436,9 +532,38 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "builtin" | "exec") =>
         {
-            if let Some(word) = value_echo(args, eligible) {
+            if let Some(word) = value_echo(args, eligible, &HashSet::new()) {
                 *changed = true;
                 return IrStmt::Return(Some(word.clone()));
+            }
+            // a bare call to an eligible function (the matchers' bare
+            // recursion — `ext_match "$c" "$p" "$v"` inside globMatch):
+            // the callee's echo becomes a value return of the fnValue
+            // result. MUST be checked here — this arm matches every
+            // exec/builtin call, so a separate arm below would be
+            // shadowed (the old code returned `st.clone()` for every
+            // non-echo exec call, leaving the bare call for pass 3 to
+            // wrap in an ECHO — printing the value instead of returning
+            // it, the extra-`0` self-test regression).
+            if let Some(IrExpr::Str(fname, _)) = args.first() {
+                if eligible.contains(fname) {
+                    *changed = true;
+                    return IrStmt::Return(Some(fn_value_call(args)));
+                }
+            }
+            st.clone()
+        }
+        // a bare call to an eligible function (the matchers' bare
+        // recursion) — the callee's echo becomes a value return of the
+        // fnValue result
+        IrStmt::Expr(IrExpr::Call { func, args, .. })
+            if matches!(func.as_str(), "exec" | "fnCall") =>
+        {
+            if let Some(IrExpr::Str(fname, _)) = args.first() {
+                if eligible.contains(fname) {
+                    *changed = true;
+                    return IrStmt::Return(Some(fn_value_call(args)));
+                }
             }
             st.clone()
         }
@@ -495,6 +620,27 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
                 var: var.clone(),
                 iter: iter.clone(),
                 body: b,
+            }
+        }
+        // the matchers' echoes live inside `case` clause bodies
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
+            let mut new_clauses: Vec<crate::ir::IrCaseClause> = Vec::with_capacity(clauses.len());
+            for clause in clauses {
+                let mut b: Vec<IrStmt> = Vec::with_capacity(clause.body.len());
+                for s in &clause.body {
+                    b.push(rewrite_stmt(s, changed, eligible));
+                }
+                new_clauses.push(crate::ir::IrCaseClause {
+                    patterns: clause.patterns.clone(),
+                    body: b,
+                });
+            }
+            IrStmt::Case {
+                discriminant: discriminant.clone(),
+                clauses: new_clauses,
             }
         }
         IrStmt::ForInit {
@@ -794,6 +940,17 @@ fn echo_of_fn_value(args: &[IrExpr]) -> Vec<IrExpr> {
         IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
         IrExpr::Array(vec![fn_value_call(args)]),
     ]
+}
+
+fn function_body<'a>(stmts: &'a [IrStmt], name: &str) -> Option<&'a [IrStmt]> {
+    for st in stmts {
+        if let IrStmt::Function { name: n, body, .. } = st {
+            if n == name {
+                return Some(body);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

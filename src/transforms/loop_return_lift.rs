@@ -103,6 +103,14 @@ fn stmt_pass(st: &mut IrStmt, flag: &str) -> bool {
         IrStmt::ForInit { body, .. } => block_pass(body, flag),
         IrStmt::Redirect { inner, .. } => block_pass(inner, flag),
         IrStmt::Function { body, .. } => block_pass(body, flag),
+        // the matchers' loops live inside `case` clause bodies
+        IrStmt::Case { clauses, .. } => {
+            let mut c = false;
+            for clause in clauses.iter_mut() {
+                c |= block_pass(&mut clause.body, flag);
+            }
+            c
+        }
         _ => false,
     }
 }
@@ -154,47 +162,142 @@ fn try_lift_loop(st: &IrStmt, flag: &str) -> Option<(IrStmt, IrExpr)> {
 }
 
 /// Rewrite the loop body: the echo+return If's then arm becomes
-/// `flag=1; break`. Returns the new body and the echo value.
+/// `flag=1; break`. Returns the new body and the echo value. The
+/// echo+return may be NESTED anywhere in the loop body (the matchers'
+/// `if [[ "$m" == "1" ]]; then echo 1; return; fi` inside a larger
+/// if/case) — the rewrite replaces the echo+return with flag+break,
+/// keeping the else arm (empty or SILENT — it runs when C is false,
+/// inside the loop, unchanged).
 fn lift_loop_body(body: &[IrStmt], flag: &str) -> Option<(Vec<IrStmt>, IrExpr)> {
     let mut out: Vec<IrStmt> = Vec::with_capacity(body.len());
     let mut value: Option<IrExpr> = None;
     for st in body {
-        if let IrStmt::If {
-            cond,
-            then,
-            elsifs,
-            else_,
-        } = st
-        {
-            if elsifs.is_empty() && else_.is_empty() {
-                if let Some(v) = echo_then_return(then) {
-                    // the then arm is [echo "$v", return] — rewrite to
-                    // [flag=1, break]
-                    value = Some(v);
-                    out.push(IrStmt::If {
-                        cond: cond.clone(),
-                        then: vec![
-                            IrStmt::Assign {
-                                targets: vec![crate::ir::AssignTarget {
-                                    var: flag.to_string(),
-                                    sigil: None,
-                                    indices: vec![],
-                                }],
-                                expr: IrExpr::Int(1),
-                                asm: None,
-                            },
-                            IrStmt::Break,
-                        ],
-                        elsifs: vec![],
-                        else_: vec![],
-                    });
-                    continue;
-                }
-            }
+        if let Some((replacement, v)) = lift_stmt(st, flag) {
+            value = Some(v);
+            out.push(replacement);
+            continue;
         }
         out.push(st.clone());
     }
     value.map(|v| (out, v))
+}
+
+/// Recursively find the echo+return If in a statement; rewrite it to
+/// `flag=1; break` (the else arm stays). Returns the replacement and
+/// the echo value.
+fn lift_stmt(st: &IrStmt, flag: &str) -> Option<(IrStmt, IrExpr)> {
+    match st {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            if elsifs.is_empty() {
+                if let Some(v) = echo_then_return(then) {
+                    if else_.iter().all(stmt_silent) {
+                        return Some((
+                            IrStmt::If {
+                                cond: cond.clone(),
+                                then: vec![
+                                    IrStmt::Assign {
+                                        targets: vec![crate::ir::AssignTarget {
+                                            var: flag.to_string(),
+                                            sigil: None,
+                                            indices: vec![],
+                                        }],
+                                        expr: IrExpr::Int(1),
+                                        asm: None,
+                                    },
+                                    IrStmt::Break,
+                                ],
+                                elsifs: vec![],
+                                else_: else_.clone(),
+                            },
+                            v,
+                        ));
+                    }
+                }
+            }
+            // recurse into the arms
+            let mut t: Vec<IrStmt> = Vec::with_capacity(then.len());
+            for s in then {
+                if let Some((r, v)) = lift_stmt(s, flag) {
+                    t.push(r);
+                    return Some((
+                        IrStmt::If {
+                            cond: cond.clone(),
+                            then: t,
+                            elsifs: elsifs.clone(),
+                            else_: else_.clone(),
+                        },
+                        v,
+                    ));
+                }
+                t.push(s.clone());
+            }
+            let mut el: Vec<IrStmt> = Vec::with_capacity(else_.len());
+            for s in else_ {
+                if let Some((r, v)) = lift_stmt(s, flag) {
+                    el.push(r);
+                    return Some((
+                        IrStmt::If {
+                            cond: cond.clone(),
+                            then: then.clone(),
+                            elsifs: elsifs.clone(),
+                            else_: el,
+                        },
+                        v,
+                    ));
+                }
+                el.push(s.clone());
+            }
+            None
+        }
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
+            let mut new_clauses: Vec<crate::ir::IrCaseClause> = Vec::with_capacity(clauses.len());
+            for clause in clauses {
+                let mut b: Vec<IrStmt> = Vec::with_capacity(clause.body.len());
+                for s in &clause.body {
+                    if let Some((r, v)) = lift_stmt(s, flag) {
+                        b.push(r);
+                        new_clauses.push(crate::ir::IrCaseClause {
+                            patterns: clause.patterns.clone(),
+                            body: b,
+                        });
+                        return Some((
+                            IrStmt::Case {
+                                discriminant: discriminant.clone(),
+                                clauses: new_clauses,
+                            },
+                            v,
+                        ));
+                    }
+                    b.push(s.clone());
+                }
+                new_clauses.push(crate::ir::IrCaseClause {
+                    patterns: clause.patterns.clone(),
+                    body: b,
+                });
+            }
+            None
+        }
+        IrStmt::Block(body) => {
+            let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
+            for s in body {
+                if let Some((r, v)) = lift_stmt(s, flag) {
+                    b.push(r);
+                    return Some((IrStmt::Block(b), v));
+                }
+                b.push(s.clone());
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Is the arm exactly `[echo "$v", return]`? Returns the echo value.
@@ -256,6 +359,40 @@ fn if_flag_echo(flag: &str, value: IrExpr, post: Vec<IrStmt>) -> IrStmt {
         then: vec![echo],
         elsifs: vec![],
         else_: post,
+    }
+}
+
+/// Is the statement silent (no stdout, no exec/capture/`$?`)? The
+/// loop-return-lift's else arm must be silent — the echo+return moves
+/// out of the loop, the else stays inside.
+fn stmt_silent(st: &IrStmt) -> bool {
+    match st {
+        IrStmt::Assign { expr, .. } => expr_pure(expr),
+        IrStmt::Declare { init, .. } => init.as_ref().map(expr_pure).unwrap_or(true),
+        IrStmt::DeclareArray { elements, .. } => elements.iter().all(expr_pure),
+        IrStmt::Expr(IrExpr::Call { func, args, .. })
+            if matches!(func.as_str(), "builtin" | "exec") =>
+        {
+            if let Some(IrExpr::Str(n, _)) = args.first() {
+                if matches!(n.as_str(), "local" | "declare" | "typeset" | "readonly" | "shift") {
+                    return args.iter().skip(1).all(expr_pure);
+                }
+            }
+            false
+        }
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            expr_pure(cond)
+                && then.iter().all(stmt_silent)
+                && elsifs.iter().all(|(c, b)| expr_pure(c) && b.iter().all(stmt_silent))
+                && else_.iter().all(stmt_silent)
+        }
+        IrStmt::Block(body) => body.iter().all(stmt_silent),
+        _ => false,
     }
 }
 

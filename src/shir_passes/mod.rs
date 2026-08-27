@@ -51,6 +51,7 @@ pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod pattern;
 pub mod restructure;
+pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
 // split_inplace: registered-but-PARKED in transforms.rs pending the
 // c worker's embed/Carp interaction fix; declaration kept so the tree
 // compiles either way.
@@ -278,6 +279,7 @@ impl Pipeline {
                 Box::new(analysis::NocaseMayEnable),
                 Box::new(analysis::PersistFd1),
                 Box::new(analysis::ProgramFunctions),
+                Box::new(analysis::FunctionScc),
                 Box::new(analysis::SyncFnCalls),
                 Box::new(analysis::NativeEchoFns),
                 Box::new(analysis::AsyncRegionLoops),
