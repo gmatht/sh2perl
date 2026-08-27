@@ -65,22 +65,21 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     crate::shir::walk_lastexit_liveness(stmts, true, &mut live);
     let mut c = false;
     for st in stmts.iter_mut() {
-        c |= stmt_pass(st, &live, None);
+        c |= stmt_pass(st, &live);
     }
     c
 }
 
-/// Walk statements, tracking the enclosing function name (for the
-/// self-recursion guard).
-fn stmt_pass(st: &mut IrStmt, live: &HashSet<usize>, fname: Option<&str>) -> bool {
+/// Walk statements.
+fn stmt_pass(st: &mut IrStmt, live: &HashSet<usize>) -> bool {
     // The statement pointer (the liveness key) is computed BEFORE the
     // mutable field borrows below.
     let self_live = live.contains(&(st as *const IrStmt as usize));
     match st {
-        IrStmt::Function { name, body, .. } => {
+        IrStmt::Function { body, .. } => {
             let mut c = false;
             for s in body.iter_mut() {
-                c |= stmt_pass(s, live, Some(name));
+                c |= stmt_pass(s, live);
             }
             c
         }
@@ -93,63 +92,63 @@ fn stmt_pass(st: &mut IrStmt, live: &HashSet<usize>, fname: Option<&str>) -> boo
             // The conds' status liveness is computed ONCE (immutable
             // borrows), then the rewrites run (mutable borrows).
             let observable = cond_status_observable(then, elsifs, else_, self_live);
-            let mut c = rewrite_cond(cond, observable, fname);
+            let mut c = rewrite_cond(cond, observable);
             for s in then.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             for (ec, eb) in elsifs.iter_mut() {
-                c |= rewrite_cond(ec, observable, fname);
+                c |= rewrite_cond(ec, observable);
                 for s in eb.iter_mut() {
-                    c |= stmt_pass(s, live, fname);
+                    c |= stmt_pass(s, live);
                 }
             }
             for s in else_.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::While { cond, body } => {
             let observable = cond_status_observable(body, &[], &[], self_live);
-            let mut c = rewrite_cond(cond, observable, fname);
+            let mut c = rewrite_cond(cond, observable);
             for s in body.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::DoWhile { body, cond, .. } => {
             let observable = cond_status_observable(body, &[], &[], self_live);
-            let mut c = rewrite_cond(cond, observable, fname);
+            let mut c = rewrite_cond(cond, observable);
             for s in body.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::For { body, .. } => {
             let mut c = false;
             for s in body.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::ForInit { init, cond, step, body } => {
             let observable = cond_status_observable(body, &[], &[], self_live);
-            let mut c = rewrite_cond(cond, observable, fname);
+            let mut c = rewrite_cond(cond, observable);
             for s in init.iter_mut().chain(step.iter_mut()).chain(body.iter_mut()) {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
             let mut c = false;
             for s in body.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
         IrStmt::Redirect { inner, .. } => {
             let mut c = false;
             for s in inner.iter_mut() {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             c
         }
@@ -157,7 +156,7 @@ fn stmt_pass(st: &mut IrStmt, live: &HashSet<usize>, fname: Option<&str>) -> boo
             let mut c = false;
             for stage in stages.iter_mut() {
                 for s in stage.iter_mut() {
-                    c |= stmt_pass(s, live, fname);
+                    c |= stmt_pass(s, live);
                 }
             }
             c
@@ -170,11 +169,11 @@ fn stmt_pass(st: &mut IrStmt, live: &HashSet<usize>, fname: Option<&str>) -> boo
         } => {
             let mut c = false;
             for s in body.iter_mut().chain(else_body.iter_mut()).chain(finally_body.iter_mut()) {
-                c |= stmt_pass(s, live, fname);
+                c |= stmt_pass(s, live);
             }
             for ex in excepts.iter_mut() {
                 for s in ex.body.iter_mut() {
-                    c |= stmt_pass(s, live, fname);
+                    c |= stmt_pass(s, live);
                 }
             }
             c
@@ -207,36 +206,36 @@ fn cond_status_observable(
 
 /// Rewrite a cond that is a pure `test` chain whose status write is
 /// provably unread. Returns whether anything changed.
-fn rewrite_cond(cond: &mut IrExpr, observable: bool, fname: Option<&str>) -> bool {
+fn rewrite_cond(cond: &mut IrExpr, observable: bool) -> bool {
     if observable || !crate::shir::is_pure_test_chain(cond) {
         return false;
     }
-    rewrite_test_chain(cond, fname)
+    rewrite_test_chain(cond)
 }
 
 /// Rewrite a pure test chain's glob-affix leaves. Returns whether
 /// anything changed.
-fn rewrite_test_chain(e: &mut IrExpr, fname: Option<&str>) -> bool {
+fn rewrite_test_chain(e: &mut IrExpr) -> bool {
     match e {
         IrExpr::BinOp { op, lhs, rhs } if matches!(op, BinOpKind::And | BinOpKind::Or) => {
-            let l = rewrite_test_chain(lhs, fname);
-            let r = rewrite_test_chain(rhs, fname);
+            let l = rewrite_test_chain(lhs);
+            let r = rewrite_test_chain(rhs);
             l | r
         }
         IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => {
             // `!`-negated leaf: rewrite the inner test, wrap in Not.
             if let IrExpr::Call { func, args, .. } = &**lhs {
                 if func == "test" {
-                    if let Some(prim) = glob_affix_primitive(args, fname) {
+                    if let Some(prim) = glob_affix_primitive(args) {
                         **lhs = prim;
                         return true;
                     }
                 }
             }
-            rewrite_test_chain(lhs, fname)
+            rewrite_test_chain(lhs)
         }
         IrExpr::Call { func, args, .. } if func == "test" => {
-            if let Some(prim) = glob_affix_primitive(args, fname) {
+            if let Some(prim) = glob_affix_primitive(args) {
                 *e = prim;
                 true
             } else {
@@ -249,7 +248,7 @@ fn rewrite_test_chain(e: &mut IrExpr, fname: Option<&str>) -> bool {
 
 /// The glob-affix shapes → the primitive call (or None). The test text is
 /// args[0] (a Str); args[1] is the `[[` style tag (ignored).
-fn glob_affix_primitive(args: &[IrExpr], fname: Option<&str>) -> Option<IrExpr> {
+fn glob_affix_primitive(args: &[IrExpr]) -> Option<IrExpr> {
     let text = match args.first() {
         Some(IrExpr::Str(s, _)) => s.as_str(),
         _ => return None,
@@ -303,12 +302,16 @@ fn glob_affix_primitive(args: &[IrExpr], fname: Option<&str>) -> Option<IrExpr> 
         return None; // exact equality is not a glob-affix shape
     };
     let (prim_name, pat) = prim;
-    // Self-recursion guard: the polyfill's own primitive implementations
-    // must not call themselves through the sh2.* namespace (the adapter
-    // would recurse infinitely).
-    if fname == Some(prim_name) {
-        return None;
-    }
+    // NOTE: no self-recursion guard here. The polyfill's own primitive
+    // bodies (`contains`'s `[[ "$h" == *"$n"* ]]`) lower to the native
+    // call — every backend renders `contains`/`strHasPrefix`/
+    // `strHasSuffix` NATIVELY (estree `.includes`/`.startsWith`/
+    // `.endsWith`, perl `index >= 0`, C `strstr`, go `strings.Contains`,
+    // python `in`, zig `std.mem.indexOf`), so the transpiled body never
+    // dispatches through the runtime's sh2.* namespace — no recursion.
+    // (The old guard refused this lowering, leaving the primitive bodies
+    // on the slow `sh2.test` parser path — contains 0.28% of hand-written
+    // speed; relaxing it is ~60-80x.)
     // The pattern operand: a var read or a literal. `"$p"` → Var(p);
     // `"/"` → Str("/").
     let pat_expr = operand(pat)?;
@@ -413,17 +416,20 @@ mod tests {
 
     #[test]
     fn self_recursion_guard_keeps_primitive_bodies() {
-        // The polyfill's own `contains` body must NOT call `sh2.contains`
-        // (the per-backend adapter would recurse infinitely).
+        // The polyfill's own `contains` body lowers to the NATIVE call
+        // (every backend renders contains/strHasPrefix/strHasSuffix
+        // natively — no runtime dispatch, no recursion). The old guard
+        // refused this, leaving the primitive bodies on the slow
+        // `sh2.test` parser path.
         let json = lower_raw(
             "contains() { local h=\"$1\" n=\"$2\"; if [[ \"$h\" == *\"$n\"* ]]; then echo 1; else echo 0; fi; }; contains a b",
         );
         assert!(
-            !json.contains("\"func\":\"contains\""),
-            "primitive body must stay a test: {json}"
+            json.contains("\"func\":\"contains\""),
+            "primitive body must lower to the native contains: {json}"
         );
-        assert!(json.contains("\"test\""), "test call lost: {json}");
-        // But a DIFFERENT function's same-shaped test lowers.
+        assert!(!json.contains("\"test\""), "test call survived: {json}");
+        // A DIFFERENT function's same-shaped test lowers too.
         let json2 = lower(
             "g() { local h=\"$1\" n=\"$2\"; if [[ \"$h\" == *\"$n\"* ]]; then echo 1; else echo 0; fi; }; g a b",
         );
