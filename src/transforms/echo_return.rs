@@ -314,6 +314,9 @@ fn stmt_silent(st: &IrStmt, eligible: &HashSet<String>) -> bool {
                 && else_.iter().all(|s| stmt_silent(s, eligible))
         }
         IrStmt::Block(body) => body.iter().all(|s| stmt_silent(s, eligible)),
+        // a `break` (the loop-return-lift transform's flag+break) exits
+        // the loop — no output, silent
+        IrStmt::Break => true,
         // A herestring/heredoc redirect feeding a silent inner (line_count's
         // `while read ... <<< "$s"`): the redirect is a pure input source.
         IrStmt::Redirect { inner, redirects } => {
