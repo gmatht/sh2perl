@@ -2023,6 +2023,69 @@ fn collect_fn_calls(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut Has
                 | IrStmt::Background(body) => walk_stmts(body, functions, out),
                 IrStmt::Assign { expr, .. } => walk_expr(expr, functions, out),
                 IrStmt::Expr(e) => walk_expr(e, functions, out),
+                // The remaining arms: every statement shape that can carry
+                // a function call. The sync-fn fixpoint's call graph must
+                // be COMPLETE — a missed call (e.g. `return f()` in a
+                // defer/recover body) leaves the caller on the sync
+                // `sh2.fnCall` path while its callee is async, and the
+                // un-awaited call detaches (the dogfood app's `run` →
+                // `parseTopLevel`).
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk_stmts(body, functions, out);
+                    for ex in excepts {
+                        if let Some(m) = &ex.match_expr {
+                            walk_expr(m, functions, out);
+                        }
+                        walk_stmts(&ex.body, functions, out);
+                    }
+                    walk_stmts(else_body, functions, out);
+                    walk_stmts(finally_body, functions, out);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    walk_stmts(init, functions, out);
+                    walk_expr(cond, functions, out);
+                    walk_stmts(step, functions, out);
+                    walk_stmts(body, functions, out);
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => walk_expr(e, functions, out),
+                IrStmt::Return(None) | IrStmt::Exit(None) => {}
+                IrStmt::SetChildError(e) => walk_expr(e, functions, out),
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, functions, out),
+                IrStmt::Output { value, .. } => walk_expr(value, functions, out),
+                IrStmt::WriteFile {
+                    path, content, ..
+                } => {
+                    walk_expr(path, functions, out);
+                    walk_expr(content, functions, out);
+                }
+                IrStmt::Declare {
+                    init: Some(e), ..
+                } => walk_expr(e, functions, out),
+                IrStmt::Declare { init: None, .. } => {}
+                IrStmt::DeclareArray { elements, .. } => {
+                    for el in elements {
+                        walk_expr(el, functions, out);
+                    }
+                }
+                IrStmt::Continue
+                | IrStmt::Break
+                | IrStmt::Require(_)
+                | IrStmt::RawText(_) => {}
+                IrStmt::Ext(ext) => {
+                    for c in ext.children() {
+                        walk_stmts(std::slice::from_ref(c), functions, out);
+                    }
+                }
                 _ => {}
             }
         }
@@ -29150,9 +29213,10 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                     return Some(sh2_call("arrayItems", vec![str_lit(real)]));
                 }
             }
-            // `${arr[@]}` / `${arr[*]}` — whole-array read.
+            // `${arr[@]}` / `${arr[*]}` — whole-array read (VALUES; the
+            // `!`-prefixed keys form above stays on arrayItems).
             if is_plain_ident(name) && matches!(off_arg, Some("@") | Some("*")) {
-                return Some(sh2_call("arrayItems", vec![str_lit(name)]));
+                return Some(sh2_call("arrayValues", vec![str_lit(name)]));
             }
             // `${arr[@]:off:len}` — the `[@]`-suffixed name is the
             // runtime's am branch: the slice is ALWAYS the array slice
@@ -29161,7 +29225,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             if let Some(base) = name.strip_suffix("[@]") {
                 if is_plain_ident(base) {
                     if let Some(o) = off_arg.and_then(int_of) {
-                        let items = sh2_call("arrayItems", vec![str_lit(base)]);
+                        let items = sh2_call("arrayValues", vec![str_lit(base)]);
                         // Optional 5th arg — the step (core request
                         // py-sh-go-sliceop): the elements are
                         // off, off+step, off+2step, … < off+len. A
@@ -29231,7 +29295,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             // caller-set env var would hit the runtime's string branch).
             if is_plain_ident(name) && assume_array_slice() && array_only_written(name) {
                 if let (Some(o), Some(len)) = (off_arg.and_then(int_of), len_arg) {
-                    let items = sh2_call("arrayItems", vec![str_lit(name)]);
+                    let items = sh2_call("arrayValues", vec![str_lit(name)]);
                     // Optional 5th arg — the step (core request
                     // py-sh-go-sliceop); see the `[@]`-suffix branch.
                     if let Some(step) = args.get(4).and_then(static_str) {
@@ -34636,8 +34700,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // whose `$?` write is provably unread — see
             // compute_test_cond_deadness): the operands lowered unstatused
             // (pure tests), so the chain is plain JS `&&` — no lastExit
-            // reads/writes per operand.
-            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+            // reads/writes per operand. Also: NEITHER operand sets the
+            // exit status (a pure-Go comparison chain like `i < len &&
+            // src[i] != '\n'` — the go-sh frontend's own lexer loops).
+            // The statused form reads STALE $? for those (the comparison
+            // never wrote it), so the plain-JS chain is the only correct
+            // lowering.
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0
+                || (!sets_last_exit(&l) && !sets_last_exit(&r))
+            {
                 native_and_or_unstatused(BinOpKind::And, l, r)
             } else {
                 native_and_or(BinOpKind::And, l, r)
@@ -34652,7 +34723,9 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0
+                || (!sets_last_exit(&l) && !sets_last_exit(&r))
+            {
                 native_and_or_unstatused(BinOpKind::Or, l, r)
             } else {
                 native_and_or(BinOpKind::Or, l, r)

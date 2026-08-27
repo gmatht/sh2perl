@@ -546,6 +546,15 @@ fn census_expr(
                 census_expr(x, reads, writes, escapes, escaping);
             }
         }
+        // A bare Str node can carry `$name` references too — the heredoc
+        // target (`cat << EOF` with `Hello $name` → Str("Hello $name\n")
+        // with interpolate:true) is a Redirect target, not a Call arg, so
+        // the Call-arg scan above never sees it. Without this, DSE judged
+        // `name` never-read and dropped `name="world"` — the heredoc
+        // interpolated the empty store (079_heredoc_interpolation).
+        IrExpr::Str(s, _) => {
+            string_read_names(s, reads);
+        }
         _ => {}
     }
 }
@@ -605,8 +614,13 @@ fn arith_census(
                 escapes.insert(v.clone());
             }
         }
-        ArithAst::Index { var, .. } => {
+        ArithAst::Index { var, key, .. } => {
             reads.insert(var.clone());
+            // the index expression is a read too (`arr[i]` — the key
+            // var `i` must not be judged never-read, or its store is
+            // DSE-dropped and the index renders as the empty-string
+            // never-written read → arr[0] (arith-array-index-expr).
+            arith_census(key, reads, writes, escapes, escaping);
         }
         ArithAst::Bin { lhs, rhs, .. } => {
             arith_census(lhs, reads, writes, escapes, escaping);
