@@ -96,8 +96,13 @@ fn generate_command_using_builtins(
                             if interp.parts.len() == 1 {
                                 if let StringPart::Variable(var) = &interp.parts[0] {
                                     match var.as_str() {
-                                        "@" => all_items.push("@ARGV".to_string()),
-                                        "*" => all_items.push("@ARGV".to_string()),
+                                        "@" | "*" => {
+                                            if generator.fn_nesting_depth > 0 {
+                                                all_items.push("@_".to_string())
+                                            } else {
+                                                all_items.push("@ARGV".to_string())
+                                            }
+                                        }
                                         _ => all_items.push(generator.word_to_perl(word)),
                                     }
                                 } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0]
@@ -2353,6 +2358,104 @@ fn generate_buffered_pipeline(
         .iter()
         .any(|cmd| has_heredoc_redirect(cmd));
 
+    // Pipelines whose first stage is a shell control-flow construct (e.g.
+    // `for k in "${!map[@]}"; do ...; done | sort`) cannot be reconstructed
+    // as a bash string: the construct reads Perl-side variables that a
+    // `bash -c` subprocess would never see.  Generate the construct natively
+    // with STDOUT captured into a scalar, then feed that text through the
+    // remaining (serializable) pipeline stages.
+    if !has_output_redirect_early
+        && !has_heredoc
+        && pipeline.commands.len() >= 2
+        && matches!(
+            pipeline.commands[0],
+            Command::For(_)
+                | Command::While(_)
+                | Command::If(_)
+                | Command::Case(_)
+                | Command::CStyleFor(_)
+                | Command::Block(_)
+        )
+    {
+        let rest = Pipeline {
+            commands: pipeline.commands[1..].to_vec(),
+            source_text: None,
+            stdout_used: pipeline.stdout_used,
+            stderr_used: pipeline.stderr_used,
+        };
+        let rest_cmd = generator.generate_command_string_for_system(&Command::Pipeline(rest));
+        if !rest_cmd.is_empty() && !rest_cmd.contains("Complex command not supported") {
+            let unique_id = generator.get_unique_id();
+            let head_code = generator.generate_command(&pipeline.commands[0]);
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_{} = do {{\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    my $__head_buf_{} = q{{}};\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    {\n");
+            output.push_str(&generator.indent());
+            output.push_str("        local *STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "        open STDOUT, '>', \\$__head_buf_{} or die \"Cannot capture STDOUT: $!\\n\";\n",
+                unique_id
+            ));
+            for line in head_code.lines() {
+                output.push_str(&generator.indent());
+                output.push_str("        ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push_str(&generator.indent());
+            output.push_str("        close STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str("    }\n");
+            output.push_str(&generator.indent());
+            output.push_str("    require IPC::Open2;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__pid_{id} = IPC::Open2::open2(my $__rd_{id}, my $__wr_{id}, 'bash', '-c', {cmd});\n",
+                id = unique_id,
+                cmd = crate::ir::safe_perl_q_string(&rest_cmd)
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    print {{$__wr_{id}}} $__head_buf_{id};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__wr_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__out_{id} = do {{ local $/; <$__rd_{id}> }} // q{{}};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__rd_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    waitpid $__pid_{id}, 0;\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    $CHILD_ERROR = $? >> 8;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    chomp $__out_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    $__out_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("};\n");
+            if should_print {
+                let print_stmt = IrStmt::Output {
+                    value: IrExpr::Var(format!("output_{}", unique_id), Some(Sigil::Scalar)),
+                    newline: true,
+                    target: None,
+                };
+                output.push_str(&stmt_to_perl(&print_stmt, 0));
+            } else {
+                output.push_str(&format!("do {{ $output_{} }}\n", unique_id));
+            }
+            return output;
+        }
+    }
+
     // Only take the clean path when there are no output redirects and no heredocs.
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).
@@ -2412,7 +2515,18 @@ fn generate_buffered_pipeline(
                 capture: Some(output_var.clone()),
                 cmd_str: Some(reconstructed_cmd),
             };
-            output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+            if should_print {
+                // Statement-position pipeline output is printed VERBATIM by
+                // bash (all trailing newlines kept); the capture template's
+                // strip-all is for $() value semantics — swap it back to a
+                // single chomp, which the conditional print's added "\n"
+                // exactly restores.
+                let emitted = stmt_to_perl(&pipeline_stmt, 0)
+                    .replace("$_r =~ s/\\n+\\z//;", "chomp $_r;");
+                output.push_str(&emitted);
+            } else {
+                output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+            }
 
             if should_print {
                 // For top-level pipelines, print the captured output.  bash
@@ -2432,7 +2546,12 @@ fn generate_buffered_pipeline(
                 // `my $var = qx{...}; chomp $var;` which are statements, not expressions,
                 // so we wrap in a do{} to make it an expression for command substitution.
                 // The caller (generate_pipeline_for_substitution) may add further wrapping.
-                output.push_str(&format!("do {{ ${} }}\n", output_var));
+                // bash $() strips ALL trailing newlines — the capture's chomp
+                // only removed one.
+                output.push_str(&format!(
+                    "do {{ ${} =~ s/\\n+\\z//; ${} }}\n",
+                    output_var, output_var
+                ));
             }
 
             return output;

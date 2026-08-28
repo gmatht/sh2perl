@@ -9,6 +9,9 @@ pub fn generate_grep_command(
     should_print: bool,
 ) -> String {
     let mut output = String::new();
+    // GNU grep exits 2 on a missing input file — track it so the final
+    // status assignment can report 2 instead of 1 (no-match).
+    output.push_str(&format!("my $grep_file_err_{} = 0;\n", command_index));
 
     // Parse grep options and pattern
     let mut pattern = String::new();
@@ -471,8 +474,8 @@ pub fn generate_grep_command(
                     output.push_str("        or croak \"Close failed: $OS_ERROR\";\n");
                     output.push_str("}\n");
                     output.push_str(&format!(
-                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; }}\n",
-                        file
+                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; $grep_file_err_{} = 1; }}\n",
+                        file, command_index
                     ));
                 }
             }
@@ -998,12 +1001,14 @@ pub fn generate_grep_command(
             ));
         }
         if should_print && !quiet_mode {
-            output.push_str(&format!("print $grep_result_{};\n", command_index));
-            if null_terminated {
-                output.push_str("print \"\\0\";\n");
-            } else {
-                output.push_str("print \"\\n\";\n");
-            }
+            // no trailing newline when nothing matched — bash's grep -l/-L
+            // prints NOTHING, not a blank line
+            output.push_str(&format!(
+                "if ($grep_result_{} ne q{{}}) {{ print $grep_result_{}; print \"{}\"; }}\n",
+                command_index,
+                command_index,
+                if null_terminated { "\\0" } else { "\\n" }
+            ));
         }
     } else if files_without_match {
         // Handle -L flag: only show filenames that do NOT contain matches
@@ -1079,12 +1084,14 @@ pub fn generate_grep_command(
             ));
         }
         if should_print && !quiet_mode {
-            output.push_str(&format!("print $grep_result_{};\n", command_index));
-            if null_terminated {
-                output.push_str("print \"\\0\";\n");
-            } else {
-                output.push_str("print \"\\n\";\n");
-            }
+            // no trailing newline when nothing matched — bash's grep -l/-L
+            // prints NOTHING, not a blank line
+            output.push_str(&format!(
+                "if ($grep_result_{} ne q{{}}) {{ print $grep_result_{}; print \"{}\"; }}\n",
+                command_index,
+                command_index,
+                if null_terminated { "\\0" } else { "\\n" }
+            ));
         }
     } else {
         // Default case: output matching lines with various formatting options
@@ -1228,7 +1235,10 @@ pub fn generate_grep_command(
     } else {
         format!("scalar @grep_filtered_{} > 0", command_index)
     };
-    output.push_str(&format!("$CHILD_ERROR = {} ? 0 : 1;\n", exit_condition));
+    output.push_str(&format!(
+        "$CHILD_ERROR = $grep_file_err_{} ? 2 : ({} ? 0 : 1);\n",
+        command_index, exit_condition
+    ));
 
     if quiet_mode {
         output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));

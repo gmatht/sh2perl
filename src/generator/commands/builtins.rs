@@ -993,8 +993,9 @@ pub fn generate_generic_builtin(
             )
         }
         "gzip" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::gzip::generate_gzip_command(generator, cmd, input_var)
+            crate::generator::commands::gzip::generate_gzip_command_with_output(
+                generator, cmd, input_var, output_var,
+            )
         }
         "zcat" => {
             // For now, use the existing signature but we should standardize this
@@ -1445,8 +1446,11 @@ fn generate_system_call_fallback(
 
     // Check if this is a function call with glob patterns (use cmd_basename)
     if generator.declared_functions.contains(cmd_basename) {
+        // Only bare (unquoted) literals are glob candidates — a quoted
+        // argument containing * or ? (e.g. a 'bash -c' script with $?)
+        // is passed through verbatim by the shell.
         let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
-            Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+            Word::Literal(s, None) => s.contains('*') || s.contains('?'),
             _ => false,
         });
 
@@ -1522,14 +1526,26 @@ fn generate_system_call_fallback(
     let out_name = output_var.trim_start_matches('$');
     let in_name = input_var.trim_start_matches('$');
     if input_var.is_empty() {
+        // A missing binary must not kill the program — bash reports
+        // "command not found" (status 127) and the script continues.
+        if out_name.is_empty() {
+            // No capture buffer — a statement-position exec (its stdout is
+            // the current STDOUT, possibly redirected by the wrapper).
+            // Emitting `${} = …` was a Perl syntax error killing the
+            // whole program.
+            return format!(
+                "\ndo {{ my $_r = q{{}}; if (open(my $__fh, '-|', {})) {{ $_r = do {{ local $/; <$__fh> }} // q{{}}; close $__fh; $CHILD_ERROR = $? >> 8; }} else {{ print STDERR \"sh: command failed: $ERRNO\\n\"; $CHILD_ERROR = 127; }} $_r; }};\n",
+                all_args,
+            );
+        }
         format!(
-            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; chomp(my $_r = do {{ local $/; <$__fh> }}); close $__fh; $_r; }};\n",
+            "\n${{{out_name}}} = do {{ my $_r = q{{}}; if (open(my $__fh, '-|', {})) {{ $_r = do {{ local $/; <$__fh> }} // q{{}}; chomp $_r; close $__fh; $CHILD_ERROR = $? >> 8; }} else {{ print STDERR \"sh: command failed: $ERRNO\\n\"; $CHILD_ERROR = 127; }} $_r; }};\n",
             all_args,
             out_name = out_name,
         )
     } else {
         format!(
-            "\n${{{out_name}}} = do {{ open(my $__fh, '|-', {}) or croak \"failed: $ERRNO\"; print $__fh \"${{{in_name}}}\"; close $__fh; $CHILD_ERROR = $? >> 8; q{{}}; }};\n",
+            "\n${{{out_name}}} = do {{ if (open(my $__fh, '|-', {})) {{ print $__fh \"${{{in_name}}}\"; close $__fh; $CHILD_ERROR = $? >> 8; }} else {{ print STDERR \"sh: command failed: $ERRNO\\n\"; $CHILD_ERROR = 127; }} q{{}}; }};\n",
             all_args,
             out_name = out_name,
             in_name = in_name,

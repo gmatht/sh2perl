@@ -185,8 +185,18 @@ fn single_nonempty_part(
 /// CommandSubstitution word — detect the `sort` + herestring shape
 /// directly instead of re-parsing reconstructed text.
 fn try_extract_sort_herestring_word(cmd: &crate::ast::Command) -> Option<String> {
-    let crate::ast::Command::Simple(sc) = cmd else {
-        return None;
+    // `sort <<< …` can parse as Simple-with-redirect OR as a Redirect
+    // wrapper around the Simple — accept both shapes.
+    let (sc, redirects): (&crate::ast::SimpleCommand, Vec<&crate::ast::Redirect>) = match cmd {
+        crate::ast::Command::Simple(sc) => (sc, sc.redirects.iter().collect()),
+        crate::ast::Command::Redirect(rc) => match &*rc.command {
+            crate::ast::Command::Simple(sc) => (
+                sc,
+                rc.redirects.iter().chain(sc.redirects.iter()).collect(),
+            ),
+            _ => return None,
+        },
+        _ => return None,
     };
     if !sc.args.is_empty() {
         return None;
@@ -197,10 +207,10 @@ fn try_extract_sort_herestring_word(cmd: &crate::ast::Command) -> Option<String>
     if name != "sort" {
         return None;
     }
-    if sc.redirects.len() != 1 {
+    if redirects.len() != 1 {
         return None;
     }
-    let r = &sc.redirects[0];
+    let r = redirects[0];
     if !matches!(r.operator, crate::ast::RedirectOperator::HereString) {
         return None;
     }
@@ -217,6 +227,19 @@ fn try_extract_sort_herestring_word(cmd: &crate::ast::Command) -> Option<String>
             crate::ast::ParameterExpansionOperator::ArraySlice(off, None) => {
                 if off == "*" || off == "@" {
                     return Some(pe.variable.clone());
+                }
+                None
+            }
+            // the parser can also keep the subscript in the NAME
+            // (`${config[*]}` → variable "config[*]", operator None)
+            crate::ast::ParameterExpansionOperator::None => {
+                if pe.variable.ends_with("[*]") || pe.variable.ends_with("[@]") {
+                    return Some(
+                        pe.variable
+                            .trim_end_matches("[*]")
+                            .trim_end_matches("[@]")
+                            .to_string(),
+                    );
                 }
                 None
             }
@@ -277,7 +300,13 @@ pub fn array_element_word_to_perl_impl(generator: &mut Generator, w: &Word) -> S
                 }
                 return format!("(sort @{})", var_name);
             }
-            generator.word_to_perl(w)
+            // arr=($(cmd)) word-splits the capture; a bare capture put the
+            // WHOLE output (or an empty string) in as one element —
+            // files=(`ls … 2>/dev/null`) with no matches must be ().
+            format!(
+                "(grep {{ $_ ne q{{}} }} split /\\s+/, ({}))",
+                generator.word_to_perl(w)
+            )
         }
         Word::ParameterExpansion(pe, _) => match &pe.operator {
             crate::ast::ParameterExpansionOperator::ArraySlice(offset, length) => {
@@ -358,11 +387,19 @@ pub(crate) fn perl_char_escape(c: char) -> String {
 
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
             // Apply bash quote removal: in unquoted words, \X → X
             // (backslash is removed, the following character is kept literally).
             // This matches how the shell processes unquoted words.
-            let s = apply_shell_quote_removal(s);
+            // QUOTED literals keep their backslashes verbatim (inside single
+            // quotes backslash is an ordinary character — '\\' is TWO
+            // backslashes); only the parser's `\'` marker for the '\''
+            // embedded-quote idiom needs decoding.
+            let s = if quoted.is_some() {
+                s.replace("\\'", "'")
+            } else {
+                apply_shell_quote_removal(s)
+            };
 
             let has_standalone_system = {
                 let mut found = false;

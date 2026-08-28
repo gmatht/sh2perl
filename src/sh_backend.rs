@@ -2235,6 +2235,49 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                IrStmt::Assign { expr, .. } => {
+                    if has_grep_p(expr) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) {
+                        return true;
+                    }
+                    for r in redirects {
+                        if has_grep_p(&r.target) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                    ..
+                } => {
+                    if has_grep_p(discriminant) {
+                        return true;
+                    }
+                    for c in clauses {
+                        if walk(&c.body) {
+                            return true;
+                        }
+                    }
+                }
+                // The structured pipeline stmt (shir-pipeline-native) holds
+                // its stage bodies as stmt lists — the grep -P exec lives
+                // inside them, so the scan must descend or the prologue is
+                // never emitted while the render still calls grep_p.
+                IrStmt::Pipeline { stages, .. } => {
+                    if stages.iter().any(|s| walk(s)) {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }

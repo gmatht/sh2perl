@@ -47,7 +47,9 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
 
     if sources.is_empty() || dest.is_empty() {
         output.push_str(&generator.indent());
-        output.push_str("croak \"cp: missing file operand\\n\";\n");
+        output.push_str(
+            "print STDERR \"cp: missing file operand\\n\"; $CHILD_ERROR = 1;\n",
+        );
         return output;
     }
 
@@ -101,8 +103,9 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&generator.indent());
             output.push_str("} else {\n");
             output.push_str(&generator.indent());
+            // bash: cp reports the error and the script continues (status 1)
             output.push_str(&format!(
-                "    croak \"cp: cannot stat '{}': No such file or directory\\n\";\n",
+                "    print STDERR \"cp: cannot stat '{}': No such file or directory\\n\"; $CHILD_ERROR = 1;\n",
                 word_text(&cmd.args[0])
             ));
             output.push_str(&generator.indent());

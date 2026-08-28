@@ -3420,7 +3420,7 @@ impl Parser {
         }
     }
 
-    fn get_current_shopt_state(&self) -> TestModifiers {
+    pub(crate) fn get_current_shopt_state(&self) -> TestModifiers {
         self.shopt_state.to_owned()
     }
 }

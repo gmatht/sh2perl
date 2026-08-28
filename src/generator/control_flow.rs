@@ -220,6 +220,45 @@ pub fn generate_case_statement_impl(
             if pattern_str == "*" {
                 // Default case (*)
                 pattern_conditions.push("1".to_string()); // Always true
+            } else if matches!(pattern, Word::CommandSubstitution(_, _))
+                || pattern_str.starts_with("$(")
+            {
+                // Pattern is a command substitution — its value only exists
+                // at runtime. Evaluate it and compare as a plain string
+                // (emitting the `$(...)` text literally can never match).
+                let pat_expr = if matches!(pattern, Word::CommandSubstitution(_, _)) {
+                    generator.word_to_perl(pattern)
+                } else {
+                    // The parser kept the `$(...)` as literal text — parse
+                    // the inner command and evaluate it as a cmdsub.
+                    let inner = pattern_str
+                        .trim_start_matches("$(")
+                        .trim_end_matches(')');
+                    match crate::parser::commands::parse_pipeline_from_text(inner) {
+                        Ok(cmd) => generator
+                            .word_to_perl(&Word::CommandSubstitution(Box::new(cmd), None)),
+                        Err(_) => generator.word_to_perl(pattern),
+                    }
+                };
+                let word_str = generator.word_to_perl(&case_stmt.word);
+                let processed_word = match &case_stmt.word {
+                    Word::Variable(var_name, _, _) => {
+                        if generator.declared_locals.contains(var_name)
+                            || generator.function_level_vars.contains(var_name)
+                            || matches!(
+                                var_name.as_str(),
+                                "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0"
+                            )
+                            || var_name.chars().all(|c| c.is_ascii_digit())
+                        {
+                            word_str
+                        } else {
+                            format!("($ENV{{{}}} // q{{}})", var_name)
+                        }
+                    }
+                    _ => word_str,
+                };
+                pattern_conditions.push(format!("(({}) eq ({}))", processed_word, pat_expr));
             } else {
                 // Check whether this is a simple literal pattern (no glob characters).
                 // If so, use `eq` instead of a regex match — it's cleaner and avoids
@@ -701,10 +740,13 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                     }
                 }
                 // The last expression in the do block must be truthy when the
-                // command succeeds (exit code 0). $main_exit_code holds the
-                // exit code from the system() call generated above; use it.
+                // command succeeds (exit code 0). $CHILD_ERROR carries the
+                // condition command's status in every generated form —
+                // including `!` negation, which flips $CHILD_ERROR but never
+                // touches $main_exit_code (the old $main_exit_code check spun
+                // `while ! cmd` forever).
                 output.push_str(&generator.indent());
-                output.push_str("$main_exit_code == 0\n");
+                output.push_str("$CHILD_ERROR == 0\n");
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}) {\n");
@@ -726,6 +768,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
+            // bash: the while command's exit status is that of the last body
+            // command (or 0 if none ran) — the final failing condition test
+            // must not leak into $?.
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
         }
     }
 
@@ -1033,8 +1080,15 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                 if interp.parts.len() == 1 {
                     if let StringPart::Variable(var) = &interp.parts[0] {
                         match var.as_str() {
-                            "@" => all_items.push("@ARGV".to_string()), // $@ -> @ARGV (no quotes)
-                            "*" => all_items.push("@ARGV".to_string()), // $* -> @ARGV (no quotes)
+                            // $@ / $* — script args at top level, function
+                            // args (@_) inside a function
+                            "@" | "*" => {
+                                if generator.fn_nesting_depth > 0 {
+                                    all_items.push("@_".to_string())
+                                } else {
+                                    all_items.push("@ARGV".to_string())
+                                }
+                            }
                             _ => all_items.push(generator.word_to_perl(word)),
                         }
                     } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
@@ -1232,6 +1286,22 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                         .map(|item| format!("\"{}\"", item))
                         .collect();
                     all_items.extend(items);
+                } else if word
+                    .as_literal()
+                    .map(|_| {
+                        matches!(word, Word::Literal(_, None))
+                            && (s.contains('*') || s.contains('?'))
+                            && !s.contains(' ')
+                    })
+                    .unwrap_or(false)
+                {
+                    // Bare glob item (for f in /dev/pts/*): expand at runtime,
+                    // falling back to the literal pattern when nothing matches
+                    // (bash keeps the unexpanded word).
+                    all_items.push(format!(
+                        "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                        s, s
+                    ));
                 } else {
                     all_items.push(generator.word_to_perl(word));
                 }
@@ -1824,8 +1894,14 @@ pub fn generate_continue_statement_impl(_generator: &Generator, level: &Option<S
 pub fn generate_return_statement_impl(generator: &mut Generator, value: &Option<Word>) -> String {
     match value {
         Some(word) => {
+            // Shell `return N` sets the function's EXIT STATUS — callers
+            // read it as $CHILD_ERROR (`if is_prime "$n"` tests the status,
+            // not the Perl return value), so set both.
             let perl_value = generator.perl_string_literal(word);
-            format!("return {};", perl_value)
+            format!(
+                "$CHILD_ERROR = {}; return {};",
+                perl_value, perl_value
+            )
         }
         None => "return;".to_string(),
     }
@@ -2023,6 +2099,17 @@ pub fn hoist_my_declarations(
     output: &mut String,
 ) {
     for var in vars {
+        // Only plain identifiers can be hoisted — a collected name like
+        // `options["$key"]` (an assoc-array element assignment) would emit
+        // the Perl syntax error `my $options["$key"];`.
+        if !var
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || var.is_empty()
+            || var.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
         if !generator.declared_locals.contains(var) && !generator.function_level_vars.contains(var)
         {
             // Ensure there's a newline before the declaration if the output

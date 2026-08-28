@@ -6,6 +6,15 @@ pub fn generate_gzip_command(
     cmd: &SimpleCommand,
     input_var: &str,
 ) -> String {
+    generate_gzip_command_with_output(generator, cmd, input_var, "")
+}
+
+pub fn generate_gzip_command_with_output(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    output_var: &str,
+) -> String {
     let mut output = String::new();
 
     // gzip command syntax: gzip [options] [file]
@@ -37,29 +46,33 @@ pub fn generate_gzip_command(
     }
 
     if files.is_empty() {
-        // No files specified, compress/decompress input
-        if decompress_mode {
-            let bash_cmd = format!("echo \"${}\" | gunzip 2>/dev/null", input_var);
-            output.push_str(&format!(
-                "my $decompressed = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $_r; }};\n",
-                generator.perl_string_literal_no_interp(&crate::ast::Word::literal(bash_cmd.to_string())),
-            ));
-            output.push_str("if (defined $decompressed) {\n");
-            output.push_str(&format!("{} = $decompressed;\n", input_var));
-            output.push_str("} else {\n");
-            output.push_str(&format!(
-                "{} = \"gunzip: input not in gzip format\\n\";\n",
-                input_var
-            ));
-            output.push_str("}\n");
+        // No files specified: filter the pipeline input through the real
+        // gzip binary, binary-safe (raw bytes in/out via open3 — no shell
+        // re-quoting of the data, no base64 detour that would corrupt the
+        // stream for a later decompression stage). syswrite (not print) so
+        // the dispatcher's snippet_likely_prints heuristic still wraps the
+        // result in the print-to-redirect capture.
+        let gzip_flag = if decompress_mode { "-dc" } else { "-c" };
+        let dest = if output_var.is_empty() {
+            input_var
         } else {
-            output.push_str(&format!(
-                "my $compressed = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'echo \"${}\" | gzip | base64\') or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $_r; }};\n",
-                input_var
-            ));
-            output.push_str("chomp $compressed;\n");
-            output.push_str(&format!("{} = $compressed;\n", input_var));
-        }
+            output_var
+        };
+        output.push_str(&format!(
+            "${} = do {{\n\
+             my ($__gz_w, $__gz_r);\n\
+             my $__gz_pid = open3($__gz_w, $__gz_r, '>&STDERR', 'gzip', '{}');\n\
+             binmode $__gz_w; binmode $__gz_r;\n\
+             syswrite($__gz_w, ${});\n\
+             close $__gz_w;\n\
+             my $__gz_out = do {{ local $/; <$__gz_r> }};\n\
+             close $__gz_r;\n\
+             waitpid $__gz_pid, 0;\n\
+             $CHILD_ERROR = $? >> 8;\n\
+             $__gz_out;\n\
+             }};\n",
+            dest, gzip_flag, input_var
+        ));
     } else {
         // Process specified files
         output.push_str("my @results;\n");

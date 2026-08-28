@@ -120,11 +120,15 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
 
     match &redirect.operator {
         RedirectOperator::Input => {
-            // Input redirection: command < file
+            // Input redirection: command < file. A failed redirect must NOT
+            // kill the program — bash reports it on stderr, fails the one
+            // command (status 1) and continues. Reopen from /dev/null so
+            // any read in the body sees EOF instead of the old stdin.
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDIN, '<', {} or croak \"Cannot read file: $OS_ERROR\\n\";\n",
-                target
+                "unless (open STDIN, '<', {}) {{ print STDERR \"sh: {}: $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDIN, '<', '/dev/null'; }}\n",
+                target,
+                target.trim_matches('"')
             ));
         }
         RedirectOperator::Output => {
@@ -520,6 +524,41 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                     result.push_str(" | "); // Default to pipe for now
                 }
                 result.push_str(command);
+            }
+            // A stage the per-command serializer could not reconstruct (a
+            // while-read loop headed into `| head`) leaves the refusal
+            // placeholder in the text — ONLY then fall back to the parser's
+            // verbatim source_text (it can over-span, so it is a last
+            // resort, gated on balanced braces/parens).
+            if result.contains("Complex command not supported") {
+                if let Some(src) = &pipeline.source_text {
+                    // Drop leading blank/comment lines (source_text can start
+                    // at the shebang), then require balanced braces/parens —
+                    // an unbalanced span (half a function definition) would
+                    // corrupt the bash -c text.
+                    let stripped: String = src
+                        .lines()
+                        .skip_while(|l| {
+                            let t = l.trim();
+                            t.is_empty() || t.starts_with('#')
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut brace = 0i32;
+                    let mut paren = 0i32;
+                    for c in stripped.chars() {
+                        match c {
+                            '{' => brace += 1,
+                            '}' => brace -= 1,
+                            '(' => paren += 1,
+                            ')' => paren -= 1,
+                            _ => {}
+                        }
+                    }
+                    if !stripped.is_empty() && brace == 0 && paren == 0 {
+                        return stripped;
+                    }
+                }
             }
             result
         }
@@ -1585,12 +1624,12 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     }
                 }
                 let concat_expr = parts_perl.join(" . ");
-                // Note: we pass $eval_input directly to bash -c rather than
-                // wrapping it in "eval \"...\"" because the latter triggers
-                // Perl::Critic's "Expression form of eval" false positive.
-                // bash -c "..." is semantically equivalent to eval "...".
+                // Execute the eval text in a bash child (stdout inherits so
+                // echo-evals print), then import the resulting environment so
+                // variable assignments land in this process — the previous
+                // emission built $eval_input and DID NOTHING with it.
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0; }};  # native Perl\n",
+                    "do {{ my $eval_input = {}; my $__envf = \"/tmp/__sh2_eval_env_$$\"; my $__sh = 'bash'; system($__sh, '-c', qq{{set -a; eval \"\\$1\"; env -0 > $__envf}}, $__sh, $eval_input); $CHILD_ERROR = $? >> 8; if (open my $__efh, '<', $__envf) {{ my $__envs = do {{ local $/; <$__efh> }} // q{{}}; close $__efh; unlink $__envf; for my $__kv (split /\\0/, $__envs) {{ my ($__k, $__v) = split /=/, $__kv, 2; next unless defined $__v && $__k =~ /^[A-Za-z_][A-Za-z0-9_]*$/; $ENV{{$__k}} = $__v; }} }} }};\n",
                     concat_expr
                 ));
             }

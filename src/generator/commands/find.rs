@@ -145,10 +145,10 @@ fn build_callback_lines_push(
     // Type filter
     if let Some(ref ftype) = file_type {
         let test = match ftype.as_str() {
-            "f" => "-f $_",
-            "d" => "-d $_",
-            "l" => "-l $_",
-            _ => "-e $_",
+            "f" => "-f $File::Find::name",
+            "d" => "-d $File::Find::name",
+            "l" => "-l $File::Find::name",
+            _ => "-e $File::Find::name",
         };
         conditions.push(format!("next unless {}", test));
     }
@@ -196,7 +196,7 @@ fn build_callback_lines_print(
             "l" => "-l",
             _ => "-e",
         };
-        lines.push(format!("    next unless {} $_;", test));
+        lines.push(format!("    next unless {} $File::Find::name;", test));
     }
 
     // Name filter
@@ -266,7 +266,15 @@ pub fn generate_find_command(
         );
 
         let find_call = format!(
-            "{0}File::Find::find(sub {{\n{1}\n{0}    }}, {2});\n",
+            concat!(
+                "{0}do {{\n",
+                "{0}    my $__ff_start = {2};\n",
+                "{0}    my $__ff_visit = sub {{ no warnings 'exiting';\n{1}\n{0}    }};\n",
+                "{0}    my $__ff_walk; $__ff_walk = sub {{ my ($__d) = @_; my @__es; if (opendir(my $__dh, $__d)) {{ @__es = readdir($__dh); closedir $__dh; }} for my $__e (@__es) {{ next if $__e eq '.' || $__e eq '..'; my $__p = \"$__d/$__e\"; for my $__once (1) {{ local $_ = $__e; local $File::Find::name = $__p; local $File::Find::dir = $__d; $__ff_visit->(); }} if (-d $__p && !-l $__p) {{ $__ff_walk->($__p); }} }} }};\n",
+                "{0}    for my $__once (1) {{ local $_ = $__ff_start; local $File::Find::name = $__ff_start; local $File::Find::dir = $__ff_start; $__ff_visit->(); }}\n",
+                "{0}    $__ff_walk->($__ff_start) if -d $__ff_start;\n",
+                "{0}}};\n"
+            ),
             indent_str,
             callback_lines.join("\n"),
             start_dir_expr,
@@ -301,7 +309,15 @@ pub fn generate_find_command(
             build_callback_lines_print(&args.file_type, &args.name_pattern, &args.maxdepth);
 
         let find_call = format!(
-            "{0}File::Find::find(sub {{\n{1}\n{0}    }}, {2});\n",
+            concat!(
+                "{0}do {{\n",
+                "{0}    my $__ff_start = {2};\n",
+                "{0}    my $__ff_visit = sub {{ no warnings 'exiting';\n{1}\n{0}    }};\n",
+                "{0}    my $__ff_walk; $__ff_walk = sub {{ my ($__d) = @_; my @__es; if (opendir(my $__dh, $__d)) {{ @__es = readdir($__dh); closedir $__dh; }} for my $__e (@__es) {{ next if $__e eq '.' || $__e eq '..'; my $__p = \"$__d/$__e\"; for my $__once (1) {{ local $_ = $__e; local $File::Find::name = $__p; local $File::Find::dir = $__d; $__ff_visit->(); }} if (-d $__p && !-l $__p) {{ $__ff_walk->($__p); }} }} }};\n",
+                "{0}    for my $__once (1) {{ local $_ = $__ff_start; local $File::Find::name = $__ff_start; local $File::Find::dir = $__ff_start; $__ff_visit->(); }}\n",
+                "{0}    $__ff_walk->($__ff_start) if -d $__ff_start;\n",
+                "{0}}};\n"
+            ),
             indent_str,
             callback_lines.join("\n"),
             start_dir_expr,
@@ -340,10 +356,10 @@ pub fn generate_find_for_substitution(
     // Type filter
     if let Some(ref ftype) = args.file_type {
         let test = match ftype.as_str() {
-            "f" => "-f $_",
-            "d" => "-d $_",
-            "l" => "-l $_",
-            _ => "-e $_",
+            "f" => "-f $File::Find::name",
+            "d" => "-d $File::Find::name",
+            "l" => "-l $File::Find::name",
+            _ => "-e $File::Find::name",
         };
         conditions.push(test.to_string());
     }
@@ -386,9 +402,19 @@ pub fn generate_find_for_substitution(
         elements: vec![],
     });
 
-    // File::Find::find(sub { ... }, start_dir);
+    // Readdir-order walker (GNU find recurses into a directory the moment
+    // it is encountered; File::Find visits all of a directory's entries
+    // before descending, which reorders the output).
     let find_call = format!(
-        "{indent}File::Find::find(sub {{ {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n",
+        concat!(
+            "{indent}do {{\n",
+            "{indent}    my $__ff_start = {start_dir};\n",
+            "{indent}    my $__ff_visit = sub {{ no warnings 'exiting'; {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }};\n",
+            "{indent}    my $__ff_walk; $__ff_walk = sub {{ my ($__d) = @_; my @__es; if (opendir(my $__dh, $__d)) {{ @__es = readdir($__dh); closedir $__dh; }} for my $__e (@__es) {{ next if $__e eq '.' || $__e eq '..'; my $__p = \"$__d/$__e\"; for my $__once (1) {{ local $_ = $__e; local $File::Find::name = $__p; local $File::Find::dir = $__d; $__ff_visit->(); }} if (-d $__p && !-l $__p) {{ $__ff_walk->($__p); }} }} }};\n",
+            "{indent}    for my $__once (1) {{ local $_ = $__ff_start; local $File::Find::name = $__ff_start; local $File::Find::dir = $__ff_start; $__ff_visit->(); }}\n",
+            "{indent}    $__ff_walk->($__ff_start) if -d $__ff_start;\n",
+            "{indent}}};\n"
+        ),
         indent = indent_str,
         condition_code = condition_code,
         start_dir = start_dir_expr,

@@ -470,7 +470,7 @@ pub fn generate_command_impl_with_input(
                         if !matches!(redirect.operator, RedirectOperator::HereString)
                             && !matches!(
                                 redirect.operator,
-                                RedirectOperator::Output | RedirectOperator::Append
+                                RedirectOperator::Output | RedirectOperator::ClobberOutput | RedirectOperator::Append
                             )
                             && !matches!(
                                 redirect.operator,
@@ -491,7 +491,7 @@ pub fn generate_command_impl_with_input(
             let has_output_redirect = all_redirects.iter().any(|r| {
                 matches!(
                     r.operator,
-                    RedirectOperator::Output | RedirectOperator::Append
+                    RedirectOperator::Output | RedirectOperator::ClobberOutput | RedirectOperator::Append
                 )
             });
             if has_stderr_redirect && !has_output_redirect {
@@ -530,13 +530,17 @@ pub fn generate_command_impl_with_input(
             // Now handle the base command with redirect context
             if let Command::Simple(cmd) = &base_command {
                 if let Word::Literal(cmd_name, _) = &cmd.name {
-                    if cmd_name.is_empty() {
-                        // Standalone redirect with no base command.
+                    if cmd_name.is_empty() || cmd_name == ":" || cmd_name == "true" {
+                        // Standalone redirect with no base command — and the
+                        // no-op builtins `:` / `true`, whose only redirect
+                        // effect is the same file creation/truncation
+                        // (`: >| file` is the idiomatic force-truncate).
                         // For output/append/stderr redirects, generate file creation/truncation.
                         let has_create = all_redirects.iter().any(|r| {
                             matches!(
                                 r.operator,
                                 RedirectOperator::Output
+                                    | RedirectOperator::ClobberOutput
                                     | RedirectOperator::Append
                                     | RedirectOperator::StderrOutput
                                     | RedirectOperator::StderrAppend
@@ -545,7 +549,8 @@ pub fn generate_command_impl_with_input(
                         if has_create {
                             for redirect in &all_redirects {
                                 match &redirect.operator {
-                                    RedirectOperator::Output => {
+                                    RedirectOperator::Output
+                                    | RedirectOperator::ClobberOutput => {
                                         let target =
                                             generator.perl_string_literal(&redirect.target);
                                         result.push_str(&generator.indent());
@@ -592,6 +597,8 @@ pub fn generate_command_impl_with_input(
                                     _ => {}
                                 }
                             }
+                            result.push_str(&generator.indent());
+                            result.push_str("$CHILD_ERROR = 0;\n");
                             return result;
                         }
                         // No file-creating redirects — return early (redirects already handled).
@@ -907,7 +914,7 @@ pub fn generate_command_impl_with_input(
                             let output_redirect = all_redirects.iter().find(|r| {
                                 matches!(
                                     r.operator,
-                                    RedirectOperator::Output | RedirectOperator::Append
+                                    RedirectOperator::Output | RedirectOperator::ClobberOutput | RedirectOperator::Append
                                 )
                             });
 
@@ -934,10 +941,10 @@ pub fn generate_command_impl_with_input(
                                     "      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n",
                                 );
                                 result.push_str(&generator.indent());
-                                result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                                result.push_str(
-                                    "      or die \"Cannot access file: $OS_ERROR\\n\";\n",
-                                );
+                                result.push_str(&format!(
+                                    "unless (open STDOUT, '{}', {}) {{ print STDERR \"sh: cannot create output file: $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDOUT, '>', '/dev/null'; }}\n",
+                                    mode, target
+                                ));
                             }
 
                             // If there's a stderr redirect, add it inside the do block
@@ -1147,18 +1154,23 @@ pub fn generate_command_impl_with_input(
                                     .iter()
                                     .find(|r| matches!(r.operator, RedirectOperator::Output))
                                 {
-                                    let target_str = match &redirect.target {
-                                        Word::Literal(s, _) => s.clone(),
-                                        _ => generator.word_to_perl(&redirect.target),
-                                    };
                                     let content = echo_cmd
                                         .args
                                         .iter()
                                         .filter_map(|a| is_simple_literal_arg(a))
                                         .collect::<Vec<_>>()
                                         .join(" ");
-                                    let target_lit = generator
-                                        .perl_string_literal(&Word::literal(target_str.clone()));
+                                    // A literal target needs quoting into a
+                                    // Perl literal; any other word is ALREADY
+                                    // a Perl expression — re-quoting it turns
+                                    // `"${tmpf}"` into the literal file name
+                                    // `"${tmpf}"` (and broke the die message
+                                    // into a syntax error).
+                                    let target_lit = match &redirect.target {
+                                        Word::Literal(s, _) => generator
+                                            .perl_string_literal(&Word::literal(s.clone())),
+                                        other => generator.word_to_perl(other),
+                                    };
                                     let expr = IrExpr::Str(content, StrStyle::DoubleQuoted);
                                     let output_stmt = IrStmt::Output {
                                         value: expr,
@@ -1167,8 +1179,8 @@ pub fn generate_command_impl_with_input(
                                     };
                                     result.push_str(&generator.indent());
                                     result.push_str(&format!(
-                                        "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
-                                        target_lit, target_str
+                                        "open my $fh, '>', {} or die \"cannot create output file: $!\\n\";\n",
+                                        target_lit
                                     ));
                                     result.push_str(&stmt_to_perl(
                                         &output_stmt,
@@ -1216,7 +1228,7 @@ pub fn generate_command_impl_with_input(
                 let output_pos = all_redirects.iter().position(|r| {
                     matches!(
                         r.operator,
-                        RedirectOperator::Output | RedirectOperator::Append
+                        RedirectOperator::Output | RedirectOperator::ClobberOutput | RedirectOperator::Append
                     )
                 });
 
@@ -1299,8 +1311,13 @@ pub fn generate_command_impl_with_input(
                         ">"
                     };
                     result.push_str(&generator.indent());
-                    result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
+                    // A failed output redirect must not kill the program —
+                    // bash reports it, fails the command (status 1), and
+                    // continues. Discard the body's output via /dev/null.
+                    result.push_str(&format!(
+                        "unless (open STDOUT, '{}', {}) {{ print STDERR \"sh: cannot create output file: $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDOUT, '>', '/dev/null'; }}\n",
+                        mode, target
+                    ));
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
@@ -1525,11 +1542,25 @@ pub fn generate_command_impl_with_input(
                         // bash commands newline-terminate their output (grep,
                         // ls, basename …); the expression-valued snippet often
                         // lacks the trailing newline, so add it unless already
-                        // present.  Empty output stays empty.
-                        result.push_str(&generator.indent());
-                        result.push_str(
-                            "if ($tmp ne q{} && !($tmp =~ m{\\n\\z})) { print \"\\n\"; }\n",
-                        );
+                        // present.  Empty output stays empty. Binary-output
+                        // commands (gzip compressing) must NOT get a newline
+                        // appended — it corrupts the stream on disk.
+                        let binary_output = if let Word::Literal(name, _) = &cmd.name {
+                            name == "gzip"
+                                && !cmd.args.iter().any(|a| {
+                                    matches!(a, Word::Literal(s, _)
+                                        if s == "-d" || s == "--decompress"
+                                        || (s.starts_with('-') && !s.starts_with("--") && s.contains('d')))
+                                })
+                        } else {
+                            false
+                        };
+                        if !binary_output {
+                            result.push_str(&generator.indent());
+                            result.push_str(
+                                "if ($tmp ne q{} && !($tmp =~ m{\\n\\z})) { print \"\\n\"; }\n",
+                            );
+                        }
 
                         // If the generated snippet actually populated the pipeline
                         // output buffer (eg. $output_<id>) but returned an empty

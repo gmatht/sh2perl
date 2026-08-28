@@ -1,10 +1,13 @@
 # Debashc - Shell Script Converter
 
-[![Tests](https://github.com/gmatht/sh2perl/actions/workflows/test.yml/badge.svg)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Tests](https://github.com/neon-ninja/sh2perl/actions/workflows/test.yml/badge.svg)](https://github.com/neon-ninja/sh2perl/actions/workflows/test.yml)
 
-<!-- Dynamic badges for test counts served from gh-pages branch -->
-[![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
-[![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+<!-- Dynamic badges for test counts served from THIS repo's gh-pages branch.
+     NOTE: the owner is baked into the URLs — adjust when this README lands
+     in a different fork/upstream. -->
+[![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/neon-ninja/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/neon-ninja/sh2perl/actions/workflows/test.yml)
+[![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/neon-ninja/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/neon-ninja/sh2perl/actions/workflows/test.yml)
+[![Corpus](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/neon-ninja/sh2perl/gh-pages/.github/badges/corpus.json)](https://github.com/neon-ninja/sh2perl/actions/workflows/test.yml)
 
 A comprehensive Rust library and command-line tool for parsing and converting shell/bash scripts to other programming languages. This project provides a robust foundation for analyzing shell scripts, converting them to Perl, Rust, Python, and more, or building shell script analysis tools.
 

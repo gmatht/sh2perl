@@ -158,8 +158,11 @@ fn cmp_stmt(s: &CmpSpec) -> String {
             "my $__o1 = ord(substr($__c1,$__i,1)); my $__o2 = ord(substr($__c2,$__i,1)); printf(\"%s %s differ: byte %d, line %d is %o %s %o %s\\n\", {f1}, {f2}, $__i+1, $__line, $__o1, chr($__o1), $__o2, chr($__o2)); $main_exit_code = $CHILD_ERROR = 1; "
         ));
     } else {
+        // default message wording ("char" vs "byte") follows the local
+        // cmp — see cmp_differ_word.
+        let differ_word = crate::generator::commands::cmp::cmp_differ_word();
         b.push_str(&format!(
-            "printf(\"%s %s differ: byte %d, line %d\\n\", {f1}, {f2}, $__i+1, $__line); $main_exit_code = $CHILD_ERROR = 1; "
+            "printf(\"%s %s differ: {differ_word} %d, line %d\\n\", {f1}, {f2}, $__i+1, $__line); $main_exit_code = $CHILD_ERROR = 1; "
         ));
     }
     b.push_str("} elsif (length($__c1) == length($__c2)) { $main_exit_code = $CHILD_ERROR = 0; } elsif (length($__short) == 0) { printf STDERR (\"cmp: EOF on %s which is empty\\n\", $__sn); $main_exit_code = $CHILD_ERROR = 1; } else { my $__sl = 1 + (() = $__short =~ /\\n/g); if (substr($__short, -1) eq \"\\n\") { printf STDERR (\"cmp: EOF on %s after byte %d, line %d\\n\", $__sn, length($__short), $__sl); } else { printf STDERR (\"cmp: EOF on %s after byte %d, in line %d\\n\", $__sn, length($__short), $__sl); } $main_exit_code = $CHILD_ERROR = 1; }");

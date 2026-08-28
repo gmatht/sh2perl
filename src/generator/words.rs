@@ -115,12 +115,16 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                         } else {
                             None
                         };
+                        // Digits 1-9 do NOT preserve interpolation: a shell
+                        // positional in a double-quoted string parses as a
+                        // Variable part, so a literal "$5" here came from
+                        // an escaped \$ ("price: \$5.00") — interpolating
+                        // it would read Perl's $5 capture var (empty).
+                        // `$0` stays interpolated: Perl's $0 is the program
+                        // name, matching bash $0 (057_case's usage line).
                         let should_escape = match next {
-                            Some(b'a'..=b'z')
-                            | Some(b'A'..=b'Z')
-                            | Some(b'0'..=b'9')
-                            | Some(b'_')
-                            | Some(b'{') => false,
+                            Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'_') | Some(b'{')
+                            | Some(b'0') => false,
                             _ => true,
                         };
                         if should_escape {
@@ -384,7 +388,7 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     format!(
-        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    chomp $result;\n    $result;\n}}",
+        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z// if defined $result;\n    $result;\n}}",
         env_setup,
         in_var,
         out_var,
@@ -399,7 +403,7 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
 pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, lit_quoted) => {
             // Handle literal strings
             if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
                 let command_str = s[1..s.len() - 1].to_string();
@@ -448,8 +452,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // helper so quoting/escaping rules are consistent and we avoid
                 // accidental Perl interpolation of shell snippets (like awk/sed)
                 // which may contain "$" or "@". Using generator.perl_string_literal
-                // ensures single-quoting is used when safe.
-                generator.perl_string_literal(&Word::literal(s.clone()))
+                // ensures single-quoting is used when safe. Preserve the
+                // quoted flag — it decides whether backslashes are shell
+                // escapes (unquoted) or verbatim characters (quoted).
+                generator.perl_string_literal(&Word::Literal(s.clone(), *lit_quoted))
             }
         }
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
@@ -570,7 +576,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .redirects
                                 .iter()
                                 .find(|r| matches!(r.operator, RedirectOperator::HereString))
-                                .map(|r| generator.perl_string_literal(&r.target))
+                                .map(|r| match &r.target {
+                                    Word::Literal(_, _) => {
+                                        generator.perl_string_literal(&r.target)
+                                    }
+                                    // interpolations go through word_to_perl
+                                    // so `${map[*]}` becomes join(values)
+                                    // instead of the literal-key $map{'*'}
+                                    other => generator.word_to_perl(other),
+                                })
                                 .unwrap_or_else(|| "''".to_string());
                             // Emit: echo <string> | <cmd>
                             let bash_cmd = format!("echo \"$here_input\" | {}", base_cmd_str);
@@ -819,10 +833,34 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Previously force_interp was used, but after the $ENV{var}
                             // conversion for undeclared / env-style variables, a bare
                             // $LOG_FILE in a double-quoted string would be undef.
+                            // Perl `my` locals are NOT in %ENV, so export any the
+                            // command references (localized) before the shell-out —
+                            // otherwise `"$file1"` in the bash child is unset.
+                            let mut exports = String::new();
+                            {
+                                let re = Regex::new(r"\$([a-z_][a-zA-Z0-9_]*)").unwrap();
+                                let mut seen = std::collections::HashSet::new();
+                                for cap in re.captures_iter(&command_str) {
+                                    let name = cap[1].to_string();
+                                    if seen.insert(name.clone())
+                                        && (generator.declared_locals.contains(&name)
+                                            || generator.function_level_vars.contains(&name))
+                                    {
+                                        exports.push_str(&format!(
+                                            "local $ENV{{{name}}} = ${name}; "
+                                        ));
+                                    }
+                                }
+                            }
                             let command_lit = generator
                                 .perl_string_literal_no_interp(&Word::literal(command_str));
 
-                            crate::ir::expr_to_open_perl(&command_lit, true)
+                            let open_code = crate::ir::expr_to_open_perl(&command_lit, true);
+                            if exports.is_empty() {
+                                open_code
+                            } else {
+                                format!("do {{ {}{} }}", exports, open_code)
+                            }
                         }
                     }
                 }
@@ -2605,6 +2643,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         }
         Word::MapAccess(map_name, key, _) => {
             // Handle array/map access like arr[1] or map[foo]
+            // ${map[*]} / ${map[@]}: ALL values joined — `$map{'*'}` looked
+            // up a literal '*' key (undef).
+            if key == "*" || key == "@" {
+                if generator.associative_arrays.contains(map_name) {
+                    return format!("join(q{{ }}, values %{})", map_name);
+                }
+                return format!("join(q{{ }}, @{})", map_name);
+            }
             // Check if the key is numeric (indexed array) or string (associative array)
             if key.parse::<usize>().is_ok() {
                 // Indexed array access: arr[1] -> $arr[1]
@@ -2957,21 +3003,35 @@ pub fn convert_string_interpolation_to_perl_impl(
             StringPart::Variable(var) => {
                 // Handle special shell variables
                 match var.as_str() {
-                    "#" => current_string.push_str("${scalar(@ARGV)}"), // $# -> ${scalar(@ARGV)} for interpolation
-                    "@" => {
-                        // $@ in bash = all script arguments (top level) or function arguments
-                        // (inside a function).  In Perl, @ARGV / @_ is the corresponding array.
+                    "#" => {
+                        // $# — argument count. An expression part (the
+                        // in-string `${scalar(@ARGV)}` form is a symbolic
+                        // deref that dies under strict), and @_ inside a
+                        // function.
+                        if !current_string.is_empty() {
+                            push_string_expr(&mut parts, &mut current_string);
+                        }
                         if generator.fn_nesting_depth > 0 {
-                            current_string.push_str("@_");
+                            parts.push("scalar(@_)".to_string());
                         } else {
-                            current_string.push_str("@ARGV");
+                            parts.push("scalar(@ARGV)".to_string());
                         }
                     }
-                    "*" => {
+                    "@" | "*" => {
+                        // $@/$* in bash = all script arguments (top level) or
+                        // function arguments (inside a function). Emit an
+                        // explicit join EXPRESSION part instead of in-string
+                        // "@_" text — downstream consumers (the IR bridge,
+                        // the echo -e escapers) re-escape @ in string
+                        // content, which turned it into the literal text
+                        // "@ARGV".
+                        if !current_string.is_empty() {
+                            push_string_expr(&mut parts, &mut current_string);
+                        }
                         if generator.fn_nesting_depth > 0 {
-                            current_string.push_str("@_");
+                            parts.push("join(q{ }, @_)".to_string());
                         } else {
-                            current_string.push_str("@ARGV");
+                            parts.push("join(q{ }, @ARGV)".to_string());
                         }
                     }
                     _ => {
@@ -3026,7 +3086,18 @@ pub fn convert_string_interpolation_to_perl_impl(
                 }
             }
             StringPart::MapAccess(map_name, key) => {
-                if generator.associative_arrays.contains(map_name) {
+                if key == "*" || key == "@" {
+                    // ${map[*]}: ALL values joined — `$map{'*'}` was a
+                    // literal-key lookup (undef).
+                    if !current_string.is_empty() {
+                        push_string_expr(&mut parts, &mut current_string);
+                    }
+                    if generator.associative_arrays.contains(map_name) {
+                        parts.push(format!("join(q{{ }}, values %{})", map_name));
+                    } else {
+                        parts.push(format!("join(q{{ }}, @{})", map_name));
+                    }
+                } else if generator.associative_arrays.contains(map_name) {
                     // Associative array access: map[foo] -> $map{'foo'}
                     // or map[$k] -> $map{$k}
                     if key.starts_with('$') {
@@ -3072,6 +3143,25 @@ pub fn convert_string_interpolation_to_perl_impl(
                 // First, add any accumulated string as a quoted part
                 if !current_string.is_empty() {
                     push_string_expr(&mut parts, &mut current_string);
+                }
+
+                // ${map[*]} / ${arr[@]} with the subscript kept in the NAME
+                // (operator None): all elements joined — the generic path
+                // emitted the literal-key lookup $map{'*'}.
+                if matches!(pe.operator, ParameterExpansionOperator::None)
+                    && (pe.variable.ends_with("[*]") || pe.variable.ends_with("[@]"))
+                {
+                    let base = pe
+                        .variable
+                        .trim_end_matches("[*]")
+                        .trim_end_matches("[@]")
+                        .to_string();
+                    if generator.associative_arrays.contains(&base) {
+                        parts.push(format!("join(q{{ }}, values %{})", base));
+                    } else {
+                        parts.push(format!("join(q{{ }}, @{})", base));
+                    }
+                    continue;
                 }
 
                 // Check for special array operations first
@@ -3352,6 +3442,18 @@ pub fn convert_string_interpolation_to_perl_impl(
                     }
                 }
             }
+            StringPart::Arithmetic(expr) => {
+                // Arithmetic expansion inside a double-quoted string, e.g.
+                // echo "$(( a + b ))" — evaluate as a concatenated expression
+                // part (like command substitution), never interpolate.
+                if !current_string.is_empty() {
+                    push_string_expr(&mut parts, &mut current_string);
+                }
+                parts.push(format!(
+                    "({})",
+                    generator.convert_arithmetic_to_perl(&expr.expression)
+                ));
+            }
             _ => {
                 // Handle other StringPart variants by converting them to debug format for now
                 current_string.push_str(&format!("{:?}", part));
@@ -3447,6 +3549,42 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     // runs the command via qx{} and captures its output.
 
     let mut result = expr.to_string();
+
+    // Phase -3: bash rejects two adjacent operands with no operator between
+    // them ("$((echo \"test\"))" → `echo test: syntax error in expression`);
+    // the assignment yields nothing and the script continues. Emitting the
+    // bogus tokens as Perl would be a compile error killing the whole
+    // program, so mirror bash: warn on stderr, evaluate to empty.
+    {
+        let re_adjacent =
+            regex::Regex::new(r#"[A-Za-z0-9_"')\]]\s+["'A-Za-z_(]"#).unwrap();
+        // Strip $(...) command substitutions first — their contents are
+        // commands, not arithmetic operands (handled later by extraction).
+        let mut probe = String::new();
+        let mut depth = 0usize;
+        let mut chars = expr.chars().peekable();
+        while let Some(c) = chars.next() {
+            if depth == 0 && c == '$' && chars.peek() == Some(&'(') {
+                chars.next();
+                depth = 1;
+            } else if depth > 0 {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                }
+            } else {
+                probe.push(c);
+            }
+        }
+        if re_adjacent.is_match(&probe) {
+            let msg = expr.trim().replace('"', "").replace('\'', "");
+            return format!(
+                "do {{ print STDERR \"{}: syntax error in expression\\n\"; q{{}} }}",
+                msg.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+    }
 
     // Phase -1: replace bash base-notation N#value with just value.
     // In bash arithmetic, `10#x` means "x interpreted in base 10"; since
@@ -3735,6 +3873,92 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             .to_string();
     }
 
+    // C/bash gives `^` higher precedence than `|`; Perl puts them on the
+    // SAME level (left-assoc), so `x | y ^ z` parses as `(x | y) ^ z`
+    // instead of bash's `x | (y ^ z)`. Re-group: split on top-level
+    // single `|` and parenthesize any segment containing a top-level `^`.
+    {
+        let bytes: Vec<char> = result.chars().collect();
+        let mut depth = 0i32;
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut i = 0;
+        let mut had_pipe = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                '|' if depth == 0 => {
+                    if bytes.get(i + 1) == Some(&'|') {
+                        cur.push_str("||");
+                        i += 2;
+                        continue;
+                    }
+                    if bytes.get(i + 1) != Some(&'=') {
+                        had_pipe = true;
+                        segs.push(std::mem::take(&mut cur));
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            cur.push(c);
+            i += 1;
+        }
+        segs.push(cur);
+        if had_pipe {
+            let regrouped: Vec<String> = segs
+                .into_iter()
+                .map(|s| {
+                    let mut d = 0i32;
+                    let mut has_xor = false;
+                    let cs: Vec<char> = s.chars().collect();
+                    for (idx, &ch) in cs.iter().enumerate() {
+                        match ch {
+                            '(' | '[' | '{' => d += 1,
+                            ')' | ']' | '}' => d -= 1,
+                            '^' if d == 0 && cs.get(idx + 1) != Some(&'=') => has_xor = true,
+                            _ => {}
+                        }
+                    }
+                    if has_xor {
+                        format!("({})", s.trim())
+                    } else {
+                        s
+                    }
+                })
+                .collect();
+            result = regrouped.join("|");
+        }
+    }
+
+    // Bitwise complement and shifts are UNSIGNED in plain Perl (~0 →
+    // 18446744073709551615) but SIGNED 64-bit in bash (~0 → -1); `use
+    // integer` scopes Perl to signed integer semantics. Only wrap when
+    // such an operator is present — `use integer` also changes division
+    // to truncation, which int() already handles for the general case.
+    // Also: & | ^ on Perl STRING operands are bitwise STRING operators
+    // ("6" & "3" is "2" by ASCII, not 2) — and shell vars are assigned as
+    // strings. `use feature 'bitwise'` forces the numeric behavior.
+    let needs_signed = expr.contains('~')
+        || expr.contains("<<")
+        || expr.contains(">>")
+        || expr.contains('&')
+        || expr.contains('|')
+        || expr.contains('^');
+    let signed_wrap = |inner: String| -> String {
+        if needs_signed {
+            format!(
+                "(do {{ use integer; use feature 'bitwise'; no warnings; {} }})",
+                inner
+            )
+        } else {
+            inner
+        }
+    };
+
     // Wrap with int() to match bash integer arithmetic semantics.
     // Use eval {} // "" only when the expression contains division or
     // modulo, because those are the only operations that can trigger a
@@ -3742,9 +3966,9 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     // like addition, subtraction, multiplication, and bitwise ops,
     // int() is sufficient — Perl integer addition cannot die.
     if result.contains('/') || result.contains('%') {
-        format!("eval {{ int({}) }} // \"\"", result)
+        format!("eval {{ int({}) }} // \"\"", signed_wrap(result))
     } else {
-        format!("int({})", result)
+        format!("int({})", signed_wrap(result))
     }
 }
 

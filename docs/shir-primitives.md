@@ -403,3 +403,58 @@ The planner keys the candidate table on (command, source):
 The planner starts from the command's actual source and follows edges that
 respect it — it won't force a string-count reduction onto a file it would
 have to slurp, and it won't force a stream into a literal-string shape.
+
+## As-built node inventory (src/shir_nodes/*.node)
+
+The implemented primitive vocabulary is declared in the `.node` manifests;
+`build.rs` generates the union (encode/decode + per-backend render
+registry). Every construct the reductions emit is one of these nodes or a
+core canonical ShIR shape; anything else falls back to a `sh2.*` call or
+the original command.
+
+| Node | Design-vocabulary name | Emitted by | Notes |
+|------|------------------------|-----------|-------|
+| `StrLen` | StrLen | text_ops (`${#v}`, `wc -c`) | |
+| `CaseTransform` | Case | text_ops (`${v^^}`/`${v,,}`, `tr` case pairs incl. `[:upper:]`/`[:lower:]`) | |
+| `CharTranslate` | MapChars | text_ops (`tr` literal sets, `-d`, `-s`) | other POSIX classes fall back |
+| `PathName` | — (Basename/Dirname composition) | text_ops (`${p##*/}`, `${p%/*}`, `basename`, `dirname`) | |
+| `RegSub` | RegReplace | text_ops (`sed 's///'`) | single-line literal sources only (as-built: one regex application, no per-line loop) |
+| `RegCount` | RegCount | text_ops (`wc -l`) | |
+| `Split` | Split | text_ops (`wc -w` composition) | |
+| `ArrayLen` | ArrayLen | text_ops (`wc -w` composition) | |
+| `FieldExtract` | ArrayIndex(Split) composition | text_ops (`cut -dD -fN`) | single-line literal sources only (as-built renderers split once, no per-line loop) |
+| `TakeLines` | ArraySlice+Join composition | text_ops (`head`/`tail -n`) | LINES only; `-c` (bytes) falls back |
+| `StringContains` | Contains | text_ops (`grep -q`, expression/condition position only) | statement-level `grep -q` prints nothing in bash → falls back |
+| `StringTrim` | Trim | text_ops (bare `xargs` over a single-spaced literal) | xargs squeezes internal whitespace runs; only a provably-clean literal equals a Trim |
+| `RepeatStr` | Repeat | text_ops (`yes X \| head -n K`) | |
+| `SubStrExtract` | SubStr | *(declared, not emitted)* | `${v:N:M}` shares its `param("slice")` shape with array slices — reducing to a string SubStr would be wrong for arrays, so slice stays with the runtime |
+| `StringAffix` | StartsWith/EndsWith | *(declared, not emitted)* | consumed by the estree lowering; no reduction produces it yet |
+| `CharExtract` | — | *(declared, not emitted)* | |
+| `CountedFor` | — (statement node) | for-recovery transform | counter-while → native counted loop |
+
+Design-vocabulary names with no as-built node yet: `Join` (only inside
+TakeLines/FieldExtract compositions), `ArrayIndex`, `ArraySlice`, `Case`
+first-char variants, standalone `StartsWith`/`EndsWith`.
+
+### Source policy (byte-exactness gates, REFUSE > GUESS)
+
+A reduction only fires when its inputs make the composition provably
+byte-exact:
+
+- **`echo` sources**: `-n` marks the text as having no trailing newline
+  (`wc -l` then counts the raw text: `echo -n x | wc -l` = 0); `-e` refuses
+  (escape interpretation); `-E` is a no-op. Args may be literals or plain
+  variable reads.
+- **`printf` sources refuse entirely**: no trailing newline and `%`/escape
+  interpretation — `printf x | wc -l` is 0, which the naive text lowering
+  got wrong.
+- **Trailing-newline fidelity**: head/tail, tr and sed reproduce the
+  input's final newline byte-for-byte, but a reduced statement prints via
+  `Output { newline: true }` — so those refuse `-n` sources.
+- **Whole-text vs line-structured**: wc / tr / head / tail operate on the
+  whole text and accept variable sources; cut and sed are single-line
+  as-built and require a single-line literal.
+- **Statement vs capture scope**: statement-level reductions fire only at
+  `emit=true`; `$(...)` capture bodies keep the original command (the
+  capture collects stdout — reducing the body to a bare value would break
+  it). Verified over the corpus: no Ext node appears inside a Capture.

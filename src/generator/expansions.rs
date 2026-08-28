@@ -113,6 +113,20 @@ pub fn generate_parameter_expansion_impl(
     generator: &mut Generator,
     pe: &ParameterExpansion,
 ) -> String {
+    // ${map[*]} / ${arr[@]} where the parser kept the subscript in the
+    // NAME — all elements joined; `$map{'*'}` was a literal-key lookup.
+    if matches!(pe.operator, ParameterExpansionOperator::None)
+        && (pe.variable.ends_with("[*]") || pe.variable.ends_with("[@]"))
+    {
+        let base = pe
+            .variable
+            .trim_end_matches("[*]")
+            .trim_end_matches("[@]");
+        if generator.associative_arrays.contains(base) {
+            return format!("join(q{{ }}, values %{})", base);
+        }
+        return format!("join(q{{ }}, @{})", base);
+    }
     match &pe.operator {
         ParameterExpansionOperator::ZshFlags(_, _) => {
             // zsh `${(flags)var}` — the zsh-only flag expansion; the
@@ -415,6 +429,31 @@ pub fn generate_parameter_expansion_impl(
                         "scalar(@_)".to_string()
                     } else {
                         "scalar(@ARGV)".to_string()
+                    }
+                } else if pe.variable.ends_with("[@]") || pe.variable.ends_with("[*]") {
+                    // ${arr[@]:off:len} where the parser kept the [@] in the
+                    // name — an ARRAY slice; substr($ENV{arr[@]},…) was a
+                    // Perl syntax error.
+                    let base = pe
+                        .variable
+                        .trim_end_matches("[@]")
+                        .trim_end_matches("[*]")
+                        .to_string();
+                    let var_ref = format!("@main::{}", base);
+                    if let Some(length_str) = length {
+                        format!(
+                            "join(q{{ }}, grep {{ defined }} ({})[{off}..({off})+({len})-1])",
+                            var_ref,
+                            off = offset,
+                            len = length_str
+                        )
+                    } else {
+                        format!(
+                            "join(q{{ }}, grep {{ defined }} ({})[{off}..$#main::{}])",
+                            var_ref,
+                            base,
+                            off = offset
+                        )
                     }
                 } else {
                     // Check if the variable is a scalar (not an array).

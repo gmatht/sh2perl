@@ -15,6 +15,37 @@ use crate::generator::Generator;
 ///   -n LIMIT                   → compare at most LIMIT bytes (EOF within the
 ///                                limit reports as a DIFFER at shorter_len+1)
 ///   -i SKIP | -i S1:S2         → skip bytes before comparing
+/// The word the local GNU cmp uses in its default differ message:
+/// diffutils <= 3.10 prints "differ: char N", >= 3.11 prints "differ:
+/// byte N". The corpus gate compares the polyfill's output against the
+/// local cmp, so probe it once (two 1-byte temp files) and bake the
+/// answer in; "byte" (the current wording) is the fallback when no cmp
+/// is available to ask.
+pub fn cmp_differ_word() -> &'static str {
+    static WORD: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        (|| -> Option<&'static str> {
+            let dir = std::env::temp_dir();
+            let a = dir.join(format!("__cmp_probe_a_{}", std::process::id()));
+            let b = dir.join(format!("__cmp_probe_b_{}", std::process::id()));
+            std::fs::write(&a, b"x").ok()?;
+            std::fs::write(&b, b"y").ok()?;
+            let out = std::process::Command::new("cmp").arg(&a).arg(&b).output();
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+            let text = String::from_utf8_lossy(&out.ok()?.stdout).into_owned();
+            if text.contains("differ: char") {
+                Some("char")
+            } else if text.contains("differ: byte") {
+                Some("byte")
+            } else {
+                None
+            }
+        })()
+        .unwrap_or("byte")
+    })
+}
+
 pub fn generate_cmp_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut silent = false;
     let mut verbose = false; // -l
@@ -138,7 +169,7 @@ pub fn generate_cmp_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
                 my $c2 = substr($__b2, $__diff, 1);
                 printf "%s %s differ: byte %d, line %d is %o %s %o %s\n", $__f1, $__f2, $__pos, $__line, ord($c1), (ord($c1) >= 32 && ord($c1) <= 126 ? $c1 : q{{}}), ord($c2), (ord($c2) >= 32 && ord($c2) <= 126 ? $c2 : q{{}});
             }} else {{
-                print "$__f1 $__f2 differ: byte $__pos, line $__line\n";
+                print "$__f1 $__f2 differ: {differ_word} $__pos, line $__line\n";
             }}
         }}
     }} elsif (length($__b1) != length($__b2)) {{
@@ -152,7 +183,7 @@ pub fn generate_cmp_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
                 my $__pos = $__n + 1;
                 my $__before = substr((length($__b1) < length($__b2) ? $__b1 : $__b2), 0, $__n);
                 my $__line = ($__before =~ tr/\n//) + 1;
-                if ($__mode eq 'l') {{ }} else {{ print "$__f1 $__f2 differ: byte $__pos, line $__line\n"; }}
+                if ($__mode eq 'l') {{ }} else {{ print "$__f1 $__f2 differ: {differ_word} $__pos, line $__line\n"; }}
             }} elsif ($__n == 0) {{
                 print STDERR "cmp: EOF on $__shorter which is empty\n";
             }} elsif ($__mode eq 'l') {{
@@ -169,6 +200,7 @@ pub fn generate_cmp_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
     $CHILD_ERROR;
 }};"#,
         f1, f2, limit_expr, skip1, skip2, if verbose { "l" } else if print_bytes { "b" } else { "n" },
-        s_mode
+        s_mode,
+        differ_word = cmp_differ_word()
     )
 }

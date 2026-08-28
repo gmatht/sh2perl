@@ -409,9 +409,12 @@ pub fn test_file_equivalence_with_critic(
     // Read shell script content
     let shell_content = match fs::read_to_string(filename) {
         Ok(c) => c,
-        Err(e) => {
-            return Err(format!("Failed to read {}: {}", filename, e));
-        }
+        Err(_) => match fs::read(filename) {
+            Ok(bytes) => bytes.iter().map(|&b| b as char).collect(),
+            Err(e) => {
+                return Err(format!("Failed to read {}: {}", filename, e));
+            }
+        },
     };
 
     // Parse and generate target language code
@@ -817,11 +820,17 @@ pub fn test_file_equivalence_detailed_with_critic(
     // If no cached Perl code, we need to parse and generate
     if cached_perl_code.is_none() {
         // Read shell script content
+        // Scripts are not always valid UTF-8 (utf8-non-utf8-content.sh has
+        // a latin-1 byte); fall back to a byte-preserving latin-1 decode so
+        // a print of the char round-trips to the same byte.
         shell_content = match fs::read_to_string(filename) {
             Ok(c) => c,
-            Err(e) => {
-                return Err(format!("Failed to read {}: {}", filename, e));
-            }
+            Err(_) => match fs::read(filename) {
+                Ok(bytes) => bytes.iter().map(|&b| b as char).collect(),
+                Err(e) => {
+                    return Err(format!("Failed to read {}: {}", filename, e));
+                }
+            },
         };
 
         // Parse and generate target language code
@@ -1816,6 +1825,8 @@ pub fn test_all_examples_next_fail(
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
     let mut should_break = false;
+    // Failed tests collected for the end-of-run summary (name [generator] — reason)
+    let mut failed_tests: Vec<String> = Vec::new();
     eprintln!(
         "DEBUG: Test loop initialized - {} total tests, {} examples, {} generators",
         total_tests,
@@ -1974,6 +1985,19 @@ pub fn test_all_examples_next_fail(
                         // Test failed - invalidate cache and show diff and exit
                         let mut cache = CommandCache::load();
                         cache.invalidate_bash_cache(example);
+                        {
+                            let reason = if result.failure_reason.is_empty() {
+                                "failed".to_string()
+                            } else {
+                                result.failure_reason.clone()
+                            };
+                            failed_tests.push(format!(
+                                "{} [{}] — {}",
+                                example.replace("examples/", "").replace("examples\\", ""),
+                                generator,
+                                reason
+                            ));
+                        }
 
                         // Clear entire terminal before showing failure
                         print!("\x1B[2J\x1B[1;1H"); // ANSI escape code to clear screen and move cursor to top
@@ -2213,6 +2237,12 @@ pub fn test_all_examples_next_fail(
 
                     println!("\n\n");
                     println!("TEST ERROR: {} with {} generator", example, generator);
+                    failed_tests.push(format!(
+                        "{} [{}] — error: {}",
+                        example.replace("examples/", "").replace("examples\\", ""),
+                        generator,
+                        e.lines().next().unwrap_or("")
+                    ));
                     println!(
                         "Test: {}/{} ({} passed before error)",
                         current_test, total_tests, passed_tests
@@ -2317,34 +2347,63 @@ pub fn test_all_examples_next_fail(
         }
     }
 
-    // All tests passed (only reached when running all tests, not a specific test)
+    // End-of-run summary (only reached when running all tests, not a specific test)
     if target_example_index.is_none() {
         println!("\n\n");
-        println!("TESTS COMPLETED: {} passed, 0 failed out of {}", passed_tests, total_tests);
-        println!("ALL TESTS PASSED! 🎉");
+        if !failed_tests.is_empty() {
+            println!("{}", "=".repeat(80));
+            println!("FAILED TESTS:");
+            for f in &failed_tests {
+                // one line per failure — a multiline reason (perl-critic
+                // reports) belongs in the per-test detail above, not here
+                println!("  FAIL: {}", f.lines().next().unwrap_or("failed"));
+            }
+            println!("{}", "=".repeat(80));
+        }
+        println!(
+            "TESTS COMPLETED: {} passed, {} failed out of {}",
+            passed_tests,
+            failed_tests.len(),
+            total_tests
+        );
+        if failed_tests.is_empty() {
+            println!("ALL TESTS PASSED! 🎉");
+        }
         println!("Total tests: {}", total_tests);
-        println!("Passed: {} (100%)", passed_tests);
-
-        // Write the total passed test count to first_n_tests_passed.txt
         println!(
-            "Writing total test count {} to first_n_tests_passed.txt",
-            passed_tests
-        );
-        println!(
-            "Current working directory: {:?}",
-            std::env::current_dir().unwrap_or_default()
+            "Passed: {} ({:.1}%)",
+            passed_tests,
+            if total_tests > 0 {
+                (passed_tests as f64 / total_tests as f64) * 100.0
+            } else {
+                100.0
+            }
         );
 
-        // When all tests pass, Perl code ran successfully, so write y99999 (all lines matched)
-        let file_content = format!("ALL_TESTS_PASSED:y99999");
-
-        if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
+        // The ALL_TESTS_PASSED marker is only truthful with zero failures —
+        // per-failure paths above already wrote their own progress records.
+        if failed_tests.is_empty() {
+            // Write the total passed test count to first_n_tests_passed.txt
             println!(
-                "Warning: Failed to write test count to first_n_tests_passed.txt: {}",
-                e
+                "Writing total test count {} to first_n_tests_passed.txt",
+                passed_tests
             );
-        } else {
-            println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
+            println!(
+                "Current working directory: {:?}",
+                std::env::current_dir().unwrap_or_default()
+            );
+
+            // When all tests pass, Perl code ran successfully, so write y99999 (all lines matched)
+            let file_content = format!("ALL_TESTS_PASSED:y99999");
+
+            if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
+                println!(
+                    "Warning: Failed to write test count to first_n_tests_passed.txt: {}",
+                    e
+                );
+            } else {
+                println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
+            }
         }
     }
 }
@@ -2954,16 +3013,23 @@ pub fn test_all_examples_next_fail_unlimited(
             println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
         }
     } else {
+        // Failed-test list FIRST, counts line LAST — the counts are what a
+        // reader (and CI log tail) looks for at the very end of the run.
+        // Reasons are truncated to their first line: with --perl-critic the
+        // stored reason embeds the full critic report including the entire
+        // generated program, which buried the summary under thousands of
+        // lines (the per-test detail above already printed it in full).
+        println!("FAILED TESTS:");
+        for (example, generator, reason) in &failure_summaries {
+            let brief = reason.lines().next().unwrap_or("failed");
+            println!("  FAIL: {} [{}] — {}", example, generator, brief);
+        }
+        println!("{}", "=".repeat(80));
         println!(
             "TESTS COMPLETED: {} passed, {} failed out of {}",
             passed_tests, failed_tests, total_tests
         );
         println!("{}", "=".repeat(80));
-        println!("\nFAILED TESTS:");
-        for (example, generator, reason) in &failure_summaries {
-            println!("  FAIL: {} [{}] — {}", example, generator, reason);
-        }
-        println!();
 
         // Write the first failed test info to first_n_tests_passed.txt
         if let Some((first_fail, _, _)) = failure_summaries.first() {

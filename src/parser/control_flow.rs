@@ -1670,7 +1670,8 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
 
     // Check if this is a test expression first
     if matches!(parser.lexer.peek(), Some(Token::TestBracket)) {
-        return parse_test_expression(&mut parser.lexer);
+        let shopt = parser.get_current_shopt_state();
+        return parse_test_expression(&mut parser.lexer, shopt);
     }
 
     let mut args = Vec::new();
@@ -1837,7 +1838,8 @@ fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
 
     // Check if this is a test expression
     if matches!(parser.lexer.peek(), Some(Token::TestBracket)) {
-        parse_test_expression(&mut parser.lexer)
+        let shopt = parser.get_current_shopt_state();
+        parse_test_expression(&mut parser.lexer, shopt)
     } else if matches!(parser.lexer.peek(), Some(Token::Identifier)) {
         // Check if this is a standalone variable assignment: identifier=value
         let mut pos = 1;
@@ -1869,7 +1871,10 @@ fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
     }
 }
 
-fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
+fn parse_test_expression(
+    lexer: &mut Lexer,
+    shopt: crate::ast::TestModifiers,
+) -> Result<Command, ParserError> {
     use crate::ast::{TestExpression, TestModifiers};
 
     // Consume the opening [
@@ -2200,15 +2205,18 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
 
     let expression = expression_parts.join(" ");
 
+    // Carry the parser's live shopt state (shopt -s extglob/nocasematch
+    // earlier in the script) instead of hardcoding everything off — the
+    // commands.rs single-bracket parser already does this.
     Ok(Command::TestExpression(TestExpression {
         expression,
         modifiers: TestModifiers {
-            extglob: false,
-            nocasematch: false,
-            globstar: false,
-            nullglob: false,
-            failglob: false,
-            dotglob: false,
+            extglob: shopt.extglob,
+            nocasematch: shopt.nocasematch,
+            globstar: shopt.globstar,
+            nullglob: shopt.nullglob,
+            failglob: shopt.failglob,
+            dotglob: shopt.dotglob,
             // `[[ ]]` (this site — the double-bracket parser in
             // control_flow.rs) vs `[ ]` (commands.rs) — the A1 test Call
             // carries the style as a trailing tag arg.

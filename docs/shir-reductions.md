@@ -120,34 +120,63 @@ falls back to `sh2.*` / the original command otherwise.
 
 ## Implementation status (as-built)
 
-These reductions are implemented in `text_ops` and verified **byte-exact vs
-bash** at statement level:
+These reductions are implemented in `text_ops` (opt-in:
+`DEBASHC_TRANSFORMS=text-ops`), each backed by a unit test demonstrating
+the emitted composition. The **corpus** column reports where the reduction
+actually fires on the current corpus (measured by walking the `--shir`
+export of all 540 examples with text-ops enabled); "unit only" means the
+corpus has no occurrence of the idiom in reducible shape — the composition
+is verified by unit test, and the corpus occurrences (if any) fall back to
+the original command for the documented reason.
 
-| Idiom | Node | Status |
-|-------|------|--------|
-| `${#v}` | StrLen (param `len` / getVar `#v`) | ✅ |
-| `${v^^}`/`${v,,}` | CaseTransform | ✅ |
-| `${v:N:M}` | SubStrExtract | ✅ |
-| `${v##*/}`/`${v%/*}`, `basename`/`dirname` | PathName | ✅ (statement level) |
-| `cut -d, -fN` | FieldExtract | ✅ |
-| `tr 'A-Z' 'a-z'` | CaseTransform | ✅ |
-| `tr 'a' 'b'` | CharTranslate | ✅ |
-| `sed 's///'` | RegSub | ✅ |
-| `grep -q P` | StringContains | ✅ |
-| `wc -c` | StrLen | ✅ |
-| `wc -l` | RegCount(text+\"\\n\") | ✅ |
-| `wc -w` | ArrayLen(Split(/\s+/)) | ✅ |
-| `head`/`tail -n` | TakeLines | ✅ |
-| `xargs` | StringTrim | ✅ |
-| `yes X | head -n K` | RepeatStr("X\\n", K) | ✅ |
+| Idiom | Node | Status | Corpus |
+|-------|------|--------|--------|
+| `${#v}` | StrLen (param `len` / getVar `#v`) | ✅ | 010_substring_loop, 064_03, 064_hard_to_generate |
+| `${v^^}`/`${v,,}` | CaseTransform | ✅ | 013, 024, 058, … (22 sites) |
+| `tr 'a-z' 'A-Z'`, `tr '[:lower:]' '[:upper:]'` (and inverses) | CaseTransform | ✅ | 070_gnuisms |
+| `tr 'abc' 'xyz'` / `tr -d` / `tr -s` | CharTranslate | ✅ | 070_gnuisms, parse-error-regex-lookbehind |
+| `${p##*/}`/`${p%/*}`, `basename`/`dirname` | PathName | ✅ | 013, 025, 999_pwd, … (8 sites) |
+| `sed 's///'` (single-line literal source) | RegSub | ✅ | 070_gnuisms, assign-in-args |
+| `head`/`tail -n` (lines) | TakeLines | ✅ | 095_select_menu |
+| `wc -c` | StrLen | ✅ | unit only (corpus `wc` uses are stream/file sources) |
+| `wc -l` | RegCount(text+"\n" for newline-terminated sources; raw text for `echo -n`) | ✅ | unit only |
+| `wc -w` | ArrayLen(Split(/\s+/)) | ✅ | unit only |
+| `cut -dD -fN` (single-line literal source) | FieldExtract | ✅ | unit only (bench-cut uses a variable source → falls back; FieldExtract is single-line as-built) |
+| `grep -q P` (expression/condition position) | StringContains | ✅ | unit only |
+| `xargs` (bare, single-spaced literal) | StringTrim | ✅ | unit only (chown-through-xargs passes args → falls back) |
+| `yes X \| head -n K` | RepeatStr("X\n", K) | ✅ | unit only (corpus uses are 3-stage or capture-position) |
+| `${v:N:M}` | — | ❌ not reduced | `param("slice")` is shared by scalar and array slices — a string SubStr would be wrong for arrays; the runtime handles both |
 
 **Scope boundary:** reductions fire at **statement level only** (`emit=true`).
 Inside a `$(...)` capture the body must remain the original COMMAND (to
 produce stdout the capture collects) — reducing it to a bare value breaks
-the capture. So capture-internal constructs fall back to `sh2.*` / the
-original command (correct, just not reduced). This is the documented
-"anything the core cannot reduce falls back" rule.
+the capture. Capture-internal constructs therefore fall back to `sh2.*` /
+the original command (correct, just not reduced). Verified over the corpus:
+no primitive node appears inside a Capture body.
+
+**Statement-position status commands:** `grep -q` prints NOTHING at
+statement level (its result is only `$?`), so it must not reduce into the
+printing `Output` wrapper — it reduces in expression/condition position
+only, and falls back to the original command as a statement (this fixed a
+live mis-render on parse-herestring.sh).
+
+**Source gates** (see docs/shir-primitives.md "Source policy"): `printf`
+heads refuse entirely; `echo -e` refuses; `echo -n` marks the missing
+trailing newline (wc counts raw; head/tail/tr/sed refuse); cut/sed require
+a single-line literal; bare-xargs requires a literal with no internal
+whitespace runs; `head -c`/`tail -c` (bytes) refuse — the as-built
+TakeLines renderers slice lines.
+
+**Transform interaction:** under the default all-transforms set,
+statement-position pipelines are claimed first by `shir-pipeline-native`
+(the canonical `IrStmt::Pipeline` statement form — a core shape, not a
+bespoke rendering); `text_ops`'s pipeline reductions then apply to what
+remains (param ops, here-strings, bare basename/dirname). The censuses in
+this file are measured with `DEBASHC_TRANSFORMS=text-ops` alone — the
+transform's own opt-in contract.
 
 **Not yet reduced (fall back to original):** `sort`/`uniq`, `seq | head`,
-`awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
-dynamic (file/grep) source.
+`awk`, `[[ $x == P* ]]` (test-string parsing → StringAffix is declared but
+nothing emits it yet), multi-stage pipelines, dynamic (file/grep) sources,
+variable-source `cut`/`sed` (single-line proof unavailable), `xargs` with
+arguments, `head -c`/`tail -c`, `printf`-headed pipelines.

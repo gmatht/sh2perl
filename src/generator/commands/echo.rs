@@ -213,8 +213,13 @@ pub fn generate_echo_command(
                                             // Handle variables in string interpolation
                                             match var.as_str() {
                                                 "#" => result.push_str("scalar(@ARGV)"),
-                                                "@" => result.push_str("@ARGV"),
-                                                "*" => result.push_str("@ARGV"),
+                                                // placeholder — the final escape
+                                                // pass turns literal @ into \@,
+                                                // which would kill the array
+                                                // interpolation; resolved after
+                                                // escaping (to @_ inside a
+                                                // function, @ARGV at top level).
+                                                "@" | "*" => result.push_str("__SH2_AT_ARGS__"),
                                                 "?" => result.push_str("$CHILD_ERROR"),
                                                 "!" => result.push_str(""),
                                                 "-" => result.push_str(""),
@@ -285,6 +290,14 @@ pub fn generate_echo_command(
                                         .replace("\t", "\\t")
                                         .replace("\r", "\\r")
                                         .replace("@", "\\@")
+                                        .replace(
+                                            "__SH2_AT_ARGS__",
+                                            if generator.fn_nesting_depth > 0 {
+                                                "\" . join(q{ }, @_) . \""
+                                            } else {
+                                                "\" . join(q{ }, @ARGV) . \""
+                                            }
+                                        )
                                 )
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler

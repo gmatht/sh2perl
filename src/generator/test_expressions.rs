@@ -70,7 +70,7 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
                     let cmd: String = result[cmd_start..cmd_end].to_string();
                     let quoted = crate::ir::safe_perl_q_string(&cmd);
                     let replacement = format!(
-                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }})",
+                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }})",
                         quoted
                     );
                     result.truncate(start.unwrap());
@@ -584,7 +584,19 @@ pub fn generate_test_expression_impl(
                 }
                 if has_glob_or_extglob_chars(value) {
                     let var = convert_shell_var_to_perl(generator, var);
-                    let regex_pattern = generator.convert_glob_to_regex(value);
+                    // Extglob constructs need their own conversion (@(a|b)
+                    // → (?:a|b)); the plain glob converter escapes them
+                    // into literal text and the match never fires.
+                    let has_extglob = value.contains("@(")
+                        || value.contains("*(")
+                        || value.contains("+(")
+                        || value.contains("?(")
+                        || value.contains("!(");
+                    let regex_pattern = if has_extglob {
+                        generator.convert_extglob_to_perl_regex(value)
+                    } else {
+                        generator.convert_glob_to_regex(value)
+                    };
                     format!(
                         "{} =~ {}",
                         var,
@@ -1264,7 +1276,86 @@ pub fn generate_test_command_impl(
 
 // Helper methods for test expressions
 pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) -> String {
-    // Convert extglob patterns to Perl regex
+    // Structured conversion for the positive extglob operators. The old
+    // string-replace approach turned "@(" into "(?:" and then fell through
+    // to the escape pass below, which re-escaped the "(?:" it had just
+    // created — the emitted regex matched the literal text "@(foo|bar)".
+    // `!(...)` keeps the legacy lookahead handling further down.
+    if (pattern.contains("@(")
+        || pattern.contains("*(")
+        || pattern.contains("+(")
+        || pattern.contains("?("))
+        && !pattern.contains("!(")
+    {
+        fn convert(pattern: &str) -> String {
+            let chars: Vec<char> = pattern.chars().collect();
+            let mut out = String::new();
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                let next = chars.get(i + 1).copied();
+                if matches!(c, '@' | '*' | '+' | '?') && next == Some('(') {
+                    let mut depth = 1;
+                    let mut j = i + 2;
+                    while j < chars.len() && depth > 0 {
+                        match chars[j] {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let inner: String = chars[i + 2..j.saturating_sub(1)].iter().collect();
+                    // split alternatives on top-level |, convert each
+                    let mut alts = Vec::new();
+                    let mut d = 0usize;
+                    let mut cur = String::new();
+                    for ch in inner.chars() {
+                        match ch {
+                            '(' => {
+                                d += 1;
+                                cur.push(ch);
+                            }
+                            ')' => {
+                                d = d.saturating_sub(1);
+                                cur.push(ch);
+                            }
+                            '|' if d == 0 => {
+                                alts.push(std::mem::take(&mut cur));
+                            }
+                            _ => cur.push(ch),
+                        }
+                    }
+                    alts.push(cur);
+                    let converted: Vec<String> =
+                        alts.iter().map(|a| convert(a)).collect();
+                    out.push_str(&format!("(?:{})", converted.join("|")));
+                    match c {
+                        '*' => out.push('*'),
+                        '+' => out.push('+'),
+                        '?' => out.push('?'),
+                        _ => {}
+                    }
+                    i = j;
+                } else {
+                    match c {
+                        '*' => out.push_str(".*"),
+                        '?' => out.push('.'),
+                        _ => {
+                            if "\\^$.|+()[]{}".contains(c) {
+                                out.push('\\');
+                            }
+                            out.push(c);
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            out
+        }
+        return convert(pattern);
+    }
+
     let mut result = pattern.to_string();
 
     // Debug output

@@ -149,6 +149,39 @@ pub fn generate_awk_command(
 ) -> String {
     let mut output = String::new();
 
+    // REFUSE > GUESS: the simulator below handles simple {print ...}
+    // programs. Control-flow-bearing awk (getline loops, while/for,
+    // user functions) came out as broken Perl — run the real awk over
+    // the pipeline buffer instead.
+    {
+        let full_prog: String = cmd
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                Word::Literal(s, _) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let unsupported = ["getline", "while", "for (", "for(", "function ", "system("]
+            .iter()
+            .any(|k| full_prog.contains(k));
+        if unsupported && !input_var.is_empty() {
+            let bash_cmd = crate::generator::redirects::generate_bash_command_string(
+                &crate::ast::Command::Simple(cmd.clone()),
+            );
+            let quoted = crate::ir::safe_perl_q_string(&format!(
+                "printf '%s' \"$__sh2_awk_in\" | {}",
+                bash_cmd
+            ));
+            return format!(
+                "${iv} = do {{ local $ENV{{__sh2_awk_in}} = ${iv}; open(my $__fh, '-|', 'bash', '-c', {q}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; defined $_r ? $_r : q{{}}; }};\n",
+                iv = input_var,
+                q = quoted
+            );
+        }
+    }
+
     // Parse awk arguments conservatively. Support an optional -F<sep>
     // field separator and extract the action block {...} along with an
     // optional condition before the block (eg. "$4 > 90 { print ... }").
