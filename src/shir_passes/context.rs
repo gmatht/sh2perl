@@ -78,6 +78,20 @@ pub struct PassContext {
     /// Every function name defined in the program.
     pub program_functions: HashSet<String>,
 
+    /// Strongly-connected components of the function call graph — the
+    /// mutually-recursive clusters (e.g. the glob matchers
+    /// `globMatch` ↔ `ext_alt_match` ↔ `ext_match`, or the
+    /// `test`/`tokenizeTest` parser cluster). Each SCC is a sorted set
+    /// of function names; the list is in condensation order. Populated
+    /// by [`crate::shir_passes::analysis::FunctionScc`]. A transform
+    /// that must reason about a recursive cluster as a whole (coinductive
+    /// eligibility, pattern lifts) queries this instead of being
+    /// defeated by a single-function fixpoint.
+    pub function_sccs: Vec<std::collections::BTreeSet<String>>,
+
+    /// Function name → index into [`PassContext::function_sccs`].
+    pub function_scc_index: HashMap<String, usize>,
+
     /// Function names whose calls lower to the sync fnCall path. Loops
     /// over sync-only call sites go *Sync (the M8 sync-loop speedup:
     /// 10M-iter arith 2.64s → 0.23s).

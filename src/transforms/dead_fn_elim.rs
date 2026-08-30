@@ -161,6 +161,18 @@ fn stmts_bodies(st: &IrStmt) -> Vec<&Vec<IrStmt>> {
         IrStmt::For { body, .. } | IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
             v.push(body)
         }
+        IrStmt::ForInit { init, step, body, .. } => {
+            v.push(init);
+            v.push(step);
+            v.push(body);
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            // the c-style-for lowering's rich node — walk init/step as
+            // statements and the body; cond is an expr
+            v.push(init);
+            v.push(step);
+            v.push(body);
+        }
         IrStmt::Case { clauses, .. } => {
             for c in clauses {
                 v.push(&c.body);
@@ -243,6 +255,7 @@ fn collect_stmt_strs(st: &IrStmt, out: &mut HashSet<String>) {
         IrStmt::If { cond, .. } => collect_expr_strs(cond, out),
         IrStmt::For { iter, .. } => collect_expr_strs(iter, out),
         IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => collect_expr_strs(cond, out),
+        IrStmt::ForInit { cond, .. } => collect_expr_strs(cond, out),
         IrStmt::Case { discriminant, .. } => collect_expr_strs(discriminant, out),
         IrStmt::WriteFile { content, path, .. } => {
             collect_expr_strs(content, out);
@@ -351,6 +364,36 @@ mod tests {
             expr: IrExpr::Str(name.to_string(), StrStyle::DoubleQuoted),
             asm: None,
         }
+    }
+
+    #[test]
+    fn keeps_fn_called_inside_cstyle_for() {
+        // a function called ONLY inside a `for ((...))` body (the rich
+        // ForInit node) must be kept — the walkers previously missed
+        // ForInit bodies, so the callee was removed and its call became
+        // an external exec.
+        let forinit = IrStmt::ForInit {
+            init: vec![],
+            cond: IrExpr::Str("0".to_string(), StrStyle::DoubleQuoted),
+            step: vec![],
+            body: vec![exec_call("g")],
+        };
+        let mut stmts = vec![
+            fn_def("g", vec![exec_call("echo")]),
+            IrStmt::For {
+                var: "i".to_string(),
+                iter: IrExpr::Array(vec![]),
+                body: vec![forinit],
+            },
+        ];
+        // g is called in the ForInit body — the transform must NOT remove
+        // it (removing would return true); the keep is the assertion.
+        transform(&mut stmts);
+        let names: Vec<&str> = stmts
+            .iter()
+            .filter_map(|s| if let IrStmt::Function { name, .. } = s { Some(name.as_str()) } else { None })
+            .collect();
+        assert!(names.contains(&"g"), "fn called in ForInit body kept");
     }
 
     #[test]

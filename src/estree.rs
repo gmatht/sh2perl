@@ -1363,7 +1363,7 @@ fn classify_array_call(
 ) {
     let Some(first) = args.first() else { return };
     let name = match fn_name {
-        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "unset" => match lit_str(first) {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" => match lit_str(first) {
             Some(n) => n,
             None => return,
         },
@@ -1473,7 +1473,7 @@ fn classify_array_call(
             }
             _ => entry.index_bad = true,
         },
-        "arrayLen" | "arrayItems" => entry.read_stmt_idxs.push(stmt_idx),
+        "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1958,7 +1958,7 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                         }
                     }
                 }
-                "arrayLen" | "arrayItems" | "param" => {
+                "arrayLen" | "arrayItems" | "arrayValues" | "param" => {
                     if let Some((name, len)) = array_len_join(fn_name, arguments) {
                         if natives.contains(name) {
                             return if len {
@@ -2131,7 +2131,7 @@ fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Opt
 fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
     match fn_name {
         "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
-        "arrayItems" => lit_str(args.first()?).map(|n| (n, false)),
+        "arrayItems" | "arrayValues" => lit_str(args.first()?).map(|n| (n, false)),
         "param" => {
             let op = lit_str(args.first()?)?;
             let mode = args.get(2).and_then(lit_str)?;
