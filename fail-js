@@ -1,0 +1,172 @@
+#!/usr/bin/env perl
+# fail-js — corpus gate for mydat's js target (the ESTree->JS path).
+#
+# For each example: transpile with mydat's otranspiler (js target, which
+# runs shell -> ShIR -> ESTree JSON -> JS via the vendored estree.js
+# converter), run the generated JS against the sh2.* runtime
+# (js-runner.mjs + sh2-namespace.mjs), and compare stdout + exit code
+# against bash. A failing test is a bug, never blessed away.
+#
+# Usage: ./fail-js [PREFIX]
+#   SH2PERL_DIR   corpus root (default /home/llm/sh2loop/sh2perl)
+#   OTRANSPILER   mydat's otranspiler binary (default $root/target/debug/otranspiler)
+#   SH2_NAMESPACE the sh2.* runtime module (default /home/llm/sh2loop/harness/sh2-namespace.mjs)
+use strict;
+use warnings;
+use Cwd qw(abs_path);
+use File::Basename qw(basename dirname);
+use File::Path qw(make_path remove_tree);
+use File::Temp qw(tempdir);
+use JSON::PP;
+
+$| = 1;
+
+my $root = dirname(abs_path($0));
+my $sh2perl = $ENV{SH2PERL_DIR} // "/home/llm/sh2loop/sh2perl";
+my $otranspiler = $ENV{OTRANSPILER} // "$root/target/debug/otranspiler";
+my $runner = "$root/harness/js-runner.mjs";
+my $sh2ns = $ENV{SH2_NAMESPACE} // "/home/llm/sh2loop/harness/sh2-namespace.mjs";
+my $examples = "$sh2perl/examples";
+my $timeout_per_test = 20;   # seconds per individual test
+
+my $ncpus = 1;
+if (open my $fh, '<', '/proc/cpuinfo') {
+    my @lines = grep { /^processor\s*:/ } <$fh>;
+    $ncpus = scalar @lines || 1;
+    close $fh;
+}
+my $jobs = int($ncpus / 2);
+$jobs = 1 if $jobs < 1;
+
+my @all_tests = sort glob "$examples/*.sh";
+if (@ARGV) {
+    my $prefix = $ARGV[0];
+    @all_tests = grep { index(basename($_), $prefix) != -1 } @all_tests;
+}
+my $total = scalar @all_tests;
+
+# ── run one test ──────────────────────────────────────────────────
+sub run_one_test {
+    my ($test_file, $test_num, $work_dir) = @_;
+    my $tmp_dir = "$work_dir/test_$test_num";
+    make_path($tmp_dir);
+
+    my %result = (file => basename($test_file));
+    my $verdict = 'PASS';
+    my $reason = '';
+
+    my $js_out = `timeout $timeout_per_test sh -c '"$otranspiler" "$test_file" - --target js 2>/dev/null'`;
+    if ($? != 0) {
+        $verdict = 'FAIL';
+        $reason = 'otranspiler failed';
+    } else {
+        my $js_file = "$tmp_dir/prog.js";
+        open my $jfh, '>', $js_file or die "write $js_file: $!";
+        print $jfh $js_out;
+        close $jfh;
+        my $run_out = `timeout $timeout_per_test node "$runner" "$js_file" --source "$test_file" --ns "$sh2ns" 2>"$tmp_dir/jserr.txt"`;
+        my $run_exit = $? >> 8;
+        my $err = '';
+        if (open my $efh, '<', "$tmp_dir/jserr.txt") {
+            local $/; $err = <$efh>; close $efh;
+        }
+        # The runner exits with the PROGRAM's exit code; only its own
+        # infrastructure failures (bad JS / usage) are runtime errors —
+        # it prefixes those with "js-runner:" on stderr.
+        if ($run_exit != 0 && $err =~ /^js-runner:/m) {
+            $verdict = 'FAIL';
+            my $first = (split /\n/, $err)[0];
+            $reason = "runtime error: $first";
+        } else {
+            my $bash_out = `timeout $timeout_per_test bash '$test_file' 2>"$tmp_dir/bserr.txt"`;
+            my $bash_exit = $? >> 8;
+            if ($bash_exit == 124) {
+                $reason = "bash reference timed out (js ran; inconclusive)";
+            } elsif (($run_out // '') ne ($bash_out // '')) {
+                $verdict = 'FAIL';
+                $reason = 'stdout mismatch';
+            } elsif ($run_exit != $bash_exit) {
+                $verdict = 'FAIL';
+                $reason = "exit code (bash=$bash_exit js=$run_exit)";
+            }
+        }
+    }
+    $result{js} = $verdict;
+    $result{reason} = $reason;
+
+    remove_tree($tmp_dir);
+    return \%result;
+}
+
+# ── main ──────────────────────────────────────────────────────────
+print "fail-js: $total tests, $jobs parallel workers, ${timeout_per_test}s timeout\n";
+print "Examples dir: $examples\n";
+print "Transpiler: $otranspiler\n";
+print "----------------------------------------\n";
+
+my $work_dir = tempdir("jsfail-XXXXXXXX", CLEANUP => 1, DIR => "/tmp");
+my %child_info;
+my $next_idx = 0;
+
+sub dispatch {
+    my ($idx) = @_;
+    my $test_file = $all_tests[$idx];
+    my $test_num  = $idx + 1;
+    my $pid = fork;
+    if (!defined $pid) { die "fork: $!"; }
+    if ($pid == 0) {
+        my $result = run_one_test($test_file, $test_num, $work_dir);
+        my $res_file = "$work_dir/result_$test_num.json";
+        open my $rfh, '>', $res_file or die "write $res_file: $!";
+        print $rfh JSON::PP::encode_json($result);
+        close $rfh;
+        exit(0);
+    }
+    $child_info{$pid} = { test_num => $test_num, test_name => basename($test_file), res_file => "$work_dir/result_$test_num.json" };
+}
+
+while ($next_idx < $total && scalar(keys %child_info) < $jobs) {
+    dispatch($next_idx);
+    $next_idx++;
+}
+
+my ($js_pass, $js_fail) = (0, 0);
+my %reason_count;
+my @js_failures;
+
+while (scalar(keys %child_info) > 0) {
+    my $pid = waitpid(-1, 0);
+    if ($pid <= 0) { sleep 1; next; }
+    my $info = $child_info{$pid};
+    delete $child_info{$pid};
+
+    my $result = {};
+    if (open my $rfh, '<', $info->{res_file}) {
+        local $/; $result = JSON::PP::decode_json(<$rfh>); close $rfh;
+    }
+    if (($result->{js} // '') eq 'PASS') { $js_pass++; }
+    else {
+        $js_fail++;
+        my $r = $result->{reason} // 'unknown';
+        $reason_count{$r}++;
+        push @js_failures, $info->{test_name};
+    }
+
+    if ($next_idx < $total) {
+        dispatch($next_idx);
+        $next_idx++;
+    }
+}
+
+print "----------------------------------------\n";
+print "JS: $js_pass passed, $js_fail failed out of $total\n";
+if ($js_fail) {
+    print "\nJS failure reasons:\n";
+    for my $r (sort { $reason_count{$b} <=> $reason_count{$a} } keys %reason_count) {
+        print "  $reason_count{$r}x  $r\n";
+    }
+    print "\nFailing tests:\n";
+    print "  $_\n" for @js_failures;
+}
+print "\n(full per-test list in .js_failures.tsv)\n";
+exit($js_fail ? 1 : 0);
