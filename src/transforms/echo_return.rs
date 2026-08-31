@@ -285,7 +285,7 @@ fn parse_stmt(
             }
             loop_body_states(body, states, eligible, scc)
         }
-        other => None,
+        _other => None,
     }
 }
 

@@ -1,3 +1,8 @@
+#![allow(unreachable_patterns)]
+#![allow(unused_assignments)]
+#![allow(dead_code)]
+#![allow(unexpected_cfgs)]
+
 pub mod ast;
 pub mod ast_words;
 pub mod lexer;

@@ -3993,7 +3993,7 @@ impl Render {
 
     /// Append a pipeline call's stage text (`a | b | c`).
     fn sh_pipeline_text(&mut self, buf: CmdBuf, args: &[IrExpr]) {
-        let mut first = true;
+        let _first = true;
         // heredoc bodies attached to pipeline stages: bash reads the
         // body from the lines FOLLOWING the whole pipeline line, while
         // the `<<DELIM` marker stays attached to its own stage. Emit
@@ -4007,7 +4007,7 @@ impl Render {
                         self.sh_raw(buf, "|");
                     }
                     first = false;
-                    let mut spec_redirect = |specs: &[IrExpr],
+                    let spec_redirect = |specs: &[IrExpr],
                                              inner: &Vec<IrStmt>,
                                              deferred: &mut Vec<String>,
                                              buf: CmdBuf,
@@ -4695,7 +4695,7 @@ impl Render {
                                 ));
                                 for v in &self_rec_vars {
                                     let id = r.c_ident(v);
-                                    if let Some(b) = r.buf_bound(v) {
+                                    if let Some(_b) = r.buf_bound(v) {
                                         r.emit(&format!("strcpy({id}, {sv_tag}_{id});"));
                                     } else {
                                         r.emit(&format!("{id} = {sv_tag}_{id};"));
@@ -6201,7 +6201,7 @@ impl Render {
                 let v = format!("((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : ({val}))");
                 if self.is_num(&name) || name.is_empty() {
                     v
-                } else if let Some(b) = self.buf_bound(&name) {
+                } else if let Some(_b) = self.buf_bound(&name) {
                     // `:=` ASSIGNS the default back (fixed buffer: copy)
                     format!("(strcpy({}, {v}), {v})", self.c_ident(&name))
                 } else {
@@ -6524,7 +6524,7 @@ impl Render {
                 };
                 if op == "=" {
                     let v = self.value_c(value);
-                    if let Some(b) = self.buf_bound(&name) {
+                    if let Some(_b) = self.buf_bound(&name) {
                         // a fixed buffer cannot be re-pointed
                         format!("(strcpy({id}, {v}), {v})")
                     } else {
@@ -6930,7 +6930,7 @@ impl Render {
                 ));
                 for v in &self_rec_vars {
                     let id = self.c_ident(v);
-                    if let Some(b) = self.buf_bound(v) {
+                    if let Some(_b) = self.buf_bound(v) {
                         self.emit(&format!("strcpy({id}, {sv_tag}_{id});"));
                     } else {
                         self.emit(&format!("{id} = {sv_tag}_{id};"));
@@ -7782,7 +7782,7 @@ impl Render {
             // assign the formatted text to a variable (printf -v)
             let name = dest;
             if cargs.is_empty() {
-                if let Some(b) = self.buf_bound(name) {
+                if let Some(_b) = self.buf_bound(name) {
                     return Some(format!(
                         "(strcpy({name}, {}), 1)",
                         Self::cstr(&fmt)

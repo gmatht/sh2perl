@@ -4,7 +4,6 @@
 //! Remove it → falls back to sh2.fieldExtract().
 
 use crate::shir_nodes::FieldExtract;
-use crate::shir_nodes::ExtExpr;
 use crate::render_ext_expr::{ExprRenderCtx, Backend};
 
 pub(crate) fn render(node: &FieldExtract, ctx: &ExprRenderCtx) -> Option<String> {

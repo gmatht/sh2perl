@@ -708,7 +708,7 @@ impl JavaCtx {
                 let id = java_ident(name);
                 let prev = self.in_function;
                 self.in_function = true;
-                let mut saved = std::mem::take(out);
+                let saved = std::mem::take(out);
                 let mut fntext = String::new();
                 fntext.push_str(&format!(
                     "{ind}static String {id}(String[] a) throws Exception {{\n",
@@ -1234,7 +1234,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             out.push_str(";\n");
             Ok(())
         }
-        IrExpr::BinOp { lhs, rhs, op } => {
+        IrExpr::BinOp { lhs: _, rhs: _, op } => {
             // statement-position command chain (`a && b`, `a || b`) —
             // passthrough as ONE bash -c text (bash owns precedence and
             // short-circuit), stdout inherited, rc lands in $?
@@ -1374,10 +1374,8 @@ fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<(char, String)>)>, usi
             while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
                 i += 1;
             }
-            let has_flags = i > flags_start;
-            let mut has_width = false;
+            let _has_flags = i > flags_start;
             while i < chars.len() && chars[i].is_ascii_digit() {
-                has_width = true;
                 i += 1;
             }
             let mut has_prec = false;
@@ -1770,7 +1768,7 @@ fn norm_arith_text(s: &str) -> String {
     norm.replace('{', " ").replace('}', " ")
 }
 
-fn collect_max_param(stmts: &[IrStmt], max: &mut usize) {
+fn collect_max_param(_stmts: &[IrStmt], _max: &mut usize) {
     fn scan_expr(e: &IrExpr, max: &mut usize) {
         if let IrExpr::Call { func, args, .. } = e {
             if func == "getVar" {

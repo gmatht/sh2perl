@@ -784,8 +784,6 @@ impl Render {
                         wrap(lhs, l.clone()),
                         wrap(rhs, r)
                     );
-                    #[cfg(feature="never")]
-                    eprintln!("DBG lhs=[{}] rhs=[{}] out=[{}]", l, r, chained);
                     if need_rs.get() {
                         self.need_run_status = true;
                     }

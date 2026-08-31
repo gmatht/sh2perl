@@ -156,7 +156,7 @@ fn recurse(st: &mut IrStmt) -> bool {
             step,
             body,
         } => {
-            let mut c = transform(init) | recurse_expr(cond) | transform(step) | transform(body);
+            let c = transform(init) | recurse_expr(cond) | transform(step) | transform(body);
             c
         }
         IrStmt::While { cond, body } => recurse_expr(cond) | transform(body),

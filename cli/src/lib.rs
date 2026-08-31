@@ -12,7 +12,6 @@ pub mod utils;
 #[cfg(all(target_os = "wasi", feature = "wasi-cli"))]
 pub mod wasi_api;
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::sync::Mutex;
@@ -88,8 +87,8 @@ pub fn estree_json_to_js(estree_json: &str) -> Result<String, String> {
 
 // Import from our new modules
 use crate::cli_commands::{
-    export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_perl, parse_shir_json_to_rust, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
+    export_mir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
+    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, parse_shir_json_to_estree, parse_shir_json_to_perl, parse_shir_json_to_rust, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
     parse_to_perl,
     parse_to_perl_embed, parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
@@ -384,6 +383,9 @@ pub fn main_with_args(args: Vec<String>) {
         }
         i += 1;
     }
+    // ast_options is configured by the --ast-* flags but not yet consumed
+    // (the AST formatting options are a known no-op); keep the config live.
+    let _ = &ast_options;
 
     let command = &args[1];
 
@@ -755,6 +757,7 @@ exit $main_exit_code;
                     output_lineno = true;
                     filename = &args[4];
                 }
+                let _ = &output_lineno;
                 let src = std::fs::read_to_string(filename).unwrap_or_else(|e| {
                     eprintln!("Error reading file {}: {}", filename, e);
                     std::process::exit(1);
@@ -887,6 +890,7 @@ exit $main_exit_code;
                 output_lineno = true;
                 input = &args[3];
             }
+            let _ = &output_lineno;
             let src = if input == "-" {
                 let mut s = String::new();
                 if let Err(e) = std::io::stdin().read_to_string(&mut s) {
@@ -1144,7 +1148,7 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
             });
         }
-        "--shir-in-go" | "--shir-in-c" | "--shir-in-python" | "--shir-in-java" | "--shir-in-rust" | "--shir-in-zig" | "--shir-in-js" | "--shir-in-glsl" => {
+        "--shir-in-go" | "--shir-in-c" | "--shir-in-python" | "--shir-in-js" | "--shir-in-glsl" => {
             // core dispatcher parity (marketplace triage gate): the
             // co-owned mirror renderers render through the same A1-ingress
             // (strip_cfor + RestructureGoto + process-subst + optimize),
@@ -1373,7 +1377,7 @@ exit $main_exit_code;
                         // Parse and run the shell script
                         let commands = match Parser::new(&content).parse() {
                             Ok(c) => c,
-                            Err(e) => {
+                            Err(_) => {
                                 // Fallback: generate a bash wrapper that runs the original script
                                 let fallback = format!(
                                     r##"#!/usr/bin/env perl

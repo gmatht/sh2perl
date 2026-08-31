@@ -3,7 +3,7 @@
 
 use crate::ir::ir_expr_to_perl;
 use crate::render_ext_expr::ExprRenderCtx;
-use crate::shir_nodes::{CloneDeep, ExtExpr};
+use crate::shir_nodes::CloneDeep;
 
 pub(crate) fn render(node: &CloneDeep, _ctx: &ExprRenderCtx) -> Option<String> {
     let value = ir_expr_to_perl(&node.value);

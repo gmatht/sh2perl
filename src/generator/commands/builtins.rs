@@ -648,7 +648,7 @@ pub fn generate_generic_builtin(
                     // Generate the full command string and use qx{} to execute the
                     // pipeline, matching how head/tail handle external commands.
                     let command = Command::Simple(cmd.clone());
-                    let command_str = generator.generate_command_string_for_system(&command);
+                    let _command_str = generator.generate_command_string_for_system(&command);
                     // This literal will be used as the qx{} operand to execute the
                     // pipeline at runtime. Emit a non-interpolating Perl literal so
                     // embedded shell $-sequences and escape sequences are preserved.

@@ -21,7 +21,7 @@ fn bareword_fh_to_lexical(code: &str) -> String {
     let bytes = result.as_bytes().to_vec();
     while i < bytes.len() {
         // look for "open" or "open("
-        if (i + 4 <= bytes.len() && &bytes[i..i + 4] == b"open") {
+        if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"open"  {
             // skip past "open" and any whitespace/parens
             let mut j = i + 4;
             while j < bytes.len()
@@ -198,7 +198,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             // Extract -i backup extension if present
             let mut inplace_ext = String::new();
             let mut file_args: Vec<String> = Vec::new();
-            for (i, arg) in cmd.args.iter().enumerate() {
+            for (_i, arg) in cmd.args.iter().enumerate() {
                 if let Word::Literal(s, _) = arg {
                     if s.starts_with("-i") && !s.starts_with("-i.bak") && s != "-i" {
                         // -i with explicit extension like -i.bak

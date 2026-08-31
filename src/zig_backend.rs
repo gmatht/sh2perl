@@ -214,7 +214,7 @@ impl Render {
             return m.clone();
         }
         let mut m = String::new();
-        for (i, c) in name.chars().enumerate() {
+        for (_i, c) in name.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 m.push(c);
             } else {
@@ -1922,7 +1922,7 @@ impl Render {
                                                 };
                                                 if let Some(a) = rest.get(argi) {
                                                     argi += 1;
-                                                    let mut pa = self.parts_of(a);
+                                                    let pa = self.parts_of(a);
                                                     if pa.len() == 1 {
                                                         // a %d over a
                                                         // string-model value

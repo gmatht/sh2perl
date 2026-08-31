@@ -301,6 +301,7 @@ pub fn parse_backticks_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
+#[allow(dead_code)]
 fn extract_core_perl_logic(perl_code: &str) -> String {
     // Look for the main logic after variable declarations
     if let Some(captures) = regex::Regex::new(r"my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)")
@@ -331,6 +332,7 @@ fn extract_core_perl_logic(perl_code: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
     // Check if this is an ls command by looking for ls-specific patterns FIRST
     // (before checking for full Perl script, so ls commands get special handling)

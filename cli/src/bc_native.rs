@@ -188,6 +188,7 @@ pub fn lower_bc_native(json: &str) -> String {
 struct BcParser<'a> {
     chars: Vec<char>,
     pos: usize,
+    #[allow(dead_code)]
     src: &'a str,
 }
 

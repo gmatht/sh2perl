@@ -2160,7 +2160,7 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                         let mut i = 0;
                         while i + 1 < words.len() {
                             if let IrExpr::Str(fl, _) = &words[i] {
-                                if (fl == "-P" || fl == "--perl-regexp") {
+                                if fl == "-P" || fl == "--perl-regexp" {
                                     if let IrExpr::Str(pat, _) = &words[i + 1] {
                                         if !ere_safe(pat) {
                                             return true;
@@ -4615,7 +4615,7 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
     // the condition: `LHS OP RHS` -> `[ "$((LHS))" -o "$((RHS))" ]`
     let cond_sh = {
         let mut cond_sh = String::new();
-        let mut rest = cond;
+        let rest = cond;
         let mut done = false;
         for (op, flag) in [
             ("<=", "-le"),
@@ -4958,7 +4958,8 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             for (i, c) in clauses.iter().enumerate() {
                 if c.comm == "default" { default_idx = Some(i); break; }
             }
-            let mut parts: Vec<String> = Vec::new();
+            let _ = &default_idx;
+                    let mut parts: Vec<String> = Vec::new();
             for c in clauses {
                 if c.comm == "default" {
                     for b in &c.body {

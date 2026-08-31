@@ -823,7 +823,7 @@ pub fn generate_command_impl_with_input(
                         // Replace the trailing bare "$tr_result_0" (which is designed for use
                         // inside a do{...} block) with a print statement for standalone commands.
                         let output_var = format!("tr_result_{}", "0");
-                        let mut lines: Vec<&str> = specific_output.rsplitn(2, '\n').collect();
+                        let lines: Vec<&str> = specific_output.rsplitn(2, '\n').collect();
                         if lines.len() == 2 && lines[0].trim() == format!("${}", output_var) {
                             // Found the trailing bare variable reference; replace with print
                             let rest = lines[1];
@@ -1003,7 +1003,7 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&diff_output);
 
                             // Close the output redirect do block if we opened one
-                            if let Some((ref mode, ref target)) = output_redirect_target {
+                            if let Some((_mode, _target)) = output_redirect_target {
                                 result.push_str(&generator.indent());
                                 result.push_str("open STDOUT, '>&', $original_stdout\n");
                                 result.push_str(

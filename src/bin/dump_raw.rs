@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use debashl::lexer::{Lexer, Token};
+use debashl::lexer::Token;
 use logos::Logos;
 
 fn main() {

@@ -298,7 +298,7 @@ impl Render {
             return m.clone();
         }
         let mut m = String::new();
-        for (i, c) in name.chars().enumerate() {
+        for (_i, c) in name.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 m.push(c);
             } else {
@@ -903,7 +903,7 @@ impl Render {
                         "(if {}.contains({}.as_str()) {{ true }} else {{ false }})",
                         self.expr_str(&x.text), self.expr_str(&x.pattern))
                 }
-                other => format!("({} != 0)", self.expr_num(e)),
+                _other => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
@@ -1267,7 +1267,7 @@ impl Render {
                     format!("{delta}")
                 };
                 let cur = self.getvar_num(var);
-                let m = self.tls(var);
+                let _m = self.tls(var);
                 let stmt = self.write_num_or_str(var, &format!("({cur} {d})"));
                 if *prefix {
                     let new = self.getvar_num(var);
@@ -1597,7 +1597,7 @@ impl Render {
                         return;
                     }
                 }
-                let text = self.cmd_text(&words, None);
+                let _text = self.cmd_text(&words, None);
                 // `eval "echo … $x …"` — expand the vars into the text
                 // (a child bash would not see the native store)
                 let interp = self.dollar_interp(&joined);
@@ -1744,7 +1744,7 @@ impl Render {
             | "unset" | "set" | "shift" | "pwd" | "wait" | "eval" | "source" | "."
             | "command" | "exec" | "break" | "continue" => {
                 // a builtin in a condition: run it, rc decides
-                let mut saved = std::mem::take(&mut self.out);
+                let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
                 self.depth = 0;
                 self.exec_stmt(args);
@@ -3061,7 +3061,7 @@ impl Render {
 
     /// Native capture: run the statements with the output buffer active.
     fn capture_block(&mut self, stmts: &[IrStmt]) -> String {
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
         // a capture is a standalone stdout context — an active fd-1
@@ -3186,7 +3186,7 @@ impl Render {
                 self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
             } else {
                 // native stage
-                let mut saved = std::mem::take(&mut self.out);
+                let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
                 self.depth = 1;
                 if idx > 0 {
@@ -3241,7 +3241,7 @@ impl Render {
         if stages.is_empty() {
             return "true".to_string();
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.pipeline_stmt(&stages);
@@ -3278,7 +3278,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         let cond_block = self.cond_block(&cond);
@@ -3323,7 +3323,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         for s in stmts {
@@ -3391,7 +3391,7 @@ impl Render {
     /// and as a bool block.
     fn and_bool(&mut self, args: &[IrExpr]) -> String {
         let blocks = self.and_blocks(args);
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         for (i, b) in blocks.iter().enumerate() {
@@ -3435,7 +3435,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.redirect_render(&stmts, &redirs);
@@ -3452,7 +3452,7 @@ impl Render {
         if let Some(IrExpr::Arrow(b)) = args.first() {
             stmts = b.clone();
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.subshell_render(&stmts);
@@ -3815,7 +3815,7 @@ impl Render {
                 "{{ let __p = {te}; let _ = std::fs::remove_file(&__p); let _ = std::process::Command::new(\"mkfifo\").arg(&__p).status(); }}"
             ));
             self.emit(&format!("let __ps_tmp_loc = {te};"));
-            let mut saved = std::mem::take(&mut self.out);
+            let saved = std::mem::take(&mut self.out);
             let old_depth = self.depth;
             self.depth = 1;
             for p in &pre {
@@ -4076,7 +4076,7 @@ impl Render {
         let name = str_arg(args, 1).unwrap_or("");
         // array-length / keys forms first
         let idx_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
-        let off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+        let _off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let name_at = name.ends_with("[@]") || name.ends_with("[*]");
         if let Some(keys) = name.strip_prefix('!') {
             // `${!prefix*[@]:0:3}` — slicing the indirect key list is a
@@ -4513,7 +4513,7 @@ impl Render {
 
     /// setArray as a bool block.
     fn setarray_bool(&mut self, func: &str, args: &[IrExpr]) -> String {
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.array_call_stmt_by_name(func, args);
@@ -5099,7 +5099,7 @@ impl Render {
                     // patterns arrive as source text — unwrap a fully
                     // quoted pattern (`""` matches the empty string;
                     // `"*"` is a LITERAL star, not the wildcard)
-                    let mut pats: Vec<String> = c
+                    let pats: Vec<String> = c
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
@@ -5176,7 +5176,7 @@ impl Render {
                     &words.iter().collect::<Vec<_>>(),
                     if env.is_empty() { None } else { Some(&env) },
                 );
-                let mut full = text;
+                let full = text;
                 for r in redirects {
                     if let IrExpr::Object(props) = r {
                         for (k, v) in props {
@@ -5335,7 +5335,7 @@ impl Render {
             }
             captured.insert(v.clone(), cap.clone());
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
         let old_captured = std::mem::replace(&mut self.captured, captured);

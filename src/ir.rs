@@ -4672,7 +4672,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                     continue;
                 };
                 if let Some(eq) = word_str.split_once('=') {
-                    let mut val = eq.1.to_string();
+                    let val = eq.1.to_string();
                     if eq.1.is_empty() && i + 1 < words.len() {
                         // value is the next word — render it structurally
                         // (a getVar(1) word → $ARGV[0]).
@@ -6909,7 +6909,6 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrExpr::Splice(e) => expr_refers_to_main_exit(e),
         IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
-        IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -7156,7 +7155,6 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrExpr::Splice(e) => collect_vars_in_expr(e, vars),
-        IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Arrow(body) => {
             for stmt in body {

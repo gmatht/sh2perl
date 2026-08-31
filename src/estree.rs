@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 // ── ESTree node model (standard subset) ─────────────────────────────
 
@@ -373,10 +373,10 @@ fn map_raw_bytes(s: &str) -> String {
 
 fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
     Some(match stmt {
-        Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+        Stmt::BreakStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
         },
-        Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+        Stmt::ContinueStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("continue", vec![]),
         },
         Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
@@ -1476,7 +1476,7 @@ fn classify_array_call(
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
-            let target = args.get(1).and_then(lit_str).unwrap_or("");
+            let _target = args.get(1).and_then(lit_str).unwrap_or("");
             let mode = args.get(2).and_then(lit_str).unwrap_or("");
             if op == "slice" && mode == "@" {
                 // len (#name) or join (name) — both reads
@@ -5081,7 +5081,7 @@ pub(crate) fn normalize_functions(mut prog: Program) -> Program {
                         let mut fn_expr: Option<Expr> = None;
                         for (k, x) in expressions.iter_mut().enumerate() {
                             if k == r.seq_idx {
-                                if let Expr::AssignmentExpression { left, right, .. } = x {
+                                if let Expr::AssignmentExpression { left, right: _, .. } = x {
                                     let l = (**left).clone();
                                     let block = fn_block.clone();
                                     let params2 = fn_params.clone();
@@ -5565,7 +5565,7 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
     }
 
     // 3. the direct-statement builders
-    fn build_expr(f: &FnInfo, args: Vec<Expr>, prog_body: &mut Vec<Stmt>) -> Expr {
+    fn build_expr(_f: &FnInfo, _args: Vec<Expr>, _prog_body: &mut Vec<Stmt>) -> Expr {
         let call_expr = |args: &Vec<Expr>| Expr::CallExpression {
             callee: Box::new(Expr::Identifier { name: "".to_string() }), // patched by the caller
             arguments: args.clone(),
@@ -5846,7 +5846,7 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
             }
         }
     }
-    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, stmt_pos: bool) {
+    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, _stmt_pos: bool) {
         match e {
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }

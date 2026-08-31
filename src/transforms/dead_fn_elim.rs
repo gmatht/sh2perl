@@ -166,7 +166,7 @@ fn stmts_bodies(st: &IrStmt) -> Vec<&Vec<IrStmt>> {
             v.push(step);
             v.push(body);
         }
-        IrStmt::ForInit { init, cond, step, body } => {
+        IrStmt::ForInit { init, cond: _, step, body } => {
             // the c-style-for lowering's rich node — walk init/step as
             // statements and the body; cond is an expr
             v.push(init);

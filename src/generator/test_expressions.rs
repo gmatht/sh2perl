@@ -1051,7 +1051,7 @@ pub fn generate_test_expression_impl(
             };
             // Replace $(cmd) with qx'cmd' (single-quote delimiters to prevent
             // Perl interpolation of shell variable references like $var)
-            let mut qx_expr = inner.to_string();
+            let qx_expr = inner.to_string();
             // Simple replacement: find $( and matching )
             let mut depth = 0i32;
             let mut start = None;
@@ -1523,7 +1523,7 @@ pub fn convert_test_args_to_expression_impl(
             Word::Variable(var, _, _) => {
                 expr_parts.push(format!("${}", var));
             }
-            Word::CommandSubstitution(cmd, _) => {
+            Word::CommandSubstitution(_cmd, _) => {
                 // For command substitution within test expressions, emit a
                 // qx{} expression using the array-element pattern for clean
                 // command generation.

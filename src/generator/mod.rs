@@ -309,8 +309,8 @@ impl Generator {
 
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
-        let needs_exit_code = self.needs_exit_code_tracking(ast);
-        let needs_file_find = self.needs_file_find_import(ast);
+        let _needs_exit_code = self.needs_exit_code_tracking(ast);
+        let _needs_file_find = self.needs_file_find_import(ast);
         let needs_digest_sha = self.needs_digest_sha_import(ast);
         let needs_file_path = self.needs_file_path_import(ast);
         let needs_file_copy = self.needs_file_copy_import(ast);
@@ -888,7 +888,7 @@ impl Generator {
                 // Extract bare identifiers from the arithmetic expression
                 let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
                 // Also detect array accesses like ${name[idx]} or ${name[idx]:-default}
-                let array_re = regex::Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\[").unwrap();
+                let _array_re = regex::Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\[").unwrap();
                 for cap in re.captures_iter(&arith_expr.expression) {
                     let var_name = &cap[1];
                     // Skip Perl keywords and operators

@@ -23,7 +23,7 @@
 //! Registered in transforms.rs ("split-in-place"). Additive contract:
 //! Split gains an optional_bool field defaulting to false.
 
-use crate::ir::{InterpPart, IrExpr, IrProgram, IrStmt};
+use crate::ir::{InterpPart, IrExpr, IrStmt};
 use std::collections::{BTreeSet, HashMap};
 
 /// Names READ by an expression (conservative: any Var/Ident and any

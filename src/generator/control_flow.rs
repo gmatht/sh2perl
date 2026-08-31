@@ -69,7 +69,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // Perl truth values, but for Not the inner exit code already maps
             // to the correct Perl boolean.
             generator.suppress_set_e_depth += 1;
-            let mut cond = generator.generate_command(inner);
+            let cond = generator.generate_command(inner);
             generator.suppress_set_e_depth -= 1;
             let cond = cond
                 .trim_start()
@@ -82,7 +82,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         }
         _ => {
             generator.suppress_set_e_depth += 1;
-            let mut cond = generator.generate_command(&if_stmt.condition);
+            let cond = generator.generate_command(&if_stmt.condition);
             generator.suppress_set_e_depth -= 1;
             // Strip trailing semicolons and whitespace - the condition
             // is used inside if(...) not as a standalone statement
@@ -1407,7 +1407,7 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     let filtered_commands = func.body.commands.clone();
 
     // Save the current output length so we can measure the body's brace balance.
-    let saved_output_len = output.len();
+    let _saved_output_len = output.len();
 
     // Save declared_locals, function_level_vars and associative_arrays so that
     // variables declared inside the function (via `local` etc.) do not leak into
@@ -1540,7 +1540,7 @@ fn count_structural_braces(code: &str) -> (usize, usize) {
     // This is not a full Perl tokenizer, but it handles the common cases
     // found in generated code.
     let mut chars = code.char_indices().peekable();
-    while let Some((i, ch)) = chars.next() {
+    while let Some((_i, ch)) = chars.next() {
         if in_comment {
             if ch == '\n' {
                 in_comment = false;
@@ -1623,6 +1623,7 @@ fn count_structural_braces(code: &str) -> (usize, usize) {
             closes += 1;
         }
     }
+    let _ = &in_string;
     (opens, closes)
 }
 
@@ -1916,7 +1917,7 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
             }
             _ => {
                 generator.suppress_set_e_depth += 1;
-                let mut c = generator.generate_command(cmd);
+                let c = generator.generate_command(cmd);
                 generator.suppress_set_e_depth -= 1;
                 let c = c
                     .trim_start()

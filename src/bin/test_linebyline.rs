@@ -1,6 +1,6 @@
 use debashl::ast::*;
 use debashl::generator::commands::builtins::{get_builtin_commands, pipeline_supports_linebyline};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 fn main() {
     // Test the line-by-line pipeline support

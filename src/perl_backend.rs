@@ -837,7 +837,7 @@ impl Render {
                 // do{…} BLOCK EXPRESSION usable in value position.
                 let k = self.fh_counter;
                 self.fh_counter += 1;
-                let mut saved = std::mem::take(&mut self.out);
+                let saved = std::mem::take(&mut self.out);
                 for s in stmts {
                     self.stmt(s);
                 }
@@ -1892,7 +1892,7 @@ impl Render {
                     || raw_r.contains('?');
                 if has_glob {
                     // `[[ x == pattern ]]` — glob match
-                    let re_l = glob_to_regex(raw_l, true);
+                    let _re_l = glob_to_regex(raw_l, true);
                     let re_r = glob_to_regex(raw_r, true);
                     if op == "!=" {
                         let re = brace_escape(&re_r);
@@ -2007,8 +2007,8 @@ impl Render {
                 }
                 "slice" => {
                     self.arrays.insert(var.to_string());
-                    let off_raw = args.get(2).and_then(|a| Self::str_arg(args, 2));
-                    let len_raw = args.get(3).and_then(|a| Self::str_arg(args, 3));
+                    let off_raw = args.get(2).and_then(|_a| Self::str_arg(args, 2));
+                    let len_raw = args.get(3).and_then(|_a| Self::str_arg(args, 3));
                     let off = args
                         .get(2)
                         .map(|a| self.expr(a))
@@ -2397,7 +2397,7 @@ impl Render {
                 }
                 // `arr=(...)` / `arr+=(...)` arrive as Assign over a
                 // setArray/setArrayAppend call — emit the store directly
-                if let IrExpr::Call { func, args } = expr {
+                if let IrExpr::Call { func, args: _ } = expr {
                     if func == "setArray" || func == "setArrayAppend" {
                         let x = self.expr(expr);
                         self.emit(&format!("{x};"));
@@ -2580,7 +2580,7 @@ impl Render {
             }
             IrStmt::Function { name, body, .. } => {
                 self.funcs.insert(name.clone());
-                let mut saved = self.in_func;
+                let saved = self.in_func;
                 self.in_func += 1;
                 self.emit(&format!("sub {} {{", ident(name)));
                 self.depth += 1;
@@ -2785,7 +2785,7 @@ impl Render {
 
     fn sub(&mut self, s: &IrSub) {
         self.funcs.insert(s.name.clone());
-        let mut saved = self.in_func;
+        let saved = self.in_func;
         self.in_func += 1;
         self.emit(&format!("sub {} {{", ident(&s.name)));
         self.depth += 1;
@@ -3003,7 +3003,7 @@ fn brace_group(g: &serde_json::Value) -> Vec<String> {
         serde_json::Value::Array(items) => items,
         _ => return Vec::new(),
     };
-    let has_range = items
+    let _has_range = items
         .iter()
         .any(|it| it.is_object() && it.get("range").map(|r| r.is_array()).unwrap_or(false));
     let mut out = Vec::new();

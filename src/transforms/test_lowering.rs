@@ -257,7 +257,7 @@ fn glob_affix_primitive(args: &[IrExpr]) -> Option<IrExpr> {
     // `"$s"==*"$p"*` — the operator splits the text into lhs/rhs. The
     // runtime's test-string grammar: quoted `$var` operands, glob
     // metachars outside quotes.
-    let (lhs, rhs, negate) = if let Some((l, r)) = text.split_once("==") {
+    let (_lhs, _rhs, _negate) = if let Some((l, r)) = text.split_once("==") {
         (l, r, false)
     } else if let Some((l, r)) = text.split_once("!=") {
         (l, r, true)

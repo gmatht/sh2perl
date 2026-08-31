@@ -91,7 +91,7 @@ pub fn generate_cmp_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
         None => "undef".to_string(),
     };
 
-    let (l_mode, b_mode, s_mode) = if verbose {
+    let (_l_mode, _b_mode, s_mode) = if verbose {
         ("1", "0", if silent { "1" } else { "0" })
     } else {
         ("0", if print_bytes { "1" } else { "0" }, if silent { "1" } else { "0" })
