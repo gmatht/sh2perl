@@ -14788,7 +14788,12 @@ pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error
     // exactly like the wasi/CLI ingress paths (one shared entry).
     let mut prog = prog.clone();
     crate::shir_passes::optimize::optimize(&mut prog);
-    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(&prog))))
+    // Apply the estreeToJs head passes (compile_head_passes) exactly like
+    // otranspilerl's shir_to_estree_compiled — the vendored estree-gen.mjs
+    // converter expects the PRE-COMPILED estree (the wasm's prefix; the JS
+    // side continues at pass #5). Without this the estree shape diverges
+    // from otranspilerl's and the converter mishandles it.
+    Ok(crate::estree::estree_to_json(&shir_to_estree_compiled(&prog)))
 }
 
 /// Classification of a case-pattern string for the native lowering.

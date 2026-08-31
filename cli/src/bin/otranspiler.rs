@@ -146,25 +146,51 @@ fn main() {
     }
 
     // ── stage 2: A1 → target render (self-spawn) ──────────────────────
-    let mut child = Command::new(&exe)
-        .arg(format!("--shir-in-{tgt}"))
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("spawn render stage");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(a1.as_bytes())
-        .expect("write A1 to render stage");
-    let out = child.wait_with_output().expect("render stage");
-    if !out.status.success() {
-        std::process::exit(out.status.code().unwrap_or(1));
-    }
-    let rendered = out.stdout;
+    // The js target uses the IN-PROCESS estree path (debashc file --estree):
+    // the A1 JSON round-trip loses information the estree generation needs
+    // (matches otranspilerl's in-process sh→A1→estree). Then convert
+    // estree→JS via the vendored estree-gen.mjs converter (node).
+    let rendered: Vec<u8> = if tgt == "js" {
+        let estree_out = Command::new(&exe)
+            .args(["file", "--estree", &input])
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {:?}: {e}", exe));
+        if !estree_out.status.success() {
+            eprintln!(
+                "otranspiler: estree failed: {}",
+                String::from_utf8_lossy(&estree_out.stderr).trim()
+            );
+            std::process::exit(1);
+        }
+        let estree = String::from_utf8_lossy(&estree_out.stdout).to_string();
+        match debashcl::estree_json_to_js(&estree) {
+            Ok(js) => js.into_bytes(),
+            Err(e) => {
+                eprintln!("otranspiler: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let mut child = Command::new(&exe)
+            .arg(format!("--shir-in-{tgt}"))
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn render stage");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(a1.as_bytes())
+            .expect("write A1 to render stage");
+        let out = child.wait_with_output().expect("render stage");
+        if !out.status.success() {
+            std::process::exit(out.status.code().unwrap_or(1));
+        }
+        out.stdout
+    };
 
     // ── output: '-' → stdout, else file ────────────────────────────────
     if out_path == "-" || output.is_none() {
