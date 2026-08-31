@@ -22,8 +22,8 @@ fn usage() -> ! {
         "usage: otranspiler <input> [<output>] [--source-lang L] [--target L]\n\
          \n\
          input   .sh/.bash/… (shell; default) | .shir (A1 contract)\n\
-         output  extension selects the backend: pl c js go rs zig java py sh\n\
-         -       stdout (also the default when <output> is omitted)"
+         output  extension selects the backend: pl c js go rs zig java py sh shir\n\
+         -       stdout (also the default when <output> is omitted); -.<ext> = stdout with backend <ext>"
     );
     std::process::exit(2);
 }
@@ -134,7 +134,7 @@ fn main() {
     };
     const BACKENDS: &[&str] = &[
         "perl", "c", "js", "go", "rs", "zig", "java", "python", "sh", "estree",
-        "glsl",
+        "glsl", "shir",
     ];
     if !BACKENDS.contains(&tgt) {
         eprintln!("otranspiler: unknown target '{tgt}' (known: {})", BACKENDS.join(" "));
@@ -150,7 +150,10 @@ fn main() {
     // the A1 JSON round-trip loses information the estree generation needs
     // (matches otranspilerl's in-process sh→A1→estree). Then convert
     // estree→JS via the vendored estree-gen.mjs converter (node).
-    let rendered: Vec<u8> = if tgt == "js" {
+    let rendered: Vec<u8> = if tgt == "shir" {
+        // the A1 contract is the output (already computed in stage 1)
+        a1.into_bytes()
+    } else if tgt == "js" {
         let estree_out = Command::new(&exe)
             .args(["file", "--estree", &input])
             .output()
@@ -192,8 +195,13 @@ fn main() {
         out.stdout
     };
 
-    // ── output: '-' → stdout, else file ────────────────────────────────
-    if out_path == "-" || output.is_none() {
+    // ── output: '-' / '-.<ext>' → stdout, else file ────────────────────
+    let to_stdout = out_path == "-"
+        || output.is_none()
+        || std::path::Path::new(&out_path)
+            .file_stem()
+            .map_or(false, |s| s == "-");
+    if to_stdout {
         std::io::stdout()
             .write_all(&rendered)
             .expect("write stdout");
