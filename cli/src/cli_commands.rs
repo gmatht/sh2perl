@@ -786,7 +786,14 @@ pub fn parse_shir_json_to_js(filename: &str) {
         Ok(p) => p,
         Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
     };
-    let js = debashl::js_backend::shir_to_js(&prog);
+    let estree = match debashl::shir::shir_to_estree_json(&prog) {
+        Ok(e) => e,
+        Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
+    };
+    let js = match crate::estree_json_to_js(&estree) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("estree->js: {}", e); std::process::exit(1); }
+    };
     print!("{}", js);
 }
 

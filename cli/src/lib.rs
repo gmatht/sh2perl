@@ -61,6 +61,31 @@ pub(crate) fn with_virtual_stdin<T>(f: impl FnOnce(Option<&[u8]>) -> T) -> T {
     f(g.as_deref())
 }
 
+/// ESTree JSON → JS via the vendored sh2runtime converter
+/// (harness/estree/run.mjs — node + estree.js + astring + lower.js).
+/// The converter path is `SH2_ESTREE_CONVERTER` (default
+/// `harness/estree/run.mjs` relative to cwd).
+pub fn estree_json_to_js(estree_json: &str) -> Result<String, String> {
+    use std::process::Command;
+    let converter = std::env::var("SH2_ESTREE_CONVERTER")
+        .unwrap_or_else(|_| "harness/estree/run.mjs".to_string());
+    let tmp = std::env::temp_dir().join(format!("sh2_estree_{}.json", std::process::id()));
+    std::fs::write(&tmp, estree_json).map_err(|e| format!("write estree json: {e}"))?;
+    let out = Command::new("node")
+        .arg(&converter)
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("spawn node {converter}: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(format!(
+            "estree->js converter failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 // Import from our new modules
 use crate::cli_commands::{
     export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
@@ -1159,7 +1184,10 @@ exit $main_exit_code;
                 "--shir-in-java" => debashl::java_backend::shir_to_java(&prog),
                 "--shir-in-rust" => Ok(debashl::rust_backend::shir_to_rust(&prog)),
                 "--shir-in-zig" => Ok(debashl::zig_backend::shir_to_zig(&prog)),
-                "--shir-in-js" => Ok(debashl::js_backend::shir_to_js(&prog)),
+                "--shir-in-js" => match debashl::shir::shir_to_estree_json(&prog) {
+                    Ok(estree) => estree_json_to_js(&estree),
+                    Err(e) => Err(e.to_string()),
+                },
                 "--shir-in-glsl" => Ok(debashl::glsl_backend::shir_to_glsl(&prog)),
                 _ => unreachable!(),
             };

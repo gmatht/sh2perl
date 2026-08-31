@@ -13,7 +13,6 @@ pub mod render_ext_expr;
 pub mod render_ext_estree;
 pub mod shir_nodes;
 pub mod shir_json;
-pub mod js_backend; // worktree-local: JS backend renderer (branch backend/js)
 pub mod transforms;
 
 pub mod bc;
