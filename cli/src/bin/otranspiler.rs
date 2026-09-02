@@ -134,7 +134,7 @@ fn main() {
     };
     const BACKENDS: &[&str] = &[
         "perl", "c", "js", "go", "rs", "zig", "java", "python", "sh", "estree",
-        "glsl", "shir",
+        "glsl", "shir", "lint",
     ];
     if !BACKENDS.contains(&tgt) {
         eprintln!("otranspiler: unknown target '{tgt}' (known: {})", BACKENDS.join(" "));

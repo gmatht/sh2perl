@@ -249,6 +249,7 @@ mod tests {
             Box::new(AsyncRegionLoops),
             Box::new(LastExitLiveness),
             Box::new(LoopStatusDeadness),
+            Box::new(UseBeforeDecl),
         ];
         let mut names: Vec<&str> = analyses.iter().map(|a| a.name()).collect();
         names.sort();
@@ -281,6 +282,7 @@ mod tests {
             Box::new(AsyncRegionLoops),
             Box::new(LastExitLiveness),
             Box::new(LoopStatusDeadness),
+            Box::new(UseBeforeDecl),
         ];
         let mut ctx = PassContext::default();
         for a in &analyses {

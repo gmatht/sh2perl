@@ -1148,6 +1148,38 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
             });
         }
+        "--shir-in-lint" => {
+            // The lint backend is a linter, not a code generator: it runs
+            // the canonical *analyses* (inside `shir_to_lint`) and renders
+            // the verdicts as a diagnostic report. We still run the shared
+            // transforms so the IR is in the same shape the other backends
+            // see (a `ForInit` lowered to a `while`, gotos folded, captures
+            // materialised) — unused-var / unused-function walks handle both
+            // forms.
+            if args.len() < 3 { println!("Error: --shir-in-lint requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", debashl::lint_backend::shir_to_lint(&prog));
+        }
         "--shir-in-go" | "--shir-in-c" | "--shir-in-python" | "--shir-in-js" | "--shir-in-glsl" => {
             // core dispatcher parity (marketplace triage gate): the
             // co-owned mirror renderers render through the same A1-ingress
