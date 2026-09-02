@@ -8,7 +8,8 @@ lib `debashl`), rustc 1.96.1, x86_64-unknown-linux-gnu.
 | Build | Size | Profile |
 |---|---|---|
 | `target/debug/otranspiler` | **93.5 MB** | cargo defaults: no opt, full DWARF, no strip, no LTO |
-| `target/release/otranspiler` | **6.2 MB** | `[profile.release]`: `opt-level="z"`, `lto=true`, `codegen-units=1`, `panic="abort"`, `strip=true` |
+| `target/release/otranspiler` (default) | **5.35 MB** | `[profile.release]`: `opt-level="z"`, `lto=true`, `codegen-units=1`, `panic="abort"`, `strip=true`; `legacy-generator` feature OFF |
+| `target/release/otranspiler` (`--features legacy-generator`) | **6.15 MB** | same profile, legacy AST-side Perl generator linked |
 
 - ~67 % of the debug binary is **debug info**, not code. The actual program is ~6 MB.
 - The release binary is ~95 % real content: 4.2 MB code, 714 KB rodata, 637 KB
@@ -70,7 +71,7 @@ Code ownership of the 4.3 MB `.text`, by family (measured via `nm`):
 |---|---|---|
 | `std`/deps | 914 KB | serde_json, backtrace-rs, allocator/panic machinery |
 | backend fleet | 900 KB | c_backend 262 KB + go/python/rust/zig/java/sh/glsl/perl/lint 638 KB — only one runs per invocation |
-| legacy perl generator | 607 KB | `word_to_perl`, `simple_command`, `generic_builtin`, `grep`, `test_expr`, pipelines |
+| legacy perl generator | 607 KB | `word_to_perl`, `simple_command`, `generic_builtin`, `grep`, `test_expr`, pipelines — **gated behind the `legacy-generator` feature (off by default)** |
 | estree emitters (`shir`) | 533 KB | `stmt_to_estree`, `expr_to_estree`, `try_native_param` |
 | `debashl` core | 513 KB | parser, ir, ast_words |
 | transforms (passes) | 307 KB | incl. `transform_stmt` |
@@ -166,11 +167,18 @@ readelf --debug-dump=frames target/release/otranspiler | grep -c "pc="   # FDE c
 
 ## Levers (if size ever matters)
 
-- **Feature-gate the backend fleet** per `--target` (only compile the requested
-  renderer): saves ~0.9 MB of `.text`.
+- **`legacy-generator` feature (done).** The legacy AST-side Perl generator
+  (`src/generator/`, 36k lines) is gated behind a cargo feature, **off by
+  default**: the new perl backend (`ir::shir_to_perl`) compiles without it
+  (emulated commands fall back to `bash -c` shell-out), and the legacy
+  CLI/wasm/wasi `to_perl` utilities degrade to a stub message. Saves ~0.8 MB
+  of the release binary (~640 KB of `.text`). Enable with
+  `cargo build --features legacy-generator`.
+- **Feature-gate the rest of the backend fleet** per `--target` (only compile
+  the requested renderer): saves ~0.9 MB of `.text`.
 - **Drop `serde_json` from the in-process render path** (call the renderer
-  directly instead of A1 JSON round-trip): saves the 106 KB ser/de + part of the
-  serde_json dependency.
+  directly instead of A1 JSON round-trip): saves the 106 KB ser/de + part of
+  the serde_json dependency.
 - **Post-link `.eh_frame` strip** (above): saves 637 KB, costs panic backtraces.
-- The debug binary is already fixed by the release profile; nothing to change for
-  distribution.
+- The debug binary is already fixed by the release profile; nothing to change
+  for distribution.

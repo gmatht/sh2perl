@@ -22,6 +22,13 @@ pub mod transforms;
 
 pub mod bc;
 pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
+#[cfg(feature = "legacy-generator")]
+pub mod generator;
+// When the legacy generator is off (default), provide a tiny stub so every
+// consumer (cli, wasm, wasi, bins) still compiles; the legacy perl commands
+// degrade to a clear message instead of generating Perl.
+#[cfg(not(feature = "legacy-generator"))]
+#[path = "generator_stub.rs"]
 pub mod generator;
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees

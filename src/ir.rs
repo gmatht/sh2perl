@@ -3540,6 +3540,7 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
 /// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
 /// native Perl, no bash dependency). Returns None when the command isn't
 /// emulatable (caller falls back to `bash -c` shell-out).
+#[cfg(feature = "legacy-generator")]
 fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     let shell_text = build_shell_cmd(cmd, words);
     let parsed = crate::Parser::new(&shell_text).parse().ok()?;
@@ -3574,6 +3575,14 @@ fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     } else {
         Some(perl)
     }
+}
+
+/// When the legacy generator is off (default), command emulation is
+/// unavailable: the caller falls back to `bash -c` shell-out (the same path
+/// `DEBASHC_IR_NO_EMUL` exercises).
+#[cfg(not(feature = "legacy-generator"))]
+fn generator_emulate_command(_cmd: &str, _words: &[&IrExpr]) -> Option<String> {
+    None
 }
 
 /// Collect the variable names a word expression READS (getVar/Var nodes,

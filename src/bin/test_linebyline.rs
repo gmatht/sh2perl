@@ -1,7 +1,11 @@
+#[cfg(feature = "legacy-generator")]
 use debashl::ast::*;
+#[cfg(feature = "legacy-generator")]
 use debashl::generator::commands::builtins::{get_builtin_commands, pipeline_supports_linebyline};
+#[cfg(feature = "legacy-generator")]
 use std::collections::BTreeMap;
 
+#[cfg(feature = "legacy-generator")]
 fn main() {
     // Test the line-by-line pipeline support
     println!("Testing line-by-line pipeline support...\n");
@@ -159,4 +163,12 @@ fn main() {
     println!("  • Falls back to buffered processing");
     println!("  • Maintains compatibility");
     println!("  • Still generates optimized Perl code");
+}
+
+#[cfg(not(feature = "legacy-generator"))]
+fn main() {
+    eprintln!(
+        "test_linebyline requires the `legacy-generator` feature (cargo run --features legacy-generator --bin test_linebyline)"
+    );
+    std::process::exit(1);
 }
