@@ -1,8 +1,8 @@
 use crate::ast::*;
-use crate::generator::utils::{extract_array_key_impl, get_temp_dir};
+use crate::generator::utils::get_temp_dir;
 use crate::generator::Generator;
 use crate::Parser;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Static counter for generating unique temp file names
@@ -421,7 +421,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // mark $output_printed_<id> when needed. If no pipeline id is
                 // active, create one, emit minimal Perl locals and push an RAII
                 // guard for the duration of the nested generation.
-                let cmd_str = if generator.current_pipeline_output_id().is_none() {
+                let _cmd_str = if generator.current_pipeline_output_id().is_none() {
                     let nested_id = generator.get_unique_id();
                     // Emit minimal Perl locals immediately so nested generators
                     // can reference $output_<id> and $output_printed_<id>.

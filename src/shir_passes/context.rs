@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{IrStmt, VarKind};
+use crate::shir_passes::used_before_decl::UseBeforeDeclFinding;
 
 /// All analysis verdicts, populated by the analysis passes, read by the
 /// renderer (`shir_to_estree`, `shir_to_perl`, future `shir_to_<lang>`).
@@ -116,6 +117,18 @@ pub struct PassContext {
     /// pipeline consumer — cannot be lowered to *Sync because the
     /// producer/consumer binding would be lost).
     pub async_region_loops: HashSet<*const IrStmt>,
+
+    // ── Use-before-declaration (the use-before-decl lint) ─────────
+    /// Variables read at a statement position on a control-flow path that
+    /// has no prior definition (the static check behind PowerShell's
+    /// `Set-StrictMode` undeclared-variable error, and a useful lint for
+    /// every backend — shell `$x` reads on unset vars are silently empty).
+    /// Populated by
+    /// [`crate::shir_passes::used_before_decl::UseBeforeDecl`]; consumed by
+    /// linters / the `--shir` JSON contract / future backends that treat
+    /// undeclared reads as errors. Sorted by (var, stmt_pos) for
+    /// determinism; deduplicated to one earliest-position finding per var.
+    pub use_before_decl: Vec<UseBeforeDeclFinding>,
 }
 
 impl PassContext {

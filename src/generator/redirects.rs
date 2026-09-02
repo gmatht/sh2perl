@@ -2,7 +2,6 @@ use super::Generator;
 use crate::ast::*;
 use crate::generator::utils::get_temp_dir;
 use regex::Regex;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1641,7 +1640,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     _ => None,
                 };
                 if let Some(handler) = handler_str {
-                    let escaped_handler = handler.replace("'", "'\\''");
+                    let _escaped_handler = handler.replace("'", "'\\''");
                     let signal_name = match signal_arg {
                         Word::Literal(s, _) => s.to_uppercase(),
                         _ => String::new(),

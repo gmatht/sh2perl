@@ -158,7 +158,7 @@ impl TimeoutManager {
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let operation_handle = thread::spawn(move || {
+        let _operation_handle = thread::spawn(move || {
             let result = operation_fn();
             let _ = tx.send(result);
         });
@@ -218,7 +218,7 @@ impl TimeoutManager {
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let operation_handle = thread::spawn(move || {
+        let _operation_handle = thread::spawn(move || {
             let result = operation_fn();
             let _ = tx.send(result);
         });
@@ -318,7 +318,7 @@ impl Default for TimeoutManager {
     }
 }
 
-/// Global timeout manager instance
+// Global timeout manager instance
 lazy_static::lazy_static! {
     pub static ref TIMEOUT_MANAGER: Arc<Mutex<TimeoutManager>> = Arc::new(Mutex::new(TimeoutManager::new()));
 }

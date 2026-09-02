@@ -18,7 +18,7 @@
 //! bash's concatenate-in-order semantics. STATEMENT-position only:
 //! `v=$(cat -n F)` captures keep their exec (value-channel consumers).
 
-use crate::ir::{ArithAst, IrExpr, IrStmt};
+use crate::ir::{IrExpr, IrStmt};
 use crate::shir_nodes::ForEachLine;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

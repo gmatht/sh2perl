@@ -15,7 +15,6 @@
 
 use crate::ir::*;
 use crate::shir_nodes::*;
-use crate::shir_nodes::ExtExpr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1476,6 +1475,7 @@ fn try_lower_getvar_len(args: &[IrExpr]) -> Option<IrExpr> {
 }
 
 /// Read a variable by name: param("", name) — the shIR's plain-read form.
+#[allow(dead_code)]
 fn param_var(name: &IrExpr) -> Option<IrExpr> {
     match name {
         IrExpr::Str(s, _) => Some(IrExpr::Call { func: "param".to_string(),
@@ -1621,7 +1621,7 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
 /// becomes the composed Ext VALUE. Allowlist only (cut/tr/head/tail/wc/xargs/
 /// simple sed) — these exit 0 on static input, so `SetChildError(0)` preserves
 /// $?. grep is excluded (status idiom). Counts append the echo trailing \n.
-fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
+fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
     if std::env::var("SH2C_DEBUG").is_ok() {
         if let IrStmt::Assign { expr, .. } = stmt {
             if matches!(expr, IrExpr::Capture { .. }) {
@@ -1832,7 +1832,7 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
                             && wa.len() == 1
                             && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")
                         {
-                            if let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] =
+                            if let [IrStmt::Expr(IrExpr::Call { func: _f1, args: a1 })] =
                                 stage_bodies[0]
                             {
                                 if let [IrExpr::Str(_, _), IrExpr::Array(fa)] = a1.as_slice() {
@@ -2735,9 +2735,42 @@ fn try_lower_grep_count(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> 
 /// `echo X | grep -q P` in EXPRESSION/CONDITION position → StringContains.
 /// Only fires here (conditions), never at statement level where the status
 /// semantics would be lost.
+/// Peel command-substitution / redirect wrappers a pipeline stage may carry
+/// (e.g. `echo X | grep P >/dev/null` parses as
+/// Arrow([Call{func:"redirect", args:[Arrow([exec grep]), ...]})]), returning
+/// the innermost command-bearing `Arrow` (whose single stmt is `Expr(Call
+/// exec|builtin …)`). The grep-idiom lift needs this to recognize `grep`
+/// regardless of how the stage is wrapped — without it, a redirected grep
+/// never matches and the stage falls through to an unrenderable Arrow.
+/// Mirrors the estree ref, which lowers the bare pipeline directly.
+fn peel_to_cmd_arrow(s: &IrExpr) -> Option<&IrExpr> {
+    match s {
+        IrExpr::Arrow(b) => {
+            if b.len() == 1 {
+                if let IrStmt::Expr(e) = &b[0] {
+                    if matches!(e, IrExpr::Call { func, .. } if func == "redirect")
+                        || matches!(e, IrExpr::Capture { .. })
+                    {
+                        return peel_to_cmd_arrow(e);
+                    }
+                    return Some(s);
+                }
+            }
+            None
+        }
+        IrExpr::Capture { expr, .. } => peel_to_cmd_arrow(expr),
+        IrExpr::Call { func, args } if func == "redirect" => {
+            args.first().and_then(|a| peel_to_cmd_arrow(a))
+        }
+        _ => None,
+    }
+}
+
 fn try_lower_grep_cond(stage1: &IrExpr, stage2: &IrExpr) -> Option<IrExpr> {
-    let b1 = match stage1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
-    let b2 = match stage2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let s1 = peel_to_cmd_arrow(stage1)?;
+    let s2 = peel_to_cmd_arrow(stage2)?;
+    let b1 = match s1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let b2 = match s2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
     let text = extract_text_from_stage(b1)?;
     let [IrStmt::Expr(IrExpr::Call { func, args })] = b2 else { return None };
     if !(func == "exec" || func == "builtin") { return None; }

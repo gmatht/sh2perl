@@ -382,7 +382,7 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
         env_setup.push_str(&format!("    local $ENV{{{}}} = ${};\n", var, var));
     }
 
-    let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    let (in_var, out_var, _err_var, _pid_var, _result_var) = generator.get_unique_ipc_vars();
     format!(
         "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    chomp $result;\n    $result;\n}}",
         env_setup,
@@ -827,7 +827,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                 }
                 Command::Simple(simple_cmd) => {
-                    let cmd_name = generator.word_to_perl(&simple_cmd.name);
+                    let _cmd_name = generator.word_to_perl(&simple_cmd.name);
 
                     // Check if this is a builtin command that we can convert properly
                     if let Word::Literal(name, _) = &simple_cmd.name {
@@ -1333,7 +1333,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         match arg {
                                             Word::StringInterpolation(interp, _) => generator
                                                 .convert_string_interpolation_to_perl(interp),
-                                            Word::Literal(literal, _) => {
+                                            Word::Literal(_literal, _) => {
                                                 // Escaped backticks should be treated as literal backticks, not command substitution
                                                 generator.perl_string_literal(arg)
                                             }
@@ -1563,7 +1563,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     "q{}".to_string()
                                 };
-                                let mut code = format!(
+                                let code = format!(
                                     "do {{ use File::Basename qw(basename); my $basename_output = basename({}); $CHILD_ERROR = 0; $basename_output; }}",
                                     path_expr
                                 );
@@ -1730,7 +1730,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // So we need to account for that extra indentation level
                             // Fixed indentation: outer do block at 4 spaces, inner do block at 8 spaces, eval at 12 spaces
                             // We use fixed indentation to ensure consistency regardless of generator.indent_level
-                            let indent1 = "    ".to_string(); // 4 spaces for outer do block
+                            let _indent1 = "    ".to_string(); // 4 spaces for outer do block
                             let indent1_do = "        ".to_string(); // 8 spaces for inner do block
                             let indent2 = "            ".to_string(); // 12 spaces for eval block
                             format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
@@ -1771,7 +1771,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .replace("if (-d", "if ( -d")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = "    ".to_string();
+                            let _indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
                             format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
@@ -1812,7 +1812,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .replace("if (-d", "if ( -d")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = "    ".to_string();
+                            let _indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
                             format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
@@ -1847,7 +1847,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 }
                             }
                             let formatted_code = formatted_lines.join("\n");
-                            let indent1 = "    ".to_string();
+                            let _indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
                             format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}$CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
@@ -1886,7 +1886,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .join("\n")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = "    ".to_string();
+                            let _indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
                             format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}$CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
@@ -2708,7 +2708,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
 
 pub fn word_to_perl_for_test_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => generator.perl_string_literal(word),
+        Word::Literal(_s, _) => generator.perl_string_literal(word),
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
         _ => format!("{:?}", word),
     }
@@ -2748,7 +2748,7 @@ pub fn handle_brace_expansion_impl(
     let suffix = expansion.suffix.as_deref().unwrap_or("");
 
     // Expand each item to its raw string value (no Perl quoting)
-    let mut raw_items: Vec<Vec<String>> = expansion
+    let raw_items: Vec<Vec<String>> = expansion
         .items
         .iter()
         .map(|item| {
@@ -3544,7 +3544,7 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         if i + 1 < result.len() && &result.as_bytes()[i..i + 2] == b"$(" {
             if let Some(end) = find_matching_paren(&result, i) {
                 // Extract the command text (including the parens)
-                let full_match = result[i..end].to_string();
+                let _full_match = result[i..end].to_string();
                 let inner_cmd = result[i + 2..end - 1].to_string();
                 // Create a placeholder
                 let placeholder = format!("__CMD_SUBST_{}__", cmd_subst_replacements.len());

@@ -4,7 +4,7 @@ use crate::parser::commands::Parser;
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 // Add the missing parse_word_list function
 fn parse_word_list(parser: &mut Parser) -> Result<Vec<Word>, ParserError> {
@@ -451,7 +451,7 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                                                 .to_string(),
                                         )
                                     })?;
-                                let sq_text = parser.lexer.get_raw_token_text()?;
+                                let _sq_text = parser.lexer.get_raw_token_text()?;
                                 // sq_text = '...' (with surrounding quotes)
                                 // First char is the escaped quote
                                 current_pattern.push('\'');

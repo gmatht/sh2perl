@@ -3,7 +3,7 @@ use crate::generator::commands::builtins::{
     generate_generic_builtin, is_builtin, pipeline_supports_linebyline,
 };
 use crate::generator::Generator;
-use crate::ir::{expr_to_perl, stmt_to_perl, IrExpr, IrStmt, Sigil};
+use crate::ir::{expr_to_perl, stmt_to_perl, IrExpr, IrStmt};
 
 /// Helper function to generate Perl code for a command using the builtins registry
 fn generate_command_using_builtins(
@@ -729,7 +729,7 @@ pub fn generate_pipeline_for_substitution(
         // Handle specific 2-command pipelines
         // Processing 2-command pipeline
         // Check for time command with redirect
-        if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
+        if let (Command::Redirect(redirect_cmd), Command::Simple(_cmd2)) =
             (&pipeline.commands[0], &pipeline.commands[1])
         {
             // Found RedirectCommand + SimpleCommand pipeline
@@ -844,7 +844,7 @@ pub fn generate_pipeline_for_substitution(
     //
     // Reconstruct the shell command string from the AST and use it
     // directly inside the qx{...} call.
-    let unique_id = generator.get_unique_id();
+    let _unique_id = generator.get_unique_id();
     let raw_cmd =
         generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
     let final_cmd = raw_cmd;
@@ -1188,12 +1188,13 @@ fn generate_streaming_pipeline(
                         }
                     }
                 }
-
+            
                 // Generate an infinite loop that gets terminated by head command
                 // Make pipeline id visible so nested redirect wrappers can mark
                 // $output_printed_<id> when they consume the pipeline output.
                 // Use the pipeline's unique id instead of a hard-coded "0" so
                 // nested generators see the correct variable names.
+                let _ = &head_max;
                 let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
                 start_index = 1; // Skip the yes command since it is handled here
                 output.push_str(&generator.indent());
@@ -1218,7 +1219,7 @@ fn generate_streaming_pipeline(
                 output.push_str(&format!("my $line = {};\n", string_to_repeat));
 
                 // Process the remaining commands in the loop
-                for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+                for (_i, command) in pipeline.commands[start_index..].iter().enumerate() {
                     match command {
                         Command::Simple(cmd) => {
                             // Generate line-by-line version of each command
@@ -1238,7 +1239,7 @@ fn generate_streaming_pipeline(
                         }
                         Command::Pipeline(nested_pipeline) => {
                             // Handle nested pipelines - process each command in the nested pipeline
-                            for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+                            for (_j, nested_command) in nested_pipeline.commands.iter().enumerate() {
                                 match nested_command {
                                     Command::Simple(cmd) => {
                                         // Generate line-by-line version of each command

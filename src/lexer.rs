@@ -928,7 +928,7 @@ impl Lexer {
     ///   2. Returns everything from `#` up to (but not including) that `}`.
     ///   3. Re-injects any text after `}` as newly-lexed tokens so the
     ///      caller can continue parsing normally.
-    pub fn handle_comment_with_brace(&mut self, brace_depth: usize) -> Result<String, ParserError> {
+    pub fn handle_comment_with_brace(&mut self, _brace_depth: usize) -> Result<String, ParserError> {
         let idx = self.current;
         let start = self.tokens[idx].1;
         let end = self.tokens[idx].2;
@@ -1596,7 +1596,7 @@ impl Lexer {
     /// characters, breaking a Comment into a Comment token (ending at
     /// the `'`) followed by adjacent non-newline tokens.  This function
     /// re-merges such fragments back into the Comment.
-    pub fn fix_split_comments(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+    pub fn fix_split_comments(_input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
         let mut result: Vec<(Token, usize, usize)> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {

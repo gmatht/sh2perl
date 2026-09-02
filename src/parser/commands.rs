@@ -10,7 +10,7 @@ use crate::parser::errors::ParserError;
 use crate::parser::redirects::parse_redirect;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::{parse_word, parse_word_no_newline_skip};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Convert a Word into a Vec of StringParts for use in StringInterpolation.
 fn word_to_parts(word: Word) -> Vec<StringPart> {
@@ -215,6 +215,7 @@ impl Parser {
                 commands.push(Command::BlankLine);
             }
         }
+        let _ = &line_start;
 
         Ok((commands, lines))
     }
@@ -888,8 +889,8 @@ impl Parser {
         // Helper: flush a pipe-commands vec into a Pipeline or a single Command.
         fn flush_pipe_sequence(
             commands: Vec<Command>,
-            start_byte_pos: usize,
-            parser: &Parser,
+            _start_byte_pos: usize,
+            _parser: &Parser,
         ) -> Command {
             if commands.len() == 1 {
                 commands.into_iter().next().unwrap()
@@ -2163,7 +2164,7 @@ impl Parser {
                 // with the env on a separate `true` leaves cmd without
                 // the env — the IFS=, read failing case).
                 Command::Redirect(redir) if matches!(&*redir.command, Command::Simple(_)) => {
-                    let mut inner = match *redir.command {
+                    let inner = match *redir.command {
                         Command::Simple(mut sc) => {
                             for (key, value) in env_vars {
                                 sc.env_vars.insert(key, value);
@@ -3531,7 +3532,7 @@ fn parse_arithmetic_assignment<'a>(expr: &'a str) -> Option<(&'a str, &'a str)> 
 pub fn parse_pipeline_from_text_with_rest(text: &str) -> Result<(Command, bool), ParserError> {
     use crate::lexer::{Lexer, Token};
 
-    let mut lexer = Lexer::new(text);
+    let lexer = Lexer::new(text);
     let mut parser = Parser::new_with_lexer(lexer);
     let cmd = parser.parse_pipeline()?;
     // Skip trailing separators/whitespace, then report what remains.
@@ -3552,10 +3553,10 @@ pub fn parse_pipeline_from_text_with_rest(text: &str) -> Result<(Command, bool),
 }
 
 pub fn parse_pipeline_from_text(text: &str) -> Result<Command, ParserError> {
-    use crate::lexer::{Lexer, Token};
+    use crate::lexer::Lexer;
 
     // Create a lexer for the command text
-    let mut lexer = Lexer::new(text);
+    let lexer = Lexer::new(text);
 
     // Create a parser with the lexer
     let mut parser = Parser::new_with_lexer(lexer);

@@ -120,7 +120,7 @@ fn pass(stmts: Vec<IrStmt>) -> (Vec<IrStmt>, bool) {
             IrStmt::DoWhile { body, cond, until } => {
                 let (body2, c) = pass(body);
                 changed |= c;
-                let base = if until { false } else { true };
+                let _base = if until { false } else { true };
                 // until=false, cond=false -> body once; until=true, cond=true
                 // -> body once (the `while`-sense is inverted)
                 if (until && eval_cond(&cond) == Some(true)) || (!until && eval_cond(&cond) == Some(false)) {

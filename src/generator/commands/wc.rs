@@ -21,7 +21,7 @@ pub fn generate_wc_command_with_output(
     generator: &mut Generator,
     cmd: &SimpleCommand,
     input_var: &str,
-    command_index: &str,
+    _command_index: &str,
     output_var: &str,
 ) -> String {
     let mut output = String::new();

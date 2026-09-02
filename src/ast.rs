@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 // Import word types from the separate ast_words module
 pub use crate::ast_words::*;

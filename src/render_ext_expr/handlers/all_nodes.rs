@@ -9,7 +9,6 @@
 //! by matching on `ctx.backend` and emitting the target language.
 
 use crate::shir_nodes::*;
-use crate::shir_nodes::ExtExpr;
 use crate::render_ext_expr::{ExprRenderCtx, Backend};
 
 /// Render a child expression per-backend (all backends, not just Perl).

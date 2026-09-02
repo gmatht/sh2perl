@@ -1,3 +1,8 @@
+#![allow(unreachable_patterns)]
+#![allow(unused_assignments)]
+#![allow(dead_code)]
+#![allow(unexpected_cfgs)]
+
 pub mod ast;
 pub mod ast_words;
 pub mod lexer;
@@ -13,11 +18,17 @@ pub mod render_ext_expr;
 pub mod render_ext_estree;
 pub mod shir_nodes;
 pub mod shir_json;
-pub mod js_backend; // worktree-local: JS backend renderer (branch backend/js)
 pub mod transforms;
 
 pub mod bc;
 pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
+#[cfg(feature = "legacy-generator")]
+pub mod generator;
+// When the legacy generator is off (default), provide a tiny stub so every
+// consumer (cli, wasm, wasi, bins) still compiles; the legacy perl commands
+// degrade to a clear message instead of generating Perl.
+#[cfg(not(feature = "legacy-generator"))]
+#[path = "generator_stub.rs"]
 pub mod generator;
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees
@@ -35,6 +46,7 @@ pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;
 pub mod zig_backend;
+pub mod lint_backend; // lint/diagnostic backend (renders analysis verdicts, not code)
 // Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
 #[cfg(not(target_os = "wasi"))]
 pub mod wasm;

@@ -8,7 +8,7 @@ use crate::generator::Generator;
 fn escape_shell_double_quotes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
-    while let Some((i, ch)) = chars.next() {
+    while let Some((_i, ch)) = chars.next() {
         match ch {
             '$' => {
                 result.push('$');

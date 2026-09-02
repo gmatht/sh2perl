@@ -95,12 +95,12 @@ fn transform_stmt(
 ) -> bool {
     // Recurse into children FIRST (bottom-up — a nested redirect inside an
     // If body is rewritten before we look at the enclosing shape).
-    let mut c = match st {
+    let c = match st {
         IrStmt::If {
-            cond,
-            then,
-            elsifs,
-            else_,
+            cond: _,
+            then: _,
+            elsifs: _,
+            else_: _,
         } => {
             let mut x = native_if_test_cond(st);
             x |= native_command_noop_cond(st);
@@ -127,7 +127,7 @@ fn transform_stmt(
             x |= transform_with_printf(body, lower_printf, files);
             x
         }
-        IrStmt::While { cond, body, .. } => {
+        IrStmt::While { cond: _, body: _, .. } => {
             let mut x = native_while_multi_cond(st);
             let IrStmt::While { cond, body, .. } = st else { return x; };
             x |= transform_with_printf(body, lower_printf, files);
@@ -411,7 +411,7 @@ fn static_pipeline_truth(e: &IrExpr) -> Option<bool> {
     let [IrExpr::Array(stages)] = args.as_slice() else { return None; };
     if stages.len() != 2 { return None; }
     let (producer, words) = literal_capture_stage(&stages[0])?;
-    let mut text = match producer.as_str() {
+    let text = match producer.as_str() {
         "echo" if !words.iter().any(|w| w.starts_with('-')) => format!("{}\n", words.join(" ")),
         "printf" if words.len() == 1 && !words[0].contains('%') => decode_capture_escapes(&words[0])?,
         _ => return None,
@@ -479,7 +479,7 @@ fn test_and_to_if(st: &mut IrStmt) -> bool {
 }
 
 fn test_chain_to_if(st: &mut IrStmt) -> bool {
-    if let IrStmt::Expr(e) = st {
+    if let IrStmt::Expr(_e) = st {
     }
     let IrStmt::Expr(IrExpr::BinOp {
         op: BinOpKind::Or,
@@ -2746,7 +2746,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
     if func != "pipeline" { return false; }
     let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
     if stages.len() != 2 { return false; }
-    let mut out = out; // outer redirect out (may be overridden by stage redirect below)
+    let _out = out; // outer redirect out (may be overridden by stage redirect below)
     // stage 0: echo [-e] LIT (literal)
     let IrExpr::Arrow(s0) = &stages[0] else { return false; };
     let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else { return false; };
@@ -3668,7 +3668,7 @@ fn native_echo_or_chain(st: &mut IrStmt) -> bool {
                     .collect();
                 content = Some(t);
             }
-            other => {
+            _other => {
                 return false;
             }
         }
@@ -3947,7 +3947,7 @@ fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
     } else {
         content
     };
-    let (cq, cexpr) = match &content_var {
+    let (cq, _cexpr) = match &content_var {
         Some(v) => (format!("${v}"), format!("${v}")),
         None => (
             crate::ir::safe_perl_q_string(&content),
@@ -4739,7 +4739,7 @@ fn native_literal_subshell_wc_stmt(st: &mut IrStmt) -> bool {
                         lines.pop();
                     }
                     for l in lines.iter_mut() {
-                        let pat = pat.clone();
+                        let pat = pat;
                         if global {
                             *l = l.replace(&pat, repl);
                         } else {

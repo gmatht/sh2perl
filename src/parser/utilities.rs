@@ -63,7 +63,7 @@ impl ParserUtilities for Lexer {
     fn capture_parenthetical_text(&mut self) -> Result<String, ParserError> {
         let mut content = String::new();
         let mut depth = 1;
-        let start_pos = self.current;
+        let _start_pos = self.current;
 
         // Consume the opening parenthesis
         self.next();

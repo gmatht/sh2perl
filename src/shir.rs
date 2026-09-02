@@ -3277,7 +3277,7 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
                 || estree_reads_positional(update)
                 || estree_stmt_reads_positional(body)
         }
-        Stmt::ForOfStatement { left, right, body } => {
+        Stmt::ForOfStatement { left: _, right, body } => {
             estree_reads_positional(right) || estree_stmt_reads_positional(body)
         }
         Stmt::FunctionDeclaration { params, body, .. } => {
@@ -3492,7 +3492,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 // `local name=value` / `declare name=value` / `export
                 // name=value` — the shell's declaration assignments: the
                 // exec/builtin call's args carry "name=" + the value
-                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                IrStmt::Expr(IrExpr::Call { func: _, args }) => {
                     let decl_name = match args.first() {
                         Some(IrExpr::Str(n, _))
                             if matches!(
@@ -4623,7 +4623,7 @@ fn is_ident_str(s: &str) -> bool {
 
 pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     fn whitespace_free(s: &str) -> bool {
         !s.chars().any(char::is_whitespace)
@@ -4894,7 +4894,6 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
 /// completely (missing names = never assigned, pure reads).
 pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> {
     use crate::ir::{ArithAst, IrExpr, IrStmt, VarKind};
-    use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
     #[derive(Default)]
@@ -8432,8 +8431,8 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
         // and bash expands it natively. The estree path never sees these
         // modes — estree.rs transform_cmd materializes process
         // substitution into temp-file paths BEFORE ast_to_ir.
-        RedirectOperator::ProcessSubstitutionInput(cmd) => ("process-in", 0),
-        RedirectOperator::ProcessSubstitutionOutput(cmd) => ("process-out", 1),
+        RedirectOperator::ProcessSubstitutionInput(_cmd) => ("process-in", 0),
+        RedirectOperator::ProcessSubstitutionOutput(_cmd) => ("process-out", 1),
     };
     let is_dup = digit_target
         && matches!(
@@ -13830,7 +13829,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
             IrStmt::DeclareArray { var, .. } => {
                 excluded.insert(var.clone());
             }
-            IrStmt::For { var, iter, body } => {
+            IrStmt::For { var: _, iter, body } => {
                 // NOTE: the loop var is NOT excluded here — the loop
                 // iteration is its assignment source (see collect_for_iters
                 // + the fixpoint); external references are removed by
@@ -17295,7 +17294,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::If {
             cond,
             then,
-            elsifs,
+            elsifs: _,
             else_,
         } => {
             let consequent = Box::new(Stmt::BlockStatement {
@@ -19379,7 +19378,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
-        IrStmt::Label(name) => {
+        IrStmt::Label(_name) => {
             // Label: `name:` — used by Goto.
             Stmt::ExpressionStatement {
                 expression: Expr::Literal {
@@ -21159,7 +21158,7 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
     // String(count(r)))).catch(e => (sh2.lastExit = 1, "")))` — the
     // exact status semantics of the runtime's redirect+wc path (the
     // read is encoding-less → a Buffer; String() decodes utf8).
-    let status = |exit: i64| Expr::AssignmentExpression {
+    let _status = |exit: i64| Expr::AssignmentExpression {
         operator: "=".to_string(),
         left: Box::new(sh2_member("lastExit")),
         right: Box::new(Expr::Literal {
@@ -29995,7 +29994,7 @@ fn lift_walk_stmt(
         IrStmt::DeclareArray { var, .. } => {
             excluded.insert(var.clone());
         }
-        IrStmt::For { var, iter, body } => {
+        IrStmt::For { var: _, iter, body } => {
             // NOTE: the loop var is NOT excluded here — the loop
             // iteration is its assignment source (see collect_for_iters
             // + the fixpoint); external references are removed by
@@ -34530,7 +34529,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             if func == "exec" {
                 if let [IrExpr::Str(name, _), IrExpr::Array(_)] = args.as_slice() {
                     if name == "exit" {
-                        let mut exprs: Vec<Expr> = mapped_args
+                        let exprs: Vec<Expr> = mapped_args
                             .get(1)
                             .and_then(|e| match e {
                                 Expr::ArrayExpression { elements, .. } => {
@@ -35288,7 +35287,7 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
             } else {
                 // text.split('').map(c => from.includes(c) ? to[from.indexOf(c)] : c).join('')
                 let c = crate::estree::ident("c");
-                let i = crate::estree::ident("i");
+                let _i = crate::estree::ident("i");
                 let idx = crate::estree::method_call(crate::estree::str_lit(&node.from), "indexOf", vec![c.clone()]);
                 // to[from.indexOf(c)] — index into `to` by c's position in `from`,
                 // NOT by the map index (a repeated char would index past `to`).
@@ -38151,6 +38150,7 @@ mod methodcall_estree_tests {
     }
 }
 
+#[cfg(test)]
 mod clobber_redirect_tests {
     use super::*;
 

@@ -88,7 +88,7 @@ fn stmt_pass(st: &mut IrStmt, flag: &str) -> bool {
         } => {
             let mut c = false;
             c |= block_pass(then, flag);
-            for (ec, eb) in elsifs.iter_mut() {
+            for (_ec, eb) in elsifs.iter_mut() {
                 c |= block_pass(eb, flag);
             }
             c |= block_pass(else_, flag);

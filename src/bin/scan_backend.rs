@@ -12,7 +12,7 @@ fn render(backend: &str, content: &str) -> Option<String> {
     let commands = Parser::new(content).parse().ok()?;
     let prog = shir::ast_to_ir(&commands);
     match backend {
-        "js" => Some(debashl::js_backend::shir_to_js(&prog)),
+        "js" => debashl::shir::shir_to_estree_json(&prog).ok(),
         "go" => Some(debashl::go_backend::shir_to_go(&prog)),
         "java" => match debashl::java_backend::shir_to_java(&prog) {
             Ok(s) => Some(s),

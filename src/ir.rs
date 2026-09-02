@@ -3540,6 +3540,7 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
 /// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
 /// native Perl, no bash dependency). Returns None when the command isn't
 /// emulatable (caller falls back to `bash -c` shell-out).
+#[cfg(feature = "legacy-generator")]
 fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     let shell_text = build_shell_cmd(cmd, words);
     let parsed = crate::Parser::new(&shell_text).parse().ok()?;
@@ -3574,6 +3575,14 @@ fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     } else {
         Some(perl)
     }
+}
+
+/// When the legacy generator is off (default), command emulation is
+/// unavailable: the caller falls back to `bash -c` shell-out (the same path
+/// `DEBASHC_IR_NO_EMUL` exercises).
+#[cfg(not(feature = "legacy-generator"))]
+fn generator_emulate_command(_cmd: &str, _words: &[&IrExpr]) -> Option<String> {
+    None
 }
 
 /// Collect the variable names a word expression READS (getVar/Var nodes,
@@ -4672,7 +4681,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                     continue;
                 };
                 if let Some(eq) = word_str.split_once('=') {
-                    let mut val = eq.1.to_string();
+                    let val = eq.1.to_string();
                     if eq.1.is_empty() && i + 1 < words.len() {
                         // value is the next word — render it structurally
                         // (a getVar(1) word → $ARGV[0]).
@@ -6909,7 +6918,6 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrExpr::Splice(e) => expr_refers_to_main_exit(e),
         IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
-        IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -7156,7 +7164,6 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrExpr::Splice(e) => collect_vars_in_expr(e, vars),
-        IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Arrow(body) => {
             for stmt in body {

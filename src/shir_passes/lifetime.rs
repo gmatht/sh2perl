@@ -533,7 +533,7 @@ fn walk_expr(
         }
         IrExpr::Arith(a) => walk_arith(a, pos, first, last, escapes, in_closure),
                 IrExpr::Ext(n) => {
-            for c in n.children() {
+            for _c in n.children() {
                 // Walk child expressions for lifetime analysis
             }
         }

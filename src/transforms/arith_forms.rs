@@ -25,7 +25,7 @@
 //! IncDec as `((x++))` / `x=$((x + 1))`); the IR shape is now what
 //! the renderer needs to match.
 
-use crate::ir::{ArithAst, AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
+use crate::ir::{ArithAst, AssignTarget, InterpPart, IrExpr, IrStmt};
 use crate::shir::parse_arith;
 
 /// Apply the transform. Returns whether anything changed.
@@ -40,7 +40,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 fn transform_stmt(st: &mut IrStmt) -> bool {
     // 1) recurse into children first (bottom-up — so a nested let inside
     //    an If body is rewritten before we look at the parent Exec)
-    let mut c = match st {
+    let c = match st {
         IrStmt::If {
             cond,
             then,
@@ -239,7 +239,7 @@ fn lower_let_stmt(st: &mut IrStmt) -> bool {
 fn lower_let_expr(e: &mut IrExpr) -> (Option<Vec<IrStmt>>, bool) {
     // recurse first — a let nested inside a deeper expr is handled by
     // the same machinery on the way down
-    let mut recursed = transform_expr(e);
+    let recursed = transform_expr(e);
     if let IrExpr::Call { func, args } = e {
         if func == "exec" {
             if let [IrExpr::Str(name, _), IrExpr::Array(items)] = args.as_slice() {

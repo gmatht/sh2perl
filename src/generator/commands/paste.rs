@@ -324,7 +324,7 @@ pub fn generate_paste_command(
             // embed it as a non-interpolating Perl literal to preserve shell
             // fragments (awk/sed/etc.). Set $CHILD_ERROR from the command exit
             // status so callers can inspect it like the shell would.
-            let cmd_string = generator
+            let _cmd_string = generator
                 .generate_command_string_for_system(&crate::ast::Command::Simple(cmd.clone()));
             // Native Perl: read ARGV files
             result.push_str(

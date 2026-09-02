@@ -27,7 +27,7 @@
 //! ..)` and `$(f ..)` captures). Output is deterministic: nodes are
 //! visited in sorted order and each SCC is a sorted set.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ir::{IrExpr, IrProgram, IrStmt};
 

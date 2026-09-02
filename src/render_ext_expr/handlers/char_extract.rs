@@ -1,7 +1,6 @@
 //! Handler for CharExtract — renders `cut -cN` / `cut -bN` natively per backend.
 
 use crate::shir_nodes::CharExtract;
-use crate::shir_nodes::ExtExpr;
 use crate::render_ext_expr::{ExprRenderCtx, Backend};
 
 pub(crate) fn render(node: &CharExtract, ctx: &ExprRenderCtx) -> Option<String> {

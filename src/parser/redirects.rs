@@ -4,7 +4,6 @@ use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
 use logos::Logos;
-use std::collections::{BTreeMap, HashMap};
 
 /// Parse the redirect header (operator + target) but do NOT parse the heredoc
 /// body.  Returns a partial Redirect; the caller must call
@@ -233,7 +232,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                 // After outer-quote stripping and newline truncation we get
                 // `EOF'`.  Strip the trailing `'` and mark as quoted.
                 } else if truncated.ends_with('\'') || truncated.ends_with('"') {
-                    let quote_char = if truncated.ends_with('\'') { '\'' } else { '"' };
+                    let _quote_char = if truncated.ends_with('\'') { '\'' } else { '"' };
                     heredoc_quoted = true;
                     let clean = truncated[..truncated.len() - 1].to_string();
                     if crate::debug::is_debug_enabled() {
