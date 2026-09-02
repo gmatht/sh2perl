@@ -1249,7 +1249,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             out.push_str(";\n");
             Ok(())
         }
-        IrExpr::BinOp { lhs: _, rhs: _, op } => {
+        IrExpr::BinOp { lhs, rhs, op } => {
             // statement-position command chain (`a && b`, `a || b`) —
             // passthrough as ONE bash -c text (bash owns precedence and
             // short-circuit), stdout inherited, rc lands in $?
