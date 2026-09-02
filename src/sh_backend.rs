@@ -990,6 +990,71 @@ fn range_of(iter: &IrExpr) -> Option<(i64, i64)> {
     }
 }
 
+/// `echo ARG | grep -q [-v] P` → native `case` substring check (no grep
+/// spawn; case/true/false are builtins).
+fn grep_q_lift_sh(stages: &[Vec<IrStmt>]) -> Result<Option<String>, String> {
+    if stages.len() != 2 {
+        return Ok(None);
+    }
+    // stage 1: echo ARG
+    let echo_arg = match stages[0].as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "builtin" || func == "exec" => {
+            let name = match args.first() {
+                Some(IrExpr::Str(n, _)) => n.as_str(),
+                _ => return Ok(None),
+            };
+            if name != "echo" {
+                return Ok(None);
+            }
+            let items = match args.get(1) {
+                Some(IrExpr::Array(it)) => it,
+                _ => return Ok(None),
+            };
+            if items.len() != 1 {
+                return Ok(None);
+            }
+            word_to_sh(&items[0])?
+        }
+        _ => return Ok(None),
+    };
+    // stage 2: grep -q [-v] P
+    let (pat, invert) = match stages[1].as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "builtin" || func == "exec" => {
+            let name = match args.first() {
+                Some(IrExpr::Str(n, _)) => n.as_str(),
+                _ => return Ok(None),
+            };
+            if name != "grep" {
+                return Ok(None);
+            }
+            let items = match args.get(1) {
+                Some(IrExpr::Array(it)) => it,
+                _ => return Ok(None),
+            };
+            let mut pat: Option<String> = None;
+            let mut invert = false;
+            for it in items {
+                match it {
+                    IrExpr::Str(s, _) if s == "-q" => {}
+                    IrExpr::Str(s, _) if s == "-v" => invert = true,
+                    IrExpr::Str(s, _) => pat = Some(s.clone()),
+                    _ => return Ok(None),
+                }
+            }
+            (pat, invert)
+        }
+        _ => return Ok(None),
+    };
+    let (Some(pat), invert) = (pat, invert) else {
+        return Ok(None);
+    };
+    let (match_br, miss_br) = if invert { ("false", "true") } else { ("true", "false") };
+    Ok(Some(format!(
+        "case {echo_arg} in *{}*) {match_br};; *) {miss_br};; esac",
+        pat
+    )))
+}
+
 fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
         IrStmt::Ext(_) => return Err("sh renderer: Ext node unsupported".to_string()),
@@ -1390,6 +1455,16 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::Pipeline {
             stages, capture, ..
         } => {
+            // idiom lift: `echo ARG | grep -q [-v] P` → native case
+            // (no grep spawn)
+            if capture.is_none() {
+                if let Some(lift) = grep_q_lift_sh(stages)? {
+                    indent(out, d);
+                    out.push_str(&lift);
+                    out.push('\n');
+                    return Ok(());
+                }
+            }
             let mut line = String::new();
             for (i, stg) in stages.iter().enumerate() {
                 if i > 0 {
@@ -3364,6 +3439,79 @@ fn pick_delimiter(body: &str) -> &'static str {
 
 // ── words ────────────────────────────────────────────────────────────
 
+/// `$(seq …)` / `$(wc -l FILE)` — native sh idiom lifts (no external
+/// process spawn: printf/read are builtins). Returns the shell text, or
+/// None if the capture isn't one of these idioms.
+fn capture_idiom_sh(expr: &IrExpr) -> Result<Option<String>, String> {
+    let IrExpr::Arrow(stmts) = expr else { return Ok(None) };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else { return Ok(None) };
+    if func != "exec" { return Ok(None); }
+    let cmd = match args.first() {
+        Some(IrExpr::Str(c, _)) => c.as_str(),
+        _ => return Ok(None),
+    };
+    let items = match args.get(1) {
+        Some(IrExpr::Array(it)) => it,
+        _ => return Ok(None),
+    };
+    let str_of = |e: &IrExpr| match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        _ => None,
+    };
+    match cmd {
+        "seq" => {
+            let nums: Vec<i64> = items
+                .iter()
+                .filter_map(str_of)
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if nums.is_empty() || nums.len() != items.len() {
+                return Ok(None);
+            }
+            let (start, inc, end) = match nums.as_slice() {
+                [end] => (1, 1, *end),
+                [start, end] => (*start, 1, *end),
+                [start, inc, end] => (*start, *inc, *end),
+                _ => return Ok(None),
+            };
+            if inc == 0 {
+                return Ok(None);
+            }
+            let mut vals = Vec::new();
+            if inc > 0 {
+                let mut v = start;
+                while v <= end {
+                    vals.push(v);
+                    v += inc;
+                }
+            } else {
+                let mut v = start;
+                while v >= end {
+                    vals.push(v);
+                    v += inc;
+                }
+            }
+            let nums = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+            Ok(Some(format!("$(printf '%s\\n' {nums})")))
+        }
+        "wc" => {
+            if items.len() == 2 && str_of(&items[0]).as_deref() == Some("-l") {
+                let file = match str_of(&items[1]) {
+                    Some(f) => f,
+                    None => return Ok(None),
+                };
+                Ok(Some(format!(
+                    "$(n=0; while IFS= read -r _; do n=$((n+1)); done < {}; echo \"$n\")",
+                    str_word(&file)
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 fn word_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Str(s, _) => Ok(str_word(s)),
@@ -3381,10 +3529,16 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         // The first-class Capture node (core request
         // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
         // `"$(...)"` rendering as the `capture` call arm.
-        IrExpr::Capture { expr, .. } => Ok(format!(
-            "\"$({})\"",
-            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
-        )),
+        IrExpr::Capture { expr, .. } => {
+            if let Some(lift) = capture_idiom_sh(expr)? {
+                Ok(lift)
+            } else {
+                Ok(format!(
+                    "\"$({})\"",
+                    arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+                ))
+            }
+        }
         IrExpr::Json(v) => Ok(json_str(v)),
         IrExpr::Ternary { cond, then, else_ } => {
             // POSIX has no inline conditional: command-substitute an
@@ -4012,10 +4166,16 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         // The first-class Capture node (core request
         // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
         // `"$(...)"` rendering as the `capture` call arm.
-        IrExpr::Capture { expr, .. } => Ok(format!(
-            "\"$({})\"",
-            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
-        )),
+        IrExpr::Capture { expr, .. } => {
+            if let Some(lift) = capture_idiom_sh(expr)? {
+                Ok(lift)
+            } else {
+                Ok(format!(
+                    "\"$({})\"",
+                    arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+                ))
+            }
+        }
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
 }

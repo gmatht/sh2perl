@@ -960,7 +960,23 @@ impl Render {
                 format!("{{ let _ = {block}; __SH_RC.load(Ordering::SeqCst) == 0 }}")
             }
             IrExpr::Call { func, args } if func == "return" => {
-                "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                // `return` WITH a value in a value-convention function:
+                // store the value to __SH_RET (the function's value home)
+                // instead of echoing. A bare `return` (flag-only) keeps
+                // the original behaviour.
+                if let Some(v) = args.first() {
+                    let v = self.expr_str(v);
+                    // evaluate the value BEFORE locking __SH_RET — a
+                    // value that is itself a fnValue call (recursive
+                    // param/… dispatch) would re-lock __SH_RET while the
+                    // outer assignment holds it (Mutex re-entrancy
+                    // deadlock — polyfills brace/param)
+                    format!(
+                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst); return; }}"
+                    )
+                } else {
+                    "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                }
             }
             IrExpr::Call { func, args } if func == "break" => {
                 if self.loop_depth > 0 {
@@ -2595,10 +2611,34 @@ impl Render {
             }
             "captureWords" => self.capture_words_expr(args),
             "assign" => format!("vec![{}]", self.assign_call_str(args)),
+            "fnValue" | "fnCall" => {
+                // value-returning user-function call in word-list context:
+                // the argv-swap call then read __SH_RET (the function's
+                // `return expr` home) — mirrors call_str's fnValue arm
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let m = self.fn_ident(name);
+                    let ws: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(items) => {
+                                Some(items.iter().map(|w| self.expr_any(w)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
+                        ws.join(", "),
+                        m
+                    )
+                } else {
+                    "vec![String::new()]".to_string()
+                }
+            }
             "test" => "Vec::new()".to_string(),
             "exec" | "builtin" => "Vec::new()".to_string(),
             "grepMatches" => "Vec::new()".to_string(),
-            "contains" => "Vec::new()".to_string(),
+            "contains" | "strHasPrefix" | "strHasSuffix" => "Vec::new()".to_string(),
             _ => {
                 self.mark_todo(&format!("word call {func}"));
                 "vec![String::new()]".to_string()
@@ -3026,11 +3066,16 @@ impl Render {
             if let IrExpr::Arrow(stmts) = a {
                 found = true;
                 // fast path: [Expr(Call exec cmd …)] → bash -c capture
-                if let Some(text) = self.stage_text(stmts) {
-                    self.add_helper("capture_rc");
-                    return format!(
-                        "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
-                    );
+                // (skipped for KNOWN user-function calls — a bash -c
+                // child can't see the transpiled fn, so those run
+                // in-process via capture_block)
+                if !self.is_fn_capture(stmts) {
+                    if let Some(text) = self.stage_text(stmts) {
+                        self.add_helper("capture_rc");
+                        return format!(
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                        );
+                    }
                 }
                 return self.capture_block(stmts);
             }
@@ -3045,11 +3090,13 @@ impl Render {
     fn capture_expr_single(&mut self, e: &IrExpr) -> String {
         if let IrExpr::Capture { expr, .. } = e {
             if let IrExpr::Arrow(stmts) = expr.as_ref() {
-                if let Some(text) = self.stage_text(stmts) {
-                    self.add_helper("capture_rc");
-                    return format!(
-                        "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
-                    );
+                if !self.is_fn_capture(stmts) {
+                    if let Some(text) = self.stage_text(stmts) {
+                        self.add_helper("capture_rc");
+                        return format!(
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                        );
+                    }
                 }
                 return self.capture_block(stmts);
             }
@@ -3057,6 +3104,26 @@ impl Render {
             let _ = inner;
         }
         "String::new()".to_string()
+    }
+
+    /// Is the capture body a single call to a KNOWN user function?
+    /// (These must run IN-PROCESS — a bash -c child can't see the
+    /// transpiled fn.)
+    fn is_fn_capture(&self, stmts: &[IrStmt]) -> bool {
+        match stmts {
+            [IrStmt::Expr(IrExpr::Call { func, args })] => {
+                if func == "fnValue" || func == "fnCall" {
+                    return true;
+                }
+                if func == "exec" || func == "builtin" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        return self.functions.contains(name);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Native capture: run the statements with the output buffer active.
@@ -4070,6 +4137,20 @@ impl Render {
 
     // ── param expansion ──────────────────────────────────────────────
 
+    /// Pattern for `#`/`%`/`/` param ops. Bash expands variables inside
+    /// the pattern (`${v#*"$sub"}` → the glob `*<value of sub>`), so a
+    /// `$var` reference must be interpolated (not emitted literally).
+    /// Quotes that wrap `$var` in the source pattern are bash delimiters
+    /// and vanish after expansion, so strip them before interpolating.
+    fn param_pattern_expr(&mut self, raw: &str) -> String {
+        if !raw.contains('$') {
+            return Self::rust_str(raw);
+        }
+        let deq = raw.replace('"', "");
+        let e = self.dollar_interp(&deq);
+        format!("&({e})")
+    }
+
     /// param(op, name, [val], [repl]) → String expr.
     fn param_str(&mut self, args: &[IrExpr]) -> String {
         let op = str_arg(args, 0).unwrap_or("");
@@ -4132,22 +4213,23 @@ impl Render {
             if matches!(op, "#" | "##" | "%" | "%%" | "/" | "//") {
                 let var_expr = self.array_index_name(name);
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 return match op {
                     "#" | "##" => {
                         let greedy = op == "##";
                         self.add_helper("strippre");
-                        format!("__sh_strippre(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                        format!("__sh_strippre(&{var_expr}, {pat_expr}, {greedy})")
                     }
                     "%" | "%%" => {
                         let greedy = op == "%%";
                         self.add_helper("stripsuf");
-                        format!("__sh_stripsuf(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                        format!("__sh_stripsuf(&{var_expr}, {pat_expr}, {greedy})")
                     }
                     _ => {
                         let repl = args.get(3).map(|x| self.param_val_str(x)).unwrap_or_else(|| "String::new()".to_string());
                         let all = op == "//";
                         self.add_helper("replace");
-                        format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
+                        format!("__sh_replace(&{var_expr}, {pat_expr}, &{repl}, {all})")
                     }
                 };
             }
@@ -4223,21 +4305,24 @@ impl Render {
             }
             "#" | "##" | "#:" | "##:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("##");
                 self.add_helper("strippre");
-                format!("__sh_strippre(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                format!("__sh_strippre(&{var_expr}, {pat_expr}, {greedy})")
             }
             "%" | "%%" | "%:" | "%%:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("%%");
                 self.add_helper("stripsuf");
-                format!("__sh_stripsuf(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                format!("__sh_stripsuf(&{var_expr}, {pat_expr}, {greedy})")
             }
             "/" | "//" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let all = op == "//";
                 self.add_helper("replace");
-                format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
+                format!("__sh_replace(&{var_expr}, {pat_expr}, &{repl}, {all})")
             }
             "slice" => {
                 // `${!prefix*[@]:off:len}` — a slice of the INDIRECT key
@@ -4323,7 +4408,7 @@ impl Render {
                         })
                         .unwrap_or_default();
                     return format!(
-                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RET.lock().unwrap().clone() }}",
+                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
                         ws.join(", "),
                         m
                     );
@@ -4415,6 +4500,16 @@ impl Render {
                 let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 let needle = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
                 format!("(if {text}.contains(&{needle}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
+            }
+            "strHasPrefix" => {
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let prefix = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("(if {text}.starts_with(&{prefix}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
+            }
+            "strHasSuffix" => {
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let suffix = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("(if {text}.ends_with(&{suffix}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
             }
             "setArray" | "setArrayAppend" => {
                 // an array assign in expr context — run it, yield ""
@@ -5055,11 +5150,22 @@ impl Render {
             IrStmt::Return(e) => {
                 if self.in_function {
                     // user-function VALUE return (strings are the value
-                    // model; numeric contexts coerce via __sh_atoi)
-                    let r = e.as_ref().map(|x| self.expr_str(x)).unwrap_or_default();
-                    self.emit(&format!(
-                        "*__SH_RET.lock().unwrap() = {r}; return;"
-                    ));
+                    // model; numeric contexts coerce via __sh_atoi). A bare
+                    // `return` keeps the current __SH_RET value, so it is a
+                    // plain early exit — never an empty assignment.
+                    if let Some(x) = e {
+                        let r = self.expr_str(x);
+                        // evaluate BEFORE locking __SH_RET — a value that
+                        // is itself a fnValue call (recursive param/…
+                        // dispatch) would re-lock __SH_RET while the
+                        // outer assignment holds it (Mutex re-entrancy
+                        // deadlock — polyfills brace/param)
+                        self.emit(&format!(
+                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                        ));
+                    } else {
+                        self.emit("return;");
+                    }
                     return;
                 }
                 if let Some(x) = e {
@@ -6167,21 +6273,21 @@ fn helper_source(h: &str) -> &'static str {
                         false
                     }
                     '*' => {
+                        // *(alts)rest  =  rest  |  a ++ *(alts)rest  (some alt a)
                         if m(rest, t) { return true; }
                         for a in &alts {
-                            let mut joined = a.clone();
-                            joined.push('*');
-                            joined.extend_from_slice(&p[..p.len() - rest.len()]);
-                            if m(&joined, t) { return true; }
+                            for i in 1..=t.len() {
+                                if m(a, &t[..i]) && m(p, &t[i..]) { return true; }
+                            }
                         }
                         false
                     }
                     '+' => {
+                        // +(alts)rest  =  a ++ *(alts)rest  (at least one alt a)
                         for a in &alts {
-                            let mut joined = a.clone();
-                            joined.push('*');
-                            joined.extend_from_slice(&p[..p.len() - rest.len()]);
-                            if m(&joined, t) { return true; }
+                            for i in 1..=t.len() {
+                                if m(a, &t[..i]) && m(p, &t[i..]) { return true; }
+                            }
                         }
                         false
                     }
@@ -7476,13 +7582,15 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 if self.style == "[[" {
                     // pattern match (glob) in [[ ]]
                     self.render.add_helper("fnmatch");
+                    let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
+                    let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
                     if self.render.nocasematch {
                         format!(
-                            "({} __sh_fnmatch(&{rhs}.to_lowercase(), &{lhs}.to_lowercase()))",
+                            "({} __sh_fnmatch(&{r}.to_lowercase(), &{l}.to_lowercase()))",
                             if eq { "" } else { "!" }
                         )
                     } else {
-                        format!("({} __sh_fnmatch(&{rhs}, &{lhs}))", if eq { "" } else { "!" })
+                        format!("({} __sh_fnmatch(&{r}, &{l}))", if eq { "" } else { "!" })
                     }
                 } else {
                     // the sh2.* runtime's evalTest contract

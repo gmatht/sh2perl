@@ -820,6 +820,23 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
     }
 }
 
+/// The pure-CPU sh2.* namespace ops (the runtime/ polyfill inventory) —
+/// these are IR ops the backends render natively, NOT user functions. A
+/// user-defined function with one of these names (polyfills.sh defines
+/// param/contains/globMatch/…) must not be confused with the op:
+/// collapsing `param("len", "v")` (the `${#v}` op) to
+/// `fnValue("param", ["len", "v"])` makes the param function's OWN
+/// `${#v}` a recursive call (stack overflow).
+const SH2_OPS: &[&str] = &[
+    "param", "join", "contains", "strLen", "strHasPrefix", "strHasSuffix",
+    "strSlice", "strCompare", "strIndex", "strLastIndex", "strCount",
+    "strReplaceAll", "strContainsAny", "globMatch", "caseMatch", "brace",
+    "basename", "dirname", "test", "line_count", "line_at", "wcLines",
+    "headLines", "tailLines", "ext_alt_match", "ext_match", "joinSep",
+    "split", "arrayIndex", "arrayLen", "arrayItems", "listVar", "assocGet",
+    "getVar", "setVar", "arith",
+];
+
 /// Rewrite `exec("f", ...)` / `fnCall("f", ...)` calls inside an
 /// expression (capture bodies, and/or chains, ternary conds, …). A
 /// CAPTURE of an eligible function's call collapses to the bare `fnValue`
@@ -830,9 +847,47 @@ fn rewrite_expr_calls(e: &mut IrExpr, eligible: &HashSet<String>) -> bool {
     // channel is the fnValue result directly (the capture would wrap an
     // echo of it and strip the newline — identical, minus the round-trip).
     if let IrExpr::Capture { expr, .. } = e {
-        if let IrExpr::Call { func, args } = expr.as_ref() {
-            if eligible_fn_call(func, args, eligible) {
-                *e = fn_value_call(args);
+        // `$(f args)` — a capture of an eligible function call: the value
+        // channel is the fnValue result directly (the capture would wrap
+        // an echo of it and strip the newline — identical, minus the
+        // round-trip). The capture may be a direct Call (the direct-calls
+        // collapse) or an Arrow wrapping a single exec (case/loop-bodied
+        // fns direct-calls refuses — the matchers).
+        let call = match expr.as_ref() {
+            IrExpr::Call { func, args } => Some((func.as_str(), args)),
+            IrExpr::Arrow(body) => match body.as_slice() {
+                [IrStmt::Expr(IrExpr::Call { func, args })]
+                    if func == "exec" || func == "fnCall" =>
+                {
+                    Some((func.as_str(), args))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((func, args)) = call {
+            let eligible_call = if matches!(func, "exec" | "fnCall") {
+                matches!(args.as_slice(), [IrExpr::Str(fname, _), IrExpr::Array(_)]
+                    if eligible.contains(fname))
+            } else {
+                eligible.contains(func)
+            };
+            if eligible_call {
+                let (fname, call_args) = if matches!(func, "exec" | "fnCall") {
+                    let [IrExpr::Str(fname, _), IrExpr::Array(call_args)] = args.as_slice() else {
+                        unreachable!("checked by eligible_call")
+                    };
+                    (fname.clone(), call_args.clone())
+                } else {
+                    (func.to_string(), args.clone())
+                };
+                *e = IrExpr::Call {
+                    func: "fnValue".to_string(),
+                    args: vec![
+                        IrExpr::Str(fname, StrStyle::DoubleQuoted),
+                        IrExpr::Array(call_args),
+                    ],
+                };
                 return true;
             }
         }
@@ -847,6 +902,25 @@ fn rewrite_expr_calls(e: &mut IrExpr, eligible: &HashSet<String>) -> bool {
             false
         }
         IrExpr::Call { func, args } => {
+            // a DIRECT call of an eligible function (the parameter-
+            // expansion lowering / direct-calls collapse for non-eligible
+            // callers — e.g. brace/test's `${s%/*}` → `param('%', s, "/")`):
+            // the value channel is the fnValue result. The pure-CPU sh2.*
+            // namespace ops are NOT user functions — they render natively
+            // per-backend, so they must NOT be collapsed to fnValue (when
+            // the polyfill defines a function with the same name — e.g.
+            // `param` — the param function's OWN `${#v}` would become a
+            // recursive call).
+            if eligible.contains(func.as_str()) && !SH2_OPS.contains(&func.as_str()) {
+                *e = IrExpr::Call {
+                    func: "fnValue".to_string(),
+                    args: vec![
+                        IrExpr::Str(func.clone(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(args.clone()),
+                    ],
+                };
+                return true;
+            }
             let mut c = false;
             for a in args.iter_mut() {
                 c |= rewrite_expr_calls(a, eligible);

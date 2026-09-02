@@ -719,6 +719,13 @@ impl Render {
                 format!("{}[{}]", self.py_ident(var), self.expr(key))
             }
             IrExpr::BinOp { lhs, op, rhs } => {
+                // idiom lift: `test -f X && cat X` → guarded read (no
+                // subprocess)
+                if matches!(op, crate::ir::BinOpKind::And) {
+                    if let Some(guarded) = self.guarded_cat(lhs, rhs) {
+                        return guarded;
+                    }
+                }
                 let l = self.expr(lhs);
                 // `not` is unary in python; the IR only ever pairs it with a
                 // meaningful lhs (the rhs is ignored)
@@ -816,6 +823,11 @@ impl Render {
                     if let [IrStmt::Expr(e)] = body.as_slice() {
                         if let IrExpr::Call { func, args } = e {
                             if func == "exec" {
+                                // idiom lifts: `$(seq …)` / `$(wc -l FILE)`
+                                // — native, no subprocess
+                                if let Some(lift) = self.capture_idiom(args) {
+                                    return lift;
+                                }
                                 let argv = self.build_argv(args);
                                 self.need_subprocess = true;
                                 return format!(
@@ -2060,6 +2072,131 @@ impl Render {
         argv
     }
 
+    /// `$(seq …)` / `$(wc -l FILE)` — native idiom lifts (no subprocess).
+    /// Returns the python expression, or None if the capture isn't one of
+    /// these idioms.
+    fn capture_idiom(&mut self, args: &[IrExpr]) -> Option<String> {
+        let cmd = match args.first() {
+            Some(IrExpr::Str(c, _)) => c.as_str(),
+            _ => return None,
+        };
+        let items = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        let str_of = |e: &IrExpr| match e {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        };
+        match cmd {
+            "seq" => {
+                // seq [START] END  /  seq START INC END — all-numeric
+                let nums: Vec<i64> = items.iter().filter_map(str_of).filter_map(|s| s.trim().parse().ok()).collect();
+                if nums.is_empty() || nums.len() != items.len() { return None; }
+                let (start, inc, end) = match nums.as_slice() {
+                    [end] => (1, 1, *end),
+                    [start, end] => (*start, 1, *end),
+                    [start, inc, end] => (*start, *inc, *end),
+                    _ => return None,
+                };
+                if inc == 0 { return None; }
+                // `$(seq a b)` = "a\n…\nb" (bash strips the trailing newline)
+                if inc > 0 {
+                    // ascending (or empty when START > END — matches the
+                    // target `seq` which yields nothing for `seq hi lo`)
+                    Some(format!(
+                        "\"\\n\".join(str(i) for i in range({}, {}, {}))",
+                        start, end + 1, inc
+                    ))
+                } else if inc < 0 {
+                    Some(format!(
+                        "\"\\n\".join(str(i) for i in range({}, {}, {}))",
+                        start, end - 1, inc
+                    ))
+                } else {
+                    None
+                }
+            }
+            "wc" => {
+                // wc -l FILE → native line count
+                if items.len() == 2 && str_of(&items[0]).as_deref() == Some("-l") {
+                    let file = str_of(&items[1])?;
+                    Some(format!(
+                        "str(len(open({}).readlines()))",
+                        Self::py_str(&file)
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `test -f X && cat X` → guarded read (no subprocess).
+    fn guarded_cat(&mut self, lhs: &IrExpr, rhs: &IrExpr) -> Option<String> {
+        let (largs, rargs) = match (lhs, rhs) {
+            (IrExpr::Call { func: lf, args: la }, IrExpr::Call { func: rf, args: ra })
+                if lf == "exec" && rf == "exec" => (la, ra),
+            _ => return None,
+        };
+        let lname = match largs.first() { Some(IrExpr::Str(n, _)) => n.as_str(), _ => return None };
+        let rname = match rargs.first() { Some(IrExpr::Str(n, _)) => n.as_str(), _ => return None };
+        if lname != "test" || rname != "cat" { return None; }
+        let litems = match largs.get(1) { Some(IrExpr::Array(it)) => it, _ => return None };
+        let ritems = match rargs.get(1) { Some(IrExpr::Array(it)) => it, _ => return None };
+        if litems.len() != 2 || ritems.len() != 1 { return None; }
+        let flag = match &litems[0] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
+        if flag != "-f" { return None; }
+        let path = self.expr(&litems[1]);
+        let catpath = self.expr(&ritems[0]);
+        Some(format!(
+            "(os.path.isfile({path}) and (sys.stdout.write(open({catpath}).read()), True)[1])"
+        ))
+    }
+
+    /// `echo ARG | grep -q [-v] P` → `__sh_rc = 0 if (P in ARG) else 1`
+    /// (native substring check, no subprocess).
+    fn grep_q_lift(&mut self, stages: &[Vec<IrStmt>]) -> Option<String> {
+        if stages.len() != 2 { return None; }
+        // stage 1: echo ARG
+        let echo_arg = match stages[0].as_slice() {
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "builtin" || func == "exec" => {
+                let name = match args.first() { Some(IrExpr::Str(n, _)) => n.as_str(), _ => return None };
+                if name != "echo" { return None; }
+                let items = match args.get(1) { Some(IrExpr::Array(it)) => it, _ => return None };
+                if items.len() != 1 { return None; }
+                self.expr(&items[0])
+            }
+            _ => return None,
+        };
+        // stage 2: grep -q [-v] P
+        let (pat, invert) = match stages[1].as_slice() {
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "builtin" || func == "exec" => {
+                let name = match args.first() { Some(IrExpr::Str(n, _)) => n.as_str(), _ => return None };
+                if name != "grep" { return None; }
+                let items = match args.get(1) { Some(IrExpr::Array(it)) => it, _ => return None };
+                let mut pat: Option<String> = None;
+                let mut invert = false;
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _) if s == "-q" => {}
+                        IrExpr::Str(s, _) if s == "-v" => invert = true,
+                        IrExpr::Str(s, _) => pat = Some(s.clone()),
+                        _ => return None,
+                    }
+                }
+                (pat?, invert)
+            }
+            _ => return None,
+        };
+        let op = if invert { "not in" } else { "in" };
+        Some(format!(
+            "__sh_rc = 0 if ({} {op} {echo_arg}) else 1",
+            Self::py_str(&pat)
+        ))
+    }
+
     /// Render a `let "EXPR"` arithmetic condition (`i<3`) as a Python
     /// numeric comparison.
     fn render_let_cond(&mut self, text: &str) -> Option<String> {
@@ -2816,6 +2953,12 @@ impl Render {
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
+                // idiom lift: `echo "$x" | grep -q P` → native substring
+                // check (no subprocess)
+                if let Some(rc) = self.grep_q_lift(stages) {
+                    self.emit(&rc);
+                    return;
+                }
                 for st in stages {
                     for s in st {
                         self.stmt(s);

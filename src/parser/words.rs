@@ -2928,7 +2928,19 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     None,
                 ))
             } else {
-                Ok(Word::Variable(prefixed, true, None))
+                // ${#name} - scalar length: keep the `#` in the variable
+                // name so `param_ir` lowers it to `param("len", name)`
+                // (rendered as `__sh_len(...)` / native `${#name}`).  The
+                // old `Word::Variable("#name")` was an env-var lookup of
+                // the literally-named `#name`, which is wrong.
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: prefixed,
+                        operator: ParameterExpansionOperator::None,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
             }
         }
         Some(Token::DollarBraceBang) => {
