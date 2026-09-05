@@ -214,6 +214,8 @@ mod tests {
     use crate::ir::IrProgram;
     // bring the `run` method into scope for direct `ConstVar.run(..)` calls
     use crate::shir_passes::Analysis as _;
+    // the use-before-decl lint analysis (defined in its own module)
+    use crate::shir_passes::used_before_decl::UseBeforeDecl;
 
     fn empty_prog() -> IrProgram {
         IrProgram {

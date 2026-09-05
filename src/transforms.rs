@@ -22,6 +22,7 @@ pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identit
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
+pub mod grep_pcre; // `grep -P 'PCRE'` → portable `grep -E 'ERE'` (lookbehind absorbed + var patterns reduced; refuse>guess)
 pub mod cat_read; // `cat [-n] FILE` → ForEachLine streaming loop (native in every backend)
 pub mod process_subst;
 pub mod ternary_desugar; // C frontend's `ternary(cond,a,b)` call → backend-neutral Ternary + test-call (non-estree backends)
@@ -69,6 +70,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
         ("grep-o", grep_o::transform),
+        ("grep-pcre", grep_pcre::transform),
         ("cat-read", cat_read::transform),
         // process substitution: the estree corpus path never reaches this
         // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
