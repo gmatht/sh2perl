@@ -213,6 +213,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                             if emit {
                                 if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
+
                                     *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: true, target: None });
                                     LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                     return;
@@ -857,6 +858,7 @@ fn extract_stage_text(stmts: &[IrStmt]) -> Option<(IrExpr, bool)> {
         // NOT an arbitrary command — `paste | head` must not reduce as if
         // paste produced a literal string.
         [IrStmt::Expr(e)] => match e {
+
             IrExpr::Str(s, _) => Some((e.clone(), s.ends_with('\n'))),
             IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
                 let txt: String = parts.iter().filter_map(|p| match p {
@@ -986,6 +988,20 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     }
     if squeeze && (from.contains('-') || to.contains('-')) {
         return None;
+    }
+
+    // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
+    // transform, NOT a literal char map ("[:upper:]" is a class, not chars).
+    // Other classes ([:digit:], [:space:], ...) can't be a literal CharTranslate
+    // — leave them to the runtime.
+    if from.contains("[:") || to.contains("[:") {
+        if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })));
+        }
+        if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })));
+        }
+        return None; // other class translations → runtime
     }
 
     // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
@@ -1411,6 +1427,7 @@ fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String
     match op {
         ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
         "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
+
         "slice" if args.len() >= 4 => {
             // ${v:N:M} on a SCALAR is SubStr; on an ARRAY it's an index
             // subset. The two produce identical param calls, so consult the
