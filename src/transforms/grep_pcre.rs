@@ -1018,6 +1018,9 @@ mod tests {
         let (ere, pre) = translate_pcre("(?:[0-9]+\\s+Doing)").unwrap();
         assert_eq!(ere, "([0-9]+[[:space:]]+Doing)");
         assert!(pre.is_none());
+        // the snap-debug-info `Error` variant
+        let (ere, _) = translate_pcre("(?:[0-9]+\\s+Error)").unwrap();
+        assert_eq!(ere, "([0-9]+[[:space:]]+Error)");
     }
 
     #[test]
@@ -1032,6 +1035,78 @@ mod tests {
         assert_eq!(ere, "a*b");
         let (ere, _) = translate_pcre("a{2,3}+").unwrap();
         assert_eq!(ere, "a{2,3}");
+    }
+
+    #[test]
+    fn softy_fqdn_pattern_refused() {
+        // lookahead + atomic + negative lookahead: not ERE-expressible →
+        // the whole pattern must be refused (kept as `grep -P`)
+        assert!(translate_pcre(
+            "(?=^.{1,254}$)(^(?>(?!\\d+\\.)[a-zA-Z0-9_\\-]{1,63}\\.?)+(?:[a-zA-Z]{2,})$)"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn pgrep_parent_pid_untouched() {
+        // memtester.sh / terminateProcess.sh: `pgrep -P $pid name` is
+        // parent-PID matching, NOT a regex form — the -P must not be
+        // mistaken for a PCRE flag.
+        let mut stmts = vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                st("pgrep"),
+                IrExpr::Array(vec![st("-P"), getvar("PPIDKILL"), st("memtester")]),
+            ],
+        })];
+        assert!(!transform(&mut stmts));
+        let av = argv_of(&stmts);
+        assert_eq!(av.len(), 0, "pgrep is not a grep — must be untouched");
+    }
+
+    #[test]
+    fn jobs_sh_downstream_filter_stages_kept() {
+        // jobs.sh: `grep default | grep -Po '(?<=dev )(\S+)' |
+        // grep -v vpn_se | head -1` — only the -P stage is rewritten and
+        // the sed strip stage is inserted right after it; the -v / head
+        // stages are untouched.
+        let pipeline = IrExpr::Call {
+            func: "pipeline".to_string(),
+            args: vec![IrExpr::Array(vec![
+                IrExpr::Arrow(vec![exec_grep(vec![st("default")])]),
+                IrExpr::Arrow(vec![exec_grep(vec![
+                    st("-P"),
+                    st("-o"),
+                    st("(?<=dev )(\\S+)"),
+                ])]),
+                IrExpr::Arrow(vec![exec_grep(vec![st("-v"), st("vpn_se")])]),
+                IrExpr::Arrow(vec![exec_grep(vec![st("-1")])]),
+            ])],
+        };
+        let mut stmts = vec![IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "A".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Capture {
+                expr: Box::new(pipeline),
+                native: false,
+            },
+            asm: None,
+        }];
+        assert!(transform(&mut stmts));
+        let av = all_argv(&stmts);
+        assert_eq!(av.len(), 5, "4 original stages + sed: {:?}", av);
+        assert_eq!(av[0], vec!["default"], "first grep untouched");
+        assert_eq!(
+            av[1],
+            vec!["-Eo", "dev ([^[:space:]]+)"],
+            "-P stage translated"
+        );
+        assert_eq!(av[2], vec!["s/^dev //"], "sed strip inserted");
+        assert_eq!(av[3], vec!["-v", "vpn_se"], "grep -v untouched");
+        assert_eq!(av[4], vec!["-1"], "head -1 untouched (last stage)");
     }
 
     #[test]
