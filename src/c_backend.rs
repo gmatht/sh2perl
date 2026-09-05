@@ -205,6 +205,11 @@ pub struct Render {
     store: BTreeSet<String>,
     /// shell-out runtime needed (the _sh_* preamble helpers)
     need_sh: bool,
+    /// uu-ffi in-process coreutils runtime needed (UU-FFI.md): emit the
+    /// `#include "uu_run.h"` + a `sh2_uu_run` statement for a static
+    /// genuinely-external command when SH2_UU_FFI env is set. Never
+    /// changes default (env-unset) output.
+    need_uu: bool,
     /// index range in self.out covering the need_sh runtime helper block
     /// (recorded at emit_runtime; trim_sh_runtime drops unreferenced
     /// helpers from it after the body is rendered)
@@ -605,6 +610,14 @@ impl Render {
         }
         self.emit("#include <math.h>");
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
+        if self.need_uu {
+            // UU-FFI.md: in-process coreutils for genuinely-external commands.
+            // SH2_UU_FFI=1 lowers a static external command to sh2_uu_run(
+            // argv) instead of `bash -c`. Link the generated program with
+            // runtime/uu_run.c + runtime/lib/libcoreutils_ffi.so
+            // (runtime/build_uu_ffi.sh).
+            self.emit("#include <uu_run.h>");
+        }
         self.emit("");
         if self.need_sh {
             self.runtime_start = self.out.len();
@@ -4432,8 +4445,62 @@ impl Render {
                     self.temp_seq - 1
                 )
             }
-            _ => self.shell_exec(args),
+            _ => {
+                if let Some(uu) = self.uu_run_opt(&cmd, &args) {
+                    self.need_sh = true;
+                    format!("(_sh_rc = {uu}, _sh_rc == 0)")
+                } else {
+                    self.shell_exec(args)
+                }
+            }
         }
+    }
+
+    /// UU-FFI.md: lower a STATIC genuinely-external command to an in-process
+    /// `sh2_uu_run(argv)` call instead of `bash -c`. Strictly opt-in (env
+    /// SH2_UU_FFI set at RENDER time) and strictly conservative: only a
+    /// plain external command with all-STATIC string words and no arrays /
+    /// env-carrying Object arg qualifies; anything dynamic keeps the
+    /// existing shell site (default, byte-identical). Returns Some(C-expr)
+    /// when the fast path applies.
+    fn uu_run_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        if std::env::var("SH2_UU_FFI").is_err() {
+            return None;
+        }
+        // command must not already be handled natively (this is only ever
+        // reached from the generic `_ =>` arm, so it's an external tool),
+        // and it must be one the built library exposes.
+        const EXTERNAL: &[&str] = &["cat", "wc", "ls", "sort", "sed", "awk"];
+        if !EXTERNAL.contains(&cmd) {
+            return None;
+        }
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        // every word must be a static string (no interpolation / call /
+        // array / env Object) so argv is built at RENDER time.
+        let mut argv: Vec<String> = vec![cmd.to_string()];
+        for w in words {
+            let IrExpr::Str(s, _) = w else { return None };
+            argv.push(s.clone());
+        }
+        // no env-prefix Object arg (IFS=: cmd ...), no array materialization
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+            return None;
+        }
+        // build `char *_sh_uu_avN[] = { ... };` + emit the call expression.
+        let av = format!("_sh_uu_av{}", self.temp_seq);
+        self.temp_seq += 1;
+        let arr: Vec<String> = argv.iter().map(|a| Self::cstr(a)).collect();
+        let mut decl = format!("char *{av}[] = {{");
+        decl.push_str(&arr.join(", "));
+        decl.push_str(", 0};");
+        self.emit(&decl);
+        self.need_uu = true;
+        Some(format!(
+            "sh2_uu_run((int)(sizeof {av} / sizeof {av}[0]) - 1, {av})"
+        ))
     }
 
     /// `export X=1` / `declare x=...` — apply the assignments to the store.
