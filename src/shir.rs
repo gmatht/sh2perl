@@ -10207,6 +10207,45 @@ fn arith_has_poison(a: &ArithAst) -> bool {
     }
 }
 
+/// Does the arith subtree contain a raw var read (Var/Ident)? Used for
+/// the div-lowering bigint taint: a lifted binding may hold a BigInt at
+/// runtime, where Math.trunc(BigInt) would throw.
+fn arith_has_var_read(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Var(_) | ArithAst::Ident(_) => true,
+        ArithAst::Bin { lhs, rhs, .. } => arith_has_var_read(lhs) || arith_has_var_read(rhs),
+        ArithAst::Un { arg, .. } => arith_has_var_read(arg),
+        ArithAst::Cond {
+            test,
+            then,
+            else_,
+            ..
+        } => arith_has_var_read(test) || arith_has_var_read(then) || arith_has_var_read(else_),
+        ArithAst::Assign { rhs, .. } => arith_has_var_read(rhs),
+        ArithAst::Cast { arg, .. } => arith_has_var_read(arg),
+        ArithAst::Index { key, .. } => arith_has_var_read(key),
+        _ => false,
+    }
+}
+
+/// Does `a` have the shape `X == 0` / `0 == X` where X contains a
+/// zero-possible div/mod and NO other poison operator? See the
+/// zero-compare native lowering in [`arith_to_estree_wrapped`].
+fn arith_is_zero_cmp(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } if op == "==" => {
+            if matches!(**lhs, ArithAst::Num(0)) {
+                arith_has_div_mod(rhs) && !arith_has_poison(rhs)
+            } else if matches!(**rhs, ArithAst::Num(0)) {
+                arith_has_div_mod(lhs) && !arith_has_poison(lhs)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Top-level arith lowering with the poison-depth bookkeeping: the
 /// div/mod arms (see [`arith_to_estree`]) consult [`ARITH_POISON_DEPTH`]
 /// to decide native-vs-throw, but an arm only sees its LOCAL subtree —
@@ -10232,6 +10271,20 @@ fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
         let out = arith_to_estree(&c);
         *ARITH_WRAP_DEPTH.lock().unwrap() -= 1;
         return out;
+    }
+    // `X == 0` with div/mod in X (the divisibility-test shape the A1
+    // frontends emit per loop iteration — py-sh-go `n % i == 0`): render
+    // WITHOUT the poison escalation. The poison exists because JS absorbs
+    // a NaN into bitwise/comparison ops where bash aborts the expansion;
+    // for `== 0` the two agree EXACTLY — a zero divisor's NaN fails `== 0`
+    // (false) the same way bash's abort fails the test (false) — so the
+    // div/mod renders NATIVE (no per-iteration imod/idiv helper dispatch:
+    // ~8x on a 67M-iteration divisibility loop). `!= 0` must KEEP the
+    // helper (NaN !== x would invert the abort→false semantics), and the
+    // pattern requires the X side to carry no OTHER poison operator
+    // (bitwise/**/nested comparisons — those genuinely absorb NaN).
+    if arith_is_zero_cmp(a) {
+        return arith_to_estree(a);
     }
     if arith_has_poison(a) {
         *ARITH_POISON_DEPTH.lock().unwrap() += 1;
@@ -10516,7 +10569,22 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 // abort can never fire), the operation is plain native
                 // JS: no idiv/imod dispatch, no zero check per evaluation.
                 let r = arith_to_estree(rhs);
-                if arith_is_nonzero(rhs) {
+                // bigint taint: any operand carrying an Int64/UInt64 cast
+                // (exact BigInt("N") literals) or a raw var read (a lifted
+                // binding may hold a BigInt — the A1 frontends' bigint
+                // regime) may be a BigInt at runtime. Math.trunc(BigInt)
+                // THROWS where the runtime idiv helper coerces — so a
+                // tainted `/` renders the helper (idiv is Math.trunc for
+                // Number operands — bash semantics identical, only the
+                // zero-divisor abort channel, which the arithEval catch
+                // maps to the same empty result). `%` is NOT tainted: the
+                // native `%` operator is BigInt-safe (a zero divisor NaN
+                // flows to the arithEval boundary like bash's abort).
+                let may_bigint = arith_has_cast(lhs)
+                    || arith_has_cast(rhs)
+                    || arith_has_var_read(lhs)
+                    || arith_has_var_read(rhs);
+                if arith_is_nonzero(rhs) && !may_bigint {
                     if *op == "/" {
                         // Math.trunc(l / r) — bash integer division
                         // (truncating toward zero) with a provably-nonzero
@@ -10562,7 +10630,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     // (bitwise → 0, `**` → 1, comparison → false) where
                     // bash aborts the whole expansion, so those keep the
                     // throwing helper. =0 restores the helper everywhere.
-                    if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 {
+                    if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 || may_bigint {
                         sh2_call("idiv", vec![arith_to_estree(lhs), r])
                     } else {
                         Expr::CallExpression {
@@ -16635,6 +16703,33 @@ fn flatten_for_iter(iter: &IrExpr) -> Expr {
     }
 }
 
+/// A loop/if condition that is an Arith expression whose tree contains
+/// div/mod lowers to the THROWING-form wrapper `sh2.arithEval(() => …)`
+/// — a STRING ("" on the bash abort, the printed value otherwise). An
+/// If/While consumes it as a BOOLEAN, and JS string truthiness is wrong
+/// for it ("0" is truthy — `if $((n % i))` with a zero remainder would
+/// take the branch where bash wouldn't). Coerce numerically: Number("")
+/// is NaN (falsy — the exact abort semantics), Number("0") is 0 (falsy),
+/// a value string is truthy. Div/mod-free arith lowers to a BARE numeric
+/// expression (no wrapper — the arm's fast path) and needs no coercion.
+fn cond_to_estree(cond: &IrExpr) -> Expr {
+    let c = expr_to_estree(cond);
+    if let IrExpr::Arith(a) = cond {
+        // the arithEval-wrapper case ONLY (the zero-compare pattern is
+        // native-numeric — see the Arith arm — and needs no coercion)
+        if arith_has_div_mod(a) && !arith_is_zero_cmp(a) {
+            return Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![c],
+                optional: false,
+            };
+        }
+    }
+    c
+}
+
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     // Declarator-position asm label (`int x asm("myx") = 7;` — core
     // request c-sh-go-toplevelasmargument-20260814-042952): the label
@@ -17348,11 +17443,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // writes).
                     if test_cond_write_is_dead(stmt) {
                         *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
-                        let c = expr_to_estree(cond);
+                        let c = cond_to_estree(cond);
                         *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
                         c
                     } else {
-                        expr_to_estree(cond)
+                        cond_to_estree(cond)
                     }
                 },
                 consequent,
@@ -17660,11 +17755,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // captures it).
                 if test_cond_write_is_dead(stmt) {
                     *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
-                    let c = expr_to_estree(cond);
+                    let c = cond_to_estree(cond);
                     *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
                     c
                 } else {
-                    expr_to_estree(cond)
+                    cond_to_estree(cond)
                 }
             };
             let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
@@ -17893,11 +17988,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let cond_e = {
                 if test_cond_write_is_dead(stmt) {
                     *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
-                    let c = expr_to_estree(cond);
+                    let c = cond_to_estree(cond);
                     *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
                     c
                 } else {
-                    expr_to_estree(cond)
+                    cond_to_estree(cond)
                 }
             };
             let test = if *until {
@@ -34896,8 +34991,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // `String(f())`; a store var inside still reads via getVar,
             // the runtime's exact coercion). Div/mod expressions keep the
             // wrapper — bash aborts the WHOLE expansion on a zero divisor
-            // (empty result), which only the catch can express.
-            if !arith_has_div_mod(a) {
+            // (empty result), which only the catch can express — EXCEPT
+            // the zero-compare pattern (`X == 0`): its native lowering
+            // already maps a zero divisor's NaN to the exact bash
+            // abort→false semantics (see arith_to_estree_wrapped), so the
+            // wrapper is dead weight there too — and it is the hot
+            // divisibility-loop shape (py-sh-go t86: ~2x per-iteration).
+            if !arith_has_div_mod(a) || arith_is_zero_cmp(a) {
                 return inner;
             }
             sh2_call(
