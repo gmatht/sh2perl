@@ -8251,11 +8251,11 @@ impl Render {
                         self.emit(&format!("_sh_rc = ({v}) ? 1 : 0;"));
                         return;
                     }
-                    IrExpr::Call { func, args } if func == "break" => {
+                    IrExpr::Call { func, args: _ } if func == "break" => {
                         self.emit("break;");
                         return;
                     }
-                    IrExpr::Call { func, args } if func == "continue" => {
+                    IrExpr::Call { func, args: _ } if func == "continue" => {
                         self.emit("continue;");
                         return;
                     }
@@ -11628,7 +11628,7 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             // `printf -v NAME …` ASSIGNS the formatted text to NAME —
             // the var must hoist a declaration or the native -v lowering
             // writes an undeclared identifier
-            IrStmt::Expr(IrExpr::Call { func, args })
+            IrStmt::Expr(IrExpr::Call { func: _, args })
                 if is_printf_v_call(args) =>
             {
                 if let Some(IrExpr::Array(items)) = args.get(1) {

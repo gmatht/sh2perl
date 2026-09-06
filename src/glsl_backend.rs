@@ -4741,7 +4741,7 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
                     _ => false,
                 }
             }
-            IrExpr::Call { func, args } if func == "test" => test_ok(e, vars),
+            IrExpr::Call { func, args: _ } if func == "test" => test_ok(e, vars),
             IrExpr::Call { func, .. } if func == "arith" => expr_range(e, vars).is_some(),
             _ => false,
         },

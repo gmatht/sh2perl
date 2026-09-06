@@ -4112,7 +4112,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 _ => None,
             },
             IrExpr::Capture { .. } => expr_len(e, lens, cap, depth + 1),
-            IrExpr::Call { func, args } if func == "capture" => expr_len(e, lens, cap, depth + 1),
+            IrExpr::Call { func, args: _ } if func == "capture" => expr_len(e, lens, cap, depth + 1),
             _ => None,
         }
     }
@@ -15792,7 +15792,7 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
         match e {
             IrExpr::Call { func, args } => {
                 if func == "shopt"
-                    && matches!(args.as_slice(), [IrExpr::Str(opt, _), IrExpr::Bool(en)]
+                    && matches!(args.as_slice(), [IrExpr::Str(opt, _), IrExpr::Bool(_en)]
                         if opt == "nocasematch")
                 {
                     if let [_, IrExpr::Bool(en)] = args.as_slice() {
@@ -16753,7 +16753,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         });
     }
     Some(match stmt {
-        IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
+        IrStmt::Expr(IrExpr::Call { func, args: _, .. }) if func == "break" => {
             // A bare `break` renders as an `sh2.break()` CALL (throws the
             // BREAK signal caught by the whileLoop/forLoop runtime) — a
             // native JS break is illegal inside the async loop-body
@@ -16786,7 +16786,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Break => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
         },
-        IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "continue" => {
+        IrStmt::Expr(IrExpr::Call { func, args: _, .. }) if func == "continue" => {
             Stmt::ExpressionStatement {
                 expression: Expr::CallExpression {
                     callee: Box::new(Expr::MemberExpression {
@@ -17260,7 +17260,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // see the `line` arm) assigned straight to the lifted
                     // binding — the runtime setVar would write the STORE
                     // and the native read would desync.
-                    IrExpr::Call { func, args } if func == "line" => {
+                    IrExpr::Call { func, args: _ } if func == "line" => {
                         expr_to_estree(expr)
                     }
                     // `n = n + 1` — lifted numeric self-add (ForEachLine

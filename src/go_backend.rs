@@ -2411,8 +2411,8 @@ impl Render {
                     Some("return".to_string())
                 }
             }
-            IrExpr::Call { func, args } if func == "break" => Some("break".to_string()),
-            IrExpr::Call { func, args } if func == "continue" => Some("continue".to_string()),
+            IrExpr::Call { func, args: _ } if func == "break" => Some("break".to_string()),
+            IrExpr::Call { func, args: _ } if func == "continue" => Some("continue".to_string()),
             IrExpr::Call { func, args } if func == "let" => {
                 let s = match args.first() {
                     Some(IrExpr::Str(s, _)) => s.clone(),
@@ -3430,7 +3430,7 @@ impl Render {
                 }
                 None
             }
-            IrExpr::Call { func, args } if func == "test" => {
+            IrExpr::Call { func, args: _ } if func == "test" => {
                 let c = self.expr_bool(e);
                 // bash status: 0 when the test is TRUE
                 Some((Vec::new(), format!("b2i(!({c}))")))
@@ -3592,7 +3592,7 @@ impl Render {
                 }
                 self.mark_todo("setVar");
             }
-            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+            IrExpr::Call { func, args: _ } if func == "fnCall" || func == "fnValue" => {
                 // user-function call in statement position
                 let v = self.expr_any(e);
                 self.flush_sides();
@@ -3629,7 +3629,7 @@ impl Render {
                 self.emit(&format!("st = {v};"));
                 self.need_st = true;
             }
-            IrExpr::Call { func, args } if func == "test" => {
+            IrExpr::Call { func, args: _ } if func == "test" => {
                 let c = self.expr_bool(e);
                 self.flush_sides();
                 // bash status: 0 when the test is TRUE

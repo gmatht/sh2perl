@@ -5330,7 +5330,7 @@ pub(crate) fn return_in_loop(mut prog: Program) -> Program {
     fn rewrite_expr(e: &mut Expr, in_loop: bool) {
         let is_loop = is_loop_call(e);
         match e {
-            Expr::CallExpression { callee, arguments, .. } if is_loop && arguments.len() > 1 => {
+            Expr::CallExpression {  arguments, .. } if is_loop && arguments.len() > 1 => {
                 for (i, a) in arguments.iter_mut().enumerate() {
                     rewrite_expr(a, i == 1);
                 }

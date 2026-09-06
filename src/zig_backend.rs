@@ -363,7 +363,7 @@ impl Render {
                 }
             }
             IrExpr::Arith(a) => self.arith(a),
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq
@@ -380,7 +380,7 @@ impl Render {
                 // bool → i64 (bash's 1/0)
                 format!("@intFromBool({})", self.expr_bool(e))
             }
-            IrExpr::BinOp { lhs, op, rhs } if *op == BinOpKind::Concat => {
+            IrExpr::BinOp { lhs: _, op, rhs: _ } if *op == BinOpKind::Concat => {
                 self.need_toint = true;
                 format!("sh2ToInt({})", self.expr_str(e))
             }
@@ -468,7 +468,7 @@ impl Render {
                     "\"false\"".into()
                 }
             }
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq

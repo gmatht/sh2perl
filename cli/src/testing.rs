@@ -354,7 +354,7 @@ pub fn find_uses_of_system() {
                         let mut parser = Parser::new(&content);
                         match parser.parse() {
                             Ok(commands) => {
-                                let mut generator = Generator::new();
+                                let generator = Generator::new();
                                 let perl_code = generator.generate(&commands);
 
                                 // Find lines containing "system"

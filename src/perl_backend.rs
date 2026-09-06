@@ -736,7 +736,7 @@ impl Render {
     /// exit status 0.
     fn boolify(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Call { func, args } if func == "exec" || func == "let" => {
+            IrExpr::Call { func, args: _ } if func == "exec" || func == "let" => {
                 format!("(({}) == 0)", self.expr(e))
             }
             IrExpr::Call { func, args } if func == "contains" => {

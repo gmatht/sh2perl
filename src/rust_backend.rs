@@ -682,7 +682,7 @@ impl Render {
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
             }
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq
@@ -813,7 +813,7 @@ impl Render {
                     "\"string\"".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "arrayLen" => {
+            IrExpr::Call { func, args: _ } if func == "arrayLen" => {
                 format!("({}).to_string()", self.expr_num(e))
             }
             IrExpr::Call { func, args } if func == "join" => self.join_str(args),
@@ -978,7 +978,7 @@ impl Render {
                     "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "break" => {
+            IrExpr::Call { func, args: _ } if func == "break" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
                         format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); break; false }}")
@@ -989,7 +989,7 @@ impl Render {
                     "false".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "continue" => {
+            IrExpr::Call { func, args: _ } if func == "continue" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
                         format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); continue; false }}")
@@ -4764,21 +4764,21 @@ impl Render {
                         }
                     }
                 }
-                IrExpr::Call { func, args } if func == "break" => {
+                IrExpr::Call { func, args: _ } if func == "break" => {
                     if self.loop_depth > 0 {
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         self.loop_capture_rc();
                         self.emit("break;");
                     }
                 }
-                IrExpr::Call { func, args } if func == "continue" => {
+                IrExpr::Call { func, args: _ } if func == "continue" => {
                     if self.loop_depth > 0 {
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         self.loop_capture_rc();
                         self.emit("continue;");
                     }
                 }
-                IrExpr::Call { func, args } if func == "return" => {
+                IrExpr::Call { func, args: _ } if func == "return" => {
                     self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
                 }
                 _ => {
@@ -9015,7 +9015,7 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
 fn arith_has_side_effects(e: &IrExpr) -> bool {
     match e {
         IrExpr::Arith(a) => arith_side_effects(a),
-        IrExpr::Call { func, args } if func == "assign" => true,
+        IrExpr::Call { func, args: _ } if func == "assign" => true,
         IrExpr::Call { func, args } if func == "arith" => args.iter().any(|a| {
             matches!(a, IrExpr::Str(s, _) if s.contains('=') || s.contains("++") || s.contains("--"))
         }),
