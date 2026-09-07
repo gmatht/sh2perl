@@ -2127,6 +2127,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             asm,
             ..
         } => {
+            if std::env::var("SH2_PROBE").is_ok() && format!("{targets:?}").contains("sed_result") {
+                eprintln!("PROBE Assign(sed_result) expr = {expr:?}");
+            }
             let rhs = ir_expr_to_perl(expr);
             // Declarator-position asm label (`int x asm("myx") = 7;` —
             // core request c-sh-go-toplevelasmargument-20260814-042952):
@@ -5855,6 +5858,28 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // not shell — refuse loudly rather than emit the
                     // broken `sub {}` text into bash -c.
                     return "die \"otranspilerl: shIR capture not expressible as shell (Perl backend)\\n\"".to_string();
+                }
+            }
+            // A NATIVE capture whose Arrow body the native-pipeline fold
+            // left as RawText perl (the fold flips `native` and inlines
+            // the pipeline's perl text — which PRINTS to explicit
+            // STDOUT). A bare Arrow render would stringify a code ref
+            // (`$sed_result` printed `CODE(0x…)`); the text must be
+            // CAPTURED instead — the fd-redirect shape (open STDOUT onto
+            // the capture buffer, run, restore; `print STDOUT` follows
+            // the redirected handle).
+            if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                if stmts.iter().any(|s| matches!(s, IrStmt::RawText(_))) {
+                    let mut body = String::new();
+                    for st in stmts.iter() {
+                        emit_stmt(&mut body, st, 1);
+                    }
+                    // perl quirk: an in-memory open(STDOUT, '>', \$ref)
+                    // needs fd 1 CLOSED first (EBADF otherwise — verified
+                    // on perl 5.38; the dup2 target must be free).
+                    return format!(
+                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap }}"
+                    );
                 }
             }
             let mut inner = ir_expr_to_perl(expr);
