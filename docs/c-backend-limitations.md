@@ -1,9 +1,39 @@
 # C backend — known runtime limitations
 
-Status: corpus gate **580/643 pass** (baseline at session start: 538/643;
-0 compile errors; 0 `TODO(unsupported)` / `sh2.*` stub markers hit on the
-corpus). Gate: `harness/c_gate_main.sh` (same oracle as
+Status: corpus gate **578/644 pass, 59 fail, 7 skip** (bash-stdout diff
+oracle, `harness/c_gate_main.sh`; the rotating single-member flake under
+12-way parallel load passes 3/3 in isolation). Baseline at session start:
+577/644. 0 compile errors; 0 `TODO(unsupported)` / `sh2.*` stub markers
+hit on the corpus. Gate: `harness/c_gate_main.sh` (same oracle as
 `harness/c_gate_repro.sh`, rendering through main's renderer).
+
+## 0. Shell-out inventory (the shrinking `bash -c` list)
+
+The C renderer's transport was historically "build a command string, run
+it via `bash -c`". The following constructs now lower NATIVELY (no child
+bash, no command text, no quoting helpers):
+
+- **`$(fn args)` of a program-defined shell function** — the fnValue
+  in-process dispatch (`_sh_capture_fn`: dup2 stdout to a pipe, call the
+  translated C function, read back). The bash transport could never run
+  a shell-defined function (the child never sees it — empty captures),
+  so this is a correctness fix, not only a speedup.
+- **`echo` statements** (incl. interpolated captures) — native
+  `printf`/`fputs`; capture args hoist into ordered temps (printf arg
+  evaluation order is unspecified in C; bash is left-to-right).
+- **zsh-mathfunc arith texts** (`int(sqrt($1)) + 1`) — native libm
+  (real bash cannot RUN these at all: a mathfunc call is a bash arith
+  syntax error, so the old capture fallback was guaranteed empty).
+- **Pipelines** (`a | b | c`) — `_sh_pipeline` fork/exec engine: argv
+  stages exec() directly, echo/printf stages fork a child running the
+  transpiled builtin. Refuses (keeps bash text): non-plain stages,
+  shell-only builtins, glob words, `$PIPESTATUS` readers.
+
+Remaining `bash -c` sites (statement exec of external commands, capture
+of external pipelines, tests with dynamic text, eval/source) are the
+documented fork/exec last resort — each refusable shape above shrank the
+list; the helpers themselves are pruned per-program by the dead-code
+trimmer (`trim_sh_runtime` reachability).
 
 Every class below is a DOCUMENTED known limitation with its root cause —
 none is a hidden regression. Each lists the corpus cases that pin it.
