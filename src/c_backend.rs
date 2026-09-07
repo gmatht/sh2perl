@@ -4361,7 +4361,6 @@ impl Render {
                     cargs.push(self.param_call(args));
                 }
                 HdSeg::Arith(a) => {
-                    if std::env::var("SH2_DBG_POS2").is_ok() { eprintln!("DBG HdSeg::Arith"); }
                     fmt.push_str("%lld");
                     // the arith() expression may be plain-int C — the
                     // varargs promotion needs an explicit long long
@@ -8676,7 +8675,7 @@ impl Render {
                         }
                         if name == "#" {
                             // $#: (argc - 1) / (_sh_argc - 1) — int
-                            if std::env::var("SH2_DBG_POS2").is_ok() { eprintln!("DBG parts_of getVar#"); } return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%d", false))];
+                            return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%d", false))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -11224,9 +11223,6 @@ struct LiftScan {
 fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
     match e {
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
-            if std::env::var("SH2_DBG_POS2").is_ok() && (name.contains("@") || name == "#" || (!name.is_empty() && name.chars().next().map_or(false, |c| c.is_ascii_digit()))) {
-                eprintln!("DBG pos_var name={} spawn={} fname={}", name, spawn, fname);
-            }
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
                 let n: usize = name.parse().unwrap_or(0);
                 if n > st.max_pos {
@@ -11497,9 +11493,6 @@ fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
     let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
     // a bare call ANYWHERE (any fn's body, any bare context) disqualifies
     let (bare, bad) = scan_bare_calls(stmts, &defmap);
-    if std::env::var("SH2_DBG_POS2").is_ok() {
-        eprintln!("DBG lift bare={:?} defnames={:?} bad={}", bare, defmap.keys().collect::<Vec<_>>(), bad);
-    }
     if bad {
         return BTreeMap::new();
     }
@@ -11744,9 +11737,6 @@ struct PosShape {
 }
 
 fn pos_scan_name(name: &str, spawn: bool, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
-    if std::env::var("SH2_DBG_POS2").is_ok() {
-        eprintln!("DBG pos_name name={} spawn={} fname={}", name, spawn, fname);
-    }
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
         if spawn {
             st.spawn_pos = true;
@@ -12035,9 +12025,6 @@ fn scan_pos_const(stmts: &[IrStmt], lifted: &BTreeMap<String, usize>, argc_argv_
     if argc_argv_shadowed {
         return false;
     }
-    if std::env::var("SH2_DBG_POS").is_ok() {
-        eprintln!("DBG pos scan start lifted_len={}", lifted.len());
-    }
     let mut names = BTreeSet::new();
     let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
     collect_fn_defs(stmts, &mut names, &mut defs);
@@ -12046,10 +12033,6 @@ fn scan_pos_const(stmts: &[IrStmt], lifted: &BTreeMap<String, usize>, argc_argv_
     pos_scan_stmts(stmts, false, "", &defmap, &mut st);
     // digits/hash only record which main() parameters to take — the
     // refusals are the rest
-    if std::env::var("SH2_DBG_POS").is_ok() {
-        eprintln!("DBG pos shape at={} spawn_pos={} shift={} nonlifted={} digits={} hash={}",
-            st.at, st.spawn_pos, st.shift, st.nonlifted_reads, st.digits, st.hash);
-    }
     !st.at && !st.spawn_pos && !st.shift && !st.nonlifted_reads
 }
 
