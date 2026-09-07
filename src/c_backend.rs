@@ -326,6 +326,18 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
+    // Arena-scope safety: if ALL capture-assigned vars are non-escaping,
+    // captures can share an arena freed at scope exit
+    {
+        let mut all_non_esc = true;
+        for (vn, vl) in &prog.var_lifetimes {
+            if capture_vars.contains(vn) && vl.escapes {
+                all_non_esc = false;
+                break;
+            }
+        }
+        r.arena_safe = all_non_esc && !capture_vars.is_empty();
+    }
     r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
@@ -709,6 +721,15 @@ impl Render {
             self.emit("  for (size_t i = 0; i < n; i++)");
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
             self.emit("  return \"\";");
+            self.emit("}");
+            self.emit("static void _sh_join_arr_nl(char *d, size_t cap, char **a, size_t n) {");
+            self.emit("  size_t dn = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = '\\n';");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    for (const char *s = a[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
             self.emit("}");
             self.emit("static void _sh_join_arr(char *d, size_t cap, char **a, size_t n) {");
             self.emit("  size_t dn = 0;");
@@ -7185,7 +7206,10 @@ impl Render {
         let id = self.c_ident(var);
         let t = self.str_temp(65536);
         if self.assoc_arrays.contains(var) {
-            self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}_v, {id}_n);"));
+            // assoc array VALUES: join with NEWLINES so downstream sort
+            // pipelines can sort individual values (space-joined text
+            // is one line and passes through sort unchanged)
+            self.emit(&format!("_sh_join_arr_nl({t}, sizeof {t}, {id}_v, {id}_n);"));
         } else {
             self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}, {id}_len);"));
         }
@@ -9294,6 +9318,7 @@ impl Render {
                 self.emit("{");
                 self.depth += 1;
                 let mut saves: Vec<String> = Vec::new();
+        let mut restores: Vec<String> = Vec::new();
                 for v in &assigned {
                     let id = self.c_ident(v);
                     if self.is_num(v) {
@@ -9304,7 +9329,10 @@ impl Render {
                         saves.push(format!("char _sv_{id}[{}];", b + 1));
                         saves.push(format!("strcpy(_sv_{id}, {id});"));
                     } else {
-                        saves.push(format!("char* _sv_{id} = {id};"));
+                        // deep copy for unbounded char* — an alias would
+                        // let body mutations leak through the restore
+                        saves.push(format!("char* _sv_{id} = {id} ? strdup({id}) : NULL;"));
+                        restores.push(format!("free({id}); {id} = _sv_{id};"));
                     }
                 }
                 for s in &saves {
@@ -13428,3 +13456,8 @@ fn c_eq(chars: &[char], i: usize) -> bool {
 
 fn s3_push(s: &mut String, line: &str) { s.push_str(line); s.push(10 as char); }
 
+#[cfg(test)]
+fn probe_parse_arith() {
+    let r = crate::shir::parse_arith("j+(100/__SHCNT_arr)");
+    println!("parse_arith j+(100/__SHCNT_arr): {:?}", r.map(|a| format!("{a:?}")));
+}

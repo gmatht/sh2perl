@@ -43,6 +43,7 @@ pub struct Render {
     out: Vec<String>,
     depth: usize,
     /// var name -> type verdict (A2); missing = Any (runtime store)
+    var_storage: std::collections::HashMap<String, crate::ir::StorageClass>,
     var_types: HashMap<String, IrType>,
     /// vars used as arrays (declare as []any)
     arrays: BTreeSet<String>,

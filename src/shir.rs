@@ -12051,13 +12051,20 @@ fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
     // values — the `let`/assignment emission (decl_source_to_estree) is
     // the same value expression the builtin arg evaluated.
     let pairs = declare_sources_dyn(args)?;
-    if !pairs.iter().all(|(n, _)| is_local_lifted(n)) {
+    // Split: names that are local-lifted get native bindings; the rest
+    // stay on the runtime local builtin. A multi-var decl with a mix
+    // must NOT fall through entirely — the lifted names' bindings would
+    // be stale (the runtime local call writes only the store).
+    let (lifted_pairs, store_pairs): (Vec<(String, IrExpr)>, Vec<(String, IrExpr)>) = pairs
+        .into_iter()
+        .partition(|(n, _)| is_local_lifted(n));
+    if lifted_pairs.is_empty() {
         return None;
     }
     // Compute the value expressions BEFORE the FUNCTION_STACK lock:
     // decl_source_to_estree consults the lift sets / expr_to_estree,
     // which lock the same mutexes (non-reentrant — a deadlock).
-    let values: Vec<(String, Expr)> = pairs
+    let values: Vec<(String, Expr)> = lifted_pairs
         .iter()
         .map(|(n, src)| (n.clone(), decl_source_to_estree(n, src)))
         .collect();
@@ -12107,6 +12114,19 @@ fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
             bool_lit(true),
         ]),
     });
+    // The non-lifted names of a mixed decl stay on the runtime local
+    // builtin (their store writes are the exact model the runtime
+    // provides; the lifted names' native bindings above are untouched).
+    if !store_pairs.is_empty() {
+        let mut cargs: Vec<Expr> = Vec::new();
+        for (n, src) in &store_pairs {
+            cargs.push(str_lit(&format!("{}={}", n, "")));
+            cargs.push(expr_to_estree(src));
+        }
+        out.push(Stmt::ExpressionStatement {
+            expression: sh2_call("builtin", vec![str_lit("local"), array(cargs)]),
+        });
+    }
     Some(out)
 }
 
@@ -16749,6 +16769,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         left: Box::new(expr_to_estree(lhs)),
                         right: Box::new(expr_to_estree(rhs)),
                     },
+                    // `s = ${s%/}` — a param source on a lifted var: the
+                    // runtime reads the value from the STORE by string
+                    // name, but the lifted binding is not there. Delegate
+                    // to the general param emission, which injects the
+                    // native value as the trailing override arg (the
+                    // same path as expression-position param on lifted
+                    // vars — the local-lift walker already skips the
+                    // store mark for param name args on this assumption)
+                    // and returns the computed string into the binding.
+                    IrExpr::Call { func, .. } if func == "param" => expr_to_estree(expr),
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
@@ -19595,6 +19625,52 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
                     no_newline = true;
                 }
             }
+            // UNQUOTED $var wrapped by the core parser's field-split
+            // marker: split(getVar(x)) — bash word-splits on IFS and DROPS
+            // empty fields — `echo got $v` with v="" prints "got".
+            IrExpr::Call { func, args } if func == "split" => {
+                if let [inner] = args.as_slice() {
+                    if matches!(inner, IrExpr::Call { func: f, .. } if f == "getVar") {
+                        // PROVABLY-NUMERIC vars: the field-split of a number
+                        // is a no-op (no whitespace in an integer) — skip
+                        // the array/join machinery entirely.
+                        let rendered = expr_to_estree(inner);
+                        if let Expr::Identifier { .. } = &rendered {
+                            flat = true;
+                            flag_done = true;
+                            arg_exprs.push(rendered);
+                            continue;
+                        }
+                        flat = true;
+                        flag_done = true;
+                        let scalar = echo_arg_scalar(a);
+                        let sep_re = regex_lit_flags("[ \\t\\n]+", "");
+                        let w_id = "w".to_string();
+                        let split_call = crate::estree::method_call(
+                            scalar,
+                            "split",
+                            vec![sep_re],
+                        );
+                        let filtered = crate::estree::method_call(
+                            split_call,
+                            "filter",
+                            vec![Expr::ArrowFunctionExpression {
+                                params: vec![crate::estree::ident(&w_id)],
+                                body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                                    operator: "!==".to_string(),
+                                    left: Box::new(Expr::Identifier { name: w_id }),
+                                    right: Box::new(str_lit("")),
+                                })),
+                                expression: true,
+                                r#async: false,
+                            }],
+                        );
+                        arg_exprs.push(filtered);
+                        continue;
+                    }
+                }
+            }
+
             other => {
                 flag_done = true;
                 if exec_arg_is_array_valued(other) {
@@ -27906,6 +27982,71 @@ fn max_last_index_of(val: &Expr, chars: &[String], method: &dyn Fn(Expr, &str, V
     ix
 }
 
+/// Interpolate `$ref`s in a param pattern into a JS expression — the
+/// pattern VALUE with refs expanded. Lifted refs → native identifiers;
+/// store-bound refs → store reads (the runtime's stripGlob*/substGlob
+/// NEVER expand patterns, so the emitter must). Returns None when the
+/// pattern has no refs (callers keep the raw-literal path) or contains
+/// a shape we cannot interpolate (nested `${...}` / `$((...))`).
+fn interp_pattern_expr(p: &str) -> Option<Expr> {
+    let bytes = p.as_bytes();
+    let mut parts: Vec<(bool, String)> = Vec::new(); // (is_ref, text)
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        if bytes[i] == b'$' && i + 1 < n {
+            if bytes[i + 1] == b'{' {
+                if let Some(close) = p[i + 2..].find('}') {
+                    let inner = &p[i + 2..i + 2 + close];
+                    if is_plain_ident(inner) {
+                        parts.push((true, inner.to_string()));
+                        i = i + 2 + close + 1;
+                        continue;
+                    }
+                }
+            } else if bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' {
+                let mut j = i + 1;
+                while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let name = &p[i + 1..j];
+                if is_plain_ident(name) {
+                    parts.push((true, name.to_string()));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = p[i..].chars().next().unwrap();
+        parts.push((false, ch.to_string()));
+        i += ch.len_utf8();
+    }
+    if !parts.iter().any(|(r, _)| *r) {
+        return None;
+    }
+    let mut out: Option<Expr> = None;
+    for (is_ref, text) in parts {
+        let e: Expr = if is_ref {
+            if is_lifted(&text) {
+                Expr::Identifier { name: text.clone() }
+            } else {
+                store_var_read(&text)
+            }
+        } else {
+            str_lit(&text)
+        };
+        out = Some(match out {
+            None => e,
+            Some(prev) => Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(prev),
+                right: Box::new(e),
+            },
+        });
+    }
+    out
+}
+
 fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
@@ -28081,6 +28222,117 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             let [_, _, IrExpr::Str(p, _), ..] = args else {
                 return None;
             };
+            // A pattern with `$ref`s (`${s%%"$sep"*}`): the runtime's
+            // stripGlob* never expands patterns, so the emitter must
+            // interpolate the refs (lifted → binding, store-bound →
+            // store read) and lower natively over the interpolated
+            // value. bash's quoted `"$sep"` is LITERAL text in the
+            // pattern — the interpolated value is the literal core (a
+            // value with glob metachars stays literal, exactly like the
+            // quoted ref). Shape matrix (P = the interpolated core):
+            //   P   (no star): #/## startsWith→slice(len); %/%%
+            //        endsWith→slice(0,-len)
+            //   *P  (star first): # indexOf→slice(ix+len); ##
+            //        lastIndexOf→slice(ix+len); % endsWith→slice(0,-len);
+            //        %% endsWith→"" (longest suffix = whole string)
+            //   P*  (star last): # startsWith→slice(len); ##
+            //        startsWith→""; % lastIndexOf→slice(0,ix); %%
+            //        indexOf→slice(0,ix)
+            // The store-var single-eval wrap (the `_g` protocol) applies
+            // to every shape below — the early returns must route through
+            // `finish` (the final match at the bottom would be bypassed).
+            let finish = |e: Expr| -> Option<Expr> {
+                match wrap.clone() {
+                    Some(store) => Some(seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("_g")),
+                            right: Box::new(store),
+                        },
+                        e,
+                    ])),
+                    None => Some(e),
+                }
+            };
+            let core = if let Some(c) = p.strip_prefix('*') {
+                (c, true)
+            } else if let Some(c) = p.strip_suffix('*') {
+                (c, false)
+            } else {
+                (p.as_str(), false)
+            };
+            let (core_raw, star_first) = core;
+            let core_unquoted = core_raw.trim_matches('"');
+            if core_unquoted.contains('$') {
+                if let Some(core_expr) = interp_pattern_expr(core_unquoted) {
+                    let has_star = core_raw.len() != p.len();
+                    let core_str = || Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![core_expr.clone()],
+                        optional: false,
+                    };
+                    let clen = || member(core_str(), "length");
+                    let starts = || method(val(), "startsWith", vec![core_str()]);
+                    let ends = || method(val(), "endsWith", vec![core_str()]);
+                    if !has_star {
+                        // literal fast path — shortest == longest
+                        if op.starts_with('#') {
+                            return finish(cond(starts(), method(val(), "slice", vec![clen()]), val()));
+                        }
+                        return finish(cond(
+                            ends(),
+                            method(val(), "slice", vec![int_lit(0), bin(int_lit(0), "-", clen())]),
+                            val(),
+                        ));
+                    }
+                    if op.starts_with('#') {
+                        if star_first {
+                            // *P: strip through the occurrence
+                            let first = op == "#";
+                            let ix = if first {
+                                method(val(), "indexOf", vec![core_str()])
+                            } else {
+                                method(val(), "lastIndexOf", vec![core_str()])
+                            };
+                            return finish(cond(
+                                bin(ix.clone(), ">=", int_lit(0)),
+                                method(val(), "slice", vec![bin(ix.clone(), "+", clen())]),
+                                val(),
+                            ));
+                        }
+                        // P*: # strips the core, ## strips everything
+                        if op == "#" {
+                            return finish(cond(starts(), method(val(), "slice", vec![clen()]), val()));
+                        }
+                        return finish(cond(starts(), str_lit(""), val()));
+                    }
+                    if !star_first {
+                        // P*: strip up to the occurrence
+                        let first = op == "%%";
+                        let ix = if first {
+                            method(val(), "indexOf", vec![core_str()])
+                        } else {
+                            method(val(), "lastIndexOf", vec![core_str()])
+                        };
+                        return finish(cond(
+                            bin(ix.clone(), ">=", int_lit(0)),
+                            method(val(), "slice", vec![int_lit(0), ix.clone()]),
+                            val(),
+                        ));
+                    }
+                    // *P: % strips the core, %% strips everything
+                    if op == "%" {
+                        return finish(cond(
+                            ends(),
+                            method(val(), "slice", vec![int_lit(0), bin(int_lit(0), "-", clen())]),
+                            val(),
+                        ));
+                    }
+                    return finish(cond(ends(), str_lit(""), val()));
+                }
+            }
             // LITERAL pattern — shortest == longest for literal patterns,
             // exactly like the runtime's literal fast paths.
             if literal_pattern(p) {
@@ -29904,6 +30156,58 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                 }
                 lift.insert(c.clone());
             }
+            // 5. all-or-nothing per multi-var decl: a `local a=.. b=..`
+            //    whose names are NOT all liftable must lift NONE of them
+            //    — the decl emission (try_native_local_decl_stmt) is
+            //    all-or-nothing, and a partial lift would leave the
+            //    lifted names' bindings stale (the runtime local call
+            //    writes only the store) while `is_lifted` still says
+            //    lifted (the identifier emission would ReferenceError).
+            for b in &body_all {
+                let names: Vec<String> = match b {
+                    IrStmt::Declare {
+                        vars,
+                        local: true,
+                        ..
+                    } if vars.len() > 1 => vars.iter().map(|v| v.name.clone()).collect(),
+                    IrStmt::Exec { cmd, args, .. } => {
+                        if let IrExpr::Str(cname, _) = cmd {
+                            if matches!(
+                                cname.as_str(),
+                                "local" | "declare" | "typeset" | "readonly"
+                            ) {
+                                decl_names(args)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    IrStmt::Expr(IrExpr::Call { func, args })
+                        if func == "exec" || func == "builtin" =>
+                    {
+                        if let Some(IrExpr::Str(cname, _)) = args.first() {
+                            if matches!(
+                                cname.as_str(),
+                                "local" | "declare" | "typeset" | "readonly"
+                            ) {
+                                decl_names(args)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                if names.len() > 1 && names.iter().any(|n| !lift.contains(n)) {
+                    for n in &names {
+                        lift.remove(n);
+                    }
+                }
+            }
             let lift_done = !lift.is_empty();
             if lift_done {
                 out.insert(name.clone(), lift.clone());
@@ -29913,6 +30217,205 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
     out
 }
 
+/// The names declared by a `local`/`declare`/`typeset`/`readonly` call's
+/// args (the `name=value` pairs).
+fn decl_names(args: &[IrExpr]) -> Vec<String> {
+    declare_sources_dyn(args)
+        .map(|pairs| pairs.into_iter().map(|(n, _)| n).collect())
+        .unwrap_or_default()
+}
+
+/// Collect every name declared with `local`/`declare`/`typeset`/
+/// `readonly` inside a function body (any nesting depth) — the
+/// function-scoped names the module-level string lift must not hoist.
+fn collect_function_locals(st: &IrStmt, out: &mut HashSet<String>) {
+    match st {
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            for b in body
+                .iter()
+                .chain(named_blocks.iter().flat_map(|(_, nb)| nb.iter()))
+            {
+                collect_local_decls(b, out);
+            }
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => {
+            for b in body {
+                collect_function_locals(b, out);
+            }
+        }
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            for b in then.iter().chain(else_) {
+                collect_function_locals(b, out);
+            }
+            for (_, b) in elsifs {
+                for s in b {
+                    collect_function_locals(s, out);
+                }
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                for b in stage {
+                    collect_function_locals(b, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for b in inner {
+                collect_function_locals(b, out);
+            }
+        }
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                for b in &c.body {
+                    collect_function_locals(b, out);
+                }
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for b in body {
+                collect_function_locals(b, out);
+            }
+            for e in excepts {
+                for b in &e.body {
+                    collect_function_locals(b, out);
+                }
+            }
+            for b in else_body {
+                collect_function_locals(b, out);
+            }
+            for b in finally_body {
+                collect_function_locals(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `local`/`declare`/`typeset`/`readonly` decl names inside one
+/// statement (recursing into nested statements).
+fn collect_local_decls(st: &IrStmt, out: &mut HashSet<String>) {
+    match st {
+        IrStmt::Declare {
+            vars,
+            local: true,
+            ..
+        } => {
+            for v in vars {
+                out.insert(v.name.clone());
+            }
+        }
+        IrStmt::Exec { cmd, args, .. } => {
+            if let IrExpr::Str(cname, _) = cmd {
+                if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                    if let Some(pairs) = declare_sources_dyn(args) {
+                        for (n, _) in pairs {
+                            out.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+            if let Some(IrExpr::Str(cname, _)) = args.first() {
+                if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                    if let Some(pairs) = declare_sources_dyn(args) {
+                        for (n, _) in pairs {
+                            out.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    match st {
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => {
+            for b in body {
+                collect_local_decls(b, out);
+            }
+        }
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            for b in then.iter().chain(else_) {
+                collect_local_decls(b, out);
+            }
+            for (_, b) in elsifs {
+                for s in b {
+                    collect_local_decls(s, out);
+                }
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                for b in stage {
+                    collect_local_decls(b, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for b in inner {
+                collect_local_decls(b, out);
+            }
+        }
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                for b in &c.body {
+                    collect_local_decls(b, out);
+                }
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for b in body {
+                collect_local_decls(b, out);
+            }
+            for e in excepts {
+                for b in &e.body {
+                    collect_local_decls(b, out);
+                }
+            }
+            for b in else_body {
+                collect_local_decls(b, out);
+            }
+            for b in finally_body {
+                collect_local_decls(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
@@ -29920,6 +30423,21 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
 
     for st in &prog.stmts {
         lift_walk_stmt(st, &mut excluded, &mut string_ctx, false);
+    }
+
+    // Function-local names: a `local`/`declare`/`typeset`/`readonly`
+    // decl inside a function body makes the name function-scoped. The
+    // module lift must NOT hoist it — the function-local emission
+    // decides (the local-lift creates the native binding, or the runtime
+    // local builtin keeps it store-bound); a module hoist would leave a
+    // stale program-level binding the function reads (the
+    // `local s="$1"` store write never touches it).
+    let mut function_locals: HashSet<String> = HashSet::new();
+    for st in &prog.stmts {
+        collect_function_locals(st, &mut function_locals);
+    }
+    for name in &function_locals {
+        excluded.insert(name.clone());
     }
 
     fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
@@ -34028,6 +34546,35 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
         // ONE line from stdin, newline stripped; EOF → "" (bash read
         // semantics for the single-variable subset). Awaited — stdin is
         // async in the JS runtime.
+        // wc -w as a first-class primitive: word count via whitespace
+        // split + empty drop + length — native JS, no runtime call
+        "WordCount" => {
+            let children_vec = n.children();
+            let text = children_vec.first()?;
+            Some(Expr::MemberExpression {
+                object: Box::new(crate::estree::method_call(
+                    crate::estree::method_call(
+                        expr_to_estree(text),
+                        "split",
+                        vec![regex_lit_flags("\\s+", "")],
+                    ),
+                    "filter",
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![crate::estree::ident("w")],
+                        body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                            operator: "!==".to_string(),
+                            left: Box::new(Expr::Identifier { name: "w".to_string() }),
+                            right: Box::new(str_lit("")),
+                        })),
+                        expression: true,
+                        r#async: false,
+                    }],
+                )),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false,
+                optional: false,
+            })
+        }
         "ReadLine" => {
             let call = crate::estree::sh2_call("readLine", vec![]);
             Some(Expr::AwaitExpression { argument: Box::new(call) })
@@ -36313,7 +36860,11 @@ mod const_analysis_tests {
 
     fn consts_of(src: &str) -> Vec<(String, crate::ir::VarKind)> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR: these tests pin the ANALYZER's verdict on the source
+        // script — worker-registered transforms (copy-propagation,
+        // dead-store-elim, …) legitimately rewrite shapes first and would
+        // change what the analyzer sees without changing bash behaviour.
+        let prog = ast_to_ir_raw(&cmds);
         analyze_var_const(&prog)
     }
 
@@ -36401,7 +36952,8 @@ mod range_analysis_tests {
 
     fn ranges_of(src: &str) -> HashMap<String, (i128, i128)> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR — see consts_of rationale
+        let prog = ast_to_ir_raw(&cmds);
         analyze_var_ranges(&prog)
     }
 
@@ -36793,7 +37345,10 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(big.contains("y"));
         // a string write mixed in rejects the escalation (the BigInt home
         // must never see a non-integer: BigInt("") throws)
-        let prog3 = ast_to_ir(
+        // RAW IR: dead-store-elim legitimately removes the overwritten
+        // `x=abc`, after which the escalation is correct — the rejection
+        // premise only exists on the UNTRANSFORMED program.
+        let prog3 = ast_to_ir_raw(
             &crate::Parser::new("x=abc\nx=9007199254740993\necho $((x+1))")
                 .parse()
                 .expect("parse"),
@@ -36902,7 +37457,8 @@ mod length_analysis_tests {
 
     fn lens_of(src: &str) -> std::collections::HashMap<String, Option<u64>> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
+        // RAW IR — see consts_of rationale (analyzer pins source shapes)
+        let prog = ast_to_ir_raw(&cmds);
         analyze_string_lengths(&prog).into_iter().collect()
     }
 

@@ -105,6 +105,7 @@ pub struct Render {
     depth: usize,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
+    var_storage: HashMap<String, crate::ir::StorageClass>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     /// vars written anywhere (declared at the top of main)
@@ -160,6 +161,7 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     }
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.var_storage = prog.var_storage.iter().cloned().collect();
     if std::env::var("ZIG_DBG").is_ok() {
         eprintln!("DBG var_types: {:?}", r.var_types);
     }

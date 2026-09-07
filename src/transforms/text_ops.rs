@@ -2115,6 +2115,37 @@ pub fn normalize_frontend_constructs(stmts: &mut Vec<IrStmt>) {
         }
         false
     }
+    fn wrap_unquoted_vars(s: &mut IrStmt) -> bool {
+        if std::env::var("SHIR_ECHO_DEBUG").is_ok() {
+            if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+                eprintln!("WUV stmt {} args {}", func, args.len());
+            }
+        }
+        // Frontend-emitted exec/builtin ARG ARRAYS carry unquoted $var
+        // expansions as BARE getVar elements. Bash word-splits those on
+        // IFS and drops empties — the same contract the CORE parser
+        // expresses with its split(getVar(…)) marker (which the renderers
+        // already handle as array-valued splices). Wrap to match.
+        let mut changed = false;
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if func == "exec" || func == "builtin" {
+                if let Some(IrExpr::Array(items)) = args.get_mut(1) {
+                    for it in items.iter_mut() {
+                        if let IrExpr::Call { func: f, .. } = it {
+                            if f == "getVar" {
+                                *it = IrExpr::Call {
+                                    func: "split".to_string(),
+                                    args: vec![it.clone()],
+                                };
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
     fn walk(s: &mut Vec<IrStmt>) {
         let mut i = 0;
         while i < s.len() {
@@ -2122,6 +2153,7 @@ pub fn normalize_frontend_constructs(stmts: &mut Vec<IrStmt>) {
                 i += 1;
                 continue;
             }
+            wrap_unquoted_vars(&mut s[i]);
             match &mut s[i] {
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
                     cond_let(cond);

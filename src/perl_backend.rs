@@ -1541,7 +1541,36 @@ impl Render {
             "set" => {
                 self.mark_todo("set options");
             }
-            "export" | "unset" | "source" | "." | "eval" | "trap" | "return" | "umask" | "type"
+            "unset" => {
+                // bash unset: remove from the variable store. In our flat
+                // model, assigning "" approximates unset (reads yield "")
+                for w in words.iter().skip(1) {
+                    if let IrExpr::Str(name, _) = w {
+                        let v = self.var_ref(name);
+                        self.emit(&format!("{} = '';", v));
+                    }
+                }
+            }
+            "export" => {
+                // export FOO=bar / export FOO: set + mark exported
+                for w in words.iter().skip(1) {
+                    if let IrExpr::Str(s, _) = w {
+                        if let Some((name, val)) = s.split_once('=') {
+                            let v = self.var_ref(name);
+                            self.emit(&format!("{} = {};", v, Self::perl_str(val)));
+                        }
+                        // bare export name → no-op (already in the store)
+                    }
+                }
+            }
+            "source" | "." => {
+                // source FILE: run the file's commands inline (via do block)
+                if let Some(IrExpr::Str(path, _)) = words.get(1) {
+                    self.emit(&format!("do '{{}}'; # source {path} — runtime gap"));
+                }
+                self.mark_todo(&format!("builtin {cmd}"));
+            }
+            "eval" | "trap" | "return" | "umask" | "type"
             | "hash" | "builtin" | "enable" | "help" | "logout" | "alias" | "unalias" | "times"
             | "ulimit" | "wait" | "getopts" | "shopt" => {
                 self.mark_todo(&format!("builtin {cmd}"));
