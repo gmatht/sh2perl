@@ -370,6 +370,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Only keep `#include`s whose symbols actually appear in the
     // emitted program (after the runtime trim removed helpers).
     r.trim_includes();
+    // main()'s prologue: drop the lines a native-only program doesn't
+    // need (a stderr /dev/null redirect that silences child processes
+    // that no longer exist; HOSTNAME/BASH_VERSION seeding no read sees).
+    r.trim_main_prologue();
     // A stripped runtime block can leave blank-line runs — keep at most
     // two (the C convention between declarations/functions).
     let mut blanks = 0usize;
@@ -848,6 +852,19 @@ impl Render {
             self.emit("  size_t n = (size_t)_n; buf[n] = 0;");
             self.emit("  close(pfd[0]);");
             self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
+            self.emit("  return buf;");
+            self.emit("}");
+            // in-process function CALL: argv swap (positional params),
+            // shared-buffer detach (the callee's own sites would
+            // _sh_reset() the caller's half-built command text) around
+            // the stdout capture. One statement per call site.
+            self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, char *buf, size_t cap) {");
+            self.emit("  char **sv = _sh_argv; int sc = _sh_argc;");
+            self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
+            self.emit("  _sh_argv = av; _sh_argc = n;");
+            self.emit("  _sh_capture_fn(fn, buf, cap);");
+            self.emit("  _sh_argv = sv; _sh_argc = sc;");
+            self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
             self.emit("  return buf;");
             self.emit("}");
             self.emit("/* string-var ++/-- — function-call boundaries are sequence");
@@ -1352,6 +1369,44 @@ impl Render {
         if !full.contains("WIFEXITED") && !full.contains("WEXITSTATUS") {
             self.out.retain(|l| !l.trim_start().starts_with("#include <sys/wait.h>"));
         }
+    }
+
+    /// main()'s prologue lines, kept only when the final program needs
+    /// them:
+    /// - `freopen(stderr, /dev/null)` + unbuffered stdout: only for REAL
+    ///   child shells (system/popen) — their stderr noise would land on
+    ///   the terminal (bash shows it too, but a transpiled program's own
+    ///   stderr writes must not interleave with unflushed buffered
+    ///   stdout ordering), and unflushed buffered stdout would reorder
+    ///   against the children's fd-1 writes. The NATIVE pipeline's
+    ///   forks all fflush before forking, so they are safe buffered.
+    /// - HOSTNAME / BASH_VERSION seeding: only when the program READS
+    ///   them (getenv sites in the body — bash seeds both itself; the
+    ///   C program must too, but only for a reader).
+    fn trim_main_prologue(&mut self) {
+        let body: String = self
+            .out
+            .iter()
+            .filter(|l| !is_prologue_line(l))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spawns = body.contains("system(") || body.contains("popen(");
+        let reads_bv = body.contains("getenv(\"BASH_VERSION\")");
+        let reads_hn = body.contains("getenv(\"HOSTNAME\")");
+        self.out.retain(|line| {
+            let t = line.trim_start();
+            if t.starts_with("freopen(\"/dev/null\"") || t.starts_with("setvbuf(stdout") {
+                return spawns;
+            }
+            if t.contains("setenv(\"BASH_VERSION\"") {
+                return reads_bv;
+            }
+            if t.contains("setenv(\"HOSTNAME\"") && t.contains("gethostname") {
+                return reads_hn;
+            }
+            true
+        });
     }
 
     /// If nothing in the final program READS `_sh_rc` (no `$?`, no
@@ -4463,7 +4518,10 @@ impl Render {
                             // (the %s null-guard would otherwise EVALUATE
                             // the pipeline twice — C has no idea it is
                             // not a pure read)
-                            if v.contains("_cap_") || v.contains("_sh_pipeline(") {
+                            if v.contains("_cap_")
+                                || v.contains("_sh_pipeline(")
+                                || v.contains("_sh_call_fn(")
+                            {
                                 let t = format!("_eh{}", self.temp_seq);
                                 self.temp_seq += 1;
                                 self.emit(&format!("char *{t} = {v};"));
@@ -7709,36 +7767,6 @@ impl Render {
                 }
                 self.need_sh = true;
                 let n = call_args.len() + 1;
-                let av = format!("_sh_av{}", self.temp_seq);
-                self.temp_seq += 1;
-                let sv = format!("_sh_sv{}", self.temp_seq);
-                self.temp_seq += 1;
-                let buf = format!("_sh_fnbuf{}", self.temp_seq);
-                self.temp_seq += 1;
-                let scmd = format!("_sh_scmd{}", self.temp_seq);
-                self.temp_seq += 1;
-                self.emit(&format!("char *{av}[{}];", n.max(2)));
-                self.emit(&format!("{av}[0] = {};", Self::cstr(&fname)));
-                for (i, w) in call_args.iter().enumerate() {
-                    let v = self.value_c(w);
-                    self.emit(&format!("{av}[{}] = {v};", i + 1));
-                }
-                let sc = format!("_sh_sc{}", self.temp_seq);
-                self.emit(&format!("char **{sv} = _sh_argv; int {sc} = _sh_argc;"));
-                self.temp_seq += 1;
-                // DETACH the shared command buffer around the call: the
-                // callee runs its own shell-out sites, which _sh_reset()
-                // the SHARED buffer — if the call happens mid-build (a
-                // `echo "[$(f 12)]"` site assembles ` 'echo' '['` and then
-                // evaluates the capture), the callee would clobber the
-                // half-built command text. Detach → the callee builds on
-                // a fresh buffer; restore the caller's text after.
-                self.emit(&format!(
-                    "char *{scmd} = _sh_cmd; size_t _sh_sccap{} = _sh_cap; _sh_cmd = 0; _sh_cap = 0;",
-                    self.temp_seq
-                ));
-                let sccap = format!("_sh_sccap{}", self.temp_seq);
-                self.temp_seq += 1;
                 // the callee reuses the same file-scope globals — a
                 // cross-function call clobbers the caller's shared vars.
                 // Save/restore the program-wide file-scope vars hoisted so
@@ -7791,12 +7819,23 @@ impl Render {
                         self.emit(&format!("char *{sv_tag}_{id} = {id};"));
                     }
                 }
-                self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
-                self.emit(&format!("static char {buf}[65536];"));
+                // arg values FIRST: their value_c temps must precede the
+                // compound-literal statement below
+                let mut lit_parts = vec![Self::cstr(&fname)];
+                for w in &call_args {
+                    lit_parts.push(self.value_c(w));
+                }
+                lit_parts.push("0".into());
+                let cn = format!("_cn{}", self.temp_seq);
+                self.temp_seq += 1;
                 self.emit(&format!(
-                    "_sh_capture_fn({}, {buf}, sizeof {buf});",
-                    self.c_ident(&fname)
+                    "char *{cn} = _sh_call_fn({}, (char *[]){{{}}}, {}, (char[65536]){{0}}, 65536);",
+                    self.c_ident(&fname),
+                    lit_parts.join(", "),
+                    n
                 ));
+                // var restores AFTER the call (the caller's enclosing
+                // statement — emitted next — reads only {cn}, never these)
                 for v in &self_rec_vars {
                     let id = self.c_ident(v);
                     if let Some(_b) = self.buf_bound(v) {
@@ -7805,10 +7844,7 @@ impl Render {
                         self.emit(&format!("{id} = {sv_tag}_{id};"));
                     }
                 }
-                self.emit(&format!("_sh_argv = {sv}; _sh_argc = {sc};"));
-                // reattach the caller's shared buffer (see the detach above)
-                self.emit(&format!("_sh_cmd = {scmd}; _sh_cap = {sccap};"));
-                buf
+                cn
             }
             "grepMatches" => {
                 // `grepMatches(text, pattern, flags)` — the `grep -o`
@@ -11029,6 +11065,15 @@ fn strip_rc_line(line: &str) -> Option<String> {
         i += 1;
     }
     Some(out)
+}
+
+/// main() prologue line? (see trim_main_prologue)
+fn is_prologue_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("freopen(\"/dev/null\"")
+        || t.starts_with("setvbuf(stdout")
+        || t.contains("setenv(\"BASH_VERSION\"")
+        || (t.contains("setenv(\"HOSTNAME\"") && t.contains("gethostname"))
 }
 
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
