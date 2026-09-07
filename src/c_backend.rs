@@ -272,8 +272,11 @@ pub struct Render {
     cur_params: Vec<String>,
     /// argv-touching lines emitted OUTSIDE any function body (main's own
     /// positional/\$0/\$@/\$# reads — a non-lifted fn's argv is call-scoped
-    /// and a lifted fn's is _pN). Zero ⇒ main needs no argv at all.
-    argv_reads: usize,
+    /// and a lifted fn's is _pN). Split per variable so the init and the
+    /// global defs shrink to exactly what the program reads: a \$#-only
+    /// program needs _sh_argc but not the _sh_argv pointer.
+    argc_reads: usize,
+    argvptr_reads: usize,
     /// inside emit_runtime — the runtime helpers' own _sh_argv text
     /// (save/restore in _sh_call_fn) must not count as a top-level read
     in_runtime: bool,
@@ -413,10 +416,14 @@ impl Render {
         if !self.in_function
             && !self.in_runtime
             && !s.trim_start().starts_with("static")
-            && (s.contains("_sh_argv") || s.contains("_sh_argc"))
         {
-            // a top-level argv read — main() must receive the real argv
-            self.argv_reads += 1;
+            // a top-level argv read — main() must receive what it reads
+            if s.contains("_sh_argv") {
+                self.argvptr_reads += 1;
+            }
+            if s.contains("_sh_argc") {
+                self.argc_reads += 1;
+            }
         }
         if s == "_sh_reset();" {
             // a new command buffer starts — shell-text assignments from
@@ -659,7 +666,8 @@ impl Render {
             self.runtime_start = self.out.len();
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
-            self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
+            self.emit("static int _sh_argc = 0;");
+            self.emit("static char **_sh_argv = 0;");
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
@@ -10996,14 +11004,26 @@ impl Render {
         // form only when a script var named argc/argv would shadow the
         // params inside main.
         let argc_shadowed = self.store.contains("argc") || self.store.contains("argv");
-        if self.argv_reads == 0 {
+        // dead-variable discipline: initialize exactly what the program
+        // reads (the trimmer drops the matching global defs; an init for
+        // a dropped def would not compile, so the halves stay in step)
+        if self.argc_reads == 0 && self.argvptr_reads == 0 {
             self.emit("int main(void) {");
+        } else if self.argvptr_reads == 0 {
+            // \$# only — C allows main(int argc) without argv
+            if argc_shadowed {
+                self.emit("int main(int _mac) {");
+                self.emit("  _sh_argc = _mac;");
+            } else {
+                self.emit("int main(int argc) {");
+                self.emit("  _sh_argc = argc;");
+            }
         } else if !argc_shadowed {
             self.emit("int main(int argc, char **argv) {");
             self.emit("  _sh_argc = argc; _sh_argv = argv;");
         } else {
             self.emit("int main(int _mac, char **_mav) {");
-            self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+            self.emit("  _sh_argc = _mac; _sh_argv = _mav;");
         }
         if self.need_sh {
             // bash seeds HOSTNAME itself — the gate env may not carry it
