@@ -1254,12 +1254,16 @@ impl Render {
                         }
                         _ => {}
                     }
-                    if self.var_types.contains_key(name) {
-                        return self.py_ident(name);
-                    }
+                    // store residency wins: a name written via setVar
+                    // anywhere reads back through the store — consistent
+                    // with the write side (the C frontend's outparam
+                    // channel writes through sh2_setVar)
                     if self.store_written.contains(name) {
                         self.sh2_calls.insert("getVar".into());
                         return format!("sh2_getVar({})", Self::py_str(name));
+                    }
+                    if self.var_types.contains_key(name) {
+                        return self.py_ident(name);
                     }
                     if self.written.contains(name) && Self::is_plain_name(name) {
                         return self.py_ident(name);
