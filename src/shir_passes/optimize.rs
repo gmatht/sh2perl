@@ -156,8 +156,8 @@ fn arith_reads(name: &str, a: &ArithAst) -> bool {
         ArithAst::Cond { test, then, else_ } => {
             arith_reads(name, test) || arith_reads(name, then) || arith_reads(name, else_)
         }
-        ArithAst::Assign { var, rhs, .. } => arith_reads(name, rhs),
-        ArithAst::IncDec { var, .. } => false,
+        ArithAst::Assign { var: _, rhs, .. } => arith_reads(name, rhs),
+        ArithAst::IncDec { var: _, .. } => false,
         ArithAst::Sizeof(_) => false,
         ArithAst::Cast { arg, .. } => arith_reads(name, arg),
     }
@@ -493,7 +493,7 @@ fn arith_reads_name(name: &str, a: &ArithAst) -> bool {
         ArithAst::Cond { test, then, else_ } => {
             arith_reads_name(name, test) || arith_reads_name(name, then) || arith_reads_name(name, else_)
         }
-        ArithAst::Assign { var, rhs, .. } => arith_reads_name(name, rhs),
+        ArithAst::Assign { var: _, rhs, .. } => arith_reads_name(name, rhs),
         ArithAst::IncDec { .. } => false,
         ArithAst::Sizeof(_) => false,
     }
@@ -1775,7 +1775,7 @@ fn collect_decl_guard(st: &IrStmt, out: &mut HashSet<String>) {
     // (`[cmd, words…]`). Both must guard their name operands, or DSE
     // deletes stores that `export NAME` makes observable
     // (`X=…; export X; perl -e 'print $ENV{X}'` lost the store).
-    let mut guard_word = |w: &str, out: &mut HashSet<String>| {
+    let guard_word = |w: &str, out: &mut HashSet<String>| {
         if w.starts_with('-') || w.contains('=') {
             return;
         }

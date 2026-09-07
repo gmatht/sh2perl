@@ -1,7 +1,6 @@
 use std::env;
 use std::fs;
-use debashl::lexer::{Lexer, Token};
-use logos::Logos;
+use debashl::lexer::Lexer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

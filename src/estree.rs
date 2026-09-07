@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 // ── ESTree node model (standard subset) ─────────────────────────────
 
@@ -373,10 +373,10 @@ fn map_raw_bytes(s: &str) -> String {
 
 fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
     Some(match stmt {
-        Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+        Stmt::BreakStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
         },
-        Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+        Stmt::ContinueStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("continue", vec![]),
         },
         Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
@@ -1363,7 +1363,7 @@ fn classify_array_call(
 ) {
     let Some(first) = args.first() else { return };
     let name = match fn_name {
-        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "unset" => match lit_str(first) {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" => match lit_str(first) {
             Some(n) => n,
             None => return,
         },
@@ -1473,10 +1473,10 @@ fn classify_array_call(
             }
             _ => entry.index_bad = true,
         },
-        "arrayLen" | "arrayItems" => entry.read_stmt_idxs.push(stmt_idx),
+        "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
-            let target = args.get(1).and_then(lit_str).unwrap_or("");
+            let _target = args.get(1).and_then(lit_str).unwrap_or("");
             let mode = args.get(2).and_then(lit_str).unwrap_or("");
             if op == "slice" && mode == "@" {
                 // len (#name) or join (name) — both reads
@@ -1958,7 +1958,7 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                         }
                     }
                 }
-                "arrayLen" | "arrayItems" | "param" => {
+                "arrayLen" | "arrayItems" | "arrayValues" | "param" => {
                     if let Some((name, len)) = array_len_join(fn_name, arguments) {
                         if natives.contains(name) {
                             return if len {
@@ -2131,7 +2131,7 @@ fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Opt
 fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
     match fn_name {
         "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
-        "arrayItems" => lit_str(args.first()?).map(|n| (n, false)),
+        "arrayItems" | "arrayValues" => lit_str(args.first()?).map(|n| (n, false)),
         "param" => {
             let op = lit_str(args.first()?)?;
             let mode = args.get(2).and_then(lit_str)?;
@@ -5081,7 +5081,7 @@ pub(crate) fn normalize_functions(mut prog: Program) -> Program {
                         let mut fn_expr: Option<Expr> = None;
                         for (k, x) in expressions.iter_mut().enumerate() {
                             if k == r.seq_idx {
-                                if let Expr::AssignmentExpression { left, right, .. } = x {
+                                if let Expr::AssignmentExpression { left, right: _, .. } = x {
                                     let l = (**left).clone();
                                     let block = fn_block.clone();
                                     let params2 = fn_params.clone();
@@ -5330,7 +5330,7 @@ pub(crate) fn return_in_loop(mut prog: Program) -> Program {
     fn rewrite_expr(e: &mut Expr, in_loop: bool) {
         let is_loop = is_loop_call(e);
         match e {
-            Expr::CallExpression { callee, arguments, .. } if is_loop && arguments.len() > 1 => {
+            Expr::CallExpression {  arguments, .. } if is_loop && arguments.len() > 1 => {
                 for (i, a) in arguments.iter_mut().enumerate() {
                     rewrite_expr(a, i == 1);
                 }
@@ -5565,7 +5565,7 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
     }
 
     // 3. the direct-statement builders
-    fn build_expr(f: &FnInfo, args: Vec<Expr>, prog_body: &mut Vec<Stmt>) -> Expr {
+    fn build_expr(_f: &FnInfo, _args: Vec<Expr>, _prog_body: &mut Vec<Stmt>) -> Expr {
         let call_expr = |args: &Vec<Expr>| Expr::CallExpression {
             callee: Box::new(Expr::Identifier { name: "".to_string() }), // patched by the caller
             arguments: args.clone(),
@@ -5846,7 +5846,7 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
             }
         }
     }
-    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, stmt_pos: bool) {
+    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, _stmt_pos: bool) {
         match e {
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }

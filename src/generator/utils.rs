@@ -1,6 +1,5 @@
 use super::Generator;
 use crate::ast::*;
-use crate::ir::expr_to_perl;
 
 /// Get the appropriate temporary directory for the current platform
 pub fn get_temp_dir() -> &'static str {
@@ -598,7 +597,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                         match arg {
                                             Word::StringInterpolation(interp, _) => generator
                                                 .convert_string_interpolation_to_perl(interp),
-                                            Word::Literal(literal, _) => {
+                                            Word::Literal(_literal, _) => {
                                                 // Escaped backticks should be treated as literal backticks, not command substitution
                                                 generator.perl_string_literal(arg)
                                             }
@@ -748,7 +747,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 }
                 _ => {
                     // For other command types, use system command fallback
-                    let (in_var, out_var, err_var, pid_var, result_var) =
+                    let (in_var, out_var, _err_var, pid_var, result_var) =
                         generator.get_unique_ipc_vars();
                     // Ensure the command string is embedded as a non-interpolating
                     // Perl literal so embedded single quotes or "$" sequences

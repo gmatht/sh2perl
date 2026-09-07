@@ -120,7 +120,7 @@ fn pass(stmts: Vec<IrStmt>) -> (Vec<IrStmt>, bool) {
             IrStmt::DoWhile { body, cond, until } => {
                 let (body2, c) = pass(body);
                 changed |= c;
-                let base = if until { false } else { true };
+                let _base = if until { false } else { true };
                 // until=false, cond=false -> body once; until=true, cond=true
                 // -> body once (the `while`-sense is inverted)
                 if (until && eval_cond(&cond) == Some(true)) || (!until && eval_cond(&cond) == Some(false)) {
@@ -179,7 +179,13 @@ fn eval_test(s: &IrExpr) -> Option<bool> {
     let words: Vec<&str> = s.split_whitespace().collect();
     match words.as_slice() {
         [a, op, b] => {
-            if a.starts_with('$') || b.starts_with('$') {
+            // a `$var` ANYWHERE in an operand (quoted or bare) makes the
+            // test non-constant — `"$x"` starts with a quote, so the
+            // old starts_with('$') check missed it and evaluated
+            // `-z "$never_set2"` as the literal `-z \"\"$never_set2\"\"`
+            // (non-empty → false), eliminating the if (unset-var-empty-
+            // string-test regression).
+            if a.contains('$') || b.contains('$') {
                 return None; // a variable — not constant
             }
             let (x, y) = (a.parse::<i64>().ok()?, b.parse::<i64>().ok()?);
@@ -193,8 +199,8 @@ fn eval_test(s: &IrExpr) -> Option<bool> {
                 _ => return None,
             })
         }
-        ["-n", w] if !w.starts_with('$') => Some(!w.is_empty()),
-        ["-z", w] if !w.starts_with('$') => Some(w.is_empty()),
+        ["-n", w] if !w.contains('$') => Some(!w.is_empty()),
+        ["-z", w] if !w.contains('$') => Some(w.is_empty()),
         _ => None,
     }
 }

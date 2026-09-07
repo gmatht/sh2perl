@@ -62,7 +62,7 @@ pub fn run_generated(lang: &str, input: &str) {
 
     match lang {
         "perl" => {
-            let mut generator = Generator::new();
+            let generator = Generator::new();
             let commands = match Parser::new(&source).parse() {
                 Ok(c) => c,
                 Err(e) => {
@@ -209,7 +209,7 @@ pub fn parse_to_perl_embed(input: &str) {
 }
 
 pub fn parse_to_perl_inline(input: &str) {
-    let mut generator = Generator::new_inline_mode();
+    let generator = Generator::new_inline_mode();
 
     if debashl::debug::is_debug_enabled() {
         println!("Converting to inline Perl:");
@@ -239,7 +239,7 @@ pub fn parse_to_perl_inline(input: &str) {
 }
 
 pub fn parse_system_to_perl(input: &str) {
-    let mut generator = Generator::new();
+    let generator = Generator::new();
 
     println!("Converting to Perl:");
     println!("{}", "=".repeat(50));
@@ -270,7 +270,7 @@ pub fn parse_system_to_perl(input: &str) {
 }
 
 pub fn parse_backticks_to_perl(input: &str) {
-    let mut generator = Generator::new();
+    let generator = Generator::new();
 
     println!("Converting backticks command to Perl:");
     println!("{}", "=".repeat(50));
@@ -301,6 +301,7 @@ pub fn parse_backticks_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
+#[allow(dead_code)]
 fn extract_core_perl_logic(perl_code: &str) -> String {
     // Look for the main logic after variable declarations
     if let Some(captures) = regex::Regex::new(r"my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)")
@@ -331,6 +332,7 @@ fn extract_core_perl_logic(perl_code: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
     // Check if this is an ls command by looking for ls-specific patterns FIRST
     // (before checking for full Perl script, so ls commands get special handling)
@@ -786,7 +788,14 @@ pub fn parse_shir_json_to_js(filename: &str) {
         Ok(p) => p,
         Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
     };
-    let js = debashl::js_backend::shir_to_js(&prog);
+    let estree = match debashl::shir::shir_to_estree_json(&prog) {
+        Ok(e) => e,
+        Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
+    };
+    let js = match crate::estree_json_to_js(&estree) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("estree->js: {}", e); std::process::exit(1); }
+    };
     print!("{}", js);
 }
 

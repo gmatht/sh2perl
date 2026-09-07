@@ -298,7 +298,7 @@ impl Render {
             return m.clone();
         }
         let mut m = String::new();
-        for (i, c) in name.chars().enumerate() {
+        for (_i, c) in name.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 m.push(c);
             } else {
@@ -682,7 +682,7 @@ impl Render {
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
             }
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq
@@ -813,7 +813,7 @@ impl Render {
                     "\"string\"".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "arrayLen" => {
+            IrExpr::Call { func, args: _ } if func == "arrayLen" => {
                 format!("({}).to_string()", self.expr_num(e))
             }
             IrExpr::Call { func, args } if func == "join" => self.join_str(args),
@@ -903,7 +903,7 @@ impl Render {
                         "(if {}.contains({}.as_str()) {{ true }} else {{ false }})",
                         self.expr_str(&x.text), self.expr_str(&x.pattern))
                 }
-                other => format!("({} != 0)", self.expr_num(e)),
+                _other => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
@@ -960,9 +960,25 @@ impl Render {
                 format!("{{ let _ = {block}; __SH_RC.load(Ordering::SeqCst) == 0 }}")
             }
             IrExpr::Call { func, args } if func == "return" => {
-                "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                // `return` WITH a value in a value-convention function:
+                // store the value to __SH_RET (the function's value home)
+                // instead of echoing. A bare `return` (flag-only) keeps
+                // the original behaviour.
+                if let Some(v) = args.first() {
+                    let v = self.expr_str(v);
+                    // evaluate the value BEFORE locking __SH_RET — a
+                    // value that is itself a fnValue call (recursive
+                    // param/… dispatch) would re-lock __SH_RET while the
+                    // outer assignment holds it (Mutex re-entrancy
+                    // deadlock — polyfills brace/param)
+                    format!(
+                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst); return; }}"
+                    )
+                } else {
+                    "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                }
             }
-            IrExpr::Call { func, args } if func == "break" => {
+            IrExpr::Call { func, args: _ } if func == "break" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
                         format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); break; false }}")
@@ -973,7 +989,7 @@ impl Render {
                     "false".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "continue" => {
+            IrExpr::Call { func, args: _ } if func == "continue" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
                         format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); continue; false }}")
@@ -1267,7 +1283,7 @@ impl Render {
                     format!("{delta}")
                 };
                 let cur = self.getvar_num(var);
-                let m = self.tls(var);
+                let _m = self.tls(var);
                 let stmt = self.write_num_or_str(var, &format!("({cur} {d})"));
                 if *prefix {
                     let new = self.getvar_num(var);
@@ -1597,7 +1613,7 @@ impl Render {
                         return;
                     }
                 }
-                let text = self.cmd_text(&words, None);
+                let _text = self.cmd_text(&words, None);
                 // `eval "echo … $x …"` — expand the vars into the text
                 // (a child bash would not see the native store)
                 let interp = self.dollar_interp(&joined);
@@ -1744,7 +1760,7 @@ impl Render {
             | "unset" | "set" | "shift" | "pwd" | "wait" | "eval" | "source" | "."
             | "command" | "exec" | "break" | "continue" => {
                 // a builtin in a condition: run it, rc decides
-                let mut saved = std::mem::take(&mut self.out);
+                let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
                 self.depth = 0;
                 self.exec_stmt(args);
@@ -2595,10 +2611,34 @@ impl Render {
             }
             "captureWords" => self.capture_words_expr(args),
             "assign" => format!("vec![{}]", self.assign_call_str(args)),
+            "fnValue" | "fnCall" => {
+                // value-returning user-function call in word-list context:
+                // the argv-swap call then read __SH_RET (the function's
+                // `return expr` home) — mirrors call_str's fnValue arm
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let m = self.fn_ident(name);
+                    let ws: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(items) => {
+                                Some(items.iter().map(|w| self.expr_any(w)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
+                        ws.join(", "),
+                        m
+                    )
+                } else {
+                    "vec![String::new()]".to_string()
+                }
+            }
             "test" => "Vec::new()".to_string(),
             "exec" | "builtin" => "Vec::new()".to_string(),
             "grepMatches" => "Vec::new()".to_string(),
-            "contains" => "Vec::new()".to_string(),
+            "contains" | "strHasPrefix" | "strHasSuffix" => "Vec::new()".to_string(),
             _ => {
                 self.mark_todo(&format!("word call {func}"));
                 "vec![String::new()]".to_string()
@@ -3026,11 +3066,16 @@ impl Render {
             if let IrExpr::Arrow(stmts) = a {
                 found = true;
                 // fast path: [Expr(Call exec cmd …)] → bash -c capture
-                if let Some(text) = self.stage_text(stmts) {
-                    self.add_helper("capture_rc");
-                    return format!(
-                        "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
-                    );
+                // (skipped for KNOWN user-function calls — a bash -c
+                // child can't see the transpiled fn, so those run
+                // in-process via capture_block)
+                if !self.is_fn_capture(stmts) {
+                    if let Some(text) = self.stage_text(stmts) {
+                        self.add_helper("capture_rc");
+                        return format!(
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                        );
+                    }
                 }
                 return self.capture_block(stmts);
             }
@@ -3045,11 +3090,13 @@ impl Render {
     fn capture_expr_single(&mut self, e: &IrExpr) -> String {
         if let IrExpr::Capture { expr, .. } = e {
             if let IrExpr::Arrow(stmts) = expr.as_ref() {
-                if let Some(text) = self.stage_text(stmts) {
-                    self.add_helper("capture_rc");
-                    return format!(
-                        "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
-                    );
+                if !self.is_fn_capture(stmts) {
+                    if let Some(text) = self.stage_text(stmts) {
+                        self.add_helper("capture_rc");
+                        return format!(
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                        );
+                    }
                 }
                 return self.capture_block(stmts);
             }
@@ -3059,9 +3106,29 @@ impl Render {
         "String::new()".to_string()
     }
 
+    /// Is the capture body a single call to a KNOWN user function?
+    /// (These must run IN-PROCESS — a bash -c child can't see the
+    /// transpiled fn.)
+    fn is_fn_capture(&self, stmts: &[IrStmt]) -> bool {
+        match stmts {
+            [IrStmt::Expr(IrExpr::Call { func, args })] => {
+                if func == "fnValue" || func == "fnCall" {
+                    return true;
+                }
+                if func == "exec" || func == "builtin" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        return self.functions.contains(name);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Native capture: run the statements with the output buffer active.
     fn capture_block(&mut self, stmts: &[IrStmt]) -> String {
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
         // a capture is a standalone stdout context — an active fd-1
@@ -3186,7 +3253,7 @@ impl Render {
                 self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
             } else {
                 // native stage
-                let mut saved = std::mem::take(&mut self.out);
+                let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
                 self.depth = 1;
                 if idx > 0 {
@@ -3241,7 +3308,7 @@ impl Render {
         if stages.is_empty() {
             return "true".to_string();
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.pipeline_stmt(&stages);
@@ -3278,7 +3345,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         let cond_block = self.cond_block(&cond);
@@ -3323,7 +3390,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         for s in stmts {
@@ -3391,7 +3458,7 @@ impl Render {
     /// and as a bool block.
     fn and_bool(&mut self, args: &[IrExpr]) -> String {
         let blocks = self.and_blocks(args);
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         for (i, b) in blocks.iter().enumerate() {
@@ -3435,7 +3502,7 @@ impl Render {
                 }
             }
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.redirect_render(&stmts, &redirs);
@@ -3452,7 +3519,7 @@ impl Render {
         if let Some(IrExpr::Arrow(b)) = args.first() {
             stmts = b.clone();
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.subshell_render(&stmts);
@@ -3815,7 +3882,7 @@ impl Render {
                 "{{ let __p = {te}; let _ = std::fs::remove_file(&__p); let _ = std::process::Command::new(\"mkfifo\").arg(&__p).status(); }}"
             ));
             self.emit(&format!("let __ps_tmp_loc = {te};"));
-            let mut saved = std::mem::take(&mut self.out);
+            let saved = std::mem::take(&mut self.out);
             let old_depth = self.depth;
             self.depth = 1;
             for p in &pre {
@@ -4070,13 +4137,27 @@ impl Render {
 
     // ── param expansion ──────────────────────────────────────────────
 
+    /// Pattern for `#`/`%`/`/` param ops. Bash expands variables inside
+    /// the pattern (`${v#*"$sub"}` → the glob `*<value of sub>`), so a
+    /// `$var` reference must be interpolated (not emitted literally).
+    /// Quotes that wrap `$var` in the source pattern are bash delimiters
+    /// and vanish after expansion, so strip them before interpolating.
+    fn param_pattern_expr(&mut self, raw: &str) -> String {
+        if !raw.contains('$') {
+            return Self::rust_str(raw);
+        }
+        let deq = raw.replace('"', "");
+        let e = self.dollar_interp(&deq);
+        format!("&({e})")
+    }
+
     /// param(op, name, [val], [repl]) → String expr.
     fn param_str(&mut self, args: &[IrExpr]) -> String {
         let op = str_arg(args, 0).unwrap_or("");
         let name = str_arg(args, 1).unwrap_or("");
         // array-length / keys forms first
         let idx_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
-        let off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+        let _off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let name_at = name.ends_with("[@]") || name.ends_with("[*]");
         if let Some(keys) = name.strip_prefix('!') {
             // `${!prefix*[@]:0:3}` — slicing the indirect key list is a
@@ -4132,22 +4213,23 @@ impl Render {
             if matches!(op, "#" | "##" | "%" | "%%" | "/" | "//") {
                 let var_expr = self.array_index_name(name);
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 return match op {
                     "#" | "##" => {
                         let greedy = op == "##";
                         self.add_helper("strippre");
-                        format!("__sh_strippre(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                        format!("__sh_strippre(&{var_expr}, {pat_expr}, {greedy})")
                     }
                     "%" | "%%" => {
                         let greedy = op == "%%";
                         self.add_helper("stripsuf");
-                        format!("__sh_stripsuf(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                        format!("__sh_stripsuf(&{var_expr}, {pat_expr}, {greedy})")
                     }
                     _ => {
                         let repl = args.get(3).map(|x| self.param_val_str(x)).unwrap_or_else(|| "String::new()".to_string());
                         let all = op == "//";
                         self.add_helper("replace");
-                        format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
+                        format!("__sh_replace(&{var_expr}, {pat_expr}, &{repl}, {all})")
                     }
                 };
             }
@@ -4223,21 +4305,24 @@ impl Render {
             }
             "#" | "##" | "#:" | "##:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("##");
                 self.add_helper("strippre");
-                format!("__sh_strippre(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                format!("__sh_strippre(&{var_expr}, {pat_expr}, {greedy})")
             }
             "%" | "%%" | "%:" | "%%:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("%%");
                 self.add_helper("stripsuf");
-                format!("__sh_stripsuf(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                format!("__sh_stripsuf(&{var_expr}, {pat_expr}, {greedy})")
             }
             "/" | "//" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                let pat_expr = self.param_pattern_expr(&pat);
                 let all = op == "//";
                 self.add_helper("replace");
-                format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
+                format!("__sh_replace(&{var_expr}, {pat_expr}, &{repl}, {all})")
             }
             "slice" => {
                 // `${!prefix*[@]:off:len}` — a slice of the INDIRECT key
@@ -4323,7 +4408,7 @@ impl Render {
                         })
                         .unwrap_or_default();
                     return format!(
-                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RET.lock().unwrap().clone() }}",
+                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
                         ws.join(", "),
                         m
                     );
@@ -4415,6 +4500,16 @@ impl Render {
                 let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 let needle = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
                 format!("(if {text}.contains(&{needle}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
+            }
+            "strHasPrefix" => {
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let prefix = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("(if {text}.starts_with(&{prefix}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
+            }
+            "strHasSuffix" => {
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let suffix = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("(if {text}.ends_with(&{suffix}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
             }
             "setArray" | "setArrayAppend" => {
                 // an array assign in expr context — run it, yield ""
@@ -4513,7 +4608,7 @@ impl Render {
 
     /// setArray as a bool block.
     fn setarray_bool(&mut self, func: &str, args: &[IrExpr]) -> String {
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
         self.array_call_stmt_by_name(func, args);
@@ -4669,21 +4764,21 @@ impl Render {
                         }
                     }
                 }
-                IrExpr::Call { func, args } if func == "break" => {
+                IrExpr::Call { func, args: _ } if func == "break" => {
                     if self.loop_depth > 0 {
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         self.loop_capture_rc();
                         self.emit("break;");
                     }
                 }
-                IrExpr::Call { func, args } if func == "continue" => {
+                IrExpr::Call { func, args: _ } if func == "continue" => {
                     if self.loop_depth > 0 {
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         self.loop_capture_rc();
                         self.emit("continue;");
                     }
                 }
-                IrExpr::Call { func, args } if func == "return" => {
+                IrExpr::Call { func, args: _ } if func == "return" => {
                     self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
                 }
                 _ => {
@@ -5055,11 +5150,22 @@ impl Render {
             IrStmt::Return(e) => {
                 if self.in_function {
                     // user-function VALUE return (strings are the value
-                    // model; numeric contexts coerce via __sh_atoi)
-                    let r = e.as_ref().map(|x| self.expr_str(x)).unwrap_or_default();
-                    self.emit(&format!(
-                        "*__SH_RET.lock().unwrap() = {r}; return;"
-                    ));
+                    // model; numeric contexts coerce via __sh_atoi). A bare
+                    // `return` keeps the current __SH_RET value, so it is a
+                    // plain early exit — never an empty assignment.
+                    if let Some(x) = e {
+                        let r = self.expr_str(x);
+                        // evaluate BEFORE locking __SH_RET — a value that
+                        // is itself a fnValue call (recursive param/…
+                        // dispatch) would re-lock __SH_RET while the
+                        // outer assignment holds it (Mutex re-entrancy
+                        // deadlock — polyfills brace/param)
+                        self.emit(&format!(
+                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                        ));
+                    } else {
+                        self.emit("return;");
+                    }
                     return;
                 }
                 if let Some(x) = e {
@@ -5099,7 +5205,7 @@ impl Render {
                     // patterns arrive as source text — unwrap a fully
                     // quoted pattern (`""` matches the empty string;
                     // `"*"` is a LITERAL star, not the wildcard)
-                    let mut pats: Vec<String> = c
+                    let pats: Vec<String> = c
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
@@ -5176,7 +5282,7 @@ impl Render {
                     &words.iter().collect::<Vec<_>>(),
                     if env.is_empty() { None } else { Some(&env) },
                 );
-                let mut full = text;
+                let full = text;
                 for r in redirects {
                     if let IrExpr::Object(props) = r {
                         for (k, v) in props {
@@ -5335,7 +5441,7 @@ impl Render {
             }
             captured.insert(v.clone(), cap.clone());
         }
-        let mut saved = std::mem::take(&mut self.out);
+        let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
         let old_captured = std::mem::replace(&mut self.captured, captured);
@@ -6167,21 +6273,21 @@ fn helper_source(h: &str) -> &'static str {
                         false
                     }
                     '*' => {
+                        // *(alts)rest  =  rest  |  a ++ *(alts)rest  (some alt a)
                         if m(rest, t) { return true; }
                         for a in &alts {
-                            let mut joined = a.clone();
-                            joined.push('*');
-                            joined.extend_from_slice(&p[..p.len() - rest.len()]);
-                            if m(&joined, t) { return true; }
+                            for i in 1..=t.len() {
+                                if m(a, &t[..i]) && m(p, &t[i..]) { return true; }
+                            }
                         }
                         false
                     }
                     '+' => {
+                        // +(alts)rest  =  a ++ *(alts)rest  (at least one alt a)
                         for a in &alts {
-                            let mut joined = a.clone();
-                            joined.push('*');
-                            joined.extend_from_slice(&p[..p.len() - rest.len()]);
-                            if m(&joined, t) { return true; }
+                            for i in 1..=t.len() {
+                                if m(a, &t[..i]) && m(p, &t[i..]) { return true; }
+                            }
                         }
                         false
                     }
@@ -7476,13 +7582,15 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 if self.style == "[[" {
                     // pattern match (glob) in [[ ]]
                     self.render.add_helper("fnmatch");
+                    let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
+                    let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
                     if self.render.nocasematch {
                         format!(
-                            "({} __sh_fnmatch(&{rhs}.to_lowercase(), &{lhs}.to_lowercase()))",
+                            "({} __sh_fnmatch(&{r}.to_lowercase(), &{l}.to_lowercase()))",
                             if eq { "" } else { "!" }
                         )
                     } else {
-                        format!("({} __sh_fnmatch(&{rhs}, &{lhs}))", if eq { "" } else { "!" })
+                        format!("({} __sh_fnmatch(&{r}, &{l}))", if eq { "" } else { "!" })
                     }
                 } else {
                     // the sh2.* runtime's evalTest contract
@@ -8907,7 +9015,7 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
 fn arith_has_side_effects(e: &IrExpr) -> bool {
     match e {
         IrExpr::Arith(a) => arith_side_effects(a),
-        IrExpr::Call { func, args } if func == "assign" => true,
+        IrExpr::Call { func, args: _ } if func == "assign" => true,
         IrExpr::Call { func, args } if func == "arith" => args.iter().any(|a| {
             matches!(a, IrExpr::Str(s, _) if s.contains('=') || s.contains("++") || s.contains("--"))
         }),

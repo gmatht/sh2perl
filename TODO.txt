@@ -27,3 +27,5 @@
 - Review and optimize generated Perl code structure
 - Consider refactoring command substitution logic for better maintainability
 
+
+Rewrite more grep -P / -Po commandlines into grep -E / -Eo commandlines.

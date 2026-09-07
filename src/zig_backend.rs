@@ -214,7 +214,7 @@ impl Render {
             return m.clone();
         }
         let mut m = String::new();
-        for (i, c) in name.chars().enumerate() {
+        for (_i, c) in name.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 m.push(c);
             } else {
@@ -363,7 +363,7 @@ impl Render {
                 }
             }
             IrExpr::Arith(a) => self.arith(a),
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq
@@ -380,7 +380,7 @@ impl Render {
                 // bool → i64 (bash's 1/0)
                 format!("@intFromBool({})", self.expr_bool(e))
             }
-            IrExpr::BinOp { lhs, op, rhs } if *op == BinOpKind::Concat => {
+            IrExpr::BinOp { lhs: _, op, rhs: _ } if *op == BinOpKind::Concat => {
                 self.need_toint = true;
                 format!("sh2ToInt({})", self.expr_str(e))
             }
@@ -468,7 +468,7 @@ impl Render {
                     "\"false\"".into()
                 }
             }
-            IrExpr::BinOp { lhs, op, rhs }
+            IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
                     BinOpKind::Eq
@@ -1922,7 +1922,7 @@ impl Render {
                                                 };
                                                 if let Some(a) = rest.get(argi) {
                                                     argi += 1;
-                                                    let mut pa = self.parts_of(a);
+                                                    let pa = self.parts_of(a);
                                                     if pa.len() == 1 {
                                                         // a %d over a
                                                         // string-model value

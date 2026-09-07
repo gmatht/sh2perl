@@ -109,6 +109,8 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str("}\n");
         }
     }
+    let _ = &force;
+    let _ = &preserve;
 
     output
 }

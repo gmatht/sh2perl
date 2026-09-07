@@ -4,7 +4,7 @@ use crate::generator::Generator;
 pub fn generate_comm_command(
     _generator: &mut Generator,
     cmd: &SimpleCommand,
-    input_var: &str,
+    _input_var: &str,
     process_sub_files: &[(String, String)],
 ) -> String {
     let mut output = String::new();

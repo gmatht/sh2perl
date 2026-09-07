@@ -34,6 +34,10 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 wasi-cli = []
+# Forwards to debashl/legacy-generator: the legacy AST-side Perl generator
+# (src/generator/). OFF by default — the new perl backend (ir::shir_to_perl)
+# works without it; the legacy CLI perl utilities degrade to a stub message.
+legacy-generator = ["debashl/legacy-generator"]
 
 [dependencies]
 debashl = { path = ".." }

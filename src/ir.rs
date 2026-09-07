@@ -1879,6 +1879,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             rest.join(", ")
                         ));
                     }
+                    "fnValue" => {
+                        // VALUE-returning function call (the echo-return
+                        // transform's convention — CROSS_BACKEND_RUNTIME.md
+                        // §8.3): a Perl sub call whose value is the
+                        // function's `return` — an expression, no status
+                        // write (the caller consumes the value, e.g. the
+                        // rewritten `print(fnValue(...), "\n")` echo).
+                        let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                        let words = exec_word_args(args);
+                        let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
+                        out.push_str(&format!("{}({})", name, rest.join(", ")));
+                    }
                     "test" => {
                         // Bare `[ cond ]` as a statement: the exit status is the
                         // condition's truth.
@@ -3528,6 +3540,7 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
 /// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
 /// native Perl, no bash dependency). Returns None when the command isn't
 /// emulatable (caller falls back to `bash -c` shell-out).
+#[cfg(feature = "legacy-generator")]
 fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     let shell_text = build_shell_cmd(cmd, words);
     let parsed = crate::Parser::new(&shell_text).parse().ok()?;
@@ -3562,6 +3575,14 @@ fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     } else {
         Some(perl)
     }
+}
+
+/// When the legacy generator is off (default), command emulation is
+/// unavailable: the caller falls back to `bash -c` shell-out (the same path
+/// `DEBASHC_IR_NO_EMUL` exercises).
+#[cfg(not(feature = "legacy-generator"))]
+fn generator_emulate_command(_cmd: &str, _words: &[&IrExpr]) -> Option<String> {
+    None
 }
 
 /// Collect the variable names a word expression READS (getVar/Var nodes,
@@ -4660,7 +4681,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                     continue;
                 };
                 if let Some(eq) = word_str.split_once('=') {
-                    let mut val = eq.1.to_string();
+                    let val = eq.1.to_string();
                     if eq.1.is_empty() && i + 1 < words.len() {
                         // value is the next word — render it structurally
                         // (a getVar(1) word → $ARGV[0]).
@@ -6454,10 +6475,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                     }
                 },
-                // The C frontend's user-function dispatch (the estree
-                // lowers the same A1 to sh2.fnCall) — a direct Perl sub
+                // The C frontend's user-shell dispatch (the estree
+                // lowers the same tree to sh2.fnCall) — a direct Perl sub
                 // call: fnCall(name, [args...]) → name(args...).
-                "fnCall" => {
+                // `fnValue` (the echo-return transform's value-returning
+                // convention) renders the same — the sub returns the
+                // value, no status channel.
+                "fnCall" | "fnValue" => {
                     let name = args.first().and_then(call_arg_str).unwrap_or_default();
                     let call_args: Vec<String> = match args.get(1) {
                         Some(IrExpr::Array(elems)) => {
@@ -6894,7 +6918,6 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrExpr::Splice(e) => expr_refers_to_main_exit(e),
         IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
-        IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -6968,10 +6991,22 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         IrStmt::Label(_) | IrStmt::Goto(_) => {} // no variables
         // Neutral ESTree-path-only nodes carry no Perl variables.
         IrStmt::Case { .. }
-        | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => {}
+        // Redirect TARGETS are reads (heredoc/herestring `<<< "$var"`,
+        // `> "$f"`, `2> "$err"`): a var read ONLY there must not be
+        // dead-eliminated (the dead-store-elim / never-written analyses
+        // consulted this same walker and dropped the assignment, folding
+        // the read to "").
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects {
+                collect_vars_in_expr(&r.target, vars);
+            }
+            for st in inner {
+                collect_vars_in_stmt(st, vars);
+            }
+        }
         // Select comm clauses may carry channel/value exprs + bodies.
         IrStmt::Select { clauses } => {
             for c in clauses {
@@ -7130,7 +7165,6 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
         }
         IrExpr::Splice(e) => collect_vars_in_expr(e, vars),
         IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
-        IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Arrow(body) => {
             for stmt in body {
                 collect_vars_in_stmt(stmt, vars);
@@ -7175,11 +7209,18 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
         }
         IrExpr::Capture { expr, .. } => collect_vars_in_expr(expr, vars),
         IrExpr::Call { func, args, .. } => {
-            // param calls reference a variable by name (args[1] is the
-            // Str literal name) — register it so the optimizer doesn't
-            // dead-eliminate the var's assignment.
-            if func == "param" {
-                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+            // param / getVar calls reference a variable by name
+            // (param: args[1], getVar: args[0]) — register it so the
+            // optimizer doesn't dead-eliminate the var's assignment.
+            let name_idx = if func == "param" {
+                Some(1)
+            } else if func == "getVar" {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(idx) = name_idx {
+                if let Some(IrExpr::Str(name, _)) = args.get(idx) {
                     vars.insert(name.clone());
                 }
             }

@@ -1,4 +1,4 @@
-use debashl::lexer::{Lexer, Token};
+use debashl::lexer::Lexer;
 use std::env;
 use std::fs;
 

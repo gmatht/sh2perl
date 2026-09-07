@@ -95,7 +95,12 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
                 body.iter().any(walk_stmt)
             }
             IrStmt::Pipeline { stages, .. } => stages.iter().any(|st| st.iter().any(walk_stmt)),
-            IrStmt::Redirect { inner, .. } => inner.iter().any(walk_stmt),
+            IrStmt::Redirect { inner, redirects } => {
+                // redirect targets are reads (`<<< "$var"`, `> "$f"`) —
+                // a var read ONLY there must not be judged dead
+                redirects.iter().any(|r| walk_expr(&r.target))
+                    || inner.iter().any(walk_stmt)
+            }
             IrStmt::Expr(e) => walk_expr(e),
             IrStmt::Output { value, .. } => walk_expr(value),
             IrStmt::WriteFile { path, content, .. } => walk_expr(path) || walk_expr(content),
@@ -276,7 +281,8 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
             IrStmt::Pipeline { stages, .. } => {
                 for stage in stages { for b in stage { walk_stmt(b, counts); } }
             }
-            IrStmt::Redirect { inner, .. } => {
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects { walk_expr(&r.target, counts); }
                 for b in inner { walk_stmt(b, counts); }
             }
             IrStmt::Expr(e) => walk_expr(e, counts),
@@ -433,7 +439,10 @@ fn census_stmt(
                 }
             }
         }
-        IrStmt::Redirect { inner, .. } => {
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects {
+                census_expr(&r.target, reads, writes, escapes, escaping);
+            }
             for s in inner {
                 census_stmt(s, reads, writes, escapes, escaping);
             }
@@ -537,6 +546,15 @@ fn census_expr(
                 census_expr(x, reads, writes, escapes, escaping);
             }
         }
+        // A bare Str node can carry `$name` references too — the heredoc
+        // target (`cat << EOF` with `Hello $name` → Str("Hello $name\n")
+        // with interpolate:true) is a Redirect target, not a Call arg, so
+        // the Call-arg scan above never sees it. Without this, DSE judged
+        // `name` never-read and dropped `name="world"` — the heredoc
+        // interpolated the empty store (079_heredoc_interpolation).
+        IrExpr::Str(s, _) => {
+            string_read_names(s, reads);
+        }
         _ => {}
     }
 }
@@ -596,8 +614,13 @@ fn arith_census(
                 escapes.insert(v.clone());
             }
         }
-        ArithAst::Index { var, .. } => {
+        ArithAst::Index { var, key, .. } => {
             reads.insert(var.clone());
+            // the index expression is a read too (`arr[i]` — the key
+            // var `i` must not be judged never-read, or its store is
+            // DSE-dropped and the index renders as the empty-string
+            // never-written read → arr[0] (arith-array-index-expr).
+            arith_census(key, reads, writes, escapes, escaping);
         }
         ArithAst::Bin { lhs, rhs, .. } => {
             arith_census(lhs, reads, writes, escapes, escaping);

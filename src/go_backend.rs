@@ -2411,8 +2411,8 @@ impl Render {
                     Some("return".to_string())
                 }
             }
-            IrExpr::Call { func, args } if func == "break" => Some("break".to_string()),
-            IrExpr::Call { func, args } if func == "continue" => Some("continue".to_string()),
+            IrExpr::Call { func, args: _ } if func == "break" => Some("break".to_string()),
+            IrExpr::Call { func, args: _ } if func == "continue" => Some("continue".to_string()),
             IrExpr::Call { func, args } if func == "let" => {
                 let s = match args.first() {
                     Some(IrExpr::Str(s, _)) => s.clone(),
@@ -2556,7 +2556,7 @@ impl Render {
     fn test_binop(
         &mut self,
         op: &str,
-        lraw: &str,
+        _lraw: &str,
         l: String,
         lk: bool,
         rraw: &str,
@@ -2696,7 +2696,7 @@ impl Render {
                     let m = self.ident_of(inner);
                     Some((m, self.is_num(inner)))
                 } else if let Ok(n) = inner.parse::<i64>() {
-                    (Some((n.to_string(), true)))
+                    Some((n.to_string(), true))
                 } else if has_dollar {
                     Some((format!("os.Getenv({})", Self::go_str(inner)), false))
                 } else {
@@ -3024,7 +3024,7 @@ impl Render {
                     self.stmt(s);
                 }
                 for v in &saved {
-                    let m = self.go_ident(v);
+                    let _m = self.go_ident(v);
                     let t = self.tmp;
                     let _ = t;
                 }
@@ -3430,7 +3430,7 @@ impl Render {
                 }
                 None
             }
-            IrExpr::Call { func, args } if func == "test" => {
+            IrExpr::Call { func, args: _ } if func == "test" => {
                 let c = self.expr_bool(e);
                 // bash status: 0 when the test is TRUE
                 Some((Vec::new(), format!("b2i(!({c}))")))
@@ -3592,7 +3592,7 @@ impl Render {
                 }
                 self.mark_todo("setVar");
             }
-            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+            IrExpr::Call { func, args: _ } if func == "fnCall" || func == "fnValue" => {
                 // user-function call in statement position
                 let v = self.expr_any(e);
                 self.flush_sides();
@@ -3629,7 +3629,7 @@ impl Render {
                 self.emit(&format!("st = {v};"));
                 self.need_st = true;
             }
-            IrExpr::Call { func, args } if func == "test" => {
+            IrExpr::Call { func, args: _ } if func == "test" => {
                 let c = self.expr_bool(e);
                 self.flush_sides();
                 // bash status: 0 when the test is TRUE
@@ -4137,7 +4137,7 @@ impl Render {
                 }
                 if let Some(eq) = arg.find('=') {
                     let name = &arg[..eq];
-                    let mut value = arg[eq + 1..].to_string();
+                    let value = arg[eq + 1..].to_string();
                     // `local x=$y` arrives as [Str("x="), getVar("y")…]
                     let mut tail: Vec<String> = Vec::new();
                     let mut j = i + 1;
@@ -4478,7 +4478,7 @@ impl Render {
             }
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr_any(e))],
             IrExpr::Call { .. } => vec![Part::Arg(self.expr_any(e))],
-            IrExpr::Ext(n) => vec![Part::Arg(self.expr_any(e))],
+            IrExpr::Ext(_n) => vec![Part::Arg(self.expr_any(e))],
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
                 vec![Part::Arg("0".into())]
@@ -5244,7 +5244,7 @@ fn test_tokens(s: &str) -> Option<Vec<String>> {
             continue;
         }
         // regular token
-        let start = i;
+        let _start = i;
         let mut tok = String::new();
         while i < b.len()
             && !b[i].is_whitespace()
@@ -5411,7 +5411,7 @@ impl TestParser {
     }
 }
 
-fn numify(e: String, is_num: bool, r: &mut Render) -> String {
+fn numify(e: String, is_num: bool, _r: &mut Render) -> String {
     if is_num {
         e
     } else {

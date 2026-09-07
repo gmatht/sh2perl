@@ -39,7 +39,7 @@
 //! - `printf` is supported only for literal `%s`/`%d`/`%i`/`%%` formats.
 
 use crate::ir::{
-    ArithAst, BinOpKind, Decl, IrCaseClause, IrExpr, IrProgram, IrRedirect, IrStmt, IrSub,
+    ArithAst, BinOpKind, Decl, IrCaseClause, IrExpr, IrProgram, IrStmt,
     IrType, InterpPart,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -1917,15 +1917,6 @@ impl Render {
                 self.todo += 1;
                 "/* TODO(cmdsub num) */ 0".to_string()
             }
-            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
-                if let Some(pipe) = self.capture_pipeline(args) {
-                    if let Some(s) = self.bc_capture(pipe) {
-                        return format!("s2i({s})");
-                    }
-                }
-                self.todo += 1;
-                "/* TODO(cmdsub num) */ 0".to_string()
-            }
             _ => {
                 self.todo += 1;
                 format!("/* TODO(expr_num {:?}) */ 0", std::mem::discriminant(e))
@@ -2119,15 +2110,6 @@ impl Render {
                 // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
                 // Call-capture arm below before the bc fold.
                 if let Some(pipe) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) {
-                    if let Some(s) = self.bc_capture(pipe) {
-                        return s;
-                    }
-                }
-                self.todo += 1;
-                "/* TODO(command substitution) */ ivec2(0, 0)".to_string()
-            }
-            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
-                if let Some(pipe) = self.capture_pipeline(args) {
                     if let Some(s) = self.bc_capture(pipe) {
                         return s;
                     }
@@ -2887,9 +2869,6 @@ impl Render {
                     return None;
                 };
                 p
-            }
-            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
-                self.capture_pipeline(args)?
             }
             other => other,
         };
@@ -3797,7 +3776,7 @@ impl Render {
             self.mark_todo("printf non-literal format");
             return;
         };
-        let mut vals = self.exec_items(&args[1..]);
+        let vals = self.exec_items(&args[1..]);
         let mut vi = 0;
         let mut chars = fmt.chars().peekable();
         let mut out: Vec<String> = Vec::new();
@@ -4762,7 +4741,7 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
                     _ => false,
                 }
             }
-            IrExpr::Call { func, args } if func == "test" => test_ok(e, vars),
+            IrExpr::Call { func, args: _ } if func == "test" => test_ok(e, vars),
             IrExpr::Call { func, .. } if func == "arith" => expr_range(e, vars).is_some(),
             _ => false,
         },

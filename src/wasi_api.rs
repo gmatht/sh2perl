@@ -241,7 +241,7 @@ fn render_ir(prog: &crate::ir::IrProgram, lang: &str) -> Result<String, String> 
         "c" => Ok(crate::c_backend::shir_to_c(prog)),
         "go" => Ok(crate::go_backend::shir_to_go(prog)),
         "java" => crate::java_backend::shir_to_java(prog),
-        "js" => Ok(crate::js_backend::shir_to_js(prog)),
+        "js" => crate::shir::shir_to_estree_json(prog).map_err(|e| e.to_string()),
         "pl" | "perl" => Ok(crate::perl_backend::shir_to_perl(prog)),
         "py" | "python" => Ok(crate::python_backend::shir_to_python(prog)),
         "rs" | "rust" => Ok(crate::rust_backend::shir_to_rust(prog)),

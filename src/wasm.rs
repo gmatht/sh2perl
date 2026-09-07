@@ -67,7 +67,7 @@ impl Debashc {
         let mut parser = Parser::new(input);
         match parser.parse() {
             Ok(commands) => {
-                let mut generator = Generator::new();
+                let generator = Generator::new();
                 Ok(generator.generate(&commands))
             }
             Err(e) => Err(JsValue::from_str(&format!("Parse error: {}", e))),

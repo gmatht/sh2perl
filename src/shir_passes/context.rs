@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{IrStmt, VarKind};
+use crate::shir_passes::used_before_decl::UseBeforeDeclFinding;
 
 /// All analysis verdicts, populated by the analysis passes, read by the
 /// renderer (`shir_to_estree`, `shir_to_perl`, future `shir_to_<lang>`).
@@ -78,6 +79,20 @@ pub struct PassContext {
     /// Every function name defined in the program.
     pub program_functions: HashSet<String>,
 
+    /// Strongly-connected components of the function call graph — the
+    /// mutually-recursive clusters (e.g. the glob matchers
+    /// `globMatch` ↔ `ext_alt_match` ↔ `ext_match`, or the
+    /// `test`/`tokenizeTest` parser cluster). Each SCC is a sorted set
+    /// of function names; the list is in condensation order. Populated
+    /// by [`crate::shir_passes::analysis::FunctionScc`]. A transform
+    /// that must reason about a recursive cluster as a whole (coinductive
+    /// eligibility, pattern lifts) queries this instead of being
+    /// defeated by a single-function fixpoint.
+    pub function_sccs: Vec<std::collections::BTreeSet<String>>,
+
+    /// Function name → index into [`PassContext::function_sccs`].
+    pub function_scc_index: HashMap<String, usize>,
+
     /// Function names whose calls lower to the sync fnCall path. Loops
     /// over sync-only call sites go *Sync (the M8 sync-loop speedup:
     /// 10M-iter arith 2.64s → 0.23s).
@@ -102,6 +117,18 @@ pub struct PassContext {
     /// pipeline consumer — cannot be lowered to *Sync because the
     /// producer/consumer binding would be lost).
     pub async_region_loops: HashSet<*const IrStmt>,
+
+    // ── Use-before-declaration (the use-before-decl lint) ─────────
+    /// Variables read at a statement position on a control-flow path that
+    /// has no prior definition (the static check behind PowerShell's
+    /// `Set-StrictMode` undeclared-variable error, and a useful lint for
+    /// every backend — shell `$x` reads on unset vars are silently empty).
+    /// Populated by
+    /// [`crate::shir_passes::used_before_decl::UseBeforeDecl`]; consumed by
+    /// linters / the `--shir` JSON contract / future backends that treat
+    /// undeclared reads as errors. Sorted by (var, stmt_pos) for
+    /// determinism; deduplicated to one earliest-position finding per var.
+    pub use_before_decl: Vec<UseBeforeDeclFinding>,
 }
 
 impl PassContext {

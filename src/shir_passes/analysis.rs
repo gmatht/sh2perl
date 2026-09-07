@@ -129,6 +129,28 @@ impl super::Analysis for ProgramFunctions {
     fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
 }
 
+/// Strongly-connected components of the function call graph — the
+/// mutually-recursive clusters (the glob matchers, the
+/// `test`/`tokenizeTest` parser cluster, …). Populates
+/// `ctx.function_sccs` / `ctx.function_scc_index` via
+/// [`crate::shir_passes::scc`]. This is the recognition a transform
+/// needs to reason about a recursive cluster as a whole (coinductive
+/// eligibility, pattern lifts) instead of being defeated by a
+/// single-function fixpoint.
+pub struct FunctionScc;
+
+impl super::Analysis for FunctionScc {
+    fn name(&self) -> &'static str {
+        "function_scc"
+    }
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        let graph = crate::shir_passes::scc::build_call_graph(prog);
+        let sccs = crate::shir_passes::scc::tarjan_sccs(&graph);
+        ctx.function_scc_index = crate::shir_passes::scc::scc_index(&sccs);
+        ctx.function_sccs = sccs;
+    }
+}
+
 /// Function names whose calls lower to the sync fnCall path. Loops
 /// over sync-only call sites go *Sync (the M8 speedup: 10M-iter arith
 /// 2.64s → 0.23s loop-only).
@@ -192,6 +214,8 @@ mod tests {
     use crate::ir::IrProgram;
     // bring the `run` method into scope for direct `ConstVar.run(..)` calls
     use crate::shir_passes::Analysis as _;
+    // the use-before-decl lint analysis (defined in its own module)
+    use crate::shir_passes::used_before_decl::UseBeforeDecl;
 
     fn empty_prog() -> IrProgram {
         IrProgram {
@@ -221,11 +245,13 @@ mod tests {
             Box::new(NocaseMayEnable),
             Box::new(PersistFd1),
             Box::new(ProgramFunctions),
+            Box::new(FunctionScc),
             Box::new(SyncFnCalls),
             Box::new(NativeEchoFns),
             Box::new(AsyncRegionLoops),
             Box::new(LastExitLiveness),
             Box::new(LoopStatusDeadness),
+            Box::new(UseBeforeDecl),
         ];
         let mut names: Vec<&str> = analyses.iter().map(|a| a.name()).collect();
         names.sort();
@@ -252,11 +278,13 @@ mod tests {
             Box::new(NocaseMayEnable),
             Box::new(PersistFd1),
             Box::new(ProgramFunctions),
+            Box::new(FunctionScc),
             Box::new(SyncFnCalls),
             Box::new(NativeEchoFns),
             Box::new(AsyncRegionLoops),
             Box::new(LastExitLiveness),
             Box::new(LoopStatusDeadness),
+            Box::new(UseBeforeDecl),
         ];
         let mut ctx = PassContext::default();
         for a in &analyses {

@@ -51,12 +51,14 @@ pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod pattern;
 pub mod restructure;
+pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
 // split_inplace: registered-but-PARKED in transforms.rs pending the
 // c worker's embed/Carp interaction fix; declaration kept so the tree
 // compiles either way.
 pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
 pub mod strip;
 pub mod transform;
+pub mod used_before_decl; // use-before-declaration lint (the "definitely uninitialized" dataflow)
 
 pub use context::PassContext;
 pub use metric::{CalleeCount, Metric};
@@ -278,11 +280,17 @@ impl Pipeline {
                 Box::new(analysis::NocaseMayEnable),
                 Box::new(analysis::PersistFd1),
                 Box::new(analysis::ProgramFunctions),
+                Box::new(analysis::FunctionScc),
                 Box::new(analysis::SyncFnCalls),
                 Box::new(analysis::NativeEchoFns),
                 Box::new(analysis::AsyncRegionLoops),
                 Box::new(analysis::LastExitLiveness),
                 Box::new(analysis::LoopStatusDeadness),
+                // use-before-declaration: the "definitely uninitialized"
+                // dataflow — independent of the lifts; a lint every backend
+                // (and the PowerShell/ESTree frontends) can surface, and a
+                // `--shir`-serialised verdict for the corpus to assert on.
+                Box::new(used_before_decl::UseBeforeDecl),
             ],
             transforms: vec![
                 Box::new(transform::ConstantFold),

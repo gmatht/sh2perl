@@ -22,6 +22,7 @@ pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identit
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
+pub mod grep_pcre; // `grep -P 'PCRE'` → portable `grep -E 'ERE'` (lookbehind absorbed + var patterns reduced; refuse>guess)
 pub mod cat_read; // `cat [-n] FILE` → ForEachLine streaming loop (native in every backend)
 pub mod process_subst;
 pub mod ternary_desugar; // C frontend's `ternary(cond,a,b)` call → backend-neutral Ternary + test-call (non-estree backends)
@@ -54,6 +55,9 @@ pub mod merge_init_assignments;
 pub mod redundant_store_elim;
 pub mod string_accumulator;
 pub mod test_simplification;
+pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix/contains (polyfill speedup, CROSS_BACKEND_RUNTIME.md §8.1)
+pub mod echo_return; // pure-output "echo a value and return" functions → fnValue value-returning convention (CROSS_BACKEND_RUNTIME.md §8.3)
+pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
 
 
@@ -66,6 +70,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
         ("grep-o", grep_o::transform),
+        ("grep-pcre", grep_pcre::transform),
         ("cat-read", cat_read::transform),
         // process substitution: the estree corpus path never reaches this
         // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
@@ -105,6 +110,9 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("redundant-store-elim", redundant_store_elim::transform),
         ("string-accumulator", string_accumulator::transform),
         ("test-simplification", test_simplification::transform),
+        ("test-lowering", test_lowering::transform),
+        ("loop-return-lift", loop_return_lift::transform),
+        ("echo-return", echo_return::transform),
         ("unreachable-after-exit", unreachable_after_exit::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
@@ -134,6 +142,10 @@ fn enabled_names() -> Vec<String> {
 /// changed. Called by `ast_to_ir` after `optimize_stmts` (NOT by
 /// `ast_to_ir_raw` — raw = unoptimized).
 pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
+    // A previous compilation's per-function end-live map must never leak
+    // into a transform-phase walk (test_lowering's): transform phase runs
+    // pre-emission, before shir_to_estree sets it fresh. Unset = all-live.
+    crate::shir::clear_fn_end_live();
     let enabled = enabled_names();
     let mut changed = false;
     for (name, tf) in all() {

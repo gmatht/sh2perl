@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +7,7 @@ use std::time::Duration;
 use crate::cache::CommandCache;
 use crate::execution::{create_exit_status, run_shell_script};
 use crate::timeout_manager::{
-    execute_with_progress, execute_with_timeout, is_execution_frozen, OperationType,
+    execute_with_timeout, is_execution_frozen, OperationType,
 };
 use crate::utils::{
     check_ast_must_contain, check_ast_must_not_contain, check_generator_available,
@@ -16,18 +15,18 @@ use crate::utils::{
     check_perl_no_qx_builtins, check_perl_no_system_builtins, cleanup_tmp, generate_unified_diff,
     load_qx_exemptions,
 };
-use debashl::parser::errors::ParserError;
 use debashl::shared_utils;
 use debashl::{lexer::Token, Generator, Lexer, Parser};
 
 // Timeout wrapper function
+#[allow(dead_code)]
 fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
-    let operation_handle = std::thread::spawn(move || {
+    let _operation_handle = std::thread::spawn(move || {
         let result = operation();
         let _ = tx.send(result);
     });
@@ -355,7 +354,7 @@ pub fn find_uses_of_system() {
                         let mut parser = Parser::new(&content);
                         match parser.parse() {
                             Ok(commands) => {
-                                let mut generator = Generator::new();
+                                let generator = Generator::new();
                                 let perl_code = generator.generate(&commands);
 
                                 // Find lines containing "system"
@@ -1502,7 +1501,7 @@ pub fn test_all_examples() {
     let total_tests = examples.len() * generators.len();
     let mut passed_tests = 0;
     let mut current_test = 0;
-    let mut should_break = false;
+    let should_break = false;
 
     if generators.len() == 1 {
         println!(
@@ -1752,7 +1751,7 @@ pub fn test_all_examples_next_fail(
         "DEBUG: Starting test_all_examples_next_fail with test_prefix: {:?}",
         test_prefix
     );
-    let overall_start = std::time::Instant::now();
+    let _overall_start = std::time::Instant::now();
 
     // Filter to only available generators
     eprintln!("DEBUG: Filtering generators...");
@@ -1811,11 +1810,10 @@ pub fn test_all_examples_next_fail(
 
     // Test each combination
     eprintln!("DEBUG: Initializing test loop...");
-    let test_loop_start = std::time::Instant::now();
+    let _test_loop_start = std::time::Instant::now();
     let mut passed_tests = 0;
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
-    let mut should_break = false;
     eprintln!(
         "DEBUG: Test loop initialized - {} total tests, {} examples, {} generators",
         total_tests,
@@ -1890,7 +1888,6 @@ pub fn test_all_examples_next_fail(
             if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
                 println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
                 println!("Example: ./fail 001");
-                should_break = true;
                 break;
             }
 

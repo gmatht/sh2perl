@@ -248,7 +248,7 @@ fn handle_guarded_goto(
         // loop. Expressed as `while true { body; if (c) {} else break }`
         // (portable: DoWhile is Perl-only, the ESTree renderer refuses
         // it). Successor-label exits inside the span fold to `break`.
-        let converted = convert_successor_exits(&mut span, successor_label.as_deref());
+        let _converted = convert_successor_exits(&mut span, successor_label.as_deref());
         span.push(IrStmt::If {
             cond,
             then: vec![],
@@ -575,7 +575,7 @@ fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -
             | IrStmt::Background(body)
             | IrStmt::Redirect { inner: body, .. }
             | IrStmt::Function { body, .. } => body,
-            IrStmt::Case { clauses, .. } => {
+            IrStmt::Case { clauses: _, .. } => {
                 // path's body step into a Case is the union of clause
                 // bodies — but for our purposes, an `if (flag) break`
                 // at the case level is still inside the loop (the
@@ -584,7 +584,7 @@ fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -
                 // say false for case steps.
                 return false;
             }
-            IrStmt::Pipeline { stages, .. } => return false,
+            IrStmt::Pipeline { stages: _, .. } => return false,
             _ => return false,
         };
     }

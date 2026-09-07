@@ -44,7 +44,7 @@
 //!   dynamic-word stages are all left untouched (they render through
 //!   different arms and cannot be proven bash-identical here).
 
-use crate::ir::{IrExpr, IrStmt, StrStyle};
+use crate::ir::{IrExpr, IrStmt};
 
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
@@ -58,7 +58,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 fn transform_stmt(st: &mut IrStmt) -> bool {
     // Recurse into children FIRST (bottom-up — a nested pipeline inside
     // an If body is rewritten before we look at the enclosing shape).
-    let mut c = match st {
+    let c = match st {
         IrStmt::If {
             cond,
             then,

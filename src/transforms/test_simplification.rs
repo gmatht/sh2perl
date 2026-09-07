@@ -25,7 +25,7 @@
 //! `transforms.rs` (DEBASHC_TRANSFORMS gated). Prereq: const-condition-
 //! elim (consumes the emitted `Bool`).
 
-use crate::ir::{ArithAst, BinOpKind, IrExpr, IrStmt};
+use crate::ir::{BinOpKind, IrExpr, IrStmt};
 
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {

@@ -15,7 +15,6 @@
 
 use crate::ir::*;
 use crate::shir_nodes::*;
-use crate::shir_nodes::ExtExpr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -214,6 +213,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                             if emit {
                                 if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
+
                                     *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: true, target: None });
                                     LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                     return;
@@ -858,6 +858,7 @@ fn extract_stage_text(stmts: &[IrStmt]) -> Option<(IrExpr, bool)> {
         // NOT an arbitrary command — `paste | head` must not reduce as if
         // paste produced a literal string.
         [IrStmt::Expr(e)] => match e {
+
             IrExpr::Str(s, _) => Some((e.clone(), s.ends_with('\n'))),
             IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
                 let txt: String = parts.iter().filter_map(|p| match p {
@@ -987,6 +988,20 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     }
     if squeeze && (from.contains('-') || to.contains('-')) {
         return None;
+    }
+
+    // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
+    // transform, NOT a literal char map ("[:upper:]" is a class, not chars).
+    // Other classes ([:digit:], [:space:], ...) can't be a literal CharTranslate
+    // — leave them to the runtime.
+    if from.contains("[:") || to.contains("[:") {
+        if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })));
+        }
+        if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })));
+        }
+        return None; // other class translations → runtime
     }
 
     // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
@@ -1412,6 +1427,7 @@ fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String
     match op {
         ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
         "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
+
         "slice" if args.len() >= 4 => {
             // ${v:N:M} on a SCALAR is SubStr; on an ARRAY it's an index
             // subset. The two produce identical param calls, so consult the
@@ -1476,6 +1492,7 @@ fn try_lower_getvar_len(args: &[IrExpr]) -> Option<IrExpr> {
 }
 
 /// Read a variable by name: param("", name) — the shIR's plain-read form.
+#[allow(dead_code)]
 fn param_var(name: &IrExpr) -> Option<IrExpr> {
     match name {
         IrExpr::Str(s, _) => Some(IrExpr::Call { func: "param".to_string(),
@@ -1621,7 +1638,7 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
 /// becomes the composed Ext VALUE. Allowlist only (cut/tr/head/tail/wc/xargs/
 /// simple sed) — these exit 0 on static input, so `SetChildError(0)` preserves
 /// $?. grep is excluded (status idiom). Counts append the echo trailing \n.
-fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
+fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
     if std::env::var("SH2C_DEBUG").is_ok() {
         if let IrStmt::Assign { expr, .. } = stmt {
             if matches!(expr, IrExpr::Capture { .. }) {
@@ -1832,7 +1849,7 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
                             && wa.len() == 1
                             && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")
                         {
-                            if let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] =
+                            if let [IrStmt::Expr(IrExpr::Call { func: _f1, args: a1 })] =
                                 stage_bodies[0]
                             {
                                 if let [IrExpr::Str(_, _), IrExpr::Array(fa)] = a1.as_slice() {
@@ -2735,9 +2752,42 @@ fn try_lower_grep_count(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> 
 /// `echo X | grep -q P` in EXPRESSION/CONDITION position → StringContains.
 /// Only fires here (conditions), never at statement level where the status
 /// semantics would be lost.
+/// Peel command-substitution / redirect wrappers a pipeline stage may carry
+/// (e.g. `echo X | grep P >/dev/null` parses as
+/// Arrow([Call{func:"redirect", args:[Arrow([exec grep]), ...]})]), returning
+/// the innermost command-bearing `Arrow` (whose single stmt is `Expr(Call
+/// exec|builtin …)`). The grep-idiom lift needs this to recognize `grep`
+/// regardless of how the stage is wrapped — without it, a redirected grep
+/// never matches and the stage falls through to an unrenderable Arrow.
+/// Mirrors the estree ref, which lowers the bare pipeline directly.
+fn peel_to_cmd_arrow(s: &IrExpr) -> Option<&IrExpr> {
+    match s {
+        IrExpr::Arrow(b) => {
+            if b.len() == 1 {
+                if let IrStmt::Expr(e) = &b[0] {
+                    if matches!(e, IrExpr::Call { func, .. } if func == "redirect")
+                        || matches!(e, IrExpr::Capture { .. })
+                    {
+                        return peel_to_cmd_arrow(e);
+                    }
+                    return Some(s);
+                }
+            }
+            None
+        }
+        IrExpr::Capture { expr, .. } => peel_to_cmd_arrow(expr),
+        IrExpr::Call { func, args } if func == "redirect" => {
+            args.first().and_then(|a| peel_to_cmd_arrow(a))
+        }
+        _ => None,
+    }
+}
+
 fn try_lower_grep_cond(stage1: &IrExpr, stage2: &IrExpr) -> Option<IrExpr> {
-    let b1 = match stage1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
-    let b2 = match stage2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let s1 = peel_to_cmd_arrow(stage1)?;
+    let s2 = peel_to_cmd_arrow(stage2)?;
+    let b1 = match s1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let b2 = match s2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
     let text = extract_text_from_stage(b1)?;
     let [IrStmt::Expr(IrExpr::Call { func, args })] = b2 else { return None };
     if !(func == "exec" || func == "builtin") { return None; }

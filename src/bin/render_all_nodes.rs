@@ -47,7 +47,7 @@ fn main() {
         ("python", Box::new(|p| Ok(debashl::python_backend::shir_to_python(p)))),
         ("rust", Box::new(|p| Ok(debashl::rust_backend::shir_to_rust(p)))),
         ("zig", Box::new(|p| Ok(debashl::zig_backend::shir_to_zig(p)))),
-        ("js", Box::new(|p| Ok(debashl::js_backend::shir_to_js(p)))),
+        ("js", Box::new(|p| debashl::shir::shir_to_estree_json(p).map_err(|e| e.to_string()))),
     ];
     let markers = [
         "TODO(unsupported)", "TODO", "unsupported", "not yet supported",

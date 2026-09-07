@@ -522,9 +522,9 @@ pub fn generate_ls_command(
         // Pipeline context: populate array but don't print - output goes to pipeline
         let should_sort = true; // Default to sorting to match shell behavior
         let array_name = format!("ls_files_{}", generator.get_unique_id());
-        let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
-        let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
-        let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+        let _all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+        let _all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+        let _all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
 
         if has_file_args {
             // Handle multiple file arguments
@@ -914,6 +914,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
 
     // Restore the saved indent level
     generator.indent_level = saved_indent;
+    let _ = &sort_by_time;
 
     output
 }

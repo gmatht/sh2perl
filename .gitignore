@@ -88,3 +88,6 @@ target-core/
 /.tmp_purify/
 /.tmp_*
 /test_purify_out.pl
+
+# uu-ffi build artifact (runtime/build_uu_ffi.sh reproduces it; do not commit the 24MB .so)
+runtime/lib/

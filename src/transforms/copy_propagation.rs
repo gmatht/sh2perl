@@ -104,6 +104,7 @@ fn count_assigns(stmts: &[IrStmt], counts: &mut HashMap<String, usize>, values: 
                         values.insert(t.var.clone(), expr.clone());
                     }
                 }
+                count_expr(expr, counts, values);
             }
             IrStmt::Declare { vars, init, .. } => {
                 if let Some(i) = init {
@@ -111,10 +112,215 @@ fn count_assigns(stmts: &[IrStmt], counts: &mut HashMap<String, usize>, values: 
                         *counts.entry(v.name.clone()).or_insert(0) += 1;
                         values.insert(v.name.clone(), i.clone());
                     }
+                    count_expr(i, counts, values);
                 }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for el in elements {
+                    count_expr(el, counts, values);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                count_expr(cond, counts, values);
+                count_assigns(then, counts, values);
+                for (c, b) in elsifs {
+                    count_expr(c, counts, values);
+                    count_assigns(b, counts, values);
+                }
+                count_assigns(else_, counts, values);
+            }
+            IrStmt::For { iter, body, .. } => {
+                count_expr(iter, counts, values);
+                count_assigns(body, counts, values);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                count_expr(cond, counts, values);
+                count_assigns(body, counts, values);
+            }
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+                ..
+            } => {
+                count_assigns(init, counts, values);
+                count_expr(cond, counts, values);
+                count_assigns(step, counts, values);
+                count_assigns(body, counts, values);
+            }
+            IrStmt::Function { body, .. } => {
+                count_assigns(body, counts, values);
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                count_assigns(body, counts, values);
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(ch) = &c.ch {
+                        count_expr(ch, counts, values);
+                    }
+                    if let Some(v) = &c.value {
+                        count_expr(v, counts, values);
+                    }
+                    count_assigns(&c.body, counts, values);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                count_assigns(inner, counts, values);
+                for r in redirects {
+                    count_expr(&r.target, counts, values);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                count_expr(discriminant, counts, values);
+                for c in clauses {
+                    count_assigns(&c.body, counts, values);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    count_assigns(stage, counts, values);
+                }
+            }
+            IrStmt::Exec { cmd, args, env, .. } => {
+                count_expr(cmd, counts, values);
+                for a in args {
+                    count_expr(a, counts, values);
+                }
+                for (_, v) in env {
+                    count_expr(v, counts, values);
+                }
+            }
+            IrStmt::Expr(e) => count_expr(e, counts, values),
+            IrStmt::Output { value, .. } => count_expr(value, counts, values),
+            IrStmt::WriteFile { path, content, .. } => {
+                count_expr(path, counts, values);
+                count_expr(content, counts, values);
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                count_expr(expr, counts, values);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) => {
+                count_expr(e, counts, values);
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                count_assigns(body, counts, values);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        count_expr(m, counts, values);
+                    }
+                    count_assigns(&e.body, counts, values);
+                }
+                count_assigns(else_body, counts, values);
+                count_assigns(finally_body, counts, values);
             }
             _ => {}
         }
+    }
+}
+
+/// Recurse into expression-nested statement bodies (arrows/lambdas) and
+/// sub-expressions so assignments there are counted too.
+fn count_expr(e: &IrExpr, counts: &mut HashMap<String, usize>, values: &mut HashMap<String, IrExpr>) {
+    match e {
+        IrExpr::Arrow(stmts) => count_assigns(stmts, counts, values),
+        IrExpr::Lambda { body, .. } => count_assigns(body, counts, values),
+        IrExpr::ArrayComp {
+            iter,
+            elem,
+            cond,
+            ..
+        } => {
+            count_expr(iter, counts, values);
+            count_expr(elem, counts, values);
+            if let Some(c) = cond {
+                count_expr(c, counts, values);
+            }
+        }
+        IrExpr::Splice(e) => count_expr(e, counts, values),
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                count_expr(a, counts, values);
+            }
+        }
+        IrExpr::Array(elems) => {
+            for el in elems {
+                count_expr(el, counts, values);
+            }
+        }
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                count_expr(v, counts, values);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    count_expr(x, counts, values);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Ternary { cond: lhs, then: rhs, .. } => {
+            count_expr(lhs, counts, values);
+            count_expr(rhs, counts, values);
+        }
+        IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
+            count_expr(key, counts, values);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            count_expr(obj, counts, values);
+            for a in args {
+                count_expr(a, counts, values);
+            }
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            count_expr(expr, counts, values);
+            count_expr(default, counts, values);
+        }
+        IrExpr::Arith(a) => count_arith(a, counts, values),
+        _ => {}
+    }
+}
+
+fn count_arith(a: &ArithAst, counts: &mut HashMap<String, usize>, values: &mut HashMap<String, IrExpr>) {
+    match a {
+        ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => {}
+        ArithAst::Index { key, .. } => count_arith(key, counts, values),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            count_arith(lhs, counts, values);
+            count_arith(rhs, counts, values);
+        }
+        ArithAst::Un { arg, .. } => count_arith(arg, counts, values),
+        ArithAst::Cond {
+            test,
+            then,
+            else_,
+            ..
+        } => {
+            count_arith(test, counts, values);
+            count_arith(then, counts, values);
+            count_arith(else_, counts, values);
+        }
+        ArithAst::Assign { rhs, .. } => count_arith(rhs, counts, values),
+        ArithAst::IncDec { .. } => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => count_arith(arg, counts, values),
     }
 }
 
