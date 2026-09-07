@@ -974,14 +974,19 @@ fn render_test_text(text: String) -> IrExpr {
 }
 
 fn render_test_tokens(text: &str) -> IrExpr {
-    let mut tokens: Vec<&str> = text.split_whitespace().collect();
+    // Quote-aware tokenization (the ir.rs tokenizer: double-quoted
+    // segments stay ONE token and their quotes are stripped). The old
+    // naive split_whitespace handed operands still carrying their shell
+    // quotes to the -f/-d/... wrappers, which re-quoted them — the
+    // `-f ""test.txt""` doubling class (fail's largest red block).
+    let mut tokens: Vec<String> = crate::ir::tokenize_test(text);
     // the `[[ ... ]]` form appends a trailing `[[` marker word
-    if tokens.last() == Some(&"[[") {
+    if tokens.last().map(String::as_str) == Some("[[") {
         tokens.pop();
     }
     // Build an IrExpr for the condition
     if tokens.len() == 3 {
-        let (left, op, right) = (tokens[0], tokens[1], tokens[2]);
+        let (left, op, right) = (tokens[0].as_str(), tokens[1].as_str(), tokens[2].as_str());
         match op {
             "-f" => IrExpr::Str(format!("-f \"{}\"", left), StrStyle::Raw),
             "-d" => IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs: Box::new(IrExpr::Str(format!("-d \"{}\"", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Bool(true)) },
@@ -1028,7 +1033,7 @@ fn render_test_tokens(text: &str) -> IrExpr {
             _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
         }
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
-        let (op, arg) = (tokens[0], tokens[1]);
+        let (op, arg) = (tokens[0].as_str(), tokens[1].as_str());
         match op {
             "-f" => IrExpr::Str(format!("-f \"{}\"", arg), StrStyle::Raw),
             "-d" => IrExpr::Str(format!("-d \"{}\"", arg), StrStyle::Raw),

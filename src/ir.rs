@@ -1047,6 +1047,7 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             .find(|(i, _)| *i == idx)
             .map(|(_, l)| *l);
         let before = body.len();
+        eprintln!("PROBE shir_to_perl emit stmt = {stmt:?}");
         emit_stmt(&mut body, stmt, 0);
         if let Some(l) = line {
             // a SHORT comment at the end of the statement's first line:
@@ -2309,7 +2310,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             elsifs,
             else_,
         } => {
+            eprintln!("PROBE emit_stmt If cond = {cond:?}");
             let cond_str = ir_expr_to_perl(cond);
+            eprintln!("PROBE emit_stmt If cond_str = {cond_str:?}");
             emit_indent(out, indent);
             out.push_str(&format!("if ({}) {{\n", cond_str));
             for s in then {
@@ -5433,7 +5436,7 @@ fn glob_or_extglob_to_regex(lhs: &str, pat: &str) -> Option<String> {
 
 /// Tokenize a test string: whitespace-separated, double-quoted runs kept
 /// together (with the quotes stripped but `$var` left for interpolation).
-fn tokenize_test(s: &str) -> Vec<String> {
+pub(crate) fn tokenize_test(s: &str) -> Vec<String> {
     let mut toks = Vec::new();
     let mut cur = String::new();
     let mut in_dq = false;
@@ -8165,3 +8168,4 @@ mod tests {
         );
     }
 }
+
