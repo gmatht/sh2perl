@@ -2956,12 +2956,11 @@ impl Render {
                             // joining into one word made the child run
                             // 'id -u' (with the space) as a command name.
                             // Emit a C loop appending 'arg' per argv slot.
-                            let quoted = "'\\\"'\\\"'"; // '"'"' escaping
+                            let quoted = "'\"'\"'"; // '"'"' escaping
                             let body = format!(
-                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; {a1} for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) {a2} else {a3} }} {a4} }} }}",
+                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_add({a1}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_add({a2}); else _sh_addc(*_qp); }} _sh_add({a4}); }} }}",
                                 a1 = Self::cstr(" '"),
                                 a2 = Self::cstr(quoted),
-                                a3 = "{ _sh_addc(*_qp); }",
                                 a4 = Self::cstr("'"),
                             );
                             match buf {
@@ -15955,6 +15954,34 @@ mod tests {
         let mut r = Render::default();
         r.store.insert(name.to_string());
         r
+    }
+
+    #[test]
+    fn getvar_at_word_quotes_argv_for_child_bash() {
+        // `getVar("@")` as a child-bash word must expand to SEPARATELY
+        // quoted argv words: `_sh_add(" '")` opens the quote, an
+        // embedded `'` is escaped via the shell `'"'"'` idiom (backslash
+        // is LITERAL inside single quotes, so `'\"'\"'` would corrupt
+        // the command), and `_sh_add("'")` closes it. Regression: the
+        // arm once emitted bare string-literal statements (no _sh_add
+        // calls, so "$@" silently vanished) with the backslash form.
+        let mut r = Render::default();
+        let at = IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![IrExpr::Str(
+                "@".to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        };
+        r.sh_word(CmdBuf::Shared, &at);
+        let out = r.out.join("\n");
+        assert!(out.contains("_sh_add(\" '\")"), "opens quote, got: {out}");
+        assert!(
+            out.contains("_sh_add(\"'\\\"'\\\"'\")"),
+            "'\"'\"' escape, got: {out}"
+        );
+        assert!(out.contains("_sh_add(\"'\")"), "closes quote, got: {out}");
+        assert!(!out.contains("\\\\\""), "no backslash escape, got: {out}");
     }
 
     #[test]
