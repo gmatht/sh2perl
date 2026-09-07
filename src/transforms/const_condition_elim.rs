@@ -31,7 +31,7 @@
 //!     once, so it is replaced by its body.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). Prereq:
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Prereq:
 //! copy-propagation (turn const vars into literals first). The pass
 //! rebuilds statement lists, so it nests cleanly into any body.
 
@@ -199,9 +199,115 @@ fn eval_test(s: &IrExpr) -> Option<bool> {
                 _ => return None,
             })
         }
-        ["-n", w] if !w.contains('$') => Some(!w.is_empty()),
-        ["-z", w] if !w.contains('$') => Some(w.is_empty()),
+        // `-n`/`-z` only on a BARE literal word. A QUOTED word (
+        // `-z "$var"`, `-n ""`) is NOT literal: the quotes are part of
+        // the raw test string, a `"$var"` expansion is a variable (unset
+        // → EMPTY, so `-z "$unset"` is TRUE — never foldable), and
+        // `-n ""` / `-z ""` are empty-ARG semantics ("-n" on an empty
+        // arg is false, "-z" is true) — the inverse of the bare-word
+        // reading. Only `-z foo` / `-n bar` (no quotes, no `$`) fold.
+        ["-n", w] if is_bare_literal(w) => Some(!w.is_empty()),
+        ["-z", w] if is_bare_literal(w) => Some(w.is_empty()),
         _ => None,
     }
 }
 
+/// A likely single literal word: no `$` (a variable reference) and no
+/// quote characters (a quoted empty string or quoted var).
+fn is_bare_literal(w: &str) -> bool {
+    !w.contains('$') && !w.contains('"') && !w.contains('\'')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn test_cond(s: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "test".to_string(),
+            args: vec![IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)],
+        }
+    }
+
+    fn if_stmt(cond: IrExpr, then_txt: &str, else_txt: &str) -> IrStmt {
+        IrStmt::If {
+            cond,
+            then: vec![IrStmt::Output {
+                value: IrExpr::Str(then_txt.to_string(), StrStyle::DoubleQuoted),
+                newline: true,
+                target: None,
+            }],
+            elsifs: vec![],
+            else_: vec![IrStmt::Output {
+                value: IrExpr::Str(else_txt.to_string(), StrStyle::DoubleQuoted),
+                newline: true,
+                target: None,
+            }],
+        }
+    }
+
+    /// `[ -z "$never_set2" ]` — a QUOTED variable is not constant (unset
+    /// expands to EMPTY, so `-z` is TRUE — never foldable to false).
+    #[test]
+    fn refuses_quoted_var_in_z() {
+        let cond = test_cond(" -z \"$never_set2\" ");
+        assert_eq!(eval_cond(&cond), None, "quoted $var must not fold");
+    }
+
+    /// `[ -z foo ]` — a bare literal folds (foo is non-empty → false).
+    #[test]
+    fn folds_bare_literal_z() {
+        let cond = test_cond("-z foo");
+        assert_eq!(eval_cond(&cond), Some(false));
+    }
+
+    /// `[ -z "" ]` — the quoted EMPTY string has empty-arg semantics
+    /// (`-z ""` is true) — the raw quote chars are not a bare literal.
+    #[test]
+    fn refuses_quoted_empty_in_z() {
+        let cond = test_cond("-z \"\"");
+        assert_eq!(eval_cond(&cond), None);
+    }
+
+    /// `[ -n "" ]` — quote chars make it non-literal (deferred to the
+    /// runtime, which decides the empty-arg truth).
+    #[test]
+    fn refuses_quoted_empty_in_n() {
+        let cond = test_cond("-n \"\"");
+        assert_eq!(eval_cond(&cond), None);
+    }
+
+    /// `[ -n "hello" ]` — quoted literal stays out of the bare-literal
+    /// fold (conservative; the runtime decides).
+    #[test]
+    fn refuses_quoted_literal_in_n() {
+        let cond = test_cond("-n \"hello\"");
+        assert_eq!(eval_cond(&cond), None);
+    }
+
+    /// `[ 5 -eq 5 ]` still folds to true.
+    #[test]
+    fn still_folds_numeric() {
+        let cond = test_cond("5 -eq 5");
+        assert_eq!(eval_cond(&cond), Some(true));
+    }
+
+    /// `[ "$x" -eq 5 ]` — quoted var in a numeric compare is refused by
+    /// the parse (never mis-folded).
+    #[test]
+    fn refuses_quoted_var_numeric() {
+        let cond = test_cond("\"$x\" -eq 5");
+        assert_eq!(eval_cond(&cond), None);
+    }
+
+    /// End-to-end: `if [ -z "$v" ]; then A; else B; fi` stays an If (the
+    /// condition is not constant), never pruned to the else branch.
+    #[test]
+    fn keeps_if_with_quoted_var_cond() {
+        let mut stmts = vec![if_stmt(test_cond(" -z \"$v\" "), "A", "B")];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0], IrStmt::If { .. }));
+    }
+}
