@@ -342,7 +342,6 @@ enum CmdBuf {
 const FIXED_BUF_CAP: u64 = 1024;
 
 /// Per-capture-site result buffer size (command substitution output).
-const CAP_BUF: usize = 65536;
 
 /// Static capacity of the array stores (elements / assoc pairs).
 const ARR_CAP: usize = 1024;
@@ -597,11 +596,18 @@ impl Render {
     /// pointer would itself be UB.
     fn emit_guarded_copy(&mut self, name: &str, b: u64, rhs: &str) {
         let rhs_c = format!("(char*)({rhs})");
+        // a vbuf member read (`_v12.p`) is a string too — the `.p`
+        // breaks is_ident, and without this the bounded store drops
+        // the value (emits `name[0] = 0`). Like a capture site, a vbuf
+        // source is NOT reliably bounded, so it also skips the
+        // debug assert (strncpy below still truncates safely).
+        let is_vbuf = rhs.strip_suffix(".p").is_some_and(|x| is_ident(x));
         let stringy = rhs.starts_with('"')
             || rhs.starts_with("(char*)")
             || rhs.starts_with('(')
             || rhs.starts_with("sh2_")
             || rhs.starts_with("_cap_")
+            || is_vbuf
             || is_ident(rhs);
         if stringy {
             // The DEBUG assert is a tripwire for bounded SOURCES (string
@@ -610,7 +616,7 @@ impl Render {
             // emits hash + filename — the analysis only counted the
             // hash), so the assert would false-positive; the strncpy
             // below still truncates safely.
-            if !rhs.starts_with("_cap_") && !rhs.starts_with("sh2_") {
+            if !rhs.starts_with("_cap_") && !rhs.starts_with("sh2_") && !is_vbuf {
                 self.emit(&format!("assert(strlen({rhs_c}) <= {b});"));
             }
             self.emit(&format!("strncpy({name}, {rhs_c}, {b} + 1);"));
@@ -652,6 +658,7 @@ impl Render {
         self.emit("#include <string.h>");
         self.emit("#include <sys/wait.h>");
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
+        self.emit("#include <errno.h>"); // EINTR retry on capture reads
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
@@ -662,12 +669,12 @@ impl Render {
             self.emit("static void _sh_import_env(void) {");
             self.emit("  FILE *_pf = fopen(\"/tmp/.shellstate_pull\", \"r\");");
             self.emit("  if (!_pf) return;");
-            self.emit("  static char _pl[65536];");
-            self.emit("  while (fgets(_pl, sizeof _pl, _pf)) {");
-            self.emit("    size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n'||_pl[_pn-1]=='\\r')) _pl[--_pn] = 0;");
-            self.emit("    char *_eq = strchr(_pl, '=');");
-            self.emit("    if (!_eq || _eq == _pl) continue;");
-            self.emit("    *_eq = 0; setenv(_pl, _eq + 1, 1);");
+            self.emit("  static _sh_vbuf _pl = {0, 0};");
+            self.emit("  while (_sh_fgets_line(_pf, &_pl)) {");
+            self.emit("    size_t _pn = strlen(_pl.p); while (_pn && (_pl.p[_pn-1]=='\\n'||_pl.p[_pn-1]=='\\r')) _pl.p[--_pn] = 0;");
+            self.emit("    char *_eq = strchr(_pl.p, '=');");
+            self.emit("    if (!_eq || _eq == _pl.p) continue;");
+            self.emit("    *_eq = 0; setenv(_pl.p, _eq + 1, 1);");
             self.emit("  }");
             self.emit("  fclose(_pf); remove(\"/tmp/.shellstate_pull\");");
             self.emit("}"); 
@@ -738,7 +745,27 @@ impl Render {
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
             self.emit("static void _sh_grow(char **b, size_t *cap, size_t need) {");
             self.emit("  if (need <= *cap) return;");
-            self.emit("  *cap = need * 2; *b = (char*)realloc(*b, *cap);");
+            self.emit("  *cap = need * 2;");
+            self.emit("  char *np = (char*)realloc(*b, *cap);");
+            self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  *b = np;");
+            self.emit("}");
+            // growable VALUE buffer: heap storage for values whose size
+            // cannot be proven (captures, pipelines, fn returns, joins,
+            // slices — the Python-origin unbounded case). Fixed statics
+            // silently truncated past 64KB; a vbuf doubles until the
+            // value fits. Per-site `static _sh_vbuf` reuse keeps the
+            // high-water mark with no per-call malloc after warmup, and
+            // the same consume-immediately discipline as the old statics
+            // (no ownership transfer, no frees, nothing to leak).
+            self.emit("typedef struct { char *p; size_t cap; } _sh_vbuf;");
+            self.emit("static void _sh_vgrow(_sh_vbuf *b, size_t need) {");
+            self.emit("  if (need <= b->cap) return;");
+            self.emit("  size_t ncap = b->cap ? b->cap : 256;");
+            self.emit("  while (ncap < need) ncap *= 2;");
+            self.emit("  char *np = (char*)realloc(b->p, ncap);");
+            self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  b->p = np; b->cap = ncap;");
             self.emit("}");
             self.emit("static void _sh_add(const char *s) {");
             self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(s);");
@@ -832,44 +859,44 @@ impl Render {
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
             self.emit("  return \"\";");
             self.emit("}");
-            self.emit("static void _sh_join_arr_nl(char *d, size_t cap, char **a, size_t n) {");
+            self.emit("static void _sh_join_arr_nl(_sh_vbuf *d, char **a, size_t n) {");
             self.emit("  size_t dn = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
-            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = '\\n';");
+            self.emit("    if (i > 0) { _sh_vgrow(d, dn + 2); d->p[dn++] = '\\n'; }");
             self.emit("    if (!a[i]) continue;");
-            self.emit("    for (const char *s = a[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("    for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
             self.emit("  }");
-            self.emit("  d[dn] = 0;");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
-            self.emit("static void _sh_join_arr(char *d, size_t cap, char **a, size_t n) {");
+            self.emit("static void _sh_join_arr(_sh_vbuf *d, char **a, size_t n) {");
             self.emit("  size_t dn = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
-            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    if (i > 0) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    if (!a[i]) continue;");
-            self.emit("    for (const char *s = a[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("    for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
             self.emit("  }");
-            self.emit("  d[dn] = 0;");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
-            self.emit("static void _sh_join_keys(char *d, size_t cap, char **k, size_t n) {");
+            self.emit("static void _sh_join_keys(_sh_vbuf *d, char **k, size_t n) {");
             self.emit("  size_t dn = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
-            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    if (i > 0) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    if (!k[i]) continue;");
-            self.emit("    for (const char *s = k[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("    for (const char *s = k[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
             self.emit("  }");
-            self.emit("  d[dn] = 0;");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
-            self.emit("static char *_sh_argv_join(char *d, size_t cap) {");
-            self.emit("  d[0] = 0; size_t n = 0;");
+            self.emit("static char *_sh_argv_join(_sh_vbuf *d) {");
+            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0; size_t n = 0;");
             self.emit("  for (int i = 1; i < _sh_argc; i++) {");
-            self.emit("    if (i > 1 && n + 1 < cap) d[n++] = ' ';");
+            self.emit("    if (i > 1) { _sh_vgrow(d, n + 2); d->p[n++] = ' '; }");
             self.emit("    const char *s = _sh_argv[i];");
-            self.emit("    while (s && *s && n + 1 < cap) d[n++] = *s++;");
+            self.emit("    while (s && *s) { _sh_vgrow(d, n + 2); d->p[n++] = *s++; }");
             self.emit("  }");
-            self.emit("  d[n] = 0; return d;");
+            self.emit("  _sh_vgrow(d, n + 1); d->p[n] = 0; return d->p;");
             self.emit("}");
             self.emit("/* ${@:off:len} — positional-param slice (off is 1-based; off 0 includes $0) */");
-            self.emit("static char *_sh_argv_slice(char *d, size_t cap, long long off, long long len) {");
+            self.emit("static char *_sh_argv_slice(_sh_vbuf *d, long long off, long long len) {");
             self.emit("  long long total = (long long)_sh_argc;");
             self.emit("  long long b = (off <= 0) ? 0 : off;");
             self.emit("  if (b > total) b = total;");
@@ -877,12 +904,13 @@ impl Render {
             self.emit("  long long e = b + ((len < 0) ? nav + len : len);");
             self.emit("  if (e > total) e = total; if (e < b) e = b;");
             self.emit("  size_t dn = 0; long long i;");
+            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
             self.emit("  for (i = b; i < e; i++) {");
-            self.emit("    if (i > b && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    if (i > b) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    const char *s = _sh_argv[i] ? _sh_argv[i] : \"\";");
-            self.emit("    while (*s && dn + 1 < cap) d[dn++] = *s++;");
+            self.emit("    while (*s) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s++; }");
             self.emit("  }");
-            self.emit("  d[dn] = 0; return d;");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0; return d->p;");
             self.emit("}");
             self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
@@ -903,45 +931,64 @@ impl Render {
             self.emit("}");
             self.emit("static void _sh_run(void) { (void)_sh_system_rc(); }");
             self.emit("/* run the built command, capture stdout, strip trailing newlines */");
-            self.emit("static void _sh_capture(char *buf, size_t cap, const char *cmd) {");
-            self.emit("  if (!cmd || !*cmd) { buf[0] = 0; _sh_rc = 0; return; }");
+            self.emit("static void _sh_capture(_sh_vbuf *d, const char *cmd) {");
+            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
+            self.emit("  if (!cmd || !*cmd) { _sh_rc = 0; return; }");
             self.emit("  _sh_wrap_cmd(cmd);");
             self.emit("  FILE *p = popen(_sh_wrap, \"r\");");
-            self.emit("  if (!p) { buf[0] = 0; _sh_rc = 127; return; }");
-            self.emit("  size_t n = fread(buf, 1, cap - 1, p); buf[n] = 0;");
+            self.emit("  if (!p) { _sh_rc = 127; return; }");
+            self.emit("  size_t n = 0, r;");
+            self.emit("  do {");
+            self.emit("    _sh_vgrow(d, n + 8192);");
+            self.emit("    r = fread(d->p + n, 1, d->cap - n - 1, p);");
+            self.emit("    n += r;");
+            self.emit("  } while (r > 0);");
+            self.emit("  d->p[n] = 0;");
             self.emit("  int rc = pclose(p);");
             self.emit("  _sh_rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
-            self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
+            self.emit("  while (n > 0 && (d->p[n - 1] == '\\n' || d->p[n - 1] == '\\r')) d->p[--n] = 0;");
             self.emit("}");
             // in-process stdout capture for a transpiled shell function:
-            // run it with stdout to a pipe, read the value (the fnValue
-            // dispatch / `$(func args)` of a known function). The function
-            // sets _sh_rc itself (its last command's status).
-            self.emit("static char *_sh_capture_fn(void (*fn)(void), char *buf, size_t cap) {");
-            self.emit("  int pfd[2];");
-            self.emit("  if (pipe(pfd) != 0) { buf[0] = 0; return buf; }");
+            // stdout is redirected to an UNLINKED TEMP FILE, not a pipe —
+            // a pipe deadlocks past its buffer: fn() must run to
+            // completion before any read starts, but a child writing
+            // more than the pipe holds blocks forever while someone
+            // waits on it (seq 1 20000 through $(f) hung exactly this
+            // way). A file never applies backpressure; afterwards the
+            // file is rewound and read into the growable buffer. The
+            // function sets _sh_rc itself (its last command's status).
+            self.emit("static char *_sh_capture_fn(void (*fn)(void), _sh_vbuf *vb) {");
+            self.emit("  _sh_vgrow(vb, 1); vb->p[0] = 0;");
+            self.emit("  FILE *t = tmpfile();");
+            self.emit("  if (!t) return vb->p;");
             self.emit("  fflush(stdout);");
             self.emit("  int saved = dup(1);");
-            self.emit("  dup2(pfd[1], 1); close(pfd[1]);");
+            self.emit("  dup2(fileno(t), 1);");
             self.emit("  fn();");
             self.emit("  fflush(stdout);");
             self.emit("  dup2(saved, 1); close(saved);");
-            self.emit("  ssize_t _n = read(pfd[0], buf, cap - 1);");
-            self.emit("  if (_n < 0) _n = 0;");
-            self.emit("  size_t n = (size_t)_n; buf[n] = 0;");
-            self.emit("  close(pfd[0]);");
-            self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
-            self.emit("  return buf;");
+            self.emit("  rewind(t);");
+            self.emit("  size_t n = 0, r;");
+            self.emit("  do {");
+            self.emit("    _sh_vgrow(vb, n + 8192);");
+            self.emit("    r = fread(vb->p + n, 1, vb->cap - n - 1, t);");
+            self.emit("    n += r;");
+            self.emit("  } while (r > 0);");
+            self.emit("  vb->p[n] = 0;");
+            self.emit("  fclose(t);");
+            self.emit("  while (n > 0 && (vb->p[n - 1] == '\\n' || vb->p[n - 1] == '\\r')) vb->p[--n] = 0;");
+            self.emit("  return vb->p;");
             self.emit("}");
             // function return-value lift: copy the value, strip trailing
             // newlines (echo printed value+\n; the $( ) capture strips
             // trailing \n/\r — the returned value IS that text)
-            self.emit("static char *_sh_ret_val(char *buf, size_t cap, const char *v) {");
-            self.emit("  size_t dn = 0;");
-            self.emit("  if (v) { for (const char *p = v; *p && dn + 1 < cap; p++) buf[dn++] = *p; }");
-            self.emit("  buf[dn] = 0;");
-            self.emit("  while (dn > 0 && (buf[dn - 1] == '\\n' || buf[dn - 1] == '\\r')) buf[--dn] = 0;");
-            self.emit("  return buf;");
+            self.emit("static char *_sh_ret_val(_sh_vbuf *vb, const char *v) {");
+            self.emit("  size_t n = v ? strlen(v) : 0;");
+            self.emit("  _sh_vgrow(vb, n + 1);");
+            self.emit("  if (v) memcpy(vb->p, v, n);");
+            self.emit("  vb->p[n] = 0;");
+            self.emit("  while (n > 0 && (vb->p[n - 1] == '\\n' || vb->p[n - 1] == '\\r')) vb->p[--n] = 0;");
+            self.emit("  return vb->p;");
             self.emit("}");
             // in-process function CALL: argv swap (positional params),
             // shared-buffer detach (the callee's own sites would
@@ -950,22 +997,22 @@ impl Render {
             // positional-const proof NO callee reads positionals — the
             // swap is unobservable, omitted.
             if self.pos_const {
-                self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, char *buf, size_t cap) {");
+                self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, _sh_vbuf *vb) {");
                 self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
                 self.emit("  (void)av; (void)n;");
-                self.emit("  _sh_capture_fn(fn, buf, cap);");
+                self.emit("  _sh_capture_fn(fn, vb);");
                 self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
-                self.emit("  return buf;");
+                self.emit("  return vb->p;");
                 self.emit("}");
             } else {
-            self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, char *buf, size_t cap) {");
+            self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, _sh_vbuf *vb) {");
             self.emit("  char **sv = _sh_argv; int sc = _sh_argc;");
             self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
             self.emit("  _sh_argv = av; _sh_argc = n;");
-            self.emit("  _sh_capture_fn(fn, buf, cap);");
+            self.emit("  _sh_capture_fn(fn, vb);");
             self.emit("  _sh_argv = sv; _sh_argc = sc;");
             self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
-            self.emit("  return buf;");
+            self.emit("  return vb->p;");
             self.emit("}");
             }
             self.emit("/* string-var ++/-- — function-call boundaries are sequence");
@@ -1030,13 +1077,21 @@ impl Render {
             self.emit("  return rc;");
             self.emit("}");
             self.emit("/* split a captured string on IFS whitespace into words */");
-            self.emit("static size_t _sh_split(char *buf, char **words, size_t max) {");
+            self.emit("static void _sh_wgrow(char ***w, size_t *cap, size_t need) {");
+            self.emit("  if (need <= *cap) return;");
+            self.emit("  size_t ncap = *cap ? *cap : 64;");
+            self.emit("  while (ncap < need) ncap *= 2;");
+            self.emit("  char **nw = (char**)realloc(*w, ncap * sizeof *nw);");
+            self.emit("  if (!nw) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  *w = nw; *cap = ncap;");
+            self.emit("}");
+            self.emit("static size_t _sh_split(char *buf, char ***w, size_t *wcap) {");
             self.emit("  size_t n = 0; char *p = buf;");
             self.emit("  while (*p) {");
             self.emit("    while (*p == ' ' || *p == '\\t' || *p == '\\n') p++;");
             self.emit("    if (!*p) break;");
-            self.emit("    if (n >= max) break;");
-            self.emit("    words[n++] = p;");
+            self.emit("    _sh_wgrow(w, wcap, n + 1);");
+            self.emit("    (*w)[n++] = p;");
             self.emit("    while (*p && *p != ' ' && *p != '\\t' && *p != '\\n') p++;");
             self.emit("    if (*p) *p++ = 0;");
             self.emit("  }");
@@ -1048,36 +1103,57 @@ impl Render {
             self.emit("}");
             self.emit("/* `read` builtin: one line from stdin into a static buffer */");
             self.emit("static char *_sh_readline(void) {");
-            self.emit("  static char *_sh_rd = 0; static size_t _sh_rdcap = 0;");
-            self.emit("  _sh_grow(&_sh_rd, &_sh_rdcap, 4096);");
-            self.emit("  if (!fgets(_sh_rd, 4096, stdin)) { _sh_rd[0] = 0; return _sh_rd; }");
-            self.emit("  size_t n = strlen(_sh_rd);");
-            self.emit("  while (n > 0 && (_sh_rd[n - 1] == '\\n' || _sh_rd[n - 1] == '\\r')) _sh_rd[--n] = 0;");
-            self.emit("  return _sh_rd;");
+            self.emit("  static _sh_vbuf _sh_rd = {0, 0};");
+            self.emit("  size_t n = 0;");
+            self.emit("  for (;;) {");
+            self.emit("    _sh_vgrow(&_sh_rd, n + 512);");
+            self.emit("    if (!fgets(_sh_rd.p + n, (int)(_sh_rd.cap - n), stdin)) break;");
+            self.emit("    n += strlen(_sh_rd.p + n);");
+            self.emit("    if (n > 0 && _sh_rd.p[n - 1] == '\\n') break;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(&_sh_rd, n + 1); _sh_rd.p[n] = 0;");
+            self.emit("  while (n > 0 && (_sh_rd.p[n - 1] == '\\n' || _sh_rd.p[n - 1] == '\\r')) _sh_rd.p[--n] = 0;");
+            self.emit("  return _sh_rd.p;");
+            self.emit("}");
+            // a FILE line of any length (fgets chunks until newline —
+            // a single fgets would SPLIT long lines into several reads).
+            // Returns 1 per line (the final unterminated line counts),
+            // 0 at EOF. Used by the while-read/mapfile/ForEachLine loops
+            // and the state-import pump.
+            self.emit("static int _sh_fgets_line(FILE *f, _sh_vbuf *vb) {");
+            self.emit("  size_t n = 0;");
+            self.emit("  for (;;) {");
+            self.emit("    _sh_vgrow(vb, n + 512);");
+            self.emit("    if (!fgets(vb->p + n, (int)(vb->cap - n), f)) break;");
+            self.emit("    n += strlen(vb->p + n);");
+            self.emit("    if (n > 0 && vb->p[n - 1] == '\\n') break;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(vb, n + 1); vb->p[n] = 0;");
+            self.emit("  return n > 0;");
             self.emit("}");
             // `while IFS= read -r line; do ...; done <<< \"$s\"` — iterate
             // the lines of a STRING (the herestring adds a trailing
             // newline, so the line count is newlines(s)+1; an empty value
             // yields one empty line).
-            self.emit("static int _sh_readline_from(const char *s, size_t *pos, char *out, size_t cap) {");
+            self.emit("static int _sh_readline_from(const char *s, size_t *pos, _sh_vbuf *out) {");
             self.emit("  if (!s) return 0;");
             self.emit("  size_t n = strlen(s);");
             self.emit("  if (*pos > n) return 0;");
             self.emit("  if (*pos == n) {");
-            self.emit("    if (n == 0 || s[n - 1] == '\\n') { out[0] = 0; *pos = n + 1; return 1; }");
+            self.emit("    if (n == 0 || s[n - 1] == '\\n') { _sh_vgrow(out, 1); out->p[0] = 0; *pos = n + 1; return 1; }");
             self.emit("    return 0;");
             self.emit("  }");
             self.emit("  size_t i = *pos;");
             self.emit("  while (i < n && s[i] != '\\n') i++;");
             self.emit("  size_t len = i - *pos;");
-            self.emit("  if (len >= cap) len = cap - 1;");
-            self.emit("  memcpy(out, s + *pos, len); out[len] = 0;");
+            self.emit("  _sh_vgrow(out, len + 1);");
+            self.emit("  memcpy(out->p, s + *pos, len); out->p[len] = 0;");
             self.emit("  *pos = (i < n) ? i + 1 : i;");
             self.emit("  return 1;");
             self.emit("}");
             self.emit("/* ${x:off:len} substring (bash: off<0 counts from the end) */");
             self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the space-joined string */");
-            self.emit("static void _sh_arr_slice(char *d, size_t cap, const char *s, long long off, long long len) {");
+            self.emit("static void _sh_arr_slice(_sh_vbuf *d, const char *s, long long off, long long len) {");
             self.emit("  const char *p = s; size_t n = 0;");
             self.emit("  while (*p) { while (*p == ' ') p++; if (!*p) break; n++; while (*p && *p != ' ') p++; }");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
@@ -1091,57 +1167,61 @@ impl Render {
             self.emit("    const char *w = p;");
             self.emit("    while (*p && *p != ' ') p++;");
             self.emit("    if (i >= (size_t)b) {");
-            self.emit("      if (dn && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("      if (dn) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("      size_t wl = (size_t)(p - w);");
-            self.emit("      if (dn + wl >= cap) wl = cap - dn - 1;");
-            self.emit("      memcpy(d + dn, w, wl); dn += wl;");
+            self.emit("      _sh_vgrow(d, dn + wl + 1);");
+            self.emit("      memcpy(d->p + dn, w, wl); dn += wl;");
             self.emit("    }");
             self.emit("    i++;");
             self.emit("  }");
-            self.emit("  d[dn] = 0;");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
-            self.emit("static char *_sh_substr(char *d, size_t cap, const char *s, long long off, long long len) {");
+            self.emit("static char *_sh_substr(_sh_vbuf *d, const char *s, long long off, long long len) {");
             self.emit("  size_t n = strlen(s);");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
             self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
             self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
             self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
             self.emit("  size_t out = (size_t)(e - b);");
-            self.emit("  if (out >= cap) out = cap - 1;");
-            self.emit("  memcpy(d, s + b, out); d[out] = 0;");
-            self.emit("  return d;");
+            self.emit("  _sh_vgrow(d, out + 1);");
+            self.emit("  memcpy(d->p, s + b, out); d->p[out] = 0;");
+            self.emit("  return d->p;");
             self.emit("}");
             self.emit("/* ${s//pat/repl} - literal replace-all */");
-            self.emit("static char *_sh_replace(char *d, size_t cap, const char *s, const char *pat, const char *repl) {");
+            self.emit("static char *_sh_replace(_sh_vbuf *d, const char *s, const char *pat, const char *repl) {");
             self.emit("  size_t pn = strlen(pat), rn = strlen(repl), dn = 0;");
             self.emit("  const char *p = s;");
-            self.emit("  if (!pn) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  _sh_vgrow(d, 1);");
+            self.emit("  if (!pn) { size_t n = strlen(s); _sh_vgrow(d, n + 1); memcpy(d->p, s, n + 1); return d->p; }");
             self.emit("  while (*p) {");
             self.emit("    const char *hit = strstr(p, pat);");
             self.emit("    if (!hit) break;");
             self.emit("    size_t pre = (size_t)(hit - p);");
-            self.emit("    while (pre-- && dn + 1 < cap) d[dn++] = *p++;");
-            self.emit("    for (size_t i = 0; i < rn && dn + 1 < cap; i++) d[dn++] = repl[i];");
+            self.emit("    _sh_vgrow(d, dn + pre + rn + 1);");
+            self.emit("    memcpy(d->p + dn, p, pre); dn += pre;");
+            self.emit("    memcpy(d->p + dn, repl, rn); dn += rn;");
             self.emit("    p = hit + pn;");
             self.emit("  }");
-            self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
-            self.emit("  d[dn] = 0;");
-            self.emit("  return d;");
+            self.emit("  size_t rest = strlen(p);");
+            self.emit("  _sh_vgrow(d, dn + rest + 1);");
+            self.emit("  memcpy(d->p + dn, p, rest + 1);");
+            self.emit("  return d->p;");
             self.emit("}");
             self.emit("/* FIRST match only — bash ${var/pat/repl} */");
-            self.emit("static char *_sh_replace_first(char *d, size_t cap, const char *s, const char *pat, const char *repl) {");
+            self.emit("static char *_sh_replace_first(_sh_vbuf *d, const char *s, const char *pat, const char *repl) {");
             self.emit("  size_t pn = strlen(pat), rn = strlen(repl), dn = 0;");
             self.emit("  const char *p = s;");
-            self.emit("  if (!pn) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  _sh_vgrow(d, 1);");
+            self.emit("  if (!pn) { size_t n = strlen(s); _sh_vgrow(d, n + 1); memcpy(d->p, s, n + 1); return d->p; }");
             self.emit("  const char *hit = strstr(p, pat);");
-            self.emit("  if (!hit) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  if (!hit) { size_t n = strlen(s); _sh_vgrow(d, n + 1); memcpy(d->p, s, n + 1); return d->p; }");
             self.emit("  size_t pre = (size_t)(hit - p);");
-            self.emit("  while (pre-- && dn + 1 < cap) d[dn++] = *p++;");
-            self.emit("  for (size_t i = 0; i < rn && dn + 1 < cap; i++) d[dn++] = repl[i];");
+            self.emit("  _sh_vgrow(d, pre + rn + strlen(hit + pn) + 1);");
+            self.emit("  memcpy(d->p, p, pre); dn = pre;");
+            self.emit("  memcpy(d->p + dn, repl, rn); dn += rn;");
             self.emit("  p = hit + pn;");
-            self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
-            self.emit("  d[dn] = 0;");
-            self.emit("  return d;");
+            self.emit("  strcpy(d->p + dn, p);");
+            self.emit("  return d->p;");
             self.emit("}");
             self.emit("/* $PIPESTATUS[i] — comma-joined stage statuses imported from the pipeline child */");
             self.emit("static char *_sh_ps(size_t i) {");
@@ -1179,36 +1259,37 @@ impl Render {
             self.emit("  *slot = val ? strdup(val) : \"\";");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
-            self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
-            self.emit("  static char sc[65536];");
-            self.emit("  strncpy(sc, s, sizeof sc - 1); sc[sizeof sc - 1] = 0;");
-            self.emit("  size_t n = strlen(sc), best = 0;");
+            self.emit("static char *_sh_strippre(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
+            self.emit("  static _sh_vbuf sc = {0, 0};");
+            self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
+            self.emit("  size_t n = strlen(sc.p), best = 0;");
             self.emit("  for (size_t i = 0; i <= n; i++) {");
-            self.emit("    char c = sc[i]; sc[i] = 0;");
-            self.emit("    if (fnmatch(pat, sc, 0) == 0) best = i;");
-            self.emit("    sc[i] = c;");
+            self.emit("    char c = sc.p[i]; sc.p[i] = 0;");
+            self.emit("    if (fnmatch(pat, sc.p, 0) == 0) best = i;");
+            self.emit("    sc.p[i] = c;");
             self.emit("    if (!greedy && best) break;");
             self.emit("  }");
-            self.emit("  strncpy(d, sc + best, cap - 1); d[cap - 1] = 0;");
-            self.emit("  return d;");
+            self.emit("  _sh_vgrow(d, n - best + 1);");
+            self.emit("  strncpy(d->p, sc.p + best, n - best); d->p[n - best] = 0;");
+            self.emit("  return d->p;");
             self.emit("}");
             self.emit("/* ${s%pat}/${s%%pat} suffix strip (the pattern matches a SUFFIX) */");
-            self.emit("static char *_sh_stripsuf(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
-            self.emit("  static char sc[65536];");
-            self.emit("  strncpy(sc, s, sizeof sc - 1); sc[sizeof sc - 1] = 0;");
-            self.emit("  size_t n = strlen(sc), best = n;");
+            self.emit("static char *_sh_stripsuf(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
+            self.emit("  static _sh_vbuf sc = {0, 0};");
+            self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
+            self.emit("  size_t n = strlen(sc.p), best = n;");
             self.emit("  if (greedy) {");
             self.emit("    for (size_t i = n; i > 0; i--) {");
-            self.emit("      if (fnmatch(pat, sc + (n - i), 0) == 0) { best = n - i; break; }");
+            self.emit("      if (fnmatch(pat, sc.p + (n - i), 0) == 0) { best = n - i; break; }");
             self.emit("    }");
             self.emit("  } else {");
             self.emit("    for (size_t i = 1; i <= n; i++) {");
-            self.emit("      if (fnmatch(pat, sc + (n - i), 0) == 0) { best = n - i; break; }");
+            self.emit("      if (fnmatch(pat, sc.p + (n - i), 0) == 0) { best = n - i; break; }");
             self.emit("    }");
             self.emit("  }");
-            self.emit("  if (best > cap - 1) best = cap - 1;");
-            self.emit("  strncpy(d, sc, best); d[best] = 0;");
-            self.emit("  return d;");
+            self.emit("  _sh_vgrow(d, best + 1);");
+            self.emit("  strncpy(d->p, sc.p, best); d->p[best] = 0;");
+            self.emit("  return d->p;");
             self.emit("}");
             self.emit("");
         if self.need_pipeline {
@@ -1220,9 +1301,10 @@ impl Render {
             // is the LAST stage's status (bash pipeline semantics).
             self.emit("/* native pipeline: argv stages (exec'd) + builtin thunks (forked) */");
             self.emit("typedef struct { char **argv; void (*fn)(void); } _sh_stage;");
-            self.emit("static char *_sh_pipeline(_sh_stage *st, int n, char *buf, size_t cap) {");
+            self.emit("static char *_sh_pipeline(_sh_stage *st, int n, _sh_vbuf *vb) {");
             self.emit("  int outfd[2]; pid_t pids[64]; int np = 0; int prev = -1;");
-            self.emit("  if (pipe(outfd) != 0) { buf[0] = 0; _sh_rc = 127; return buf; }");
+            self.emit("  _sh_vgrow(vb, 1); vb->p[0] = 0;");
+            self.emit("  if (pipe(outfd) != 0) { _sh_rc = 127; return vb->p; }");
             self.emit("  for (int i = 0; i < n; i++) {");
             self.emit("    int pfd[2]; int last = (i == n - 1);");
             self.emit("    if (!last && pipe(pfd) != 0) break;");
@@ -1247,14 +1329,20 @@ impl Render {
             self.emit("  }");
             self.emit("  close(outfd[1]);");
             self.emit("  if (prev >= 0) close(prev);");
-            self.emit("  size_t gn = 0; ssize_t r2;");
-            self.emit("  while (gn < cap - 1 && (r2 = read(outfd[0], buf + gn, cap - 1 - gn)) > 0) gn += (size_t)r2;");
-            self.emit("  buf[gn] = 0; close(outfd[0]);");
+            self.emit("  size_t gn = 0;");
+            self.emit("  for (;;) {");
+            self.emit("    _sh_vgrow(vb, gn + 8192);");
+            self.emit("    ssize_t r2 = read(outfd[0], vb->p + gn, vb->cap - gn - 1);");
+            self.emit("    if (r2 < 0) { if (errno == EINTR) continue; break; }");
+            self.emit("    if (r2 == 0) break;");
+            self.emit("    gn += (size_t)r2;");
+            self.emit("  }");
+            self.emit("  vb->p[gn] = 0; close(outfd[0]);");
             self.emit("  int status = 0;");
             self.emit("  for (int i = 0; i < np; i++) waitpid(pids[i], &status, 0);");
             self.emit("  _sh_rc = (np == 0) ? 127 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);");
-            self.emit("  while (gn > 0 && (buf[gn - 1] == '\\n' || buf[gn - 1] == '\\r')) buf[--gn] = 0;");
-            self.emit("  return buf;");
+            self.emit("  while (gn > 0 && (vb->p[gn - 1] == '\\n' || vb->p[gn - 1] == '\\r')) vb->p[--gn] = 0;");
+            self.emit("  return vb->p;");
             self.emit("}");
             self.emit("");
             // statement-position pipelines write the LAST stage to the
@@ -1293,32 +1381,33 @@ impl Render {
             self.emit("   each match on its own line (grep -o's output), set _sh_rc");
             self.emit("   (0 iff any match), return the newline-joined matches */");
             self.emit("static char *_sh_grep_matches(const char *text, const char *pat, const char *flags) {");
-            self.emit("  static char _sh_gm_buf[65536];");
-            self.emit("  static char _sh_gm_re[65536];");
-            self.emit("  char *d = _sh_gm_re; const char *p = pat;");
+            self.emit("  static _sh_vbuf _sh_gm_buf = {0, 0};");
+            self.emit("  static _sh_vbuf _sh_gm_re = {0, 0};");
+            self.emit("  const char *p = pat; size_t dn = 0;");
+            self.emit("  _sh_vgrow(&_sh_gm_re, 1); _sh_gm_re.p[0] = 0;");
             self.emit("  if (strchr(flags, 'F')) {");
-            self.emit("    for (; *p && d - _sh_gm_re < 65530; p++) {");
-            self.emit("      if (strchr(\"\\\\^$.|?*+()[]{}${}\", *p)) *d++ = '\\\\';");
-            self.emit("      *d++ = *p;");
+            self.emit("    for (; *p; p++) {");
+            self.emit("      if (strchr(\"\\\\^$.|?*+()[]{}${}\", *p)) { _sh_vgrow(&_sh_gm_re, dn + 3); _sh_gm_re.p[dn++] = '\\\\'; }");
+            self.emit("      _sh_vgrow(&_sh_gm_re, dn + 2); _sh_gm_re.p[dn++] = *p;");
             self.emit("    }");
-            self.emit("    *d = 0;");
             self.emit("  } else if (!strchr(flags, 'E')) {");
-            self.emit("    for (; *p && d - _sh_gm_re < 65530; p++) {");
-            self.emit("      if (*p == '\\\\' && p[1] && strchr(\"(){}?+|\", p[1])) { *d++ = p[1]; p++; }");
-            self.emit("      else *d++ = *p;");
+            self.emit("    for (; *p; p++) {");
+            self.emit("      if (*p == '\\\\' && p[1] && strchr(\"(){}?+|\", p[1])) { _sh_vgrow(&_sh_gm_re, dn + 2); _sh_gm_re.p[dn++] = p[1]; p++; }");
+            self.emit("      else { _sh_vgrow(&_sh_gm_re, dn + 2); _sh_gm_re.p[dn++] = *p; }");
             self.emit("    }");
-            self.emit("    *d = 0;");
             self.emit("  } else {");
-            self.emit("    strncpy(_sh_gm_re, pat, 65535); _sh_gm_re[65535] = 0;");
+            self.emit("    dn = strlen(pat);");
+            self.emit("    _sh_vgrow(&_sh_gm_re, dn + 1); strcpy(_sh_gm_re.p, pat);");
             self.emit("  }");
+            self.emit("  _sh_vgrow(&_sh_gm_re, dn + 1); _sh_gm_re.p[dn] = 0;");
             self.emit("  regex_t rx;");
-            self.emit("  if (regcomp(&rx, _sh_gm_re, REG_EXTENDED | REG_NEWLINE | (strchr(flags, 'i') ? REG_ICASE : 0)) != 0) {");
-            self.emit("    _sh_rc = 2; return _sh_gm_buf; /* bad pattern: grep exits 2 */");
+            self.emit("  if (regcomp(&rx, _sh_gm_re.p, REG_EXTENDED | REG_NEWLINE | (strchr(flags, 'i') ? REG_ICASE : 0)) != 0) {");
+            self.emit("    _sh_rc = 2; return _sh_gm_buf.p ? _sh_gm_buf.p : \"\"; /* bad pattern: grep exits 2 */");
             self.emit("  }");
-            self.emit("  _sh_gm_buf[0] = 0;");
+            self.emit("  _sh_vgrow(&_sh_gm_buf, 1); _sh_gm_buf.p[0] = 0;");
             self.emit("  size_t out = 0, n = strlen(text), pos = 0, any = 0;");
             self.emit("  regmatch_t m;");
-            self.emit("  while (pos <= n && out < 65535) {");
+            self.emit("  while (pos <= n) {");
             self.emit("    int rc = regexec(&rx, text + pos, 1, &m, 0);");
             self.emit("    if (rc != 0) break;");
             self.emit("    size_t ms = (size_t)m.rm_so, me = (size_t)m.rm_eo;");
@@ -1326,17 +1415,16 @@ impl Render {
             self.emit("    any = 1;");
             self.emit("    printf(\"%.*s\\n\", (int)(me - ms), text + pos + ms);");
             self.emit("    size_t len = me - ms;");
-            self.emit("    if (out + len + 1 < sizeof _sh_gm_buf) {");
-            self.emit("      memcpy(_sh_gm_buf + out, text + pos + ms, len);");
-            self.emit("      out += len;");
-            self.emit("      if (out + 1 < sizeof _sh_gm_buf) _sh_gm_buf[out++] = '\\n';");
-            self.emit("    }");
+            self.emit("    _sh_vgrow(&_sh_gm_buf, out + len + 2);");
+            self.emit("    memcpy(_sh_gm_buf.p + out, text + pos + ms, len);");
+            self.emit("    out += len;");
+            self.emit("    _sh_gm_buf.p[out++] = '\\n';");
             self.emit("    pos += me;");
             self.emit("  }");
-            self.emit("  _sh_gm_buf[out] = 0;");
+            self.emit("  _sh_vgrow(&_sh_gm_buf, out + 1); _sh_gm_buf.p[out] = 0;");
             self.emit("  regfree(&rx);");
             self.emit("  _sh_rc = any ? 0 : 1;");
-            self.emit("  return _sh_gm_buf;");
+            self.emit("  return _sh_gm_buf.p;");
             self.emit("}");
             self.emit("");
         }
@@ -1412,9 +1500,10 @@ impl Render {
         //   - top-level `static` VARIABLE declarations and `typedef`s are
         //     their own segments (so `_sh_wb`/`_sh_opts`/`_sh_bg_pids` die
         //     independently, not with whatever function precedes them).
-        //   - everything else attaches to the current segment — a `static
-        //     char sc[65536];` LOCAL inside a helper body (brace depth > 0)
-        //     must not split the helper in two and orphan its tail.
+        //   - everything else attaches to the current segment — a
+        //     `static _sh_vbuf sc = {0, 0};` LOCAL inside a helper body
+        //     (brace depth > 0) must not split the helper in two and
+        //     orphan its tail.
         //   - nameless lines (comments, #define, blank) pend and attach to
         //     the NEXT segment, so `#define SH2_ARENA_CAP` stays glued to
         //     the `_sh_arena` typedef and a dropped helper's comment dies
@@ -2162,7 +2251,7 @@ impl Render {
         let lifted = lifted_arity.is_some();
         if lifted {
             self.emit(&format!(
-                "static char _fnret_{fname}[65536];"
+                "static _sh_vbuf _fnret_{fname} = {{0, 0}};"
             ));
         }
         let n_body = body.len();
@@ -2189,11 +2278,11 @@ impl Render {
                         {
                             self.emit(&format!("char *{rv} = {v};"));
                             self.emit(&format!(
-                                "return _sh_ret_val(_fnret_{fname}, sizeof _fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
+                                "return _sh_ret_val(&_fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
                             ));
                         } else {
                             self.emit(&format!(
-                                "return _sh_ret_val(_fnret_{fname}, sizeof _fnret_{fname}, (({v}) ? ({v}) : \"\"));"
+                                "return _sh_ret_val(&_fnret_{fname}, (({v}) ? ({v}) : \"\"));"
                             ));
                         }
                     }
@@ -2425,11 +2514,33 @@ impl Render {
 
     /// Emit `char _sN[cap];` and return `_sN` — a per-use string temp.
     /// STATIC (see num_temp — the address may escape into a var).
+    /// Only for PROVABLY bounded contents (numbers, flags); anything
+    /// sized by program data uses vbuf_temp below.
     fn str_temp(&mut self, cap: usize) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
         self.emit(&format!("static char {t}[{cap}];"));
         t
+    }
+    /// Emit `static _sh_vbuf _vN = {0,0};` and return `_vN` — a
+    /// growable heap value buffer for sizes no analysis can prove
+    /// (captures, joins, slices, argv joins — the unbounded case).
+    /// Call sites pass `&{t}`; value uses read `{t}.p`. Same reuse
+    /// discipline as str_temp (per-site static, consume-immediately).
+    fn vbuf_temp(&mut self) -> String {
+        let t = format!("_v{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("static _sh_vbuf {t} = {{0, 0}};"));
+        t
+    }
+    /// Emit a snprintf into vbuf `t` that grows until the output fits.
+    /// `fmt` is the format expression, `args` the comma args ("" or
+    /// ", a, b"). Unbounded %s parts make fixed temps unsound here.
+    fn snprintf_grow(&mut self, t: &str, fmt: &str, args: &str) {
+        let m = format!("_m{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("_sh_vgrow(&{t}, 256);"));
+        self.emit(&format!("for (;;) {{ int {m} = snprintf({t}.p, {t}.cap, {fmt}{args}); if ({m} < 0) break; if ((size_t){m} < {t}.cap) break; _sh_vgrow(&{t}, (size_t){m} + 1); }}"));
     }
 
     /// Is a param call a LENGTH form (${#x}, ${#arr[@]}, param("slice","#arr","@"))?
@@ -2483,17 +2594,15 @@ impl Render {
                         }
                     }
                 }
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 let args = if cargs.is_empty() {
                     String::new()
                 } else {
                     format!(", {}", cargs.join(", "))
                 };
-                self.emit(&format!(
-                    "snprintf({t}, sizeof {t}, {}{args});",
-                    Self::cstr(&fmt)
-                ));
-                t
+                let fmt_c = Self::cstr(&fmt);
+                self.snprintf_grow(&t, &fmt_c, &args);
+                format!("{t}.p")
             }
             IrExpr::Call { func, args } => match func.as_str() {
                 "getVar" => {
@@ -2523,9 +2632,9 @@ impl Render {
                         return self.num_temp(&self.argc_expr_l());
                     }
                     if name == "@" || name == "*" {
-                        let t = self.str_temp(4096);
-                        self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                        return t;
+                        let t = self.vbuf_temp();
+                        self.emit(&format!("_sh_argv_join(&{t});"));
+                        return format!("{t}.p");
                     }
                     if name.chars().all(|c| c.is_ascii_digit()) {
                         return self.positional_str_l(&name);
@@ -2624,8 +2733,8 @@ impl Render {
                                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
                                 Self::cstr(&format!("echo \"$(({s}))\""))
                             ));
-                            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
-                            r.emit("return buf;");
+                            r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
+                            r.emit("return buf.p;");
                         })
                     } else {
                         "0".into()
@@ -2861,7 +2970,7 @@ impl Render {
         let body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         let mut s = format!("static char *_cap_{id}(void) {{\n");
-        s.push_str(&format!("  static char buf[{CAP_BUF}];\n"));
+        s.push_str(&format!("  static _sh_vbuf buf = {{0, 0}};\n"));
         s.push_str(&format!(
             "  static char *_c{id}_cmd = 0; static size_t _c{id}_cap = 0;\n"
         ));
@@ -2979,9 +3088,9 @@ impl Render {
                             }
                         }
                         Some("*") => {
-                            let t = self.str_temp(4096);
-                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                            word(self, t);
+                            let t = self.vbuf_temp();
+                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            word(self, format!("{t}.p"));
                         }
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
                             self.emit(&format!(
@@ -3000,9 +3109,9 @@ impl Render {
                             // evaluated at site-build time while _sh_argv
                             // is live (an env export of "@" is always
                             // empty: generator-system-echo-checkqx)
-                            let t = self.str_temp(65536);
-                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                            word(self, t);
+                            let t = self.vbuf_temp();
+                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            word(self, format!("{t}.p"));
                         }
                         Some("IFS") => {
                             // bash RESETS an inherited IFS to " \t\n" at
@@ -3252,8 +3361,8 @@ impl Render {
                                     // "$@" — the JOINED positional value at
                                     // site-build time (an env export of "@"
                                     // is always empty)
-                                    let t = self.str_temp(65536);
-                                    self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                                    let t = self.vbuf_temp();
+                                    self.emit(&format!("_sh_argv_join(&{t});"));
                                     // mid-word: GLUE the runtime value in
                                     // as a double-quoted piece (`"hello $@"`
                                     // is ONE word — a word separator would
@@ -3261,7 +3370,7 @@ impl Render {
                                     match buf {
                                         CmdBuf::Shared => {
                                             self.emit("_sh_add(\"\\\"\");");
-                                            self.emit(&format!("_sh_add({t});"));
+                                            self.emit(&format!("_sh_add({t}.p);"));
                                             self.emit("_sh_add(\"\\\"\");");
                                         }
                                         CmdBuf::Private(id) => {
@@ -3269,7 +3378,7 @@ impl Render {
                                                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
                                             ));
                                             self.emit(&format!(
-                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t});"
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t}.p);"
                                             ));
                                             self.emit(&format!(
                                                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
@@ -4058,10 +4167,10 @@ impl Render {
                 s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
                 s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
                 s5.push_str("  if (_pp) {\n");
-                s5.push_str("    static char _pl[65536];\n");
-                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
-                s5.push_str("      size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n' || _pl[_pn-1]=='\\r')) _pl[--_pn] = 0;\n");
-                s5.push_str("      fputs(_pl, stdout); fputc('\\n', stdout);\n");
+                s5.push_str("    static _sh_vbuf _pl = {0, 0};\n");
+                s5.push_str("    while (_sh_fgets_line(_pp, &_pl)) {\n");
+                s5.push_str("      size_t _pn = strlen(_pl.p); while (_pn && (_pl.p[_pn-1]=='\\n' || _pl.p[_pn-1]=='\\r')) _pl.p[--_pn] = 0;\n");
+                s5.push_str("      fputs(_pl.p, stdout); fputc('\\n', stdout);\n");
                 s5.push_str("    }\n");
                 s5.push_str("    pclose(_pp);\n");
                 s5.push_str("  }\n");
@@ -4384,10 +4493,10 @@ impl Render {
             r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
             r.sh_export_vars(&cmd);
             r.emit(&format!(
-                "_sh_capture(buf, sizeof buf, {});",
+                "_sh_capture(&buf, {});",
                 Self::cstr(&cmd)
             ));
-            r.emit("return buf;");
+            r.emit("return buf.p;");
         })
     }
 
@@ -4441,17 +4550,15 @@ impl Render {
                 }
             }
         }
-        let t = self.str_temp(4096);
+        let t = self.vbuf_temp();
         let args = if cargs.is_empty() {
             String::new()
         } else {
             format!(", {}", cargs.join(", "))
         };
-        self.emit(&format!(
-            "snprintf({t}, sizeof {t}, {}{args});",
-            Self::cstr(&fmt)
-        ));
-        t
+        let fmt_c = Self::cstr(&fmt);
+        self.snprintf_grow(&t, &fmt_c, &args);
+        format!("{t}.p")
     }
 
     /// Append the redirect text (`> f`, `>> f`, `< f`, heredoc, ...).
@@ -5456,9 +5563,9 @@ impl Render {
         ));
         if capture {
             let buf = format!("_pipe{pid}");
-            self.emit(&format!("static char {buf}[65536];"));
+            self.emit(&format!("static _sh_vbuf {buf} = {{0, 0}};"));
             Some(format!(
-                "_sh_pipeline({sp}, {}, {buf}, sizeof {buf})",
+                "_sh_pipeline({sp}, {}, &{buf})",
                 stages.len()
             ))
         } else {
@@ -5558,8 +5665,8 @@ impl Render {
             if !found {
                 r.emit("/* empty capture */");
             }
-            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
-            r.emit("return buf;");
+            r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
+            r.emit("return buf.p;");
         })
     }
 
@@ -5586,8 +5693,8 @@ impl Render {
                                             func: "fnValue".to_string(),
                                             args: a2.clone(),
                                         });
-                                        r.emit(&format!("strncpy(buf, {v}, 65535); buf[65535] = 0;"));
-                                        r.emit("return buf;");
+                                        r.emit(&format!("_sh_vgrow(&buf, strlen({v}) + 1); strcpy(buf.p, {v});"));
+                                        r.emit("return buf.p;");
                                         return;
                                     }
                                 }
@@ -5617,6 +5724,13 @@ impl Render {
                                 r.temp_seq += 1;
                                 let sc = format!("_sh_sc{}", r.temp_seq);
                                 r.temp_seq += 1;
+                                // Under the positional-const proof NO callee
+                                // reads positionals — the argv set/swap is
+                                // unobservable, omitted (and the _sh_argc
+                                // /_sh_argv globals don't even exist, so
+                                // emitting it would not compile). Mirrors
+                                // the statement-position call path.
+                                if !r.pos_const {
                                 r.emit(&format!("char *{av}[{}];", n.max(2)));
                                 r.emit(&format!("{av}[0] = {};", Self::cstr(&fname)));
                                 for (i, w) in call_args.iter().enumerate() {
@@ -5624,6 +5738,7 @@ impl Render {
                                     r.emit(&format!("{av}[{}] = {v};", i + 1));
                                 }
                                 r.emit(&format!("char **{sv} = _sh_argv; int {sc} = _sh_argc;"));
+                                }
                                 // the callee reuses the SAME file-scope
                                 // globals (its params/locals hoisted for the
                                 // capture helpers) — a cross-function call
@@ -5663,9 +5778,11 @@ impl Render {
                                         r.emit(&format!("char *{sv_tag}_{id} = {id};"));
                                     }
                                 }
+                                if !r.pos_const {
                                 r.emit(&format!("_sh_argv = {av}; _sh_argc = {n};"));
+                                }
                                 r.emit(&format!(
-                                    "_sh_capture_fn({}, buf, sizeof buf);",
+                                    "_sh_capture_fn({}, &buf);",
                                     r.c_ident(&fname)
                                 ));
                                 for v in &self_rec_vars {
@@ -5676,8 +5793,10 @@ impl Render {
                                         r.emit(&format!("{id} = {sv_tag}_{id};"));
                                     }
                                 }
+                                if !r.pos_const {
                                 r.emit(&format!("_sh_argv = {sv}; _sh_argc = {sc};"));
-                                r.emit("return buf;");
+                                }
+                                r.emit("return buf.p;");
                                 return;
                             }
                         }
@@ -5687,8 +5806,8 @@ impl Render {
             } else {
                 r.mark_todo(&format!("capture expr {:?}", expr));
             }
-            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
-            r.emit("return buf;");
+            r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
+            r.emit("return buf.p;");
         })
     }
 
@@ -7159,12 +7278,10 @@ impl Render {
             if rest.is_empty() {
                 return home.into();
             }
-            let t = self.str_temp(4096);
-            self.emit(&format!(
-                "snprintf({t}, sizeof {t}, \"%s/%s\", {home}, {});",
-                Self::cstr(rest)
-            ));
-            return t;
+            let t = self.vbuf_temp();
+            let rest_c = Self::cstr(rest);
+            self.snprintf_grow(&t, "\"%s/%s\"", &format!(", {home}, {rest_c}"));
+            return format!("{t}.p");
         }
         // `${name op arg}` — a parameter expansion inside the test.
         // (The core may DROP the closing `}` when the pattern contains a
@@ -7269,12 +7386,10 @@ impl Render {
                 if rest.is_empty() {
                     return v;
                 }
-                let t = self.str_temp(4096);
-                self.emit(&format!(
-                    "snprintf({t}, sizeof {t}, \"%s%s\", {v}, {});",
-                    Self::cstr(rest)
-                ));
-                return t;
+                let t = self.vbuf_temp();
+                let rest_c = Self::cstr(rest);
+                self.snprintf_grow(&t, "\"%s%s\"", &format!(", {v}, {rest_c}"));
+                return format!("{t}.p");
             }
             // special params ($?, $#, $$, $!, $-, $0, $1.., $@) — the
             // getVar mapping (a `?` here previously rendered as "")
@@ -7429,9 +7544,9 @@ impl Render {
                     } else {
                         self.store_read(&name)
                     };
-                    let t = self.str_temp(65536);
-                    self.emit(&format!("strncpy({t}, {v}, 65535); {t}[65535] = 0;"));
-                    t
+                    let t = self.vbuf_temp();
+                    self.emit(&format!("_sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"));
+                    format!("{t}.p")
                 };
                 let off_idx = if idx_is_at { 3 } else { 2 };
                 let len_idx = off_idx + 1;
@@ -7447,24 +7562,24 @@ impl Render {
                     Some(_) => self.args_value_num(len_idx),
                 };
                 self.need_sh = true;
-                let t = self.str_temp(65536);
+                let t = self.vbuf_temp();
                 if is_positional {
                     // `${@:off:len}` — bash's offset is 1-based (0
                     // includes $0); the helper slices _sh_argv directly
                     // (the space-joined form would lose empty elements)
                     self.emit(&format!(
-                        "_sh_argv_slice({t}, sizeof {t}, {off}, {len});"
+                        "_sh_argv_slice(&{t}, {off}, {len});"
                     ));
                 } else if is_array {
                     self.emit(&format!(
-                        "_sh_arr_slice({t}, sizeof {t}, {joined}, {off}, {len});"
+                        "_sh_arr_slice(&{t}, {joined}, {off}, {len});"
                     ));
                 } else {
                     self.emit(&format!(
-                        "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+                        "_sh_substr(&{t}, {joined}, {off}, {len});"
                     ));
                 }
-                return t;
+                return format!("{t}.p");
             }
         }
         // `${arr[1]}` / `${#arr[@]}` — the array machinery (bare
@@ -7493,9 +7608,9 @@ impl Render {
             self.argc_expr_l()
         } else if name == "@" || name == "*" {
             self.need_sh = true;
-            let t = self.str_temp(4096);
-            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            t
+            let t = self.vbuf_temp();
+            self.emit(&format!("_sh_argv_join(&{t});"));
+            format!("{t}.p")
         } else if self.var_types.contains_key(&name) && self.is_num(&name) {
             self.num_temp(&self.c_ident(&name))
         } else if name.starts_with('$') || name.chars().all(|c| c.is_ascii_digit()) {
@@ -7559,30 +7674,30 @@ impl Render {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 self.need_fnmatch = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 let greedy = if op.starts_with("##") { "1" } else { "0" };
                 let pat_c = self.pattern_c(&pat);
                 self.emit(&format!(
-                    "_sh_strippre({t}, sizeof {t}, {var_expr}, {pat_c}, {greedy});"
+                    "_sh_strippre(&{t}, {var_expr}, {pat_c}, {greedy});"
                 ));
-                t
+                format!("{t}.p")
             }
             "%" | "%:" | "%%" | "%%:" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 self.need_fnmatch = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 let greedy = if op.starts_with("%%") { "1" } else { "0" };
                 let pat_c = self.pattern_c(&pat);
                 self.emit(&format!(
-                    "_sh_stripsuf({t}, sizeof {t}, {var_expr}, {pat_c}, {greedy});"
+                    "_sh_stripsuf(&{t}, {var_expr}, {pat_c}, {greedy});"
                 ));
-                t
+                format!("{t}.p")
             }
             "//" | "/" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 // `/` replaces the FIRST match only; `//` replaces all —
                 // one helper served both and \${y/one/1} clobbered every
                 let helper = if op == "//" {
@@ -7591,10 +7706,10 @@ impl Render {
                     "_sh_replace_first"
                 };
                 self.emit(&format!(
-                    "{helper}({t}, sizeof {t}, {var_expr}, {}, {repl});",
+                    "{helper}(&{t}, {var_expr}, {}, {repl});",
                     Self::cstr(strip_glob(&pat))
                 ));
-                t
+                format!("{t}.p")
             }
             "slice" => {
                 let off = args
@@ -7609,59 +7724,59 @@ impl Render {
                     .map(|x| self.value_num_dollar(x))
                     .unwrap_or_else(|| "(long long)1LL<<60".into());
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "_sh_substr({t}, sizeof {t}, {var_expr}, {off}, {len});"
+                    "_sh_substr(&{t}, {var_expr}, {off}, {len});"
                 ));
-                t
+                format!("{t}.p")
             }
             "^^" | "^^:" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ char *_u = {var_expr}; size_t _i; for (_i = 0; _u[_i]; _i++) {t}[_i] = (char)toupper((unsigned char)_u[_i]); {t}[_i] = 0; }}"
+                    "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); char *_d = {t}.p; size_t _i; for (_i = 0; _u[_i]; _i++) _d[_i] = (char)toupper((unsigned char)_u[_i]); _d[_i] = 0; }}"
                 ));
-                t
+                format!("{t}.p")
             }
             ",," | ",,:" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ char *_u = {var_expr}; size_t _i; for (_i = 0; _u[_i]; _i++) {t}[_i] = (char)tolower((unsigned char)_u[_i]); {t}[_i] = 0; }}"
+                    "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); char *_d = {t}.p; size_t _i; for (_i = 0; _u[_i]; _i++) _d[_i] = (char)tolower((unsigned char)_u[_i]); _d[_i] = 0; }}"
                 ));
-                t
+                format!("{t}.p")
             }
             "^" | "^:" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ char *_u = {var_expr}; strncpy({t}, _u, 4095); {t}[4095] = 0; if ({t}[0]) {t}[0] = (char)toupper((unsigned char){t}[0]); }}"
+                    "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); strcpy({t}.p, _u); if ({t}.p[0]) {t}.p[0] = (char)toupper((unsigned char){t}.p[0]); }}"
                 ));
-                t
+                format!("{t}.p")
             }
             "," | ",:" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ char *_u = {var_expr}; strncpy({t}, _u, 4095); {t}[4095] = 0; if ({t}[0]) {t}[0] = (char)tolower((unsigned char){t}[0]); }}"
+                    "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); strcpy({t}.p, _u); if ({t}.p[0]) {t}.p[0] = (char)tolower((unsigned char){t}.p[0]); }}"
                 ));
-                t
+                format!("{t}.p")
             }
             "dirname" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); size_t _n = _s ? (size_t)(_s - _u) : 0; if (_n == 0 && _s) _n = 1; strncpy({t}, _u, _n); {t}[_n] = 0; }}"
+                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); size_t _n = _s ? (size_t)(_s - _u) : 0; if (_n == 0 && _s) _n = 1; _sh_vgrow(&{t}, _n + 1); memcpy({t}.p, _u, _n); {t}.p[_n] = 0; }}"
                 ));
-                t
+                format!("{t}.p")
             }
             "basename" => {
                 self.need_sh = true;
-                let t = self.str_temp(4096);
+                let t = self.vbuf_temp();
                 self.emit(&format!(
-                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); strncpy({t}, _s ? _s + 1 : _u, 4095); {t}[4095] = 0; }}"
+                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); const char *_b = _s ? _s + 1 : _u; _sh_vgrow(&{t}, strlen(_b) + 1); strcpy({t}.p, _b); }}"
                 ));
-                t
+                format!("{t}.p")
             }
             _ => {
                 self.mark_todo(&format!("param op {op}"));
@@ -7707,11 +7822,11 @@ impl Render {
                         Some(_) => self.args_value_num(3),
                     };
                     let joined = self.array_join_all(var);
-                    let t = self.str_temp(65536);
+                    let t = self.vbuf_temp();
                     self.emit(&format!(
-                        "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+                        "_sh_substr(&{t}, {joined}, {off}, {len});"
                     ));
-                    return t;
+                    return format!("{t}.p");
                 }
                 _ => return self.array_join_all(var),
             }
@@ -7782,9 +7897,9 @@ impl Render {
                 }
                 if name == "@" || name == "*" {
                     self.need_sh = true;
-                    let t = self.str_temp(4096);
-                    self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                    return t;
+                    let t = self.vbuf_temp();
+                    self.emit(&format!("_sh_argv_join(&{t});"));
+                    return format!("{t}.p");
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
                     // positional $N — a lifted fn's C param or the argv
@@ -8137,8 +8252,8 @@ impl Render {
                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
                             Self::cstr(&format!("echo \"$(({s}))\""))
                         ));
-                        r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
-                        r.emit("return buf;");
+                        r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
+                        r.emit("return buf.p;");
                     })
                 }
                 None => "0".into(),
@@ -8187,14 +8302,14 @@ impl Render {
                 self.emit(&format!("char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;", self.temp_seq));
                 self.temp_seq += 1;
                 self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
-                self.emit(&format!("static char {buf}[65536];"));
-                self.emit(&format!("_sh_capture_fn({id}, {buf}, sizeof {buf});"));
+                    self.emit(&format!("static _sh_vbuf {buf} = {{0, 0}};"));
+                self.emit(&format!("_sh_capture_fn({id}, &{buf});"));
                 self.emit(&format!("_sh_argv = {sv}; _sh_argc = _sh_sc{};", self.temp_seq - 1));
                 // the polyfill's test primitives (strHasPrefix, globMatch,
                 // …) ECHO the result ("1"/"0") — the function's _sh_rc is
                 // its STATUS (0 = success), not the test result. The
                 // condition is the echoed value.
-                format!("(strcmp({buf}, \"1\") == 0)")
+                format!("(strcmp({buf}.p, \"1\") == 0)")
             }
             "fnValue" => {
                 // fnValue("f", [args...]) — the echo-return-lift's
@@ -8291,8 +8406,9 @@ impl Render {
                         lit_parts.push(self.value_c(w));
                     }
                     lit_parts.push("0".into());
+                    self.emit(&format!("static _sh_vbuf {cn}_vb = {{0, 0}};"));
                     self.emit(&format!(
-                        "char *{cn} = _sh_call_fn({}, (char *[]){{{}}}, {}, (char[65536]){{0}}, 65536);",
+                        "char *{cn} = _sh_call_fn({}, (char *[]){{{}}}, {}, &{cn}_vb);",
                         self.c_ident(&fname),
                         lit_parts.join(", "),
                         n
@@ -8404,12 +8520,9 @@ impl Render {
             fmt.push_str("%s");
             cargs.push(self.value_c(it));
         }
-        let t = self.str_temp(65536);
-        self.emit(&format!(
-            "snprintf({t}, sizeof {t}, \"{fmt}\", {});",
-            cargs.join(", ")
-        ));
-        t
+        let t = self.vbuf_temp();
+        self.snprintf_grow(&t, &format!("\"{fmt}\""), &format!(", {}", cargs.join(", ")));
+        format!("{t}.p")
     }
 
     /// A numeric param argument (off/len for slices) — the args are
@@ -8513,12 +8626,9 @@ impl Render {
         for _ in &parts {
             fmt.push_str("%s");
         }
-        let t = self.str_temp(4096);
-        self.emit(&format!(
-            "snprintf({t}, sizeof {t}, \"{fmt}\", {});",
-            parts.join(", ")
-        ));
-        Some(t)
+        let t = self.vbuf_temp();
+        self.snprintf_grow(&t, &format!("\"{fmt}\""), &format!(", {}", parts.join(", ")));
+        Some(format!("{t}.p"))
     }
 
     /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
@@ -8675,12 +8785,9 @@ impl Render {
                     // PLACE, and the source may be const/read-only
                     // (string literals, static buffers)
                     self.emit(&format!(
-                        "char {t}[65536]; strncpy({t}, {v}, 65535); {t}[65535] = 0;"
+                        "static _sh_vbuf {t} = {{0, 0}}; static char **{t}_w = 0; static size_t {t}_wc = 0; _sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"
                     ));
-                    self.emit(&format!("char *{t}_w[1024];"));
-                    self.emit(&format!(
-                        "size_t _sn{t} = _sh_split({t}, {t}_w, 1024);"
-                    ));
+                    self.emit(&format!("size_t _sn{t} = _sh_split({t}.p, &{t}_w, &{t}_wc);"));
                     self.emit(&format!(
                         "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = strdup({t}_w[_sk{t}]);"
                     ));
@@ -8843,23 +8950,23 @@ impl Render {
         if var == "@" || var == "*" {
             // `$@`/`$*` in an expansion — the positional params
             self.need_sh = true;
-            let t = self.str_temp(4096);
-            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            let t = self.vbuf_temp();
+            self.emit(&format!("_sh_argv_join(&{t});"));
             return t;
         }
         self.arrays.insert(var.to_string());
         self.need_sh = true;
         let id = self.c_ident(var);
-        let t = self.str_temp(65536);
+        let t = self.vbuf_temp();
         if self.assoc_arrays.contains(var) {
             // assoc array VALUES: join with NEWLINES so downstream sort
             // pipelines can sort individual values (space-joined text
             // is one line and passes through sort unchanged)
-            self.emit(&format!("_sh_join_arr_nl({t}, sizeof {t}, {id}_v, {id}_n);"));
+            self.emit(&format!("_sh_join_arr_nl(&{t}, {id}_v, {id}_n);"));
         } else {
-            self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}, {id}_len);"));
+            self.emit(&format!("_sh_join_arr(&{t}, {id}, {id}_len);"));
         }
-        t
+        format!("{t}.p")
     }
 
     /// `${!map[@]}` — assoc keys joined
@@ -8868,9 +8975,9 @@ impl Render {
         self.assoc_arrays.insert(var.to_string());
         self.need_sh = true;
         let id = self.c_ident(var);
-        let t = self.str_temp(65536);
-        self.emit(&format!("_sh_join_keys({t}, sizeof {t}, {id}_k, {id}_n);"));
-        t
+        let t = self.vbuf_temp();
+        self.emit(&format!("_sh_join_keys(&{t}, {id}_k, {id}_n);"));
+        format!("{t}.p")
     }
 
     /// Split an expression into printf parts: Lit(text) | Arg(cexpr, is_num).
@@ -8934,9 +9041,9 @@ impl Render {
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
-                            let t = self.str_temp(4096);
-                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                            return vec![Part::Arg(t, NumSpec::Str)];
+                            let t = self.vbuf_temp();
+                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            return vec![Part::Arg(format!("{t}.p"), NumSpec::Str)];
                         }
                         if name.chars().all(|c| c.is_ascii_digit()) {
                             self.need_sh = true;
@@ -9207,16 +9314,19 @@ impl Render {
                 }
                 return Some(format!("({name} = {}, 1)", Self::cstr(&fmt)));
             }
-            let t = self.str_temp(65536);
+            let t = self.vbuf_temp();
             let store = if self.buf_bound(name).is_some() {
-                format!("strcpy({}, {t})", name)
+                format!("strcpy({}, {t}.p)", name)
             } else {
-                format!("{name} = strdup({t});")
+                format!("{name} = strdup({t}.p);")
             };
             return Some(format!(
-                "({{ snprintf({t}, sizeof {t}, {}, {args}); {store} }})",
-                Self::cstr(&fmt),
-                args = cargs.join(", "),
+                "({{ {sn} {store} }})",
+                sn = {
+                    let m = format!("_m{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    format!("_sh_vgrow(&{t}, 256); for (;;) {{ int {m} = snprintf({t}.p, {t}.cap, {}, {args}); if ({m} < 0) break; if ((size_t){m} < {t}.cap) break; _sh_vgrow(&{t}, (size_t){m} + 1); }}", Self::cstr(&fmt), args = cargs.join(", "))
+                },
             ));
         }
         if cargs.is_empty() {
@@ -9519,23 +9629,23 @@ impl Render {
                         // _sh_cmd would be re-run by the tail system()
                         self.emit(&format!("if (_pf{id}) {{"));
                         self.depth += 1;
-                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!("static _sh_vbuf _rl{id} = {{0, 0}};"));
                         self.emit(&format!(
-                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                            "while (_sh_fgets_line(_pf{id}, &_rl{id})) {{"
                         ));
                         self.depth += 1;
                         self.emit(&format!(
-                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                            "size_t _rn{id} = strlen(_rl{id}.p); while (_rn{id} && (_rl{id}.p[_rn{id}-1]=='\\n' || _rl{id}.p[_rn{id}-1]=='\\r')) _rl{id}.p[--_rn{id}] = 0;"
                         ));
                         let nv = vars_c.len();
                         match &ifs_spec {
                             None => {
                                 // default IFS: leading-blank trim + split
                                 self.emit(&format!(
-                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}.p[_sk{id}] == ' ' || _rl{id}.p[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}.p, _rl{id}.p + _sk{id}, strlen(_rl{id}.p + _sk{id}) + 1); }}"
                                 ));
                                 self.emit(&format!(
-                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, \" \\t\", {nv}, __fv);"
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}.p, \" \\t\", {nv}, __fv);"
                                 ));
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
@@ -9548,7 +9658,7 @@ impl Render {
                             Some(s) if s.is_empty() => {
                                 // IFS= : raw whole line to the FIRST var
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
                                 for (vi, v) in vars_c.iter().enumerate().skip(1) {
                                     let vid2 = self.c_ident(v);
                                     self.emit(&format!("{vid2} = strdup(\"\");"));
@@ -9559,7 +9669,7 @@ impl Render {
                                 // LAST var keeps the remainder
                                 let dch = cs.as_bytes()[0];
                                 self.emit(&format!(
-                                    "{{ char *__fv[{nv}]; char *_rp = _rl{id}; size_t _rk; for (_rk = 0; _rk < {nv}; _rk++) {{ char *_d = (_rk + 1 < {nv}) ? strchr(_rp, {dch}) : NULL; if (_d) *_d = 0; __fv[_rk] = _rp; if (!_d) break; else _rp = _d + 1; }}"
+                                    "{{ char *__fv[{nv}]; char *_rp = _rl{id}.p; size_t _rk; for (_rk = 0; _rk < {nv}; _rk++) {{ char *_d = (_rk + 1 < {nv}) ? strchr(_rp, {dch}) : NULL; if (_d) *_d = 0; __fv[_rk] = _rp; if (!_d) break; else _rp = _d + 1; }}"
                                 ));
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
@@ -9667,13 +9777,13 @@ impl Render {
                         }
                         self.emit(&format!("if (_pf{id}) {{"));
                         self.depth += 1;
-                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!("static _sh_vbuf _rl{id} = {{0, 0}};"));
                         self.emit(&format!(
-                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                            "while (_sh_fgets_line(_pf{id}, &_rl{id})) {{"
                         ));
                         self.depth += 1;
                         self.emit(&format!(
-                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                            "size_t _rn{id} = strlen(_rl{id}.p); while (_rn{id} && (_rl{id}.p[_rn{id}-1]=='\\n' || _rl{id}.p[_rn{id}-1]=='\\r')) _rl{id}.p[--_rn{id}] = 0;"
                         ));
                         // IFS: None = default whitespace split with
                         // leading trim; Some("") = raw whole line to the
@@ -9682,26 +9792,26 @@ impl Render {
                         match &ifs_spec {
                             None => {
                                 self.emit(&format!(
-                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}.p[_sk{id}] == ' ' || _rl{id}.p[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}.p, _rl{id}.p + _sk{id}, strlen(_rl{id}.p + _sk{id}) + 1); }}"
                                 ));
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
                             }
                             Some(s) if s.is_empty() => {
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
                             }
                             Some(cs) if nv == 1 => {
                                 let vid = self.c_ident(&vars_c[0]);
                                 self.emit(&format!(
-                                    "{{ char *_d = strchr(_rl{id}, {cs_byte}); if (_d) *_d = 0; {vid} = strdup(_rl{id}); }}",
+                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {vid} = strdup(_rl{id}.p); }}",
                                     cs_byte = cs.as_bytes()[0]
                                 ));
                             }
                             Some(cs) => {
                                 let ifs_s = cs.clone();
                                 self.emit(&format!(
-                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, {}, {nv}, __fv);",
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}.p, {}, {nv}, __fv);",
                                     Self::cstr(&ifs_s),
                                     nv = nv
                                 ));
@@ -9785,7 +9895,7 @@ impl Render {
                         let t = self.value_c(target);
                         let strip = if striptail { "1" } else { "0" };
                         self.emit(&format!(
-                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static char _mfl[65536]; while (fgets(_mfl, sizeof _mfl, _mf)) {{ size_t _mn = strlen(_mfl); if ({strip}) {{ while (_mn && (_mfl[_mn-1]=='\\n'||_mfl[_mn-1]=='\\r')) _mfl[--_mn]=0; }} if ({id}_len < {ARR_CAP}) {id}[{id}_len++] = strdup(_mfl); }} fclose(_mf); }} }}"
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len < {ARR_CAP}) {id}[{id}_len++] = strdup(_mfl.p); }} fclose(_mf); }} }}"
                         ));
                         return;
                     }
@@ -10511,8 +10621,8 @@ impl Render {
                                 ));
                             }
                         }
-                        r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
-                        r.emit("return buf;");
+                        r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
+                        r.emit("return buf.p;");
                     });
                     self.need_sh = true;
                     let wn = format!("_wn_{}", self.temp_seq);
@@ -10520,7 +10630,7 @@ impl Render {
                     let ws = format!("_ws_{}", self.temp_seq);
                     self.temp_seq += 1;
                     self.emit(&format!(
-                        "char *{wn} = {cap}; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                        "char *{wn} = {cap}; static char **{ws} = 0; static size_t {ws}_cap = 0; size_t _wc_{wn} = _sh_split({wn}, &{ws}, &{ws}_cap);"
                     ));
                     let var_name = self.c_ident(var);
                     self.emit(&format!(
@@ -10549,9 +10659,9 @@ impl Render {
                             if name == "*" {
                                 // `"$*"` is ONE word (the joined argv) —
                                 // bash runs the body exactly once
-                                let t = self.str_temp(4096);
-                                self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                                self.emit(&format!("{var_name} = {t};"));
+                                let t = self.vbuf_temp();
+                                self.emit(&format!("_sh_argv_join(&{t});"));
+                                self.emit(&format!("{var_name} = {t}.p;"));
                                 self.emit("{");
                                 self.depth += 1;
                                 for s in body {
@@ -10658,7 +10768,7 @@ impl Render {
                             let ws = format!("_ws_{}", self.temp_seq);
                             self.temp_seq += 1;
                             self.emit(&format!(
-                                "char *{wn} = {cap}; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                                "char *{wn} = {cap}; static char **{ws} = 0; static size_t {ws}_cap = 0; size_t _wc_{wn} = _sh_split({wn}, &{ws}, &{ws}_cap);"
                             ));
                             let var_name = self.c_ident(var);
                             self.emit(&format!(
@@ -10684,7 +10794,7 @@ impl Render {
                             let ws = format!("_ws_{}", self.temp_seq);
                             self.temp_seq += 1;
                             self.emit(&format!(
-                                "char {wn}[65536]; strncpy({wn}, {v}, 65535); {wn}[65535] = 0; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                                "static _sh_vbuf {wn} = {{0, 0}}; static char **{ws} = 0; static size_t {ws}_cap = 0; _sh_vgrow(&{wn}, strlen({v}) + 1); strcpy({wn}.p, {v}); size_t _wc_{wn} = _sh_split({wn}.p, &{ws}, &{ws}_cap);"
                             ));
                             let var_name = self.c_ident(var);
                             self.emit(&format!(
@@ -10843,16 +10953,16 @@ impl Render {
                     self.need_sh = true;
                     let hs = self.value_c(&hs);
                     self.emit(&format!("size_t _hs_pos = 0;"));
-                    self.emit(&format!("static char _hs_line[65536];"));
+                    self.emit(&format!("static _sh_vbuf _hs_line = {{0, 0}};"));
                     for s in inner {
                         if let Some((target, body)) = Self::herestring_read_while(s) {
                             let id = self.c_ident(&target);
                             self.store.insert(target.clone());
                             self.emit(&format!(
-                                "while (_sh_readline_from({hs}, &_hs_pos, _hs_line, sizeof _hs_line)) {{"
+                                "while (_sh_readline_from({hs}, &_hs_pos, &_hs_line)) {{"
                             ));
                             self.depth += 1;
-                            self.emit(&format!("{id} = _hs_line;"));
+                            self.emit(&format!("{id} = _hs_line.p;"));
                             for b in body {
                                 self.stmt(b);
                             }
@@ -10907,9 +11017,9 @@ impl Render {
                 s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
                 s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
                 s5.push_str("  if (_pp) {\n");
-                s5.push_str("    static char _pl[65536];\n");
-                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
-                s5.push_str("      fputs(_pl, stdout);\n");
+                s5.push_str("    static _sh_vbuf _pl = {0, 0};\n");
+                s5.push_str("    while (_sh_fgets_line(_pp, &_pl)) {\n");
+                s5.push_str("      fputs(_pl.p, stdout);\n");
                 s5.push_str("    }\n");
                 s5.push_str("    int _rc = pclose(_pp); _sh_rc = (_rc == -1) ? 127 : WEXITSTATUS(_rc);\n");
                 s5.push_str("  }\n");
@@ -11336,16 +11446,16 @@ impl Render {
                 ));
                 self.emit(&format!("  if (_ff{k}) {{"));
                 self.emit(&format!(
-                    "    static char _fll{k}[65536]; long long _fli{k} = 0;"
+                    "    static _sh_vbuf _fll{k} = {{0, 0}}; long long _fli{k} = 0;"
                 ));
                 self.emit(&format!(
-                    "    while (fgets(_fll{k}, sizeof _fll{k}, _ff{k})) {{"
+                    "    while (_sh_fgets_line(_ff{k}, &_fll{k})) {{"
                 ));
                 self.depth += 3;
                 self.emit(&format!(
-                    "size_t _fn{k} = strlen(_fll{k}); while (_fn{k} && (_fll{k}[_fn{k}-1]=='\\n' || _fll{k}[_fn{k}-1]=='\\r')) _fll{k}[--_fn{k}] = 0;"
+                    "size_t _fn{k} = strlen(_fll{k}.p); while (_fn{k} && (_fll{k}.p[_fn{k}-1]=='\\n' || _fll{k}.p[_fn{k}-1]=='\\r')) _fll{k}.p[--_fn{k}] = 0;"
                 ));
-                self.emit(&format!("{var} = strdup(_fll{k});"));
+                self.emit(&format!("{var} = strdup(_fll{k}.p);"));
                 for b in &fl.body {
                     self.stmt(b);
                 }
@@ -15954,6 +16064,38 @@ mod tests {
         let mut r = Render::default();
         r.store.insert(name.to_string());
         r
+    }
+
+    #[test]
+    fn value_path_has_no_fixed_64k_buffers() {
+        // Structural guard for the growable-value regime: a program
+        // exercising capture, array join, slice and command substitution
+        // must render _sh_vbuf buffers (never `char x[65536]` /
+        // `sizeof buf` caps) on the value path. Fixed caps truncated
+        // past 65535 bytes with no diagnostic; the shell (and esp.
+        // Python-origin programs) has no such limit.
+        let src = "a=(1 2 3); j=\"${a[@]}\"; s=${j:0:2}; x=$(echo hi); echo \"$s$x\"";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = shir_to_c(&prog);
+        assert!(out.contains("_sh_vbuf"), "growable buffers missing:\n{out}");
+        assert!(out.contains("_sh_vgrow"), "grow helper missing:\n{out}");
+        for pat in [
+            "[65536]", "[65535]", "65535]", "sizeof buf", "(char[65536])",
+            "_sh_split(",
+        ] {
+            // _sh_split survives only in its growable-args form
+            if pat == "_sh_split(" {
+                for line in out.lines().filter(|l| l.contains(pat)) {
+                    assert!(
+                        line.contains("_sh_wgrow") || line.contains("char ***"),
+                        "fixed-shape _sh_split call: {line}"
+                    );
+                }
+                continue;
+            }
+            assert!(!out.contains(pat), "fixed-cap remnant {pat:?} in:\n{out}");
+        }
     }
 
     #[test]
