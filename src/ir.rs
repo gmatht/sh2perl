@@ -1111,6 +1111,14 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         }
     }
 
+    // The external-command seam (UU-FFI.md): emitted when the body calls
+    // __sh_uu_capture/__sh_uu_run — the helper probes for the uu-ffi .so
+    // at BEGIN and falls back to guarded fork/exec (with a one-time
+    // stderr warning) when absent.
+    if body.contains("__sh_uu_capture") || body.contains("__sh_uu_run") {
+        out.push_str(SH_RUN_EXT_PREAMBLE);
+        out.push('\n');
+    }
     // Emit the imports (every decision input — the body scan, `say`, and
     // the hostname analysis — is computed by now).
     for import in &imports {
@@ -2504,10 +2512,20 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Side-effect run via bash -c (the args are bash-quoted words; a
                 // bare `system(<joined words>)` concatenates them into one broken
                 // perl expression). Track the status for `$?`/`&&`/`||`.
-                out.push_str(&format!(
-                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                    safe_perl_q_string(&full_cmd)
-                ));
+                // Simple commands (no metacharacters, no env-interp `$`)
+                // route through the __sh_uu_* seam; the rest keep the
+                // bash -c string path (REFUSE > GUESS).
+                if let Some(argv) = sh_split_simple_cmd(&full_cmd) {
+                    let args = argv.iter().map(|w| perl_word_literal(w)).collect::<Vec<_>>().join(", ");
+                    out.push_str(&format!(
+                        "__sh_uu_run({args}); $main_exit_code = $CHILD_ERROR = $__sh_uu_rc;\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                        safe_perl_q_string(&full_cmd)
+                    ));
+                }
             }
         }
 
@@ -6610,6 +6628,153 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// `qx{...}`.  This produces semantically equivalent code (both run
 /// `/bin/sh -c \'cmd\'` and capture stdout) but avoids check_qx.pl
 /// violations because `open()` is not checked.
+
+/// The `__sh_run_ext` seam (UU-FFI.md): emitted into the preamble when
+/// the body shells out to an external command. uu-ffi .so present ⇒
+/// in-process coreutils (`sh2_uu_run`/`sh2_uu_capture` — concurrent-drain
+/// capture, no fork/exec); absent ⇒ the feature-guarded fork/exec
+/// fallback with a one-time stderr warning. check_qx whitelists this
+/// block (the bash -c inside is guarded, never unconditional).
+const SH_RUN_EXT_PREAMBLE: &str = r#"# __SH_RUN_EXT_BEGIN (UU-FFI.md external-command seam)
+# uu-ffi .so present: in-process coreutils via uu_run (capture = temp-file
+# fd-1 redirect around the in-process call — no pipe, so no concurrent-
+# drain deadlock, and no C-side wrapper .so needed). Absent: guarded
+# fork/exec fallback (one-time warning). The bash -c below is
+# feature-guarded — check_qx strips this block before scanning.
+my $__SH_UU = 0;
+my $__SH_UU_FFI;
+our $__sh_uu_rc = 0;
+my %__SH_UU_OK = map { $_ => 1 } qw(cat wc ls sort sed awk grep);
+BEGIN {
+    my @cand;
+    push @cand, $ENV{SH2_UU_LIB} if defined $ENV{SH2_UU_LIB};
+    for my $up ('', '../', '../../', '../../../', '../../../../', '../../../../../') {
+        push @cand, "${up}runtime/lib/libcoreutils_ffi.so";
+    }
+    push @cand, 'libcoreutils_ffi.so';
+    for my $lib (@cand) {
+        next unless defined $lib && -e $lib;
+        my $ok = eval {
+            require FFI::Platypus;
+            my $ffi = FFI::Platypus->new(lib => [$lib]);
+            $ffi->attach([uu_run => '__sh_uu_run_ffi'] => ['string', 'int', 'string[]'] => 'int');
+            $__SH_UU_FFI = $ffi;
+            $__SH_UU = 1;
+            1;
+        };
+        last if $ok;
+    }
+    unless ($__SH_UU) {
+        warn "sh2perl: uu-ffi .so (libcoreutils_ffi) not found — external commands fall back to fork/exec (slower)\n";
+    }
+}
+my $__SH_UU_SEQ = 0;
+sub __sh_uu_run {
+    my @argv = @_;
+    if ($__SH_UU && ($__SH_UU_OK{ $argv[0] // '' } // 0)) {
+        $__sh_uu_rc = __sh_uu_run_ffi($argv[0], scalar(@argv), \@argv);
+        return;
+    }
+    system('bash', '-c', join(' ', @argv));
+    $__sh_uu_rc = $? >> 8;
+}
+sub __sh_uu_capture {
+    my @argv = @_;
+    if ($__SH_UU && ($__SH_UU_OK{ $argv[0] // '' } // 0)) {
+        # Capture = fd-1 redirect to a temp file around the IN-PROCESS
+        # uu_run call (the fd redirect is what the C wrapper's drain
+        # thread exists for; a temp file cannot fill, so no deadlock).
+        my $tmpf = "/tmp/sh2_uu_${$}_" . ($__SH_UU_SEQ++) . ".cap";
+        open(my $saved, '>&', \*STDOUT) or do { $__sh_uu_rc = 127; return ''; };
+        open(STDOUT, '>', $tmpf) or do { $__sh_uu_rc = 127; return ''; };
+        my $rc = eval { __sh_uu_run_ffi($argv[0], scalar(@argv), \@argv) };
+        open(STDOUT, '>&', $saved) or do { $__sh_uu_rc = 127; return ''; };
+        close($saved);
+        $__sh_uu_rc = defined $rc ? $rc : 127;
+        my $out = '';
+        if (open(my $rf, '<', $tmpf)) { $out = do { local $/; <$rf> } // ''; close $rf; }
+        unlink $tmpf;
+        return $out;
+    }
+    my $c = join(' ', @argv);
+    my $out = do {
+        open(my $fh, '-|', 'bash', '-c', $c) or do { $__sh_uu_rc = 127; return ''; };
+        my $r = do { local $/; <$fh> };
+        close $fh;
+        $r;
+    };
+    $__sh_uu_rc = $? >> 8;
+    return $out // '';
+}
+# __SH_RUN_EXT_END
+"#;
+
+/// Split a shell command string into argv (dq/sq aware, quotes stripped).
+/// REFUSE > GUESS: None on shell metacharacters (`| & ; < > ( )` backtick,
+/// `$`, backslash, newline) — those keep the existing shell-string paths —
+/// or on unbalanced quotes.
+pub(crate) fn sh_split_simple_cmd(cmd: &str) -> Option<Vec<String>> {
+    if cmd.is_empty() {
+        return None;
+    }
+    if cmd.chars().any(|c| {
+        matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`' | '$' | '\\' | '\n')
+    }) {
+        return None;
+    }
+    let mut argv = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in cmd.chars() {
+        match (quote, c) {
+            (None, '"') | (None, '\'') => {
+                if !cur.is_empty() {
+                    argv.push(std::mem::take(&mut cur));
+                }
+                quote = Some(c);
+            }
+            (Some(q), c2) if Some(c2) == quote => {
+                argv.push(std::mem::take(&mut cur));
+                quote = None;
+            }
+            (Some(_), c2) => cur.push(c2),
+            (None, c2) if c2.is_whitespace() => {
+                if !cur.is_empty() {
+                    argv.push(std::mem::take(&mut cur));
+                }
+            }
+            (None, c2) => cur.push(c2),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !cur.is_empty() {
+        argv.push(cur);
+    }
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+/// Perl single-quoted literal for one argv word.
+fn perl_word_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Route a simple command through the `__sh_uu_*` seam (capture form):
+/// `do { my $_r = __sh_uu_capture(…); $CHILD_ERROR = $__sh_uu_rc; chomp
+/// $_r; $_r; }` — byte-identical semantics to the open-idiom it replaces
+/// (trailing-newline chomp; $?-derived status), without the bash wrap.
+fn sh_uu_capture_expr(argv: &[String]) -> String {
+    let args = argv.iter().map(|w| perl_word_literal(w)).collect::<Vec<_>>().join(", ");
+    format!(
+        "do {{ my $_r = __sh_uu_capture({args}); $CHILD_ERROR = $__sh_uu_rc; chomp $_r; $_r; }}"
+    )
+}
+
 pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // Wrap the command string in a Perl do { open() ... } block so it is
     // executed through bash -c and stdout is captured, avoiding qx{...}
@@ -6625,6 +6790,14 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // where neither character appears in the content.  This avoids the old
     // fragile approach of escaping `}` as `\}` inside q{...}, which changed
     // the content (e.g. broke awk `{print ...}` programs).
+    // The external-command seam (UU-FFI.md): a SIMPLE command (no shell
+    // metacharacters — `sh_split_simple_cmd` refuses those) routes through
+    // __sh_uu_capture (in-process uu-ffi when the .so is present, guarded
+    // fork/exec fallback otherwise). Complex commands keep the bash -c
+    // string path.
+    if let Some(argv) = sh_split_simple_cmd(cmd) {
+        return sh_uu_capture_expr(&argv);
+    }
     let quoted = safe_perl_q_string(cmd);
     format!(
         "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
