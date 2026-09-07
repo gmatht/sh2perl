@@ -1181,39 +1181,64 @@ impl Render {
         let body = self.out[self.runtime_end..].join("\n");
         let runtime: Vec<String> = self.out[self.runtime_start..self.runtime_end].to_vec();
 
+        // Segmentation must mirror C structure, or reachability cascades:
+        //   - a function segment's DECLARED name is the identifier before
+        //     the first '(' — NOT the whole signature. Parameter TYPES
+        //     (`static char *_sh_adup(_sh_arena *a, …)`) must not count,
+        //     or mentioning a type keeps every helper that takes it alive.
+        //   - top-level `static` VARIABLE declarations and `typedef`s are
+        //     their own segments (so `_sh_wb`/`_sh_opts`/`_sh_bg_pids` die
+        //     independently, not with whatever function precedes them).
+        //   - everything else attaches to the current segment — a `static
+        //     char sc[65536];` LOCAL inside a helper body (brace depth > 0)
+        //     must not split the helper in two and orphan its tail.
+        //   - nameless lines (comments, #define, blank) pend and attach to
+        //     the NEXT segment, so `#define SH2_ARENA_CAP` stays glued to
+        //     the `_sh_arena` typedef and a dropped helper's comment dies
+        //     with it (attach-to-previous would drop a live #define when
+        //     the preceding declaration dies).
         let mut segs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
+        let mut depth: i64 = 0;
         for line in &runtime {
             let t = line.trim_start();
-            // only FUNCTION declarations start a segment — a `static char
-            // sc[65536];` LOCAL inside a helper would otherwise split the
-            // helper in two and orphan its body. Lines appended to a
-            // segment still contribute their `_sh_*` names (the `static
-            // int _sh_rc = 0;` def has no paren).
-            let toks = sh_tokens(t);
-            if t.starts_with("static ") && t.contains('(') {
-                // names come from the DECLARATION only — a single-line
-                // function (`static void f(void) { g(); }`) puts its body
-                // on the same line; its body's calls must not count as
-                // declared names or the reachability cascades
-                let head = t.split('{').next().unwrap_or(t);
-                segs.push((sh_tokens(head).into_iter().collect(), vec![line.clone()]));
-            } else if let Some(last) = segs.last_mut() {
-                // only `static` VARIABLE declarations contribute names
-                // (the `static int _sh_rc = 0;` def, `static char
-                // sc[65536];` locals) — a function BODY's calls must
-                // not, or the reachability cascades through the whole
-                // call graph
-                if t.starts_with("static ") {
-                    for tk in toks {
-                        if !last.0.contains(&tk) {
-                            last.0.push(tk);
-                        }
+            let is_static = t.starts_with("static ");
+            if depth == 0 && is_static {
+                let mut lines = std::mem::take(&mut pending);
+                lines.push(line.clone());
+                if t.contains('(') {
+                    // function definition: the name is the last `_sh_*`
+                    // token before the parameter list's '(' — parameter
+                    // types must not become declared names
+                    let head = t.split('{').next().unwrap_or(t);
+                    let before_paren = head.split('(').next().unwrap_or(head);
+                    let mut names: Vec<String> = sh_tokens(before_paren)
+                        .into_iter()
+                        .collect();
+                    if let Some(last) = names.len().checked_sub(1) {
+                        names.drain(..last); // keep ONLY the fn name
+                    } else {
+                        names = sh_tokens(head).into_iter().collect();
                     }
+                    segs.push((names, lines));
+                } else {
+                    // top-level variable declaration — names from the
+                    // whole line (a one-line `static char x, *y;` may
+                    // declare several)
+                    segs.push((sh_tokens(t).into_iter().collect(), lines));
                 }
+            } else if depth == 0 && t.starts_with("typedef ") {
+                let mut lines = std::mem::take(&mut pending);
+                lines.push(line.clone());
+                segs.push((sh_tokens(t).into_iter().collect(), lines));
+            } else if let Some(last) = segs.last_mut() {
                 last.1.push(line.clone());
             } else {
-                segs.push((toks.into_iter().collect(), vec![line.clone()]));
+                // nameless line before any segment — pend for the next one
+                pending.push(line.clone());
             }
+            depth += line.matches('{').count() as i64;
+            depth -= line.matches('}').count() as i64;
         }
 
         let mut needed: BTreeSet<String> = sh_tokens(&body);
@@ -1356,7 +1381,16 @@ impl Render {
 
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Int(i) => i.to_string(),
+            IrExpr::Int(i) => {
+                // bash arithmetic is 64-bit — a literal beyond int range
+                // must carry the LL suffix or int math overflows silently
+                // (`67108847 * 67108837` folds as int → wrong product)
+                if *i > i32::MAX as i64 || *i < i32::MIN as i64 {
+                    format!("{i}LL")
+                } else {
+                    i.to_string()
+                }
+            }
             IrExpr::Str(s, _) => Self::cstr(s),
             IrExpr::Var(name, _) => self.c_ident(name),
             IrExpr::Ident(name) => self.c_ident(name),
@@ -1431,13 +1465,73 @@ impl Render {
         }
     }
 
+    /// Every leaf of `a` is a literal (the pure-constant subtree check
+    /// for the 64-bit-widening rule in `arith`).
+    fn arith_const_only(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Num(_) => true,
+            ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_const_only(lhs) && Self::arith_const_only(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_const_only(arg),
+            _ => false,
+        }
+    }
+
+    /// Does `lhs op rhs`'s proven range exceed int32 (the widening
+    /// trigger)? Unknown ranges → false (leave the current shape).
+    fn arith_bin_range_exceeds_i32(op: &str, lhs: &ArithAst, rhs: &ArithAst) -> bool {
+        let state = HashMap::new();
+        let bin = ArithAst::Bin {
+            op: op.to_string(),
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+        };
+        match arith_range_local(&bin, &state) {
+            Some((lo, hi)) => lo < i32::MIN as i128 || hi > i32::MAX as i128,
+            None => false,
+        }
+    }
+
+    /// Render a CONST-ONLY subtree with every literal suffixed LL —
+    /// the 64-bit form `arith` emits when the value would overflow int.
+    fn arith_const_wide(a: &ArithAst) -> String {
+        match a {
+            ArithAst::Num(n) => format!("{n}LL"),
+            ArithAst::Bin { op, lhs, rhs } => format!(
+                "({} {} {})",
+                Self::arith_const_wide(lhs),
+                op,
+                Self::arith_const_wide(rhs)
+            ),
+            ArithAst::Un { op, arg } => format!("({op}{})", Self::arith_const_wide(arg)),
+            _ => "0LL".into(),
+        }
+    }
+
     /// Native C arithmetic from ArithAst (the numeric path).
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
-            ArithAst::Num(n) => n.to_string(),
+            ArithAst::Num(n) => {
+                // bash arithmetic is 64-bit — a literal beyond int range
+                // must carry the LL suffix, or the CONSTANT FOLDS as int
+                // (`67108847 * 67108837` overflows, truncating the
+                // product) and the program silently computes garbage
+                if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
+                    format!("{n}LL")
+                } else {
+                    n.to_string()
+                }
+            }
             ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.is_num(name) {
                     self.c_ident(name)
+                } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    // `$1` in `$(( ))` — the positional param (the caller's
+                    // _sh_argv; fnValue swaps it around in-process calls)
+                    format!(
+                        "(long long)atoll((({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\"))"
+                    )
                 } else {
                     // a Str-typed var in arithmetic: coerce its value
                     // (`$((x * y))` with x="5" — bash parses at runtime)
@@ -1463,8 +1557,19 @@ impl Render {
                 format!("(long long)atoll(_sh_arr_get({id}, {id}_len, {k}))")
             }
             ArithAst::Bin { op, lhs, rhs } => {
-                let l = self.arith(lhs);
-                let r = self.arith(rhs);
+                // bash arithmetic is intmax_t (64-bit): a constant subtree
+                // whose proven value exceeds int must render with LL
+                // literals, or C folds the PRODUCT as int BEFORE the
+                // caller's `(long long)` cast truncates it
+                // (`67108847 * 67108837` → wrong product silently)
+                let wide = matches!(op.as_str(), "+" | "-" | "*")
+                    && (Self::arith_const_only(lhs) || Self::arith_const_only(rhs))
+                    && Self::arith_bin_range_exceeds_i32(op, lhs, rhs);
+                let (l, r) = if wide {
+                    (Self::arith_const_wide(lhs), Self::arith_const_wide(rhs))
+                } else {
+                    (self.arith(lhs), self.arith(rhs))
+                };
                 if *op == "**" {
                     // no libm on the gate's cc line — integer pow helper
                     self.need_pow = true;
@@ -1922,6 +2027,16 @@ impl Render {
     /// render as the empty string, matching bash's unset semantics in
     /// expansions).
     fn store_ref(&self, name: &str) -> String {
+        // positional params ($1, $2, …) — the caller's _sh_argv (the
+        // fnValue dispatch / fn-call lowering swaps it around in-process
+        // calls, so a function body's `$1` reads ITS call's argv). A
+        // digit name must NOT fall through to the var store: `c_ident
+        // ("1")` is not a C identifier (`(1 ? 1 : "")` — garbage).
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            return format!(
+                "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
+            );
+        }
         let id = self.c_ident(name);
         // managed-string vars read via .p; raw char* vars via null-guard
         if self.managed_strings.contains(name) {
@@ -2991,8 +3106,22 @@ impl Render {
                             }
                             let id = self.c_ident(&n);
                             if !joined.is_empty() && joined.contains(&id) {
+                                // materialize into THIS stage's buffer: a
+                                // capture site builds a PRIVATE command
+                                // text (_cN_cmd) — writing the init into
+                                // the shared _sh_cmd corrupts BOTH (the
+                                // capture runs `; cmd args` — a bash
+                                // syntax error — and the init text lands
+                                // mid-command in an outer shared build)
+                                let (bcmd, bcap) = match buf {
+                                    CmdBuf::Shared => ("&_sh_cmd", "&_sh_cap"),
+                                    CmdBuf::Private(pid) => (
+                                        &*format!("&_c{pid}_cmd"),
+                                        &*format!("&_c{pid}_cap"),
+                                    ),
+                                };
                                 self.emit(&format!(
-                                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {}, {}_len);",
+                                    "_sh_idx_init({bcmd}, {bcap}, {}, {}, {}_len);",
                                     Self::cstr(&n),
                                     id,
                                     id
@@ -4636,6 +4765,34 @@ impl Render {
     /// call expression. The site's command text is built in its own
     /// private buffers (nested captures can't clobber it).
     fn capture_call(&mut self, args: &[IrExpr]) -> String {
+        // `$(fn args…)` of a shell function DEFINED in this program:
+        // lower to the in-process call + stdout capture (the fnValue
+        // dispatch → `_sh_capture_fn`). The bash shell-out can NEVER run
+        // a shell-defined function — the child bash never sees it, so it
+        // prints `command not found` and the capture comes back empty —
+        // which makes this the CORRECT lowering, not just a faster one.
+        // Refuse > guess: only the exact single-stmt shape.
+        if let [IrExpr::Arrow(stmts)] = args {
+            if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
+                if matches!(func.as_str(), "exec" | "builtin") {
+                    if let Some(fname) = Self::str_arg(cargs, 0) {
+                        if !fname.is_empty() && self.functions.contains(&fname) {
+                            let words = match cargs.get(1) {
+                                Some(IrExpr::Array(items)) => items.clone(),
+                                _ => vec![],
+                            };
+                            return self.expr(&IrExpr::Call {
+                                func: "fnValue".to_string(),
+                                args: vec![
+                                    IrExpr::Str(fname, crate::ir::StrStyle::DoubleQuoted),
+                                    IrExpr::Array(words),
+                                ],
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let args = args.to_vec();
         self.cap_site(|r, id| {
             r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
@@ -6928,6 +7085,8 @@ impl Render {
                 self.temp_seq += 1;
                 let buf = format!("_sh_fnbuf{}", self.temp_seq);
                 self.temp_seq += 1;
+                let scmd = format!("_sh_scmd{}", self.temp_seq);
+                self.temp_seq += 1;
                 self.emit(&format!("char *{av}[{}];", n.max(2)));
                 self.emit(&format!("{av}[0] = {};", Self::cstr(&fname)));
                 for (i, w) in call_args.iter().enumerate() {
@@ -6936,6 +7095,19 @@ impl Render {
                 }
                 let sc = format!("_sh_sc{}", self.temp_seq);
                 self.emit(&format!("char **{sv} = _sh_argv; int {sc} = _sh_argc;"));
+                self.temp_seq += 1;
+                // DETACH the shared command buffer around the call: the
+                // callee runs its own shell-out sites, which _sh_reset()
+                // the SHARED buffer — if the call happens mid-build (a
+                // `echo "[$(f 12)]"` site assembles ` 'echo' '['` and then
+                // evaluates the capture), the callee would clobber the
+                // half-built command text. Detach → the callee builds on
+                // a fresh buffer; restore the caller's text after.
+                self.emit(&format!(
+                    "char *{scmd} = _sh_cmd; size_t _sh_sccap{} = _sh_cap; _sh_cmd = 0; _sh_cap = 0;",
+                    self.temp_seq
+                ));
+                let sccap = format!("_sh_sccap{}", self.temp_seq);
                 self.temp_seq += 1;
                 // the callee reuses the same file-scope globals — a
                 // cross-function call clobbers the caller's shared vars.
@@ -7004,6 +7176,8 @@ impl Render {
                     }
                 }
                 self.emit(&format!("_sh_argv = {sv}; _sh_argc = {sc};"));
+                // reattach the caller's shared buffer (see the detach above)
+                self.emit(&format!("_sh_cmd = {scmd}; _sh_cap = {sccap};"));
                 buf
             }
             "grepMatches" => {
@@ -9650,8 +9824,11 @@ impl Render {
             IrExpr::Arith(a) => {
                 let mut has_var = false;
                 arith_leaves_at_width(a, self, w, &mut has_var)
-                    // a pure-Num arith renders as `int` — only matches I32
-                    && (has_var || w == Width::I32)
+                    // a pure-Num arith may render with LL literals (the
+                    // 64-bit widening in `arith` — int-range folding
+                    // would truncate) — only a var-leaf expr is provably
+                    // at its declared width
+                    && has_var
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 // `$y` read of a typed var renders as the declared ident
