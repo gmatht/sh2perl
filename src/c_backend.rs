@@ -29,7 +29,7 @@
 //! covered by the range analysis; the string side stays open).
 
 use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart, VarKind};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 enum Part {
     Lit(String),
@@ -263,6 +263,13 @@ pub struct Render {
     /// native pipeline builtin-stage thunks (`static void _sh_stgN_M(void) {...}`)
     stage_thunks: Vec<String>,
     thunk_names: Vec<String>,
+    /// native calling-convention lifts: shell fn name → arity (the max
+    /// positional index its body reads). A lifted fn takes real C
+    /// params (char *_pN) and RETURNS its single trailing `echo V`'s
+    /// value — call sites are plain C calls (no argv swap, no capture).
+    lifted_fns: BTreeMap<String, usize>,
+    /// the current lifted fn's param idents (_p1..) during its body render
+    cur_params: Vec<String>,
     /// the actual helper ids (the seq counter interleaves sites and caps)
     site_ids: Vec<usize>,
     cap_ids: Vec<usize>,
@@ -359,6 +366,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
+    r.lifted_fns = scan_fn_lifts(&prog.stmts);
+    if !r.lifted_fns.is_empty() {
+        // the lifted fns' return values live in the _sh_* runtime
+        r.need_sh = true;
+    }
     r.program(&prog);
     r.trim_sh_runtime();
     // _sh_rc models bash's `$?`: the renderer stores it after every
@@ -852,6 +864,16 @@ impl Render {
             self.emit("  size_t n = (size_t)_n; buf[n] = 0;");
             self.emit("  close(pfd[0]);");
             self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
+            self.emit("  return buf;");
+            self.emit("}");
+            // function return-value lift: copy the value, strip trailing
+            // newlines (echo printed value+\n; the $( ) capture strips
+            // trailing \n/\r — the returned value IS that text)
+            self.emit("static char *_sh_ret_val(char *buf, size_t cap, const char *v) {");
+            self.emit("  size_t dn = 0;");
+            self.emit("  if (v) { for (const char *p = v; *p && dn + 1 < cap; p++) buf[dn++] = *p; }");
+            self.emit("  buf[dn] = 0;");
+            self.emit("  while (dn > 0 && (buf[dn - 1] == '\\n' || buf[dn - 1] == '\\r')) buf[--dn] = 0;");
             self.emit("  return buf;");
             self.emit("}");
             // in-process function CALL: argv swap (positional params),
@@ -1664,11 +1686,9 @@ impl Render {
                 if self.is_num(name) {
                     self.c_ident(name)
                 } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-                    // `$1` in `$(( ))` — the positional param (the caller's
-                    // _sh_argv; fnValue swaps it around in-process calls)
-                    format!(
-                        "(long long)atoll((({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\"))"
-                    )
+                    // `$1` in `$(( ))` — a lifted fn's real C param, else
+                    // the caller's _sh_argv (fnValue swaps it per call)
+                    format!("(long long){}", self.positional_read_l(name))
                 } else {
                     // a Str-typed var in arithmetic: coerce its value
                     // (`$((x * y))` with x="5" — bash parses at runtime)
@@ -1988,6 +2008,22 @@ impl Render {
     /// Always emitted: a `:`-body function may be CALLED (shellbench
     /// func:func wraps the call in @begin/@end) — dropping the
     /// definition would make the call an undefined symbol.
+    /// The C signature for a shell function: lifted fns return their
+    /// value and take real C params; everything else stays void(void).
+    fn fn_c_sig(&self, name: &str, fname: &str) -> String {
+        match self.lifted_fns.get(name) {
+            None => format!("static void {fname}(void)"),
+            Some(&0) => format!("static char *{fname}(void)"),
+            Some(&n) => format!(
+                "static char *{fname}({})",
+                (1..=n)
+                    .map(|i| format!("char *_p{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
     fn emit_function(&mut self, name: &str, body: &[IrStmt], main_vars: &BTreeSet<String>) {
         let fname = self.c_ident(name);
         // per-function hoist: vars ASSIGNED inside the function that are
@@ -2046,9 +2082,56 @@ impl Render {
         let cap_mark = self.cap_bodies.len();
         self.decl_line_idx.clear();
         let fn_vars_before = self.site_file_vars.clone();
-        for st in body {
+        // LIFTED fn: real C params ($N reads render as _pN) and the
+        // single trailing `echo V` becomes the return value (the caller
+        // consumed it as the $(fn) capture's text)
+        let lifted_arity = self.lifted_fns.get(name).copied();
+        let saved_params = std::mem::take(&mut self.cur_params);
+        if let Some(arity) = lifted_arity {
+            self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
+        }
+        let lifted = lifted_arity.is_some();
+        if lifted {
+            self.emit(&format!(
+                "static char _fnret_{fname}[65536];"
+            ));
+        }
+        let n_body = body.len();
+        for (bi, st) in body.iter().enumerate() {
+            if lifted && bi == n_body - 1 {
+                continue; // the echo → return, emitted below
+            }
             self.stmt(st);
         }
+        if let (Some(_arity), true) = (lifted_arity, lifted && n_body > 0) {
+            // the trailing echo's single element — its VALUE is the
+            // function's value (echo printed value+\n; the $( ) capture
+            // strips trailing newlines; _sh_ret_val does the same)
+            if let IrStmt::Expr(IrExpr::Call { args, .. }) = body.last().unwrap() {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if let Some(val) = items.first() {
+                        let v = self.value_c(val);
+                        let rv = format!("_rv{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        // impure value exprs (native pipeline calls)
+                        // must run exactly once — hoist to a temp
+                        if v.contains("_sh_pipeline(") || v.contains("_cap_")
+                            || v.contains("_sh_call_fn(")
+                        {
+                            self.emit(&format!("char *{rv} = {v};"));
+                            self.emit(&format!(
+                                "return _sh_ret_val(_fnret_{fname}, sizeof _fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "return _sh_ret_val(_fnret_{fname}, sizeof _fnret_{fname}, (({v}) ? ({v}) : \"\"));"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        self.cur_params = saved_params;
         let fn_file_vars: BTreeSet<String> = self
             .site_file_vars
             .difference(&fn_vars_before)
@@ -2126,8 +2209,9 @@ impl Render {
         }
         // forward declaration: a function may CALL another defined later
         // (nested defs are hoisted in collection order — 081 inner/outer)
-        self.fn_fwd_decls.push(format!("static void {fname}(void);"));
-        self.emit(&format!("static void {fname}(void) {{"));
+        let sig = self.fn_c_sig(name, &fname);
+        self.fn_fwd_decls.push(format!("{sig};"));
+        self.emit(&format!("{sig} {{"));
         self.depth += 1;
         let mut local_lines: Vec<&String> = Vec::new();
         for (n, line) in fvars.iter().zip(decl_lines.iter()) {
@@ -2170,9 +2254,7 @@ impl Render {
         // digit name must NOT fall through to the var store: `c_ident
         // ("1")` is not a C identifier (`(1 ? 1 : "")` — garbage).
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-            return format!(
-                "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
-            );
+            return self.positional_str_l(&name);
         }
         let id = self.c_ident(name);
         // managed-string vars read via .p; raw char* vars via null-guard
@@ -2183,6 +2265,38 @@ impl Render {
         } else {
             format!("({id} ? {id} : \"\")")
         }
+    }
+
+    /// The C ident of positional param N when rendering a LIFTED
+    /// function's body (native calling convention), else None.
+    fn lifted_param(&self, name: &str) -> Option<String> {
+        if self.cur_params.is_empty() {
+            return None;
+        }
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let i: usize = name.parse().ok()?;
+        if i == 0 || i > self.cur_params.len() {
+            return None;
+        }
+        Some(self.cur_params[i - 1].clone())
+    }
+
+    /// Numeric `$N` read: the lifted fn's param, else the caller's argv.
+    fn positional_read_l(&self, n: &str) -> String {
+        if let Some(p) = self.lifted_param(n) {
+            return format!("(atoll((({p}) ? ({p}) : \"\")))");
+        }
+        format!("(atoll((( {n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")))")
+    }
+
+    /// String `$N` read (the argv-or-param form, null-guarded).
+    fn positional_str_l(&self, n: &str) -> String {
+        if let Some(p) = self.lifted_param(n) {
+            return format!("(({p}) ? ({p}) : \"\")");
+        }
+        format!("(({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")")
     }
 
     /// store read with the env fallback: an ASSIGNED var reads the C
@@ -2320,9 +2434,7 @@ impl Render {
                         return t;
                     }
                     if name.chars().all(|c| c.is_ascii_digit()) {
-                        return format!(
-                            "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
-                        );
+                        return self.positional_str_l(&name);
                     }
                     if self.is_num(&name) {
                         self.num_temp(&self.c_ident(&name))
@@ -2377,7 +2489,7 @@ impl Render {
                     // (`echo "$(( ))"`) is the fallback for texts the
                     // parser cannot handle.
                     if let Some(s) = Self::str_arg(args, 0) {
-                        let pre = Self::arith_subst_specials(&s);
+                        let pre = self.arith_subst_specials_l(&s);
                         if let Some(ast) = crate::shir::parse_arith(&pre) {
                             let v = if Self::arith_has_side_effects(&ast) {
                                 self.arith_sequenced(&ast)
@@ -2740,7 +2852,8 @@ impl Render {
                         }
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
                             self.emit(&format!(
-                                "_sh_export(\"_SHARGV\", (({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\"));"
+                                "_sh_export(\"_SHARGV\", {});",
+                                self.positional_str_l(n)
                             ));
                             match buf {
                                 CmdBuf::Shared => self.emit("_sh_addraw(\"$_SHARGV\");"),
@@ -5418,7 +5531,7 @@ impl Render {
     /// Positional/special params are substituted textually first (bash
     /// expands them before the arithmetic parses).
     fn arith_text(&mut self, s: &str) -> String {
-        let pre = Self::arith_subst_specials(s);
+        let pre = self.arith_subst_specials_l(s);
         if let Some(ast) = crate::shir::parse_arith(&pre) {
             if Self::arith_has_side_effects(&ast) {
                 return self.arith_sequenced(&ast);
@@ -5671,7 +5784,7 @@ impl Render {
     fn mf_numref(&mut self, name: &str) -> String {
         self.need_sh = true;
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-            return Self::positional_read(name);
+            return self.positional_read_l(name);
         }
         if self.is_num(name) {
             return format!("(long long)({})", self.c_ident(name));
@@ -5770,7 +5883,7 @@ impl Render {
 
     /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
     /// bash expands these BEFORE the arith parser sees the text.
-    fn arith_subst_specials(s: &str) -> String {
+    fn arith_subst_specials_l(&self, s: &str) -> String {
         let chars: Vec<char> = s.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -5781,7 +5894,7 @@ impl Render {
                     if let Some(end) = inner.find('}') {
                         let name = &inner[..end];
                         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-                            out.push_str(&Self::positional_read(name));
+                            out.push_str(&self.positional_read_l(name));
                             i += 3 + end;
                             continue;
                         }
@@ -5792,7 +5905,7 @@ impl Render {
                         j += 1;
                     }
                     let n: String = chars[i + 1..j].iter().collect();
-                    out.push_str(&Self::positional_read(&n));
+                    out.push_str(&self.positional_read_l(&n));
                     i = j;
                     continue;
                 } else if rest.starts_with('#') {
@@ -5811,11 +5924,7 @@ impl Render {
         out
     }
 
-    fn positional_read(n: &str) -> String {
-        format!(
-            "(atoll((( {n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")))"
-        )
-    }
+
 
     /// Whether a list of statements can be rendered natively (the body
     /// runs inside a C `while(_sh_readline_from(...))` loop, so it must
@@ -7063,9 +7172,9 @@ impl Render {
         } else if self.var_types.contains_key(&name) && self.is_num(&name) {
             self.num_temp(&self.c_ident(&name))
         } else if name.starts_with('$') || name.chars().all(|c| c.is_ascii_digit()) {
-            // positional $N — the function-call argv (empty at top level)
+            // positional $N — a lifted fn's C param or the caller's argv
             self.need_sh = true;
-            format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
+            self.positional_str_l(name.trim_start_matches('$'))
         } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
             // `${LIST:-}` / `${MAP[k]}` — an ARRAY read: element 0 for
             // scalars (the array_join path handles the @/* forms above)
@@ -7341,11 +7450,9 @@ impl Render {
                     return t;
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
-                    // positional $N — the function-call argv (empty at top)
+                    // positional $N — a lifted fn's C param or the argv
                     self.need_sh = true;
-                    return format!(
-                        "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
-                    );
+                    return self.positional_str_l(&name);
                 }
                 if let Some(rest) = name.strip_prefix('#') {
                     // ${#var} — the core spells the LENGTH expansion
@@ -7819,21 +7926,41 @@ impl Render {
                         self.emit(&format!("char *{sv_tag}_{id} = {id};"));
                     }
                 }
-                // arg values FIRST: their value_c temps must precede the
-                // compound-literal statement below
-                let mut lit_parts = vec![Self::cstr(&fname)];
-                for w in &call_args {
-                    lit_parts.push(self.value_c(w));
-                }
-                lit_parts.push("0".into());
                 let cn = format!("_cn{}", self.temp_seq);
                 self.temp_seq += 1;
-                self.emit(&format!(
-                    "char *{cn} = _sh_call_fn({}, (char *[]){{{}}}, {}, (char[65536]){{0}}, 65536);",
-                    self.c_ident(&fname),
-                    lit_parts.join(", "),
-                    n
-                ));
+                if let Some(&arity) = self.lifted_fns.get(&fname) {
+                    // NATIVE calling convention: the fn takes real C
+                    // params and returns its value — a plain call. No
+                    // argv swap (the body reads _pN), no stdout capture,
+                    // no helper. Missing args pad "" (unset positionals).
+                    let mut a: Vec<String> = Vec::new();
+                    for i in 0..arity {
+                        let v = match call_args.get(i) {
+                            Some(w) => self.value_c(w),
+                            None => "\"\"".into(),
+                        };
+                        a.push(v);
+                    }
+                    self.emit(&format!(
+                        "char *{cn} = {}({});",
+                        self.c_ident(&fname),
+                        a.join(", ")
+                    ));
+                } else {
+                    // arg values FIRST: their value_c temps must precede the
+                    // compound-literal statement below
+                    let mut lit_parts = vec![Self::cstr(&fname)];
+                    for w in &call_args {
+                        lit_parts.push(self.value_c(w));
+                    }
+                    lit_parts.push("0".into());
+                    self.emit(&format!(
+                        "char *{cn} = _sh_call_fn({}, (char *[]){{{}}}, {}, (char[65536]){{0}}, 65536);",
+                        self.c_ident(&fname),
+                        lit_parts.join(", "),
+                        n
+                    ));
+                }
                 // var restores AFTER the call (the caller's enclosing
                 // statement — emitted next — reads only {cn}, never these)
                 for v in &self_rec_vars {
@@ -8003,9 +8130,7 @@ impl Render {
                             parts.push(Self::cstr(&lit));
                             lit.clear();
                         }
-                        parts.push(format!(
-                            "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
-                        ));
+                        parts.push(self.positional_str_l(&name));
                         i = j;
                         continue;
                     }
@@ -8429,9 +8554,7 @@ impl Render {
                         if name.chars().all(|c| c.is_ascii_digit()) {
                             self.need_sh = true;
                             return vec![Part::Arg(
-                                format!(
-                                    "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
-                                ),
+                                self.positional_str_l(name),
                                 NumSpec::Str,
                             )];
                         }
@@ -10881,6 +11004,494 @@ impl Render {
             self.emit(&format!("/* {} construct(s) lowered to TODO markers */", self.todo));
         }
     }
+}
+
+fn lift_str_arg(args: &[IrExpr], i: usize) -> Option<String> {
+    match args.get(i) {
+        Some(IrExpr::Str(s, _)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// ── native calling-convention lift analysis ──
+///
+/// A shell function qualifies when
+///   - it is NEVER called as a bare statement (its stdout is only ever
+///     captured — `$(f …)` / capture arrows / pipeline stages), so its
+///     single `echo` output is its VALUE,
+///   - its body reads only `$1..$9` (no `$@`/`$*`/`$#`/`$0`, no
+///     `shift`/`set --` to renumber them),
+///   - it has no bash `return`, no nested function defs of unknown
+///     shape, and its ONLY stdout writer is the LAST statement, an
+///     `echo V` with a single element (no -n/-e flags, no multi-word),
+///   - it does not call itself (the per-fn return buffer would alias).
+/// Such a fn takes real C params (`char *_pN`) and returns its value —
+/// call sites are plain C calls. Refuse > guess: anything unanalyzed
+/// keeps the argv/capture transport.
+#[derive(Default)]
+struct LiftScan {
+    max_pos: usize,
+    bad: bool,
+    self_call: bool,
+    writers: usize,
+}
+
+fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
+    match e {
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                let n: usize = name.parse().unwrap_or(0);
+                if n > st.max_pos {
+                    st.max_pos = n;
+                }
+            } else if matches!(name.as_str(), "@" | "*" | "#" | "0") {
+                st.bad = true;
+            }
+        }
+        IrExpr::Str(s, _) => {
+            // `$1` inside RAW text: an arith text is fine (arith_subst/
+            // mathfunc read the lifted param); any other raw text would
+            // reach a child bash that does not see the fn's params —
+            // refuse rather than guess.
+            if !spawn && s.contains('$') {
+                let b: Vec<char> = s.chars().collect();
+                let mut i = 0;
+                while i < b.len() {
+                    if b[i] == '$' {
+                        let d = b.get(i + 1);
+                        if d.map_or(false, |c| c.is_ascii_digit() || *c == '{' || *c == '@') {
+                            st.bad = true;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        IrExpr::Call { func, args } => match func.as_str() {
+            "capture" | "captureWords" => {
+                for a in args {
+                    if let IrExpr::Arrow(stmts) = a {
+                        lift_scan_stmts(stmts, true, fname, st);
+                    }
+                }
+            }
+            "pipeline" => {
+                if !spawn {
+                    st.writers += 1;
+                }
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    for it in items {
+                        if let IrExpr::Arrow(stmts) = it {
+                            lift_scan_stmts(stmts, true, fname, st);
+                        }
+                    }
+                }
+            }
+            "exec" | "builtin" => {
+                if let Some(c) = lift_str_arg(args, 0) {
+                    if c == fname {
+                        st.self_call = true;
+                    }
+                }
+            }
+            "fnValue" => {
+                if let Some(c) = lift_str_arg(args, 0) {
+                    if c == fname {
+                        st.self_call = true;
+                    }
+                }
+            }
+            "arith" => {
+                // the arith STRING may carry `$N` — legal (the numeric
+                // subst/mathfunc paths read the lifted param)
+                for a in args {
+                    lift_scan_expr(a, true, fname, st);
+                }
+            }
+            _ => {
+                for a in args {
+                    lift_scan_expr(a, spawn, fname, st);
+                }
+            }
+        },
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    lift_scan_expr(x, spawn, fname, st);
+                }
+            }
+        }
+        IrExpr::Arrow(stmts) => lift_scan_stmts(stmts, true, fname, st),
+        IrExpr::Array(items) => {
+            for x in items {
+                lift_scan_expr(x, spawn, fname, st);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            lift_scan_expr(lhs, spawn, fname, st);
+            lift_scan_expr(rhs, spawn, fname, st);
+        }
+        IrExpr::Index { key, .. } => lift_scan_expr(key, spawn, fname, st),
+        IrExpr::Arith(a) => lift_scan_arith(a, st),
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                lift_scan_expr(v, spawn, fname, st);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            lift_scan_expr(obj, spawn, fname, st);
+            for a in args {
+                lift_scan_expr(a, spawn, fname, st);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            lift_scan_expr(cond, spawn, fname, st);
+            lift_scan_expr(then, spawn, fname, st);
+            lift_scan_expr(else_, spawn, fname, st);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            lift_scan_expr(expr, spawn, fname, st);
+            lift_scan_expr(default, spawn, fname, st);
+        }
+        IrExpr::Capture { expr, .. } => lift_scan_expr(expr, true, fname, st),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            lift_scan_expr(iter, spawn, fname, st);
+            lift_scan_expr(elem, spawn, fname, st);
+            if let Some(c) = cond {
+                lift_scan_expr(c, spawn, fname, st);
+            }
+        }
+        IrExpr::Splice(x) => lift_scan_expr(x, spawn, fname, st),
+        // opaque / unknown shapes — refuse the lift
+        IrExpr::RawExpr(_) | IrExpr::Ext(_) | IrExpr::Lambda { .. } => st.bad = true,
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
+        | IrExpr::Range { .. } => {}
+    }
+}
+
+fn lift_scan_arith(a: &ArithAst, st: &mut LiftScan) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                let i: usize = n.parse().unwrap_or(0);
+                if i > st.max_pos {
+                    st.max_pos = i;
+                }
+            }
+        }
+        ArithAst::Bin { lhs, rhs, .. } | ArithAst::Cond { test: lhs, then: rhs, .. } => {
+            lift_scan_arith(lhs, st);
+            lift_scan_arith(rhs, st);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => lift_scan_arith(arg, st),
+        ArithAst::Index { var: _, key } => lift_scan_arith(key, st),
+        _ => {}
+    }
+}
+
+fn lift_scan_stmts(stmts: &[IrStmt], spawn: bool, fname: &str, st: &mut LiftScan) {
+    for s in stmts {
+        lift_scan_stmt(s, spawn, fname, st);
+    }
+}
+
+fn lift_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
+    match s {
+        IrStmt::Expr(e) => lift_scan_expr(e, spawn, fname, st),
+        IrStmt::Assign { expr, .. } => lift_scan_expr(expr, spawn, fname, st),
+        IrStmt::If {
+            cond, then, elsifs, else_,
+        } => {
+            lift_scan_expr(cond, spawn, fname, st);
+            lift_scan_stmts(then, spawn, fname, st);
+            for (_, b) in elsifs {
+                lift_scan_expr(cond, spawn, fname, st);
+                lift_scan_stmts(b, spawn, fname, st);
+            }
+            lift_scan_stmts(else_, spawn, fname, st);
+        }
+        IrStmt::While { cond, body } => {
+            lift_scan_expr(cond, spawn, fname, st);
+            lift_scan_stmts(body, spawn, fname, st);
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            lift_scan_stmts(body, spawn, fname, st);
+            lift_scan_expr(cond, spawn, fname, st);
+        }
+        IrStmt::Redirect { inner, .. } => {
+            if !spawn {
+                st.writers += 1;
+            }
+            lift_scan_stmts(inner, true, fname, st);
+        }
+        IrStmt::Subshell(body) => lift_scan_stmts(body, spawn, fname, st),
+        IrStmt::Background(body) => lift_scan_stmts(body, true, fname, st),
+        IrStmt::Pipeline { stages, .. } => {
+            if !spawn {
+                st.writers += 1;
+            }
+            for stage in stages {
+                lift_scan_stmts(stage, true, fname, st);
+            }
+        }
+        IrStmt::Output { .. } => {
+            if !spawn {
+                st.writers += 1;
+            }
+        }
+        IrStmt::Return(_) => st.bad = true,
+        IrStmt::RawText(_) => st.bad = true,
+        IrStmt::Ext(_) | IrStmt::Select { .. } | IrStmt::Exec { .. } => st.bad = true,
+        IrStmt::Function { .. } => st.bad = true,
+
+        IrStmt::Case { clauses, .. } => {
+            for cl in clauses {
+                lift_scan_stmts(&cl.body, spawn, fname, st);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            lift_scan_stmts(body, spawn, fname, st);
+            for ex in excepts {
+                lift_scan_stmts(&ex.body, spawn, fname, st);
+            }
+            lift_scan_stmts(else_body, spawn, fname, st);
+            lift_scan_stmts(finally_body, spawn, fname, st);
+        }
+        IrStmt::For { body, .. } => lift_scan_stmts(body, spawn, fname, st),
+        IrStmt::Die { .. } | IrStmt::Warn { .. } | IrStmt::Exit(_)
+        | IrStmt::Continue | IrStmt::Break => {}
+        _ => st.bad = true,
+    }
+}
+
+/// The lift map: shell fn name → arity, for every function that passes
+/// the native-calling-convention analysis.
+fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
+    let mut names = BTreeSet::new();
+    let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    collect_fn_defs(stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    // a bare call ANYWHERE (any fn's body, any bare context) disqualifies
+    let (bare, bad) = scan_bare_calls(&defmap);
+    if bad {
+        return BTreeMap::new();
+    }
+    let mut out = BTreeMap::new();
+    for (name, body) in &defmap {
+        if bare.contains(name) {
+            continue;
+        }
+        let Some(last) = body.last() else {
+            continue;
+        };
+        // the single trailing echo with one element
+        let val = match last {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if matches!(func.as_str(), "exec" | "builtin") =>
+            {
+                let cmd_ok = lift_str_arg(args, 0).as_deref() == Some("echo");
+                match args.get(1) {
+                    Some(IrExpr::Array(items)) if items.len() == 1 && cmd_ok => {
+                        items.first().cloned()
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        let _ = val;
+        let mut st = LiftScan::default();
+        lift_scan_stmts(&body[..body.len() - 1], false, name, &mut st);
+        if st.bad || st.self_call || st.writers > 0 || st.max_pos == 0 || st.max_pos > 9 {
+            continue;
+        }
+        out.insert(name.clone(), st.max_pos);
+    }
+    out
+}
+
+/// fn names whose body CALLS a defined fn as a bare statement (the
+/// stdout of a bare call prints to the program's stdout — such a callee
+/// must keep its echo). Captures/pipeline/redirect contexts are spawn
+/// (stdout consumed), everything else is bare.
+fn scan_bare_calls(defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTreeSet<String>, bool) {
+    let mut out = BTreeSet::new();
+    let mut bad = false;
+    fn walk_stmts(
+        stmts: &[IrStmt],
+        spawn: bool,
+        defs: &BTreeMap<String, Vec<IrStmt>>,
+        out: &mut BTreeSet<String>,
+        bad: &mut bool,
+    ) {
+        for s in stmts {
+            walk_stmt(s, spawn, defs, out, bad);
+        }
+    }
+    fn walk_stmt(
+        s: &IrStmt,
+        spawn: bool,
+        defs: &BTreeMap<String, Vec<IrStmt>>,
+        out: &mut BTreeSet<String>,
+        bad: &mut bool,
+    ) {
+        match s {
+            IrStmt::Expr(e) => walk_expr(e, spawn, defs, out, bad),
+            IrStmt::Assign { expr, .. } => walk_expr(expr, spawn, defs, out, bad),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, spawn, defs, out, bad);
+                walk_stmts(then, spawn, defs, out, bad);
+                for (_, b) in elsifs {
+                    walk_stmts(b, spawn, defs, out, bad);
+                }
+                walk_stmts(else_, spawn, defs, out, bad);
+            }
+            IrStmt::While { cond, body } => {
+                walk_expr(cond, spawn, defs, out, bad);
+                walk_stmts(body, spawn, defs, out, bad);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                walk_stmts(body, spawn, defs, out, bad);
+                walk_expr(cond, spawn, defs, out, bad);
+            }
+            IrStmt::Redirect { inner, .. } => walk_stmts(inner, true, defs, out, bad),
+            IrStmt::Subshell(body) => walk_stmts(body, spawn, defs, out, bad),
+            IrStmt::Background(body) => walk_stmts(body, true, defs, out, bad),
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    walk_stmts(stage, true, defs, out, bad);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for cl in clauses {
+                    walk_stmts(&cl.body, spawn, defs, out, bad);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                walk_stmts(body, spawn, defs, out, bad);
+                for ex in excepts {
+                    walk_stmts(&ex.body, spawn, defs, out, bad);
+                }
+                walk_stmts(else_body, spawn, defs, out, bad);
+                walk_stmts(finally_body, spawn, defs, out, bad);
+            }
+            IrStmt::For { body, .. } => walk_stmts(body, spawn, defs, out, bad),
+            IrStmt::Function { name, body, .. } => {
+                if defs.contains_key(name) {
+                    walk_stmts(body, false, defs, out, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(
+        e: &IrExpr,
+        spawn: bool,
+        defs: &BTreeMap<String, Vec<IrStmt>>,
+        out: &mut BTreeSet<String>,
+        bad: &mut bool,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => match func.as_str() {
+                "capture" | "captureWords" => {
+                    for a in args {
+                        if let IrExpr::Arrow(stmts) = a {
+                            walk_stmts(stmts, true, defs, out, bad);
+                        }
+                    }
+                }
+                "pipeline" => {
+                    if let Some(IrExpr::Array(items)) = args.first() {
+                        for it in items {
+                            if let IrExpr::Arrow(stmts) = it {
+                                walk_stmts(stmts, true, defs, out, bad);
+                            }
+                        }
+                    }
+                }
+                "exec" | "builtin" => {
+                    if let Some(c) = lift_str_arg(args, 0) {
+                        if !spawn && defs.contains_key(c.as_str()) {
+                            out.insert(c.to_string());
+                        }
+                    }
+                    for a in args {
+                        walk_expr(a, spawn, defs, out, bad);
+                    }
+                }
+                "fnValue" => {
+                    if let Some(c) = lift_str_arg(args, 0) {
+                        if defs.contains_key(c.as_str()) {
+                            out.remove(c.as_str());
+                        }
+                    }
+                }
+                _ => {
+                    for a in args {
+                        walk_expr(a, spawn, defs, out, bad);
+                    }
+                }
+            },
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, spawn, defs, out, bad);
+                    }
+                }
+            }
+            IrExpr::Arrow(stmts) => walk_stmts(stmts, true, defs, out, bad),
+            IrExpr::Array(items) => {
+                for x in items {
+                    walk_expr(x, spawn, defs, out, bad);
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, true, defs, out, bad),
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, spawn, defs, out, bad);
+                walk_expr(then, spawn, defs, out, bad);
+                walk_expr(else_, spawn, defs, out, bad);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, spawn, defs, out, bad);
+                walk_expr(default, spawn, defs, out, bad);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, spawn, defs, out, bad);
+                for a in args {
+                    walk_expr(a, spawn, defs, out, bad);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, spawn, defs, out, bad);
+                walk_expr(rhs, spawn, defs, out, bad);
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, spawn, defs, out, bad),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, spawn, defs, out, bad);
+                    }
+                }
+            }
+            // opaque/unknown shapes may hide a bare call — refuse lifts
+            IrExpr::RawExpr(_) | IrExpr::Ext(_) | IrExpr::Lambda { .. }
+            | IrExpr::ArrayComp { .. } | IrExpr::Splice(_) => *bad = true,
+            IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
+            | IrExpr::Range { .. }
+            | IrExpr::Str(_, _) | IrExpr::Var(_, _) | IrExpr::Ident(_)
+            | IrExpr::Arith(_) => {}
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, spawn, defs, out, bad);
+                }
+            }
+        }
+    }
+    for body in defs.values() {
+        walk_stmts(body, false, defs, &mut out, &mut bad);
+    }
+    (out, bad)
 }
 
 /// Collect every variable name referenced by statements (assign targets,
