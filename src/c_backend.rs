@@ -280,6 +280,15 @@ pub struct Render {
     /// inside emit_runtime — the runtime helpers' own _sh_argv text
     /// (save/restore in _sh_call_fn) must not count as a top-level read
     in_runtime: bool,
+    /// positional-constness proof: no shift/set--, no spawn-context
+    /// positional refs, no non-lifted fn reads positionals, no $@/$*,
+    /// no script var named argc/argv. Reads render as the main()
+    /// parameters DIRECTLY (idiomatic C; no _sh_argc/_sh_argv globals).
+    pos_const: bool,
+    /// (const mode) an inline $N/$0 read was rendered → argv needed
+    const_digits: std::cell::Cell<bool>,
+    /// (const mode) an inline $# read was rendered → argc needed
+    const_hash: std::cell::Cell<bool>,
     /// the actual helper ids (the seq counter interleaves sites and caps)
     site_ids: Vec<usize>,
     cap_ids: Vec<usize>,
@@ -380,6 +389,14 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
+    }
+    {
+        // positional-constness: reads use main's params directly
+        let mut vars = BTreeSet::new();
+        let mut for_vars = BTreeSet::new();
+        collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
+        let shadowed = vars.contains("argc") || vars.contains("argv");
+        r.pos_const = scan_pos_const(&prog.stmts, &r.lifted_fns, shadowed);
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -666,8 +683,10 @@ impl Render {
             self.runtime_start = self.out.len();
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
+        if !self.pos_const {
             self.emit("static int _sh_argc = 0;");
             self.emit("static char **_sh_argv = 0;");
+        }
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
@@ -902,7 +921,18 @@ impl Render {
             // in-process function CALL: argv swap (positional params),
             // shared-buffer detach (the callee's own sites would
             // _sh_reset() the caller's half-built command text) around
-            // the stdout capture. One statement per call site.
+            // the stdout capture. One statement per call site. Under the
+            // positional-const proof NO callee reads positionals — the
+            // swap is unobservable, omitted.
+            if self.pos_const {
+                self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, char *buf, size_t cap) {");
+                self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
+                self.emit("  (void)av; (void)n;");
+                self.emit("  _sh_capture_fn(fn, buf, cap);");
+                self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
+                self.emit("  return buf;");
+                self.emit("}");
+            } else {
             self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, char *buf, size_t cap) {");
             self.emit("  char **sv = _sh_argv; int sc = _sh_argc;");
             self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
@@ -912,6 +942,7 @@ impl Render {
             self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
             self.emit("  return buf;");
             self.emit("}");
+            }
             self.emit("/* string-var ++/-- — function-call boundaries are sequence");
             self.emit("   points, so two mutations in one expression stay ordered */");
             self.emit("static long long _sh_postinc(char **v, int d) {");
@@ -1527,7 +1558,7 @@ impl Render {
                 "<sys/stat.h>",
                 &["struct stat", "stat(", "fstat(", "lstat(", "mkdir(", "chmod("],
             ),
-            ("<sys/wait.h>", &["WIFEXITED", "WEXITSTATUS"]),
+            ("<sys/wait.h>", &["WIFEXITED", "WEXITSTATUS", "waitpid(", "fork("]),
             (
                 "<time.h>",
                 &[
@@ -2314,15 +2345,35 @@ impl Render {
         if let Some(p) = self.lifted_param(n) {
             return format!("(atoll((({p}) ? ({p}) : \"\")))");
         }
+        if self.pos_const && !self.in_function {
+            self.const_digits.set(true);
+            return format!("(atoll((( {n} < argc && argv[{n}]) ? argv[{n}] : \"\")))");
+        }
         format!("(atoll((( {n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")))")
     }
 
-    /// String `$N` read (the argv-or-param form, null-guarded).
+    /// String `$N` read (the argv-or-param form, null-guarded). In a
+    /// positional-const program read inline in main, the main params
+    /// DIRECTLY — no globals.
     fn positional_str_l(&self, n: &str) -> String {
         if let Some(p) = self.lifted_param(n) {
             return format!("(({p}) ? ({p}) : \"\")");
         }
+        if self.pos_const && !self.in_function {
+            self.const_digits.set(true);
+            return format!("(({n} < argc && argv[{n}]) ? argv[{n}] : \"\")");
+        }
         format!("(({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")")
+    }
+
+    /// The `$#` read: a positional-const program's inline reads use the
+    /// main() parameter DIRECTLY; otherwise the _sh_argc global.
+    fn argc_expr_l(&self) -> String {
+        if self.pos_const && !self.in_function {
+            self.const_hash.set(true);
+            return "((argc > 0) ? (argc - 1) : 0)".into();
+        }
+        "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into()
     }
 
     /// store read with the env fallback: an ASSIGNED var reads the C
@@ -2452,7 +2503,7 @@ impl Render {
                     }
                     if name == "#" {
                         // string form: `echo $#` prints the count
-                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                        return self.num_temp(&self.argc_expr_l());
                     }
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
@@ -4885,11 +4936,11 @@ impl Render {
                 // sets _sh_rc, so `(f(), _sh_rc)` is the function's status.
                 // The call args become the function's positional params:
                 // set _sh_argv (save/restore around the call for nesting).
+                // Under the positional-const proof NO callee reads
+                // positionals — the swap is unobservable, omitted.
                 self.need_sh = true;
                 let n = words.len() + 1;
                 let av = format!("_sh_av{}", self.temp_seq);
-                self.temp_seq += 1;
-                let sv = format!("_sh_sv{}", self.temp_seq);
                 self.temp_seq += 1;
                 self.emit(&format!("char *{av}[{}];", n.max(2)));
                 self.emit(&format!("{av}[0] = {};", Self::cstr(&cmd)));
@@ -4897,14 +4948,31 @@ impl Render {
                     let v = self.value_c(w);
                     self.emit(&format!("{av}[{}] = {v};", i + 1));
                 }
-                self.emit(&format!("char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;", self.temp_seq));
-                self.temp_seq += 1;
-                self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
-                format!(
-                    "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
-                    self.c_ident(&cmd),
-                    self.temp_seq - 1
-                )
+                if let Some(&arity) = self.lifted_fns.get(&cmd) {
+                    // LIFTED fn: plain C call with the args as params
+                    let mut a: Vec<String> = Vec::new();
+                    for i in 0..arity {
+                        let v = match words.get(i) {
+                            Some(w) => self.value_c(w),
+                            None => "\"\"".into(),
+                        };
+                        a.push(v);
+                    }
+                    format!("({}({}), _sh_rc == 0)", self.c_ident(&cmd), a.join(", "))
+                } else if self.pos_const {
+                    format!("({}(), _sh_rc == 0)", self.c_ident(&cmd))
+                } else {
+                    let sv = format!("_sh_sv{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    self.emit(&format!("char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;", self.temp_seq));
+                    self.temp_seq += 1;
+                    self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
+                    format!(
+                        "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
+                        self.c_ident(&cmd),
+                        self.temp_seq - 1
+                    )
+                }
             }
             _ => {
                 if let Some(uu) = self.uu_run_opt(&cmd, &args) {
@@ -5935,7 +6003,7 @@ impl Render {
                     i = j;
                     continue;
                 } else if rest.starts_with('#') {
-                    out.push_str("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    out.push_str(&self.argc_expr_l());
                     i += 2;
                     continue;
                 } else if rest.starts_with('?') {
@@ -7011,7 +7079,7 @@ impl Render {
                 "?" => self.num_temp("_sh_rc"),
                 "$" => self.num_temp("getpid()"),
                 "#" => {
-                    self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)")
+                    self.num_temp(&self.argc_expr_l())
                 }
                 d if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
                     format!(
@@ -7189,7 +7257,7 @@ impl Render {
             "\"\"".to_string()
         } else if name == "#" {
             self.need_sh = true;
-            "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into()
+            self.argc_expr_l()
         } else if name == "@" || name == "*" {
             self.need_sh = true;
             let t = self.str_temp(4096);
@@ -7454,12 +7522,16 @@ impl Render {
                 }
                 if name == "#" {
                     self.need_sh = true;
-                    return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
+                    return self.argc_expr_l();
                 }
                 if name == "0" {
                     // $0 — the program name (argv[0]; bash carries the
                     // script path there, the transpiled binary its own)
                     self.need_sh = true;
+                    if self.pos_const && !self.in_function {
+                        self.const_digits.set(true);
+                        return "((argc > 0 && argv[0]) ? argv[0] : \"\")".into();
+                    }
                     return "((_sh_argc > 0 && _sh_argv[0]) ? _sh_argv[0] : \"\")".into();
                 }
                 if name == "-" {
@@ -7484,7 +7556,7 @@ impl Render {
                     // ${#var} — the core spells the LENGTH expansion
                     // getVar("#var") (010_substring_loop len=${#s})
                     if rest.is_empty() || rest == "@" || rest == "*" {
-                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                        return self.num_temp(&self.argc_expr_l());
                     }
                     let v = if self.is_num(rest) {
                         self.num_temp(&self.c_ident(rest))
@@ -8569,7 +8641,7 @@ impl Render {
                             return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "#" {
-                            return vec![Part::Arg("((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into(), NumSpec::Num("%lld", true))];
+                            return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%lld", true))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -11006,11 +11078,21 @@ impl Render {
         let argc_shadowed = self.store.contains("argc") || self.store.contains("argv");
         // dead-variable discipline: initialize exactly what the program
         // reads (the trimmer drops the matching global defs; an init for
-        // a dropped def would not compile, so the halves stay in step)
-        if self.argc_reads == 0 && self.argvptr_reads == 0 {
+        // a dropped def would not compile, so the halves stay in step).
+        // Positional-const programs go further: the reads ARE the main()
+        // parameters — no init, no globals.
+        if self.pos_const {
+            if self.const_digits.get() {
+                self.emit("int main(int argc, char **argv) {");
+            } else if self.const_hash.get() {
+                self.emit("int main(int argc) {");
+            } else {
+                self.emit("int main(void) {");
+            }
+        } else if self.argc_reads == 0 && self.argvptr_reads == 0 {
             self.emit("int main(void) {");
         } else if self.argvptr_reads == 0 {
-            // \$# only — C allows main(int argc) without argv
+            // $# only — C allows main(int argc) without argv
             if argc_shadowed {
                 self.emit("int main(int _mac) {");
                 self.emit("  _sh_argc = _mac;");
@@ -11091,6 +11173,9 @@ struct LiftScan {
 fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
     match e {
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            if std::env::var("SH2_DBG_POS2").is_ok() && (name.contains("@") || name == "#" || (!name.is_empty() && name.chars().next().map_or(false, |c| c.is_ascii_digit()))) {
+                eprintln!("DBG pos_var name={} spawn={} fname={}", name, spawn, fname);
+            }
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
                 let n: usize = name.parse().unwrap_or(0);
                 if n > st.max_pos {
@@ -11121,6 +11206,20 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
             }
         }
         IrExpr::Call { func, args } => match func.as_str() {
+            "getVar" | "listVar" => {
+                // string-context `$1` / `$@` — the name rides INSIDE the
+                // Str arg (same hole the pos-const scan had)
+                if let Some(c) = lift_str_arg(args, 0) {
+                    if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+                        let n: usize = c.parse().unwrap_or(0);
+                        if n > st.max_pos {
+                            st.max_pos = n;
+                        }
+                    } else if matches!(c.as_str(), "@" | "*" | "#" | "0") {
+                        st.bad = true;
+                    }
+                }
+            }
             "capture" | "captureWords" => {
                 for a in args {
                     if let IrExpr::Arrow(stmts) = a {
@@ -11141,9 +11240,30 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                 }
             }
             "exec" | "builtin" => {
-                if let Some(c) = lift_str_arg(args, 0) {
+                let cmd = lift_str_arg(args, 0);
+                if cmd.as_deref() == Some("set") {
+                    // set -- renumbers the positionals
+                    st.bad = true;
+                }
+                if let Some(c) = cmd {
                     if c == fname {
                         st.self_call = true;
+                    }
+                }
+                for a in args {
+                    lift_scan_expr(a, spawn, fname, st);
+                }
+            }
+            "param" => {
+                // the slice form: param("slice", "@", off, len)
+                if let Some(c) = lift_str_arg(args, 1) {
+                    if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+                        let n: usize = c.parse().unwrap_or(0);
+                        if n > st.max_pos {
+                            st.max_pos = n;
+                        }
+                    } else if matches!(c.as_str(), "@" | "*" | "#" | "0") || c.starts_with('@') {
+                        st.bad = true;
                     }
                 }
             }
@@ -11325,7 +11445,10 @@ fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
     collect_fn_defs(stmts, &mut names, &mut defs);
     let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
     // a bare call ANYWHERE (any fn's body, any bare context) disqualifies
-    let (bare, bad) = scan_bare_calls(&defmap);
+    let (bare, bad) = scan_bare_calls(stmts, &defmap);
+    if std::env::var("SH2_DBG_POS2").is_ok() {
+        eprintln!("DBG lift bare={:?} defnames={:?} bad={}", bare, defmap.keys().collect::<Vec<_>>(), bad);
+    }
     if bad {
         return BTreeMap::new();
     }
@@ -11367,7 +11490,7 @@ fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
 /// stdout of a bare call prints to the program's stdout — such a callee
 /// must keep its echo). Captures/pipeline/redirect contexts are spawn
 /// (stdout consumed), everything else is bare.
-fn scan_bare_calls(defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTreeSet<String>, bool) {
+fn scan_bare_calls(top: &[IrStmt], defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTreeSet<String>, bool) {
     let mut out = BTreeSet::new();
     let mut bad = false;
     fn walk_stmts(
@@ -11540,10 +11663,343 @@ fn scan_bare_calls(defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTreeSet<String>, b
             }
         }
     }
+    // the PROGRAM's top-level statements are bare context (a bare call
+    // there prints to the program's stdout) — walking only the fn bodies
+    // missed every top-level call site
+    walk_stmts(top, false, defs, &mut out, &mut bad);
     for body in defs.values() {
         walk_stmts(body, false, defs, &mut out, &mut bad);
     }
     (out, bad)
+}
+
+/// ── positional-constness shape ──
+///
+/// The scan decides whether the program's positional reads can use the
+/// main() parameters DIRECTLY (no _sh_argc/_sh_argv globals): every
+/// positional touch must be an INLINE main read of $N/$0/$# — no
+/// spawn-context refs (sites/thunks/captures are file-scope fns that
+/// cannot see main's params), no non-lifted fn reading them (their argv
+/// is the _sh_call_fn swap), no $@/$* (the join helper needs the
+/// globals), no shift/set -- (mutates), no script var named argc/argv.
+#[derive(Default)]
+struct PosShape {
+    digits: bool,
+    hash: bool,
+    at: bool,
+    spawn_pos: bool,
+    shift: bool,
+    nonlifted_reads: bool,
+}
+
+fn pos_scan_name(name: &str, spawn: bool, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
+    if std::env::var("SH2_DBG_POS2").is_ok() {
+        eprintln!("DBG pos_name name={} spawn={} fname={}", name, spawn, fname);
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        if spawn {
+            st.spawn_pos = true;
+        } else if !fname.is_empty() && !defs.contains_key(fname) {
+            st.nonlifted_reads = true;
+        } else if fname.is_empty() {
+            st.digits = true;
+        }
+    } else if matches!(name, "@" | "*") {
+        st.at = true;
+    } else if name == "#" {
+        if spawn {
+            st.spawn_pos = true;
+        } else if !fname.is_empty() && !defs.contains_key(fname) {
+            st.nonlifted_reads = true;
+        } else if fname.is_empty() {
+            st.hash = true;
+        }
+    }
+}
+
+fn pos_scan_expr(e: &IrExpr, spawn: bool, in_arith: bool, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
+    match e {
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                if name != "0" {
+                    if spawn {
+                        st.spawn_pos = true;
+                    } else if !fname.is_empty() && !defs.contains_key(fname) {
+                        st.nonlifted_reads = true;
+                    } else if fname.is_empty() {
+                        st.digits = true;
+                    }
+                } else {
+                    // $0 — same routing
+                    if spawn {
+                        st.spawn_pos = true;
+                    } else if !fname.is_empty() && !defs.contains_key(fname) {
+                        st.nonlifted_reads = true;
+                    } else if fname.is_empty() {
+                        st.digits = true;
+                    }
+                }
+            } else if matches!(name.as_str(), "@" | "*") {
+                st.at = true;
+            } else if name == "#" {
+                if spawn {
+                    st.spawn_pos = true;
+                } else if !fname.is_empty() && !defs.contains_key(fname) {
+                    st.nonlifted_reads = true;
+                } else if fname.is_empty() {
+                    st.hash = true;
+                }
+            }
+        }
+        IrExpr::Str(sval, _) => {
+            // $N inside raw text is const-eligible ONLY in an arith text
+            // read inline in main (arith_subst/mathfunc render it via the
+            // positional_read_l const branch) — anywhere else it reaches
+            // a child bash or a file-scope helper: refuse. $@ never
+            // qualifies (the join helper needs the globals).
+            if sval.contains('$') {
+                let b: Vec<char> = sval.chars().collect();
+                let mut i = 0;
+                while i < b.len() {
+                    if b[i] == '$' {
+                        let d = b.get(i + 1);
+                        let is_pos = d.map_or(false, |c| c.is_ascii_digit())
+                            || (d == Some(&'{') && b.get(i + 2).map_or(false, |c| c.is_ascii_digit()));
+                        if is_pos {
+                            if in_arith && !spawn && fname.is_empty() {
+                                st.digits = true;
+                            } else {
+                                st.at = true;
+                            }
+                            break;
+                        }
+                        if d == Some(&'@') || d == Some(&'*') || d == Some(&'#') {
+                            st.at = true;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        IrExpr::Call { func, args } => match func.as_str() {
+            "exec" | "builtin" => {
+                let cmd = lift_str_arg(args, 0);
+                if cmd.as_deref() == Some("shift") || cmd.as_deref() == Some("set") {
+                    // shift / set -- renumber the positionals — the
+                    // globals are mutable state, not const params
+                    st.shift = true;
+                }
+                for a in args {
+                    pos_scan_expr(a, spawn, false, fname, defs, st);
+                }
+            }
+            "getVar" | "listVar" => {
+                // string-context `$1` / `$@` — the positional name rides
+                // INSIDE the Str arg
+                if let Some(c) = lift_str_arg(args, 0) {
+                    pos_scan_name(&c, spawn, fname, defs, st);
+                }
+            }
+            "param" => {
+                // the slice/len form: param("slice", "@", off, len) —
+                // args[1] carries the positional NAME
+                if let Some(c) = lift_str_arg(args, 1) {
+                    pos_scan_name(&c, spawn, fname, defs, st);
+                }
+            }
+            "arith" => {
+                // the arith STRING may carry $N — the numeric subst /
+                // mathfunc paths render it (const-aware)
+                for a in args {
+                    pos_scan_expr(a, spawn, true, fname, defs, st);
+                }
+            }
+            "capture" | "captureWords" => {
+                for a in args {
+                    if let IrExpr::Arrow(stmts) = a {
+                        pos_scan_stmts(stmts, true, fname, defs, st);
+                    }
+                }
+            }
+            "pipeline" => {
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    for it in items {
+                        if let IrExpr::Arrow(stmts) = it {
+                            pos_scan_stmts(stmts, true, fname, defs, st);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for a in args {
+                    pos_scan_expr(a, spawn, false, fname, defs, st);
+                }
+            }
+        },
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    pos_scan_expr(x, spawn, false, fname, defs, st);
+                }
+            }
+        }
+        IrExpr::Arrow(stmts) => pos_scan_stmts(stmts, true, fname, defs, st),
+        IrExpr::Array(items) => {
+            for x in items {
+                pos_scan_expr(x, spawn, false, fname, defs, st);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            pos_scan_expr(lhs, spawn, false, fname, defs, st);
+            pos_scan_expr(rhs, spawn, false, fname, defs, st);
+        }
+        IrExpr::Index { key, .. } => pos_scan_expr(key, spawn, false, fname, defs, st),
+        IrExpr::Arith(a) => pos_scan_arith(a, fname, defs, st),
+        IrExpr::Capture { expr, .. } => pos_scan_expr(expr, true, false, fname, defs, st),
+        IrExpr::Ternary { cond, then, else_ } => {
+            pos_scan_expr(cond, spawn, false, fname, defs, st);
+            pos_scan_expr(then, spawn, false, fname, defs, st);
+            pos_scan_expr(else_, spawn, false, fname, defs, st);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            pos_scan_expr(expr, spawn, false, fname, defs, st);
+            pos_scan_expr(default, spawn, false, fname, defs, st);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            pos_scan_expr(obj, spawn, false, fname, defs, st);
+            for a in args {
+                pos_scan_expr(a, spawn, false, fname, defs, st);
+            }
+        }
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                pos_scan_expr(v, spawn, false, fname, defs, st);
+            }
+        }
+        IrExpr::Splice(x) => pos_scan_expr(x, spawn, false, fname, defs, st),
+        IrExpr::RawExpr(_) | IrExpr::Ext(_) | IrExpr::Lambda { .. } | IrExpr::ArrayComp { .. } => {
+            st.at = true; // opaque → refuse const (reuse the at flag)
+        }
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
+        | IrExpr::Range { .. } => {}
+    }
+}
+
+fn pos_scan_arith(a: &ArithAst, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                if spawn_free_inline(fname, defs) {
+                    st.digits = true;
+                } else if !fname.is_empty() && !defs.contains_key(fname) {
+                    st.nonlifted_reads = true;
+                }
+            }
+        }
+        ArithAst::Bin { lhs, rhs, .. } | ArithAst::Cond { test: lhs, then: rhs, .. } => {
+            pos_scan_arith(lhs, fname, defs, st);
+            pos_scan_arith(rhs, fname, defs, st);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => pos_scan_arith(arg, fname, defs, st),
+        ArithAst::Index { var: _, key } => pos_scan_arith(key, fname, defs, st),
+        _ => {}
+    }
+}
+
+fn spawn_free_inline(fname: &str, defs: &BTreeMap<String, usize>) -> bool {
+    fname.is_empty()
+}
+
+fn pos_scan_stmts(stmts: &[IrStmt], spawn: bool, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
+    for s in stmts {
+        pos_scan_stmt(s, spawn, fname, defs, st);
+    }
+}
+
+fn pos_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, defs: &BTreeMap<String, usize>, st: &mut PosShape) {
+    match s {
+        IrStmt::Expr(e) => pos_scan_expr(e, spawn, false, fname, defs, st),
+        IrStmt::Assign { expr, .. } => pos_scan_expr(expr, spawn, false, fname, defs, st),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            pos_scan_expr(cond, spawn, false, fname, defs, st);
+            pos_scan_stmts(then, spawn, fname, defs, st);
+            for (_, b) in elsifs {
+                pos_scan_stmts(b, spawn, fname, defs, st);
+            }
+            pos_scan_stmts(else_, spawn, fname, defs, st);
+        }
+        IrStmt::While { cond, body } => {
+            pos_scan_expr(cond, spawn, false, fname, defs, st);
+            pos_scan_stmts(body, spawn, fname, defs, st);
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            pos_scan_stmts(body, spawn, fname, defs, st);
+            pos_scan_expr(cond, spawn, false, fname, defs, st);
+        }
+        IrStmt::Redirect { inner, redirects, .. } => {
+            for rd in redirects {
+                pos_scan_expr(&rd.target, true, false, fname, defs, st);
+            }
+            pos_scan_stmts(inner, true, fname, defs, st);
+        }
+        IrStmt::Subshell(body) => pos_scan_stmts(body, spawn, fname, defs, st),
+        IrStmt::Background(body) => pos_scan_stmts(body, true, fname, defs, st),
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                pos_scan_stmts(stage, true, fname, defs, st);
+            }
+        }
+        IrStmt::Case { clauses, .. } => {
+            for cl in clauses {
+                pos_scan_stmts(&cl.body, spawn, fname, defs, st);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            pos_scan_stmts(body, spawn, fname, defs, st);
+            for ex in excepts {
+                pos_scan_stmts(&ex.body, spawn, fname, defs, st);
+            }
+            pos_scan_stmts(else_body, spawn, fname, defs, st);
+            pos_scan_stmts(finally_body, spawn, fname, defs, st);
+        }
+        IrStmt::For { iter, body, .. } => {
+            pos_scan_expr(iter, spawn, false, fname, defs, st);
+            pos_scan_stmts(body, spawn, fname, defs, st);
+        }
+        IrStmt::Function { name, body, .. } => {
+            pos_scan_stmts(body, false, name, defs, st);
+        }
+        IrStmt::Return(v) | IrStmt::Exit(v) => {
+            if let Some(v) = v {
+                pos_scan_expr(v, spawn, false, fname, defs, st);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The positional-const decision for the whole program.
+fn scan_pos_const(stmts: &[IrStmt], lifted: &BTreeMap<String, usize>, argc_argv_shadowed: bool) -> bool {
+    if argc_argv_shadowed {
+        return false;
+    }
+    if std::env::var("SH2_DBG_POS").is_ok() {
+        eprintln!("DBG pos scan start lifted_len={}", lifted.len());
+    }
+    let mut names = BTreeSet::new();
+    let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    collect_fn_defs(stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, usize> = lifted.clone();
+    let mut st = PosShape::default();
+    pos_scan_stmts(stmts, false, "", &defmap, &mut st);
+    // digits/hash only record which main() parameters to take — the
+    // refusals are the rest
+    if std::env::var("SH2_DBG_POS").is_ok() {
+        eprintln!("DBG pos shape at={} spawn_pos={} shift={} nonlifted={} digits={} hash={}",
+            st.at, st.spawn_pos, st.shift, st.nonlifted_reads, st.digits, st.hash);
+    }
+    !st.at && !st.spawn_pos && !st.shift && !st.nonlifted_reads
 }
 
 /// Collect every variable name referenced by statements (assign targets,
