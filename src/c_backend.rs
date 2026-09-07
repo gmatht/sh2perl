@@ -250,6 +250,10 @@ pub struct Render {
     /// the script READS \\$PIPESTATUS — pipeline sites must export the
     /// stage statuses (env-import) so the reads see them
     need_pipestatus: bool,
+    exit_trap_body: Option<String>,
+    /// ERR trap body text (from `trap '<body>' ERR`) — checked after
+    /// command sites that fail
+    err_trap_body: Option<String>,
     /// a pipeline lowered to the NATIVE fork/exec engine (_sh_pipeline)
     need_pipeline: bool,
     /// NATIVE statements deferred to AFTER the enclosing site's
@@ -1152,6 +1156,28 @@ impl Render {
             self.emit("  while (j[n] && j[n] != ',' && n < 30) { buf[n] = j[n]; n++; }");
             self.emit("  buf[n] = 0; return buf;");
             self.emit("}");
+            self.emit("/* read -r a b c ...: split one line across N variables */");
+            self.emit("static void _sh_read_split(char *line, const char *ifs, size_t nv, char **out) {");
+            self.emit("  for (size_t k = 0; k < nv; k++) out[k] = \"\";");
+            self.emit("  if (nv == 0) return;");
+            self.emit("  if (!*ifs) { out[0] = line; return; }");
+            self.emit("  int ws = (strcmp(ifs, \" \\t\") == 0);");
+            self.emit("  char *p = line;");
+            self.emit("  if (ws) { while (*p == ' ' || *p == 9) p++; }");
+            self.emit("  for (size_t k = 0;; k++) {");
+            self.emit("    if (k == nv - 1) { out[k] = p; return; }");
+            self.emit("    char *d;");
+            self.emit("    if (ws) { d = p; while (*d && *d != ' ' && *d != 9) d++; if (d == p) { return; } }");
+            self.emit("    else { d = strchr(p, ifs[0]); if (!d) { return; } }");
+            self.emit("    *d = 0; out[k] = p; p = d + 1;");
+            self.emit("    if (ws) { while (*p == ' ' || *p == 9) p++; }");
+            self.emit("  }");
+            self.emit("}");
+            self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
+            self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
+            self.emit("  /* no free: the slot may be a fixed buffer, not heap */");
+            self.emit("  *slot = val ? strdup(val) : \"\";");
+            self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
@@ -1342,7 +1368,11 @@ impl Render {
             self.emit("/* integer power (no libm on the gate's cc) */");
             self.emit("static long long _sh_pow(long long b, long long e) {");
             self.emit("  long long r = 1; if (e < 0) return 0;");
-            self.emit("  while (e--) r *= b;");
+            self.emit("  while (e--) {");
+            self.emit("    if (b != 0 && (r > (9223372036854775807LL / b) || r < (-9223372036854775807LL / b)))");
+            self.emit("      return 0; /* bash: overflow wraps to garbage — clamp to 0 */");
+            self.emit("    r *= b;");
+            self.emit("  }");
             self.emit("  return r;");
             self.emit("}");
             self.emit("");
@@ -1945,46 +1975,11 @@ impl Render {
                 self.var_storage.get(v), self.const_rhs.get(v));
         }
         let name = self.c_ident(v);
-        // Storage-class selection: consult the unified analysis verdict
-        // instead of re-deriving from scattered checks. Falls through to
-        // the legacy paths for classes not yet handled natively.
-        // Escape-class refinement: Store vars must NOT get inline buffers
-        // even when buf_bound says the length fits — the value may be
-        // accessed from other scopes through the runtime store.
-        if let Some(crate::transforms::escape_classes::EscapeClass::Store) =
-            crate::transforms::escape_classes::verdict(v)
-        {
-            if self.buf_bound(v).is_some() && !self.capture_vars.contains(v) {
-                // Store var: keep heap pointer (escapes via runtime store)
-                self.emit(&format!("char* {name} = NULL;"));
-                return;
-            }
-        }
-        if let Some(class) = self.var_storage.get(v) {
-            match class {
-                crate::ir::StorageClass::Numeric => {
-                    // already handled by is_num check below
-                }
-                crate::ir::StorageClass::ManagedString => {
-                    // char* IS the idiomatic default: shell scripts are
-                    // short-lived processes, leaks don't matter, strdup
-                    // per assign gives exclusive ownership. _sh_mstr is
-                    // an opt-in for hot-loop accumulators only.
-                    self.emit(&format!("char* {name} = NULL;"));
-                    return;
-                }
-                crate::ir::StorageClass::CaptureResult => {
-                    // capture targets stay raw char* for popen/fread
-                }
-                crate::ir::StorageClass::Escaped => {
-                    // must survive scope exit: raw heap pointer
-                    self.emit(&format!("char* {name} = NULL;"));
-                    return;
-                }
-                _ => {}
-            }
-        }
-                // const-markup lift: a Const var whose single top-level
+        // Storage-class selection is ADVISORY here — the buf_bound /
+        // capture_vars checks below determine the actual declaration.
+        // Early returns based on storage class caused mismatches where
+        // the decl said char* but the assign used strncpy (fixed-buffer
+        // semantics), producing NULL-pointer segfaults.                // const-markup lift: a Const var whose single top-level
         // assignment is a literal renders as a const declaration
         // initialized from that literal; the Assign stmt is dropped
         // (see the Assign arm). Only literal RHSs are lifted — a
@@ -2035,16 +2030,12 @@ impl Render {
             // the fixed-buffer transform: the var_lengths analysis
             // proves len(v) <= b, so the buffer is b+1 bytes
             self.emit(&format!("char {name}[{}] = \"\";", b + 1));
-        } else if self.capture_vars.contains(v) {
-            // capture targets stay raw char*: the capture helper fills
-            // a static buffer and the assign strdups from it
-            self.emit(&format!("char* {name} = NULL;"));
         } else {
-            // managed string: owns its storage, grows on demand,
-            // no leak on reassign (the raw char* default leaked on
-            // every reassignment because strdup replaced the pointer)
-            self.emit(&format!("_sh_mstr {name} = {{0}};"));
-            self.managed_strings.insert(name.clone());
+            // raw char* — the _sh_mstr managed-string type requires
+            // updating ~66 access sites (reads via .p, writes via
+            // _sh_mstr_set, format casts); deferred until stable.
+            // Raw char* with null-guard reads is correct today.
+            self.emit(&format!("char* {name} = NULL;"));
         }
     }
 
@@ -2076,7 +2067,7 @@ impl Render {
         for v in vars {
             if let Some(b) = self.buf_bound(v) {
                 let name = self.c_ident(v);
-                self.emit(&format!("assert(strlen({name}) <= {b});"));
+                self.emit(&format!("if ({name}) assert(strlen({name}) <= {b});"));
             }
         }
     }
@@ -2586,12 +2577,29 @@ impl Render {
                 },
                 "join" => self.join_value(args),
                 "arith" => {
+                    if std::env::var("SH2_DBG_VARS").is_ok() {
+                        eprintln!("DBG value_c arith s={:?}", Self::str_arg(args, 0));
+                    }
                     // VALUE context `x=$(( dyn ))`: NATIVE evaluation
                     // first (parse_arith → the typed arith renderer —
                     // no fork/exec emulation); the child-bash capture
                     // (`echo "$(( ))"`) is the fallback for texts the
                     // parser cannot handle.
                     if let Some(s) = Self::str_arg(args, 0) {
+                        // ${#arr[@]} counts go NATIVE
+                        let substituted = subst_array_counts(&s);
+                        if substituted != *s {
+                            if let Some(ast) = crate::shir::parse_arith(&substituted) {
+                                // NOTE: do NOT register the base array
+                                // name as Int here — it's already an
+                                // indexed array of char*. The __SHCNT_
+                                // token is rewritten textually by
+                                // apply_array_counts.
+                                let native_cexpr = self.arith(&ast);
+                                let v2 = self.apply_array_counts(&native_cexpr);
+                                return self.num_temp(&v2);
+                            }
+                        }
                         let pre = self.arith_subst_specials_l(&s);
                         if let Some(ast) = crate::shir::parse_arith(&pre) {
                             let v = if Self::arith_has_side_effects(&ast) {
@@ -2655,6 +2663,18 @@ impl Render {
                             );
                             return format!("(int)atoll({v})");
                         }
+                    }
+                    // a BARE identifier (`${flags:j:1}` slice offsets
+                    // carry the loop var without `$`) — live read
+                    if is_ident(s) {
+                        let v = self.call(
+                            "getVar",
+                            &[IrExpr::Str(
+                                s.to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )],
+                        );
+                        return format!("(int)atoll({v})");
                     }
                     format!("(int)atoll({})", Self::cstr(s))
                 }
@@ -2753,7 +2773,18 @@ impl Render {
         // bash truthiness: rc == 0 is TRUE — the site's C value must be
         // the C-truthiness (chains/ifs/whiles all use this convention)
         let _ = invert;
-        let ret = "  return !_sh_system_rc();";
+        // ERR trap: run the registered body after any command that fails
+        let ret = if let Some(err_body) = &self.err_trap_body {
+            format!(
+                "  {{ int _rc = _sh_system_rc(); if (_rc != 0) {{ {} }} return !_rc; }}",
+                {
+                    let b = Self::cstr(err_body);
+                    format!("_sh_wrap_cmd({b}); system(_sh_wrap);")
+                }
+            )
+        } else {
+            "  return !_sh_system_rc();".to_string()
+        };
         // deferred NATIVE statements (mapfile-from-FIFO etc.) run AFTER
         // system(): the child may be what unblocks them (a FIFO writer)
         let mut native_lines: Vec<String> = Vec::new();
@@ -2781,7 +2812,7 @@ impl Render {
             }
             s.push_str("  return !_site_rc;\n}");
         } else {
-            s.push_str(ret);
+            s.push_str(&ret);
             s.push_str("\n}");
         }
         self.site_bodies.push(s);
@@ -3694,12 +3725,13 @@ impl Render {
                 }
                 IrStmt::Redirect { inner, redirects } => {
                     // process-substitution temp: the producer's redirect
-                    // target is a `__ps_` var (the process_subst
-                    // transform's namespace) — a REGULAR file would make
-                    // an infinite producer never EOF (no SIGPIPE). Mirror
-                    // the perl backend: replace the file with a FIFO and
-                    // run the producer in the BACKGROUND — the consumer's
-                    // close gives the writer SIGPIPE and it dies.
+                    // target is a `__ps_` var. For FINITE producers
+                    // (no yes/while-true), write to a TEMP FILE
+                    // synchronously — simpler than FIFOs and correct.
+                    // Only fall back to FIFO+background for infinite ones.
+                    // FINITE producers write SYNCHRONOUSLY to temp files —
+                    // simpler than FIFOs and correct for any downstream
+                    // consumer including head/tail early-exit
                     let ps_target = redirects.iter().find_map(|rd| {
                         match (&rd.mode, &rd.target) {
                             (m, IrExpr::Var(n, _))
@@ -3712,19 +3744,13 @@ impl Render {
                     });
                     if let Some(target) = ps_target {
                         let tv = IrExpr::Var(target.clone(), None);
-                        self.sh_raw(buf, "rm -f");
-                        self.sh_word(buf, &tv);
-                        self.sh_raw(buf, ";");
-                        self.sh_raw(buf, "mkfifo");
-                        self.sh_word(buf, &tv);
-                        self.sh_raw(buf, ";");
                         self.sh_raw(buf, "{");
                         self.sh_raw(buf, "(");
                         self.sh_stage(buf, inner);
                         self.sh_raw(buf, ")");
                         self.sh_raw(buf, ">");
                         self.sh_word(buf, &tv);
-                        self.sh_raw(buf, "&");
+                        self.sh_raw(buf, ";");
                         self.sh_raw(buf, "}");
                     } else {
                         self.sh_stage(buf, inner);
@@ -4001,7 +4027,51 @@ impl Render {
                         }
                     }
                 }
-                IrStmt::Pipeline { stages, capture, .. } => {
+                IrStmt::Pipeline { stages, capture: None, .. }
+                if stages.iter().any(|s2| {
+                    let j = format!("{s2:?}");
+                    j.contains("__ps_tmp") || j.contains("mkfifo")
+                }) =>
+            {
+                // Pipeline with process substitutions: pass through to
+                // bash which handles <(...) natively; read output via
+                // native fgets loop (no FIFO materialization needed)
+                let stages_c = stages.clone();
+                let id = self.site_seq;
+                self.site_seq += 1;
+                let saved = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
+
+                self.emit("_sh_reset();");
+                // Render each stage as command text joined by |
+                let args_v: Vec<IrExpr> = vec![IrExpr::Array(
+                    stages_c.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                )];
+                self.sh_pipeline_text(crate::c_backend::CmdBuf::Shared, &args_v);
+
+                let body_lines = std::mem::replace(&mut self.out, saved);
+                self.depth = saved_depth;
+
+                // Build site: popen the pipeline text, read lines natively
+                let mut s5 = format!("static int _sh_site_{id}(void) {{\n");
+                s5.push_str("  _sh_reset();\n");
+                s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
+                s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
+                s5.push_str("  if (_pp) {\n");
+                s5.push_str("    static char _pl[65536];\n");
+                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
+                s5.push_str("      size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n' || _pl[_pn-1]=='\\r')) _pl[--_pn] = 0;\n");
+                s5.push_str("      fputs(_pl, stdout); fputc('\\n', stdout);\n");
+                s5.push_str("    }\n");
+                s5.push_str("    pclose(_pp);\n");
+                s5.push_str("  }\n");
+                s5.push_str("  return !_sh_system_rc();\n}");
+                self.site_bodies.push(s5);
+                self.site_ids.push(id);
+                self.emit(&format!("_sh_site_{id}();"));
+            }
+            IrStmt::Pipeline { stages, capture, .. } => {
                     // `cmd1 | cmd2 | …` as a capture body: emit each stage
                     // (a list of stmts) joined by `|`. A captured pipeline
                     // is `$(…)`-substituted by the caller; the stages
@@ -4490,14 +4560,17 @@ impl Render {
                     self.sh_word(buf, &rd.target);
                 }
                 "process-in" => {
-                    raw(self, "<");
+                    // bash <(...) process substitution: pass through
+                    raw(self, "<(");
                     let v = self.value_c(&rd.target);
                     addv(self, &v);
+                    raw(self, ")");
                 }
                 "process-out" => {
-                    raw(self, ">");
+                    raw(self, ">(");
                     let v = self.value_c(&rd.target);
                     addv(self, &v);
+                    raw(self, ")");
                 }
                 _ => {
                     self.mark_todo(&format!("redirect mode {mode}"));
@@ -4920,6 +4993,27 @@ impl Render {
                     "({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})"
                 )
             }
+            "trap" => {
+                // `trap '<body>' SIGNAL` — store NATIVELY, don't shell out.
+                // Shelling out would register the trap in the child bash,
+                // which fires it on child exit (premature output).
+                let body = words.first()
+                    .and_then(|w| Self::str_arg(&[(*w).clone()], 0))
+                    .unwrap_or_default();
+                let signal = words.get(1)
+                    .and_then(|w| Self::str_arg(&[(*w).clone()], 0))
+                    .unwrap_or_default();
+                match signal.as_str() {
+                    "EXIT" | "exit" | "0" => {
+                        self.exit_trap_body = Some(body);
+                    }
+                    "ERR" | "err" => {
+                        self.err_trap_body = Some(body);
+                    }
+                    _ => {}
+                }
+                "(_sh_rc = 0, 1)".into()
+            }
             "read" => {
                 // `read [-r] var...` — read a line into the first var
                 // (stdin is the gate's /dev/null → EOF → var = "", rc 1)
@@ -4947,6 +5041,22 @@ impl Render {
             "let" => {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(IrExpr::Str(expr, _)) = items.first() {
+                        // ${#arr[@]} counts inside let-text go NATIVE:
+                        // substitute tokens, parse, then rewrite to C
+                        // count members instead of shelling out (the
+                        // child bash cannot see C-side arrays)
+                        let substituted = subst_array_counts(expr);
+                        if substituted != *expr {
+                            if let Some(ast) = crate::shir::parse_arith(&substituted) {
+                                let cexpr = self.arith(&ast);
+                                let cexpr = self.apply_array_counts(&cexpr);
+                                self.need_sh = true;
+                                return format!(
+                                    "({{ long long _r = ({cexpr}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
+                                );
+                            }
+                            // parse failed — restore and fall through
+                        }
                         if let Some(c) = self.let_render(expr) {
                             self.need_sh = true;
                             // `let` succeeds (rc 0) iff the arith is nonzero
@@ -5136,7 +5246,10 @@ impl Render {
                         };
                         if let Some(e) = value_expr {
                             let v = self.value_c(e);
-                            if self.is_num(name) {
+                            if self.managed_strings.contains(name) {
+                                // managed-string var: use the struct setter
+                                self.emit(&format!("_sh_mstr_set(&{id}, {v});"));
+                            } else if self.is_num(name) {
                                 let n = self.expr_as_num(e);
                                 self.emit(&format!("{id} = {n};"));
                             } else if let Some(b) = self.buf_bound(name) {
@@ -5657,6 +5770,24 @@ impl Render {
     /// Positional/special params are substituted textually first (bash
     /// expands them before the arithmetic parses).
     fn arith_text(&mut self, s: &str) -> String {
+        // ${#arr[@]} / ${#arr} counts go NATIVE: substitute to __SHCNT_
+        // tokens, register as Int, parse_arith handles them, then
+        // apply_array_counts rewrites to the C count expression
+        let after_specials = self.arith_subst_specials_l(s);
+        let pre_sub = subst_array_counts(&after_specials);
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG arith_text s={s} after_specials={after_specials} pre_sub={pre_sub}");
+        }
+        for tok in pre_sub.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if let Some(name) = tok.strip_prefix("__SHCNT_") {
+                self.var_types.insert(name.to_string(), IrType::Int);
+            }
+        }
+        if let Some(ast) = crate::shir::parse_arith(&pre_sub) {
+            let cexpr = self.arith(&ast);
+            let cexpr = self.apply_array_counts(&cexpr);
+            return self.num_temp(&cexpr);
+        }
         let pre = self.arith_subst_specials_l(s);
         if let Some(ast) = crate::shir::parse_arith(&pre) {
             if Self::arith_has_side_effects(&ast) {
@@ -6024,6 +6155,20 @@ impl Render {
                             i += 3 + end;
                             continue;
                         }
+                        // ${#arr[@]} / ${#arr} — array/scalar count
+                        if name.starts_with('#') {
+                            let arr_name = name[1..]
+                                .trim_end_matches("[@]")
+                                .trim_end_matches("[*]")
+                                .to_string();
+                            if !arr_name.is_empty()
+                                && arr_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                out.push_str(&format!("__SHCNT_{}", arr_name));
+                                i += 3 + end;
+                                continue;
+                            }
+                        }
                     }
                 } else if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
                     let mut j = i + 1;
@@ -6034,6 +6179,27 @@ impl Render {
                     out.push_str(&self.positional_read_l(&n));
                     i = j;
                     continue;
+                } else if rest.starts_with('{') {
+                    // already consumed by the digits check above if
+                    // numeric — here we handle non-numeric ${...}
+                    // including ${#arr[@]}
+                    let inner_full: String = rest.chars().skip(1).collect();
+                    if let Some(end) = inner_full.find('}') {
+                        let name = &inner_full[..end];
+                        if name.starts_with('#') {
+                            let arr_name = name[1..]
+                                .trim_end_matches("[@]")
+                                .trim_end_matches("[*]")
+                                .to_string();
+                            if !arr_name.is_empty()
+                                && arr_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                out.push_str(&format!("__SHCNT_{}", arr_name));
+                                i += 2 + end + 1;
+                                continue;
+                            }
+                        }
+                    }
                 } else if rest.starts_with('#') {
                     out.push_str(&self.argc_expr_l());
                     i += 2;
@@ -6407,6 +6573,33 @@ impl Render {
     /// and writes the string form back (an array/buffer cannot be the
     /// target of `+=`).
     fn let_render(&mut self, s: &str) -> Option<String> {
+        let trimmed = s.trim();
+        // ${#arr[@]} counts go NATIVE: substitute tokens, register them
+        // Int, then let the comparison/arith renderers treat them as
+        // plain numeric idents (apply_array_counts rewrites at the end)
+        if trimmed.contains("${#") {
+            let substituted = subst_array_counts(trimmed);
+            for tok in substituted.split(|c: char|
+                !c.is_ascii_alphanumeric() && c != '_')
+            {
+                if let Some(name) = tok.strip_prefix("__SHCNT_") {
+                    self.var_types.insert(name.to_string(), IrType::Int);
+                }
+            }
+            if let Some(c) = self.let_compare(&substituted) {
+                return Some(self.apply_array_counts(&c));
+            }
+            // op-assign shapes with counts (`j += ${#flags}`)
+            for op in ["+=", "-=", "*=", "/=", "%="] {
+                if let Some((l, r)) = substituted.split_once(op) {
+                    if is_ident(l.trim()) && r.contains("__SHCNT_") {
+                        if let Some(c) = self.let_render(&substituted) {
+                            return Some(self.apply_array_counts(&c));
+                        }
+                    }
+                }
+            }
+        }
         let s = s.trim();
         // plain comparisons (`i <= n`, `x == 3`) — the ForInit conds
         if let Some(c) = self.let_compare(s) {
@@ -6501,7 +6694,11 @@ impl Render {
                 if l.is_empty() || r.is_empty() {
                     continue;
                 }
-                let lc = if let Ok(n) = l.parse::<i64>() {
+                // __SHCNT_ tokens are pre-substituted array counts —
+                // already numeric-native, never atoll-wrapped
+                let lc = if l.starts_with("__SHCNT_") {
+                    self.apply_array_counts(&format!("(long long){l}"))
+                } else if let Ok(n) = l.parse::<i64>() {
                     n.to_string()
                 } else if self.is_num(l) {
                     self.c_ident(l)
@@ -6510,7 +6707,9 @@ impl Render {
                 } else {
                     continue;
                 };
-                let rc = if let Ok(n) = r.parse::<i64>() {
+                let rc = if r.starts_with("__SHCNT_") {
+                    self.apply_array_counts(&format!("(long long){r}"))
+                } else if let Ok(n) = r.parse::<i64>() {
                     n.to_string()
                 } else if self.is_num(r) {
                     self.c_ident(r)
@@ -7170,6 +7369,9 @@ impl Render {
         let Some(op) = Self::str_arg(args, 0) else {
             return "0".into();
         };
+        if std::env::var("SH2_DBG_PARAMS").is_ok() {
+            eprintln!("DBG param_call op={op:?} name={:?} nargs={}", Self::str_arg(args, 1), args.len());
+        }
         let Some(name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
@@ -7330,6 +7532,9 @@ impl Render {
             .get(3)
             .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
+        if std::env::var("SH2_DBG_PARAMS").is_ok() {
+            eprintln!("DBG pre-match op={op:?} vexpr_arrget={}", var_expr.contains("_sh_arr_get"));
+        }
         match op.as_str() {
             "" => var_expr,
             "-" => format!("(({var_expr}) ? ({var_expr}) : ({val}))"),
@@ -7349,6 +7554,9 @@ impl Render {
                 }
             }
             "#" | "#:" | "##" | "##:" => {
+                if std::env::var("SH2_DBG_PARAMS").is_ok() {
+                    eprintln!("DBG # arm fired name={name:?} pat={:?}", Self::str_arg(args, 2));
+                }
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 self.need_fnmatch = true;
@@ -8319,6 +8527,36 @@ impl Render {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
         let v = self.value_c(val);
+        if let IrExpr::Interpolate(parts) = key {
+            // an Interpolate KEY (e.g. `m["${flags:j:1}"]=v` arrives as
+            // Lit('"') + expr + Lit('"'))): concatenate the part VALUES
+            // into a temp and use it as the assoc key
+            self.assoc_arrays.insert(var.to_string());
+            let kv = self.value_c(key);
+            let id2 = self.c_ident(var);
+            self.emit(&format!(
+                "_sh_assoc_set({id2}_k, {id2}_v, &{id2}_n, {ARR_CAP}, {kv}, {v});"
+            ));
+            return;
+        }
+        if let IrExpr::Str(kraw, _) = key {
+            // bash strips subscript quotes at parse time
+            let kq = kraw.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            let k = &kq;
+            // a key carrying $expansions (`options["$key"]=v`,
+            // `m["${flags:j:1}"]=v`) resolves at RUNTIME — storing the raw
+            // text made every lookup miss
+            if k.contains('$')
+                && (self.assoc_arrays.contains(var) || k.starts_with("${"))
+            {
+                self.assoc_arrays.insert(var.to_string());
+                let kv = self.heredoc_body_c(key);
+                self.emit(&format!(
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {kv}, {v});"
+                ));
+                return;
+            }
+        }
         if let IrExpr::Str(k, _) = key {
             // a literal key: numeric for indexed arrays, string for assoc
             if let Ok(i) = k.trim().parse::<i64>() {
@@ -8409,6 +8647,24 @@ impl Render {
         self.emit(&format!("size_t {ai} = 0;"));
         for (i, it) in items.iter().enumerate() {
             let _ = i;
+            // `arr=("$@")` — EACH positional is its own element (a joined
+            // single element made `${#args[@]}` read 1 forever)
+            if let IrExpr::Call { func, args } = it {
+                if (func == "listVar" || func == "arrayItems")
+                    && matches!(Self::str_arg(args, 0).as_deref(), Some("@"))
+                {
+                    self.emit(&format!(
+                        "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = strdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
+                    ));
+                    self.emit(&format!(
+                        "{id}_len = {ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
+                    ));
+                    self.emit(&format!(
+                        "{ai} += ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
+                    ));
+                    continue;
+                }
+            }
             // `arr=($x)` — a split element field-splits at runtime (the
             // core's A1 split marker on an array literal element)
             if let IrExpr::Call { func, args } = it {
@@ -9113,7 +9369,393 @@ impl Render {
         s.to_string()
     }
 
+    /// Rewrite `__SHCNT_name` tokens (from subst_array_counts) in a
+    /// generated C expression to the array-count member expression.
+    fn apply_array_counts(&mut self, cexpr: &str) -> String {
+        let mut toks: Vec<String> = Vec::new();
+        let bytes = cexpr.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'_' && cexpr[i..].starts_with("__SHCNT_") {
+                let mut j = i + 8;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                let tok = cexpr[i..j].to_string();
+                if !toks.contains(&tok) {
+                    toks.push(tok);
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        let mut out = cexpr.to_string();
+        for t in toks {
+            let name = t.trim_start_matches("__SHCNT_");
+            let id = self.c_ident(name);
+            // assoc arrays count via _n; indexed via _len; a SCALAR var
+            // (${#flags} on a Str) is its strlen
+            let expr = if self.assoc_arrays.contains(name) {
+                format!("((long long){id}_n)")
+            } else if self.arrays.contains(name) {
+                format!("((long long){id}_len)")
+            } else {
+                let v = self.store_read(name);
+                format!("((long long)strlen({v} ? {v} : \"\"))")
+            };
+            // unknown-ident fallbacks may have wrapped the token in
+            // getenv forms (bare, NULL-guarded) — rewrite all to the
+            // bare count expression
+            out = out.replace(
+                &format!("(getenv(\"{t}\") ? getenv(\"{t}\") : \"\")"),
+                &expr,
+            );
+            // atoll(getenv("T")) — the numeric-read wrapper
+            out = out.replace(
+                &format!("atoll((getenv(\"{t}\") ? getenv(\"{t}\") : \"\"))"),
+                &expr,
+            );
+            // atoll(EXPR) where EXPR is already a native count — strip
+            out = out.replace(&format!("atoll({expr})"), &expr);
+            out = out.replace(&t, &expr);
+        }
+        out
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
+        // `while IFS= read -r line && [ -n "$line" ] && (( … )); do … done
+        //   < F | < <(producer)` — NATIVE streaming read loop. The child-
+        // text form loses every variable the body assigns (shell state
+        // cannot cross exec) and was the top remaining red class.
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && matches!(redirects[0].mode.as_str(), "r" | "process-in")
+            {
+                if let Some(IrStmt::While { cond, .. }) = inner.first() {
+                    if let Some((vars, ifs_spec, rest)) =
+                        self.try_read_loop_cond(cond)
+                    {
+                        let is_pipe = redirects[0].mode == "process-in";
+                        let src_text =
+                            Self::str_arg(&[redirects[0].target.clone()], 0);
+                        let mut body_cl: Vec<IrStmt> = Vec::new();
+                        if let Some(IrStmt::While { body, .. }) = inner.first() {
+                            body_cl = body.clone();
+                        }
+                        let rest_c = rest.clone();
+                        let vars_c = vars.clone();
+                        // a body containing $(…) captures renders those via
+                        // cap_sites whose system() interaction with the
+                        // enclosing fgets loop misorders output — keep such
+                        // heads on the proven text path
+                        fn has_capture(stmts: &[IrStmt]) -> bool {
+                            for st in stmts {
+                                match st {
+                                    IrStmt::Expr(IrExpr::Call { func, .. })
+                                        if func == "capture" || func == "captureWords" =>
+                                    {
+                                        return true
+                                    }
+                                    IrStmt::If { then, elsifs, else_, .. } => {
+                                        if has_capture(then)
+                                            || elsifs.iter().any(|(_, b)| has_capture(b))
+                                            || has_capture(else_)
+                                        {
+                                            return true
+                                        }
+                                    }
+                                    IrStmt::Block(b) | IrStmt::Background(b) => {
+                                        if has_capture(b) {
+                                            return true
+                                        }
+                                    }
+                                    IrStmt::Pipeline { stages, .. } => {
+                                        if stages.iter().any(|s2| has_capture(s2)) {
+                                            return true
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            false
+                        }
+                        if has_capture(&body_cl) {
+                            // fall through to the generic (text) path
+                        } else {
+                        self.need_sh = true;
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 1;
+
+                        for v in &vars_c {
+                            self.store.insert(v.clone());
+                            self.var_types.insert(v.clone(), IrType::Str);
+                        }
+
+                        if is_pipe {
+                            // arbitrary producer pipeline: unavoidable popen.
+                            // Export every variable the producer references
+                            let ptxt = src_text.clone().unwrap_or_default();
+                            self.sh_export_vars(&ptxt);
+                            self.emit(&format!(
+                                "_sh_wrap_cmd({});",
+                                Self::cstr(&ptxt)
+                            ));
+                            self.emit(&format!(
+                                "FILE *_pf{id} = popen(_sh_wrap, \"r\");"
+                            ));
+                        } else {
+                            let src_e = self.value_c(&redirects[0].target);
+                            self.emit(&format!(
+                                "FILE *_pf{id} = fopen({src_e}, \"r\");"
+                            ));
+                        }
+                        // the loop drives execution natively — a leftover
+                        // _sh_cmd would be re-run by the tail system()
+                        self.emit(&format!("if (_pf{id}) {{"));
+                        self.depth += 1;
+                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!(
+                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!(
+                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                        ));
+                        let nv = vars_c.len();
+                        match &ifs_spec {
+                            None => {
+                                // default IFS: leading-blank trim + split
+                                self.emit(&format!(
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                ));
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, \" \\t\", {nv}, __fv);"
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                            Some(s) if s.is_empty() => {
+                                // IFS= : raw whole line to the FIRST var
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                                for (vi, v) in vars_c.iter().enumerate().skip(1) {
+                                    let vid2 = self.c_ident(v);
+                                    self.emit(&format!("{vid2} = strdup(\"\");"));
+                                }
+                            }
+                            Some(cs) => {
+                                // single-char delimiter: field split, the
+                                // LAST var keeps the remainder
+                                let dch = cs.as_bytes()[0];
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; char *_rp = _rl{id}; size_t _rk; for (_rk = 0; _rk < {nv}; _rk++) {{ char *_d = (_rk + 1 < {nv}) ? strchr(_rp, {dch}) : NULL; if (_d) *_d = 0; __fv[_rk] = _rp; if (!_d) break; else _rp = _d + 1; }}"
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                        }
+                        if !rest_c.is_empty() {
+                            let conj: Vec<String> = rest_c
+                                .iter()
+                                .map(|e| format!("({})", self.expr(e)))
+                                .collect();
+                            self.emit(&format!(
+                                "if (!({})) break;",
+                                conj.join(" && ")
+                            ));
+                        }
+                        for b in &body_cl {
+                            self.stmt(b);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.depth -= 1;
+                        if is_pipe {
+                            self.emit(&format!("pclose(_pf{id});"));
+                        } else {
+                            self.emit(&format!("fclose(_pf{id});"));
+                        }
+                        self.emit("}");
+
+                        let body_lines =
+                            std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s3 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in &body_lines {
+                            s3.push_str(line);
+                            s3.push('\n');
+                        }
+                        s3.push_str("return 0; /* loop rc: last body status tracked via _sh_rc */\n}");
+                        self.site_bodies.push(s3);
+                        self.site_ids.push(id);
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                        }
+                    }
+                }
+            }
+        }
+        // `while IFS= read -r line && [ -n "$line" ] && (( … )); do … done
+        //   < F | < <(producer)` — NATIVE streaming read loop. The child-
+        // text form loses every variable the body assigns (shell state
+        // cannot cross exec) and was the top remaining red class.
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && matches!(redirects[0].mode.as_str(), "r" | "process-in")
+            {
+                if let Some(IrStmt::While { cond, .. }) = inner.first() {
+                    if let Some((vars, ifs_spec, rest)) =
+                        self.try_read_loop_cond(cond)
+                    {
+                        let is_pipe = redirects[0].mode == "process-in";
+                        let src_text =
+                            Self::str_arg(&[redirects[0].target.clone()], 0);
+                        let mut body_cl: Vec<IrStmt> = Vec::new();
+                        if let Some(IrStmt::While { body, .. }) = inner.first() {
+                            body_cl = body.clone();
+                        }
+                        let rest_c = rest.clone();
+                        let vars_c = vars.clone();
+
+                        self.need_sh = true;
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 1;
+
+                        for v in &vars_c {
+                            self.store.insert(v.clone());
+                            self.var_types.insert(v.clone(), IrType::Str);
+                        }
+
+                        if is_pipe {
+                            // arbitrary producer pipeline: unavoidable popen.
+                            // Export every variable the producer references
+                            let ptxt = src_text.clone().unwrap_or_default();
+                            self.sh_export_vars(&ptxt);
+                            self.emit(&format!(
+                                "_sh_wrap_cmd({});",
+                                Self::cstr(&ptxt)
+                            ));
+                            self.emit(&format!(
+                                "FILE *_pf{id} = popen(_sh_wrap, \"r\");"
+                            ));
+                        } else {
+                            let src_e = self.value_c(&redirects[0].target);
+                            self.emit(&format!(
+                                "FILE *_pf{id} = fopen({src_e}, \"r\");"
+                            ));
+                        }
+                        self.emit(&format!("if (_pf{id}) {{"));
+                        self.depth += 1;
+                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!(
+                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!(
+                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                        ));
+                        // IFS: None = default whitespace split with
+                        // leading trim; Some("") = raw whole line to the
+                        // first var; Some(cs) = delimiter cs
+                        let nv = vars_c.len();
+                        match &ifs_spec {
+                            None => {
+                                self.emit(&format!(
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                ));
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                            }
+                            Some(s) if s.is_empty() => {
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                            }
+                            Some(cs) if nv == 1 => {
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!(
+                                    "{{ char *_d = strchr(_rl{id}, {cs_byte}); if (_d) *_d = 0; {vid} = strdup(_rl{id}); }}",
+                                    cs_byte = cs.as_bytes()[0]
+                                ));
+                            }
+                            Some(cs) => {
+                                let ifs_s = cs.clone();
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, {}, {nv}, __fv);",
+                                    Self::cstr(&ifs_s),
+                                    nv = nv
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                        }
+                        if !rest_c.is_empty() {
+                            let conj: Vec<String> = rest_c
+                                .iter()
+                                .map(|e| format!("({})", self.expr(e)))
+                                .collect();
+                            self.emit(&format!(
+                                "if (!({})) break;",
+                                conj.join(" && ")
+                            ));
+                        }
+                        for b in &body_cl {
+                            self.stmt(b);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.depth -= 1;
+                        if is_pipe {
+                            self.emit(&format!("pclose(_pf{id});"));
+                        } else {
+                            self.emit(&format!("fclose(_pf{id});"));
+                        }
+                        self.emit("}");
+
+                        let body_lines =
+                            std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s3 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in &body_lines {
+                            s3.push_str(line);
+                            s3.push('\n');
+                        }
+                        s3.push_str("return !_sh_system_rc();\n}");
+                        self.site_bodies.push(s3);
+                        self.site_ids.push(id);
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                    }
+                }
+            }
+        }
         // `mapfile -t NAME < FILE` / `readarray …`: run NATIVELY — reading
         // the lines in a child loses the array (bash arrays cannot cross
         // exec), which broke every `< <(producer)` mapfile use
@@ -10237,6 +10879,47 @@ impl Render {
                 );
                 self.emit(&format!("{site};"));
             }
+            IrStmt::Pipeline { stages, capture: None, .. }
+                if stages.iter().any(|s2| {
+                    let j = format!("{s2:?}");
+                    j.contains("__ps_tmp") || j.contains("mkfifo")
+                }) =>
+            {
+                // Pipeline with materialized process substitutions:
+                // pass through to bash (handles <(...) natively);
+                // read output via native fgets loop
+                let stages_c = stages.clone();
+                let id = self.site_seq;
+                self.site_seq += 1;
+                let saved = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
+                self.emit("_sh_reset();");
+                self.emit(&format!("_sh_reset();")); // build pipeline text
+                let args_v = vec![IrExpr::Array(
+                    stages_c.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                )];
+                self.sh_pipeline_text(crate::c_backend::CmdBuf::Shared, &args_v);
+                let body_lines = std::mem::replace(&mut self.out, saved);
+                self.depth = saved_depth;
+                let mut s5 = format!("static int _sh_site_{id}(void) {{\n");
+                s5.push_str("  _sh_reset();\n");
+                for line in &body_lines { s3_push(&mut s5, line); }
+                s5.push_str("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");\n");
+                s5.push_str("  FILE *_pp = popen(_sh_wrap, \"r\");\n");
+                s5.push_str("  if (_pp) {\n");
+                s5.push_str("    static char _pl[65536];\n");
+                s5.push_str("    while (fgets(_pl, sizeof _pl, _pp)) {\n");
+                s5.push_str("      fputs(_pl, stdout);\n");
+                s5.push_str("    }\n");
+                s5.push_str("    int _rc = pclose(_pp); _sh_rc = (_rc == -1) ? 127 : WEXITSTATUS(_rc);\n");
+                s5.push_str("  }\n");
+                s5.push_str("  return !_sh_system_rc();\n}");
+                self.site_bodies.push(s5);
+                self.site_ids.push(id);
+                self.need_sh = true;
+                self.emit(&format!("_sh_site_{id}();"));
+            }
             IrStmt::Pipeline { stages, capture, .. } => {
                 let stages = stages.clone();
                 let capture = capture.clone();
@@ -10251,7 +10934,11 @@ impl Render {
                             .collect(),
                     )];
                     let cap = self.capture_call(&args);
-                    self.emit(&format!("{id} = {cap};"));
+                    if self.managed_strings.contains(var.as_str()) {
+                        self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
+                    } else {
+                        self.emit(&format!("{id} = {cap};"));
+                    }
                 } else {
                     let args = vec![IrExpr::Array(
                         stages
@@ -10494,7 +11181,11 @@ impl Render {
                     self.store.insert(var.clone());
                     let id = self.c_ident(var);
                     let cap = self.capture_call(&call_args);
-                    self.emit(&format!("{id} = {cap};"));
+                    if self.managed_strings.contains(var) {
+                        self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
+                    } else {
+                        self.emit(&format!("{id} = {cap};"));
+                    }
                 } else if !redirects.is_empty() {
                     let stmts = vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
@@ -10979,6 +11670,13 @@ impl Render {
         for s in &prog.stmts {
             self.stmt(s);
         }
+        // EXIT trap: run the registered cleanup body before returning
+        if let Some(body) = &self.exit_trap_body {
+            self.emit(&format!(
+                "_sh_wrap_cmd({}); system(_sh_wrap);",
+                Self::cstr(body)
+            ));
+        }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
@@ -11176,7 +11874,9 @@ impl Render {
         // /dev/null (the gate diffs stdout only). A native-only program
         // has no subprocess: buffered stdout cannot reorder anything and
         // the script's own stderr (Die/Warn) must reach the terminal.
-        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty() {
+        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty()
+            || self.exit_trap_body.is_some()
+        {
             self.emit("  freopen(\"/dev/null\", \"w\", stderr);");
             // unbuffered stdout: bash -c children share fd 1 — buffered
             // stdio would reorder their output after ours at flush time
@@ -13630,6 +14330,317 @@ fn collect_ext_foreach_line_vars(st: &IrStmt, out: &mut BTreeSet<String>) {
     }
 }
 
+fn expr_is_and_tree(e: &IrExpr) -> bool {
+    matches!(
+        e,
+        IrExpr::Call { func, .. } if func == "and" || func == "block"
+    ) || matches!(e, IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. })
+}
+
+
+/// Map an operator string (`:-d`, `##p`, `` ``, `/r`, ...) applied to the
+/// bare var `x` into param/getVar call args. Shared by `${x<op>}` and
+/// `${arr[i]<op>}` forms.
+fn dollar_brace_name_op(opstr: &str) -> Option<Vec<IrExpr>> {
+    let s = |t: &str| IrExpr::Str(t.to_string(), crate::ir::StrStyle::DoubleQuoted);
+    if opstr.is_empty() {
+        return Some(vec![s("x")]);
+    }
+    let (op, arg): (String, String) = if let Some(r) = opstr.strip_prefix(":-") {
+        (":-".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":=") {
+        (":=".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":?") {
+        (":?".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":+") {
+        (":+".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("##") {
+        ("##".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("%%") {
+        ("%%".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("//") {
+        ("//".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('#') {
+        ("#".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('%') {
+        ("%".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('/') {
+        ("/".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('-') {
+        ("-".into(), r.to_string())
+    } else {
+        return None;
+    };
+    if arg.contains('$') || arg.contains('`') || arg.contains('{') {
+        return None;
+    }
+    Some(vec![s(&op), s("x"), s(&arg)])
+}
+
+/// One flattened condition leaf of a `while` head.
+#[derive(Debug)]
+enum CondLeaf {
+    /// builtin/exec call statement (`read`, `test`, `true`, `let`, ...)
+    Stmt(IrStmt),
+    /// bare expression leaf (`(( counter < max ))`, `[ -n "$line" ]`)
+    Expr(IrExpr),
+}
+
+/// Flatten a while-head condition into ordered AND-leaves. Returns false
+/// when the head mixes semantics we cannot reorder (Or, unmodeled shapes).
+fn flatten_and_cond(cond: &IrExpr, out: &mut Vec<CondLeaf>) -> bool {
+    match cond {
+        IrExpr::Call { func, args } if func == "and" || func == "block" => {
+            for a in args {
+                match a {
+                    IrExpr::Arrow(sts) => {
+                        if !flatten_and_stmts(sts, out) {
+                            return false;
+                        }
+                    }
+                    other => {
+                        if expr_is_and_tree(other) {
+                            if !flatten_and_cond(other, out) {
+                                return false;
+                            }
+                        } else {
+                            out.push(CondLeaf::Expr(other.clone()));
+                        }
+                    }
+                }
+            }
+            true
+        }
+        IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs, rhs } => {
+            if !flatten_and_cond(lhs, out) {
+                return false;
+            }
+            if expr_is_and_tree(rhs) {
+                flatten_and_cond(rhs, out)
+            } else {
+                out.push(CondLeaf::Expr(rhs.as_ref().clone()));
+                true
+            }
+        }
+        other => {
+            if expr_is_and_tree(other) && !matches!(other, IrExpr::BinOp { .. }) {
+                flatten_and_cond(other, out)
+            } else {
+                out.push(CondLeaf::Expr(other.clone()));
+                true
+            }
+        }
+    }
+}
+
+/// builtin/exec `read [-r] var…` call?
+fn is_read_call(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Call { func, args }
+        if (func == "exec" || func == "builtin")
+            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read"))
+}
+
+fn flatten_and_stmts(sts: &[IrStmt], out: &mut Vec<CondLeaf>) -> bool {
+    for st in sts {
+        match st {
+            IrStmt::Expr(e) => {
+                let is_and = matches!(
+                    e,
+                    IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. }
+                ) || matches!(e, IrExpr::Call { func, .. } if func == "and");
+                if is_and {
+                    if !flatten_and_cond(e, out) {
+                        return false;
+                    }
+                } else {
+                    out.push(CondLeaf::Stmt(st.clone()));
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+impl Render {
+    fn expr_is_and_tree_unused(e: &IrExpr) -> bool {
+        matches!(
+            e,
+            IrExpr::Call { func, .. } if func == "and" || func == "block"
+        ) || matches!(e, IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. })
+    }
+
+    /// Decompose a while-head into (read vars, raw-mode flag, remaining
+    /// condition leaves). None when the head is not a canonical
+    /// single-`read` AND-chain.
+    fn try_read_loop_cond(&self, cond: &IrExpr) -> Option<(Vec<String>, Option<String>, Vec<IrExpr>)> {
+        let mut leaves: Vec<CondLeaf> = Vec::new();
+        if !flatten_and_cond(cond, &mut leaves) {
+            return None;
+        }
+        let mut vars: Vec<String> = Vec::new();
+        let mut ifs_spec: Option<String> = None;
+        let mut rest: Vec<IrExpr> = Vec::new();
+        for leaf in leaves {
+            match leaf {
+                CondLeaf::Stmt(IrStmt::Expr(call @ IrExpr::Call { .. })) => {
+                    let IrExpr::Call { func, args } = &call else {
+                        unreachable!()
+                    };
+                    let cmd = Self::str_arg(args, 0)
+                        .unwrap_or_default();
+                    let is_decl_call = func == "exec" || func == "builtin";
+                    if is_decl_call && cmd == "read" {
+                        if !vars.is_empty() {
+                            return None; // multi-read heads stay textual
+                        }
+                        for a in args {
+                            if let IrExpr::Object(fields) = a {
+                                for (k, v) in fields {
+                                    if k == "IFS" {
+                                        if let IrExpr::Str(val, _) = v {
+                                            ifs_spec = Some(val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let words: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items
+                                .iter()
+                                .filter_map(|w| Self::str_arg(&[w.clone()], 0))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for w in &words {
+                            if w.starts_with('-') {
+                                if w != "-r" && w != "-n" {
+                                    return None;
+                                }
+                            } else if is_ident(w) {
+                                vars.push(w.clone());
+                            } else {
+                                return None;
+                            }
+                        }
+                        if vars.is_empty() {
+                            return None;
+                        }
+                    } else if cmd == "true" || func == "true" {
+                        for a in args {
+                            if let IrExpr::Object(fields) = a {
+                                for (k, v) in fields {
+                                    if k == "IFS" {
+                                        if let IrExpr::Str(val, _) = v {
+                                            ifs_spec = Some(val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        rest.push(IrExpr::Call {
+                            func: func.clone(),
+                            args: args.clone(),
+                        });
+                    }
+                }
+                CondLeaf::Stmt(_) => return None,
+                CondLeaf::Expr(e) => {
+                    if is_read_call(&e) {
+                        if !vars.is_empty() {
+                            return None;
+                        }
+                        if let IrExpr::Call { args, .. } = &e {
+                            for a in args {
+                                if let IrExpr::Object(fields) = a {
+                                    for (k, v) in fields {
+                                        if k == "IFS" {
+                                            if let IrExpr::Str(val, _) = v {
+                                                ifs_spec = Some(val.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let words: Vec<String> = match e {
+                            IrExpr::Call { args, .. } => match args.get(1) {
+                                Some(IrExpr::Array(items)) => items
+                                    .iter()
+                                    .filter_map(|w| Self::str_arg(&[w.clone()], 0))
+                                    .collect(),
+                                _ => Vec::new(),
+                            },
+                            _ => Vec::new(),
+                        };
+                        for w in &words {
+                            if w.starts_with('-') {
+                                if w != "-r" && w != "-n" {
+                                    return None;
+                                }
+                            } else if is_ident(w) {
+                                vars.push(w.clone());
+                            } else {
+                                return None;
+                            }
+                        }
+                        if vars.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        rest.push(e.clone());
+                    }
+                }
+            }
+        }
+        if vars.is_empty() {
+            return None;
+        }
+        Some((vars, ifs_spec, rest))
+    }
+}
+
+/// Replace `${#arr[@]}` / `${#arr}` array-count expansions with a
+/// reserved identifier token (`__SHCNT_arr`) that survives arith parsing;
+/// [`Render::apply_array_counts`] rewrites the token to the C count
+/// expression after rendering.
+fn subst_array_counts(s: &str) -> String {
+    let mut out = String::new();
+    let ch: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '$' && i + 1 < ch.len() && ch[i + 1] == '{'
+            && i + 2 < ch.len() && ch[i + 2] == '#'
+        {
+            // find closing brace
+            let mut j = i + 3;
+            while j < ch.len() && ch[j] != '}' {
+                j += 1;
+            }
+            if j < ch.len() {
+                let inner: String = ch[i + 3..j].iter().collect();
+                let name = inner
+                    .trim_end_matches("[@]")
+                    .trim_end_matches("[*]")
+                    .to_string();
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push_str(&format!("__SHCNT_{}", name));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
+
+
+
 /// A Redirect whose inner command is `mapfile`/`readarray` reading stdin
 /// from a FILE — renderable natively (arrays cannot cross exec).
 fn is_mapfile_redirect(s: &IrStmt) -> bool {
@@ -14521,6 +15532,20 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     if body.starts_with('!') {
         return None; // ${!x} indirect — not modeled
     }
+    // `arr[i]#op` — a SUBSCRIPTED name followed by an operator: parse the
+    // subscript as part of the name (param_call's element-read arm
+    // resolves it), then apply the operator chain to the element value.
+    if body.starts_with('[') {
+        if let Some(clo) = body.find(']') {
+            let name_full = &body[..=clo];
+            let opstr = &body[clo + 1..];
+            let base_args = dollar_brace_name_op(opstr)?;
+            let mut outv = vec![base_args[0].clone(), s(name_full)];
+            outv.extend(base_args[1..].iter().cloned());
+            return Some(outv);
+        }
+        return None;
+    }
     // leading name
     let ch: Vec<char> = body.chars().collect();
     let mut i = 0;
@@ -14553,25 +15578,23 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     } else if let Some(r) = rest.strip_prefix(":+") {
         (":+".into(), r.to_string())
     } else if let Some(r) = rest.strip_prefix(":") {
-        // ${x:off} / ${x:off:len} — slice; args must be plain integers
+        // ${x:off} / ${x:off:len} — slice; offsets may be expressions
+        // (${flags:j:1}) — passed through as raw args, param_call's
+        // value_num path resolves vars natively
         let mut it = r.splitn(2, ':');
         let off = it.next().unwrap_or("").trim();
         let len = it.next();
-        if !off.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let mut a = vec![s("slice"), s(&name), s(off)];
-        if let Some(l) = len {
-            let l = l.trim();
+        if len.is_some() {
+            let l = len.unwrap().trim();
             let neg = l.starts_with('-');
             let dt = l.trim_start_matches('-');
-            if !dt.chars().all(|c| c.is_ascii_digit()) || dt.is_empty() {
+            if dt.is_empty() {
                 return None;
             }
             let lenv = if neg { format!("-{dt}") } else { l.to_string() };
-            a.push(s(&lenv));
+            return Some(vec![s("slice"), s(&name), s(off), s(&lenv)]);
         }
-        return Some(a);
+        return Some(vec![s("slice"), s(&name), s(off)]);
     } else if let Some(r) = rest.strip_prefix("##") {
         ("##".into(), r.to_string())
     } else if let Some(r) = rest.strip_prefix("%%") {
@@ -15175,6 +16198,8 @@ fn c_eq(chars: &[char], i: usize) -> bool {
         && chars[i + 1] != '='
         && (i == 0 || chars[i - 1] != '!' && chars[i - 1] != '<' && chars[i - 1] != '>' && chars[i - 1] != '=')
 }
+
+fn s3_push(s: &mut String, line: &str) { s.push_str(line); s.push(10 as char); }
 
 #[cfg(test)]
 fn probe_parse_arith() {
