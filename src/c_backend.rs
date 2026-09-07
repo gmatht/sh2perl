@@ -1358,7 +1358,13 @@ impl Render {
             ),
             (
                 "<math.h>",
-                &["pow(", "sqrt(", "floor(", "ceil(", "log(", "fabs(", "round(", "fmod("],
+                &[
+                    "pow(", "sqrt(", "floor(", "ceil(", "log(", "fabs(", "round(", "fmod(",
+                    "exp(", "log10(", "log2(", "cbrt(", "trunc(",
+                    "sin(", "cos(", "tan(", "asin(", "acos(", "atan(", "atan2(",
+                    "sinh(", "cosh(", "tanh(", "asinh(", "acosh(", "atanh(",
+                    "hypot(", "copysign(",
+                ],
             ),
             ("<assert.h>", &["assert("]),
         ];
@@ -2247,6 +2253,13 @@ impl Render {
                             } else {
                                 self.arith(&ast)
                             };
+                            return self.num_temp(&v);
+                        }
+                        // zsh-mathfunc texts (`int(sqrt($1)) + 1`) — the
+                        // native mathfunc parser before the child-bash
+                        // capture (which real bash cannot even run: a
+                        // mathfunc call is a bash arith SYNTAX error)
+                        if let Some(v) = self.mathfunc_arith_c(&s) {
                             return self.num_temp(&v);
                         }
                         let s = s.clone();
@@ -5106,7 +5119,288 @@ impl Render {
             }
             return self.arith(&ast);
         }
+        if let Some(v) = self.mathfunc_arith_c(s) {
+            return v;
+        }
         self.arith_string_site(s)
+    }
+
+    /// zsh-mathfunc arith text → native C numeric expression.
+    ///
+    /// The deterministic `evalArith` subset (`harness/sh2-namespace.mjs`,
+    /// same shape as the python backend's `mathfunc_arith`): `int()`
+    /// truncates toward zero (a C cast — exactly), `sqrt()` is libm
+    /// `sqrt`, `$N` reads argv, `$name` coerces numerically. Returns
+    /// `None` — the caller keeps the child-bash `echo "$((…))"` capture
+    /// — for anything outside the subset (refuse > guess): `%`,
+    /// `&&`/`||`/`!`/`~`, the bitwise and shift ops, ternaries,
+    /// assignments and `++`/`--` (their bash/runtime value semantics are
+    /// int-arith, not the float mathfunc domain), `$?`/`$#`, array
+    /// subscripts. `/` renders as DOUBLE division (the runtime's
+    /// JS-number semantics; C `i64/i64` would truncate) and `**` as
+    /// `pow((double),(double))` — a signed base before `**` refuses
+    /// (matches the runtime's parse).
+    fn mathfunc_arith_c(&mut self, src: &str) -> Option<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut pos = 0usize;
+        let out = self.mf_cmp(&chars, &mut pos)?;
+        Self::mf_ws(&chars, &mut pos);
+        if pos != chars.len() {
+            return None;
+        }
+        Some(out)
+    }
+
+    fn mf_ws(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+
+    /// `a < b` → `((a) < (b))` — C comparisons yield 1/0, exactly the
+    /// runtime's ints. At most ONE comparison (left-assoc in the
+    /// runtime; a `a < b < c` chain would be a syntax error in C, which
+    /// the parse itself refuses).
+    fn mf_cmp(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let l = self.mf_add(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        let rest: String = chars[*pos..].iter().collect();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if rest.starts_with(op) {
+                *pos += op.len();
+                let r = self.mf_add(chars, pos)?;
+                return Some(format!("(({l}) {op} ({r}))"));
+            }
+        }
+        Some(l)
+    }
+
+    fn mf_add(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_mul(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            let op = match chars.get(*pos) {
+                Some('+') => "+",
+                Some('-') => "-",
+                _ => return Some(l),
+            };
+            *pos += 1;
+            let r = self.mf_mul(chars, pos)?;
+            l = format!("(({l}) {op} ({r}))");
+        }
+    }
+
+    fn mf_mul(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_pow(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            // `*` but not `**`; `/` is DOUBLE division (the runtime's
+            // JS-number semantics); `%` refused (fmod sign diverges from
+            // the int-arith % the shell texts use)
+            if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) != Some(&'*') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("(({l}) * ({r}))");
+            } else if chars.get(*pos) == Some(&'/') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("((double)({l}) / (double)({r}))");
+            } else {
+                return Some(l);
+            }
+        }
+    }
+
+    /// `**` mirrors the runtime: a signed base before `**` refuses; the
+    /// exponent takes signs. `pow((double),(double))` — double result,
+    /// like `Math.pow`.
+    fn mf_pow(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        let signed = matches!(chars.get(*pos), Some('+') | Some('-'));
+        let base = self.mf_unary(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) == Some(&'*') {
+            if signed {
+                return None;
+            }
+            *pos += 2;
+            let exp = self.mf_unary(chars, pos)?;
+            return Some(format!("pow((double)({base}), (double)({exp}))"));
+        }
+        Some(base)
+    }
+
+    fn mf_unary(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('+') => {
+                *pos += 1;
+                self.mf_unary(chars, pos)
+            }
+            Some('-') => {
+                *pos += 1;
+                Some(format!("(-{})", self.mf_unary(chars, pos)?))
+            }
+            // `!`/`~` refused (the runtime's value semantics diverge)
+            _ => self.mf_atom(chars, pos),
+        }
+    }
+
+    fn mf_atom(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('(') => {
+                *pos += 1;
+                let e = self.mf_cmp(chars, pos)?;
+                Self::mf_ws(chars, pos);
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(format!("({e})"))
+            }
+            Some('$') => self.mf_dollar(chars, pos),
+            Some(c) if c.is_ascii_digit() || *c == '.' => Self::mf_number(chars, pos),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => self.mf_named(chars, pos),
+            _ => None,
+        }
+    }
+
+    fn mf_dollar(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        *pos += 1; // consume `$`
+        if chars.get(*pos) == Some(&'{') {
+            *pos += 1;
+            let name = Self::mf_name(chars, pos)?;
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) != Some(&'}') {
+                return None;
+            }
+            *pos += 1;
+            return Some(self.mf_numref(&name));
+        }
+        let name = Self::mf_name(chars, pos)?;
+        Some(self.mf_numref(&name))
+    }
+
+    fn mf_name(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    /// Bare name or call: a known mathfunc name followed by `(` parses
+    /// args; anything else is a numeric variable read. An unknown call
+    /// (or wrong arity) refuses the whole text.
+    fn mf_named(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let name = Self::mf_name(chars, pos)?;
+        let save = *pos;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) != Some(&'(') {
+            *pos = save;
+            return Some(self.mf_numref(&name));
+        }
+        *pos += 1;
+        let mut args: Vec<String> = Vec::new();
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&')') {
+            *pos += 1;
+            return self.mf_call(&name, args);
+        }
+        loop {
+            args.push(self.mf_cmp(chars, pos)?);
+            Self::mf_ws(chars, pos);
+            match chars.get(*pos) {
+                Some(',') => {
+                    *pos += 1;
+                }
+                Some(')') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        self.mf_call(&name, args)
+    }
+
+    /// One mathfunc call → the libm C form. `int()` truncates toward
+    /// zero — a C cast, exactly. Everything else is the same-named libm
+    /// function (all live in <math.h>; trim_includes keeps the header
+    /// while any trigger symbol appears).
+    fn mf_call(&mut self, name: &str, args: Vec<String>) -> Option<String> {
+        let dbl = |a: &String| format!("(double)({})", a);
+        match name {
+            "int" if args.len() == 1 => Some(format!("((long long)({}))", args[0])),
+            "abs" | "fabs" if args.len() == 1 => Some(format!("fabs({})", dbl(&args[0]))),
+            "floor" | "ceil" | "round" | "trunc" | "sqrt" | "cbrt" | "exp"
+            | "log" | "log10" | "log2" | "sin" | "cos" | "tan" | "asin"
+            | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+            | "atanh" if args.len() == 1 => Some(format!("{}({})", name, dbl(&args[0]))),
+            "atan2" | "fmod" | "copysign" if args.len() == 2 => Some(format!(
+                "{}({}, {})",
+                name,
+                dbl(&args[0]),
+                dbl(&args[1])
+            )),
+            "hypot" if !args.is_empty() => Some(format!(
+                "hypot({})",
+                args.iter().map(dbl).collect::<Vec<_>>().join(", ")
+            )),
+            _ => None,
+        }
+    }
+
+    /// Numeric read of a `$`-ref or bare name: positional params read
+    /// argv; typed-Int vars read as their C ident; everything else
+    /// atoll()s the store read (env fallback for never-assigned names).
+    fn mf_numref(&mut self, name: &str) -> String {
+        self.need_sh = true;
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            return Self::positional_read(name);
+        }
+        if self.is_num(name) {
+            return format!("(long long)({})", self.c_ident(name));
+        }
+        format!("(long long)atoll({})", self.store_read(name))
+    }
+
+    /// A numeric literal: integer digits render `…LL` (bash arith is
+    /// intmax_t — an int-suffix literal overflows silently), anything
+    /// with a dot is a double literal as written.
+    fn mf_number(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        let mut dots = 0usize;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_digit() {
+                *pos += 1;
+            } else if *c == '.' {
+                dots += 1;
+                if dots > 1 {
+                    return None;
+                }
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        let s: String = chars[start..*pos].iter().collect();
+        if dots > 0 {
+            Some(s)
+        } else {
+            Some(format!("{s}LL"))
+        }
     }
 
     /// Shell-text initializers for every KNOWN array whose ident appears
@@ -7077,8 +7371,12 @@ impl Render {
             "join" => self.join_value(args),
             "arith" => match Self::str_arg(args, 0) {
                 // value context: capture `$(( text ))` — the arith
-                // RESULT (a site returns only the truthiness)
+                // RESULT (a site returns only the truthiness); the
+                // mathfunc parser lowers the deterministic subset first
                 Some(s) => {
+                    if let Some(v) = self.mathfunc_arith_c(&s) {
+                        return self.num_temp(&v);
+                    }
                     let s = s.clone();
                     self.cap_site(|r, id| {
                         r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
@@ -13175,6 +13473,29 @@ mod tests {
     }
 
     #[test]
+    fn mathfunc_factor_shape_c() {
+        // The zsh-mathfunc subset lowers NATIVELY — no child-bash capture
+        // (real bash cannot even RUN `int(sqrt($1))`: it is a bash arith
+        // syntax error). int() = C cast, sqrt() = libm, $N reads argv.
+        let mut r = Render::default();
+        let out = r
+            .mathfunc_arith_c("(int(sqrt($1)) + 1)")
+            .expect("lowers");
+        assert!(out.contains("sqrt((double)("), "{out}");
+        assert!(out.contains("_sh_argv[1]"), "{out}");
+        assert!(out.contains("(long long)("), "{out}");
+        assert!(out.contains("1LL"), "{out}");
+        // refuse > guess: the ops whose runtime semantics diverge
+        assert!(r.mathfunc_arith_c("a % 2").is_none(), "fmod refused");
+        assert!(r.mathfunc_arith_c("a && b").is_none(), "&& refused");
+        assert!(r.mathfunc_arith_c("a ? b : c").is_none(), "ternary refused");
+        assert!(r.mathfunc_arith_c("x=5").is_none(), "assignment refused");
+        assert!(r.mathfunc_arith_c("i++").is_none(), "increment refused");
+        assert!(r.mathfunc_arith_c("arr[1]").is_none(), "subscript refused");
+        assert!(r.mathfunc_arith_c("$?").is_none(), "$? refused");
+        assert!(r.mathfunc_arith_c("unknownfn(2)").is_none(), "unknown call refused");
+    }
+
     fn phase3_numeric_var_declares_numeric() {
         // Numeric vars get immediate C numeric types — no pointer involved
         let mut r = Render::default();
