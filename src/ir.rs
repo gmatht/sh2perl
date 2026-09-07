@@ -1047,7 +1047,6 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             .find(|(i, _)| *i == idx)
             .map(|(_, l)| *l);
         let before = body.len();
-        eprintln!("PROBE shir_to_perl emit stmt = {stmt:?}");
         emit_stmt(&mut body, stmt, 0);
         if let Some(l) = line {
             // a SHORT comment at the end of the statement's first line:
@@ -2318,9 +2317,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             elsifs,
             else_,
         } => {
-            eprintln!("PROBE emit_stmt If cond = {cond:?}");
             let cond_str = ir_expr_to_perl(cond);
-            eprintln!("PROBE emit_stmt If cond_str = {cond_str:?}");
             emit_indent(out, indent);
             out.push_str(&format!("if ({}) {{\n", cond_str));
             for s in then {
@@ -6644,7 +6641,7 @@ const SH_RUN_EXT_PREAMBLE: &str = r#"# __SH_RUN_EXT_BEGIN (UU-FFI.md external-co
 my $__SH_UU = 0;
 my $__SH_UU_FFI;
 our $__sh_uu_rc = 0;
-my %__SH_UU_OK = map { $_ => 1 } qw(cat wc ls sort sed awk grep);
+my %__SH_UU_OK = map { $_ => 1 } qw(cat wc ls sort sed awk grep date sha256sum uname basename dirname cp);
 BEGIN {
     my @cand;
     push @cand, $ENV{SH2_UU_LIB} if defined $ENV{SH2_UU_LIB};
@@ -7873,9 +7870,9 @@ mod tests {
 
     /// The pid_tempfile shape (examples/pid_tempfile.sh): the redirect
     /// target is a getVar (`> "$tmpf"`) and the cat/rm reads go through
-    /// the generator emulation — they must read the LIVE `my $tmpf`
+    /// the bash -c — the LIVE `my $tmpf` propagates to every consumer:
     /// (`${tmpf}`), not `$ENV{tmpf}` (never populated; the value lives in
-    /// the preamble local).
+    /// export the local into the child env (never a stale/self ENV read).
     #[test]
     fn redirect_var_target_and_emulated_reads() {
         let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
@@ -7889,15 +7886,27 @@ mod tests {
             regex::Regex::new(r#"\$ENV\{__sh2_rd\d+\} = \$tmpf;"#)
                 .unwrap()
                 .is_match(&perl),
-            "var target bound from the live local: {perl}"
+            "redirect target bound from the live local: {perl}"
+        );
+        // the emulated reads (cat/rm) export the LIVE local into the
+        // child's env before the bash -c — a self-export
+        // ($ENV{tmpf} = $ENV{tmpf}) would propagate an UNSET value.
+        // (The original test pinned the deleted legacy generator's native
+        // `open my $fh, '<', …` cat emulation; the propagation contract
+        // it guarded — the live local reaching every consumer — is
+        // unchanged.)
+        assert!(
+            perl.contains("$ENV{tmpf} = $tmpf;"),
+            "emulated read exports the live local: {perl}"
         );
         assert!(
-            perl.contains("open my $fh, '<', \"${tmpf}\""),
-            "cat reads the live local: {perl}"
-        );
-        assert!(
-            !perl.contains("$ENV{tmpf}"),
+            !perl.contains("$ENV{tmpf} = $ENV{tmpf}"),
             "no stale ENV read: {perl}"
+        );
+        // the bash text reads the exported slot, not a literal path.
+        assert!(
+            perl.contains(r#"q{'cat' "$tmpf"}"#),
+            "cat reads the exported slot: {perl}"
         );
     }
 

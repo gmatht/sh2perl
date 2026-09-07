@@ -7140,7 +7140,19 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     );
     let mut int_vars = HashSet::new();
     let mut slots: HashMap<String, usize> = HashMap::new();
-    for v in &assigned {
+    // VERDICT-PRIOR FLIP (docs/arith-homes.md §mechanism 1): the prior is
+    // Unknown-as-WIDE. Every NUMERIC var not PROVEN within ±2^53
+    // escalates — including untracked writes (read/getopts/dynamic
+    // setVar shapes the walk misses) — instead of the old
+    // Unknown-as-Number prior (only `assigned`-tracked vars escalated;
+    // an untracked numeric var stayed a Number and rounded). The proof
+    // layer (the loop fixpoints + numeric-lift) still decides which vars
+    // PROVE narrow; everything else takes the exact home. The dual-loop
+    // guard keeps the hot loops on the Number arm.
+    let numeric = numeric_lift_vars(prog);
+    let mut candidates: HashSet<String> = assigned.clone();
+    candidates.extend(numeric.iter().cloned());
+    for v in &candidates {
         let safe = ranges.get(v).is_some_and(|&(lo, hi)| lo >= -SAFE_NUMBER && hi <= SAFE_NUMBER);
         if safe {
             continue;
@@ -18516,16 +18528,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Str(sv, _) => bigint_lit_expr(
                         sv.trim().parse::<i64>().unwrap_or(0),
                     ),
-                    // other sources (getVar of another var, captures)
-                    // don't occur for self-RMW chains; a BigInt coercion
-                    // of the generic expr keeps the slot exact
-                    other => Expr::CallExpression {
-                        callee: Box::new(Expr::Identifier {
-                            name: "BigInt".to_string(),
-                        }),
-                        arguments: vec![expr_to_estree(other)],
-                        optional: false,
-                    },
+                    // other sources (getVar of another var, captures,
+                    // the for-loop slot sync's string items) coerce via
+                    // sh2.toI64 — bash-faithful (BigInt("a") would throw
+                    // where bash's $((x)) gives 0)
+                    other => sh2_call_estree(
+                        "toI64",
+                        vec![expr_to_estree(other)],
+                    ),
                 };
                 return Some(Stmt::ExpressionStatement {
                     expression: Expr::AssignmentExpression {
@@ -18545,7 +18555,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         if var_type_of(&target.var)
                             == Some(IrType::Int64)
                         {
-                            bigint_wrap_as_intn(inner)
+                            // asIntN REQUIRES a BigInt — the wrapped sum
+                            // may still contain Number-coerced operands
+                            // (mixed verdicts: a non-escalated store read
+                            // renders `Number(sh2.vars.x ?? …) || 0`).
+                            // BigInt(Number) is the safety net; under the
+                            // flipped verdicts the operands are already
+                            // BigInt and BigInt(BigInt) is idempotent.
+                            // (064_10_nested_function_definitions: the
+                            // bare asIntN(Number-sum) threw
+                            // "Cannot convert 0 to a BigInt".)
+                            bigint_wrap_as_intn(Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "BigInt".to_string(),
+                                }),
+                                arguments: vec![inner],
+                                optional: false,
+                            })
                         } else {
                             inner
                         }
@@ -18591,28 +18617,51 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         // fixpoint accepts the getVar positional family):
                         // the native read (`sh2.positional[i] ?? ""`,
                         // `.join(" ")`) — the exact value the runtime's
-                        // getVar yields
-                        _ => expr_to_estree(expr),
+                        // getVar yields. BOUNDARY-EXACT BINDING (the
+                        // verdict-prior flip's twin): an Int64 target
+                        // coerces the string at the BINDING — sh2.toI64
+                        // parses the digits exactly (past 2^53) and
+                        // coerces empty/non-numeric to 0n, where the
+                        // arith-time BigInt(<raw string>) would throw.
+                        _ => {
+                            let src = expr_to_estree(expr);
+                            if var_type_of(&target.var) == Some(IrType::Int64) {
+                                sh2_call_estree("toI64", vec![src])
+                            } else {
+                                src
+                            }
+                        }
                     },
                     // string-lifted capture source: `x=$(cmd)` →
                     // `x = await sh2.capture(...)` (or the native
                     // echo/tr/cat/sort/... capture lifts) — the runtime
                     // capture always yields a string, exactly the setVar
-                    // path minus the store write + dispatch.
+                    // path minus the store write + dispatch. Same
+                    // boundary-exact Int64 binding as the positional arm.
                     IrExpr::Call { func, args } if func == "capture" => {
-                        expr_to_estree(&IrExpr::Call {
+                        let src = expr_to_estree(&IrExpr::Call {
                             func: func.clone(),
                             args: args.clone(),
-                        })
+                        });
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            sh2_call_estree("toI64", vec![src])
+                        } else {
+                            src
+                        }
                     }
                     // the first-class Capture node (core request
                     // zsh-sh-go-20260814-230503) — same runtime lowering
                     // as the legacy call form above.
                     IrExpr::Capture { expr, .. } => {
-                        expr_to_estree(&IrExpr::Call {
+                        let src = expr_to_estree(&IrExpr::Call {
                             func: "capture".to_string(),
                             args: vec![expr.as_ref().clone()],
-                        })
+                        });
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            sh2_call_estree("toI64", vec![src])
+                        } else {
+                            src
+                        }
                     }
                     // the for-loop numeric coercion (`i = Number(i)`)
                     IrExpr::Call { func, args } if func == "Number" => match args.as_slice() {
@@ -19423,6 +19472,10 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
+            if std::env::var("SH2_PROBE").is_ok() {
+                eprintln!("PROBE For var={var} slot={:?} lifted_num={} lifted={}", slot_var_index(var), is_lifted_num(var), is_lifted(var));
+                eprintln!("PROBE slots map = {:?}", TRUE64_SLOTS.lock().unwrap());
+            }
             // The `seq_range_for` transform's native-range iterable (a
             // bare `Range{lo,hi}`): the loop lowers to a native JS
             // `for (let i = lo; i <= hi; i++)` — no runtime call, no item
@@ -19432,7 +19485,27 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // integers.
             let range = for_range_bounds(iter);
             let mut coercion: Option<IrStmt> = None;
-            if is_lifted_num(var) {
+            if let Some(_k) = slot_var_index(var) {
+                // `--true64` slot-homed loop var: the per-iteration
+                // coercion IS the slot sync — the Assign lift's slot arm
+                // writes `__t64[k] = BigInt(Number(item))` (numeric
+                // coercion like the lifted-num `i = Number(i)`; the slot
+                // is the home — the module binding never sees the item).
+                // Without this the for-of items never reach the slot and
+                // every body read sees 0 (002_control_flow's `Number: 0`).
+                coercion = Some(IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: var.clone(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "Number".to_string(),
+                        args: vec![IrExpr::Ident(js_var.clone())],
+                    },
+                    asm: None,
+                });
+            } else if is_lifted_num(var) {
                 if range.is_some() {
                     // the native counter binding is a NUMBER from the
                     // `let i = lo` init — no per-iteration coercion (the
@@ -19455,7 +19528,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         asm: None,
                     });
                 }
-            } else if !is_lifted(var) {
+} else if !is_lifted(var) {
                 // store sync (non-lifted loop var)
                 coercion = Some(IrStmt::Assign {
                     targets: vec![AssignTarget {
@@ -19560,7 +19633,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // value, exactly like bash) + ONE post-loop write.
                     let mut sync_elim: Option<Vec<Stmt>> = None;
                     if let Some(sync) = &coercion {
+                        // a slot-homed var's coercion is the SLOT sync
+                        // (the Assign lift writes __t64[k]) — the store
+                        // sync-elim would replace it with the temp write +
+                        // a post-loop setVar to the STORE (the slot would
+                        // never see the items — 002_control_flow).
                         let is_store_sync = !is_lifted(var)
+                            && slot_var_index(var).is_none()
                             && matches!(sync, IrStmt::Assign { targets, .. }
                                 if targets.len() == 1 && targets[0].var == *var);
                         if is_store_sync && forof_sync_elim_ok(&body_e[1..], var) {
@@ -19612,6 +19691,29 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         return Some(persist_block(Box::new(move |b2| {
                             native_range_for(js_var2, lo, hi, b2)
                         })));
+                    }
+                    // `--true64` slot-homed loop var: the body's reads go
+                    // to `__t64[k]` — sync the counter into the slot every
+                    // iteration (the Assign lift's slot arm renders
+                    // `__t64[k] = BigInt(<counter>)`; BigInt is idempotent
+                    // for the int64-literal counter). Without this every
+                    // body read sees 0 (002_control_flow's `Number: 0` ×5).
+                    if slot_var_index(var).is_some() {
+                        let mut body2: Vec<Stmt> = Vec::new();
+                        let slot_sync = IrStmt::Assign {
+                            targets: vec![AssignTarget {
+                                var: var.clone(),
+                                sigil: None,
+                                indices: vec![],
+                            }],
+                            expr: IrExpr::Ident(js_var.clone()),
+                            asm: None,
+                        };
+                        if let Some(st) = stmt_to_estree(&slot_sync) {
+                            body2.push(st);
+                        }
+                        body2.extend(body_e.iter().cloned());
+                        return Some(native_range_for(js_var.clone(), lo, hi, body2));
                     }
                     return Some(native_range_for(js_var.clone(), lo, hi, body_e));
                 }
@@ -19667,7 +19769,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // loop is worth 10k call sites in runtime terms.
                     let mut sync_elim: Option<(Vec<Stmt>, String)> = None;
                     if let Some(sync) = &coercion {
+                        // a slot-homed var's coercion is the SLOT sync
+                        // (the Assign lift writes __t64[k]) — the store
+                        // sync-elim would replace it with the temp write +
+                        // a post-loop setVar to the STORE (the slot would
+                        // never see the items — 002_control_flow).
                         let is_store_sync = !is_lifted(var)
+                            && slot_var_index(var).is_none()
                             && matches!(sync, IrStmt::Assign { targets, .. }
                                 if targets.len() == 1 && targets[0].var == *var);
                         if is_store_sync && forof_sync_elim_ok(&body_e[1..], var) {
@@ -34183,6 +34291,24 @@ fn native_store_read(name: &str) -> Expr {
     }
 }
 
+/// `sh2.<name>(<args>)` — a runtime-namespace call expression.
+fn sh2_call_estree(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "sh2".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: args,
+        optional: false,
+    }
+}
+
 /// `sh2.vars.<name>` — the runtime's plain-object store property.
 fn store_member(name: &str) -> Expr {
     Expr::MemberExpression {
@@ -34445,6 +34571,21 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         },
         IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
         IrExpr::Call { func, args } => {
+            // JS-builtin numeric coercions are NATIVE JS calls — the
+            // runtime namespace has no Number member, and every
+            // `sh2.Number(...)` render was a latent TypeError (the
+            // true64 slot-sync's Number(item) crashed on it).
+            if func == "Number" {
+                if let [arg] = args.as_slice() {
+                    return Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "Number".to_string(),
+                        }),
+                        arguments: vec![expr_to_estree(arg)],
+                        optional: false,
+                    };
+                }
+            }
             // `f args...` — a call to a PROVABLY-SYNC script-defined
             // function with await-free call-site args (see
             // [`SYNC_FN_CALLS`] / `try_native_fn_call`): the sync
