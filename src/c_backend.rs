@@ -270,6 +270,13 @@ pub struct Render {
     lifted_fns: BTreeMap<String, usize>,
     /// the current lifted fn's param idents (_p1..) during its body render
     cur_params: Vec<String>,
+    /// argv-touching lines emitted OUTSIDE any function body (main's own
+    /// positional/\$0/\$@/\$# reads — a non-lifted fn's argv is call-scoped
+    /// and a lifted fn's is _pN). Zero ⇒ main needs no argv at all.
+    argv_reads: usize,
+    /// inside emit_runtime — the runtime helpers' own _sh_argv text
+    /// (save/restore in _sh_call_fn) must not count as a top-level read
+    in_runtime: bool,
     /// the actual helper ids (the seq counter interleaves sites and caps)
     site_ids: Vec<usize>,
     cap_ids: Vec<usize>,
@@ -403,6 +410,14 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
 
 impl Render {
     fn emit(&mut self, s: &str) {
+        if !self.in_function
+            && !self.in_runtime
+            && !s.trim_start().starts_with("static")
+            && (s.contains("_sh_argv") || s.contains("_sh_argc"))
+        {
+            // a top-level argv read — main() must receive the real argv
+            self.argv_reads += 1;
+        }
         if s == "_sh_reset();" {
             // a new command buffer starts — shell-text assignments from
             // the previous one no longer own their vars
@@ -1133,7 +1148,10 @@ impl Render {
             self.emit("      close(outfd[0]); close(outfd[1]);");
             self.emit("      if (!last) { close(pfd[0]); dup2(pfd[1], 1); close(pfd[1]); }");
             self.emit("      if (prev >= 0) { dup2(prev, 0); close(prev); }");
-            self.emit("      if (st[i].fn) { st[i].fn(); fflush(stdout); _exit(_sh_rc); }");
+            // the stage's status is UNOBSERVABLE (the pipeline's rc is
+            // the last stage's; PIPESTATUS readers keep the bash text) —
+            // a plain 0, so _sh_rc stays dead when nothing reads it
+            self.emit("      if (st[i].fn) { st[i].fn(); fflush(stdout); _exit(0); }");
             self.emit("      execvp(st[i].argv[0], st[i].argv);");
             self.emit("      _exit(127);");
             self.emit("    }");
@@ -10889,7 +10907,9 @@ impl Render {
         // includes, runtime helpers, the global var decls, then the
         // site/capture helpers (definition-before-use: main + functions
         // call them), the sh2.* stubs (should be none), main.
+        self.in_runtime = true;
         self.emit_runtime();
+        self.in_runtime = false;
         self.out.extend(decl_out.iter().cloned());
         self.emit("");
         // forward declarations: a capture body may call a site and a
@@ -10970,15 +10990,27 @@ impl Render {
         if !fn_out.is_empty() {
             self.emit("");
         }
-        self.emit("int main(int _mac, char **_mav) {");
-        if self.need_sh {
-            // real argv for $0 / positional params (function-call
-            // emulation saves/restores _sh_argv around its own sites)
+        // the prototype follows the PROOF: zero top-level argv reads ⇒
+        // int main(void), no init. With argv reads and no script var
+        // shadowing the names, the conventional prototype; the underscore
+        // form only when a script var named argc/argv would shadow the
+        // params inside main.
+        let argc_shadowed = self.store.contains("argc") || self.store.contains("argv");
+        if self.argv_reads == 0 {
+            self.emit("int main(void) {");
+        } else if !argc_shadowed {
+            self.emit("int main(int argc, char **argv) {");
+            self.emit("  _sh_argc = argc; _sh_argv = argv;");
+        } else {
+            self.emit("int main(int _mac, char **_mav) {");
             self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+        }
+        if self.need_sh {
             // bash seeds HOSTNAME itself — the gate env may not carry it
-            // (064_21: ${HOSTNAME:-localhost} took the default)
+            // (064_21: ${HOSTNAME:-localhost} took the default).
             // extern decl inline: the runtime trimmer may drop
-            // <unistd.h> when nothing else needs it
+            // <unistd.h> when nothing else needs it.
+            // (Kept/removed per actual reads by trim_main_prologue.)
             self.emit("  if (!getenv(\"HOSTNAME\")) { extern int gethostname(char *, size_t); static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
             // bash also seeds BASH_VERSION — a script probing
             // `${BASH_VERSION-}` asks "am I bash?" and the transpiled
