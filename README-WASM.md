@@ -125,7 +125,7 @@ the same parsing/transpiling code:
 | Artifact | Role | Entry | Use |
 |---|---|---|---|
 | `target/wasm32-wasip1/release/otranspilerl-cli.wasm` | WASI **command** | `_start` | `wasmtime run --dir . otranspilerl-cli.wasm file --perl script.sh` (also `file --estree`, `parse`, `lex`, ...) |
-| `target/wasm32-wasip1/release/debashl.wasm` | WASM **library** | `_initialize` | instantiate and call `debashc_to_perl` / `debashc_to_estree` / `debashc_lex` / `debashc_version` (plain C ABI, no JS glue) |
+| `target/wasm32-wasip1/release/debashl.wasm` | WASM **library** | `_initialize` | instantiate and call `otranspilerl-cli_to_perl` / `otranspilerl-cli_to_estree` / `otranspilerl-cli_lex` / `otranspilerl-cli_version` (plain C ABI, no JS glue) |
 
 Build with:
 
