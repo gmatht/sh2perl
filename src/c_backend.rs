@@ -250,6 +250,8 @@ pub struct Render {
     /// the script READS \\$PIPESTATUS — pipeline sites must export the
     /// stage statuses (env-import) so the reads see them
     need_pipestatus: bool,
+    /// a pipeline lowered to the NATIVE fork/exec engine (_sh_pipeline)
+    need_pipeline: bool,
     /// NATIVE statements deferred to AFTER the enclosing site's
     /// system() call — a native mapfile reading a FIFO must run once the
     /// child (which spawns the FIFO writer) has started, not before it
@@ -258,6 +260,9 @@ pub struct Render {
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
     cap_bodies: Vec<String>,
+    /// native pipeline builtin-stage thunks (`static void _sh_stgN_M(void) {...}`)
+    stage_thunks: Vec<String>,
+    thunk_names: Vec<String>,
     /// the actual helper ids (the seq counter interleaves sites and caps)
     site_ids: Vec<usize>,
     cap_ids: Vec<usize>,
@@ -1066,6 +1071,77 @@ impl Render {
             self.emit("  return d;");
             self.emit("}");
             self.emit("");
+        if self.need_pipeline {
+            // Native pipeline engine: argv stages exec() directly (no
+            // bash, no command-text quoting); builtin stages fork a
+            // child that runs the transpiled builtin and _exits with its
+            // rc. The last stage's stdout is captured (trailing newlines
+            // stripped — the same semantics as _sh_capture) and _sh_rc
+            // is the LAST stage's status (bash pipeline semantics).
+            self.emit("/* native pipeline: argv stages (exec'd) + builtin thunks (forked) */");
+            self.emit("typedef struct { char **argv; void (*fn)(void); } _sh_stage;");
+            self.emit("static char *_sh_pipeline(_sh_stage *st, int n, char *buf, size_t cap) {");
+            self.emit("  int outfd[2]; pid_t pids[64]; int np = 0; int prev = -1;");
+            self.emit("  if (pipe(outfd) != 0) { buf[0] = 0; _sh_rc = 127; return buf; }");
+            self.emit("  for (int i = 0; i < n; i++) {");
+            self.emit("    int pfd[2]; int last = (i == n - 1);");
+            self.emit("    if (!last && pipe(pfd) != 0) break;");
+            self.emit("    fflush(stdout); fflush(stderr);");
+            self.emit("    pid_t pid = fork();");
+            self.emit("    if (pid < 0) break;");
+            self.emit("    if (pid == 0) {");
+            self.emit("      if (last) { dup2(outfd[1], 1); }");
+            self.emit("      close(outfd[0]); close(outfd[1]);");
+            self.emit("      if (!last) { close(pfd[0]); dup2(pfd[1], 1); close(pfd[1]); }");
+            self.emit("      if (prev >= 0) { dup2(prev, 0); close(prev); }");
+            self.emit("      if (st[i].fn) { st[i].fn(); fflush(stdout); _exit(_sh_rc); }");
+            self.emit("      execvp(st[i].argv[0], st[i].argv);");
+            self.emit("      _exit(127);");
+            self.emit("    }");
+            self.emit("    if (np < 64) pids[np++] = pid;");
+            self.emit("    if (prev >= 0) close(prev);");
+            self.emit("    if (!last) { close(pfd[1]); prev = pfd[0]; }");
+            self.emit("  }");
+            self.emit("  close(outfd[1]);");
+            self.emit("  if (prev >= 0) close(prev);");
+            self.emit("  size_t gn = 0; ssize_t r2;");
+            self.emit("  while (gn < cap - 1 && (r2 = read(outfd[0], buf + gn, cap - 1 - gn)) > 0) gn += (size_t)r2;");
+            self.emit("  buf[gn] = 0; close(outfd[0]);");
+            self.emit("  int status = 0;");
+            self.emit("  for (int i = 0; i < np; i++) waitpid(pids[i], &status, 0);");
+            self.emit("  _sh_rc = (np == 0) ? 127 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);");
+            self.emit("  while (gn > 0 && (buf[gn - 1] == '\\n' || buf[gn - 1] == '\\r')) buf[--gn] = 0;");
+            self.emit("  return buf;");
+            self.emit("}");
+            self.emit("");
+            // statement-position pipelines write the LAST stage to the
+            // program's stdout (only $() captures into a buffer)
+            self.emit("static void _sh_pipeline_out(_sh_stage *st, int n) {");
+            self.emit("  pid_t pids[64]; int np = 0; int prev = -1;");
+            self.emit("  for (int i = 0; i < n; i++) {");
+            self.emit("    int pfd[2]; int last = (i == n - 1);");
+            self.emit("    if (!last && pipe(pfd) != 0) break;");
+            self.emit("    fflush(stdout); fflush(stderr);");
+            self.emit("    pid_t pid = fork();");
+            self.emit("    if (pid < 0) break;");
+            self.emit("    if (pid == 0) {");
+            self.emit("      if (!last) { close(pfd[0]); dup2(pfd[1], 1); close(pfd[1]); }");
+            self.emit("      if (prev >= 0) { dup2(prev, 0); close(prev); }");
+            self.emit("      if (st[i].fn) { st[i].fn(); fflush(stdout); _exit(_sh_rc); }");
+            self.emit("      execvp(st[i].argv[0], st[i].argv);");
+            self.emit("      _exit(127);");
+            self.emit("    }");
+            self.emit("    if (np < 64) pids[np++] = pid;");
+            self.emit("    if (prev >= 0) close(prev);");
+            self.emit("    if (!last) { close(pfd[1]); prev = pfd[0]; }");
+            self.emit("  }");
+            self.emit("  if (prev >= 0) close(prev);");
+            self.emit("  int status = 0;");
+            self.emit("  for (int i = 0; i < np; i++) waitpid(pids[i], &status, 0);");
+            self.emit("  _sh_rc = (np == 0) ? 127 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);");
+            self.emit("}");
+            self.emit("");
+        }
             self.runtime_end = self.out.len();
             self.runtime_known = true;
         }
@@ -4382,7 +4458,12 @@ impl Render {
                     let mut hoisted: Vec<String> = Vec::new();
                     for pt in parts.iter_mut() {
                         if let Part::Arg(v, _) = pt {
-                            if v.starts_with("_cap_") && v.ends_with(")") && !v.contains(' ') {
+                            // side-effectful args: a bare _cap_N() call or
+                            // an expr embedding one / a _sh_pipeline call
+                            // (the %s null-guard would otherwise EVALUATE
+                            // the pipeline twice — C has no idea it is
+                            // not a pure read)
+                            if v.contains("_cap_") || v.contains("_sh_pipeline(") {
                                 let t = format!("_eh{}", self.temp_seq);
                                 self.temp_seq += 1;
                                 self.emit(&format!("char *{t} = {v};"));
@@ -4855,10 +4936,177 @@ impl Render {
         true
     }
 
+    /// Commands that CANNOT run via execvp (shell builtins with no
+    /// binary, or binaries whose builtin semantics differ). A pipeline
+    /// stage running one of these keeps the bash-text lowering.
+    fn execable_cmd(cmd: &str) -> bool {
+        !matches!(
+            cmd,
+            "echo" | "printf" | "read" | "readarray" | "mapfile" | "eval" | "source"
+                | "." | "wait" | "shift" | "cd" | "pushd" | "popd" | "dirs" | "jobs"
+                | "bg" | "fg" | "disown" | "trap" | "ulimit" | "umask" | "set"
+                | "unset" | "export" | "declare" | "typeset" | "local" | "return"
+                | "alias" | "bind" | "builtin" | "command" | "exec" | "exit"
+                | "logout" | "history" | "help" | "let" | "shopt" | "suspend"
+                | "hash" | "caller" | "getopts" | "times" | "fc" | "[[" | ":"
+                | "kill" | "compgen" | "complete" | "enable"
+        )
+    }
+
+    /// A pipeline lowered to the NATIVE fork/exec engine: argv stages
+    /// exec() directly (no bash, no command-text quoting — the current
+    /// text path single-quotes every word, so one-arg-per-word IS the
+    /// established semantics), echo/printf stages fork a child running
+    /// the transpiled builtin. Emits the stage setup lines; returns the
+    /// `_sh_pipeline(...)` call expression. Refuse > guess: any stage
+    /// that is not a single plain exec/builtin statement keeps the bash
+    /// text (redirects, env prefixes, chains, dynamic commands).
+    fn native_pipeline(&mut self, args: &[IrExpr], capture: bool) -> Option<String> {
+        if self.need_pipestatus {
+            return None;
+        }
+        let stages = match args.first() {
+            Some(IrExpr::Array(items)) if !items.is_empty() => items,
+            _ => return None,
+        };
+        let pid = self.temp_seq;
+        self.temp_seq += 1;
+        let mut specs: Vec<String> = Vec::new();
+        let mut decls: Vec<String> = Vec::new();
+        for (i, st) in stages.iter().enumerate() {
+            let IrExpr::Arrow(stmts) = st else {
+                return None;
+            };
+            let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() else {
+                return None;
+            };
+            if !matches!(func.as_str(), "exec" | "builtin") {
+                return None;
+            }
+            let cmd = Self::str_arg(cargs, 0)?;
+            let words: Vec<IrExpr> = match cargs.get(1) {
+                Some(IrExpr::Array(items)) => items.clone(),
+                _ => vec![],
+            };
+            if cmd == "echo" || cmd == "printf" {
+                // builtin stage: fork-render the transpiled builtin (the
+                // native echo/printf where possible, a _sh_site_N bash
+                // call otherwise — both write the child's stdout = pipe).
+                // Scratch-render first: a stage that needs PIPESTATUS
+                // state-import machinery keeps the bash text.
+                let saved = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
+                let expr = self.exec_call(cargs);
+                let body_lines = std::mem::replace(&mut self.out, saved);
+                self.depth = saved_depth;
+                let fname = format!("_stg{pid}_{i}");
+                let mut thunk = format!("static void {fname}(void) {{\n");
+                for l in &body_lines {
+                    thunk.push_str(l);
+                    thunk.push('\n');
+                }
+                thunk.push_str(&format!("  {expr};\n}}\n"));
+                self.stage_thunks.push(thunk);
+                self.thunk_names.push(fname.clone());
+                specs.push(format!("{{0, {fname}}}"));
+            } else if Self::execable_cmd(&cmd) {
+                let arr = format!("_a{pid}_{i}");
+                let mut parts = vec![Self::cstr(&cmd)];
+                let mut globbed = false;
+                for w in &words {
+                    let v = self.value_c(w);
+                    // a glob word (the \x01SH2GLOB\x01 marker — value_c
+                    // emits it ESCAPED into the C literal) relies on the
+                    // child bash to expand — native argv has no shell:
+                    // refuse the stage (keeps the bash text)
+                    if v.contains("SH2GLOB") {
+                        globbed = true;
+                    }
+                    parts.push(v);
+                }
+                if globbed {
+                    return None;
+                }
+                parts.push("0".into());
+                decls.push(format!("char *{arr}[] = {{{}}};", parts.join(", ")));
+                specs.push(format!("{{{arr}, 0}}"));
+            } else {
+                return None;
+            }
+        }
+        self.need_pipeline = true;
+        self.need_sh = true;
+        for d in &decls {
+            self.emit(d);
+        }
+        let sp = format!("_sp{pid}");
+        self.emit(&format!(
+            "_sh_stage {sp}[] = {{{}}};",
+            specs.join(", ")
+        ));
+        if capture {
+            let buf = format!("_pipe{pid}");
+            self.emit(&format!("static char {buf}[65536];"));
+            Some(format!(
+                "_sh_pipeline({sp}, {}, {buf}, sizeof {buf})",
+                stages.len()
+            ))
+        } else {
+            // statement position: the last stage writes to stdout
+            Some(format!("(_sh_pipeline_out({sp}, {}), _sh_rc == 0)", stages.len()))
+        }
+    }
+
     /// `$(...)` / `` `...` `` — register a capture site and return the
     /// call expression. The site's command text is built in its own
     /// private buffers (nested captures can't clobber it).
     fn capture_call(&mut self, args: &[IrExpr]) -> String {
+        // `$(a | b | c)` — the capture body is exactly one pipeline:
+        // the ShIR Pipeline statement, the Call-form pipeline, or the
+        // Array-of-Arrows re-wrap — lower to the native fork/exec engine
+        // (the value is the last stage's stdout, trailing newlines
+        // stripped — the same semantics as _sh_capture).
+        let pipeline_stages: Option<Vec<Vec<IrStmt>>> = match args {
+            [IrExpr::Arrow(stmts)] => match stmts.as_slice() {
+                [IrStmt::Pipeline { stages, .. }] => Some(stages.clone()),
+                [IrStmt::Expr(IrExpr::Call { func, args: pargs })] if func == "pipeline" => {
+                    match pargs.first() {
+                        Some(IrExpr::Array(items)) => Some(
+                            items
+                                .iter()
+                                .map(|x| match x {
+                                    IrExpr::Arrow(st) => st.clone(),
+                                    _ => vec![],
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            [IrExpr::Array(items)]
+                if !items.is_empty() && items.iter().all(|x| matches!(x, IrExpr::Arrow(_))) =>
+            {
+                Some(
+                    items
+                        .iter()
+                        .map(|x| match x {
+                            IrExpr::Arrow(st) => st.clone(),
+                            _ => vec![],
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        if let Some(stages) = pipeline_stages {
+            let arr = IrExpr::Array(stages.into_iter().map(IrExpr::Arrow).collect());
+            if let Some(v) = self.native_pipeline(&[arr], true) {
+                return v;
+            }
+        }
         // `$(fn args…)` of a shell function DEFINED in this program:
         // lower to the in-process call + stdout capture (the fnValue
         // dispatch → `_sh_capture_fn`). The bash shell-out can NEVER run
@@ -7229,6 +7477,9 @@ impl Render {
                     self.site_ids.push(id);
                     self.need_sh = true;
                     return format!("_sh_site_{id}()");
+                }
+                if let Some(v) = self.native_pipeline(&args, false) {
+                    return v;
                 }
                 self.shell_site(
                     |r| {
@@ -10493,6 +10744,12 @@ impl Render {
         for id in &site_ids {
             self.emit(&format!("static int _sh_site_{id}(void);"));
         }
+        // native pipeline builtin-stage thunks: the setup lines call
+        // them before the definitions below
+        let thunk_names = std::mem::take(&mut self.thunk_names);
+        for n in &thunk_names {
+            self.emit(&format!("static void {n}(void);"));
+        }
         // forward declarations for the sh2.* stubs: the capture/site
         // helpers call them BEFORE the stub definitions below — without
         // a prototype the implicit int() decl clashes with the long long
@@ -10515,6 +10772,13 @@ impl Render {
             || !sh2_names.is_empty()
             || !fn_fwd.is_empty()
         {
+            self.emit("");
+        }
+        let stage_thunks = std::mem::take(&mut self.stage_thunks);
+        for b in &stage_thunks {
+            for line in b.lines() {
+                self.emit(line);
+            }
             self.emit("");
         }
         let cap_bodies = std::mem::take(&mut self.cap_bodies);
