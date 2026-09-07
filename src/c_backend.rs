@@ -289,6 +289,9 @@ pub struct Render {
     const_digits: std::cell::Cell<bool>,
     /// (const mode) an inline $# read was rendered → argc needed
     const_hash: std::cell::Cell<bool>,
+    /// statement-position expr: the value is DISCARDED (the `, 1`
+    /// chain-verdict tail of the native echo is pointless there)
+    value_discarded: bool,
     /// the actual helper ids (the seq counter interleaves sites and caps)
     site_ids: Vec<usize>,
     cap_ids: Vec<usize>,
@@ -406,6 +409,19 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // helper, no fn-call status), the stores are unobservable dead
     // code — strip them and the definition.
     r.strip_dead_rc();
+    // the discarded-value echo collapsed to `(printf(...));` /
+    // `(fputs(...));` — drop OUR comma-expr wrapper parens (safe: these
+    // prefixes are never a cast/declaration at statement position).
+    // Runs AFTER strip_dead_rc so the stripper sees the `_sh_rc = 0`
+    // store in its group context first.
+    for line in r.out.iter_mut() {
+        let t = line.trim_start();
+        if (t.starts_with("(printf(") || t.starts_with("(fputs(")) && t.ends_with(");")
+        {
+            let indent = &line[..line.len() - t.len()];
+            *line = format!("{}{};", indent, &t[1..t.len() - 2]);
+        }
+    }
     // Only keep `#include`s whose symbols actually appear in the
     // emitted program (after the runtime trim removed helpers).
     r.trim_includes();
@@ -430,27 +446,32 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
 
 impl Render {
     fn emit(&mut self, s: &str) {
+        // `(printf(...));` / `(fputs(...));` — the discarded-value echo
+        // after strip_dead_rc; the outer parens are our comma-expr
+        // wrapper (never a cast/declaration at statement position for
+        // these two prefixes) → drop them
+        let s2: &str = s;
         if !self.in_function
             && !self.in_runtime
-            && !s.trim_start().starts_with("static")
+            && !s2.trim_start().starts_with("static")
         {
             // a top-level argv read — main() must receive what it reads
-            if s.contains("_sh_argv") {
+            if s2.contains("_sh_argv") {
                 self.argvptr_reads += 1;
             }
-            if s.contains("_sh_argc") {
+            if s2.contains("_sh_argc") {
                 self.argc_reads += 1;
             }
         }
-        if s == "_sh_reset();" {
+        if s2 == "_sh_reset();" {
             // a new command buffer starts — shell-text assignments from
             // the previous one no longer own their vars
             self.shell_assigned.clear();
         }
-        if s.is_empty() {
+        if s2.is_empty() {
             self.out.push(String::new());
         } else {
-            self.out.push(format!("{}{}", "    ".repeat(self.depth), s));
+            self.out.push(format!("{}{}", "    ".repeat(self.depth), s2));
         }
     }
 
@@ -4340,6 +4361,7 @@ impl Render {
                     cargs.push(self.param_call(args));
                 }
                 HdSeg::Arith(a) => {
+                    if std::env::var("SH2_DBG_POS2").is_ok() { eprintln!("DBG HdSeg::Arith"); }
                     fmt.push_str("%lld");
                     // the arith() expression may be plain-int C — the
                     // varargs promotion needs an explicit long long
@@ -4729,7 +4751,13 @@ impl Render {
                     self.need_sh = true;
                     // value 1: the chain peel publishes the verdict from
                     // this expr — a trailing `_sh_rc = 0` would make the
-                    // comma value 0 (falsy) and flip every `echo && …`
+                    // comma value 0 (falsy) and flip every `echo && …`.
+                    // In statement position the value is discarded: the
+                    // `, 1` goes (and strip_dead_rc drops the rc write
+                    // when nothing reads $?, leaving bare printf).
+                    if self.value_discarded {
+                        return format!("({p}, _sh_rc = 0)");
+                    }
                     return format!("({p}, _sh_rc = 0, 1)");
                 }
                 self.shell_exec(args)
@@ -8643,10 +8671,12 @@ impl Render {
                 if func == "getVar" {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         if name == "?" {
-                            return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%lld", true))];
+                            // _sh_rc is an int — %d, no cast
+                            return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%d", false))];
                         }
                         if name == "#" {
-                            return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%lld", true))];
+                            // $#: (argc - 1) / (_sh_argc - 1) — int
+                            if std::env::var("SH2_DBG_POS2").is_ok() { eprintln!("DBG parts_of getVar#"); } return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%d", false))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -9438,7 +9468,12 @@ impl Render {
                     }
                     _ => {}
                 }
+                // statement position: the expr's value is discarded — the
+                // native echo drops its `, 1` chain-verdict tail here
+                let was = self.value_discarded;
+                self.value_discarded = true;
                 let x = self.expr(e);
+                self.value_discarded = was;
                 self.emit(&format!("{x};"));
             }
             IrStmt::Assign { targets, expr, .. } => {
@@ -10690,6 +10725,17 @@ impl Render {
     /// pins the vararg type to match `%lld` — the pair is always
     /// consistent, so a casted operand never meets a `%u`/`%d`.
     fn num_spec(&self, e: &IrExpr) -> NumSpec {
+        // the shell specials are ints: `$#` → (argc-1)/(_sh_argc-1),
+        // `$?` → _sh_rc, `$$` → getpid() — all int-typed C → %d, no cast
+        if let IrExpr::Call { func, args } = e {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if matches!(name.as_str(), "#" | "?" | "$") {
+                        return NumSpec::Num("%d", false);
+                    }
+                }
+            }
+        }
         let w = self.expr_width(e);
         if self.expr_type_matches(e, w) {
             NumSpec::Num(w.format(), false)
