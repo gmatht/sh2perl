@@ -1,0 +1,43 @@
+{
+  "objective": "",
+  "status": "active",
+  "steps": [
+    {
+      "id": 1,
+      "description": "Establish baseline: run fail-go corpus + dogfood app gate, capture current frontier errors",
+      "status": "inprogress",
+      "note": ""
+    },
+    {
+      "id": 2,
+      "description": "Survey every construct in go-sh.go that the go frontend cannot yet lower (continue-past-error probe)",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 3,
+      "description": "Fix go frontend so it lowers its own source to a complete, valid A1 shIR (package-call returns like shiremit.Emit/golib.Shir, and any other gaps)",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 4,
+      "description": "Pipe the dogfood A1 through debashc --shir-in-estree and verify it renders to runnable JS",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 5,
+      "description": "Verify the JS frontend produces identical output to go run on the testdata corpus + on its own source",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 6,
+      "description": "Commit progress with a clear status note",
+      "status": "pending",
+      "note": ""
+    }
+  ],
+  "notes": ""
+}

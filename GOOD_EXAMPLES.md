@@ -94,13 +94,13 @@ Before submitting, test your examples:
 
 ```bash
 # Test a specific example
-cargo run --bin debashc -- test examples/your_example.sh
+cargo run --bin otranspilerl-cli -- test examples/your_example.sh
 
 # Run all tests
-cargo run --bin debashc -- test-all
+cargo run --bin otranspilerl-cli -- test-all
 
 # Test with Perl::Critic enabled
-cargo run --bin debashc -- test-all --perl-critic
+cargo run --bin otranspilerl-cli -- test-all --perl-critic
 ```
 
 ### 10. **Example Structure Template**

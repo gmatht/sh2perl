@@ -22,14 +22,6 @@ pub mod transforms;
 
 pub mod bc;
 pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
-#[cfg(feature = "legacy-generator")]
-pub mod generator;
-// When the legacy generator is off (default), provide a tiny stub so every
-// consumer (cli, wasm, wasi, bins) still compiles; the legacy perl commands
-// degrade to a clear message instead of generating Perl.
-#[cfg(not(feature = "legacy-generator"))]
-#[path = "generator_stub.rs"]
-pub mod generator;
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees
 // (branch backend/<lang>). Each consumes the ShIR in-process and emits
@@ -51,7 +43,7 @@ pub mod lint_backend; // lint/diagnostic backend (renders analysis verdicts, not
 #[cfg(not(target_os = "wasi"))]
 pub mod wasm;
 // WASI (wasm32-wasip1) library ABI — plain C exports, see wasi_api.rs.
-// Feature-gated so the `debashc` command build stays a clean WASI command
+// Feature-gated so a WASI command build (the otranspilerl-cli bin) stays a
 // (a module exporting both `_start` and `_initialize` is neither a valid
 // command nor a valid reactor in strict runtimes like Node's node:wasi).
 #[cfg(all(target_os = "wasi", feature = "wasi-lib"))]
@@ -63,7 +55,6 @@ pub use lexer::{Lexer, Token};
 pub use parser::commands::Parser;
 pub use parser::utilities::ParserUtilities;
 
-pub use generator::Generator;
 #[cfg(test)]
 pub mod estree_debug_tests {
     use super::*;

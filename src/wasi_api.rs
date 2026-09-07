@@ -1,4 +1,4 @@
-//! WASI library ABI for debashc.
+//! WASI library ABI for sh2perl.
 //!
 //! Plain C-ABI exports (no wasm-bindgen, no JS glue) so the *same crate* can
 //! be loaded as a library from any WASI embedder: wasmtime, wasmer, Node's
@@ -6,7 +6,7 @@
 //!
 //! ## Memory contract
 //!
-//! Every `debashc_*` string export returns a pointer into WASM linear memory
+//! Every `sh2perl_*` string export returns a pointer into WASM linear memory
 //! pointing at a NUL-terminated UTF-8 buffer laid out as:
 //!
 //! ```text
@@ -14,8 +14,8 @@
 //! ^ ptr-4                     ^ returned ptr
 //! ```
 //!
-//! - `debashc_str_len(ptr)` → byte length of `data` (excludes the NUL).
-//! - `debashc_free(ptr)` → release the buffer (required for every returned ptr).
+//! - `sh2perl_str_len(ptr)` → byte length of `data` (excludes the NUL).
+//! - `sh2perl_free(ptr)` → release the buffer (required for every returned ptr).
 //!
 //! ## Results
 //!
@@ -43,7 +43,7 @@ fn alloc_string(s: &str) -> *mut u8 {
     let total = 4 + n + 1;
     let layout = Layout::from_size_align(total, 4).expect("valid layout");
     // Safety: total >= 5 so `alloc` is well-defined; the layout used here
-    // exactly matches the one reconstructed in `debashc_free`.
+    // exactly matches the one reconstructed in `sh2perl_free`.
     let ptr = unsafe { alloc(layout) };
     if ptr.is_null() {
         return null_mut();
@@ -77,17 +77,17 @@ fn err_json(e: &dyn std::fmt::Display) -> String {
 #[no_mangle]
 pub extern "C" fn _initialize() {}
 
-/// `debashc_version() -> *mut u8` — `"debashc <crate-version>"` (JSON envelope,
-/// needs `debashc_free`).
+/// `sh2perl_version() -> *mut u8` — `"sh2perl <crate-version>"` (JSON envelope,
+/// needs `sh2perl_free`).
 #[no_mangle]
-pub extern "C" fn debashc_version() -> *mut u8 {
-    alloc_string(&ok_json(concat!("debashc ", env!("CARGO_PKG_VERSION"))))
+pub extern "C" fn sh2perl_version() -> *mut u8 {
+    alloc_string(&ok_json(concat!("sh2perl ", env!("CARGO_PKG_VERSION"))))
 }
 
-/// `debashc_to_perl(input, input_len) -> *mut u8` — transpile shell → Perl.
+/// `sh2perl_to_perl(input, input_len) -> *mut u8` — transpile shell → Perl.
 /// Returns a JSON envelope; `output` holds the generated Perl source.
 #[no_mangle]
-pub extern "C" fn debashc_to_perl(input: *const u8, input_len: usize) -> *mut u8 {
+pub extern "C" fn sh2perl_to_perl(input: *const u8, input_len: usize) -> *mut u8 {
     let input = unsafe { slice::from_raw_parts(input, input_len) };
     let input = String::from_utf8_lossy(input);
     match Parser::new(&input).parse() {
@@ -99,11 +99,11 @@ pub extern "C" fn debashc_to_perl(input: *const u8, input_len: usize) -> *mut u8
     }
 }
 
-/// `debashc_to_estree(input, input_len) -> *mut u8` — shell → **standard
+/// `sh2perl_to_estree(input, input_len) -> *mut u8` — shell → **standard
 /// ESTree JSON** (the PLAN.md §1.2 contract; `sh2.*` runtime namespace).
 /// `output` holds the raw ESTree JSON document.
 #[no_mangle]
-pub extern "C" fn debashc_to_estree(input: *const u8, input_len: usize) -> *mut u8 {
+pub extern "C" fn sh2perl_to_estree(input: *const u8, input_len: usize) -> *mut u8 {
     let input = unsafe { slice::from_raw_parts(input, input_len) };
     let input = String::from_utf8_lossy(input);
     match Parser::new(&input).parse() {
@@ -115,13 +115,13 @@ pub extern "C" fn debashc_to_estree(input: *const u8, input_len: usize) -> *mut 
     }
 }
 
-/// `debashc_to_glsl(input, input_len) -> *mut u8` — shell → **GLSL ES 1.00
+/// `sh2perl_to_glsl(input, input_len) -> *mut u8` — shell → **GLSL ES 1.00
 /// render fragment** (the MIMEcroft shader pipeline): the bash program
 /// becomes a fragment shader with the frag_x/frag_y/vcolor_*/uv_*/tex_*
 /// bridges (see glsl_backend) — so the browser can compile bash-authored
 /// shaders through the otranspiler wasm, no native binary needed.
 #[no_mangle]
-pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8 {
+pub extern "C" fn sh2perl_to_glsl(input: *const u8, input_len: usize) -> *mut u8 {
     let input = unsafe { slice::from_raw_parts(input, input_len) };
     let input = String::from_utf8_lossy(input);
     match Parser::new(&input).parse() {
@@ -148,9 +148,9 @@ pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8
     }
 }
 
-/// `debashc_lex(input, input_len) -> *mut u8` — token dump (debug helper).
+/// `sh2perl_lex(input, input_len) -> *mut u8` — token dump (debug helper).
 #[no_mangle]
-pub extern "C" fn debashc_lex(input: *const u8, input_len: usize) -> *mut u8 {
+pub extern "C" fn sh2perl_lex(input: *const u8, input_len: usize) -> *mut u8 {
     let input = unsafe { slice::from_raw_parts(input, input_len) };
     let input = String::from_utf8_lossy(input);
     let mut lexer = Lexer::new(&input);
@@ -163,20 +163,20 @@ pub extern "C" fn debashc_lex(input: *const u8, input_len: usize) -> *mut u8 {
     alloc_string(&ok_json(&tokens.join("\n")))
 }
 
-/// `debashc_str_len(ptr) -> u32` — payload length in bytes (excludes NUL).
+/// `sh2perl_str_len(ptr) -> u32` — payload length in bytes (excludes NUL).
 #[no_mangle]
-pub extern "C" fn debashc_str_len(ptr: *const u8) -> u32 {
+pub extern "C" fn sh2perl_str_len(ptr: *const u8) -> u32 {
     if ptr.is_null() {
         return 0;
     }
     unsafe { u32::from_le(*(ptr.sub(4) as *const u32)) }
 }
 
-/// `debashc_free(ptr)` — release a buffer returned by a `debashc_*` export.
+/// `sh2perl_free(ptr)` — release a buffer returned by a `sh2perl_*` export.
 
 // ── otranspilerl_* — the unified ABI (all nine backends) ────────
 //
-// Same memory contract as debashc_*: every string export returns a
+// Same memory contract as sh2perl_*: every string export returns a
 // pointer to the data area of a [u32 len][data][0] buffer;
 // otranspilerl_str_len reads the len prefix, otranspilerl_free
 // releases it. otranspilerl_alloc(len) returns the data pointer of a
@@ -208,13 +208,13 @@ pub extern "C" fn otranspilerl_alloc(len: usize) -> *mut u8 {
 /// `otranspilerl_str_len(ptr)` — payload length in bytes (excludes NUL).
 #[no_mangle]
 pub extern "C" fn otranspilerl_str_len(ptr: *const u8) -> u32 {
-    debashc_str_len(ptr)
+    sh2perl_str_len(ptr)
 }
 
 /// `otranspilerl_free(ptr)` — release a buffer (result or alloc'd input).
 #[no_mangle]
 pub extern "C" fn otranspilerl_free(ptr: *mut u8) {
-    debashc_free(ptr);
+    sh2perl_free(ptr);
 }
 
 /// `otranspilerl_version() -> *mut u8` — "otranspilerl <version>" (JSON
@@ -318,7 +318,7 @@ pub extern "C" fn otranspilerl_transpile(
     }
 }
 #[no_mangle]
-pub extern "C" fn debashc_free(ptr: *mut u8) {
+pub extern "C" fn sh2perl_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }

@@ -42,7 +42,7 @@
 //! match emission.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer hooks: estree.rs replaces its local
 //! `liftLocalVars`-style analysis with the verdicts; the C/Go/Perl
 //! generators read the store-vs-local verdict instead of guessing.

@@ -1,6 +1,6 @@
 # ESTree-JSON Contract Norms
 
-Normative guarantees of the `debashc file --estree` output contract
+Normative guarantees of the `otranspilerl-cli --target estree` output contract
 (PLAN.md §1.2). Consumers: the reference executor
 (`harness/estree-gen.mjs` + `sh2-namespace.mjs`), sh2runtime (their repo),
 and any future backend (C — see `backends/c/docs/backend-c-core-needs.md`,

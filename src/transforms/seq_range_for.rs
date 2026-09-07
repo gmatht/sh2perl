@@ -32,7 +32,7 @@
 //! The transform is conservative on every point; anything doubtful keeps
 //! the runtime `captureWords` path (correct, just unoptimized).
 //!
-//! Registered in `transforms.rs` (gated by `DEBASHC_TRANSFORMS` like the
+//! Registered in `transforms.rs` (gated by `SH2_TRANSFORMS` like the
 //! rest of the registry). IR-shape changes only — the ESTree renderer
 //! consumes the `Range` iterable; the Perl corpus path (AST generator)
 //! never sees this IR.

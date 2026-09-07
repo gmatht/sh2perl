@@ -1,4 +1,4 @@
-use crate::{parser::commands::Parser, Generator, Lexer};
+use crate::{ir, parser::commands::Parser, shir, shir_passes, transforms, Lexer};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -62,13 +62,17 @@ impl Debashc {
         }
     }
 
-    /// Convert shell script to Perl
+    /// Convert shell script to Perl (the modern pipeline: parse → A1 →
+    /// shir_to_perl — the same path otranspilerl renders with).
     pub fn to_perl(&mut self, input: &str) -> Result<String, JsValue> {
         let mut parser = Parser::new(input);
         match parser.parse() {
             Ok(commands) => {
-                let generator = Generator::new();
-                Ok(generator.generate(&commands))
+                let mut prog = shir::ast_to_ir(&commands);
+                transforms::apply(&mut prog.stmts);
+                shir_passes::restructure_goto_only(&mut prog);
+                shir_passes::strip_cfor(&mut prog);
+                Ok(ir::shir_to_perl(&prog))
             }
             Err(e) => Err(JsValue::from_str(&format!("Parse error: {}", e))),
         }

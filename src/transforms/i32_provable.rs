@@ -34,7 +34,7 @@
 //! statics, read by the renderers. No structural mutation.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer hooks: estree.rs reads the verdicts for
 //! its ToInt32 lowering; the C/Go/Rust/GLSL generators for their native
 //! int typing.

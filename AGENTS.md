@@ -1,4 +1,4 @@
-# sh2perl (debashc) — Agent Guide
+# sh2perl — Agent Guide
 
 Shell-to-Perl transpiler in Rust. Parses bash to an AST and generates Perl.
 An ESTree/JSON backend is planned (see below). This repo is standalone: it
@@ -7,15 +7,18 @@ self-contained).
 
 ## Build & test
 
-- Build: `cargo build -p debashcl --bin otranspiler` (the DEFAULT
-  user-facing binary — `cargo run` runs it too; parse shell → A1 → any
-  backend, `otranspiler <input> [output] [--target L]`). `debashc`
-  remains the flag-level CLI the gates and scripts invoke.
-- Unit tests: `cargo test`
+- The user-facing CLI is `otranspilerl-cli` (the workspace crate
+  `../otranspilerl`, which statically links THIS core + every renderer):
+  `cd ../otranspilerl && cargo build --bin otranspilerl-cli`, then
+  `otranspilerl-cli <input> [<output>] [--source-lang L] [--target L]`
+  (parse shell → A1 → any backend). This repo builds as a library only:
+  `cargo build` / `cargo test --lib`.
+- Unit tests: `cargo test --lib`
 - Corpus gate: the full 517-example suite runs from the workspace harness
   (a `fail` script outside this repo); this repo only guarantees `cargo
   build`/`cargo test` pass standalone.
 - WASM demo: `bash build-wasm.sh` (wasm-pack → `www/pkg`).
+- WASI: `bash build-wasi.sh` (WASI command + library modules).
 
 ## Architecture (current)
 
@@ -24,13 +27,14 @@ self-contained).
   `docs/ir-design.md`); being generalized into a language-neutral ShIR.
   **`RawText` is a deliberate migration bridge, not a defect — keep it until
   the migration is proven.**
-- `src/generator/` — AST → IrProgram → Perl text. Style decisions live in the
-  IR backend, not the generators.
+- `src/ir.rs` also hosts the perl renderer (`shir_to_perl`); style
+  decisions live in the IR backend, not the generators.
 - `src/mir*.rs` — analysis passes (`pub mod mir` currently disabled).
 
 ## Planned: ESTree backend (not yet implemented)
 
-- Target: `debashc --estree file.sh` emits **standard ESTree JSON** with shell
+- Target: `otranspilerl-cli --target estree file.sh` emits **standard ESTree JSON**
+  with shell
   semantics lowered to calls in a documented `sh2.*` runtime namespace
   (`sh2.fs.*`, `sh2.exec`, `sh2.pipeline`, `sh2.capture`, ...). The consumer
   owns the spec (see PLAN.md in the workspace).

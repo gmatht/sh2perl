@@ -1,6 +1,6 @@
 # WASM Build and Run Script
 
-This PowerShell script (`build-and-run-wasm.ps1`) automates the process of building and running the WASM version of the debashc project.
+This PowerShell script (`build-and-run-wasm.ps1`) automates the process of building and running the WASM version of the otranspilerl-cli project.
 
 ## Prerequisites
 
@@ -96,8 +96,8 @@ sh2perl/
 ├── www/
 │   ├── index.html            # Main application page
 │   └── pkg/                  # Generated WASM files
-│       ├── debashc.js
-│       ├── debashc_bg.wasm
+│       ├── otranspilerl-cli.js
+│       ├── sh2perl_bg.wasm
 │       └── ...
 └── ...
 ```
@@ -124,7 +124,7 @@ the same parsing/transpiling code:
 
 | Artifact | Role | Entry | Use |
 |---|---|---|---|
-| `target/wasm32-wasip1/release/debashc.wasm` | WASI **command** | `_start` | `wasmtime run --dir . debashc.wasm file --perl script.sh` (also `file --estree`, `parse`, `lex`, ...) |
+| `target/wasm32-wasip1/release/otranspilerl-cli.wasm` | WASI **command** | `_start` | `wasmtime run --dir . otranspilerl-cli.wasm file --perl script.sh` (also `file --estree`, `parse`, `lex`, ...) |
 | `target/wasm32-wasip1/release/debashl.wasm` | WASM **library** | `_initialize` | instantiate and call `debashc_to_perl` / `debashc_to_estree` / `debashc_lex` / `debashc_version` (plain C ABI, no JS glue) |
 
 Build with:
@@ -139,6 +139,6 @@ runtimes (e.g. Node `node:wasi`) reject a module exporting both `_start` and
 (`wasi-lib` cargo feature, see `src/wasi_api.rs` for the memory contract and
 JSON result envelope). The library is callable from wasmtime/wasmer embedding
 APIs, Node `node:wasi`, Python `wasmtime`, C/C++, etc. — no wasm-bindgen, no
-browser glue. `debashc file --estree` / `debashc_to_estree` emit the standard
+browser glue. `otranspilerl-cli --target estree` / `sh2perl_to_estree` emit the standard
 ESTree JSON contract (PLAN.md §1.2), so sh2runtime can consume this WASI
 binary as a transpiler tool.

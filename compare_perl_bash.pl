@@ -15,10 +15,10 @@ print "=" x 60 . "\n\n";
 my ($perl_fh, $perl_file) = tempfile(SUFFIX => '.pl', UNLINK => 1);
 my ($bash_fh, $bash_file) = tempfile(SUFFIX => '.sh', UNLINK => 1);
 
-# Run debashc.exe to get the Perl code
-print "1. Generating Perl code from debashc.exe...\n";
+# Run otranspilerl-cli.exe to get the Perl code
+print "1. Generating Perl code from otranspilerl-cli.exe...\n";
 my $start_time = [gettimeofday];
-my ($perl_code, $perl_stderr, $perl_exit) = run_debashc($command);
+my ($perl_code, $perl_stderr, $perl_exit) = run_otranspilerl($command);
 my $perl_gen_time = tv_interval($start_time);
 
 if ($perl_exit != 0) {
@@ -107,10 +107,10 @@ if ($perl_output eq $bash_output && $perl_exit_code == $bash_exit_code) {
 # Cleanup
 unlink $perl_file, $bash_file;
 
-sub run_debashc {
+sub run_otranspilerl {
     my ($cmd) = @_;
     my ($stdout, $stderr);
-    my $exit_code = run(['target/debug/debashc.exe', $cmd], \$stdout, \$stderr);
+    my $exit_code = run(['../otranspilerl/target/debug/otranspilerl-cli', $cmd], \$stdout, \$stderr);
     return ($stdout, $stderr, $exit_code);
 }
 

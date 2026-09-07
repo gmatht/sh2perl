@@ -69,7 +69,7 @@ docker-compose run --rm test bash
 
 # Inside the container, you can:
 # - Build the project
-cargo build --bin debashc
+cd ../otranspilerl && cargo build --bin otranspilerl-cli
 
 # - Run tests
 bash ./fail
@@ -128,7 +128,7 @@ The container sets:
 
 - `LOCALE=C` - Consistent locale for tests
 - `LC_COLLATE=C` - Consistent collation order
-- `PATH` - Includes the built debashc binary
+- `PATH` - Includes the built otranspilerl-cli binary
 
 ## Troubleshooting
 

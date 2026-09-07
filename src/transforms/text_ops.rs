@@ -22,15 +22,15 @@ static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // text-ops is an EXPERIMENTAL lowering that changes the shIR shape
     // (pipelines/commands → ExtExpr nodes). It is opt-in ONLY: run when
-    // DEBASHC_TRANSFORMS explicitly lists "text-ops". This keeps the
+    // SH2_TRANSFORMS explicitly lists "text-ops". This keeps the
     // default corpus gate and unit tests green (the analyses and renderers
     // have conservative Ext-node defaults, but the byte-equal round-trip
     // and corpus tests still pin the UN-lowered shape).
-    let enabled = std::env::var("DEBASHC_TRANSFORMS").unwrap_or_default();
+    let enabled = std::env::var("SH2_TRANSFORMS").unwrap_or_default();
     if !enabled.split(',').any(|s| s.trim() == "text-ops") {
         return false;
     }
-    // text-ops is often exercised ALONE (DEBASHC_TRANSFORMS=text-ops) — the
+    // text-ops is often exercised ALONE (SH2_TRANSFORMS=text-ops) — the
     // worker's A/B gate. But arithmetic statements (`let "v = e"`, `((v=e))`)
     // are lowered by arith-forms, which the opt-in gate then EXCLUDES: a
     // script byte-exact at baseline would regress purely because another
@@ -2087,7 +2087,7 @@ fn try_lower_find_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
 
 /// Frontend-ingest normalisations: apply ONLY the let-condition and read
 /// lifts to an already-ingested A1 (the fish/zsh frontends emit those
-/// constructs as opaque exec calls). Runs when DEBASHC_TRANSFORMS lists
+/// constructs as opaque exec calls). Runs when SH2_TRANSFORMS lists
 /// text-ops; deliberately narrower than transform() — everything else in
 /// the ingest keeps its baseline shape.
 pub fn normalize_frontend_constructs(stmts: &mut Vec<IrStmt>) {

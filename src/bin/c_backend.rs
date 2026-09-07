@@ -3,9 +3,9 @@
 //! Compiles the C renderer IN (debashl::c_backend) and drives it directly
 //! from the parsed ShIR — no `--shir` JSON round-trip. Usage:
 //!
-//!     debashc file --shir foo.sh            # the JSON contract path (core)
+//!     otranspilerl-cli --target shir foo.sh       # the JSON contract path (core)
 //!     c_backend foo.sh                       # this: library path, in-process
-//!     debashc file --estree foo.sh | estree_to_c   # the old ESTree-JSON draft
+//!     otranspilerl-cli --target estree foo.sh | shir_render --target c   # the JSON path
 //!
 //! Debugging aid: prints the generated C to stdout.
 

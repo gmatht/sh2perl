@@ -36,7 +36,7 @@ Run `next-ideom-review` (or similar) after `./fail` and
 
 1. Finds the first script in `examples/` or `sh/` that doesn't have
    a corresponding `.md` in `ideom/`.
-2. Generates the Perl code with `debashc -i <file> -o /dev/stdout`.
+2. Generates the Perl code with `otranspilerl-cli -i <file> -o /dev/stdout`.
 3. Invokes pi with the template below to produce the review.
 4. Saves the review to `ideom/{examples|sh}/<filename>.md`.
 

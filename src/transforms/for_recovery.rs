@@ -31,7 +31,7 @@
 //! Anything else is left untouched — refuse > guess.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated, like the
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated, like the
 //! rest of the registry). Runs inside `ast_to_ir` (NOT `ast_to_ir_raw`
 //! — raw = unoptimized). The estree worker mediates the contract bit:
 //! `IrExpr::Range` is already INCLUSIVE (`start..end`), so the bound is

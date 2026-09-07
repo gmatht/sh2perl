@@ -37,7 +37,7 @@
 //! structural mutation.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer hooks: estree.rs replaces its
 //! `backgroundDecide` call with the verdicts; the C/Go/Perl generators
 //! emit fork (`&` subprocess) vs thread (worker dispatch) from the same

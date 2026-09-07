@@ -200,8 +200,8 @@ STDOUT DIFFERENCES:
 -target
 -temp
 -temp*.txt;
--temp_debashc_output_17296.txt
--temp_debashc_output_36952.txt
+-temp_otranspilerl_output_17296.txt
+-temp_otranspilerl_output_36952.txt
 -temp_dir
 -temp_file.txt
 -temp_output.txt

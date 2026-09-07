@@ -158,7 +158,7 @@ Each `echo` maps to exactly one `print` statement. The translator correctly reco
 
 ### 7. Note on Current Codebase State
 
-Running the current generator (`target/release/debashc -i examples/004_test_quoted.sh`) actually produces:
+Running the current generator (`target/release/otranspilerl-cli -i examples/004_test_quoted.sh`) actually produces:
 
 ```perl
 use feature 'say';

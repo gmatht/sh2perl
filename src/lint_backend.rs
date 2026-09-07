@@ -21,7 +21,7 @@
 //! it has no code to generate, so mutating the IR is pointless) and then
 //! aggregates. Output is deterministic and sorted so it is diff-stable.
 //!
-//! Surface it via `debashc --shir-in-lint -` (or `otranspiler x.sh
+//! Surface it via `shir_render --target lint -` (or `otranspilerl-cli x.sh
 //! --target lint`). The report is plain text on stdout; pipe through
 //! `jq` if you want machine form (a future `--lint-json` flag can emit
 //! `ctx`'s serialized verdicts directly).

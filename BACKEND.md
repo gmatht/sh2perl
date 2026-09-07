@@ -9,9 +9,9 @@ gate, and the sh2.*-usage metric for zig.
 
 ## The renderer
 
-- `src/zig_backend.rs` — `debashl::zig_backend::shir_to_zig(&IrProgram) -> String`.
+- `src/zig_backend.rs` — `sh2perl core::zig_backend::shir_to_zig(&IrProgram) -> String`.
   A crate library consuming the ShIR in-process (ask B, docs/backend-c-core-needs.md).
-- CLI entry: `debashc --shir-in-zig -` (worktree `cli/src/lib.rs`), mirroring
+- CLI entry: `shir_render --target zig -` (worktree `cli/src/lib.rs`), mirroring
   `--shir-in-perl`/`--shir-in-estree`: reads shIR JSON (file or stdin via `-`),
   `shir_json_in::shir_json_to_ir` → `shir_to_zig` → stdout.
 

@@ -24,7 +24,7 @@ everywhere) and the strong standard library (regex, glob via
 | B: Rust API | in-process only | no |
 | C: **ShIR JSON** (`--shir`) | the ask — a Java generator reads the JSON (Jackson/Gson or a small parser) + renders | **yes** |
 
-Java consumes path C: `debashc --shir > prog.json` → a generator class
+Java consumes path C: `otranspilerl-cli --target shir > prog.json` → a generator class
 renders `.java` → `javac` → `java -cp ... Main`.
 
 ## 2. Node inventory

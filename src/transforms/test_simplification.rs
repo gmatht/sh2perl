@@ -22,7 +22,7 @@
 //!
 //! ## Placement
 //! Bundle for run_core_worker.sh (register + manifest). Registered in
-//! `transforms.rs` (DEBASHC_TRANSFORMS gated). Prereq: const-condition-
+//! `transforms.rs` (SH2_TRANSFORMS gated). Prereq: const-condition-
 //! elim (consumes the emitted `Bool`).
 
 use crate::ir::{BinOpKind, IrExpr, IrStmt};

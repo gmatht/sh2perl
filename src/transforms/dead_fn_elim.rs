@@ -19,7 +19,7 @@
 //! indirect — keeps the function (refuse > guess).
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated), so it runs in
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated), so it runs in
 //! `ast_to_ir` for every backend.
 
 use crate::ir::{InterpPart, IrExpr, IrStmt};

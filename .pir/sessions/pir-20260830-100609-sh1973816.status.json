@@ -1,0 +1,9 @@
+{
+  "status": "interrupted",
+  "pid": 1978894,
+  "updated": 1788085281,
+  "built": "0.1.1",
+  "last_prompt": "Implement compaction",
+  "goal_pending": false,
+  "reason": "cancelled"
+}

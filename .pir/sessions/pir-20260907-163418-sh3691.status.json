@@ -1,0 +1,9 @@
+{
+  "status": "interrupted",
+  "pid": 305653,
+  "updated": 1788798867,
+  "built": "0.1.1",
+  "last_prompt": "cd ..",
+  "goal_pending": false,
+  "reason": "turn error: request cancelled"
+}

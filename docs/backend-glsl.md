@@ -5,10 +5,10 @@ fragment shader that computes the shell program's stdout into a global
 byte buffer and encodes it as the fragment color. The natural home is the
 `backends/glsl` worktree (branch `backend/glsl`); the renderer is merged
 at `src/glsl_backend.rs` (`shir_to_glsl`), wired to the CLI as
-`debashc --shir-in-glsl <a1.json>` / `file --shir-in-glsl`.
+`shir_render --target glsl <a1.json>` / `file --shir-in-glsl`.
 
 ```
-debashc file --shir foo.sh --raw | debashc --shir-in-glsl - > foo.frag
+otranspilerl-cli --target shir foo.sh --raw | shir_render --target glsl - > foo.frag
 ```
 
 ## Why a fragment shader
@@ -106,7 +106,7 @@ worse.
 
 - `cargo test --lib glsl_backend` — renderer unit tests.
 - Corpus sweep: every `sh2perl/examples/*.sh` renders and validates:
-  `debashc file --shir f.sh --raw | debashc --shir-in-glsl - > f.frag &&
+  `otranspilerl-cli --target shir f.sh --raw | shir_render --target glsl - > f.frag &&
   glslangValidator -S frag f.frag` (532/532 as of the sketch).
 - Runtime verification requires a WebGL2 context (readPixels): render a
   1 × OUT_CAP canvas with `u_mode = 1` and reassemble stdout from the

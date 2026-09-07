@@ -37,7 +37,7 @@ shell ──► Shell AST ──► ShIR (IrProgram)
 | B: Rust API | in-process `IrProgram` (types already `pub`) | **Perl** (today), **Rust** (the reference) |
 | C: **ShIR JSON** (`--shir`) | language-neutral IR + annotations | **C, Python, Zig, Lua, Java** — the cross-backend contract |
 
-Perl and Rust consume B naturally (they compile against `debashl`); the
+Perl and Rust consume B naturally (they compile against `sh2perl core`); the
 others need C (the serializer). B and C must serialize the *same* IR —
 the JSON schema is the contract's canonical form.
 
@@ -45,7 +45,7 @@ the JSON schema is the contract's canonical form.
 
 | # | Ask | What it gives every backend |
 |---|---|---|
-| A1 | `debashc --shir`: serialize `IrProgram` as JSON + schema + structural gate | the cross-backend contract itself (precedent: `--mir`) |
+| A1 | `otranspilerl-cli --shir`: serialize `IrProgram` as JSON + schema + structural gate | the cross-backend contract itself (precedent: `--mir`) |
 | A2 | `IrType {Int, Str, Any}` — serialize the numeric lift's existing verdicts | the type split every static backend needs (C: long long vs char*, Zig/Java/Rust: i64/long vs String, …) |
 | A3 | purity tag (`PureCpu`/`Emulable`/`Spawn`) on `Exec`/`Pipeline` | the lowering-ladder as data — each backend renders the same decision |
 | A4 | machine-readable `sh2.*` spec (39 callees: name, arity, arg types, purity, sync/async, `$?` effects, errors) | every backend's runtime module/table generated from one source |

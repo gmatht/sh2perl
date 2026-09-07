@@ -4,7 +4,7 @@
 //! directly from the parsed ShIR — no `--shir` JSON round-trip. Usage:
 //!
 //!     perl_backend foo.sh                # this: library path, in-process
-//!     debashc --shir-in-perl - < foo.json  # the JSON contract path (core)
+//!     otranspilerl-cli --source-lang shir --target perl - < foo.json  # the JSON contract path (core)
 //!
 //! The renderer NEVER fails on valid shell input (unsupported constructs
 //! become `# TODO(unsupported)` markers), so the corpus gate's render

@@ -21,7 +21,7 @@
 //!
 //! ## Placement
 //! Bundle for run_core_worker.sh (register + manifest). Registered in
-//! `transforms.rs` (DEBASHC_TRANSFORMS gated). Complements direct-calls.
+//! `transforms.rs` (SH2_TRANSFORMS gated). Complements direct-calls.
 
 use crate::ir::{ArithAst, InterpPart, IrExpr, IrStmt};
 

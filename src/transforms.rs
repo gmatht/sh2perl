@@ -8,10 +8,10 @@
 //! corpus to blame a transform that regresses it.
 //!
 //! Each transform is a `fn(&mut Vec<IrStmt>) -> bool` (returns whether it
-//! changed anything). They are gated at RUNTIME by the `DEBASHC_TRANSFORMS`
+//! changed anything). They are gated at RUNTIME by the `SH2_TRANSFORMS`
 //! env var (comma-separated names; empty/unset = ALL registered), so the
 //! estree worker compiles the crate once (all transforms registered) and
-//! bisects by setting `DEBASHC_TRANSFORMS=first-n` — no rebuild per step.
+//! bisects by setting `SH2_TRANSFORMS=first-n` — no rebuild per step.
 
 use crate::ir::IrStmt;
 
@@ -125,17 +125,17 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
     ]
 }
 
-/// Names to enable, from `DEBASHC_TRANSFORMS` (comma-separated). Empty or
-/// unset = ALL registered transforms.
+/// Names to enable, from `SH2_TRANSFORMS` (comma-separated; the legacy
+/// `SH2_TRANSFORMS` name is accepted as an alias). Empty or unset =
+/// ALL registered transforms.
 fn enabled_names() -> Vec<String> {
-    std::env::var("DEBASHC_TRANSFORMS")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    let raw = std::env::var("SH2_TRANSFORMS")
+        .or_else(|_| std::env::var("SH2_TRANSFORMS"))
+        .unwrap_or_default();
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Apply the enabled transforms to the statement list. Returns true if any
@@ -156,7 +156,7 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
     changed
 }
 
-/// Is a named transform enabled under the `DEBASHC_TRANSFORMS` gate
+/// Is a named transform enabled under the `SH2_TRANSFORMS` gate
 /// (empty/unset = ALL)? The renderer hooks that READ a transform's
 /// verdict statics must consult the same gate, so the bisect machinery
 /// (env-gated, no rebuild) can disable a transform end-to-end — including

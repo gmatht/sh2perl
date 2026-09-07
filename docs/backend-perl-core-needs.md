@@ -26,7 +26,7 @@ wasm/JS natives) gives the hot paths: a native arith/text/bc module.
 | C: ShIR JSON (`--shir`) | the cross-backend contract (A1) — a Perl backend could consume it out-of-process | later, optional |
 
 Perl is the one backend where path B is natural (Rust + Perl both compile
-natively; a `debashl` callable). Path C matters only if a *pure-Perl* tool
+natively; a `sh2perl core` callable). Path C matters only if a *pure-Perl* tool
 chain (no Rust binary) is a product goal.
 
 ## 2. Node inventory
@@ -149,7 +149,7 @@ A1–A7 (shared) + Perl-specific:
   native, loop controls native, always-sync) — the *cleanest* spawning
   model of the interpreted backends.
 - Hard: the 88 failures are real generator work (no shortcuts); the
-  "debashc failed to generate code" refusals need parser/IR coverage,
+  "otranspilerl-cli failed to generate code" refusals need parser/IR coverage,
   not just rendering.
 - The XS layer is a *performance* investment — do it only if Perl
   runtime speed matters; correctness first.

@@ -1,0 +1,9 @@
+{
+  "status": "interrupted",
+  "pid": 1974743,
+  "updated": 1788084154,
+  "built": "0.1.1",
+  "last_prompt": "Review the code base.",
+  "goal_pending": false,
+  "reason": "turn error: HTTP 400: Error from provider (Console Go): Upstream request failed: [400] This endpoint's maximum context length is 262144 tokens. However, you requested about 275989 tokens (210334 of text input, 1655 of tool input, 64000 in the output). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically."
+}

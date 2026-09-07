@@ -1,7 +1,7 @@
 # Rust Backend: What It Wants From Core
 
 Status: DRAFT. Mirror of `backends/c/docs/backend-c-core-needs.md`. Rust
-is the **home language**: debashc IS Rust, the IR types are already
+is the **home language**: otranspilerl-cli IS Rust, the IR types are already
 `pub`, and a Rust backend can consume path B (in-process) with zero
 serialization overhead — the fastest to build and the closest to the
 core. Worktree `backends/rust`, branch `backend/rust`.
@@ -23,7 +23,7 @@ store, or an arena).
 | Path | Contract | Verdict |
 |---|---|---|
 | A: ESTree JSON | JS-shaped — no | no |
-| B: **Rust API (in-process `IrProgram`)** | types already `pub`; a renderer crate calls `debashl::shir::ast_to_ir` | **today** — the cheapest path |
+| B: **Rust API (in-process `IrProgram`)** | types already `pub`; a renderer crate calls `sh2perl core::shir::ast_to_ir` | **today** — the cheapest path |
 | C: ShIR JSON (`--shir`) | useful for the OTHER backends; a Rust backend doesn't need the JSON hop | optional |
 
 Rust is the one backend where path B is the *right* answer (no FFI, no

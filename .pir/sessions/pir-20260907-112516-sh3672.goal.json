@@ -1,0 +1,49 @@
+{
+  "objective": "Implement the true64 verdict-prior flip (Unknown-as-wide), boundary-exact bindings (BigInt parse for string sources into wide vars), and run the corpus gate to flip shell-input default to --true64. Update docs/arith-homes.md and commit.",
+  "status": "active",
+  "steps": [
+    {
+      "id": 1,
+      "description": "Understand current analyze_true64 / analyze_var_ranges / analyze_big_i53 behavior and the estree binding emitters (argv/read/captures)",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 2,
+      "description": "Implement verdict-prior flip: true64 path seeds Unknown-as-wide",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 3,
+      "description": "Implement boundary-exact bindings: BigInt parse for string sources into wide vars",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 4,
+      "description": "Build + run unit tests",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 5,
+      "description": "Run corpus gate true64 on vs off, bit-compare",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 6,
+      "description": "Flip shell-input default to --true64 if green",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 7,
+      "description": "Update docs/arith-homes.md checklist, commit",
+      "status": "pending",
+      "note": ""
+    }
+  ],
+  "notes": ""
+}

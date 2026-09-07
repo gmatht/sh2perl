@@ -754,7 +754,7 @@ pub enum IrStmt {
     /// execution semantics (begin once, process once PER pipeline input
     /// item, end/clean once); the other backends render `body` and ignore
     /// the field. A frontend emitting named blocks targets the ESTree
-    /// backend (the A1-ingress oracle is `debashc --shir-in-estree`).
+    /// backend (the A1-ingress oracle is `otranspilerl-cli --source-lang shir --target estree`).
     Function {
         name: String,
         body: Vec<IrStmt>,
@@ -1468,7 +1468,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // declared nodes; a node with no handler keeps the refusal.
             if !crate::render_ext::render_ext(out, &**n, indent) {
                 emit_indent(out, indent);
-                out.push_str("die \"debashc: shIR Ext node not supported by the Perl backend\\n\";\n");
+                out.push_str("die \"otranspilerl: shIR Ext node not supported by the Perl backend\\n\";\n");
             }
         }
         IrStmt::RawText(text) => {
@@ -1562,20 +1562,20 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         // would be wrong).
         IrStmt::Try { .. } => {
             emit_indent(out, indent);
-            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (try)\\n\";\n");
+            out.push_str("die \"otranspilerl: shIR construct not yet supported by the Perl backend (try)\\n\";\n");
         }
         // Go-style select over channel comm clauses — ESTree-path only;
         // the Perl generator never emits it. Refuse loudly.
         IrStmt::Select { .. } => {
             emit_indent(out, indent);
-            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (select)\\n\";\n");
+            out.push_str("die \"otranspilerl: shIR construct not yet supported by the Perl backend (select)\\n\";\n");
         }
         // Inline assembly — ESTree-path only (JS cannot execute machine
         // code either; the estree renderer lowers it to a no-op comment).
         // The Perl generator refuses loudly (refuse > guess).
         IrStmt::Asm { .. } => {
             emit_indent(out, indent);
-            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (asm)\\n\";\n");
+            out.push_str("die \"otranspilerl: shIR construct not yet supported by the Perl backend (asm)\\n\";\n");
         }
         IrStmt::Case {
             discriminant,
@@ -1742,7 +1742,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_shell_cmd(out, indent, &cmd);
                     } else {
                         emit_indent(out, indent);
-                        out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect mode)\\n\";\n");
+                        out.push_str("die \"otranspilerl: shIR construct not yet supported by the Perl backend (redirect mode)\\n\";\n");
                     }
                 }
                 None => {
@@ -1806,7 +1806,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                         _ => {
                             emit_indent(out, indent);
-                            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect)\\n\";\n");
+                            out.push_str("die \"otranspilerl: shIR construct not yet supported by the Perl backend (redirect)\\n\";\n");
                         }
                     }
                 }
@@ -1854,7 +1854,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             out.push_str(&format!("{t} = {v};\n"));
                         } else {
                             emit_indent(out, indent);
-                            out.push_str("die \"debashc: setVar args not renderable (Perl backend)\\n\";\n");
+                            out.push_str("die \"otranspilerl: setVar args not renderable (Perl backend)\\n\";\n");
                         }
                     }
                     "builtin" => {
@@ -1919,7 +1919,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             emit_shell_cmd(out, indent, &cmd);
                         } else {
                             emit_indent(out, indent);
-                            out.push_str("die \"debashc: shIR pipeline not yet supported by the Perl backend\\n\";\n");
+                            out.push_str("die \"otranspilerl: shIR pipeline not yet supported by the Perl backend\\n\";\n");
                         }
                     }
                     "and" | "or" => {
@@ -1976,7 +1976,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     "caseMatch" | "define" | "subshell" | "background" => {
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
+                            "die \"otranspilerl: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
                             func
                         ));
                     }
@@ -2010,7 +2010,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             emit_shell_cmd(out, indent, &cmd);
                         } else {
                             emit_indent(out, indent);
-                            out.push_str("die \"debashc: shIR redirect not yet supported by the Perl backend\\n\";\n");
+                            out.push_str("die \"otranspilerl: shIR redirect not yet supported by the Perl backend\\n\";\n");
                         }
                     }
                     other => {
@@ -2020,7 +2020,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         } else {
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
+                                "die \"otranspilerl: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
                                 other
                             ));
                         }
@@ -2054,7 +2054,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_shell_cmd(out, indent, &cmd);
                     } else {
                         emit_indent(out, indent);
-                        out.push_str("die \"debashc: shIR expression not yet supported by the Perl backend\\n\";\n");
+                        out.push_str("die \"otranspilerl: shIR expression not yet supported by the Perl backend\\n\";\n");
                     }
                 }
             }
@@ -2128,7 +2128,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             if let Some(spec) = asm {
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "die \"debashc: shIR construct not yet supported by the Perl backend (asm label '{}')\\n\";\n",
+                    "die \"otranspilerl: shIR construct not yet supported by the Perl backend (asm label '{}')\\n\";\n",
                     spec.template
                 ));
                 return;
@@ -2191,7 +2191,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             // A non-rebuildable closure (dynamic exec / assign
                             // body): its Perl rendering is not shell — refuse
                             // loudly rather than emit the broken `sub {}` text.
-                            "die \"debashc: shIR capture not expressible as shell (Perl backend)\\n\"".to_string()
+                            "die \"otranspilerl: shIR capture not expressible as shell (Perl backend)\\n\"".to_string()
                         } else {
                             let mut inner_str = ir_expr_to_perl(inner_expr);
                             // Strip surrounding backticks from StrStyle::Command rendering
@@ -3540,47 +3540,10 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
 /// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
 /// native Perl, no bash dependency). Returns None when the command isn't
 /// emulatable (caller falls back to `bash -c` shell-out).
-#[cfg(feature = "legacy-generator")]
-fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
-    let shell_text = build_shell_cmd(cmd, words);
-    let parsed = crate::Parser::new(&shell_text).parse().ok()?;
-    let simple = parsed.into_iter().find_map(|c| match c {
-        crate::ast::Command::Simple(sc) => Some(sc),
-        _ => None,
-    })?;
-    let mut gen = crate::generator::Generator::new();
-    // The modern-IR preamble declares every referenced script var as
-    // `my $name` (see shir_to_perl's collect_assigned/read_vars), while
-    // the Generator's emulations read undeclared vars via `$ENV{name}`.
-    // Register the command's non-env var reads as declared locals so the
-    // emulations read the LIVE `$name` (examples/pid_tempfile, the t32
-    // redirect twin: `cat "$tmpf"` read `$ENV{tmpf}` while the value
-    // lived in `my $tmpf` — a guaranteed undef mismatch). Env-style
-    // (uppercase) names stay `$ENV{...}`: they are real environment
-    // variables, not preamble locals.
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for w in words {
-        word_var_reads(w, &mut names);
-    }
-    for n in names {
-        if is_emulatable_var_name(&n) {
-            gen.declared_locals.insert(n);
-        }
-    }
-    let perl = crate::generator::commands::simple_commands::generate_simple_command_impl(
-        &mut gen, &simple,
-    );
-    if perl.trim().is_empty() {
-        None
-    } else {
-        Some(perl)
-    }
-}
-
-/// When the legacy generator is off (default), command emulation is
-/// unavailable: the caller falls back to `bash -c` shell-out (the same path
-/// `DEBASHC_IR_NO_EMUL` exercises).
-#[cfg(not(feature = "legacy-generator"))]
+/// Command emulation is unavailable post-legacy-cleanup: the caller falls
+/// back to `bash -c` shell-out (the same path `DEBASHC_IR_NO_EMUL`
+/// exercises). The per-command native emulations (ls/wc/sed/…) move into
+/// the perl renderer proper (backend/perl's renderer work).
 fn generator_emulate_command(_cmd: &str, _words: &[&IrExpr]) -> Option<String> {
     None
 }
@@ -5873,7 +5836,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // A non-rebuildable closure: its Perl rendering is
                     // not shell — refuse loudly rather than emit the
                     // broken `sub {}` text into bash -c.
-                    return "die \"debashc: shIR capture not expressible as shell (Perl backend)\\n\"".to_string();
+                    return "die \"otranspilerl: shIR capture not expressible as shell (Perl backend)\\n\"".to_string();
                 }
             }
             let mut inner = ir_expr_to_perl(expr);
@@ -6006,15 +5969,15 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // ESTree-path-only comprehension — the Perl generator never
             // emits it. Refuse loudly (a sub returning 0 would silently
             // miscompile).
-            "die \"debashc: shIR construct not yet supported by the Perl backend (ArrayComp)\";".to_string()
+            "die \"otranspilerl: shIR construct not yet supported by the Perl backend (ArrayComp)\";".to_string()
         }
         IrExpr::Lambda { .. } => {
             // ESTree-path-only lambda — refuse loudly (see ArrayComp).
-            "die \"debashc: shIR construct not yet supported by the Perl backend (Lambda)\";".to_string()
+            "die \"otranspilerl: shIR construct not yet supported by the Perl backend (Lambda)\";".to_string()
         }
         IrExpr::Splice(_) => {
             // ESTree-path-only splice marker — refuse loudly (see ArrayComp).
-            "die \"debashc: shIR construct not yet supported by the Perl backend (Splice)\";".to_string()
+            "die \"otranspilerl: shIR construct not yet supported by the Perl backend (Splice)\";".to_string()
         }
         IrExpr::Ext(n) => {
             // Transform-declared expression node — drop-in handler dispatch.
@@ -6390,7 +6353,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         let n = i.parse::<usize>().unwrap_or(0);
                         format!("((split(/\\n/, {ve}))[{n}] // '')")
                     } else {
-                        eprintln!("debashc: line args unsupported");
+                        eprintln!("otranspilerl: line args unsupported");
                         "''".to_string()
                     }
                 }
@@ -6402,7 +6365,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 "regexMatch" => match args.first() {
                     Some(IrExpr::Regex { pattern, flags }) => {
                         if flags.chars().any(|c| c != 'i') {
-                            eprintln!("debashc: regexMatch flags {:?} unsupported", flags);
+                            eprintln!("otranspilerl: regexMatch flags {:?} unsupported", flags);
                             "0".to_string()
                         } else {
                             let v = args
@@ -6416,7 +6379,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                     }
                     other => {
-                        eprintln!("debashc: regexMatch arg 0 not Regex: {other:?}");
+                        eprintln!("otranspilerl: regexMatch arg 0 not Regex: {other:?}");
                         "0".to_string()
                     }
                 },

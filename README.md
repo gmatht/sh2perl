@@ -60,8 +60,8 @@ This tool is ideal for:
 ## Installation
 
 ```bash
-git clone https://github.com/gmatht/debashc.git
-cd debashc
+git clone https://github.com/gmatht/otranspilerl-cli.git
+cd otranspilerl-cli
 cargo build --release
 ```
 
@@ -69,38 +69,38 @@ cargo build --release
 
 ### Command Line Interface
 
-The `debashc` binary provides several commands for analyzing and converting shell scripts:
+The `otranspilerl-cli` binary provides several commands for analyzing and converting shell scripts:
 
 ```bash
 # Tokenize a shell script
-debashc lex "echo hello world"
+otranspilerl-cli lex "echo hello world"
 
 # Parse a shell script to AST
-debashc parse "ls | grep test"
+otranspilerl-cli parse "ls | grep test"
 
 # Parse a shell script from file
-debashc file examples/simple.sh
+otranspilerl-cli file examples/simple.sh
 
 # Convert shell script to Perl
-debashc parse --perl "ls | grep test"
+otranspilerl-cli parse --perl "ls | grep test"
 
 # Convert shell script to Rust
-debashc parse --rust "ls | grep test"
+otranspilerl-cli parse --rust "ls | grep test"
 
 # Convert shell script to Python
-debashc parse --python "ls | grep test"
+otranspilerl-cli parse --python "ls | grep test"
 
 # Convert shell script file to Perl
-debashc file --perl examples/simple.sh
+otranspilerl-cli --target pl examples/simple.sh
 
 # Interactive mode
-debashc interactive
+otranspilerl-cli interactive
 ```
 
 ### Library Usage
 
 ```rust
-use debashc::{Lexer, Parser, Generator, RustGenerator, PythonGenerator};
+use otranspilerl-cli::{Lexer, Parser, Generator, RustGenerator, PythonGenerator};
 
 // Tokenize a shell script
 let input = "echo hello world";
@@ -469,13 +469,13 @@ Before submitting, test your examples:
 
 ```bash
 # Test a specific example
-cargo run --bin debashc -- test examples/your_example.sh
+cargo run --bin otranspilerl-cli -- test examples/your_example.sh
 
 # Run all tests
-cargo run --bin debashc -- test-all
+cargo run --bin otranspilerl-cli -- test-all
 
 # Test with Perl::Critic enabled
-cargo run --bin debashc -- test-all --perl-critic
+cargo run --bin otranspilerl-cli -- test-all --perl-critic
 ```
 
 ### 10. **Example Structure Template**
@@ -537,7 +537,7 @@ This project is licensed under the GPLv3 License - see the LICENSE file for deta
 - [ ] Test more examples
 
 ## NOTES
-- The binary is currently debashc. If you see references to sh2perl, well in the future I might have seperate sh2perl, sh2rust etc. Alas not yet../f
+- The binary is currently otranspilerl-cli. If you see references to sh2perl, well in the future I might have seperate sh2perl, sh2rust etc. Alas not yet../f
 
 - We are trying to generate the same output as `LANG=C bash` on Linux/WSL would generate
 

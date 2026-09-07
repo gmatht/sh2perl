@@ -1,0 +1,9 @@
+{
+  "status": "interrupted",
+  "pid": 2081054,
+  "updated": 1788103268,
+  "built": "0.1.1",
+  "last_prompt": "Improve sh2perl until the go frontend written in go can be transpiled into a go frontend written in js that produces that same output as the original frontend written in go.",
+  "goal_pending": true,
+  "reason": "turn error: HTTP 429: Monthly usage limit reached. Resets in 17 days. To continue using this model now, enable usage from your available balance: https://opencode.ai/workspace/wrk_01M07702030C2C2DJ42RV6KHYA/go"
+}

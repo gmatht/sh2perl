@@ -11,7 +11,6 @@ my $help = 0;
 my $verbose = 0;
 my $inplace = 0;
 my $output_file;
-my $debashc_path = -x 'target/debug/debashc' ? 'target/debug/debashc' : 'target/debug/debashc.exe';
 my $otranspilerl_path;
 # Counter used to generate unique temp vars when normalizing print qx{...} patterns
 my $PURIFY_PRINT_QX_COUNTER = 0;
@@ -28,7 +27,6 @@ GetOptions(
     'verbose|v' => \$verbose,
     'inplace|i' => \$inplace,
     'output|o=s' => \$output_file,
-    'debashc-path=s' => \$debashc_path,
     'otranspilerl-path=s' => \$otranspilerl_path,
 ) or die "Error in command line arguments\n";
 
@@ -58,7 +56,7 @@ if (!-f $input_file) {
 # Resolve the embed backend (PLAN §10): otranspilerl-cli renders shell
 # snippets as embeddable fragments. Explicit option / OTRANSPILERL_CLI env /
 # the sibling crate's debug binary. Absent ⇒ snippets fall to the exec
-# fallback (never the legacy debashc Generator — otranspiler-only).
+# fallback (never the legacy otranspilerl-cli Generator — otranspiler-only).
 {
     my $script_dir = $0 =~ m{(.*)[/\\]} ? $1 : '.';
     my $candidate = $otranspilerl_path
@@ -132,14 +130,14 @@ OPTIONS:
     -v, --verbose           Verbose output
     -i, --inplace           Modify the input file in place
     -o, --output <file>     Write output to specified file
-    --debashc-path <path>   Path to debashc executable (default: target/debug/debashc.exe)
+    --otranspilerl-cli-path <path>   Path to otranspilerl-cli executable (default: target/debug/otranspilerl-cli.exe)
 
 DESCRIPTION:
     This script uses PPI (Perl Parsing Interface) to find instances of:
     - system() calls with shell commands
     - Backtick (`) command substitution
     
-    It then uses debashc to convert these shell snippets into native Perl code.
+    It then uses otranspilerl-cli to convert these shell snippets into native Perl code.
     
     By default, the purified code is written to stdout for easy piping.
 
@@ -149,7 +147,7 @@ EXAMPLES:
     perl purify.pl -i script.pl                 # Modify file in place
     perl purify.pl -o clean.pl script.pl        # Write to specific file
     perl purify.pl -o - script.pl               # Explicitly write to stdout
-    perl purify.pl --debashc-path /path/to/debashc script.pl
+    perl purify.pl --otranspilerl-cli-path /path/to/otranspilerl-cli script.pl
 
 EOF
 }
@@ -352,7 +350,7 @@ sub process_system_calls_string {
         # Always use fork+exec so we preserve the exact semantics of the
         # original system() call: the command runs in a child process,
         # its stdout/stderr go directly to the terminal (not captured),
-        # and the parent waits for completion.  Using debashc here caused
+        # and the parent waits for completion.  Using otranspilerl-cli here caused
         # problems such as die-on-failure (for rmdir/mkdir conversions) and
         # spurious printed return values (e.g. 1 from a successful rmdir).
         # For statement context we don't need to capture $? so strip the
@@ -404,7 +402,7 @@ sub _system_stmt_in_expr_ctx {
 }
 
 # Generate a fork+exec block that returns $? (exit status), suitable for
-# embedding inside a do { ... } expression. Does NOT call debashc so the
+# embedding inside a do { ... } expression. Does NOT call otranspilerl-cli so the
 # original exit-status semantics of system() are preserved exactly.
 sub _build_fork_exec_for_expr {
     my ($tokens_ref) = @_;
@@ -628,20 +626,20 @@ sub process_single_backtick_string {
     my $prefix = defined $declaration ? $declaration : '';
     # Preserve the raw command text for heuristic checks, but decode
     # escape sequences for conversion. decode_perl_double_quoted_string
-    # turns sequences like \n into actual newlines which debashc expects.
+    # turns sequences like \n into actual newlines which otranspilerl-cli expects.
     my $raw_command = $command;
     $command = decode_perl_double_quoted_string($command);
 
     print "DEBUG: Processing backtick command: $command\n" if $verbose;
 
     # Check if the raw command contains unescaped Perl variable references
-    # (like $lines[$i]) that would confuse debashc's shell parser.
+    # (like $lines[$i]) that would confuse otranspilerl-cli's shell parser.
     # In Perl backtick context, all unescaped $variables are Perl
-    # variables interpolated before the shell sees them, so debashc
+    # variables interpolated before the shell sees them, so otranspilerl-cli
     # cannot correctly handle them and must be bypassed.
     my $perl_result;
     if ($raw_command =~ /(?<!\\)\$[A-Za-z_]\w*/) {
-        print "DEBUG: Command contains Perl variables; skipping debashc\n" if $verbose;
+        print "DEBUG: Command contains Perl variables; skipping otranspilerl-cli\n" if $verbose;
         # Leave $perl_result undef to trigger IPC::Open3 fallback
     } elsif (embed_enabled()) {
         # Embed backend (PLAN §10): otranspilerl-cli --embed-perl renders the
@@ -691,17 +689,17 @@ sub process_single_backtick_string {
     # Detect such patterns and treat them as conversion failures so the
     # open3-based fallback below is used instead.
         if ($perl_result && $perl_result =~ /\$DATE_SNAPSHOT\b/) {
-            print "DEBUG: debashc output references \$DATE_SNAPSHOT; treating as conversion failure\n" if $verbose;
+            print "DEBUG: otranspilerl-cli output references \$DATE_SNAPSHOT; treating as conversion failure\n" if $verbose;
             undef $perl_result;
         }
 
         if ($perl_result && $perl_result =~ /\bsystem\b/) {
-            print "DEBUG: debashc output contains system() call; treating as conversion failure\n" if $verbose;
+            print "DEBUG: otranspilerl-cli output contains system() call; treating as conversion failure\n" if $verbose;
             undef $perl_result;
         }
 
     if ($perl_result) {
-        # Heuristic fix: debashc sometimes emits a Perl command string where
+        # Heuristic fix: otranspilerl-cli sometimes emits a Perl command string where
         # an echo argument that originally was single-quoted and contained
         # embedded newlines ends up unquoted. That leaves literal newlines
         # outside quotes which the shell interprets as command separators.
@@ -709,7 +707,7 @@ sub process_single_backtick_string {
         #   my $X = "echo ...\n... | ...";
         # and wrap the echo argument in single quotes so the shell treats
         # the embedded newlines as part of the single argument.
-        # debashc may emit the assigned command string using different
+        # otranspilerl-cli may emit the assigned command string using different
         # Perl quoting styles (single-quoted '...', double-quoted "...",
         # or q{...}). The previous heuristic only handled the ' or "
         # forms which missed q{...} and allowed multiline echo arguments
@@ -735,7 +733,7 @@ sub process_single_backtick_string {
                     my $new_cmdstr = $cmdstr;
                     $new_cmdstr =~ s/\becho\s+$quoted_arg_re(\s*\|)/echo $new_arg$1/s;
 
-                    # Replace the inner command string in the debashc result.
+                    # Replace the inner command string in the otranspilerl-cli result.
                     # Using quotemeta on the original inner text is the most
                     # robust way to swap just the command contents regardless
                     # of whether it was quoted with ' " or q{ }.
@@ -758,7 +756,7 @@ sub process_single_backtick_string {
         # output so further processing and checks remain correct.
         $perl_result =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
 
-        # Fix debashc inline pipeline output issues:
+        # Fix otranspilerl-cli inline pipeline output issues:
         # 1. Debashc sometimes emits `my $output_N = q{};` followed later
         #    by a bare `my $output_N;` in the same scope. The second
         #    redeclaration causes 'variable masks earlier declaration' errors
@@ -788,15 +786,15 @@ sub process_single_backtick_string {
         # Remove trailing $err_N from a 3-variable my() declaration.
         $perl_result =~ s/(my\s*\(\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+(\s*\);)/$1$2/g;
 
-        # If debashc converted a `yes ... | head/tail` pipeline to pure Perl
+        # If otranspilerl-cli converted a `yes ... | head/tail` pipeline to pure Perl
         # (possibly with open3 for a later stage such as `wc`), the
         # conversion omits shell-level side effects: specifically, the
         # "yes: standard output: Broken pipe" message that GNU yes writes to
         # stderr when head/tail closes the pipe early.  Fall back to
         # IPC::Open3 shell execution unconditionally for any yes-with-pipe
         # backtick, which preserves all shell-level behaviours including
-        # stderr.  We intentionally do NOT filter on whether the debashc
-        # result already contains open3 calls: debashc may include open3
+        # stderr.  We intentionally do NOT filter on whether the otranspilerl-cli
+        # result already contains open3 calls: otranspilerl-cli may include open3
         # only for a downstream stage (e.g. wc) while still converting the
         # yes loop to bounded pure-Perl, which would miss the broken-pipe
         # signal.
@@ -805,7 +803,7 @@ sub process_single_backtick_string {
             && $perl_result !~ /\bqx\b/
             && $perl_result !~ /\bexec\b/
             && $perl_result !~ /\bsystem\b/) {
-            print "DEBUG: debashc generated pure-Perl for 'yes' pipeline; falling back to IPC::Open3\n" if $verbose;
+            print "DEBUG: otranspilerl-cli generated pure-Perl for 'yes' pipeline; falling back to IPC::Open3\n" if $verbose;
             my $cmd_lit = _perl_quote_literal_no_interp($command);
             my $open3_inner = "do {\n"
                 . "    require IPC::Open3;\n"
@@ -823,7 +821,7 @@ sub process_single_backtick_string {
         }
 
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
-        # Sanitize debashc inline backtick snippets: debashc sometimes emits
+        # Sanitize otranspilerl-cli inline backtick snippets: otranspilerl-cli sometimes emits
         # a Perl assignment where the assigned command string contains
         # literal newlines (e.g. my $X = "echo 1,2,3\n4,5,6\n7,8,9 | ...";).
         # When such a literal contains actual newline characters they end
@@ -891,12 +889,12 @@ sub process_single_backtick_string {
         # semantics used e.g. when a backtick is passed directly as a
         # function argument) and the raw string in scalar context.
         if (!defined $var_name) {
-            # Strip any trailing semicolon that debashc may have appended to
+            # Strip any trailing semicolon that otranspilerl-cli may have appended to
             # the do-block.  A semicolon inside a function-call argument list
             # causes a syntax error (it terminates the statement), so we must
             # remove it before embedding the expression in __bt(...).
             (my $expr = $perl_result) =~ s/;\s*$//s;
-            # If debashc emitted a multi-statement sequence (e.g. my $output_1;
+            # If otranspilerl-cli emitted a multi-statement sequence (e.g. my $output_1;
             # $output_1 = "..."; ...; $output_1) we cannot pass it directly as
             # a function argument -- Perl does not allow statements in that
             # position.  Wrap it in a do { ... } block so it becomes a single
@@ -1014,11 +1012,11 @@ sub reconstruct_shell_command_from_system_call {
     return unless @parts;
 
     # A single-argument system() call is already a shell command string.
-    # Preserve it verbatim so debashc can see the original shell syntax.
+    # Preserve it verbatim so otranspilerl-cli can see the original shell syntax.
     if (@parts == 1) {
         my $single = $parts[0];
         # Drop surrounding quotes for the single-argument case so the
-        # debashc invokation receives the raw command text.
+        # otranspilerl-cli invokation receives the raw command text.
         $single =~ s/^['"]//;
         $single =~ s/['"]$//;
         return $single;
@@ -1028,15 +1026,15 @@ sub reconstruct_shell_command_from_system_call {
     # reasonable shell command by joining the token pieces with spaces.
     # Preserve any original quoting on tokens; for bare words, apply
     # shell-quoting heuristics so that arguments with spaces are kept as
-    # single shell arguments. This allows debashc to convert common
+    # single shell arguments. This allows otranspilerl-cli to convert common
     # list-form system(...) usages into equivalent Perl logic.
     my @reconstructed;
     for my $p (@parts) {
         # Normalize tokens by removing outer quotes (if any) and then
         # re-quoting via our shell-quoting helper. Preserving the original
         # surrounding quotes here caused embedded quote characters to be
-        # passed through into the debashc input which in some cases
-        # (e.g. system("rm", "-rf", "dir")) led debashc to misinterpret
+        # passed through into the otranspilerl-cli input which in some cases
+        # (e.g. system("rm", "-rf", "dir")) led otranspilerl-cli to misinterpret
         # option tokens like "-rf" as separate filenames. Stripping outer
         # quotes and re-applying controlled quoting keeps semantics while
         # avoiding that confusion.
@@ -1172,7 +1170,7 @@ sub generate_exec_do_block {
         $normalized_flag =~ s/^\s+|\s+$//g;
         # Determine if the original token was a clean '-c' (no surrounding
         # whitespace). Only when the original token equals the normalized
-        # value do we consider attempting the special debashc conversion.
+        # value do we consider attempting the special otranspilerl-cli conversion.
         my $is_clean_flag = ($flag_txt eq $normalized_flag);
         # If the token was exactly '-c' prefer a sane bare quoting
         # preference; do not adjust quoting when the original token
@@ -1186,7 +1184,7 @@ sub generate_exec_do_block {
         # normalization and preserve the original argument text by using
         # the perl-quoted tokens we captured earlier. This preserves the
         # exact runtime behavior (including accidental/malformed flags)
-        # and avoids attempting debashc conversion which could change
+        # and avoids attempting otranspilerl-cli conversion which could change
         # semantics.
         if ($normalized_flag eq '-c' && !$is_clean_flag) {
             # The original flag token contained surrounding whitespace;
@@ -1216,15 +1214,15 @@ sub generate_exec_do_block {
             # Build the shell command string from the remaining tokens (preserve pipeline '|' as raw pipe)
             my @cmd_parts = @tokens[1..$#tokens];
             # Build a raw shell command (no surrounding quoting) for conversion
-            # so debashc sees the original shell text. Separately build a
+            # so otranspilerl-cli sees the original shell text. Separately build a
             # quoted form we can embed into exec('sh','-c', ...) when we
             # fall back to executing via the shell.
             # Build a raw shell command (no surrounding quoting) for conversion
-            # so debashc sees the original shell text. When tokens were
+            # so otranspilerl-cli sees the original shell text. When tokens were
             # single-quoted in the original Perl source they may contain
             # Perl-level backslash escapes (for example '\' to represent a
             # single quote inside a single-quoted Perl string). Decode those
-            # so the shell text passed to debashc matches what the shell
+            # so the shell text passed to otranspilerl-cli matches what the shell
             # would actually see at runtime.
             my $shell_cmd_raw = join(' ', map {
                 my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
@@ -1259,7 +1257,7 @@ sub generate_exec_do_block {
             # If any original token was double-quoted and contains a Perl-style
             # variable ($ or @) the original source intended Perl interpolation
             # at the call site. In such cases avoid converting the inner shell
-            # command into pure-Perl via debashc (which may change semantics)
+            # command into pure-Perl via otranspilerl-cli (which may change semantics)
             # and instead emit an exec('sh','-c', ...) where we preserve the
             # original quoting preference so Perl interpolation still occurs.
             my $skip_conversion_due_to_perl_interpolation = 0;
@@ -1286,10 +1284,10 @@ sub generate_exec_do_block {
             my $perl_inner;
             if (!$skip_conversion_due_to_perl_interpolation) {
                 # Try conversion using the raw inner shell text first. Passing the
-                # raw command (without additional surrounding quotes) to debashc
+                # raw command (without additional surrounding quotes) to otranspilerl-cli
                 # generally lets the parser see the intended shell syntax and
                 # enables generators (e.g. sha256sum/sha512sum) to emit pure-Perl
-                # implementations. otranspiler-only: the debashc --system path is
+                # implementations. otranspiler-only: the otranspilerl-cli --system path is
                 # retired — always fall to the exec('sh','-c', ...) path below
                 # (semantically exact; the legacy Generator conversion was
                 # nondeterministic and has been removed).
@@ -1298,7 +1296,7 @@ sub generate_exec_do_block {
             }
 
             if (defined $perl_inner) {
-                # Defensive: If debashc emitted a fallback that itself
+                # Defensive: If otranspilerl-cli emitted a fallback that itself
                 # contains a single-quoted system(... ) invocation while the
                 # original shell command contains single-quotes, the emitted
                 # Perl will be syntactically invalid (nested single-quotes).
@@ -1306,7 +1304,7 @@ sub generate_exec_do_block {
                 # exec('sh','-c', ...) using a safe non-interpolating Perl
                 # literal instead of splicing the broken snippet.
                 if ($perl_inner =~ /system\s*'/ && $shell_cmd_for_exec =~ /'/) {
-                    warn "DEBUG: debashc produced single-quoted system fallback; falling back to exec/sh path\n" if $verbose;
+                    warn "DEBUG: otranspilerl-cli produced single-quoted system fallback; falling back to exec/sh path\n" if $verbose;
                 } else {
                     # If conversion succeeded and looks safe, return the
                     # generated Perl fragment so the caller can splice it in.
@@ -1725,7 +1723,7 @@ sub replace_system_call_with_code {
     my ($system_call, $replacement_code) = @_;
     
     # If the replacement code is a hand-crafted exec/fork block or already a
-    # do{ ... } wrapper as emitted by debashc, avoid running it through
+    # do{ ... } wrapper as emitted by otranspilerl-cli, avoid running it through
     # extract_core_perl_logic_ppi which is intended to strip headers from
     # full generated scripts and can mangle quoting for small code
     # fragments. Detect common patterns for exec/fork/do-blocks and skip
@@ -2095,7 +2093,7 @@ sub replace_backtick_with_code {
 sub embed_enabled {
     # otranspiler-only (PLAN "migrate to otranspiler only"): the embed
     # path is THE backtick path; refusals fall to the exec fallback, never
-    # the legacy debashc Generator.
+    # the legacy otranspilerl-cli Generator.
     return $OTRANSPILERL ? 1 : 0;
 }
 
@@ -2184,188 +2182,6 @@ sub split_embed_fragment {
         return ($1, $f);
     }
     return ('', $f);
-}
-
-sub convert_shell_to_perl {
-    my ($shell_command, $is_backticks) = @_;
-    
-    return undef unless $shell_command;
-    
-    # Clean up the command
-    $shell_command =~ s/^\s+//;
-    $shell_command =~ s/\s+$//;
-    
-    return undef if !$shell_command;
-    
-    print "Converting shell command: $shell_command\n" if $verbose;
-    
-    # Use debashc to convert the shell command to Perl
-    # Backticks need inline expressions; system() calls should use the system path
-    my $mode = $is_backticks ? "--inline" : "--system";
-    # Invoke debashc directly without going through an intermediate shell so
-    # we don't have to shoehorn the shell snippet into a quoted shell
-    # string. This avoids nested-quoting/escaping issues where embedded
-    # single-quotes or other characters would be corrupted by an extra
-    # shell parsing layer. Capture both stdout and stderr from debashc and
-    # combine them for downstream extraction.
-    print "DEBUG: Running command: $debashc_path parse $mode <shell_command>\n" if $verbose;
-
-    my $stdout = '';
-    my $err = gensym;
-    my $out;
-    my $pid;
-    eval {
-        $pid = open3(undef, $out, $err, $debashc_path, 'parse', $mode, $shell_command);
-        1;
-    } or do {
-        warn "Failed to invoke debashc via open3: $@\n";
-        return undef;
-    };
-
-    # Read both stdout and stderr until EOF to avoid deadlocks on large output
-    my $sel = IO::Select->new();
-    $sel->add($out) if defined $out;
-    $sel->add($err);
-    while ($sel->count) {
-        for my $fh ($sel->can_read) {
-            my $buf;
-            my $bytes = sysread($fh, $buf, 8192);
-            if (defined $bytes) {
-                if ($bytes == 0) {
-                    $sel->remove($fh);
-                    close $fh;
-                } else {
-                    $stdout .= $buf;
-                }
-            } else {
-                # On error just remove the handle and continue
-                $sel->remove($fh);
-                close $fh;
-            }
-        }
-    }
-
-    waitpid($pid, 0);
-    my $exit_code = $? >> 8;
-
-    # Strip debashc debug chatter so the returned Perl is valid code.
-    $stdout =~ s/^DEBUG\b.*(?:\n|\z)//mg;
-
-    print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
-
-    if ($exit_code != 0) {
-        warn "debashc failed with exit code $exit_code: $stdout\n" if $verbose;
-        return undef;
-    }
-    
-    # Extract the Perl code from debashc output
-    my $perl_result = extract_perl_from_debashc_output($stdout, $is_backticks);
-
-    if ($perl_result && !$is_backticks) {
-        $perl_result = extract_core_perl_logic_ppi($perl_result);
-    }
-
-    # Defensive check: if debashc fell back to emitting a single-quoted
-    # system(...) invocation but the original shell command contains
-    # single-quote characters, the emitted Perl will be syntactically
-    # invalid (nested unescaped single-quotes). Treat this as a failed
-    # conversion so callers can fall back to a safe exec('sh','-c', ...) path
-    # which we construct using a non-interpolating Perl literal.
-    if (defined $perl_result && !$is_backticks) {
-        if ($perl_result =~ /system\s*'/ && $shell_command =~ /'/) {
-            warn "DEBUG: debashc emitted single-quoted system fallback while original command contains single-quotes; treating as conversion failure\n" if $verbose;
-            return undef;
-        }
-    }
-
-    if (!$perl_result) {
-        warn "Failed to extract Perl code from debashc output\n" if $verbose;
-        return undef;
-    }
-    
-    return $perl_result;
-}
-
-sub extract_perl_from_debashc_output {
-    my ($output, $is_backticks) = @_;
-    
-    print "DEBUG: extract_perl_from_debashc_output called with is_backticks=$is_backticks\n" if $verbose;
-    print "DEBUG: Output length: " . length($output) . "\n" if $verbose;
-    print "DEBUG: First 200 chars: " . substr($output, 0, 200) . "\n" if $verbose;
-    
-    # Check if this is an error message first
-    if ($output =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
-        return undef;
-    }
-    
-    # Look for Perl code in the output
-    # The output format might vary, so we try different patterns
-    
-    # Pattern 1: Look for code between markers (new format with blank lines)
-    if ($output =~ /==================================================\n\n(.*?)\n\n==================================================/s) {
-        my $inline_code = $1;
-        print "DEBUG: Pattern 1 matched, extracted code: [$inline_code]\n" if $verbose;
-        # Clean up the extracted code - remove trailing whitespace
-        $inline_code =~ s/\n\s*$//;
-        # Check if the code contains error messages
-        if ($inline_code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
-            return undef;
-        }
-        
-        # For non-backtick commands, return as-is
-        return $inline_code;
-    }
-    
-    # Pattern 1b: Look for code between markers (new format without blank lines)
-    if ($output =~ /==================================================\n(.*?)\n\n==================================================/s) {
-        my $inline_code = $1;
-        print "DEBUG: Pattern 1b matched, extracted code: [$inline_code]\n" if $verbose;
-        # Clean up the extracted code - remove trailing whitespace
-        $inline_code =~ s/\n\s*$//;
-        # Check if the code contains error messages
-        if ($inline_code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
-            return undef;
-        }
-        
-        # For non-backtick commands, return as-is
-        return $inline_code;
-    }
-    
-    # Pattern 2: Look for code after "Converting to Perl:" and between separator lines
-    if ($output =~ /Converting to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
-        my $code = $1;
-        # Check if the code contains error messages
-        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
-            return undef;
-        }
-
-        # For system calls, extract the executable core from the generated script.
-        if (!$is_backticks && $code =~ /#!/) {
-            $code = extract_core_perl_logic_ppi($code);
-        }
-        
-        # Clean up the code - remove trailing whitespace while preserving
-        # terminating semicolons for statement-valued do blocks.
-        $code =~ s/\n\s*$//;
-        $code .= ';' if $code =~ /^do\s*\{/ && $code !~ /;\s*$/;
-
-        return $code;
-    }
-    
-    # Pattern 3: If the output is just Perl code
-    if ($output =~ /^[^=]/ && $output !~ /Error|Failed|Parse error|Unexpected token/) {
-        # Reject whitespace-only output (e.g. debashc returns "\n\n" for variable commands)
-        return undef if $output !~ /\S/;
-
-        # Check if the code contains undefined variables or invalid syntax
-        if ($output =~ /undefined|undefined variable/i) {
-            return undef;
-        }
-        
-        return $output;
-    }
-    
-    return undef;
 }
 
 sub extract_core_perl_logic_ppi {
@@ -2523,7 +2339,7 @@ This script uses PPI (Perl Parsing Interface) to find instances of:
 - system() calls with shell commands
 - Backtick (`) command substitution
 
-It then uses debashc to convert these shell snippets into native Perl code.
+It then uses otranspilerl-cli to convert these shell snippets into native Perl code.
 
 =head1 OPTIONS
 
@@ -2545,9 +2361,9 @@ Modify the input file in place
 
 Write output to specified file
 
-=item --debashc-path <path>
+=item --otranspilerl-cli-path <path>
 
-Path to debashc executable (default: target/debug/debashc.exe)
+Path to otranspilerl-cli executable (default: target/debug/otranspilerl-cli.exe)
 
 =back
 
@@ -2556,11 +2372,11 @@ Path to debashc executable (default: target/debug/debashc.exe)
     perl purify.pl script.pl
     perl purify.pl -i script.pl
     perl purify.pl -o clean.pl script.pl
-    perl purify.pl --debashc-path /path/to/debashc script.pl
+    perl purify.pl --otranspilerl-cli-path /path/to/otranspilerl-cli script.pl
 
 =head1 REQUIREMENTS
 
-- debashc executable (built from this project)
+- otranspilerl-cli executable (built from this project)
 - PPI (Perl Parsing Interface)
 - Getopt::Long
 

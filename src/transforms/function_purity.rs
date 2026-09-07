@@ -38,7 +38,7 @@
 //! mutation.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer hooks: estree.rs reads the verdicts for
 //! its and/or flatten + pure-helper specialization; the C/GLSL/Go
 //! generators consume the same.

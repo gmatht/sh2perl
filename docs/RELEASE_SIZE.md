@@ -1,7 +1,7 @@
 # Release binary size
 
-Measured on `otranspiler` (the default user-facing binary, package `debashcl`,
-lib `debashl`), rustc 1.96.1, x86_64-unknown-linux-gnu.
+Measured on `otranspiler` (the default user-facing binary, package `otranspilerl`,
+lib `sh2perl core`), rustc 1.96.1, x86_64-unknown-linux-gnu.
 
 ## TL;DR
 
@@ -49,7 +49,7 @@ monomorphized, match-heavy functions (dev build, `cargo bloat`):
 - A1 JSON (de)serialization: `shir_json::stmt_json`/`expr_json` (65/41 KB),
   `shir_json_in::stmt_from` (55 KB) — serde on the giant `IrStmt`/`IrExpr` enums
 - glob/grep engine: `aho_corasick` Teddy AVX2 ×4 SIMD widths (~210 KB) + `regex_automata`
-- even the CLI's own `main_with_args` (~100 KB) and `debashcl::testing::*` test
+- even the CLI's own `main_with_args` (~100 KB) and `otranspilerl::testing::*` test
   functions (~86 KB)
 
 ## Release build: what is in the 6.2 MB
@@ -73,10 +73,10 @@ Code ownership of the 4.3 MB `.text`, by family (measured via `nm`):
 | backend fleet | 900 KB | c_backend 262 KB + go/python/rust/zig/java/sh/glsl/perl/lint 638 KB — only one runs per invocation |
 | legacy perl generator | 607 KB | `word_to_perl`, `simple_command`, `generic_builtin`, `grep`, `test_expr`, pipelines — **gated behind the `legacy-generator` feature (off by default)** |
 | estree emitters (`shir`) | 533 KB | `stmt_to_estree`, `expr_to_estree`, `try_native_param` |
-| `debashl` core | 513 KB | parser, ir, ast_words |
+| `sh2perl core` core | 513 KB | parser, ir, ast_words |
 | transforms (passes) | 307 KB | incl. `transform_stmt` |
 | regex/glob engine | 305 KB | `regex_automata` + `aho_corasick` |
-| `debashcl` cli | 126 KB | `main_with_args` 35 KB |
+| `otranspilerl` cli | 126 KB | `main_with_args` 35 KB |
 | A1 JSON ser/de | 106 KB | `stmt_json`/`expr_json`/`stmt_from` |
 
 Biggest single functions (release, LTO already collapsed the debug giants —
@@ -91,7 +91,7 @@ symbol sizes = 4.31 MB ≈ `.text`).
 
 ### Structural drivers (why it is this big)
 
-1. **"One library, every target."** `debashl` contains the legacy generator +
+1. **"One library, every target."** `sh2perl core` contains the legacy generator +
    estree emitters + all 10 backends, all reachable from `--target` dispatch, so
    LTO cannot drop them — ~1.5 MB of the 4.2 MB is renderers/generators only one
    of which is used per run.
@@ -119,7 +119,7 @@ dead weight for this binary.
 
 ```
 RUSTFLAGS="-C force-unwind-tables=no" cargo build --release \
-  --config 'profile.release.panic="abort"' -p debashcl --bin otranspiler
+  --config 'profile.release.panic="abort"' -p otranspilerl --bin otranspiler
 ```
 
 Result: `.eh_frame` **unchanged** (637.6 KB), `.text` unchanged (4278.3 KB),
@@ -159,7 +159,7 @@ size -A target/release/otranspiler | sort -k2 -rn | head
 nm -S --size-sort --radix=d target/release/otranspiler | tail -30
 
 # crate/function breakdown (cargo-bloat)
-cargo bloat -p debashcl --bin otranspiler -n 25
+cargo bloat -p otranspilerl --bin otranspiler -n 25
 
 # unwind tables
 readelf --debug-dump=frames target/release/otranspiler | grep -c "pc="   # FDE count

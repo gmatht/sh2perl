@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Wrapper script for Perl::Critic used by debashc tests.
+# Wrapper script for Perl::Critic used by otranspilerl-cli tests.
 # Usage: perl perlcritic_wrapper.pl [--profile <config_file>] <perl_file>
 # Runs perlcritic on the given file with the specified profile.
 

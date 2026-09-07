@@ -21,7 +21,7 @@
 //! Anything else is left untouched — refuse > guess.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated, like the
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated, like the
 //! rest of the registry). The sh2glsl CLI and the otranspiler wasm
 //! render shaders through `ast_to_ir_raw` — they must use `ast_to_ir`
 //! for the shared transform pipeline to run on shaders.

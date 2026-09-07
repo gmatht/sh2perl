@@ -14,7 +14,7 @@ fi
 
 # Check if www/pkg directory exists and has the expected files
 WASM_DIR="www/pkg"
-WASM_FILES=("$WASM_DIR/debashl_bg.wasm" "$WASM_DIR/debashl.js" "$WASM_DIR/debashl.d.ts")
+WASM_FILES=("$WASM_DIR/debashl_bg.wasm" "$WASM_DIR/sh2perl core.js" "$WASM_DIR/sh2perl core.d.ts")
 
 # Function to check if any source files are newer than WASM files
 needs_rebuild() {
@@ -49,7 +49,7 @@ needs_rebuild() {
 
 # Check if rebuild is needed
 if needs_rebuild; then
-    echo "Building WASM target for debashc..."
+    echo "Building WASM target for otranspilerl-cli..."
     
     # Build the WASM target
     echo "Compiling to WASM..."

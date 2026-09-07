@@ -1,6 +1,4 @@
 [workspace]
-members = [".", "cli"]
-default-members = [".", "cli"]
 
 [package]
 name = "debashl"
@@ -9,19 +7,13 @@ edition = "2021"
 
 [features]
 default = []
-# The legacy AST-side Perl generator (src/generator/, 36k lines, ~600 KB of
-# release .text). OFF by default: the new perl backend (ir::shir_to_perl)
-# compiles without it — emulated commands fall back to `bash -c` shell-out —
-# and the legacy CLI/wasm/wasi `to_perl` utilities degrade to a stub message.
-legacy-generator = []
 # Library (reactor) build for wasm32-wasip1: adds the plain C-ABI exports
-# (src/wasi_api.rs). Use:  cargo build --target wasm32-wasip1 --features wasi-lib --lib -p debashl
+# (src/wasi_api.rs). Use:  cargo build --target wasm32-wasip1 --features wasi-lib --lib
 wasi-lib = []
 
 [[bin]]
 name = "convert_examples"
 path = "src/bin/convert_examples.rs"
-
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -63,6 +55,3 @@ strip = true     # Strip symbols
 [profile.release.package."*"]
 opt-level = "z"
 
-[[bin]]
-name = "render_all_nodes"
-path = "src/bin/render_all_nodes.rs"

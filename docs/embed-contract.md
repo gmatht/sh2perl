@@ -169,7 +169,7 @@ A command substitution whose INNER command the renderer falls back to the
 `bash -c` capture path can emit the emulated Perl body as the bash command
 (`open(my $__fh, '-|', 'bash', '-c', q(sub { … }))`) — bash reports
 `sub: command not found`. This reproduces byte-for-byte through the
-standalone `debashc file --perl` (it is a `shir_to_perl` capture-path bug,
+standalone `otranspilerl-cli --target pl` (it is a `shir_to_perl` capture-path bug,
 not the embed profile). The corpus does not currently exercise this shape
 (`$(…)` in the middle of a double-quoted string with an emulable inner
 command). Fixes live in the shared renderer; the embed smoke matrix marks

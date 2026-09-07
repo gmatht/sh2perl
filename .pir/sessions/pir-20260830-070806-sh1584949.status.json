@@ -1,0 +1,9 @@
+{
+  "status": "completed",
+  "pid": 1681104,
+  "updated": 1788095335,
+  "built": "0.1.1",
+  "last_prompt": "Improve sh2perl until the go frontend written in go can be transpiled into a go frontend written in js that produces that same output as the original frontend written in go.",
+  "goal_pending": true,
+  "reason": ""
+}

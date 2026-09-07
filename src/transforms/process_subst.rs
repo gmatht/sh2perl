@@ -25,7 +25,7 @@
 //!
 //! ## Placement
 //!
-//! Registered in `transforms.rs` (gated by `DEBASHC_TRANSFORMS` like the
+//! Registered in `transforms.rs` (gated by `SH2_TRANSFORMS` like the
 //! rest of the registry) — it runs in `ast_to_ir`, i.e. the ESTree file
 //! pipeline and the `--shir` export — and is ALSO run at the A1 ingress
 //! (cli `--shir-in-estree` / `--shir-in-perl`), so frontend A1 JSON

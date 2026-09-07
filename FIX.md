@@ -30,7 +30,7 @@ variables such as $PROGRAM_NAME.
 Small purify.pl tweak
 ---------------------
 Also adjusted purify.pl so that when reconstructing list-form `system('sh','-c', ...)`
-we always first attempt to convert the raw inner shell text using debashc. If
+we always first attempt to convert the raw inner shell text using otranspilerl-cli. If
 that conversion fails we fall back to exec('sh','-c', q{...}) using a
 non-interpolating Perl literal. Additionally, purify.pl's helper that
 selects single- vs double-quoted Perl literals now prefers single-quoted
@@ -170,11 +170,11 @@ Files changed
   purify logic robust for constructs like for/if where the previous
   approach could misidentify the argument list.
 
-Fix: Avoid over-escaping single-quoted debashc literals in purify.pl
+Fix: Avoid over-escaping single-quoted otranspilerl-cli literals in purify.pl
 -----------------------------------------------------------------
 Problem
 -------
-When sanitizing debashc's emitted Perl snippets, purify.pl applied
+When sanitizing otranspilerl-cli's emitted Perl snippets, purify.pl applied
 aggressive backslash and quote escaping to all double- or single-quoted
 assigned command strings. That re-escaped already-correct single-quoted
 literals (containing sequences like \' ) turning them into invalid Perl
@@ -184,7 +184,7 @@ Fix
 ---
 Only apply the full backslash/double-quote/control-character escaping
 when the assigned string is double-quoted. For single-quoted literals
-preserve existing backslash escapes emitted by debashc and only encode
+preserve existing backslash escapes emitted by otranspilerl-cli and only encode
 raw control characters (\n, \r, \t) into backslash sequences so the
 generated Perl source does not contain literal newlines. This avoids
 producing malformed Perl like unescaped single quotes or excessive
@@ -198,7 +198,7 @@ Files changed
 Why this is minimal and safe
 ---------------------------
 This change is a narrow defensive tweak in purify.pl's post-processing
-of debashc output and only affects how control characters and existing
+of otranspilerl-cli output and only affects how control characters and existing
 escapes are handled for already-quoted literals. It prevents the
 specific syntax error observed in Example 024 without altering the
 generator's emitted Perl semantics.
@@ -207,16 +207,16 @@ Why this is minimal and safe
 ---------------------------
   This only changes how purify.pl locates system() calls in the parsed
   Perl AST; it does not change the conversion logic or the Rust
-  debashc behaviour. It fixes the specific failing example
+  otranspilerl-cli behaviour. It fixes the specific failing example
   examples.impurl/036_control_flow_basic.pl where loop headers were
   being mistaken for system() arguments.
 
-Fix: tolerate non-executable debashc binary in test harness
+Fix: tolerate non-executable otranspilerl-cli binary in test harness
 ---------------------------------------------------------
 Problem
 -------
-The test harness (test_purify.pl) previously required the debashc
-binary to be present and executable at target/debug/debashc. In some
+The test harness (test_purify.pl) previously required the otranspilerl-cli
+binary to be present and executable at target/debug/otranspilerl-cli. In some
 environments the file may exist but lack the executable bit (for
 example due to umask or filesystem extraction), causing the test to
 fail early with a confusing "not found" message.
@@ -233,15 +233,15 @@ builds where file modes may differ.
 Files changed
 -------------
 - test_purify.pl: attempt to set the executable bit on the built
-  debashc binary when present but not executable; improve error
+  otranspilerl-cli binary when present but not executable; improve error
   messaging.
 
 Why this is minimal and safe
 ---------------------------
 This change only affects the test harness and is a small, defensive
-improvement to avoid spurious failures when the debashc binary exists
+improvement to avoid spurious failures when the otranspilerl-cli binary exists
 but lacks execute permissions. It does not change any code generation
-paths or runtime behaviour of the debashc program itself.
+paths or runtime behaviour of the otranspilerl-cli program itself.
 
 Fix: Recombine split short-options when serializing shell commands
 -----------------------------------------------------------------
@@ -326,7 +326,7 @@ Why this is minimal and safe
 This change tightens a single regex used for post-processing generated snippets
 and fixes a concrete syntax-error observed in an example. It does not change
 the broader generator logic and keeps purify.pl as a thin wrapper around the
-Rust debashc output.
+Rust otranspilerl-cli output.
 
 Note: The regex replacement is now skipped when the statement being normalized
 is itself a `use Carp` import line. This prevents producing invalid import
@@ -373,7 +373,7 @@ Verification
 Regenerate the purified Perl for the failing example (examples.impurl/039_subshell_operations.pl)
 and confirm the placeholder no longer appears in the generated output.
 
-Fix: Strip DEBUG-prefixed stderr lines from debashc output in purify.pl
+Fix: Strip DEBUG-prefixed stderr lines from otranspilerl-cli output in purify.pl
 -------------------------------------------------------------------
 Problem
 -------
@@ -455,7 +455,7 @@ Fix: Ensure Digest::SHA is imported for generated sha*_hex usages
 ----------------------------------------------------------------
 Problem
 -------
-Some purified Perl snippets generated by the Rust debashc output call
+Some purified Perl snippets generated by the Rust otranspilerl-cli output call
 Digest::SHA functions (sha256_hex, sha512_hex) but the final spliced
 document did not always include the corresponding "use Digest::SHA"
 import. That caused runtime errors like "Undefined subroutine
@@ -548,7 +548,7 @@ host tools are absent.
 Fix
 ---
 When purify reconstructs a list-form `system('sh','-c', ...)` invocation we now
-try to convert the inner shell command to pure Perl first (via debashc). If the
+try to convert the inner shell command to pure Perl first (via otranspilerl-cli). If the
 conversion succeeds we inline the generated Perl instead of emitting an
 exec('sh','-c', ...) call. Only if conversion fails do we fall back to the
 exec/sh approach. This avoids spurious "not found" output when the external
@@ -597,7 +597,7 @@ Problem
 -------
 When handling list-form calls like system('sh','-c', ...), purify.pl reconstructed
 both a raw and a quoted version of the inner shell command but passed the raw
-form to debashc. The raw form could lose original single-quote characters which
+form to otranspilerl-cli. The raw form could lose original single-quote characters which
 prevented purify.pl's defensive check from detecting unsafe single-quoted
 generator fallbacks. That allowed nested unescaped single-quotes to be inserted
 into the final Perl output.
@@ -605,8 +605,8 @@ into the final Perl output.
 Fix
 ---
 Pass the semantics-preserving quoted shell command to convert_shell_to_perl so
-debashc sees the same shell quoting as the original source. Also use the same
-quoted string when checking for debashc single-quoted system(...) fallbacks so
+otranspilerl-cli sees the same shell quoting as the original source. Also use the same
+quoted string when checking for otranspilerl-cli single-quoted system(...) fallbacks so
 unsafe fallbacks are rejected and a safe exec('sh','-c', q{...}) fallback is
 used instead.
 
@@ -639,7 +639,7 @@ heuristics without changing semantics elsewhere.
 
 Additional runtime tweak
 ------------------------
-While testing I observed debashc sometimes failed to parse reconstructed
+While testing I observed otranspilerl-cli sometimes failed to parse reconstructed
 shell snippets when the inner command had been reassembled into a quoted
 form. To improve the converter's success rate (and allow it to emit pure-Perl
 implementations such as for sha256sum/sha512sum when available) purify.pl now

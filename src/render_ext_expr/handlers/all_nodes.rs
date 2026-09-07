@@ -409,7 +409,7 @@ pub fn cgo_call(node: &CgoCall, ctx: &ExprRenderCtx) -> Option<String> {
         // — only the C frontend build can provide it. Perl/JS render a
         // loud runtime failure, never silence.
         Backend::Perl => Some(format!(
-            "die \"debashc: cgo-path construct {} requires the C frontend build\\n\";",
+            "die \"otranspilerl: cgo-path construct {} requires the C frontend build\\n\";",
             node.target
         )),
         _ => None,

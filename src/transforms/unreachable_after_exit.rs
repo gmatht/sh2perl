@@ -24,7 +24,7 @@
 //! left alone.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). Complements
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Complements
 //! dead-store-elim and const-condition-elim (different unreachable
 //! classes).
 

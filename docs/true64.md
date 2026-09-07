@@ -7,7 +7,7 @@ silently corrupts:
 ```sh
 $ x=9007199254740992; x=$((x + 1)); echo "$x"
 9007199254740993        # bash: exact int64
-$ debashc --shir-in-estree <a1> | node estree-runner.mjs
+$ otranspilerl-cli --source-lang shir --target estree <a1> | node estree-runner.mjs
 9007199254740992        # default: the +1 vanished (Number rounding)
 ```
 
@@ -17,7 +17,7 @@ arithmetic. **Off by default** (the default path is unchanged).
 ## Usage
 
 ```
-debashc --shir-in-estree --true64 <file.a1>   # A1 -> ESTree, true 64-bit
+otranspilerl-cli --source-lang shir --target estree --true64 <file.a1>   # A1 -> ESTree, true 64-bit
 ```
 
 The flag may sit between the mode and the filename. Only the

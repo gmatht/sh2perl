@@ -18,7 +18,7 @@ for i in {1..5}; do
 done
 ```
 
-**Generated Perl** (from `debashc -i ../sh/001_simple.sh`):
+**Generated Perl** (from `otranspilerl-cli -i ../sh/001_simple.sh`):
 ```perl
 #!/usr/bin/env perl
 use strict;

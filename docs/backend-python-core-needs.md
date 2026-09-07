@@ -21,7 +21,7 @@ except under PyPy or with C extensions.
 |---|---|---|
 | A: ESTree JSON | JS-shaped — wrong shape | no |
 | B: Rust API | in-process only | no |
-| C: **ShIR JSON** (`debashc --shir`) | the ask — Python reads it directly (json module) | **yes** |
+| C: **ShIR JSON** (`otranspilerl-cli --shir`) | the ask — Python reads it directly (json module) | **yes** |
 
 Python is the *purest* consumer of path C: no compile step, `json.load`
 + a renderer module is the whole integration.

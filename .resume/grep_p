@@ -1,0 +1,33 @@
+Done. All eight forms from the sh.new files are now covered by the corpus example + unit tests.
+
+ What was added
+
+ examples/grep_p.sh (new corpus example — the missing "grep_p example"):
+ - functions.sh / softy: grep -Po '(?<=dev )(\S+)' in $(…) → verified output grep -Eo 'dev ([^[:space:]]+)' | sed 's/^dev //'
+ - jobs.sh: same + grep -v vpn_se | head -1 downstream → only the -P stage translated, the -v/head stages untouched
+ - snap-debug-info.sh: both (?:[0-9]+\s+Doing) and (?:[0-9]+\s+Error) → grep -Eo '([0-9]+[[:space:]]+Doing)' / '([0-9]+[[:space:]]+Error)'
+ - softy FQDN: the (?=^.{1,254}$)(…(?>)…(?!\d+\.)…) pattern → refused, stays grep -P (verified in generated code)
+ - memtester.sh / terminateProcess.sh: pgrep -P → untouched (the -P must not be mistaken for a PCRE flag)
+
+ Adaptations (documented in the file): kill -9 deliberately omitted (no corpus example may kill); the [[ "…" == "" ]] and [ -z "$VAR" ] / $(…) || true /   
+ for chg in $(…) shapes hit pre-existing perl-backend/parser gaps unrelated to grep-pcre, so the FQDN section uses grep -Pc counts — same refused pattern, 
+ deterministic.
+
+ Unit tests (23 total, all pass): snap Error variant, the softy FQDN pattern refusal, pgrep -P untouched, and a jobs.sh 4-stage pipeline test asserting    
+ the sed stage is inserted after the -P stage while -v/head -1 stay intact.
+
+ Gate evidence
+
+ - stdout + exit code byte-identical to bash (verified directly and via the harness).
+ - Full ./fail: 270 passed / 282 failed of 552 — the only delta vs. the pre-example run is grep_p.sh's own verdict: FAIL via the pre-existing check_qx     
+   pipeline-wrapping gate (the perl backend shells grep/sed out through bash -c — the same verdict the 015–019 grep examples already carry; not the        
+   translation, which is verified green in the generated code). The example header documents this.
+
+ Committed as e1771ba5 (pushed to origin/main), workspace gitlink bumped to 64089918.
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/llm/sh2loop/sh2perl (main)
+↑37M ↓187k R287k CH0.0% $16.406 26.5%/1.0M (auto)                                                              (ollama-cloud) deepseek-v4-flash:0731 • high
+To resume this session: pi --session 01a071ce-3109-7695-afb6-f7cc0e786185

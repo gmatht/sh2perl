@@ -10,7 +10,7 @@ use Cwd qw(abs_path);
 # Usage: check_side_effects.pl <test.sh>
 
 my $WATCH_DIRS = ['.'];  # watch sh2perl/ (examples, examples.out, etc.)
-my $debashc = './target/debug/debashc';
+my $otranspilerl-cli = './target/debug/otranspilerl-cli';
 my $violations = 0;
 
 $SIG{__WARN__} = sub {};
@@ -62,7 +62,7 @@ sub capture_side_effects {
     if ($mode eq 'bash') {
         system('bash', $script);
     } else {
-        my $raw = `$debashc parse --perl "$script" 2>/dev/null`;
+        my $raw = `$otranspilerl-cli parse --perl "$script" 2>/dev/null`;
         if ($? != 0 || !defined $raw || $raw !~ m{#!/}) {
             return ("PERL GENERATION FAILED");
         }

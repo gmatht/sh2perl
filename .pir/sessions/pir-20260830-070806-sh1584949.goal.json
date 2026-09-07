@@ -1,0 +1,37 @@
+{
+  "objective": "Make the go-sh (Go) frontend transpile via sh2perl's estree backend into JS that, run through the sh2 runtime, produces byte-identical A1 JSON to the native go-sh binary (fail-go-app gate).",
+  "status": "active",
+  "steps": [
+    {
+      "id": 1,
+      "description": "Probe how go-sh lowers map[string]any composites / append / json.Marshal to JS, and what runtime jsonMarshal produces",
+      "status": "inprogress",
+      "note": ""
+    },
+    {
+      "id": 2,
+      "description": "Lower `shiremit.Emit(prog)` to a runtime jsonMarshal call (frontend change)",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 3,
+      "description": "Extend runtime JSON serialization to faithfully emit an A1 program object (obj/list/map recursion + numeric typing parity)",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 4,
+      "description": "Verify fail-go --app frontends/go-sh/go-sh.go converges to PASS without regressing the 103/103 corpus",
+      "status": "pending",
+      "note": ""
+    },
+    {
+      "id": 5,
+      "description": "Commit in sh2perl submodule + bump gitlink in workspace",
+      "status": "pending",
+      "note": ""
+    }
+  ],
+  "notes": "Confirmed scope: corpus 103/103 green. Frontier = dog-food self-host of go-sh.go, single blocker `shiremit.Emit` at line 9846. estree backend renders NONE of the object-store/JSON family (jsonMarshal, objNew, assocSet, listNew, etc.) — go-sh.go emits them throughout. So work spans: (1) estree+runtime jsonMarshal/assoc serialization, (2) go-sh.go lowering Emit->jsonMarshal of an assoc 'prog'. Need byte-identical encoding/json parity (sorted keys, numeric typing). Must not regress 103/103 corpus."
+}

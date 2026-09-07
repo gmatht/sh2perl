@@ -28,7 +28,7 @@ Three ways a C backend can talk to core:
 |---|---|---|
 | A: ESTree JSON (`--estree`) | JS-shaped ESTree + `sh2.*` calls | wrong shape long-term |
 | B: Direct ShIR via Rust API (`shir::ast_to_ir`) | `IrProgram` in-process | works only for Rust-written backends |
-| C: **Serialized ShIR JSON** (`debashc file --shir`) | language-neutral IR as JSON | **the ask — DONE (A1)** |
+| C: **Serialized ShIR JSON** (`otranspilerl-cli --target shir`) | language-neutral IR as JSON | **the ask — DONE (A1)** |
 
 Path C mirrors the ESTree-JSON decision that decoupled sh2runtime: core
 lowers once, every backend renders. It does not replace `--estree`; it
@@ -149,7 +149,7 @@ sync with it — see `docs/estree-contract.md` §5.
 
 | # | Ask | Where | Status |
 |---|---|---|---|
-| A1 | `debashc file --shir`: serialize `IrProgram` as language-neutral JSON | `src/shir_json.rs` + CLI (`file --shir`, `--shir`) + `pub mod shir_json` | **DONE** |
+| A1 | `otranspilerl-cli --target shir`: serialize `IrProgram` as language-neutral JSON | `src/shir_json.rs` + CLI (`file --shir`, `--shir`) + `pub mod shir_json` | **DONE** |
 | A2 | `IrType {Int,Str,Any}` + `analyze_var_types` serializing the lift verdicts | `src/ir.rs`, `src/shir.rs`, `IrProgram.var_types` | **DONE** |
 | A3 | purity tag on `Call`/`Exec`/`Pipeline` (A4 mapping) | `src/shir_json.rs` | **DONE** |
 | A4 | machine-readable `sh2.*` spec | workspace harness `sh2-namespace.json` | **DONE** |
@@ -163,7 +163,7 @@ gate + metric mirroring the JS harness.
 
 ## 9. What the draft proved
 
-The ESTree-JSON-consumer draft ran end-to-end (`sh → debashc --estree →
+The ESTree-JSON-consumer draft ran end-to-end (`sh → otranspilerl-cli --target estree →
 renderer → gcc → run`) and matched bash on the lowerable subset. Its
 failures were exactly the v2 objections, now concrete: type inference
 (guessed `long long` vs `char*` from init literals — core has the real

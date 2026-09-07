@@ -24,7 +24,7 @@
 //! so the pass only fires on literal-known non-negative dividends.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). Renderer
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Renderer
 //! hooks: the C/Go/Rust/Zig/JS generators emit `x >> n` (for `Div`) and
 //! `x & (2^n - 1)` (for `Mod`) when the verdict is set; the GLSL backend
 //! ignores the verdict and keeps `/`. Prereq: i32-provable (the widening

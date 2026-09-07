@@ -35,7 +35,7 @@
 //! each `seg` is preserved exactly.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). Analysis
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Analysis
 //! only, no structural mutation. Renderer hooks: estree.rs (the shrinking
 //! `blk_p` cons-chain), and any backend with a mutable string builder.
 

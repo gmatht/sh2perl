@@ -1,0 +1,9 @@
+{
+  "status": "interrupted",
+  "pid": 1227611,
+  "updated": 1788777919,
+  "built": "0.1.1",
+  "last_prompt": "JUST LOOK ALREADY",
+  "goal_pending": true,
+  "reason": "turn error: request cancelled"
+}

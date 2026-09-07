@@ -60,7 +60,7 @@
 //!
 //! Register: `("sync-ok-loops", sync_ok_loops::transform),` (the estree
 //! worker appends this to `transforms::all()` when it compile-ins the
-//! file). Gated by `DEBASHC_TRANSFORMS` like every transform.
+//! file). Gated by `SH2_TRANSFORMS` like every transform.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -84,7 +84,7 @@ const STMT_COST_US: u64 = 3;
 // ── Verdicts (pointer-keyed, mirroring ASYNC_REGION_LOOPS) ───────────
 // Set once per compilation by `transform` (ast_to_ir), read by the
 // renderer hooks. Empty when the transform is disabled (the
-// DEBASHC_TRANSFORMS gate skips `transform`, so the statics stay None).
+// SH2_TRANSFORMS gate skips `transform`, so the statics stay None).
 static SYNC_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static BATCH_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -131,7 +131,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 }
 
 /// Shared verdict computation over an immutable statement list. Called by
-/// [`transform`] (the `DEBASHC_TRANSFORMS`-gated ast_to_ir hook) AND
+/// [`transform`] (the `SH2_TRANSFORMS`-gated ast_to_ir hook) AND
 /// re-run by the ESTree renderer under the compile lock (shir.rs
 /// `shir_to_estree`) so the pointer keys the emission reads are the
 /// authoritative ones for THIS compilation — the statics are

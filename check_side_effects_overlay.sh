@@ -5,8 +5,8 @@
 TEST="$1"
 [ -n "$TEST" ] || { echo "Usage: $0 <test.sh>"; exit 1; }
 
-SRC="/nvme/ai/sh2loop/sh2perl"
-DEBASHC="$SRC/target/debug/debashc"
+SRC="$(cd "$(dirname "$0")" && pwd)"
+OTRANS="$(cd "$SRC/.." && pwd)/otranspilerl/target/debug/otranspilerl-cli"
 VIOLATIONS=0
 
 for MODE in bash perl; do
@@ -22,7 +22,7 @@ for MODE in bash perl; do
     if [ "$MODE" = "bash" ]; then
         bash "$TEST" 2>&1 || true
     else
-        PERL_CODE=$("$DEBASHC" parse --perl "$VIEW/$TEST" 2>/dev/null | sed -n '/^#!/,/^===/p' | head -n -1)
+        PERL_CODE=$("$OTRANS" --target pl "$VIEW/$TEST" 2>/dev/null)
         if [ -n "${PERL_CODE:-}" ]; then
             echo "$PERL_CODE" | timeout 30 perl - 2>&1 || true
         else

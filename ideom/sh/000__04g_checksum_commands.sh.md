@@ -27,7 +27,7 @@ echo "SHA512 result: $sha512_result"
 
 # strings command with backticks
 #PERL_MUST_NOT_CONTAIN `strings
-strings_result=`strings target/debug/debashc.exe | head -3`
+strings_result=`strings target/debug/otranspilerl-cli.exe | head -3`
 echo "Strings result:"
 echo "$strings_result"
 
@@ -118,7 +118,7 @@ my $strings_result = do {
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     my $input_data;
-    if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
+    if ( open my $fh, '<', 'target/debug/otranspilerl-cli.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;;
 say "Strings result:";
 say $strings_result;
@@ -153,7 +153,7 @@ say "=== Checksum Commands Complete ===";
 | 1 | **Redundant `do { ... }` wrapper for simple assignment** | `my $sha256_result = do { my @results; if (...) { ... } join(...) . "\n"; };` | `my $sha256_result = sha256_hex( slurp('test_checksum.txt') ) . "  test_checksum.txt\n";` | Yes |
 | 2 | **STDOUT save/restore for redirect** | `do { open my $orig, '>&', STDOUT; open STDOUT, '>', $file; print $tmp; open STDOUT, '>&', $orig; close $orig; };` | `system 'echo', 'test content', '>', 'test_checksum.txt';` or `write_file('test_checksum.txt', "test content\n");` | Yes |
 | 3 | **Verbose file slurp with manual open/close** | `do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', $file or croak "..."; my $content = <$fh>; close $fh or croak "..."; $content; }` | `do { local $/; open my $fh, '<', $file; <$fh> }` | Yes |
-| 4 | **Pipeline infrastructure for `strings... \| head -3`** | `do { do { my $output_0 = q{}; my $output_printed_0; my $pipeline_success_0 = 1; my $input_data; if (open ...) { local $INPUT_RECORD_SEPARATOR = undef;; ...` (with no actual command execution) | `my $strings_result = qx{strings target/debug/debashc.exe | head -3};` | Yes |
+| 4 | **Pipeline infrastructure for `strings... \| head -3`** | `do { do { my $output_0 = q{}; my $output_printed_0; my $pipeline_success_0 = 1; my $input_data; if (open ...) { local $INPUT_RECORD_SEPARATOR = undef;; ...` (with no actual command execution) | `my $strings_result = qx{strings target/debug/otranspilerl-cli.exe | head -3};` | Yes |
 | 5 | **Over-verbose `rm -f` translation** | `if (-e "file") { if (-d "file") { carp "... is a directory ..." } else { if (unlink "file") { } else { carp "... could not remove ..." } } } else { local $CHILD_ERROR = 0; }` | `unlink 'test_checksum.txt'` or `system 'rm', '-f', 'test_checksum.txt';` | Yes |
 | 6 | **Unused imports** | `use IPC::Open3; use File::Path qw(make_path remove_tree);` | (remove entirely) | Yes |
 | 7 | **Non-idiomatic error variables** | `$OS_ERROR`, `$INPUT_RECORD_SEPARATOR`, `$ERRNO`, `croak`, `carp` without `use English` or `use Carp` | Use `$!`, `$/`, and import `croak`/`carp` from `Carp`, or use `die`/`warn` | Yes |
@@ -289,7 +289,7 @@ Instead of the current 9-line open/close/croak pattern.
 **IR node involved:** `IrStmt::System { capture: Some("strings_result") }`. The generator should recognize that `strings ... | head -3` is a command substitution and emit a single `System` capture. The `ir_to_perl()` backend would produce:
 
 ```perl
-my $strings_result = qx{strings target/debug/debashc.exe | head -3};
+my $strings_result = qx{strings target/debug/otranspilerl-cli.exe | head -3};
 $CHILD_ERROR = $? >> 8;
 ```
 

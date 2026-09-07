@@ -46,7 +46,7 @@
 //!    infinitely).
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). Reuses the
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Reuses the
 //! shir.rs lastExit-liveness helpers (`walk_lastexit_liveness` /
 //! `lastexit_scan_top_read` / `is_pure_test_chain` — made pub(crate)).
 

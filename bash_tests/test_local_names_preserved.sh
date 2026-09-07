@@ -2,7 +2,7 @@ set -ex
 
 mkdir -p tmp
 
-cargo run --bin debashc examples/061_test_local_names_preserved.sh > tmp/output_local_names.txt 2> tmp/output_local_names.err
+cargo run --bin otranspilerl-cli examples/061_test_local_names_preserved.sh > tmp/output_local_names.txt 2> tmp/output_local_names.err
 
 fgrep 'sub test_math($first_number, $second_number, $operation) {' < tmp/output_local_names.txt
 fgrep 'sub test_strings($input_string, $search_pattern, $replacement) {' < tmp/output_local_names.txt

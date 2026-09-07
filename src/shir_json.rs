@@ -15,7 +15,7 @@
 //!     buffer sizing and copy-vs-move input).
 //! Deterministic: same input → byte-identical JSON.
 //!
-//! Usage: `debashc file --shir foo.sh` (or `debashc --shir <input>`).
+//! Usage: `otranspilerl-cli --target shir foo.sh` (A1 to stdout).
 //! See docs/backend-c-core-needs.md §8 (A1) and docs/estree-contract.md.
 
 use crate::ir::*;

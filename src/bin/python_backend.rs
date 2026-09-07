@@ -3,7 +3,7 @@
 //! Compiles the python renderer IN (debashl::python_backend) and drives it
 //! directly from the parsed ShIR — no `--shir` JSON round-trip. Usage:
 //!
-//!     debashc file --shir foo.sh            # the JSON contract path (core)
+//!     otranspilerl-cli --target shir foo.sh       # the JSON contract path (core)
 //!     python_backend foo.sh                  # this: library path, in-process
 //!
 //! Debugging aid: prints the generated python to stdout.

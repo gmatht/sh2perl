@@ -38,7 +38,7 @@
 //!   value, not a Promise.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! emitter needs no new arms: `IrStmt::Return` renders natively and
 //! `Call("fnValue")` renders `sh2.fnValue(...)` (the general call path).
 

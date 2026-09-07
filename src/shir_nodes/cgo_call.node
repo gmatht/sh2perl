@@ -15,7 +15,7 @@
 #   JS   : sh2.cgoUnsupported("target") — throws at RUNTIME (never
 #          silently wrong); browser deployments bundle the WASM/native
 #          bridge instead.
-#   Perl : die "debashc: cgo-path construct <target> requires the C
+#   Perl : die "otranspilerl: cgo-path construct <target> requires the C
 #          frontend build\n"
 
 node CgoCall

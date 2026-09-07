@@ -36,7 +36,7 @@
 //! Anything else is left untouched — refuse > guess.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated). The estree
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer arms: estree.rs, cfront.rs and the
 //! C/Go/Perl generators each add a `Capture { expr: Call }` arm (run the
 //! function with a fresh output buffer, return the concatenated lines).

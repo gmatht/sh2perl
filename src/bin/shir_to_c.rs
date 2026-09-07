@@ -1,6 +1,6 @@
 //! DRAFT: ShIR JSON -> C renderer (universal backend contract, path C).
 //!
-//! Consumes `debashc file --shir foo.sh` output on stdin and emits C,
+//! Consumes an A1 shIR contract (otranspilerl-cli --target shir) on stdin and emits C,
 //! via the worktree's library renderer (`c_backend::shir_to_c`) after a
 //! ShIR-JSON round-trip (`shir_json_in::shir_json_to_ir`).
 //!
@@ -14,7 +14,7 @@
 //! a JS rendering.
 //!
 //! Usage:
-//!   debashc file --shir foo.sh | cargo run --bin shir_to_c > foo.c \
+//!   otranspilerl-cli --target shir foo.sh | cargo run --bin shir_to_c > foo.c \
 //!     && gcc foo.c -lm -o foo && ./foo
 
 use std::io::{self, Read};

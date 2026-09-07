@@ -19,7 +19,7 @@
 //!   node) leaves the whole exec untouched — refuse > guess.
 //!
 //! ## Placement
-//! Registered in `transforms.rs` (DEBASHC_TRANSFORMS gated, like the
+//! Registered in `transforms.rs` (SH2_TRANSFORMS gated, like the
 //! rest of the registry). The sh renderer's separate job is to render
 //! `Assign{Arith(Assign{compound})}` as a plain `x=$((x + 1))` (and
 //! IncDec as `((x++))` / `x=$((x + 1))`); the IR shape is now what

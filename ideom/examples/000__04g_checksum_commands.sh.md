@@ -13,7 +13,7 @@ sha256_result=`sha256sum test_checksum.txt`
 echo "SHA256 result: $sha256_result"
 sha512_result=`sha512sum test_checksum.txt`
 echo "SHA512 result: $sha512_result"
-strings_result=`strings target/debug/debashc.exe | head -3`
+strings_result=`strings target/debug/otranspilerl-cli.exe | head -3`
 echo "Strings result:"
 echo "$strings_result"
 rm -f test_checksum.txt
@@ -75,7 +75,7 @@ my $strings_result = do {
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     my $input_data;
-    if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
+    if ( open my $fh, '<', 'target/debug/otranspilerl-cli.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;;
 say "Strings result:";         # ← BUG: escaped the do-block
 say $strings_result;           # ← BUG: references var before assignment completes
@@ -325,7 +325,7 @@ my $strings_result = do {
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     my $input_data;
-    if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
+    if ( open my $fh, '<', 'target/debug/otranspilerl-cli.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;;
 say "Strings result:";         # ← lines escaped from the do-block
 say $strings_result;           # ← references var before assignment completes
@@ -340,11 +340,11 @@ The braces are unbalanced: three `do {` openings but only three `}` closings, wi
 
 **Idiomatic Perl**:
 ```perl
-my $strings_result = qx{strings target/debug/debashc.exe | head -3};
+my $strings_result = qx{strings target/debug/otranspilerl-cli.exe | head -3};
 ```
 
 **IR-fixable?** Yes — but only if the generator produces correct IR nodes. The structural bug is in the generator's string concatenation logic, not in the pretty-printer. With IR:
-- The generator would produce `IrStmt::System { capture: Some("strings_result"), cmd: "strings", args: ["target/debug/debashc.exe"], pipe_to: "head -3" }` (or a `Pipeline` node).
+- The generator would produce `IrStmt::System { capture: Some("strings_result"), cmd: "strings", args: ["target/debug/otranspilerl-cli.exe"], pipe_to: "head -3" }` (or a `Pipeline` node).
 - The pretty-printer would emit `my $strings_result = qx{strings ... | head ...};` — a single line.
 - Since the IR is a tree, brace nesting is handled automatically by `emit_stmt` with `indent_level` tracking, eliminating the class of bug where string concatenation produces mismatched braces.
 

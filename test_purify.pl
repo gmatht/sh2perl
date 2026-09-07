@@ -62,30 +62,30 @@ my $repo_root = dirname(abs_path($0));
 my $workspace_root = File::Spec->catdir($repo_root, '.test-work', 'purify');
 make_path($workspace_root);
 my $purify_pl = File::Spec->catfile($repo_root, 'purify.pl');
-my $debashc_path = File::Spec->catfile($repo_root, 'target', 'debug', 'debashc');
+my $otranspilerl_path = File::Spec->catfile($repo_root, 'target', 'debug', 'otranspilerl-cli');
 # On Windows try the .exe suffix if the plain name isn't executable
-if ($^O eq 'MSWin32' && !-x $debashc_path && -f "$debashc_path.exe") {
-    $debashc_path .= '.exe';
+if ($^O eq 'MSWin32' && !-x $otranspilerl_path && -f "$otranspilerl_path.exe") {
+    $otranspilerl_path .= '.exe';
 }
 
 # If the file doesn't exist, error out.
-if (!-e $debashc_path) {
-    die "Error: debashc not found at '$debashc_path'. Please build the project first with 'cargo build'\n";
+if (!-e $otranspilerl_path) {
+    die "Error: otranspilerl-cli not found at '$otranspilerl_path'. Please build the project first with 'cargo build'\n";
 }
 
 # If the file exists but is not executable, attempt to set the executable
 # bit on Unix-like systems so the test harness can run it. If chmod fails
 # or we're on Windows and the file isn't executable, bail with an error.
-if (!-x $debashc_path) {
+if (!-x $otranspilerl_path) {
     if ($^O ne 'MSWin32') {
-        my $ok = chmod 0755, $debashc_path;
+        my $ok = chmod 0755, $otranspilerl_path;
         if ($ok) {
-            print "Notice: set executable bit on '$debashc_path'\n" if $verbose;
+            print "Notice: set executable bit on '$otranspilerl_path'\n" if $verbose;
         } else {
-            die "Error: debashc exists at '$debashc_path' but is not executable and chmod failed. Please run 'chmod +x $debashc_path' or rebuild with cargo.\n";
+            die "Error: otranspilerl-cli exists at '$otranspilerl_path' but is not executable and chmod failed. Please run 'chmod +x $otranspilerl_path' or rebuild with cargo.\n";
         }
     } else {
-        die "Error: debashc not found or not executable at '$debashc_path'. Please build the project first with 'cargo build'\n";
+        die "Error: otranspilerl-cli not found or not executable at '$otranspilerl_path'. Please build the project first with 'cargo build'\n";
     }
 }
 
@@ -303,7 +303,7 @@ sub assert_rewrites_backticks {
     my ($out_fh, $output_path) = tempfile();
     close $out_fh;
 
-    my $command = "$perl_cmd \"$purify_pl\" --debashc-path \"$debashc_path\" \"$input_path\" > \"$output_path\" 2>&1";
+    my $command = "$perl_cmd \"$purify_pl\" --otranspilerl-cli-path \"$otranspilerl_path\" \"$input_path\" > \"$output_path\" 2>&1";
     my ($output, $result) = run_backticks_with_timeout($command, 'purify_execution', $name);
     if ($result != 0) {
         die "$name failed: $output\n";
@@ -387,7 +387,7 @@ foreach my $perl_file (@test_files) {
         eval {
             # Test purify.pl on the Perl file and capture output
             debug_print(2, "Running purify.pl on $perl_file");
-            my ($output, $purify_result) = run_backticks_with_timeout("$perl_cmd \"$purify_pl\" --debashc-path \"$debashc_path\" \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
+            my ($output, $purify_result) = run_backticks_with_timeout("$perl_cmd \"$purify_pl\" --otranspilerl-cli-path \"$otranspilerl_path\" \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
             debug_print(2, "purify.pl result: $purify_result");
 
                 if ($purify_result == 0) {
