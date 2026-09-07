@@ -12,11 +12,14 @@ narrowing THEM is the behavior change.
 | Source | Default flag | Exact home | Narrow-on-proof |
 |---|---|---|---|
 | shell (bash/zsh/ksh/dash) | `--true64` | i64 wraparound (bash-exact) | yes — proven ≤2^53 vars stay Number |
-| Python / JS origin | `--bigint` | bignum everywhere | yes — same verdict machinery |
+| Python origin | `--bigint` | bignum everywhere | yes — same verdict machinery |
+| JS origin | default (Number) | **f64 double** — JS arithmetic IS double; `2**53+1` rounding, `0.1+0.2`, NaN/±Infinity are faithful emulation, not bugs | n/a — no wider contract to restore |
 | C origin | typed verdicts | the declared `var_types` type | n/a (already typed) |
 
 `--bigint` implies true64 semantics (a superset): i64 values are exact
-inside it; only >64-bit magnitudes distinguish it.
+inside it; only >64-bit magnitudes distinguish it. It applies to
+BIGNUM-language sources (Python, Ruby, …) — JS-origin sources default to
+the f64 Number path, which IS their native arithmetic.
 
 ## Mechanism (shared, shIR-level)
 
