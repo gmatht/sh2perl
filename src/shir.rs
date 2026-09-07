@@ -39140,6 +39140,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
     fn try_stmt_lowers_to_js_try_catch() {
         use crate::ir::{IrExpr, IrProgram, IrStmt, TryExcept};
         let mk = |else_body: Vec<IrStmt>, finally_body: Vec<IrStmt>| IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Try {
@@ -39166,7 +39167,6 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
-            var_storage: vec![],
             var_bash_env: vec![],
         };
         // bare try/except: TryStatement + CatchClause + instanceof ladder

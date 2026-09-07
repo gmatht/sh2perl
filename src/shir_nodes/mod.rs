@@ -185,6 +185,7 @@ mod tests {
             body: vec![IrStmt::Expr(crate::ir::IrExpr::Int(1))],
         }));
         let prog = IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![ext],
@@ -195,7 +196,6 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
-            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json(&prog);
@@ -237,6 +237,7 @@ mod tests {
             ],
         }));
         let prog = IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![ext],
@@ -247,7 +248,6 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
-            var_storage: vec![],
             var_bash_env: vec![],
         };
         let perl = crate::ir::shir_to_perl(&prog);

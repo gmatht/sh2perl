@@ -709,6 +709,7 @@ mod tests {
 
     fn program(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts,
@@ -719,7 +720,6 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
-            var_storage: vec![],
             var_bash_env: vec![],
         }
     }
