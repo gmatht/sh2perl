@@ -1424,13 +1424,19 @@ fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<(char, String)>)>, usi
                     i += 1;
                 }
             }
+            // C LENGTH MODIFIERS (%lld, %zu, %hhd) — skip them so the
+            // conversion char is recognized
+            while i < chars.len() && matches!(chars[i], 'l' | 'h' | 'L' | 'z' | 'j' | 't') {
+                i += 1;
+            }
             let Some(&conv) = chars.get(i) else {
                 return None;
             };
             if has_prec {
                 return None;
             }
-            // [-0-9]* flags+width carried on the spec ('' when bare)
+            // [-0-9]* flags+width captured BEFORE the length-modifier skip
+            // so %lld's 'll' doesn't end up in the java format string
             let fw: String = chars[flags_start..i].iter().collect();
             match conv {
                 's' | 'd' | 'i' | 'u' => {
@@ -2553,7 +2559,11 @@ fn arith_str(a: &ArithAst) -> Result<String, String> {
 fn arith_to_java(a: &ArithAst, out: &mut String) -> Result<(), String> {
     match a {
         ArithAst::Num(n) => {
-            out.push_str(&n.to_string());
+            if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
+                out.push_str(&format!("{n}L"));
+            } else {
+                out.push_str(&n.to_string());
+            }
             Ok(())
         }
         ArithAst::Var(name) | ArithAst::Ident(name) => {
