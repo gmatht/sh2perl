@@ -2434,6 +2434,19 @@ impl Render {
     /// refresh every call — `while (cond)` must re-evaluate them per
     /// iteration (a hoisted temp would go stale).
     fn cond_site(&mut self, cond: &IrExpr) -> String {
+        // A PURE condition (nothing emitted while rendering it) needs no
+        // helper: the expr self-evaluates in the C `while (…)`, and any
+        // _cap_N()/site calls inside it re-run per iteration anyway. The
+        // wrapper existed only to refresh hoisted numeric temps — nothing
+        // to refresh when rendering emitted no lines. (Without this, even
+        // `while (i < n)` grew a site whose `return !_sh_system_rc();`
+        // tail kept _sh_rc — and the whole shell-out runtime — alive.)
+        let mark = self.out.len();
+        let v = self.expr(cond);
+        if self.out.len() == mark {
+            return v;
+        }
+        // temps were emitted: keep the site (re-renders per iteration)
         let cond = cond.clone();
         self.shell_site(
             |r| {
