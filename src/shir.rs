@@ -4675,7 +4675,7 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // Shared optimization passes (M6): the same optimize_stmts the Perl
     // backend runs now also runs here, so future passes (constant folding,
     // dead-assignment elimination) benefit both consumers of the IR.
-    // Then apply worker-submitted transforms (gated by DEBASHC_TRANSFORMS;
+    // Then apply worker-submitted transforms (gated by SH2_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
     let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
     let mut stmts: Vec<IrStmt> = Vec::new();
@@ -15058,6 +15058,26 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // stay store-bound — a native binding would never see the
                 // write (and the native binding's value would be stale for
                 // every later read). Mirror of the string-lift walker.
+                // The go-sh self-hosting helpers (byteAt / jsonGet /
+                // jsonSet / jsonArrGet / jsonArrSet / jsonArrAppend) read
+                // their name arg from the STORE (byteAt("src", "i") — the
+                // runtime resolves "src" via getVar) — a lifted binding
+                // would desync, so mark the name arg (and byteAt's index
+                // identifiers) as store-read.
+                if matches!(
+                    func.as_str(),
+                    "byteAt" | "jsonGet" | "jsonSet" | "jsonArrGet" | "jsonArrSet"
+                        | "jsonArrAppend"
+                ) {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        string_ctx.insert(n.clone());
+                    }
+                    if func == "byteAt" {
+                        if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                            mark_all_idents(t, string_ctx);
+                        }
+                    }
+                }
                 if func == "exec" || func == "builtin" {
                     // `builtin` is the sync-builtin-dispatch callee (M8) —
                     // same write-builtin semantics as exec-lowered builtins
@@ -15902,7 +15922,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // (the transform's ast_to_ir hook also runs it, but the statics are
     // per-compilation global state — parallel compilations would tear
     // them between the ast_to_ir write and this read). Gated by
-    // DEBASHC_TRANSFORMS like the transform machinery itself.
+    // SH2_TRANSFORMS like the transform machinery itself.
     if crate::transforms::transform_enabled("sync-ok-loops") {
         crate::transforms::sync_ok_loops::apply_to(&prog.stmts);
     }
@@ -31305,6 +31325,24 @@ fn lift_walk_expr(
                     }
                 }
             }
+            // the go-sh self-hosting helpers read their name arg from the
+            // STORE (byteAt("src", "i") — the runtime resolves "src" via
+            // getVar) — a lifted binding would desync, so mark the name
+            // arg (and byteAt's index identifiers) as store-read.
+            if matches!(
+                func.as_str(),
+                "byteAt" | "jsonGet" | "jsonSet" | "jsonArrGet" | "jsonArrSet"
+                    | "jsonArrAppend"
+            ) {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    string_ctx.insert(n.clone());
+                }
+                if func == "byteAt" {
+                    if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                        lift_mark_all_idents(t, string_ctx);
+                    }
+                }
+            }
             if func == "exec" || func == "builtin" {
                 // `builtin` is the sync-builtin-dispatch callee (M8) —
                 // same write-builtin semantics as exec-lowered builtins
@@ -38890,7 +38928,10 @@ mod const_analysis_tests {
 
     #[test]
     fn single_assignment_is_const() {
-        let v = consts_of("x=5\necho $x");
+        // a capture def survives copy-propagation (not a literal — the
+        // fold refuses), so the single-assignment const verdict is what
+        // the analysis records, not the folded/eliminated store
+        let v = consts_of("x=$(echo 5)\necho $x");
         assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Const));
     }
 

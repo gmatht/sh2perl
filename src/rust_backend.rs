@@ -9452,7 +9452,7 @@ mod tests {
 
     #[test]
     fn assigns_and_echo() {
-        let out = render("x=5\necho \"x is $x\"\n");
+        let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
         assert!(out.contains("thread_local! { static __SHV_x: std::cell::Cell<i64>"), "{out}");
         assert!(out.contains("x.with(|v| v.set(5));"), "{out}");
@@ -9477,9 +9477,12 @@ mod tests {
 
     #[test]
     fn rust_keyword_mangled() {
-        let out = render("type=1\necho \"$type\"\n");
-        assert!(out.contains("static __SHV_type_: std::cell::Cell<i64>"), "{out}");
-        assert!(!out.contains("static __SHV_type: std::cell::Cell"), "{out}");
+        // a keyword-named var with a surviving store gets a mangled name
+        // (a single-literal def like `type=1` folds away entirely under
+        // copy-propagation, so the mangling needs a dynamic def to observe)
+        let out = render("type=$1\necho \"$type\"\n");
+        assert!(out.contains("__SHV_type_"), "{out}");
+        assert!(!out.contains("static __SHV_type:"), "{out}");
     }
 }
 

@@ -1677,6 +1677,23 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         out.push(n.clone());
                     }
                 }
+            } else if matches!(
+                func.as_str(),
+                "byteAt" | "jsonGet" | "jsonSet" | "jsonArrGet" | "jsonArrSet"
+                    | "jsonArrAppend"
+            ) {
+                // the go-sh self-hosting helpers read their name arg
+                // (args[0]); byteAt also reads the index vars in args[1].
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.push(n.clone());
+                }
+                if func == "byteAt" {
+                    if let Some(IrExpr::Str(t, _)) = args.get(1) {
+                        for nm in bare_dollar_names(&format!("${t}")) {
+                            out.push(nm);
+                        }
+                    }
+                }
             } else if func == "test" || func == "let" {
                 // `ternary` (the C frontend's `cond ? a : b`): args[0] is
                 // the cond TEST-STRING — try_native_test lowers it by

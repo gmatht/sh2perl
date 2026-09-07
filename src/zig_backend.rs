@@ -2981,7 +2981,7 @@ mod tests {
 
     #[test]
     fn assigns_and_echo() {
-        let out = render("x=5\necho \"x is $x\"\n");
+        let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("const std = @import(\"std\");"), "{out}");
         assert!(out.contains("var x: i64 = 0;"), "{out}");
         assert!(out.contains("x = 5;"), "{out}");
@@ -3015,7 +3015,7 @@ mod tests {
 
     #[test]
     fn zig_keyword_mangled() {
-        let out = render("fn=1\necho \"$fn\"\n");
+        let out = render("fn=1\nfn=2\necho \"$fn\"\n");
         assert!(out.contains("var fn_: i64 = 0;"), "{out}");
         assert!(!out.contains("var fn: i64"), "{out}");
     }
