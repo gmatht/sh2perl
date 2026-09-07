@@ -4340,9 +4340,37 @@ impl Render {
                             }
                         }
                     }
+                    // capture args may run children (a _cap_N() call in
+                    // the printf arg list) and their bodies may READ $?:
+                    // bash runs the substitutions BEFORE echo and only
+                    // THEN zeroes $? — so the rc reset must come AFTER the
+                    // printf, not before (a leading `(_sh_rc = 0, …)` made
+                    // a capture body see $? == 0 where bash sees the
+                    // pre-echo status).
+                    //
+                    // Also: C printf arg evaluation order is UNSPECIFIED —
+                    // with several _cap_N() args the captures could run
+                    // right-to-left (gcc), reordering side effects where
+                    // bash is strictly left-to-right. Hoist each bare
+                    // _cap_N() arg into an ordered temp.
+                    let mut hoisted: Vec<String> = Vec::new();
+                    for pt in parts.iter_mut() {
+                        if let Part::Arg(v, _) = pt {
+                            if v.starts_with("_cap_") && v.ends_with(")") && !v.contains(' ') {
+                                let t = format!("_eh{}", self.temp_seq);
+                                self.temp_seq += 1;
+                                self.emit(&format!("char *{t} = {v};"));
+                                *v = t.clone();
+                                hoisted.push(t);
+                            }
+                        }
+                    }
                     let p = self.printf_from_parts(parts);
                     self.need_sh = true;
-                    return format!("(_sh_rc = 0, {p})");
+                    // value 1: the chain peel publishes the verdict from
+                    // this expr — a trailing `_sh_rc = 0` would make the
+                    // comma value 0 (falsy) and flip every `echo && …`
+                    return format!("({p}, _sh_rc = 0, 1)");
                 }
                 self.shell_exec(args)
             }
@@ -4739,26 +4767,66 @@ impl Render {
         }
     }
 
+    /// `$(...)` whose body is EXACTLY one exec/builtin of a program-defined
+    /// shell function — `capture_call` lowers that to the in-process
+    /// dispatch, so the capture's value is a plain char* temp. The
+    /// enclosing echo can then printf it natively (no shell-out, no
+    /// command-text build mid-printf).
+    fn capture_in_process_ok(&self, args: &[IrExpr]) -> bool {
+        if let [IrExpr::Arrow(stmts)] = args {
+            if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
+                if matches!(func.as_str(), "exec" | "builtin") {
+                    if let Some(fname) = Self::str_arg(cargs, 0) {
+                        return !fname.is_empty() && self.functions.contains(&fname);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Can this word be printed by the native echo (no split, no
     /// brace-multiword, no capture in shell-out-requiring position)?
+    /// A capture is fine: in-process fn captures lower to a char* temp,
+    /// and every other capture renders as a `_cap_N()` CALL evaluated
+    /// inside the printf args (position-safe under &&/||/?:).
     fn echo_native_ok(&self, w: &IrExpr) -> bool {
         match w {
             IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_)
             | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_) => true,
+            IrExpr::Call { func, args, .. } if func == "capture" => {
+                // an in-process-lowered capture is a plain value; anything
+                // else goes through the deferred _cap_N() site call
+                self.capture_in_process_ok(args)
+                    || self.capture_shellout_ok(args)
+            }
             IrExpr::Call { func, .. } => {
-                !matches!(func.as_str(), "split" | "capture" | "captureWords" | "pipeline")
+                !matches!(func.as_str(), "split" | "captureWords" | "pipeline")
             }
             IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
                 InterpPart::Lit(_) => true,
                 InterpPart::Expr(x) => match x.as_ref() {
+                    IrExpr::Call { func, args, .. } if func == "capture" => {
+                        self.capture_in_process_ok(args)
+                            || self.capture_shellout_ok(args)
+                    }
                     IrExpr::Call { func, .. } => {
-                        !matches!(func.as_str(), "split" | "capture" | "captureWords")
+                        !matches!(func.as_str(), "split" | "captureWords")
                     }
                     _ => true,
                 },
             }),
             _ => false,
         }
+    }
+
+    /// A capture that stays a deferred `_cap_N()` shell-out site — the
+    /// call is evaluated inside the printf's arg list, so ordering is
+    /// safe. Refuse when the body would need the SHARED command buffer
+    /// mid-build (an exec inside the capture is fine — the site has its
+    /// own private buffer).
+    fn capture_shellout_ok(&self, _args: &[IrExpr]) -> bool {
+        true
     }
 
     /// `$(...)` / `` `...` `` — register a capture site and return the
@@ -10281,12 +10349,17 @@ fn strip_rc_line(line: &str) -> Option<String> {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < b.len() {
-        // non-ASCII bytes (em-dashes in comments etc.) — only the ASCII
-        // constructs below are processed; skip the byte (slicing at a
-        // mid-char index would panic)
+        // non-ASCII bytes (em-dashes, emoji in printf formats, etc.) —
+        // copy the whole UTF-8 run THROUGH, byte-exact: pushing one byte
+        // `as char` would re-encode 0xE2 as U+00E2 (→ mojibake). Only the
+        // ASCII constructs below are processed.
         if b[i] >= 0x80 {
-            out.push(b[i] as char);
-            i += 1;
+            let mut j2 = i;
+            while j2 < b.len() && b[j2] >= 0x80 {
+                j2 += 1;
+            }
+            out.push_str(&String::from_utf8_lossy(&b[i..j2]));
+            i = j2;
             continue;
         }
         // `(_sh_rc = N, X)` sequence wrapper → X
@@ -10320,18 +10393,58 @@ fn strip_rc_line(line: &str) -> Option<String> {
             }
             // `_sh_rc == 0` comparisons are NOT stores
             if b.get(j) == Some(&b'=') && b.get(j + 1) != Some(&b'=') {
-                // the store statement ends at the next `;` (the RHS
-                // forms the renderer emits never contain one)
+                // the store's RHS never contains a top-level `;`; it MAY
+                // be followed by `, more-expr)` — the native echo's
+                // `(printf(…), _sh_rc = 0, 1)` ordering (capture bodies
+                // read the PRE-echo $?, echo zeroes it after). Track
+                // paren depth: a `,`/`)` inside the RHS is not the end.
                 let mut k = j + 1;
-                while k < b.len() && b[k] != b';' {
+                let mut pdepth = 0usize;
+                while k < b.len() {
+                    match b[k] {
+                        b'(' => pdepth += 1,
+                        b')' => {
+                            if pdepth == 0 {
+                                break;
+                            }
+                            pdepth -= 1;
+                        }
+                        b',' | b';' if pdepth == 0 => break,
+                        _ => {}
+                    }
                     k += 1;
                 }
-                let end = if k < b.len() { k + 1 } else { b.len() };
-                // inline store: eat the preceding separator so no
-                // `; ;` / `{ }`-with-gap remains
-                let out_t = out.trim_end();
-                if out_t.ends_with(';') || out_t.ends_with('{') {
-                    out.truncate(out_t.len());
+                // eat the store; also eat ONE adjacent separator so no
+                // `, ,` / `, )` gap remains
+                let mut end = k;
+                if k < b.len() && b[k] == b',' {
+                    end = k + 1;
+                    while end < b.len() && (b[end] == b' ' || b[end] == b'\t') {
+                        end += 1;
+                    }
+                } else if k < b.len() && b[k] == b')' {
+                    // trailing store inside a group: eat the preceding
+                    // `, ` too (…, _sh_rc = 0) → (…)
+                    let mut cut = out.trim_end().len();
+                    while cut > 0
+                        && (out.as_bytes()[cut - 1] == b' ' || out.as_bytes()[cut - 1] == b'\t')
+                    {
+                        cut -= 1;
+                    }
+                    if cut > 0 && out.as_bytes()[cut - 1] == b',' {
+                        out.truncate(cut - 1);
+                    }
+                    // keep the ')' — pushed by the main loop
+                } else {
+                    // statement-form store (`_sh_rc = N;`) — eat the `;`
+                    // and any doubled separator before it
+                    if k < b.len() && b[k] == b';' {
+                        end = k + 1;
+                    }
+                    let out_t = out.trim_end();
+                    if out_t.ends_with(';') || out_t.ends_with('{') {
+                        out.truncate(out_t.len());
+                    }
                 }
                 i = end;
                 continue;
