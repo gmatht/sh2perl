@@ -2367,13 +2367,18 @@ impl Render {
     }
 
     /// The `$#` read: a positional-const program's inline reads use the
-    /// main() parameter DIRECTLY; otherwise the _sh_argc global.
+    /// main() parameter DIRECTLY; otherwise the _sh_argc global. No
+    /// zero-guard: main's argc is >= 1 in every real invocation, the
+    /// fn-call swaps set n >= 1, and shift's lowering clamps so
+    /// _sh_argc never drops below 1 — `$#` is exactly (argc - 1).
+    /// (The $0 read keeps its argc > 0 guard: THAT one protects the
+    /// argv[0] deref in the exotic argc == 0 execve corner.)
     fn argc_expr_l(&self) -> String {
         if self.pos_const && !self.in_function {
             self.const_hash.set(true);
-            return "((argc > 0) ? (argc - 1) : 0)".into();
+            return "(argc - 1)".into();
         }
-        "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into()
+        "(_sh_argc - 1)".into()
     }
 
     /// store read with the env fallback: an ASSIGNED var reads the C
