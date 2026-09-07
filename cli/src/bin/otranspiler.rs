@@ -154,18 +154,46 @@ fn main() {
         // the A1 contract is the output (already computed in stage 1)
         a1.into_bytes()
     } else if tgt == "js" {
-        let estree_out = Command::new(&exe)
-            .args(["file", "--estree", &input])
-            .output()
-            .unwrap_or_else(|e| panic!("spawn {:?}: {e}", exe));
-        if !estree_out.status.success() {
-            eprintln!(
-                "otranspiler: estree failed: {}",
-                String::from_utf8_lossy(&estree_out.stderr).trim()
-            );
-            std::process::exit(1);
-        }
-        let estree = String::from_utf8_lossy(&estree_out.stdout).to_string();
+        // Shell input keeps the in-process sh→A1→estree path (debashc
+        // file --estree): the A1 JSON round-trip loses information the
+        // estree generation needs. A .shir input is already A1, so it
+        // goes through --shir-in-estree with the stage-1 bytes on stdin
+        // (file --estree would re-parse the JSON as shell and emit the
+        // exit-2 fallback program).
+        let estree = if lang == "shir" {
+            let mut child = Command::new(&exe)
+                .args(["--shir-in-estree", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn {:?}: {e}", exe));
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(a1.as_bytes())
+                .expect("write A1 to estree stage");
+            let out = child.wait_with_output().expect("estree stage");
+            if !out.status.success() {
+                eprintln!("otranspiler: estree failed");
+                std::process::exit(out.status.code().unwrap_or(1));
+            }
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            let estree_out = Command::new(&exe)
+                .args(["file", "--estree", &input])
+                .output()
+                .unwrap_or_else(|e| panic!("spawn {:?}: {e}", exe));
+            if !estree_out.status.success() {
+                eprintln!(
+                    "otranspiler: estree failed: {}",
+                    String::from_utf8_lossy(&estree_out.stderr).trim()
+                );
+                std::process::exit(1);
+            }
+            String::from_utf8_lossy(&estree_out.stdout).to_string()
+        };
         match debashcl::estree_json_to_js(&estree) {
             Ok(js) => js.into_bytes(),
             Err(e) => {

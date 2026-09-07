@@ -13,7 +13,7 @@ use crate::estree::*;
 use crate::ir::*;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Mutex;
 
 /// Variables proven (conservatively) to hold ONLY numbers — lifted to
@@ -770,23 +770,948 @@ pub(crate) fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mu
                 walk_lastexit_liveness(body, self_live, live);
             }
             IrStmt::Redirect { inner, .. } => walk_lastexit_liveness(inner, self_live, live),
-            // a called function's status is recorded by fnCall — treat as
-            // live (conservative; refining to call-site liveness is a
-            // future plan entry); named blocks run inside the function
+            // A called function's status is recorded by fnCall — live iff
+            // the callee's final status may be observed (see fn_end_live:
+            // program observers anywhere, or a final-position call).
+            // Unobserved callees walk dead (their tracking writes drop).
+            // Named blocks run inside the function.
             IrStmt::Function {
+                name,
                 body,
                 named_blocks,
                 ..
             } => {
-                walk_lastexit_liveness(body, true, live);
+                let end_live = fn_end_live(name);
+                walk_lastexit_liveness(body, end_live, live);
                 for (_, nb) in named_blocks {
-                    walk_lastexit_liveness(nb, true, live);
+                    walk_lastexit_liveness(nb, end_live, live);
                 }
             }
             _ => {}
         }
     }
 }
+
+/// Per-function lastExit end-liveness: the call-site refinement to the
+/// historically always-live function walk above. `name -> end_live` for
+/// the functions DEFINED in this compilation; absent means live (the
+/// status quo ante). Set per compilation in `shir_to_estree` (before
+/// `compute_lastexit_deadness`, whose walk reads it); cleared in
+/// `transforms::apply` so a previous compilation's map never leaks into a
+/// transform-phase walk (e.g. test_lowering's). Unset (transform phase,
+/// disabled gate) → every function live, bit-identical to the old
+/// unconditional walk.
+static FN_END_LIVE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+pub(crate) fn clear_fn_end_live() {
+    *FN_END_LIVE.lock().unwrap() = None;
+}
+fn fn_end_live(name: &str) -> bool {
+    FN_END_LIVE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
+        .unwrap_or(true)
+}
+
+/// Compute the per-function end-live map for a compilation: `end_live(f)`
+/// is true iff f's final status may be observed. Observation channels:
+/// (a) any status observer program-wide (then every defined function
+/// stays live — the old behavior; refining to per-function readers is
+/// future work), else (b) final-called functions (their final status IS
+/// the program's exit code, possibly through capture/assignment chains).
+/// Gated by the `lastexit-call-sites` transform flag (empty/unset gate =
+/// on, like every registry transform); disabled → empty map → every
+/// function live (status quo ante, for bisection).
+///
+/// This is the generic shIR-level analysis every backend shares: the walk
+/// above feeds LASTEXIT_DEAD / TEST_COND_DEAD / LOOP_STATUS_DEAD, which
+/// the renderers consult. Backends without status tracking (C has none;
+/// Python's While is a bare native loop) need no hook; backends that add
+/// tracking later read the same verdicts. Out-of-crate backends can use
+/// the serialized `"runs"` markup precedent if they ever need it.
+pub(crate) fn compute_fn_end_live(prog: &IrProgram) -> HashMap<String, bool> {
+    if !crate::transforms::transform_enabled("lastexit-call-sites") {
+        return HashMap::new();
+    }
+    let mut defined: HashMap<String, Vec<IrStmt>> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    collect_defined_functions(&prog.stmts, &mut defined, &mut ambiguous);
+    // A sub sharing a shell function's name makes calls ambiguous — the
+    // outparam channel is invisible to the call recognition below, so
+    // force live (conservative; the status quo ante for that name).
+    for sub in &prog.subs {
+        if defined.contains_key(&sub.name) {
+            ambiguous.insert(sub.name.clone());
+        }
+    }
+    if prog_status_observed(prog, &defined) {
+        return HashMap::new();
+    }
+    let final_called = final_called_functions(&prog.stmts, &defined);
+    defined
+        .keys()
+        .map(|n| {
+            (
+                n.clone(),
+                ambiguous.contains(n) || final_called.contains(n),
+            )
+        })
+        .collect()
+}
+
+/// Shell function names defined anywhere (nested defs included) with
+/// their bodies. Redefinitions go to `ambiguous` (callers may target
+/// either body — always live). Sub bodies are NOT collected (the liveness
+/// walk never visits them; their tracking is unconditionally kept) — but
+/// a sub colliding with a shell name forces ambiguity (see above).
+fn collect_defined_functions(
+    stmts: &[IrStmt],
+    defined: &mut HashMap<String, Vec<IrStmt>>,
+    ambiguous: &mut HashSet<String>,
+) {
+    for st in stmts {
+        match st {
+            IrStmt::Function { name, body, .. } => {
+                if defined.contains_key(name) {
+                    ambiguous.insert(name.clone());
+                } else {
+                    defined.insert(name.clone(), body.clone());
+                }
+                collect_defined_functions(body, defined, ambiguous);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                collect_defined_functions(body, defined, ambiguous)
+            }
+            IrStmt::ForInit { init, body, step, .. } => {
+                collect_defined_functions(init, defined, ambiguous);
+                collect_defined_functions(body, defined, ambiguous);
+                collect_defined_functions(step, defined, ambiguous);
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                collect_defined_functions(then, defined, ambiguous);
+                for (_, b) in elsifs {
+                    collect_defined_functions(b, defined, ambiguous);
+                }
+                collect_defined_functions(else_, defined, ambiguous);
+            }
+            IrStmt::Redirect { inner, .. } => {
+                collect_defined_functions(inner, defined, ambiguous)
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_defined_functions(&c.body, defined, ambiguous);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for s in stages {
+                    collect_defined_functions(s, defined, ambiguous);
+                }
+            }
+            // Try/Select/Ext/Asm bodies are never visited by the liveness
+            // walk (conservative status quo there) — nothing to collect.
+            _ => {}
+        }
+    }
+}
+
+/// True iff any status observer exists anywhere: top-level statements,
+/// function bodies at any depth, named blocks, and sub bodies. The shared
+/// reader predicate covers and/or-chains, bare exit/return, and every $?
+/// expansion (transitively through subshells, captures and bodies); the
+/// extra scan below covers the forms it does not model. Subs are included
+/// for observers (a nested chain there still consumes a status) but never
+/// for defined/final-called (their end status is outparam-channeled).
+/// Over-approximating here only keeps tracking (safe); missing an
+/// observer would drop a live write (never).
+fn prog_status_observed(
+    prog: &IrProgram,
+    defined: &HashMap<String, Vec<IrStmt>>,
+) -> bool {
+    if ir_stmts_read_status(&prog.stmts) {
+        return true;
+    }
+    if prog
+        .subs
+        .iter()
+        .any(|s| ir_stmts_read_status(&s.body))
+    {
+        return true;
+    }
+    if prog
+        .stmts
+        .iter()
+        .any(|s| stmt_has_extra_observer(s, defined))
+    {
+        return true;
+    }
+    prog.subs.iter().any(|s| {
+        s.body
+            .iter()
+            .any(|st| stmt_has_extra_observer(st, defined))
+    })
+}
+
+/// Command names whose mere presence forces conservative all-live
+/// functions: `wait` (reaps a background job's status — `f & wait` as
+/// program-final exits with f's status), `eval`/`source`/`.` (dynamic
+/// code may do anything). `command`/`time` are NOT observers — their
+/// target is recognized transparently by the call scan below (`command
+/// -v` probing costs nothing; over-recording a probe is safe).
+fn extra_observer_cmd(name: &str) -> bool {
+    matches!(name, "wait" | "eval" | "source" | ".")
+}
+
+/// Statement forms with unverified status behavior — observers by fiat
+/// (rare nodes; keeping status quo there is free). Anything the analyzer
+/// below does not explicitly recurse into or classify is also an
+/// observer; new IrStmt variants MUST be classified here (no wildcard —
+/// the compiler enforces it).
+fn stmt_has_extra_observer(stmt: &IrStmt, defined: &HashMap<String, Vec<IrStmt>>) -> bool {
+    match stmt {
+        IrStmt::Exec { cmd, args, .. } => {
+            if let IrExpr::Str(name, _) = cmd {
+                if extra_observer_cmd(name) {
+                    return true;
+                }
+            }
+            args.iter()
+                .any(|a| expr_has_extra_observer(a, defined, false))
+        }
+        IrStmt::Expr(e) => expr_has_extra_observer(e, defined, false),
+        IrStmt::Assign { expr, .. } => expr_has_extra_observer(expr, defined, false),
+        IrStmt::Declare { init, .. } => init
+            .as_ref()
+            .map(|e| expr_has_extra_observer(e, defined, false))
+            .unwrap_or(false),
+        IrStmt::DeclareArray { elements, .. } => elements
+            .iter()
+            .any(|e| expr_has_extra_observer(e, defined, false)),
+        IrStmt::Output { value, .. } => expr_has_extra_observer(value, defined, false),
+        IrStmt::WriteFile { path, content, .. } => {
+            // Unverified status behavior (redirect-write node) — observer.
+            let _ = (path, content);
+            true
+        }
+        IrStmt::Return(opt) | IrStmt::Exit(opt) => opt
+            .as_ref()
+            .map(|e| expr_has_extra_observer(e, defined, false))
+            .unwrap_or(false),
+        IrStmt::SetChildError(_) => true,
+        IrStmt::Require(_) | IrStmt::RawText(_) => true,
+        IrStmt::Warn { .. } => true,
+        IrStmt::Die { .. } => false,
+        IrStmt::Break | IrStmt::Continue | IrStmt::Label(_) | IrStmt::Goto(_) => {
+            // Labels/gotos defeat structured final-position reasoning
+            // (a backward jump re-enters past writers) — observer.
+            matches!(stmt, IrStmt::Label(_) | IrStmt::Goto(_))
+        }
+        IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+            cond_calls_observe(cond, defined)
+                || body.iter().any(|s| stmt_has_extra_observer(s, defined))
+        }
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            cond_calls_observe(cond, defined)
+                || then.iter().any(|s| stmt_has_extra_observer(s, defined))
+                || elsifs.iter().any(|(_, b)| {
+                    b.iter().any(|s| stmt_has_extra_observer(s, defined))
+                })
+                || else_.iter().any(|s| stmt_has_extra_observer(s, defined))
+        }
+        IrStmt::For { iter, body, .. } => {
+            expr_has_extra_observer(iter, defined, false)
+                || body.iter().any(|s| stmt_has_extra_observer(s, defined))
+        }
+        IrStmt::ForInit {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            // A C-style cond can call (`for (i=0; f(); i++)`) — the call
+            // consumes f's status into the loop machinery.
+            cond_calls_observe(cond, defined)
+                || init.iter().any(|s| stmt_has_extra_observer(s, defined))
+                || expr_has_extra_observer(cond, defined, false)
+                || step.iter().any(|s| stmt_has_extra_observer(s, defined))
+                || body.iter().any(|s| stmt_has_extra_observer(s, defined))
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            expr_has_extra_observer(discriminant, defined, false)
+                || clauses.iter().any(|c| {
+                    c.body.iter().any(|s| stmt_has_extra_observer(s, defined))
+                })
+        }
+        IrStmt::Pipeline { stages, .. } => stages
+            .iter()
+            .any(|s| s.iter().any(|st| stmt_has_extra_observer(st, defined))),
+        IrStmt::Redirect { inner, redirects } => {
+            inner.iter().any(|s| stmt_has_extra_observer(s, defined))
+                || redirects.iter().any(|r| expr_has_extra_observer(&r.target, defined, false))
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            body.iter().any(|s| stmt_has_extra_observer(s, defined))
+                || named_blocks.iter().any(|(_, b)| {
+                    b.iter().any(|s| stmt_has_extra_observer(s, defined))
+                })
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => body
+            .iter()
+            .any(|s| stmt_has_extra_observer(s, defined)),
+        // try/select/ext/asm: unknown status flow — observer (status quo).
+        IrStmt::Try { .. } | IrStmt::Select { .. } | IrStmt::Ext(_) | IrStmt::Asm { .. } => true,
+    }
+}
+
+/// A user-function call directly in a loop/if condition (`if f`, `while
+/// f`): the dispatch consumes f's final status — a stale never-ran value
+/// would mis-branch. External commands need nothing (the runtime sets
+/// their own status); value positions never reach here (callers pass
+/// in_cond=false for args and captures).
+fn cond_calls_observe(cond: &IrExpr, defined: &HashMap<String, Vec<IrStmt>>) -> bool {
+    match cond {
+        IrExpr::Call { func, args }
+            if matches!(
+                func.as_str(),
+                "exec" | "builtin" | "fnCall" | "$fn_call" | "command" | "time"
+            ) =>
+        {
+            args.iter().any(|a| matches!(a, IrExpr::Str(n, _) if defined.contains_key(n)))
+        }
+        _ => expr_has_extra_observer(cond, defined, false),
+    }
+}
+
+/// Extra observers inside expressions. `in_cond` is true only at the top
+/// of a condition (see above) — every nested command argument, capture
+/// and value resets it (shadowed or value-consumed there). Any &&/||/!
+/// anywhere consumes a status (nested chains are not statement-level
+/// readers); any PIPESTATUS text may read the pipe status array.
+fn expr_has_extra_observer(
+    e: &IrExpr,
+    defined: &HashMap<String, Vec<IrStmt>>,
+    in_cond: bool,
+) -> bool {
+    match e {
+        IrExpr::BinOp { op, lhs, rhs } => {
+            matches!(
+                op,
+                crate::ir::BinOpKind::And
+                    | crate::ir::BinOpKind::Or
+                    | crate::ir::BinOpKind::Not
+            ) || expr_has_extra_observer(lhs, defined, false)
+                || expr_has_extra_observer(rhs, defined, false)
+        }
+        IrExpr::Call { func, args } => {
+            if matches!(func.as_str(), "wait" | "eval" | "source" | ".") {
+                return true;
+            }
+            // The general `exec`/`builtin` carrier names its command in
+            // args[0] (far more common than IrStmt::Exec) — `wait` reaps
+            // background statuses wherever it appears.
+            if matches!(func.as_str(), "exec" | "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(n, _)) if extra_observer_cmd(n))
+            {
+                return true;
+            }
+            if func == "and" || func == "or" {
+                // Frontend-emitted chain calls (the `and`/`or` reader
+                // family) — nested ones are not statement readers.
+                return true;
+            }
+            if in_cond
+                && matches!(
+                    func.as_str(),
+                    "exec" | "builtin" | "fnCall" | "$fn_call" | "command" | "time"
+                )
+                && args
+                    .iter()
+                    .any(|a| matches!(a, IrExpr::Str(n, _) if defined.contains_key(n)))
+            {
+                return true;
+            }
+            args.iter()
+                .any(|a| expr_has_extra_observer(a, defined, false))
+        }
+        IrExpr::Str(s, _) => s.contains("PIPESTATUS"),
+        IrExpr::Var(name, _) => name == "?",
+        IrExpr::Ident(name) => name == "?",
+        IrExpr::Arith(a) => arith_reads_status(a),
+        IrExpr::Index { key, .. } => expr_has_extra_observer(key, defined, false),
+        IrExpr::MethodCall { obj, args, .. } => {
+            expr_has_extra_observer(obj, defined, false)
+                || args
+                    .iter()
+                    .any(|a| expr_has_extra_observer(a, defined, false))
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_has_extra_observer(cond, defined, false)
+                || expr_has_extra_observer(then, defined, false)
+                || expr_has_extra_observer(else_, defined, false)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            expr_has_extra_observer(expr, defined, false)
+                || expr_has_extra_observer(default, defined, false)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            crate::ir::InterpPart::Lit(s) => s.contains("PIPESTATUS"),
+            crate::ir::InterpPart::Expr(x) => expr_has_extra_observer(x, defined, false),
+        }),
+        IrExpr::Capture { expr, .. } => expr_has_extra_observer(expr, defined, false),
+        IrExpr::Splice(inner) => expr_has_extra_observer(inner, defined, false),
+        // Backend-specific expression opaqueness — unknown status
+        // behavior, so an observer (status quo wherever one appears).
+        IrExpr::Ext(_) => true,
+        IrExpr::Arrow(stmts) => stmts
+            .iter()
+            .any(|s| stmt_has_extra_observer(s, defined)),
+        IrExpr::Array(items) => items
+            .iter()
+            .any(|a| expr_has_extra_observer(a, defined, false)),
+        IrExpr::ArrayComp { .. } => {
+            // Comprehension internals unexamined — observer (rare node).
+            true
+        }
+        IrExpr::Lambda { body, .. } => body
+            .iter()
+            .any(|s| stmt_has_extra_observer(s, defined)),
+        IrExpr::Object(fields) => fields
+            .iter()
+            .any(|(_, v)| expr_has_extra_observer(v, defined, false)),
+        // Data, never status: numbers, bools, ranges, identifiers (other
+        // than `?` above), regex patterns (not expansions), raw backend
+        // bridges (the emitter refuses them before status matters).
+        IrExpr::Int(_)
+        | IrExpr::Bool(_)
+        | IrExpr::Range { .. }
+        | IrExpr::Ident(_)
+        | IrExpr::Regex { .. }
+        | IrExpr::RawExpr(_)
+        | IrExpr::Json(_) => false,
+    }
+}
+
+/// `$?` inside an arithmetic tree (a frontend-emitted `Arith(Var("?"))`
+/// — the shell parser rejects `$` in arith text, so the core parser never
+/// produces this; the shared reader predicate has no Arith arm either).
+fn arith_reads_status(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => n == "?",
+        ArithAst::Index { key, .. } => arith_reads_status(key),
+        ArithAst::Bin { lhs, rhs, .. } => arith_reads_status(lhs) || arith_reads_status(rhs),
+        ArithAst::Un { arg, .. } => arith_reads_status(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_reads_status(test) || arith_reads_status(then) || arith_reads_status(else_)
+        }
+        ArithAst::Assign { rhs, .. } => arith_reads_status(rhs),
+        ArithAst::IncDec { .. } | ArithAst::Num(_) => false,
+        ArithAst::Sizeof(_) => false,
+        ArithAst::Cast { arg, .. } => arith_reads_status(arg),
+    }
+}
+
+/// Functions whose final status can BE the program's exit code: invoked in
+/// final command position. Only the LAST statement of a block can
+/// determine its final status (earlier calls are shadowed by a later
+/// writer, or the last statement determines 0 itself) — so the descent
+/// follows last statements through the status-transparent forms (blocks,
+/// subshells, redirect inners, if/case arms, pipeline last stages,
+/// capture-taking assignments) and records direct calls, stopping
+/// everywhere else. Over-approximating (recording a mere string mention
+/// or a value-position capture) only keeps tracking — safe; missing a
+/// flow would drop a live write — never (each STOP below was audited:
+/// builtins overwrite, tests overwrite, loops synthesize via the dance
+/// the existing self_live walk already protects).
+///
+/// The result feeds `fn_end_live` (with a fixpoint through recorded
+/// bodies: a final-called function's own final calls determine its end
+/// status, which is what its callers observe).
+fn final_called_functions(
+    top: &[IrStmt],
+    defined: &HashMap<String, Vec<IrStmt>>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    mark_final_calls(top, defined, &mut out);
+    // Fixpoint through recorded bodies.
+    let mut stack: Vec<String> = out.iter().cloned().collect();
+    while let Some(name) = stack.pop() {
+        if let Some(body) = defined.get(&name) {
+            let prev: HashSet<String> = out.clone();
+            mark_final_calls(body, defined, &mut out);
+            for n in out.difference(&prev) {
+                stack.push(n.clone());
+            }
+        }
+    }
+    out
+    }
+
+fn mark_final_calls(
+    stmts: &[IrStmt],
+    defined: &HashMap<String, Vec<IrStmt>>,
+    out: &mut HashSet<String>,
+) {
+    let Some(last) = stmts.last() else {
+        return;
+    };
+    match last {
+        // Transparent forwards: the inside-final determines the status.
+        IrStmt::Block(b) | IrStmt::Subshell(b) => mark_final_calls(b, defined, out),
+        IrStmt::Redirect { inner, .. } => mark_final_calls(inner, defined, out),
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            mark_final_calls(then, defined, out);
+            for (_, b) in elsifs {
+                mark_final_calls(b, defined, out);
+            }
+            mark_final_calls(else_, defined, out);
+        }
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                mark_final_calls(&c.body, defined, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            if let Some(last_stage) = stages.last() {
+                mark_final_calls(last_stage, defined, out);
+            }
+        }
+        // Loops synthesize via the tracking dance (never-ran 0) — bodies
+        // do not determine the exit directly; the existing self_live walk
+        // already protects them.
+        IrStmt::While { .. }
+        | IrStmt::DoWhile { .. }
+        | IrStmt::For { .. }
+        | IrStmt::ForInit { .. } => {}
+        // Assignments take a capture RHS's status (`x=$(f)` exits with
+        // f's status); plain values determine 0.
+        IrStmt::Assign { expr, .. } => mark_flow_expr(expr, defined, out),
+        IrStmt::Declare { init: Some(e), .. } => mark_flow_expr(e, defined, out),
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                mark_flow_expr(e, defined, out);
+            }
+        }
+        // A bare capture/command expression in final position.
+        IrStmt::Expr(e) => mark_flow_expr(e, defined, out),
+        // Direct and indirect calls determine the status via the callee;
+        // `command`/`time`/`exec`/`builtin` wrappers are transparent, so
+        // their Str args are scanned uniformly (a `command -v` probe that
+        // merely mentions a name over-records — safe).
+        IrStmt::Exec { cmd, args, .. } => {
+            record_cmd_strs(cmd, args, defined, out);
+        }
+        // Definitions, signals and builtins determine their own status;
+        // nested captures inside their args are shadowed (overwritten).
+        // (WriteFile/Declare-plain determine 0 in bash; any runtime
+        // preservation gap there is pre-existing and untouched — the
+        // top-level walk is bit-identical with the gate off.)
+        _ => {}
+    }
+}
+
+/// Record defined-function names from a command and its direct Str args
+/// (uniform over-approximation — see above; a mere string mention only
+/// keeps tracking).
+fn record_cmd_strs(
+    cmd: &IrExpr,
+    args: &[IrExpr],
+    defined: &HashMap<String, Vec<IrStmt>>,
+    out: &mut HashSet<String>,
+) {
+    if let IrExpr::Str(name, _) = cmd {
+        if defined.contains_key(name) {
+            out.insert(name.clone());
+        }
+    }
+    for a in args {
+        if let IrExpr::Str(name, _) = a {
+            if defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+    }
+}
+
+/// Record user-function calls whose end status can flow to the program's
+/// exit code through this expression: direct command Calls, Captures
+/// (forwarded) and Arrow bodies (subshell command contexts in flow
+/// position). Chain operands record everything in their subtree
+/// (defensive: the extras scan already falls back on any nested chain,
+/// so this arm never decides alone — belt and braces, zero coupling).
+/// Value wrappers (arrays, interpolation, ternaries, compares) are
+/// descended uniformly — over-approximating a value-position capture
+/// only keeps tracking. Unknown call funcs record their whole subtree
+/// (a forwarding semantic we have not audited must never be missed).
+fn mark_flow_expr(
+    e: &IrExpr,
+    defined: &HashMap<String, Vec<IrStmt>>,
+    out: &mut HashSet<String>,
+) {
+    match e {
+        IrExpr::Capture { expr, .. } => mark_flow_expr(expr, defined, out),
+        IrExpr::Splice(inner) => mark_flow_expr(inner, defined, out),
+        IrExpr::Ext(ext) => {
+            for c in ext.children() {
+                mark_flow_expr(c, defined, out);
+            }
+        }
+        IrExpr::Arrow(stmts) => mark_final_calls(stmts, defined, out),
+        IrExpr::Call { func, args } => {
+            if matches!(
+                func.as_str(),
+                "exec" | "builtin" | "fnCall" | "$fn_call" | "command" | "time"
+            ) {
+                record_cmd_strs(
+                    args.first().unwrap_or(&IrExpr::Bool(false)),
+                    args,
+                    defined,
+                    out,
+                );
+                for a in args {
+                    if let IrExpr::Arrow(stmts) = a {
+                        mark_final_calls(stmts, defined, out);
+                    }
+                }
+            } else {
+                // Unknown (or value) call: record the whole subtree — a
+                // forwarding semantic we have not audited must never be
+                // missed. Test/arith/getVar shapes over-record here;
+                // harmless (keeps tracking) and rare in flow position.
+                record_all_calls_in_expr(e, defined, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                mark_flow_expr(i, defined, out);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    mark_flow_expr(x, defined, out);
+                }
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            mark_flow_expr(cond, defined, out);
+            mark_flow_expr(then, defined, out);
+            mark_flow_expr(else_, defined, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            mark_flow_expr(expr, defined, out);
+            mark_flow_expr(default, defined, out);
+        }
+        IrExpr::BinOp { op, lhs, rhs } => {
+            if matches!(
+                op,
+                crate::ir::BinOpKind::And
+                    | crate::ir::BinOpKind::Or
+                    | crate::ir::BinOpKind::Not
+            ) {
+                record_all_calls_in_expr(e, defined, out);
+            } else {
+                mark_flow_expr(lhs, defined, out);
+                mark_flow_expr(rhs, defined, out);
+            }
+        }
+        IrExpr::Index { key, .. } => mark_flow_expr(key, defined, out),
+        IrExpr::MethodCall { obj, args, .. } => {
+            mark_flow_expr(obj, defined, out);
+            for a in args {
+                mark_flow_expr(a, defined, out);
+            }
+        }
+        // Leaves and value-only forms: a variable or literal is not a
+        // call (Arith trees hold no calls by construction), and object
+        // values do not determine status.
+        IrExpr::Int(_)
+        | IrExpr::Str(..)
+        | IrExpr::Var(..)
+        | IrExpr::Ident(_)
+        | IrExpr::Bool(_)
+        | IrExpr::Arith(_)
+        | IrExpr::Regex { .. }
+        | IrExpr::Range { .. }
+        | IrExpr::RawExpr(_)
+        | IrExpr::Json(_) => {}
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                mark_flow_expr(v, defined, out);
+            }
+        }
+        IrExpr::ArrayComp { .. } => {
+            // Unexamined comprehension internals — record defensively.
+            record_all_calls_in_expr(e, defined, out);
+        }
+        IrExpr::Lambda { .. } => {
+            // Invocation-invisible body: its calls cannot determine the
+            // program exit (status consumers inside still trip the
+            // extras scan, which recurses lambda bodies).
+        }
+    }
+}
+
+/// Defensive over-approximation: every direct-Str user-function name
+/// anywhere in the subtree counts as called. Safe (keeps tracking).
+fn record_all_calls_in_expr(
+    e: &IrExpr,
+    defined: &HashMap<String, Vec<IrStmt>>,
+    out: &mut HashSet<String>,
+) {
+    match e {
+        IrExpr::Str(name, _) => {
+            if defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                record_all_calls_in_expr(a, defined, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for a in items {
+                record_all_calls_in_expr(a, defined, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. }
+        | IrExpr::DefinedOr { expr: lhs, default: rhs } => {
+            record_all_calls_in_expr(lhs, defined, out);
+            record_all_calls_in_expr(rhs, defined, out);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            record_all_calls_in_expr(cond, defined, out);
+            record_all_calls_in_expr(then, defined, out);
+            record_all_calls_in_expr(else_, defined, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    record_all_calls_in_expr(x, defined, out);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => record_all_calls_in_expr(expr, defined, out),
+        IrExpr::Splice(inner) => record_all_calls_in_expr(inner, defined, out),
+        IrExpr::Ext(ext) => {
+            for c in ext.children() {
+                record_all_calls_in_expr(c, defined, out);
+            }
+        }
+        IrExpr::Arrow(stmts) => {
+            for s in stmts {
+                record_all_calls_in_stmt(s, defined, out);
+            }
+        }
+        IrExpr::Index { key, .. } => record_all_calls_in_expr(key, defined, out),
+        IrExpr::MethodCall { obj, args, .. } => {
+            record_all_calls_in_expr(obj, defined, out);
+            for a in args {
+                record_all_calls_in_expr(a, defined, out);
+            }
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                record_all_calls_in_expr(v, defined, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Statement-level half of the defensive scan above: records every
+/// command-looking call anywhere in the subtree (all bodies, all
+/// expressions). Deliberately exhaustive over composites — an unvisited
+/// corner would silently under-record.
+fn record_all_calls_in_stmt(
+    stmt: &IrStmt,
+    defined: &HashMap<String, Vec<IrStmt>>,
+    out: &mut HashSet<String>,
+) {
+    match stmt {
+        IrStmt::Exec { cmd, args, .. } => {
+            record_cmd_strs(cmd, args, defined, out);
+            for a in args {
+                record_all_calls_in_expr(a, defined, out);
+            }
+        }
+        IrStmt::Expr(e)
+        | IrStmt::Assign { expr: e, .. }
+        | IrStmt::Output { value: e, .. }
+        | IrStmt::SetChildError(e) => {
+            record_all_calls_in_expr(e, defined, out);
+        }
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                record_all_calls_in_expr(e, defined, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                record_all_calls_in_expr(e, defined, out);
+            }
+        }
+        IrStmt::WriteFile { path, content, .. } => {
+            record_all_calls_in_expr(path, defined, out);
+            record_all_calls_in_expr(content, defined, out);
+        }
+        IrStmt::Return(opt) | IrStmt::Exit(opt) => {
+            if let Some(e) = opt {
+                record_all_calls_in_expr(e, defined, out);
+            }
+        }
+        IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+            record_all_calls_in_expr(cond, defined, out);
+            for b in body {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+        }
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            record_all_calls_in_expr(cond, defined, out);
+            for b in then.iter().chain(else_) {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+            for (_, b) in elsifs {
+                for stm in b {
+                    record_all_calls_in_stmt(stm, defined, out);
+                }
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            record_all_calls_in_expr(iter, defined, out);
+            for b in body {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+        }
+        IrStmt::ForInit {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            for b in init.iter().chain(body).chain(step) {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+            record_all_calls_in_expr(cond, defined, out);
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            record_all_calls_in_expr(discriminant, defined, out);
+            for c in clauses {
+                for b in &c.body {
+                    record_all_calls_in_stmt(b, defined, out);
+                }
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for s in stages {
+                for b in s {
+                    record_all_calls_in_stmt(b, defined, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+            for r in redirects {
+                record_all_calls_in_expr(&r.target, defined, out);
+            }
+        }
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            for b in body {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+            for (_, nb) in named_blocks {
+                for b in nb {
+                    record_all_calls_in_stmt(b, defined, out);
+                }
+            }
+        }
+        IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+            for b in body {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for b in body.iter().chain(else_body).chain(finally_body) {
+                record_all_calls_in_stmt(b, defined, out);
+            }
+            for ex in excepts {
+                if let Some(m) = &ex.match_expr {
+                    record_all_calls_in_expr(m, defined, out);
+                }
+                for b in &ex.body {
+                    record_all_calls_in_stmt(b, defined, out);
+                }
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    record_all_calls_in_expr(ch, defined, out);
+                }
+                if let Some(v) = &c.value {
+                    record_all_calls_in_expr(v, defined, out);
+                }
+                for b in &c.body {
+                    record_all_calls_in_stmt(b, defined, out);
+                }
+            }
+        }
+        IrStmt::Asm { inputs, outputs, .. } => {
+            for (_, e) in inputs.iter().chain(outputs) {
+                record_all_calls_in_expr(e, defined, out);
+            }
+        }
+        // Leaves and non-calling forms.
+        IrStmt::Break
+        | IrStmt::Continue
+        | IrStmt::Label(_)
+        | IrStmt::Goto(_)
+        | IrStmt::Require(_)
+        | IrStmt::RawText(_)
+        | IrStmt::Die { .. }
+        | IrStmt::Warn { .. }
+        | IrStmt::Ext(_) => {}
+    }
+}
+
 
 /// The `echo ARGS...` / `printf FMT ARGS...` statements that lower via
 /// [`try_native_echo`] / [`try_native_printf`] — the other droppable
@@ -1242,7 +2167,20 @@ fn loop_provably_runs(stmt: &IrStmt) -> bool {
         .unwrap_or(false)
 }
 
+/// The FUNCTION-BODY loop-status twin of [`ARROW_BODY_DEAD`] (same
+/// clone-pointer gap — the clone's loops consult this map during the
+/// define-arrow construction). Computed from the clone's own liveness
+/// alongside ARROW_BODY_DEAD; save/restored together with it.
+static ARROW_BODY_LOOP_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 fn loop_status_write_dead(stmt: &IrStmt) -> bool {
+    // The active function-arrow construction's map wins (its pointers are
+    // the exact statements being emitted); fall back to the global map
+    // (original-tree pointers — loops/subshells outside arrows).
+    if let Some(m) = ARROW_BODY_LOOP_DEAD.lock().unwrap().as_ref() {
+        if let Some(&dead) = m.get(&(stmt as *const IrStmt as usize)) {
+            return dead;
+        }
+    }
     LOOP_STATUS_DEAD
         .lock()
         .unwrap()
@@ -1449,6 +2387,361 @@ fn loop_in_async_region(stmt: &IrStmt) -> bool {
 /// writes lastExit itself (its status is the body's leftover — the native
 /// for-of preserves that exactly), and `do/while` never reaches the ESTree
 /// path (parsed as `IrStmt::While` with a negated cond).
+/// The arith-operator subset the true64 wrapper lowers soundly (its
+/// production set): add/sub/mul (exact i64 wrap), div/mod (via the
+/// runtime's BigInt-aware idiv/imod), comparisons, unary minus,
+/// compound assigns, ++/--. Anything else (& | ^ << >> ** Cond with call
+/// shapes) refuses versioning — the wide arm would mix Number/BigInt or
+/// change NaN semantics.
+fn arith_versionable_op(a: &ArithAst, vars_ok: &mut bool) -> bool {
+    match a {
+        ArithAst::Num(_) => true,
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            // length placeholders are runtime-exact; slots are exact
+            // int64 elements (no guard needed); everything else must be
+            // a lifted numeric binding (the guard reads it natively).
+            arith_len_leaf(n).is_some()
+                || slot_var_index(n).is_some()
+                || is_lifted_num(n)
+        }
+        ArithAst::Index { var, key } => {
+            slot_var_index(var).is_some() && arith_versionable_op(key, vars_ok)
+        }
+        ArithAst::Bin { op, lhs, rhs } => {
+            matches!(
+                op.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | "<=" | ">" | ">="
+            ) && arith_versionable_op(lhs, vars_ok)
+                && arith_versionable_op(rhs, vars_ok)
+        }
+        ArithAst::Un { op, arg } => op == "-" && arith_versionable_op(arg, vars_ok),
+        ArithAst::Assign { op, rhs, .. } => {
+            matches!(op.as_str(), "=" | "+=" | "-=" | "*=")
+                && arith_versionable_op(rhs, vars_ok)
+        }
+        ArithAst::IncDec { .. } => true,
+        ArithAst::Cast { arg, .. } => arith_versionable_op(arg, vars_ok),
+        _ => {
+            *vars_ok = false;
+            false
+        }
+    }
+}
+
+/// Clone `stmts`, wrapping every `IrExpr::Arith` root through
+/// [`wrap_true64_arith_ast`] (Num → `Cast(Int64,Num)`, Var reads →
+/// `Cast(Int64,Var)`, slot reads stay raw). Returns None on any
+/// statement shape the walker does not cover — the caller refuses
+/// versioning rather than emit a partially-wrapped wide arm.
+fn wrap_stmts_arith(stmts: &[IrStmt]) -> Option<Vec<IrStmt>> {
+    fn wrap_expr(e: &IrExpr) -> Option<IrExpr> {
+        Some(match e {
+            IrExpr::Arith(a) => {
+                let mut c = a.as_ref().clone();
+                wrap_true64_arith_ast(&mut c);
+                IrExpr::Arith(Box::new(c))
+            }
+            IrExpr::BinOp { lhs, rhs, op } => IrExpr::BinOp {
+                lhs: Box::new(wrap_expr(lhs)?),
+                rhs: Box::new(wrap_expr(rhs)?),
+                op: op.clone(),
+            },
+            IrExpr::Call { func, args } => IrExpr::Call {
+                func: func.clone(),
+                args: args.iter().map(wrap_expr).collect::<Option<Vec<_>>>()?,
+            },
+            IrExpr::Capture { expr, native } => IrExpr::Capture {
+                expr: Box::new(wrap_expr(expr)?),
+                native: *native,
+            },
+            IrExpr::Array(items) => IrExpr::Array(
+                items.iter().map(wrap_expr).collect::<Option<Vec<_>>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+    fn wrap_stmt(s: &IrStmt) -> Option<IrStmt> {
+        Some(match s {
+            IrStmt::Assign { targets, expr, asm } => IrStmt::Assign {
+                targets: targets.clone(),
+                expr: wrap_expr(expr)?,
+                asm: asm.clone(),
+            },
+            IrStmt::Expr(e) => IrStmt::Expr(wrap_expr(e)?),
+            IrStmt::While { cond, body } => IrStmt::While {
+                cond: wrap_expr(cond)?,
+                body: wrap_stmts(body)?,
+            },
+            IrStmt::DoWhile { body, cond, until } => IrStmt::DoWhile {
+                body: wrap_stmts(body)?,
+                cond: wrap_expr(cond)?,
+                until: *until,
+            },
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => IrStmt::If {
+                cond: wrap_expr(cond)?,
+                then: wrap_stmts(then)?,
+                elsifs: elsifs
+                    .iter()
+                    .map(|(c, b)| Some((c.clone(), wrap_stmts(b)?)))
+                    .collect::<Option<Vec<_>>>()?,
+                else_: wrap_stmts(else_)?,
+            },
+            IrStmt::Block(b) => IrStmt::Block(wrap_stmts(b)?),
+            IrStmt::Declare { vars, init, local } => IrStmt::Declare {
+                vars: vars.clone(),
+                init: match init {
+                    Some(e) => Some(wrap_expr(e)?),
+                    None => None,
+                },
+                local: *local,
+            },
+            IrStmt::Output {
+                value,
+                newline,
+                target,
+            } => IrStmt::Output {
+                value: wrap_expr(value)?,
+                newline: *newline,
+                target: target.clone(),
+            },
+            _other => return None,
+        })
+    }
+    fn wrap_stmts(stmts: &[IrStmt]) -> Option<Vec<IrStmt>> {
+        stmts.iter().map(wrap_stmt).collect()
+    }
+    wrap_stmts(stmts)
+}
+
+/// The dual-version gate: opt-in via `SH2_DUAL_LOOPS=1` (an emitter-level
+/// feature, not a tree transform — the registry gates tree rewrites).
+/// The static override (-1 = consult env) exists for tests: parallel test
+/// threads mutating process env race each other.
+static DUAL_LOOPS_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+pub fn set_dual_loops(on: Option<bool>) {
+    let v = match on {
+        None => -1,
+        Some(true) => 1,
+        Some(false) => 0,
+    };
+    DUAL_LOOPS_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+fn dual_loops_enabled() -> bool {
+    match DUAL_LOOPS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    std::env::var("SH2_DUAL_LOOPS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Build the guarded dual-loop If for an eligible native while, or None
+/// (keep the single narrow loop). Eligibility: the loop's status write is
+/// dead (versioning duplicates the body — tracking vars would need
+/// duplicating too); the cond is a numeric comparison; every arith tree
+/// in cond+body is in the versionable subset; every read var is a lifted
+/// numeric binding (guard reads natively) or an exact slot.
+fn dual_version_while(
+    stmt: &IrStmt,
+    cond: &IrExpr,
+    body: &[IrStmt],
+    narrow: &Stmt,
+) -> Option<Stmt> {
+    if !dual_loops_enabled() {
+        return None;
+    }
+    // NOTE: tracked loops version fine too — the ran/last lets are
+    // block-scoped per arm, and only one arm executes.
+    // cond must be a numeric comparison over versionable operands.
+    let mut vars_ok = true;
+    let cond_ast = match cond {
+        IrExpr::Arith(a) => a.as_ref().clone(),
+        _ => return None,
+    };
+    if !arith_versionable_op(&cond_ast, &mut vars_ok) || !vars_ok {
+        return None;
+    }
+    // every body arith root in the subset; non-arith statements
+    // (setArrayAppend calls, captures) carry no wide-path obligation —
+    // their values are strings/runtime-managed.
+    fn body_versionable(stmts: &[IrStmt], ok: &mut bool) -> bool {
+        for s in stmts {
+            let pass = match s {
+                IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => match expr {
+                    IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                    _ => true,
+                },
+                IrStmt::While { cond, body } => {
+                    (match cond {
+                        IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                        _ => false,
+                    }) && body_versionable(body, ok)
+                }
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    (match cond {
+                        IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                        _ => false,
+                    }) && body_versionable(then, ok)
+                        && elsifs.iter().all(|(_, b)| body_versionable(b, ok))
+                        && body_versionable(else_, ok)
+                }
+                IrStmt::Block(b) => body_versionable(b, ok),
+                IrStmt::Declare { init: Some(e), .. } => match e {
+                    IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                    _ => true,
+                },
+                _ => true,
+            };
+            if !*ok || !pass {
+                return false;
+            }
+        }
+        true
+    }
+    if !body_versionable(body, &mut vars_ok) || !vars_ok {
+        return None;
+    }
+    // Guard variables: every lifted numeric binding mentioned in cond or
+    // body arith gets one `Number.isSafeInteger(read)` conjunct (slots
+    // need none — exact int64 elements by construction).
+    let mut guard_vars: Vec<String> = Vec::new();
+    fn collect_vars(a: &ArithAst, out: &mut Vec<String>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                if is_lifted_num(n) && !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            ArithAst::Index { key, .. } => collect_vars(key, out),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                collect_vars(lhs, out);
+                collect_vars(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => collect_vars(arg, out),
+            ArithAst::Assign { rhs, .. } => collect_vars(rhs, out),
+            ArithAst::Cast { arg, .. } => collect_vars(arg, out),
+            _ => {}
+        }
+    }
+    fn collect_body_vars(stmts: &[IrStmt], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => {
+                    if let IrExpr::Arith(a) = expr {
+                        collect_vars(a, out);
+                    }
+                }
+                IrStmt::While { cond, body } => {
+                    if let IrExpr::Arith(a) = cond {
+                        collect_vars(a, out);
+                    }
+                    collect_body_vars(body, out);
+                }
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    if let IrExpr::Arith(a) = cond {
+                        collect_vars(a, out);
+                    }
+                    collect_body_vars(then, out);
+                    for (_, b) in elsifs {
+                        collect_body_vars(b, out);
+                    }
+                    collect_body_vars(else_, out);
+                }
+                IrStmt::Block(b) => collect_body_vars(b, out),
+                _ => {}
+            }
+        }
+    }
+    if let IrExpr::Arith(a) = cond {
+        collect_vars(a, &mut guard_vars);
+    }
+    collect_body_vars(body, &mut guard_vars);
+    if guard_vars.is_empty() {
+        // nothing can escape the safe-integer range — versioning buys
+        // nothing
+        return None;
+    }
+    // The wide arm: identical IR with arith roots wrapped. The clone is
+    // rendered through the normal path; its pointers miss the deadness
+    // maps (conservative → tracking kept, sound), and nested loops in the
+    // clone cannot re-version (dead=false there).
+    let wide_body = wrap_stmts_arith(body)?;
+    let wide_cond = if let IrExpr::Arith(a) = cond {
+        let mut c = a.as_ref().clone();
+        wrap_true64_arith_ast(&mut c);
+        IrExpr::Arith(Box::new(c))
+    } else {
+        unreachable!()
+    };
+    // The forced-wrap scope: every arith render inside (cond + body,
+    // including the zero-compare div/mod fast path) goes exact-i64.
+    INT64_WRAP_FORCE.store(1, std::sync::atomic::Ordering::Relaxed);
+    let wide_cond_e = cond_to_estree(&wide_cond);
+    let wide_stmts: Vec<Stmt> = wide_body.iter().filter_map(stmt_to_estree).collect();
+    INT64_WRAP_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
+    if wide_stmts.len() != wide_body.len() {
+        return None; // a body stmt refused to lower — no partial arms
+    }
+    let wide = Stmt::WhileStatement {
+        test: wide_cond_e,
+        body: Box::new(Stmt::BlockStatement { body: wide_stmts }),
+    };
+    // `if (Number.isSafeInteger(v) && …) { narrow } else { wide }` — the
+    // guard is a pure read of materialized bindings, evaluated once.
+    let mut test: Option<Expr> = None;
+    for v in &guard_vars {
+        let check = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "isSafeInteger".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![arith_var_read(v)],
+            optional: false,
+        };
+        test = Some(match test {
+            None => check,
+            Some(l) => Expr::LogicalExpression {
+                operator: "&&".to_string(),
+                left: Box::new(l),
+                right: Box::new(check),
+            },
+        });
+    }
+    Some(Stmt::IfStatement {
+        test: test.expect("guard_vars nonempty"),
+        consequent: Box::new(Stmt::BlockStatement {
+            body: vec![narrow.clone()],
+        }),
+        alternate: Some(Box::new(Stmt::BlockStatement { body: vec![wide] })),
+    })
+}
+
 fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
     match st {
         IrStmt::While { body, .. } => {
@@ -10314,7 +11607,77 @@ fn arith_has_cast(a: &ArithAst) -> bool {
     }
 }
 
+/// Dual-loop versioning: when >0, EVERY arith render wraps its leaves
+/// `Cast(Int64, …)` (the --true64 treatment) regardless of the flag —
+/// the wide arm of a versioned loop must be exact-i64 even though the
+/// program never opted into --true64. Scoped strictly around the wide
+/// arm's render in [`dual_version_while`]; zero everywhere else.
+static INT64_WRAP_FORCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Unconditional leaf-wrap for the dual-loop wide arm: every Num/Var/Ident
+/// leaf becomes `Cast(Int64, …)` (slots and length placeholders stay raw —
+/// they are already exact), so the whole tree evaluates in exact BigInt
+/// and lands in i64 via the cast (mod-2^64 ring arithmetic makes leaf
+/// wrapping ≡ bash's per-op wrapping for + - *). Unlike
+/// [`wrap_true64_arith_ast`] this ignores flag classification — the wide
+/// arm must be exact even when the program never opted into --true64.
+fn force_wrap_arith(a: &mut ArithAst) {
+    match a {
+        ArithAst::Num(_) => {
+            let inner = std::mem::replace(a, ArithAst::Num(0));
+            *a = ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(inner),
+            };
+        }
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if arith_len_leaf(n).is_some() || slot_var_index(n).is_some() {
+                return; // already exact
+            }
+            let inner = std::mem::replace(a, ArithAst::Num(0));
+            *a = ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(inner),
+            };
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            force_wrap_arith(lhs);
+            force_wrap_arith(rhs);
+        }
+        ArithAst::Un { arg, .. } => force_wrap_arith(arg),
+        ArithAst::Cond {
+            test,
+            then,
+            else_,
+            ..
+        } => {
+            force_wrap_arith(test);
+            force_wrap_arith(then);
+            force_wrap_arith(else_);
+        }
+        ArithAst::Assign { rhs, .. } => force_wrap_arith(rhs),
+        // Cast (already wrapped), IncDec (native ++/-- on the counter —
+        // always in safe range), Index (slot element — exact), Sizeof
+        // (compile-time): leave as-is.
+        ArithAst::Cast { .. } | ArithAst::IncDec { .. } | ArithAst::Index { .. }
+        | ArithAst::Sizeof(_) => {}
+    }
+}
+
 fn arith_to_estree(a: &ArithAst) -> Expr {
+    if INT64_WRAP_FORCE.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && !arith_has_cast(a)
+    {
+        let mut c = a.clone();
+        force_wrap_arith(&mut c);
+        // Render the wrapped tree with the force scope OFF: every leaf is
+        // Cast now, and arith_cast_to_estree re-enters this function on
+        // the (bare) leaf — re-wrapping there would never terminate.
+        let prev = INT64_WRAP_FORCE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let out = arith_to_estree(&c);
+        INT64_WRAP_FORCE.store(prev, std::sync::atomic::Ordering::Relaxed);
+        return out;
+    }
     match a {
         ArithAst::Num(v) => Expr::Literal {
             value: serde_json::Value::from(*v),
@@ -14519,6 +15882,10 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         prog,
         NATIVE_ECHO_FNS.lock().unwrap().as_ref().unwrap(),
     ));
+    // Per-function end-liveness (the call-site refinement): unobserved
+    // callees walk dead below. Set fresh every compilation (also when the
+    // gate is off — empty means all-live, the status quo ante).
+    *FN_END_LIVE.lock().unwrap() = Some(compute_fn_end_live(prog));
     // Plan 4 — lastExit-write liveness: which `(( ))`/echo statements' status
     // writes are unread, and which empty-else ifs' synthesized false-path
     // `sh2.lastExit = 0` is droppable (empty under a possible `set -e`).
@@ -17919,7 +19286,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                 alternate: None,
                             });
                         }
-                        return Some(Stmt::BlockStatement { body: tracked });
+                        let tracked_block = Stmt::BlockStatement { body: tracked };
+                        return Some(
+                            dual_version_while(stmt, cond, body, &tracked_block)
+                                .unwrap_or(tracked_block),
+                        );
                     }
                     // The !dead case returned above (tracked). Here the
                     // loop's status write is DEAD (and no errexit): the
@@ -17930,6 +19301,27 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // path above, where the restored loop status feeds
                     // the guard.)
                     // dead loop status: bare native while, zero tracking
+                    // ── dual-loop versioning (SH2_DUAL_LOOPS=1, opt-in) ──
+                    // A hot counted loop whose arith is entirely in the
+                    // true64-wrapper's sound subset gets an entry guard:
+                    // `if (Number.isSafeInteger(v) && …) { narrow while }
+                    // else { wide while }`. Narrow = today's bytes (fast
+                    // f64 path); wide = the same body with every arith
+                    // root wrapped `Cast(Int64, …)` — exact i64 wraparound
+                    // (bash-identical) instead of silent f64 rounding
+                    // past 2^53. The guard reads only materialized lifted
+                    // bindings, runs once per loop ENTRY (never inside —
+                    // a per-iteration deopt would cost the whole win), and
+                    // implies the wide arm's soundness by construction
+                    // (the wrapper is the production --true64 machinery).
+                    // Opt-in until corpus-verified at scale.
+                    let narrow = Stmt::WhileStatement {
+                        test: cond_e.clone(),
+                        body: Box::new(Stmt::BlockStatement { body: inner.clone() }),
+                    };
+                    if let Some(dual) = dual_version_while(stmt, cond, body, &narrow) {
+                        return Some(dual);
+                    }
                     return Some(Stmt::WhileStatement {
                         test: cond_e,
                         body: Box::new(Stmt::BlockStatement { body: inner }),
@@ -18528,9 +19920,10 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // (computed on the ORIGINAL tree in shir_to_estree) never
             // match the clone's statements — the dead-write drops (echo/
             // `(( ))`/bare-test/native-decl `local`) never fired inside
-            // function bodies. The function's final status is ALWAYS
-            // consumed (fnCall), so the clone's liveness is the same walk
-            // as the original's with end_live=true — computed into the
+            // function bodies. The clone's liveness is the same walk as
+            // the original's with the refined end_live (unobserved callees
+            // walk dead — an unobserved callee's final status is recorded
+            // nowhere) — computed into the
             // ARROW_BODY_DEAD statics for the duration of the arrow
             // construction below (the clone's statements are alive then —
             // the pointer keys cannot collide — and the statics are
@@ -18543,17 +19936,31 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let cloned_body = body.clone();
             let saved_body_dead = ARROW_BODY_DEAD.lock().unwrap().take();
             let saved_cond_dead = ARROW_BODY_COND_DEAD.lock().unwrap().take();
+            let saved_loop_dead = ARROW_BODY_LOOP_DEAD.lock().unwrap().take();
             if named_blocks.is_empty()
                 && !MAY_ERREXIT.lock().unwrap().unwrap_or(true)
                 && LASTEXIT_DEAD.lock().unwrap().is_some()
             {
                 let mut live: HashSet<usize> = HashSet::new();
-                walk_lastexit_liveness(&cloned_body, true, &mut live);
+                walk_lastexit_liveness(&cloned_body, fn_end_live(name), &mut live);
                 let mut dead = HashMap::new();
                 mark_lastexit_dead(&cloned_body, &live, &mut dead);
                 *ARROW_BODY_DEAD.lock().unwrap() = Some(dead);
                 *ARROW_BODY_COND_DEAD.lock().unwrap() =
                     Some(compute_test_cond_deadness(&cloned_body, &live));
+                // Clone-scoped loop-status verdicts (same gate as the
+                // function refinement above): disabled → map stays absent
+                // → the emitter falls back to the global map (a miss =
+                // dance kept), i.e. bit-identical to the pre-refinement
+                // output. Enabled → pre-existing loop-dead logic finally
+                // reaches function bodies (it never fired inside clones).
+                if crate::transforms::transform_enabled("lastexit-call-sites") {
+                    let mut loop_dead = HashMap::new();
+                    for st in &cloned_body {
+                        mark_loop_status_deadness(st, &live, &mut loop_dead);
+                    }
+                    *ARROW_BODY_LOOP_DEAD.lock().unwrap() = Some(loop_dead);
+                }
             }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
@@ -18582,6 +19989,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // the arrow's IrExpr; their keys must not outlive them).
             *ARROW_BODY_DEAD.lock().unwrap() = saved_body_dead;
             *ARROW_BODY_COND_DEAD.lock().unwrap() = saved_cond_dead;
+            *ARROW_BODY_LOOP_DEAD.lock().unwrap() = saved_loop_dead;
             FUNCTION_STACK.lock().unwrap().pop();
             let binding = fn_call_is_direct(name)
                 .then(|| direct_binding_name(name).expect("direct set is binding-valid"));
@@ -38301,5 +39709,165 @@ mod case_alternation_tests {
     fn no_pipe_returns_whole() {
         assert_eq!(split_case_alternatives("*.txt"), vec!["*.txt"]);
         assert_eq!(split_case_alternatives(""), vec![""]);
+    }
+}
+
+#[cfg(test)]
+mod lastexit_callsite_tests {
+    use super::*;
+    use crate::Parser;
+
+    fn prog_of(src: &str) -> IrProgram {
+        let commands = Parser::new(src).parse().expect("parse");
+        ast_to_ir(&commands)
+    }
+
+    const LOOP_FN: &str = "f() { i=0; while [ \"$i\" -lt 3 ]; do i=$((i + 1)); done; }\n";
+
+    /// The factor shape: f called only inside a capture arg (shadowed by
+    /// the caller's own status) and never observed — f walks dead.
+    #[test]
+    fn unobserved_callee_walks_dead() {
+        let prog = prog_of(&format!("{LOOP_FN}echo \"[$(f)]\"\n"));
+        let map = compute_fn_end_live(&prog);
+        assert_eq!(map.get("f"), Some(&false), "{map:?}");
+    }
+
+    /// Any `$?` reader anywhere keeps every function live (status quo).
+    #[test]
+    fn status_reader_keeps_all_live() {
+        let prog = prog_of(&format!("{LOOP_FN}echo \"[$(f)]\"\necho \"status $?\"\n"));
+        let map = compute_fn_end_live(&prog);
+        assert!(map.is_empty(), "all live = empty map, got {map:?}");
+    }
+
+    /// A direct final call's status IS the exit code — f stays live.
+    #[test]
+    fn final_call_keeps_live() {
+        let prog = prog_of(&format!("{LOOP_FN}f\n"));
+        let map = compute_fn_end_live(&prog);
+        assert_eq!(map.get("f"), Some(&true), "{map:?}");
+    }
+
+    /// Final-called transitively through another function body (fixpoint).
+    #[test]
+    fn chained_final_call_keeps_live() {
+        let prog = prog_of("f() { :; }\ng() { f; }\ng\n");
+        let map = compute_fn_end_live(&prog);
+        assert_eq!(map.get("g"), Some(&true), "{map:?}");
+        assert_eq!(map.get("f"), Some(&true), "{map:?}");
+    }
+
+    /// An if-arm-final call can determine the exit code.
+    #[test]
+    fn if_arm_final_call_keeps_live() {
+        let prog = prog_of("f() { :; }\nif true; then f; fi\n");
+        let map = compute_fn_end_live(&prog);
+        assert_eq!(map.get("f"), Some(&true), "{map:?}");
+    }
+
+    /// `wait` reaps background statuses — conservative all-live.
+    #[test]
+    fn wait_forces_conservative() {
+        let prog = prog_of("f() { :; }\nf & wait\n");
+        let map = compute_fn_end_live(&prog);
+        assert!(map.is_empty(), "all live = empty map, got {map:?}");
+    }
+
+    /// `if f` consumes f's status into the dispatch — conservative.
+    #[test]
+    fn cond_call_forces_conservative() {
+        let prog = prog_of("f() { :; }\nif f; then echo y; fi\n");
+        let map = compute_fn_end_live(&prog);
+        assert!(map.is_empty(), "all live = empty map, got {map:?}");
+    }
+
+    /// End to end: the unobserved callee's loop dance is gone from the
+    /// ESTree (structural assertion — the `__sh2_loop_ran`/`last`
+    /// tracking must be absent, the loop itself present).
+    #[test]
+    fn estree_drops_dead_loop_dance() {
+        let prog = prog_of(&format!("{LOOP_FN}echo \"[$(f)]\"\n"));
+        let json = shir_to_estree_json(&prog).expect("render");
+        assert!(!json.contains("__sh2_loop_ran"), "dance dropped");
+        assert!(!json.contains("__sh2_loop_last"), "dance dropped");
+        assert!(json.contains("WhileStatement"), "loop kept");
+    }
+
+    /// End to end control: the final-called callee keeps its dance (the
+    /// exit code depends on it — a never-ran loop must exit 0, not stale).
+    #[test]
+    fn estree_keeps_final_called_dance() {
+        let prog = prog_of(&format!("{LOOP_FN}f\n"));
+        let json = shir_to_estree_json(&prog).expect("render");
+        assert!(json.contains("__sh2_loop_last"), "dance kept:\n{json}");
+    }
+}
+
+#[cfg(test)]
+mod dual_loop_tests {
+    use super::*;
+
+    /// factor-shaped A1: a dead-status counted loop over lifted Int vars
+    /// (i, lim, n), body = guarded mod echo + i++.
+    const A1: &str = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+      {"type":"Assign","targets":[{"var":"i","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Num","value":1}}},
+      {"type":"Assign","targets":[{"var":"lim","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Num","value":46341}}},
+      {"type":"Assign","targets":[{"var":"n","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Num","value":2147483645}}},
+      {"type":"While","cond":{"type":"Arith","ast":{"type":"Bin","op":"<","lhs":{"type":"Var","name":"i"},"rhs":{"type":"Var","name":"lim"}}},"body":[
+        {"type":"If","cond":{"type":"Arith","ast":{"type":"Bin","op":"==","lhs":{"type":"Bin","op":"%","lhs":{"type":"Var","name":"n"},"rhs":{"type":"Var","name":"i"}},"rhs":{"type":"Num","value":0}}},"then":[
+          {"type":"Output","value":{"type":"Var","name":"i"},"newline":true}
+        ],"elsifs":[],"else":[]},
+        {"type":"Assign","targets":[{"var":"i","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Bin","op":"+","lhs":{"type":"Var","name":"i"},"rhs":{"type":"Num","value":1}}}}
+      ]},
+      {"type":"Output","value":{"type":"Str","value":"done","style":"DoubleQuoted"},"newline":true}
+    ],"subs":[],"var_types":[{"name":"i","type":"Int"},{"name":"lim","type":"Int"},{"name":"n","type":"Int"}]}"#;
+
+    fn render_env(dual: bool) -> String {
+        set_dual_loops(Some(dual));
+        let mut prog = crate::shir_json_in::shir_json_to_ir(A1).expect("ingress");
+        prog.var_types = crate::shir::analyze_var_types(&prog);
+        let json = shir_to_estree_json(&prog).expect("render");
+        set_dual_loops(None);
+        json
+    }
+
+    /// Opt-in: the eligible loop gets the guarded dual shape — a
+    /// safe-integer guard selecting today's narrow while or the
+    /// Cast(Int64)-wrapped wide while. Structural assertions on both
+    /// arms, not just presence.
+    #[test]
+    fn dual_shape_when_opted_in() {
+        let json = render_env(true);
+        assert!(json.contains("isSafeInteger"), "guard present:\n{json}");
+        assert!(json.contains("BigInt"), "wide arm carries BigInt casts");
+        // both arms are WhileStatements (narrow = today's bytes, wide =
+        // wrapped); the guard's IfStatement selects between them
+        assert!(
+            json.matches("\"WhileStatement\"").count() >= 2,
+            "two loop arms:\n{json}"
+        );
+        assert!(json.contains("asIntN"), "wide arm uses BigInt.asIntN");
+    }
+
+    /// Opt-out (default): no guard, no wide arm, no BigInt anywhere.
+    #[test]
+    fn opt_out_unchanged() {
+        let json = render_env(false);
+        assert!(!json.contains("isSafeInteger"), "no guard by default");
+        assert!(!json.contains("BigInt"), "no wide arm by default");
+    }
+
+    /// Refusal: an op outside the sound subset (** — NaN semantics) keeps
+    /// the single loop even when opted in.
+    #[test]
+    fn unsound_shape_refused() {
+        let bad = A1.replace("\"op\":\"%\"", "\"op\":\"**\"");
+        set_dual_loops(Some(true));
+        let mut prog = crate::shir_json_in::shir_json_to_ir(&bad).expect("ingress");
+        prog.var_types = crate::shir::analyze_var_types(&prog);
+        let json = shir_to_estree_json(&prog).expect("render");
+        set_dual_loops(None);
+        assert!(!json.contains("isSafeInteger"), "must refuse:\n{json}");
     }
 }

@@ -142,6 +142,10 @@ fn enabled_names() -> Vec<String> {
 /// changed. Called by `ast_to_ir` after `optimize_stmts` (NOT by
 /// `ast_to_ir_raw` — raw = unoptimized).
 pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
+    // A previous compilation's per-function end-live map must never leak
+    // into a transform-phase walk (test_lowering's): transform phase runs
+    // pre-emission, before shir_to_estree sets it fresh. Unset = all-live.
+    crate::shir::clear_fn_end_live();
     let enabled = enabled_names();
     let mut changed = false;
     for (name, tf) in all() {

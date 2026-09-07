@@ -39,6 +39,10 @@ pub struct Render {
     store_written: HashSet<String>,
     /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
     need_atoi: bool,
+    /// needs `import math` (a lowered zsh-mathfunc arith text)
+    need_math: bool,
+    /// needs the `__sh_num` float-tolerant coercion helper (same)
+    need_num: bool,
     todo: usize,
     /// needs the `__sh_rc` status var (a `$?` test operand)
     need_rc: bool,
@@ -940,7 +944,18 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => {
                 // bash coerces arith operands to integers; python would
                 // string-repeat/double a str loop var, so wrap the read.
-                // (int() of an int-typed var is a no-op.) A STORE-resident
+                // (int() of an int-typed var is a no-op.) A positional
+                // `$N` is NOT the literal N (and has no binding — see the
+                // declaration skip): read argv like the getVar arm,
+                // coerced (`n = int(1)` for `n=$1` would freeze n at 1).
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    let i: i64 = name.parse().unwrap_or(1);
+                    self.need_atoi = true;
+                    return format!(
+                        "__sh_atoi((sys.argv[{i}] if len(sys.argv) > {i} else \"\"))"
+                    );
+                }
+                // A STORE-resident
                 // name (dotted struct fields — the C frontend flattens
                 // p.x to a store key) has no native binding: read via the
                 // store and coerce.
@@ -994,6 +1009,295 @@ impl Render {
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
         }
+    }
+
+    /// zsh-mathfunc arith text → native Python numeric expression.
+    ///
+    /// The deterministic `evalArith` subset (`harness/sh2-namespace.mjs`):
+    /// `int()` truncates toward zero, `sqrt()` is `Math.sqrt`, `$N` reads
+    /// argv, `$name` reads coerce numerically. Returns `None` — the caller
+    /// keeps the `sh2.arith` exit-2 stub — for anything outside the subset
+    /// (refuse > guess). In particular `%`, `&&`/`||`/`!`, the bitwise and
+    /// shift ops, ternaries, assignments and `++`/`--` stay stubs: their
+    /// Python value semantics diverge from the runtime's (float-fmod sign,
+    /// short-circuit operand values, int32 coercion, comparison chaining).
+    /// NaN edge: `sqrt` of a negative raises `ValueError` where the JS
+    /// runtime yields NaN — both are failures (nonzero exit); the
+    /// trial-division domain (non-negative loop bounds) is exact.
+    fn mathfunc_arith(&mut self, src: &str) -> Option<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut pos = 0;
+        let out = self.mf_cmp(&chars, &mut pos)?;
+        Self::mf_ws(&chars, &mut pos);
+        if pos != chars.len() {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// One `math.func` call for an evalArith mathfunc name, or `None`
+    /// outside the deterministic subset (`cbrt` needs Python 3.11+,
+    /// `rint` is banker's rounding vs JS half-up — both refused).
+    /// Python `int()` truncates toward zero, exactly `Math.trunc`.
+    fn mf_call(&mut self, name: &str, args: Vec<String>) -> Option<String> {
+        match name {
+            "abs" | "fabs" if args.len() == 1 => Some(format!("abs({})", args[0])),
+            "int" if args.len() == 1 => Some(format!("int({})", args[0])),
+            "ceil" | "floor" if args.len() == 1 => {
+                self.need_math = true;
+                Some(format!("math.{name}({})", args[0]))
+            }
+            "sqrt" | "exp" | "log" | "log10" | "log2" | "sin" | "cos" | "tan"
+            | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+            | "acosh" | "atanh" if args.len() == 1 => {
+                self.need_math = true;
+                Some(format!("math.{name}({})", args[0]))
+            }
+            "atan2" | "fmod" | "copysign" if args.len() == 2 => {
+                self.need_math = true;
+                Some(format!("math.{name}({}, {})", args[0], args[1]))
+            }
+            "hypot" if !args.is_empty() => {
+                self.need_math = true;
+                Some(format!("math.hypot({})", args.join(", ")))
+            }
+            _ => None,
+        }
+    }
+
+    /// Numeric read of a `$`-ref or bare name: reuse the getVar arm (it
+    /// owns residency — positional argv, store, native binding,
+    /// unset→"") and coerce float-tolerantly (evalArith's num() takes
+    /// `int(3.7)` floats; `__sh_atoi` is int-only and would zero them).
+    fn mf_numref(&mut self, name: &str) -> String {
+        self.need_num = true;
+        let gv = self.expr(&IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![IrExpr::Str(
+                name.to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        });
+        format!("__sh_num({gv})")
+    }
+
+    fn mf_ws(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+
+    /// `a < b` → `(1 if (a < b) else 0)` (evalArith yields 0/1 ints; a
+    /// bare Python bool would print as True/False). At most one
+    /// comparison — `a < b < c` chains in Python but is left-assoc in the
+    /// runtime, so a second comparison refuses the whole text.
+    fn mf_cmp(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let l = self.mf_add(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        let rest: String = chars[*pos..].iter().collect();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if rest.starts_with(op) {
+                *pos += op.len();
+                let r = self.mf_add(chars, pos)?;
+                return Some(format!("(1 if ({l} {op} {r}) else 0)"));
+            }
+        }
+        Some(l)
+    }
+
+    fn mf_add(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_mul(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            let op = match chars.get(*pos) {
+                Some('+') => "+",
+                Some('-') => "-",
+                _ => return Some(l),
+            };
+            *pos += 1;
+            let r = self.mf_mul(chars, pos)?;
+            l = format!("({l} {op} {r})");
+        }
+    }
+
+    fn mf_mul(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_pow(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            // `*` — but not `**` (that's pow's). `/` is float division,
+            // mirroring the runtime's JS-number semantics. `%` is refused
+            // (float-fmod sign diverges from Python % on negatives).
+            if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) != Some(&'*') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("({l} * {r})");
+            } else if chars.get(*pos) == Some(&'/') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("({l} / {r})");
+            } else {
+                return Some(l);
+            }
+        }
+    }
+
+    /// `**` mirrors JS: a signed base before `**` (`-2**2` is a
+    /// SyntaxError there) refuses the text — a signed base must
+    /// parenthesize — while the exponent takes signs (`2**-2` valid).
+    /// Signs are fine everywhere else (call args, operands).
+    fn mf_pow(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        let signed = matches!(chars.get(*pos), Some('+') | Some('-'));
+        let base = self.mf_unary(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) == Some(&'*') {
+            if signed {
+                return None;
+            }
+            *pos += 2;
+            let exp = self.mf_unary(chars, pos)?;
+            // `pow()` matches this backend's existing `**` rendering.
+            return Some(format!("pow({base},{exp})"));
+        }
+        Some(base)
+    }
+
+    fn mf_unary(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('+') => {
+                *pos += 1;
+                self.mf_unary(chars, pos)
+            }
+            Some('-') => {
+                *pos += 1;
+                Some(format!("(-{})", self.mf_unary(chars, pos)?))
+            }
+            // `!`/`~` refused (NaN/int32 divergences) — mf_atom rejects
+            // them, refusing the whole text.
+            _ => self.mf_atom(chars, pos),
+        }
+    }
+
+    fn mf_atom(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('(') => {
+                *pos += 1;
+                let e = self.mf_cmp(chars, pos)?;
+                Self::mf_ws(chars, pos);
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(format!("({e})"))
+            }
+            Some('$') => self.mf_dollar(chars, pos),
+            Some(c) if c.is_ascii_digit() || *c == '.' => Self::mf_number(chars, pos),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => self.mf_named(chars, pos),
+            _ => None,
+        }
+    }
+
+    fn mf_dollar(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        *pos += 1; // consume `$`
+        if chars.get(*pos) == Some(&'{') {
+            *pos += 1;
+            let name = Self::mf_name(chars, pos)?;
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) != Some(&'}') {
+                return None;
+            }
+            *pos += 1;
+            return Some(self.mf_numref(&name));
+        }
+        let name = Self::mf_name(chars, pos)?;
+        Some(self.mf_numref(&name))
+    }
+
+    fn mf_name(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    /// Bare name or call: a known mathfunc name followed by `(` parses
+    /// args; anything else is a numeric variable read. An unknown call
+    /// (or wrong arity) refuses the whole text.
+    fn mf_named(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let name = Self::mf_name(chars, pos)?;
+        let save = *pos;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) != Some(&'(') {
+            *pos = save;
+            return Some(self.mf_numref(&name));
+        }
+        *pos += 1;
+        let mut args = Vec::new();
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&')') {
+            *pos += 1;
+        } else {
+            loop {
+                args.push(self.mf_cmp(chars, pos)?);
+                Self::mf_ws(chars, pos);
+                match chars.get(*pos) {
+                    Some(',') => {
+                        *pos += 1;
+                    }
+                    Some(')') => {
+                        *pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        self.mf_call(&name, args)
+    }
+
+    /// Decimal int/float or hex (evalArith's num() shapes), emitted
+    /// verbatim — Python parses the same shapes. Exponents are refused
+    /// (the runtime's num() stops before the `e`, erroring on trailing).
+    fn mf_number(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        if chars.get(*pos) == Some(&'0')
+            && matches!(chars.get(*pos + 1), Some('x') | Some('X'))
+        {
+            *pos += 2;
+            let ds = *pos;
+            while matches!(chars.get(*pos), Some(c) if c.is_ascii_hexdigit()) {
+                *pos += 1;
+            }
+            if *pos == ds {
+                return None;
+            }
+        } else {
+            while matches!(chars.get(*pos), Some(c) if c.is_ascii_digit()) {
+                *pos += 1;
+            }
+            // `3.` is a float (the runtime's float-output shape); `..`
+            // is refused (no range syntax in this grammar).
+            if chars.get(*pos) == Some(&'.') && chars.get(*pos + 1) != Some(&'.') {
+                *pos += 1;
+                while matches!(chars.get(*pos), Some(c) if c.is_ascii_digit()) {
+                    *pos += 1;
+                }
+            }
+            if *pos == start {
+                return None;
+            }
+        }
+        Some(chars[start..*pos].iter().collect())
     }
 
     /// String interpolation: f-string when every expression part renders to
@@ -1504,6 +1808,17 @@ impl Render {
                     let norm = norm.replace('{', " ").replace('}', " ");
                     if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
                         return self.arith(&ast);
+                    }
+                    // zsh-mathfunc arith text (`(int(sqrt($1)) + 1)` — the
+                    // factor shape): the core's parse_arith has no call
+                    // syntax and ArithAst has no call node, so this can
+                    // never become IrExpr::Arith (the estree reference keeps
+                    // it as sh2.arith runtime eval). Lower the deterministic
+                    // evalArith subset (harness/sh2-namespace.mjs) to native
+                    // math calls; anything else keeps the stub below
+                    // (refuse > guess).
+                    if let Some(py) = self.mathfunc_arith(s) {
+                        return py;
                     }
                 }
                 self.sh2_stub("arith", args, "arith")
@@ -3012,6 +3327,13 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
+            // positional/special names (`1`, `?` — the shell `$1` reads)
+            // have no native binding: reads go through the argv idiom in
+            // the getVar arm, and declaring them emits `1 = ""`, a
+            // Python syntax error. Same no-binding reason as below.
+            if !Self::is_plain_name(v) {
+                continue;
+            }
             // store-resident names (dotted struct fields written via
             // sh2_setVar) have no native binding — hoisting `p.y = ""`
             // would be an unbound NameError
@@ -3052,6 +3374,9 @@ impl Render {
         self.emit("import sys");
         if self.need_re {
             self.emit("import re");
+        }
+        if self.need_math {
+            self.emit("import math");
         }
         if self.need_subprocess {
             self.emit("");
@@ -3148,6 +3473,25 @@ impl Render {
             self.emit("def __sh_atoi(s):");
             self.emit("    try:");
             self.emit("        return int(str(s).strip(), 10)");
+            self.emit("    except ValueError:");
+            self.emit("        return 0");
+            self.emit("");
+        }
+        if self.need_num {
+            // float-tolerant numeric coercion for zsh-mathfunc arith
+            // texts (the runtime evalArith num(): `int(3.7)` floats parse,
+            // hex parses, unset/invalid → 0). __sh_atoi is int-only and
+            // would zero "3.7".
+            self.emit("def __sh_num(s):");
+            self.emit("    t = str(s).strip()");
+            self.emit("    try:");
+            self.emit("        return int(t, 10)");
+            self.emit("    except ValueError:");
+            self.emit("        pass");
+            self.emit("    try:");
+            self.emit("        if t[:2].lower() == \"0x\":");
+            self.emit("            return int(t, 16)");
+            self.emit("        return float(t)");
             self.emit("    except ValueError:");
             self.emit("        return 0");
             self.emit("");
@@ -3498,4 +3842,140 @@ fn py_brace_words(args: &[IrExpr]) -> Option<String> {
     }
     let words: Vec<String> = combos.iter().map(|c| format!("{pre}{c}{suf}")).collect();
     Some(words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, IrStmt};
+
+    /// translator-level: the factor shape lowers, flags set.
+    #[test]
+    fn mathfunc_factor_shape() {
+        let mut r = Render::default();
+        let out = r.mathfunc_arith("(int(sqrt($1)) + 1)").expect("lowers");
+        assert!(out.contains("math.sqrt"), "{out}");
+        assert!(out.contains("sys.argv[1]"), "{out}");
+        assert!(out.contains("__sh_num"), "{out}");
+        assert!(r.need_math, "import math");
+        assert!(r.need_num, "__sh_num helper");
+        // structural: int() truncation outside, +1 preserved
+        assert!(out.contains("int(math.sqrt"), "{out}");
+        assert!(out.contains("+ 1"), "{out}");
+    }
+
+    /// comparisons yield 0/1 ints, never bare bools.
+    #[test]
+    fn mathfunc_comparison_wrapped() {
+        // % is refused (float-fmod sign diverges from Python %)
+        let mut r2 = Render::default();
+        assert!(r2.mathfunc_arith("($n % 2)").is_none(), "% stays a stub");
+        let mut r3 = Render::default();
+        let out = r3.mathfunc_arith("($n + 1)").expect("parses");
+        assert!(out.contains("__sh_num"), "{out}");
+        let mut r4 = Render::default();
+        let out = r4.mathfunc_arith("(a < b)").expect("parses");
+        assert!(out.contains("(1 if ("), "{out}");
+        assert!(out.contains("else 0)"), "{out}");
+    }
+
+    /// divergences refused: chaining, logic ops, shifts, ternary, rint/cbrt.
+    #[test]
+    fn mathfunc_refusals() {
+        for bad in [
+            "(a < b < c)",      // python chains, runtime is left-assoc
+            "(a && b)",         // short-circuit operand values
+            "(!a)",             // NaN semantics
+            "(a << 2)",         // int32 coercion in the runtime
+            "(a ? b : c)",      // ternary
+            "(x = 5)",          // assignment
+            "(i++)",            // incdec
+            "rint(1.5)",        // banker's vs half-up
+            "cbrt(8)",          // needs 3.11+
+            "bogusfn(2)",       // unknown call
+            "sqrt(1, 2)",       // wrong arity
+            "(2 + )",           // truncation
+            "1e3",              // exponent shape the runtime rejects
+            "(a % b)",          // fmod sign
+            "${x:-d}",          // fancy expansion
+        ] {
+            let mut r = Render::default();
+            assert!(r.mathfunc_arith(bad).is_none(), "{bad} must stay a stub");
+        }
+    }
+
+    /// multi-arg calls and JS `**` edge shapes.
+    #[test]
+    fn mathfunc_calls_and_pow() {
+        let mut r = Render::default();
+        let out = r.mathfunc_arith("hypot($a, $b)").expect("lowers");
+        assert!(out.contains("math.hypot"), "{out}");
+        let mut r = Render::default();
+        let out = r.mathfunc_arith("copysign($a, -1)").expect("lowers");
+        assert!(out.contains("math.copysign"), "{out}");
+        // `2**-2` valid (unary exponent), `-2**2` refused (JS SyntaxError).
+        let mut r = Render::default();
+        assert!(r.mathfunc_arith("2**-2").is_some(), "2**-2 lowers");
+        let mut r = Render::default();
+        assert!(r.mathfunc_arith("-2**2").is_none(), "-2**2 refused");
+    }
+
+    /// end-to-end through the real A1 ingress: the factor `__fl0` stmt.
+    #[test]
+    fn factor_fl0_no_stub() {
+        let json = r#"{"contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"(int(sqrt($1)) + 1)"}],"func":"arith","purity":"PureCpu","type":"Call"},"targets":[{"indices":[],"sigil":null,"var":"__fl0"}],"type":"Assign"}],"subs":[],"type":"Program","var_types":[]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(json).expect("ingress");
+        let out = shir_to_python(&prog);
+        assert!(out.contains("math.sqrt"), "{out}");
+        assert!(out.contains("import math"), "{out}");
+        assert!(out.contains("__sh_num"), "{out}");
+        assert!(!out.contains("TODO sh2.arith"), "{out}");
+        assert!(!out.contains("sys.exit(2)"), "{out}");
+    }
+
+    /// positional `$1` reads argv (never the literal 1) and declares
+    /// nothing (`1 = ""` would be a syntax error).
+    #[test]
+    fn positional_var_reads_argv() {
+        let json = r#"{"contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[{"expr":{"ast":{"name":"1","type":"Var"},"type":"Arith"},"targets":[{"indices":[],"sigil":null,"var":"n"}],"type":"Assign"}],"subs":[],"type":"Program","var_types":[]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(json).expect("ingress");
+        let out = shir_to_python(&prog);
+        assert!(out.contains("sys.argv[1]"), "{out}");
+        assert!(!out.contains("n = int(1)"), "{out}");
+        for line in out.lines() {
+            assert!(
+                !line.starts_with("1 = ") && !line.starts_with("1=") ,
+                "declares a digit binding: {line}"
+            );
+        }
+        python_syntax_ok(&out);
+    }
+
+    /// the emitted prelude with helpers is itself valid Python.
+    fn python_syntax_ok(out: &str) {
+        // structural gate (no interpreter available at unit level): every
+        // helper referenced in the body is defined in the preamble.
+        for helper in ["__sh_num", "__sh_atoi"] {
+            if out.contains(&format!("{helper}(")) {
+                assert!(out.contains(&format!("def {helper}(s):")), "{out}");
+            }
+        }
+        if out.contains("math.") {
+            assert!(out.contains("import math"), "{out}");
+        }
+    }
+
+    /// stmts helper so unused-import lints stay quiet if trimmed.
+    #[allow(dead_code)]
+    fn _assign(var: &str, expr: IrExpr) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr,
+            asm: None,
+        }
+    }
 }
