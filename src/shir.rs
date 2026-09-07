@@ -39849,6 +39849,14 @@ mod lastexit_callsite_tests {
 mod dual_loop_tests {
     use super::*;
 
+    // The dual-loop switch (set_dual_loops) is a process-global static;
+    // these tests render concurrently under cargo's parallel harness, so
+    // one test's Some(true)/None reset would tear another's render
+    // (flake: "guard present" fired with the option out, "no guard"
+    // with it on — order-dependent across runs). Serialize the whole
+    // set/render/reset sequence.
+    static DUAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// factor-shaped A1: a dead-status counted loop over lifted Int vars
     /// (i, lim, n), body = guarded mod echo + i++.
     const A1: &str = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
@@ -39865,6 +39873,7 @@ mod dual_loop_tests {
     ],"subs":[],"var_types":[{"name":"i","type":"Int"},{"name":"lim","type":"Int"},{"name":"n","type":"Int"}]}"#;
 
     fn render_env(dual: bool) -> String {
+        let _g = DUAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_dual_loops(Some(dual));
         let mut prog = crate::shir_json_in::shir_json_to_ir(A1).expect("ingress");
         prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -39903,6 +39912,7 @@ mod dual_loop_tests {
     /// the single loop even when opted in.
     #[test]
     fn unsound_shape_refused() {
+        let _g = DUAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let bad = A1.replace("\"op\":\"%\"", "\"op\":\"**\"");
         set_dual_loops(Some(true));
         let mut prog = crate::shir_json_in::shir_json_to_ir(&bad).expect("ingress");
