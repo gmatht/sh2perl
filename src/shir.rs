@@ -9969,7 +9969,6 @@ fn is_safe_grep_literal(pat: &str) -> bool {
 fn command_to_ir(cmd: &Command) -> IrExpr {
     match cmd {
         Command::TestExpression(t) => {
-            eprintln!("DBG command_to_ir TestExpression expr={:?}", t.expression);
             if t.modifiers.double {
                 call("test", vec![st(&t.expression), st("[[")])
             } else {
