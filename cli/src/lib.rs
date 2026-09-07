@@ -294,7 +294,10 @@ pub fn main_with_args(args: Vec<String>) {
 
     // `--true64`: bash arithmetic is true 64-bit (out-of-±2^53 numeric
     // vars home in BigInt64Array slots or BigInt values). Off by default.
-    if args.iter().any(|a| a == "--true64") {
+    // `--bigint`: exact-bignum semantics (Python/JS-origin sources) —
+    // implies true64 (i64 values are exact inside it); see
+    // docs/arith-homes.md for the per-source matrix.
+    if args.iter().any(|a| a == "--true64" || a == "--bigint") {
         debashl::shir::set_true64(true);
     }
 
