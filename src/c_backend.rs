@@ -9512,6 +9512,11 @@ impl Render {
         let ai = format!("_ai{}", self.temp_seq);
         self.temp_seq += 1;
         self.emit(&format!("size_t {ai} = 0;"));
+        // setArray REPLACES the array: reset the length up front so an
+        // empty literal (`arr=()`) clears a previously-populated array
+        // (the item loop below re-sets _len per element; without this a
+        // function-local array reused across calls keeps its old length).
+        self.emit(&format!("{id}_len = 0;"));
         for (i, it) in items.iter().enumerate() {
             let _ = i;
             // `arr=("$@")` — EACH positional is its own element (a joined
