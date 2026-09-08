@@ -1037,6 +1037,10 @@ fn grep_q_lift_sh(stages: &[Vec<IrStmt>]) -> Result<Option<String>, String> {
                 match it {
                     IrExpr::Str(s, _) if s == "-q" => {}
                     IrExpr::Str(s, _) if s == "-v" => invert = true,
+                    // any OTHER flag (-oP, -E, -i, …) means the case-glob
+                    // emulation cannot express the semantics — bail to the
+                    // general grep rendering (the grep_p polyfill for -P)
+                    IrExpr::Str(s, _) if s.starts_with('-') => return Ok(None),
                     IrExpr::Str(s, _) => pat = Some(s.clone()),
                     _ => return Ok(None),
                 }

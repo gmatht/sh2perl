@@ -68,7 +68,7 @@ impl Render {
     /// The mem handles are the tagged strings `\x01mem:<id>:<off>`; the
     /// arena is a flat byte-slot array with the load/store offset scaled by
     /// the type's element size (p + n gets its sizeof(*p) semantics).
-    const RUNTIME: &[(&str, &str)] = &[
+    const RUNTIME: &'static [(&'static str, &'static str)] = &[
         (
             "getVar",
             "def sh2_getVar(name):\n    return __sh_store.get(name, \"\")\n",
