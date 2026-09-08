@@ -235,6 +235,11 @@ pub struct Render {
     /// The gate links -lgmp (libgmp-dev installed); programs without
     /// bigint values never pay for it.
     need_gmp: bool,
+    /// Python-style exceptions (IrStmt::Try): setjmp/longjmp — <setjmp.h>
+    /// + the _sh_raise helper. Only programs with a Try pay for it.
+    need_exc: bool,
+    /// nesting depth of the current Try (unique jmp_buf/var names)
+    try_depth: usize,
     /// vars whose value is a GMP bigint (mpz_t): assigned from
     /// Cast(Int64)-tainted arithmetic (fixpoint over var reads).
     /// params stay char* (shell boundary); only these VAR slots change.
@@ -750,6 +755,7 @@ impl Render {
         }
         self.emit("#include <stdio.h>");
         self.emit("#include <stdlib.h>");
+        self.emit("#include <limits.h>"); // LLONG_MAX for the i64 fast-path check
         self.emit("#include <string.h>");
         self.emit("#include <sys/wait.h>");
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
@@ -762,6 +768,21 @@ impl Render {
         }
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
+        }
+        if self.need_exc {
+            // Python-style exceptions: setjmp/longjmp. A Try saves the
+            // OUTER buffer, setjmps into the shared one, and restores it
+            // after the finally — nested trys nest correctly. _sh_raise
+            // (the future `raise` lowering / the div-by-zero error path)
+            // longjmps with a code; the value rides in _sh_exc_val.
+            self.emit("#include <setjmp.h>");
+            self.emit("static jmp_buf _sh_exc_buf;");
+            self.emit("static const char *_sh_exc_val = NULL;");
+            self.emit("static void _sh_raise(int _code, const char *_val) {");
+            self.emit("  _sh_exc_val = _val;");
+            self.emit("  longjmp(_sh_exc_buf, _code);");
+            self.emit("}");
+            self.emit("");
         }
         if self.need_state_import {
             // source/eval state pull: import the child's KEY=VALUE dump
@@ -929,11 +950,46 @@ impl Render {
             self.emit("  }");
             self.emit("  return sa > 0 ? m : -m;");
             self.emit("}");
-            self.emit("static int _sh_sline_cmp(const void *pa, const void *pb) {");
-            self.emit("  const _sh_sline *a = (const _sh_sline *)pa, *b = (const _sh_sline *)pb;");
-            self.emit("  int m = _sh_numkey_cmp(a->p, b->p);");
+            // tier state: file-scope (the qsort comparator is its own
+            // function and cannot see helper locals). Separate segments
+            // so the trimmer keeps exactly what the surviving code
+            // mentions; reused across calls (high-water, never freed).
+            self.emit("static long long *_sh_sj_keys = 0;");
+            self.emit("static size_t _sh_sj_keycap = 0;");
+            self.emit("static int _sh_sj_fast = 0;");
+            self.emit("static int _sh_sline_cmp(const void *pa, const void *pb) {");            self.emit("  const _sh_sline *a = (const _sh_sline *)pa, *b = (const _sh_sline *)pb;");
+            self.emit("  int m;");
+            self.emit("  if (_sh_sj_fast) {");
+            self.emit("    long long x = _sh_sj_keys[a->idx], y = _sh_sj_keys[b->idx];");
+            self.emit("    m = x < y ? -1 : x > y ? 1 : 0;");
+            self.emit("  } else m = _sh_numkey_cmp(a->p, b->p);");
             self.emit("  if (m != 0) return m;");
             self.emit("  return a->idx < b->idx ? -1 : a->idx > b->idx ? 1 : 0;");
+            self.emit("}");
+            self.emit("/* canonical plain integer fitting i64? (blanks, one '-',");
+            self.emit("   digits, blanks — anything else, including '+', '.', or");
+            self.emit("   overflow, fails so the general path handles it) */");
+            self.emit("static int _sh_parse_i64(const char *s, long long *out) {");
+            self.emit("  while (*s == ' ' || *s == '\\t') s++;");
+            self.emit("  int neg = 0;");
+            self.emit("  if (*s == '-') { neg = 1; s++; }");
+            self.emit("  if (*s < '0' || *s > '9') return 0;");
+            self.emit("  unsigned long long mag = 0;");
+            self.emit("  while (*s >= '0' && *s <= '9') {");
+            self.emit("    unsigned d = (unsigned)(*s - '0');");
+            self.emit("    if (mag > (ULLONG_MAX - d) / 10) return 0;");
+            self.emit("    mag = mag * 10 + d; s++;");
+            self.emit("  }");
+            self.emit("  while (*s == ' ' || *s == '\\t') s++;");
+            self.emit("  if (*s != 0) return 0;");
+            self.emit("  if (!neg) {");
+            self.emit("    if (mag > (unsigned long long)LLONG_MAX) return 0;");
+            self.emit("    *out = (long long)mag;");
+            self.emit("  } else {");
+            self.emit("    if (mag > (unsigned long long)LLONG_MAX + 1ULL) return 0;");
+            self.emit("    *out = (mag == (unsigned long long)LLONG_MAX + 1ULL) ? LLONG_MIN : -(long long)mag;");
+            self.emit("  }");
+            self.emit("  return 1;");
             self.emit("}");
             // native sorted-print: the LINES stage 0 would emit (each
             // element + '\\n', exactly printf '%s\\n' semantics — an
@@ -980,11 +1036,32 @@ impl Render {
             self.emit("    i = j + 1;");
             self.emit("  }");
             self.emit("  if (ln > 0) ln--; /* post-terminator artifact */");
+            self.emit("  /* tier: every line a canonical plain i64 int? Then");
+            self.emit("     parse-once keys + trivial compare (no GMP, no per-");
+            self.emit("     comparison parsing). Otherwise the general string");
+            self.emit("     path above (mpq can't parse sort keys anyway: it");
+            self.emit("     rejects every decimal point). */");
+            self.emit("  _sh_sj_fast = 1;");
+            self.emit("  size_t kk;");
+            self.emit("  for (kk = 0; kk < ln; kk++) {");
+            self.emit("    if (_sh_sj_keycap <= kk) {");
+            self.emit("      size_t nc = _sh_sj_keycap ? _sh_sj_keycap * 2 : 64;");
+            self.emit("      while (nc <= kk) nc *= 2;");
+            self.emit("      long long *np = (long long *)realloc(_sh_sj_keys, nc * sizeof *_sh_sj_keys);");
+            self.emit("      if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("      _sh_sj_keys = np; _sh_sj_keycap = nc;");
+            self.emit("    }");
+            self.emit("    if (!_sh_parse_i64(_sj_ln[kk].p, &_sh_sj_keys[kk])) { _sh_sj_fast = 0; break; }");
+            self.emit("  }");
             self.emit("  if (ln > 0) qsort(_sj_ln, ln, sizeof *_sj_ln, _sh_sline_cmp);");
             self.emit("  size_t dn = 0, k;");
             self.emit("  _sh_vgrow(d, 1);");
             self.emit("  for (k = 0; k < ln; k++) {");
-            self.emit("    if (k > 0 && _sh_numkey_cmp(_sj_ln[k].p, _sj_ln[k-1].p) == 0) continue;");
+            self.emit("    int same;");
+            self.emit("    if (k == 0) same = 0;");
+            self.emit("    else if (_sh_sj_fast) same = (_sh_sj_keys[_sj_ln[k].idx] == _sh_sj_keys[_sj_ln[k-1].idx]);");
+            self.emit("    else same = (_sh_numkey_cmp(_sj_ln[k].p, _sj_ln[k-1].p) == 0);");
+            self.emit("    if (k > 0 && same) continue;");
             self.emit("    size_t l = strlen(_sj_ln[k].p);");
             self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
             self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
@@ -12141,6 +12218,65 @@ impl Render {
                 self.emit("  }");
                 self.emit("}");
             }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                // Python-style exceptions via setjmp/longjmp: the try body
+                // (and the else body — Python's no-exception branch) run
+                // in the setjmp==0 arm; a raise longjmps to the else arm,
+                // which runs the FIRST matching except (the py-sh-go
+                // subset emits bare excepts — match null — so the first
+                // arm catches everything; a typed match_expr refuses).
+                // The finally body runs on BOTH paths, then the outer
+                // buffer is restored (nested trys nest correctly).
+                self.need_exc = true;
+                let k = self.try_depth;
+                self.try_depth += 1;
+                self.emit(&format!("{{"));
+                self.emit(&format!("  jmp_buf _saved_exc{k};"));
+                self.emit(&format!(
+                    "  memcpy(_saved_exc{k}, _sh_exc_buf, sizeof(jmp_buf));"
+                ));
+                self.emit(&format!("  int _exc{k} = setjmp(_sh_exc_buf);"));
+                self.emit(&format!("  if (_exc{k} == 0) {{"));
+                self.depth += 1;
+                for st in body {
+                    self.stmt(st);
+                }
+                for st in else_body {
+                    self.stmt(st);
+                }
+                self.depth -= 1;
+                self.emit(&format!("  }} else {{"));
+                self.depth += 1;
+                for ex in excepts {
+                    if ex.match_expr.is_some() {
+                        self.mark_todo("typed except (match_expr)");
+                        continue;
+                    }
+                    if let Some(name) = &ex.as_name {
+                        // `except E as e:` — bind the raised value
+                        let id = self.c_ident(name);
+                        self.emit(&format!(
+                            "  {id} = strdup(_sh_exc_val ? _sh_exc_val : \"\");"
+                        ));
+                    }
+                    for st in &ex.body {
+                        self.stmt(st);
+                    }
+                    // a bare except catches everything — only the first
+                    // arm runs
+                    break;
+                }
+                self.depth -= 1;
+                self.emit(&format!("  }}"));
+                for st in finally_body {
+                    self.stmt(st);
+                }
+                self.emit(&format!(
+                    "  memcpy(_sh_exc_buf, _saved_exc{k}, sizeof(jmp_buf));"
+                ));
+                self.emit(&format!("}}"));
+                self.try_depth -= 1;
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -17029,6 +17165,7 @@ mod tests {
         assert!(!out.contains("\"sort\""), "sort argv kept:\n{out}");
         assert!(!out.contains("\"awk\""), "awk argv kept:\n{out}");
         assert!(out.contains("_sh_numkey_cmp"), "comparator missing:\n{out}");
+        assert!(out.contains("_sh_parse_i64"), "i64 fast path missing:\n{out}");
     }
 
     #[test]
