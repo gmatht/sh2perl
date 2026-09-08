@@ -880,13 +880,14 @@ impl Render {
             // the same consume-immediately discipline as the old statics
             // (no ownership transfer, no frees, nothing to leak).
             self.emit("typedef struct { char *p; size_t cap; } _sh_vbuf;");
-            self.emit("static void _sh_vgrow(_sh_vbuf *b, size_t need) {");
-            self.emit("  if (need <= b->cap) return;");
+            self.emit("static char *_sh_vgrow(_sh_vbuf *b, size_t need) {");
+            self.emit("  if (need <= b->cap && b->p) return b->p;");
             self.emit("  size_t ncap = b->cap ? b->cap : 256;");
             self.emit("  while (ncap < need) ncap *= 2;");
             self.emit("  char *np = (char*)realloc(b->p, ncap);");
             self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
             self.emit("  b->p = np; b->cap = ncap;");
+            self.emit("  return np;");
             self.emit("}");
             self.emit("static void _sh_add(const char *s) {");
             self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(s);");
@@ -1002,7 +1003,7 @@ impl Render {
             self.emit("  static _sh_vbuf _sj = {0, 0};");
             self.emit("  static _sh_sline *_sj_ln = 0; static size_t _sj_lncap = 0;");
             self.emit("  size_t i, ln = 0;");
-            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  _sh_vgrow(&_sj, 1); _sj.p[0] = 0;");
             self.emit("  size_t tot = 1, pos = 0;");
             self.emit("  for (i = 0; i < n; i++) tot += (a[i] ? strlen(a[i]) : 0) + 1;");
@@ -1077,7 +1078,7 @@ impl Render {
             if self.need_gmp {
             self.emit("static char *_sh_mpz_str(_sh_vbuf *d, const mpz_t v) {");
             self.emit("  char *s = mpz_get_str(0, 10, v);");
-            self.emit("  if (!s) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
+            self.emit("  if (!s) { char *dp = _sh_vgrow(d, 1); dp[0] = 0; return dp; }");
             self.emit("  size_t n = strlen(s);");
             self.emit("  _sh_vgrow(d, n + 1);");
             self.emit("  memcpy(d->p, s, n + 1);");
@@ -1188,8 +1189,100 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
+            // typed sorted-unique join (py-sh-go sortedIntJoin/sortedBigintJoin
+            // nodes): the elements are CONTRACTUALLY canonical Python-int
+            // strings (proven ints, int vs arbitrary magnitude chosen by
+            // the frontend's range analysis) — no blanks/decimals/junk to
+            // parse, so plain atoll/mpz compare is exact (unlike the
+            // untyped _sh_sorted_join above, which must emulate GNU -n).
+            // Stable (index-decorated qsort) + first-in-input dedupe +
+            // ", " join, matching the pipeline shape bit-for-bit.
+            self.emit("static long long *_sh_sij_keys = 0; static size_t _sh_sij_keycap = 0;");
+            self.emit("static int _sh_sij_cmp(const void *pa, const void *pb) {");
+            self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
+            self.emit("  long long x = _sh_sij_keys[a], y = _sh_sij_keys[b];");
+            self.emit("  if (x != y) return x < y ? -1 : 1;");
+            self.emit("  return a < b ? -1 : a > b;");
+            self.emit("}");
+            self.emit("static void _sh_sorted_int_join(_sh_vbuf *d, char **a, size_t n) {");
+            self.emit("  static size_t *_sh_sij_ix = 0; static size_t _sh_sij_ixcap = 0;");
+            self.emit("  size_t i;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
+            self.emit("  if (_sh_sij_keycap < n) {");
+            self.emit("    size_t nc = _sh_sij_keycap ? _sh_sij_keycap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    long long *np = (long long *)realloc(_sh_sij_keys, nc * sizeof *_sh_sij_keys);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sij_keys = np; _sh_sij_keycap = nc;");
+            self.emit("  }");
+            self.emit("  if (_sh_sij_ixcap < n) {");
+            self.emit("    size_t nc = _sh_sij_ixcap ? _sh_sij_ixcap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    size_t *np = (size_t *)realloc(_sh_sij_ix, nc * sizeof *_sh_sij_ix);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sij_ix = np; _sh_sij_ixcap = nc;");
+            self.emit("  }");
+            self.emit("  for (i = 0; i < n; i++) { _sh_sij_keys[i] = atoll(a[i] ? a[i] : \"0\"); _sh_sij_ix[i] = i; }");
+            self.emit("  if (n > 0) qsort(_sh_sij_ix, n, sizeof *_sh_sij_ix, _sh_sij_cmp);");
+            self.emit("  size_t dn = 0, k;");
+            self.emit("  for (k = 0; k < n; k++) {");
+            self.emit("    size_t j = _sh_sij_ix[k];");
+            self.emit("    if (k > 0 && _sh_sij_keys[j] == _sh_sij_keys[_sh_sij_ix[k-1]]) continue;");
+            self.emit("    const char *s = a[j] ? a[j] : \"\";");
+            self.emit("    size_t l = strlen(s);");
+            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
+            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("    memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            self.emit("static mpz_t *_sh_sbj_v = 0; static size_t _sh_sbj_cap = 0; static size_t _sh_sbj_init = 0;");
+            self.emit("static int _sh_sbj_cmp(const void *pa, const void *pb) {");
+            self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
+            self.emit("  int m = mpz_cmp(_sh_sbj_v[a], _sh_sbj_v[b]);");
+            self.emit("  if (m != 0) return m;");
+            self.emit("  return a < b ? -1 : a > b;");
+            self.emit("}");
+            self.emit("static void _sh_sorted_bigint_join(_sh_vbuf *d, char **a, size_t n) {");
+            self.emit("  static size_t *_sh_sbj_ix = 0; static size_t _sh_sbj_ixcap = 0;");
+            self.emit("  size_t i;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
+            self.emit("  if (_sh_sbj_cap < n) {");
+            self.emit("    size_t nc = _sh_sbj_cap ? _sh_sbj_cap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    mpz_t *np = (mpz_t *)realloc(_sh_sbj_v, nc * sizeof *_sh_sbj_v);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sbj_v = np;");
+            self.emit("    for (; _sh_sbj_init < nc; _sh_sbj_init++) mpz_init(_sh_sbj_v[_sh_sbj_init]);");
+            self.emit("    _sh_sbj_cap = nc;");
+            self.emit("  }");
+            self.emit("  if (_sh_sbj_ixcap < n) {");
+            self.emit("    size_t nc = _sh_sbj_ixcap ? _sh_sbj_ixcap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    size_t *np = (size_t *)realloc(_sh_sbj_ix, nc * sizeof *_sh_sbj_ix);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sbj_ix = np; _sh_sbj_ixcap = nc;");
+            self.emit("  }");
+            self.emit("  for (i = 0; i < n; i++) {");
+            self.emit("    const char *s = a[i] ? a[i] : \"0\";");
+            self.emit("    if (mpz_set_str(_sh_sbj_v[i], s, 10) != 0) mpz_set_ui(_sh_sbj_v[i], 0);");
+            self.emit("    _sh_sbj_ix[i] = i;");
+            self.emit("  }");
+            self.emit("  if (n > 0) qsort(_sh_sbj_ix, n, sizeof *_sh_sbj_ix, _sh_sbj_cmp);");
+            self.emit("  size_t dn = 0, k;");
+            self.emit("  for (k = 0; k < n; k++) {");
+            self.emit("    size_t j = _sh_sbj_ix[k];");
+            self.emit("    if (k > 0 && mpz_cmp(_sh_sbj_v[j], _sh_sbj_v[_sh_sbj_ix[k-1]]) == 0) continue;");
+            self.emit("    const char *s = a[j] ? a[j] : \"\";");
+            self.emit("    size_t l = strlen(s);");
+            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
+            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("    memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
             self.emit("static char *_sh_argv_join(_sh_vbuf *d) {");
-            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0; size_t n = 0;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0; size_t n = 0;");
             self.emit("  for (int i = 1; i < _sh_argc; i++) {");
             self.emit("    if (i > 1) { _sh_vgrow(d, n + 2); d->p[n++] = ' '; }");
             self.emit("    const char *s = _sh_argv[i];");
@@ -1206,7 +1299,7 @@ impl Render {
             self.emit("  long long e = b + ((len < 0) ? nav + len : len);");
             self.emit("  if (e > total) e = total; if (e < b) e = b;");
             self.emit("  size_t dn = 0; long long i;");
-            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  for (i = b; i < e; i++) {");
             self.emit("    if (i > b) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    const char *s = _sh_argv[i] ? _sh_argv[i] : \"\";");
@@ -1234,7 +1327,7 @@ impl Render {
             self.emit("static void _sh_run(void) { (void)_sh_system_rc(); }");
             self.emit("/* run the built command, capture stdout, strip trailing newlines */");
             self.emit("static void _sh_capture(_sh_vbuf *d, const char *cmd) {");
-            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  if (!cmd || !*cmd) { _sh_rc = 0; return; }");
             self.emit("  _sh_wrap_cmd(cmd);");
             self.emit("  FILE *p = popen(_sh_wrap, \"r\");");
@@ -1286,11 +1379,11 @@ impl Render {
             // trailing \n/\r — the returned value IS that text)
             self.emit("static char *_sh_ret_val(_sh_vbuf *vb, const char *v) {");
             self.emit("  size_t n = v ? strlen(v) : 0;");
-            self.emit("  _sh_vgrow(vb, n + 1);");
-            self.emit("  if (v) memcpy(vb->p, v, n);");
-            self.emit("  vb->p[n] = 0;");
-            self.emit("  while (n > 0 && (vb->p[n - 1] == '\\n' || vb->p[n - 1] == '\\r')) vb->p[--n] = 0;");
-            self.emit("  return vb->p;");
+            self.emit("  char *p = _sh_vgrow(vb, n + 1);");
+            self.emit("  if (v) memcpy(p, v, n);");
+            self.emit("  p[n] = 0;");
+            self.emit("  while (n > 0 && (p[n - 1] == '\\n' || p[n - 1] == '\\r')) p[--n] = 0;");
+            self.emit("  return p;");
             self.emit("}");
             // in-process function CALL: argv swap (positional params),
             // shared-buffer detach (the callee's own sites would
@@ -3226,6 +3319,30 @@ impl Render {
                     None => "0".into(),
                 },
                 "join" => self.join_value(args),
+                "sortedIntJoin" | "sortedBigintJoin" => {
+                    // typed sorted-unique join (py-sh-go node): elements
+                    // contractually canonical ints — plain atoll/mpz
+                    // compare is exact (no GNU -n fringe). Plain arrays
+                    // only; anything else is a loud TODO (cannot happen
+                    // from the frontend: it emits the legacy pipeline
+                    // for untracked shapes).
+                    let Some(name) = Self::str_arg(args, 0) else {
+                        return "\"\"".into();
+                    };
+                    if !self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+                        self.mark_todo(&format!("sorted join of non-array {name}"));
+                        return "\"\"".into();
+                    }
+                    let id = self.c_ident(&name);
+                    let vb = self.vbuf_temp();
+                    if func == "sortedIntJoin" {
+                        self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                    } else {
+                        self.need_gmp = true;
+                        self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
+                    }
+                    format!("{vb}.p")
+                }
                 "arith" => {
                     if std::env::var("SH2_DBG_VARS").is_ok() {
                         eprintln!("DBG value_c arith s={:?}", Self::str_arg(args, 0));
@@ -9742,6 +9859,25 @@ impl Render {
                         let v = self.call(func, &args);
                         return vec![Part::Arg(v, NumSpec::Str)];
                     }
+                }
+                // typed sorted-unique join nodes (py-sh-go): same
+                // lowering as value_c (string text in a vbuf).
+                if func == "sortedIntJoin" || func == "sortedBigintJoin" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if self.arrays.contains(name) && !self.assoc_arrays.contains(name) {
+                            let id = self.c_ident(name);
+                            let vb = self.vbuf_temp();
+                            if func == "sortedIntJoin" {
+                                self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                            } else {
+                                self.need_gmp = true;
+                                self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
+                            }
+                            return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
+                        }
+                    }
+                    self.mark_todo(&format!("sorted join of non-array {func}"));
+                    return vec![Part::Arg("\"\"".into(), NumSpec::Str)];
                 }
                 // other calls: render the call expression; numeric iff the
                 // expression is numeric (stubs return long long → %lld+cast)
@@ -17090,6 +17226,78 @@ mod tests {
         let out = shir_to_c(&prog);
         assert!(out.contains("_sh_mpz_str"), "helper trimmed while referenced:\n{out}");
         assert!(out.contains("mpz_add"), "add not lowered:\n{out}");
+    }
+
+    #[test]
+    fn sorted_join_nodes_lower_natively() {
+        // sortedIntJoin/sortedBigintJoin (py-sh-go typed sorted-list
+        // nodes): native qsort lowers, no fork/exec engine, no argv.
+        // The bigint node needs GMP (mpz_cmp); the int node must not.
+        use crate::ir::StrStyle;
+        for (func, want_mpz) in [
+            ("sortedIntJoin", false),
+            ("sortedBigintJoin", true),
+        ] {
+            let prog = IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![
+                    IrStmt::Assign {
+                        targets: vec![crate::ir::AssignTarget {
+                            var: "a".to_string(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Call {
+                            func: "setArray".to_string(),
+                            args: vec![
+                                IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![
+                                    IrExpr::Str("3".to_string(), StrStyle::DoubleQuoted),
+                                    IrExpr::Str("1".to_string(), StrStyle::DoubleQuoted),
+                                ]),
+                            ],
+                        },
+                        asm: None,
+                    },
+                    IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: vec![
+                            IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Call {
+                                func: func.to_string(),
+                                args: vec![IrExpr::Str(
+                                    "a".to_string(),
+                                    StrStyle::DoubleQuoted,
+                                )],
+                            }]),
+                        ],
+                    }),
+                ],
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            };
+            let out = shir_to_c(&prog);
+            let helper = if want_mpz {
+                "_sh_sorted_bigint_join"
+            } else {
+                "_sh_sorted_int_join"
+            };
+            assert!(out.contains(helper), "{func}: helper missing:\n{out}");
+            assert!(!out.contains("_sh_pipeline("), "{func}: fork kept:\n{out}");
+            assert_eq!(
+                out.contains("mpz_cmp"),
+                want_mpz,
+                "{func}: GMP presence wrong:\n{out}"
+            );
+        }
     }
 
     #[test]
