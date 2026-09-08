@@ -33,6 +33,7 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 pub mod shir_pipeline_native;
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
+pub mod planner; // backend node manifests + core solver (the "solve" idea, docs/shir-primitives.md)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
