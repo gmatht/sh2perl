@@ -377,7 +377,7 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
     if stages.len() != 3 {
         return None;
     }
-    fn stage_call(s: &IrExpr) -> Option<(&str, Vec<IrExpr>)> {
+    fn stage_call(s: &IrExpr) -> Option<(String, Vec<IrExpr>)> {
         let IrExpr::Arrow(stmts) = s else {
             return None;
         };
@@ -392,11 +392,7 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
             Some(IrExpr::Array(items)) => items.clone(),
             _ => vec![],
         };
-        Some((cmd_leak(cmd), words))
-    }
-    // 'static promotion for the borrowed cmd: str_arg clones already
-    fn cmd_leak(s: String) -> &'static str {
-        Box::leak(s.into_boxed_str())
+        Some((cmd, words))
     }
     let (c0, w0) = stage_call(&stages[0])?;
     let (c1, w1) = stage_call(&stages[1])?;
@@ -407,7 +403,7 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
     let [IrExpr::Str(fmt, _), IrExpr::Call { func, args }] = w0.as_slice() else {
         return None;
     };
-    if fmt != "%s\\n" || func != "param" {
+    if (fmt != "%s\n" && fmt != "%s\\n") || func != "param" {
         return None;
     }
     let [IrExpr::Str(op, _), IrExpr::Str(arr, _), IrExpr::Str(at, _), IrExpr::Str(len, _)] =
@@ -2527,6 +2523,7 @@ impl Render {
                         // must run exactly once — hoist to a temp
                         if v.contains("_sh_pipeline(") || v.contains("_cap_")
                             || v.contains("_sh_call_fn(")
+                            || v.contains("_sh_sorted_join(")
                         {
                             self.emit(&format!("char *{rv} = {v};"));
                             self.emit(&format!(
@@ -5432,6 +5429,7 @@ impl Render {
                             if v.contains("_cap_")
                                 || v.contains("_sh_pipeline(")
                                 || v.contains("_sh_call_fn(")
+                                || v.contains("_sh_sorted_join(")
                             {
                                 let t = format!("_eh{}", self.temp_seq);
                                 self.temp_seq += 1;
@@ -6003,6 +6001,37 @@ impl Render {
         };
         let pid = self.temp_seq;
         self.temp_seq += 1;
+        // sorted-print idiom: `printf '%s\n' "${arr[@]}" | sort -n
+        // -u | awk-JOIN` sorts in memory (no fork/exec). The array is
+        // consumed directly — no join/serialize roundtrip, no child
+        // processes. Plain (non-assoc) arrays only; everything else
+        // keeps the fork engine below.
+        if capture {
+            if let Some(arr) = sorted_join_array(stages) {
+                if self.arrays.contains(&arr) && !self.assoc_arrays.contains(&arr) {
+                    // the runtime region (helpers, _sh_rc, vbuf core)
+                    // lives under need_sh — set it; the trimmer drops
+                    // everything this lowering doesn't reference
+                    self.need_sh = true;
+                    let id = self.c_ident(&arr);
+                    let b = format!("_sj{pid}");
+                    self.emit(&format!("static _sh_vbuf {b} = {{0, 0}};"));
+                    return Some(format!(
+                        "(_sh_rc = 0, _sh_sorted_join(&{b}, {id}, {id}_len))"
+                    ));
+                }
+            }
+        } else if let Some(arr) = sorted_join_array(stages) {
+            if self.arrays.contains(&arr) && !self.assoc_arrays.contains(&arr) {
+                self.need_sh = true;
+                let id = self.c_ident(&arr);
+                let b = format!("_sj{pid}");
+                self.emit(&format!("static _sh_vbuf {b} = {{0, 0}};"));
+                return Some(format!(
+                    "(_sh_rc = 0, fputs(_sh_sorted_join(&{b}, {id}, {id}_len), stdout), _sh_rc == 0)"
+                ));
+            }
+        }
         let mut specs: Vec<String> = Vec::new();
         let mut decls: Vec<String> = Vec::new();
         for (i, st) in stages.iter().enumerate() {
@@ -16925,6 +16954,81 @@ mod tests {
         let out = shir_to_c(&prog);
         assert!(out.contains("_sh_mpz_str"), "helper trimmed while referenced:\n{out}");
         assert!(out.contains("mpz_add"), "add not lowered:\n{out}");
+    }
+
+    #[test]
+    fn sorted_join_idiom_lowers_natively() {
+        // `printf '%s\n' "${a[@]}" | sort -n -u | awk-JOIN` must
+        // lower to _sh_sorted_join (no fork/exec engine, no sort/awk
+        // argv). Other pipelines are untouched (covered by the gate).
+        use crate::ir::StrStyle;
+        let word = |s: &str| IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted);
+        let stage = |cmd: &str, words: Vec<IrExpr>| {
+            IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![word(cmd), IrExpr::Array(words)],
+            })])
+        };
+        let slice = IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![
+                word("slice"),
+                word("a"),
+                word("@"),
+                word(""),
+            ],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "pipeline".to_string(),
+                args: vec![IrExpr::Array(vec![
+                    stage("printf", vec![word("%s\n"), slice]),
+                    stage("sort", vec![word("-n"), word("-u")]),
+                    stage(
+                        "awk",
+                        vec![word("NR>1{printf \"%s\",\", \"}{printf \"%s\",$0}")],
+                    ),
+                ])],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        // the array must exist as a plain array for the trigger
+        // (registered via setArray assigns, like the frontend emits)
+        let mut prog = prog;
+        prog.stmts.insert(
+            0,
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "a".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: "setArray".to_string(),
+                    args: vec![
+                        word("a"),
+                        IrExpr::Array(vec![word("3"), word("1")]),
+                    ],
+                },
+                asm: None,
+            },
+        );
+        let out = shir_to_c(&prog);
+        assert!(out.contains("_sh_sorted_join"), "no native lowering:\n{out}");
+        assert!(!out.contains("_sh_pipeline("), "fork engine kept:\n{out}");
+        assert!(!out.contains("\"sort\""), "sort argv kept:\n{out}");
+        assert!(!out.contains("\"awk\""), "awk argv kept:\n{out}");
+        assert!(out.contains("_sh_numkey_cmp"), "comparator missing:\n{out}");
     }
 
     #[test]
