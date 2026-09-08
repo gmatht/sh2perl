@@ -183,6 +183,9 @@ pub struct Render {
     need_state_import: bool,
     /// emit the _sh_wc_words word-count helper (WordCount ext node)
     need_wc_words: bool,
+    /// emit the primitive ext-node helpers (_sh_wc_words, _sh_count_char,
+    /// _sh_split_count) for StrLen/WordCount/RegCount/ArrayLen(Split)
+    need_primitives: bool,
     /// true when ALL capture-assigned vars in the current scope are
     /// non-escaping → captures can share an arena freed at return
     arena_safe: bool,
@@ -1771,6 +1774,34 @@ impl Render {
             self.runtime_end = self.out.len();
             self.runtime_known = true;
         }
+        if self.need_primitives {
+            // primitive ext-node helpers (StrLen/WordCount/RegCount/
+            // ArrayLen(Split)) — pure C, no shell-out runtime. Emitted
+            // OUTSIDE the need_sh block so a program that uses only a
+            // primitive (no shell-out) still gets them.
+            self.emit("/* count whitespace-delimited words (WordCount) */");
+            self.emit("static size_t _sh_wc_words(const char *s) {");
+            self.emit("  size_t n = 0; int in = 0;");
+            self.emit("  for (; s && *s; s++) {");
+            self.emit("    if (*s == ' ' || *s == '\\t' || *s == '\\n') in = 0;");
+            self.emit("    else if (!in) { in = 1; n++; }");
+            self.emit("  }");
+            self.emit("  return n;");
+            self.emit("}");
+            self.emit("/* count occurrences of a single char (RegCount of a literal) */");
+            self.emit("static size_t _sh_count_char(const char *s, char c) {");
+            self.emit("  size_t n = 0;");
+            self.emit("  for (; s && *s; s++) if (*s == c) n++;");
+            self.emit("  return n;");
+            self.emit("}");
+            self.emit("/* number of fields when splitting by a single char (ArrayLen(Split)) */");
+            self.emit("static size_t _sh_split_count(const char *s, char delim) {");
+            self.emit("  if (!s || !*s) return 0;");
+            self.emit("  size_t n = 1;");
+            self.emit("  for (; *s; s++) if (*s == delim) n++;");
+            self.emit("  return n;");
+            self.emit("}");
+        }
         if self.need_grep {
             self.emit("/* grepMatches(text, pat, flags) — the `grep -o` lift: print");
             self.emit("   each match on its own line (grep -o's output), set _sh_rc");
@@ -2209,6 +2240,7 @@ impl Render {
                     "0".into()
                 }
             },
+            IrExpr::Ext(node) => self.ext_value_c(&**node),
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "0".into()
@@ -2929,6 +2961,82 @@ impl Render {
         self.emit(&format!("static char {t}[32];"));
         self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
         t
+    }
+
+    /// Render a transform-declared primitive Ext node (StrLen/WordCount/
+    /// RegCount/ArrayLen(Split)) to a C value expression. Anything else is
+    /// a loud TODO (the C backend implements the primitives, not every
+    /// Ext node). Sets `need_primitives` so the preamble emits the helpers.
+    fn ext_value_c(&mut self, node: &dyn crate::shir_nodes::ExtExpr) -> String {
+        use crate::shir_nodes::{ArrayLen, RegCount, Split, StrLen, WordCount};
+        match node.tag() {
+            "StrLen" => {
+                let n = node.as_any().downcast_ref::<StrLen>().unwrap();
+                let t = self.value_c(&n.text);
+                self.need_primitives = true;
+                self.num_temp(&format!("strlen((char*)({t}))"))
+            }
+            "WordCount" => {
+                let n = node.as_any().downcast_ref::<WordCount>().unwrap();
+                let t = self.value_c(&n.text);
+                self.need_primitives = true;
+                self.num_temp(&format!("_sh_wc_words((char*)({t}))"))
+            }
+            "RegCount" => {
+                let n = node.as_any().downcast_ref::<RegCount>().unwrap();
+                let t = self.value_c(&n.text);
+                // C has no regex: only the literal newline-count case
+                // (wc -l) lowers natively; any other pattern is a TODO.
+                if n.pattern == "\\n" || n.pattern == "\n" {
+                    self.need_primitives = true;
+                    self.num_temp(&format!("_sh_count_char((char*)({t}), '\\n')"))
+                } else {
+                    self.mark_todo(&format!("RegCount pattern {:?}", n.pattern));
+                    "0".into()
+                }
+            }
+            "ArrayLen" => {
+                let n = node.as_any().downcast_ref::<ArrayLen>().unwrap();
+                // ArrayLen(Split(text, delim)) → count the split fields.
+                if let IrExpr::Ext(split) = &n.array {
+                    if split.tag() == "Split" {
+                        let sp = split.as_any().downcast_ref::<Split>().unwrap();
+                        if !sp.is_regex {
+                            // interpret the escaped "\n" / literal "\n" as
+                            // a newline delimiter; any other single char as
+                            // itself; multi-char delims are a TODO.
+                            let d = if sp.delim == "\\n" || sp.delim == "\n" {
+                                Some('\n')
+                            } else if sp.delim.chars().count() == 1 {
+                                sp.delim.chars().next()
+                            } else {
+                                None
+                            };
+                            if let Some(d) = d {
+                                let t = self.value_c(&sp.text);
+                                self.need_primitives = true;
+                                // emit the C char literal (a newline as
+                                // the escape sequence, not a raw newline)
+                                let clit = if d == '\n' {
+                                    "'\\n'".to_string()
+                                } else {
+                                    format!("'{}'", d)
+                                };
+                                return self.num_temp(&format!(
+                                    "_sh_split_count((char*)({t}), {clit})"
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.mark_todo("ArrayLen of non-literal-Split");
+                "0".into()
+            }
+            _ => {
+                self.mark_todo(&format!("ext expr {}", node.tag()));
+                "0".into()
+            }
+        }
     }
 
     /// Emit `char _sN[cap];` and return `_sN` — a per-use string temp.
@@ -17875,6 +17983,73 @@ mod tests {
             r.num_spec(&IrExpr::Int(42)),
             NumSpec::Num("%lld", true)
         );
+    }
+
+    #[test]
+    fn primitive_ext_nodes_render_natively() {
+        // StrLen/WordCount/RegCount/ArrayLen(Split) lower to native C
+        // (strlen / _sh_wc_words / _sh_count_char / _sh_split_count), not
+        // a TODO marker — the C backend implements the primitives.
+        use crate::ir::StrStyle;
+        use crate::shir_nodes::{ArrayLen, RegCount, Split, StrLen, WordCount};
+        let text = IrExpr::Str("a\nb\n".to_string(), StrStyle::DoubleQuoted);
+        let cases: Vec<(IrExpr, &str)> = vec![
+            (
+                IrExpr::Ext(Box::new(StrLen { text: text.clone() })),
+                "strlen",
+            ),
+            (
+                IrExpr::Ext(Box::new(WordCount { text: text.clone() })),
+                "_sh_wc_words",
+            ),
+            (
+                IrExpr::Ext(Box::new(RegCount {
+                    text: text.clone(),
+                    pattern: "\\n".to_string(),
+                })),
+                "_sh_count_char",
+            ),
+            (
+                IrExpr::Ext(Box::new(ArrayLen {
+                    array: IrExpr::Ext(Box::new(Split {
+                        text: text.clone(),
+                        delim: "\\n".to_string(),
+                        is_regex: false,
+                        in_place: false,
+                    })),
+                })),
+                "_sh_split_count",
+            ),
+        ];
+        for (value, want) in cases {
+            let prog = IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Output {
+                    value,
+                    newline: true,
+                    target: None,
+                }],
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            };
+            let out = shir_to_c(&prog);
+            assert!(
+                out.contains(want),
+                "primitive {want} missing from C output:\n{out}"
+            );
+            assert!(
+                !out.contains("TODO(unsupported)"),
+                "primitive lowered to TODO:\n{out}"
+            );
+        }
     }
 }
 
