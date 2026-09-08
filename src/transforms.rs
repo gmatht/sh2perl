@@ -49,7 +49,15 @@ pub fn target() -> Option<String> {
 /// shell-like backends never see the rich nodes — the "solve" idea).
 pub fn transform_applies(name: &str) -> bool {
     match name {
-        // e.g. "text-ops-planner" => matches!(target().as_deref(), Some("c" | "js" | "go" | "rs" | "zig")),
+        // text-ops-planner (the "solve" idea): only the backends that want
+        // the rich node compositions run it. The shell-like backends (sh,
+        // glsl) never see the rich nodes — they keep the original command
+        // (or the existing text_ops lowering). Unset target = every
+        // transform applies (historical default).
+        "text-ops-planner" => matches!(
+            target().as_deref(),
+            Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "zig" | "java" | "python")
+        ),
         _ => true,
     }
 }
@@ -70,6 +78,7 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 pub mod shir_pipeline_native;
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
+pub mod text_ops_planner; // the "solve" idea, observable: wc -l lowers per-backend by manifest (opt-in)
 pub mod planner; // backend node manifests + core solver (the "solve" idea, docs/shir-primitives.md)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
@@ -136,6 +145,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
         ("text-ops", text_ops::transform),
+        ("text-ops-planner", text_ops_planner::transform),
         // core-requests/transforms/done batch merge (12 orphaned submissions)
         ("const-capture-fold", const_capture_fold::transform),
         ("const-condition-elim", const_condition_elim::transform),

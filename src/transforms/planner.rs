@@ -26,6 +26,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
+use crate::ir::IrExpr;
+use crate::shir_nodes::{ArrayLen, RegCount, Split};
+
 /// A backend's declared native node set, loaded from `backends/<lang>/nodes.txt`.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -152,6 +155,75 @@ pub fn plan(cmd: &str, cap: &Capabilities) -> Option<&'static str> {
     None
 }
 
+/// Embedded per-backend manifests (the "solve" idea, observable end to
+/// end). In production these live in `backends/<lang>/nodes.txt` and are
+/// loaded via `Capabilities::load`; the embedded table keeps the first
+/// demonstration self-contained (the core doesn't know the workspace root).
+/// A backend absent here = an empty manifest (falls back to `sh2.*`).
+pub fn manifest_for(target: &str) -> Capabilities {
+    match target {
+        // C: no regex — Split+ArrayLen (or a char-loop) for wc -l.
+        "c" => Capabilities::from_manifest("Split\nArrayLen\nStrLen\nWordCount\n"),
+        // JS/estree/perl: regex-capable — RegCount is the natural wc -l.
+        "js" | "estree" | "perl" | "go" | "rs" | "zig" | "java" | "python" => {
+            Capabilities::from_manifest("RegCount\nSplit\nArrayLen\nStrLen\nWordCount\n")
+        }
+        _ => Capabilities::default(),
+    }
+}
+
+/// Build the IR for `wc -l` given the input text and the target backend's
+/// manifest. Internally runs the solver; the chosen candidate is built
+/// with composites EXPANDED to the backend's declared leaves — so a
+/// no-regex backend (C) that reaches `RegCount` only via recursion gets
+/// `ArrayLen(Split(text, "\n"))`, never a `RegCount` node it can't render.
+/// Returns None for the `sh2.wc` fallback (keep the original command).
+pub fn build_wc_l(text: IrExpr, cap: &Capabilities) -> Option<IrExpr> {
+    for cand in candidates("wc -l") {
+        let mut seen = HashSet::new();
+        if cand.nodes.iter().all(|n| reachable(n, cap, &mut seen)) {
+            return build_candidate(cand.name, text, cap);
+        }
+    }
+    None
+}
+
+fn build_candidate(name: &str, text: IrExpr, cap: &Capabilities) -> Option<IrExpr> {
+    match name {
+        // Regex backend: RegCount(text, /\n/) — a newline count, exact.
+        "RegCount" => {
+            if cap.supports("RegCount") {
+                Some(IrExpr::Ext(Box::new(RegCount {
+                    text,
+                    pattern: "\\n".to_string(),
+                })))
+            } else {
+                // Reached via recursion (no-regex backend): expand to the
+                // doc's Split+ArrayLen composition (off-by-one candidate,
+                // only offered to backends that accept it).
+                Some(IrExpr::Ext(Box::new(ArrayLen {
+                    array: IrExpr::Ext(Box::new(Split {
+                        text,
+                        delim: "\\n".to_string(),
+                        is_regex: false,
+                        in_place: false,
+                    })),
+                })))
+            }
+        }
+        // No-regex backend, explicit candidate: ArrayLen(Split(text, "\n")).
+        "SplitArrayLen" => Some(IrExpr::Ext(Box::new(ArrayLen {
+            array: IrExpr::Ext(Box::new(Split {
+                text,
+                delim: "\\n".to_string(),
+                is_regex: false,
+                in_place: false,
+            })),
+        }))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +290,33 @@ mod tests {
     fn unknown_command_has_no_candidates() {
         let c = cap("RegCount\n");
         assert_eq!(plan("ls -la", &c), None);
+    }
+
+    #[test]
+    fn wc_l_builds_different_ir_per_backend() {
+        use crate::ir::StrStyle;
+        // The "solve" idea, observable: the SAME `wc -l` input lowers to
+        // DIFFERENT IR depending on the target backend's manifest.
+        let text = IrExpr::Str("a\nb\n".to_string(), StrStyle::DoubleQuoted);
+        // JS has RegCount → the natural RegCount composition.
+        let js = manifest_for("js");
+        let js_ir = build_wc_l(text.clone(), &js).expect("js builds IR");
+        // C has no regex → RegCount reached only via recursion, so it is
+        // EXPANDED to ArrayLen(Split(text, "\n")) — never a RegCount node.
+        let c = manifest_for("c");
+        let c_ir = build_wc_l(text.clone(), &c).expect("c builds IR");
+        // Same input, different backends → different IR.
+        assert_ne!(format!("{js_ir:?}"), format!("{c_ir:?}"));
+        // JS gets a RegCount; C gets an ArrayLen(Split) composition.
+        assert!(format!("{js_ir:?}").contains("RegCount"));
+        assert!(format!("{c_ir:?}").contains("ArrayLen"));
+        assert!(!format!("{c_ir:?}").contains("RegCount"));
+    }
+
+    #[test]
+    fn manifest_for_unknown_target_is_empty() {
+        let m = manifest_for("glsl");
+        assert!(m.nodes.is_empty());
+        assert!(!m.has_sh2);
     }
 }
