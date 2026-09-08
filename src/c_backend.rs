@@ -29,7 +29,7 @@
 //! covered by the range analysis; the string side stays open).
 
 use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart, VarKind};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 enum Part {
     Lit(String),
@@ -324,6 +324,10 @@ pub struct Render {
     cur_param_args: Vec<IrExpr>,
     /// array names (indexed arrays: `char* name[N]` + `name_len`)
     arrays: BTreeSet<String>,
+    /// int-typed arrays (every element provably a 64-bit integer, only
+    /// consumed by sortedIntJoin/sortedBigintJoin): stored as
+    /// `long long name[N]` + `name_len` instead of `char* name[N]`
+    int_arrays: BTreeSet<String>,
     /// associative-array names (`name_k`/`name_v`/`name_n` stores)
     assoc_arrays: BTreeSet<String>,
     /// `shopt -s nocasematch` → [[ == ]] globs match case-insensitively
@@ -434,6 +438,177 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
     Some(arr.clone())
 }
 
+/// Prove which arrays are int-typed: every element is a provable 64-bit
+/// integer AND the array is never read in a string context (only
+/// `sortedIntJoin`/`sortedBigintJoin` consume it). Such arrays can be
+/// stored as `long long[]` instead of `char *[]` — no string round-trip.
+fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
+    let mut all_arrays: HashSet<String> = HashSet::new();
+    let mut int_consumed: HashSet<String> = HashSet::new();
+    let mut non_int_write: HashSet<String> = HashSet::new();
+    let mut string_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        walk_int_array_stmt(
+            s,
+            &mut all_arrays,
+            &mut int_consumed,
+            &mut non_int_write,
+            &mut string_read,
+            &prog.var_types,
+        );
+    }
+    all_arrays
+        .into_iter()
+        .filter(|a| {
+            int_consumed.contains(a) && !non_int_write.contains(a) && !string_read.contains(a)
+        })
+        .collect()
+}
+
+fn walk_int_array_stmt(
+    s: &IrStmt,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+) {
+    match s {
+        IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt),
+        IrStmt::Assign { expr, .. } => walk_int_array_expr(expr, all, consumed, non_int, str_read, vt),
+        IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt);
+            for b in then { walk_int_array_stmt(b, all, consumed, non_int, str_read, vt); }
+            for (c, b) in elsifs {
+                walk_int_array_expr(c, all, consumed, non_int, str_read, vt);
+                for st in b { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            }
+            for st in else_ { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::While { cond, body, .. } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::For { body, .. } => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::Function { body, .. } => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::Block(body) => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt); }
+        }
+        _ => {}
+    }
+}
+
+fn walk_int_array_expr(
+    e: &IrExpr,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+) {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "setArray" | "setArrayAppend" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    // the values are args[1] (an Array of items)
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            if !is_int_expr(it, vt) {
+                                non_int.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+            }
+            "sortedIntJoin" | "sortedBigintJoin" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+            }
+            "exec" | "builtin" => {
+                // the array may appear in the argv (a string context)
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+            }
+            "arrayIndex" | "arrayItems" | "arrayLen" => {
+                // reading the array as a value — if it's used in a string
+                // context this is a string read; conservatively mark it
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    str_read.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+            }
+            "getVar" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
+            }
+            _ => {
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+            }
+        },
+        IrExpr::Array(items) => {
+            for it in items { walk_int_array_expr(it, all, consumed, non_int, str_read, vt); }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_int_array_expr(x, all, consumed, non_int, str_read, vt);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_int_array_expr(lhs, all, consumed, non_int, str_read, vt);
+            walk_int_array_expr(rhs, all, consumed, non_int, str_read, vt);
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt); }
+        }
+        _ => {}
+    }
+}
+
+/// Is `e` a provable 64-bit integer expression (a literal, arithmetic, or
+/// an int-typed var read)?
+fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        IrExpr::Arith(_) => true,
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
+            vt.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        ),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                matches!(
+                    vt.get(name),
+                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+                )
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
@@ -466,6 +641,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_storage = prog.var_storage.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
+    r.int_arrays = analyze_int_arrays(&prog);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
     // Arena-scope safety: if ALL capture-assigned vars are non-escaping,
@@ -1236,6 +1412,42 @@ impl Render {
             self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
             self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
             self.emit("    memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // int-typed array (long long[]): sort the raw 64-bit values
+            // directly — no atoll parse, no string round-trip.
+            self.emit("static long long *_sh_sij64_v = 0;");
+            self.emit("static int _sh_sij64_cmp(const void *pa, const void *pb) {");
+            self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
+            self.emit("  long long x = _sh_sij64_v[a], y = _sh_sij64_v[b];");
+            self.emit("  if (x != y) return x < y ? -1 : 1;");
+            self.emit("  return a < b ? -1 : a > b;");
+            self.emit("}");
+            self.emit("static void _sh_sorted_int64_join(_sh_vbuf *d, long long *a, size_t n) {");
+            self.emit("  static size_t *_sh_sij_ix = 0; static size_t _sh_sij_ixcap = 0;");
+            self.emit("  size_t i;");
+            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
+            self.emit("  if (_sh_sij_ixcap < n) {");
+            self.emit("    size_t nc = _sh_sij_ixcap ? _sh_sij_ixcap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    size_t *np = (size_t *)realloc(_sh_sij_ix, nc * sizeof *_sh_sij_ix);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sij_ix = np; _sh_sij_ixcap = nc;");
+            self.emit("  }");
+            self.emit("  _sh_sij64_v = a;");
+            self.emit("  for (i = 0; i < n; i++) _sh_sij_ix[i] = i;");
+            self.emit("  if (n > 0) qsort(_sh_sij_ix, n, sizeof *_sh_sij_ix, _sh_sij64_cmp);");
+            self.emit("  size_t dn = 0, k;");
+            self.emit("  for (k = 0; k < n; k++) {");
+            self.emit("    size_t j = _sh_sij_ix[k];");
+            self.emit("    if (k > 0 && a[j] == a[_sh_sij_ix[k-1]]) continue;");
+            self.emit("    char _s[32];");
+            self.emit("    snprintf(_s, sizeof _s, \"%lld\", a[j]);");
+            self.emit("    size_t l = strlen(_s);");
+            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
+            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("    memcpy(d->p + dn, _s, l); dn += l;");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
@@ -3502,7 +3714,11 @@ impl Render {
                     let id = self.c_ident(&name);
                     let vb = self.vbuf_temp();
                     if func == "sortedIntJoin" {
-                        self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                        if self.int_arrays.contains(&name) {
+                            self.emit(&format!("_sh_sorted_int64_join(&{vb}, {id}, {id}_len);"));
+                        } else {
+                            self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                        }
                     } else {
                         self.need_gmp = true;
                         self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
@@ -9732,7 +9948,11 @@ impl Render {
                 }
             }
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
+            if self.int_arrays.contains(var) {
+                self.emit(&format!("{id}[{ai}] = atoll((char*)({v}));"));
+            } else {
+                self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
+            }
             self.emit(&format!("{id}_len = ++{ai};"));
         }
     }
@@ -9747,7 +9967,12 @@ impl Render {
         };
         for (i, it) in items.iter().enumerate() {
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
+            if self.int_arrays.contains(var) {
+                // int-typed array: store the parsed 64-bit value directly
+                self.emit(&format!("{id}[{id}_len + {i}] = atoll((char*)({v}));"));
+            } else {
+                self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
+            }
         }
         self.emit(&format!("{id}_len += {};", items.len()));
     }
@@ -10045,7 +10270,11 @@ impl Render {
                             let id = self.c_ident(name);
                             let vb = self.vbuf_temp();
                             if func == "sortedIntJoin" {
-                                self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                                if self.int_arrays.contains(name) {
+                                    self.emit(&format!("_sh_sorted_int64_join(&{vb}, {id}, {id}_len);"));
+                                } else {
+                                    self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+                                }
                             } else {
                                 self.need_gmp = true;
                                 self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
@@ -12877,6 +13106,12 @@ impl Render {
                 self.emit(&format!("static char *{id}_k[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static char *{id}_v[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_n = 0;"));
+            } else if self.int_arrays.contains(a) {
+                // int-typed array: every element is a provable 64-bit
+                // integer, only consumed by sortedIntJoin — store as
+                // long long[], no string round-trip.
+                self.emit(&format!("static long long {id}[{ARR_CAP}] = {{0}};"));
+                self.emit(&format!("static size_t {id}_len = 0;"));
             } else {
                 self.emit(&format!("static char *{id}[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_len = 0;"));
