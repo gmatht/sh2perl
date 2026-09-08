@@ -2443,7 +2443,13 @@ impl Render {
                 };
                 format!("({l} {c_op} {r})")
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a) => {
+                if self.is_bigint_arith(a) {
+                    self.bigint_cond(a)
+                } else {
+                    self.arith(a)
+                }
+            }
             IrExpr::Interpolate(_) => self.value_c(e),
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|e| self.expr(e)).collect();
@@ -3573,6 +3579,36 @@ impl Render {
         let vb = self.vbuf_temp();
         self.emit(&format!("_sh_mpz_str(&{vb}, {bt});"));
         format!("{vb}.p")
+    }
+
+    /// Render a bigint arith in a BOOLEAN (condition) position: a
+    /// comparison evaluates both sides into mpz temps and compares via
+    /// mpz_cmp (exact — never truncates past i64); any other bigint
+    /// value is truthy iff its sign is nonzero.
+    fn bigint_cond(&mut self, a: &ArithAst) -> String {
+        self.need_gmp = true;
+        match a {
+            ArithAst::Bin { op, lhs, rhs }
+                if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") =>
+            {
+                let lt = self.bigint_operand(lhs);
+                let rt = self.bigint_operand(rhs);
+                let cmp = format!("mpz_cmp({lt}, {rt})");
+                match op.as_str() {
+                    "==" => format!("({cmp} == 0)"),
+                    "!=" => format!("({cmp} != 0)"),
+                    "<" => format!("({cmp} < 0)"),
+                    ">" => format!("({cmp} > 0)"),
+                    "<=" => format!("({cmp} <= 0)"),
+                    ">=" => format!("({cmp} >= 0)"),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                let t = self.bigint_eval_temp(a);
+                format!("(mpz_sgn({t}) != 0)")
+            }
+        }
     }
 
     fn value_c(&mut self, e: &IrExpr) -> String {
@@ -17645,6 +17681,65 @@ mod tests {
         }
         assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
         assert!(!out.contains("_sh_"), "_sh_ runtime leaked into pure-bigint output:\n{out}");
+    }
+
+    #[test]
+    fn bigint_arith_condition_uses_mpz_cmp_not_atoll() {
+        // A bigint arith in a CONDITION (e.g. `n % i == 0` with a >2^64
+        // n) must compare via mpz_cmp — never truncate the operands to
+        // long long (atoll) and compare the wrapped values.
+        use crate::ir::{ArithAst, IrType};
+        let cast = |arg: ArithAst| ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(arg),
+        };
+        let n = cast(ArithAst::Var("n".to_string()));
+        let i = cast(ArithAst::Var("i".to_string()));
+        let zero = cast(ArithAst::Num(0));
+        let rem = ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(n),
+            rhs: Box::new(i),
+        };
+        let cond = ArithAst::Bin {
+            op: "==".to_string(),
+            lhs: Box::new(rem),
+            rhs: Box::new(zero),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::If {
+                cond: IrExpr::Arith(Box::new(cond)),
+                then: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str("hi".to_string(), crate::ir::StrStyle::DoubleQuoted)]),
+                    ],
+                })],
+                elsifs: vec![],
+                else_: vec![],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("mpz_cmp"),
+            "bigint condition not compared via mpz_cmp:\n{out}"
+        );
+        assert!(
+            !out.contains("atoll"),
+            "bigint condition truncated via atoll:\n{out}"
+        );
     }
 
     #[test]
