@@ -230,6 +230,19 @@ pub struct Render {
     need_time: bool,
     /// integer pow helper (cc has no -lm on the gate)
     need_pow: bool,
+    /// GMP bigint runtime (the py-sh-go proven-big regime): set when
+    /// any Cast(Int64) arith is rendered — <gmp.h> + _sh_mpz_* helpers.
+    /// The gate links -lgmp (libgmp-dev installed); programs without
+    /// bigint values never pay for it.
+    need_gmp: bool,
+    /// vars whose value is a GMP bigint (mpz_t): assigned from
+    /// Cast(Int64)-tainted arithmetic (fixpoint over var reads).
+    /// params stay char* (shell boundary); only these VAR slots change.
+    bigint_vars: BTreeSet<String>,
+    /// bigint vars already declared (mpz_t needs exactly one decl;
+    /// main-prologue mpz_init list derives from this; limbs live for
+    /// the process like every other site-static — nothing is freed).
+    bigint_declared: Vec<String>,
     /// counter for _sh_site_N() / _cap_N() helper ids
     site_seq: usize,
     /// vars ASSIGNED anywhere in the shell-text stage currently being
@@ -395,6 +408,13 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
+    }
+    // GMP bigint vars (Cast(Int64)-tainted assigns, fixpoint over
+    // reads). Set before rendering: decls need it, and need_gmp must
+    // be settled before emit_runtime runs.
+    r.bigint_vars = analyze_bigint_vars(&prog);
+    if !r.bigint_vars.is_empty() {
+        r.need_gmp = true;
     }
     {
         // positional-constness: reads use main's params directly
@@ -575,6 +595,10 @@ impl Render {
     /// analysis also bounds numeric RHS (`i=$((i+1))` -> 20), and
     /// `strlen`/`strncpy` on a `long long` is itself UB.
     fn buf_bound(&self, name: &str) -> Option<u64> {
+        if self.bigint_vars.contains(name) {
+            // GMP vars are never fixed buffers (unbounded by design)
+            return None;
+        }
         if self.is_num(name) || self.capture_vars.contains(name) {
             // a capture-receiving var: the length analysis under-bounds
             // command output (`sha256sum` emits hash + filename) — a
@@ -660,6 +684,11 @@ impl Render {
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
         self.emit("#include <errno.h>"); // EINTR retry on capture reads
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
+        if self.need_gmp {
+            // GMP bigint path (proven-big regime): <gmp.h> must precede
+            // every use; linked with -lgmp (libgmp-dev on the gate).
+            self.emit("#include <gmp.h>");
+        }
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
         }
@@ -1452,6 +1481,23 @@ impl Render {
             self.emit("static int _sh_is_w(const char *p) { return access(p, W_OK) == 0; }");
             self.emit("static int _sh_is_x(const char *p) { return access(p, X_OK) == 0; }");
         }
+        if self.need_gmp {
+            // bigint decimal rendering: mpz -> decimal text into a
+            // growable buffer (mpz_get_str mallocs; the copy is freed
+            // — GMP's default allocator is malloc/free, so free() is
+            // the matching deallocator). Powers prints, string contexts
+            // and unbounded-var stores.
+            self.emit("static char *_sh_mpz_str(_sh_vbuf *d, const mpz_t v) {");
+            self.emit("  char *s = mpz_get_str(0, 10, v);");
+            self.emit("  if (!s) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
+            self.emit("  size_t n = strlen(s);");
+            self.emit("  _sh_vgrow(d, n + 1);");
+            self.emit("  memcpy(d->p, s, n + 1);");
+            self.emit("  free(s);");
+            self.emit("  return d->p;");
+            self.emit("}");
+            self.emit("");
+        }
         if self.need_pow {
             self.emit("/* integer power (no libm on the gate's cc) */");
             self.emit("static long long _sh_pow(long long b, long long e) {");
@@ -1880,6 +1926,11 @@ impl Render {
                 }
             }
             ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if self.bigint_vars.contains(name) {
+                    // GMP slot in an i64 context: truncate (documented;
+                    // exact paths go through bigint_into, never here)
+                    return format!("mpz_get_si({})", self.c_ident(name));
+                }
                 if self.is_num(name) {
                     self.c_ident(name)
                 } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
@@ -2058,6 +2109,16 @@ impl Render {
     /// -> the fixed buffer, else char*). Shared by the main hoist and the
     /// per-function hoists.
     fn emit_var_decl(&mut self, v: &str) {
+        if self.bigint_vars.contains(v) {
+            // GMP bigint slot (proven-big regime): heap limbs, init in
+            // the main prologue (tracked once).
+            let name = self.c_ident(v);
+            self.emit(&format!("mpz_t {name};"));
+            if !self.bigint_declared.contains(&name) {
+                self.bigint_declared.push(name);
+            }
+            return;
+        }
         if std::env::var("SH2_DEBUG_DECL").is_ok() && v == "__sh2_found" {
             eprintln!("DECL __sh2_found: is_num={} buf_bound={:?} capture={} storage={:?} const_rhs={:?}",
                 self.is_num(v), self.buf_bound(v), self.capture_vars.contains(v),
@@ -2560,11 +2621,212 @@ impl Render {
 
     /// The char* C expression for a word's VALUE (numeric operands get a
     /// snprintf temp emitted as statements before the current one).
+    /// Is this arithmetic bigint-tainted (contains a sized Cast or
+    /// reads a bigint var)? Such subtrees render via mpz statements,
+    /// never native C operators.
+    fn is_bigint_arith(&self, a: &ArithAst) -> bool {
+        arith_is_bigint(a, &self.bigint_vars)
+    }
+
+    /// Evaluate bigint arith `a` into the already-initialized mpz
+    /// `target` (a bigint var or temp). Operands materialize via
+    /// bigint_operand; GMP permits dest==src overlap. `//`/`%` are
+    /// Python FLOOR ops (mpz_fdiv_*, not tdiv) with the bash
+    /// zero-divisor-guard shape (result 0); `**` with negative
+    /// exponent is 0 like _sh_pow.
+    fn bigint_into(&mut self, a: &ArithAst, target: &str) {
+        self.need_gmp = true;
+        match a {
+            ArithAst::Num(n) => {
+                // set_str: always exact, no C-literal edge cases
+                self.emit(&format!("mpz_set_str({target}, \"{n}\", 10);"));
+            }
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if self.bigint_vars.contains(name) {
+                    self.emit(&format!("mpz_set({target}, {});", self.c_ident(name)));
+                } else if self.is_num(name) {
+                    self.emit(&format!("mpz_set_si({target}, {});", self.c_ident(name)));
+                } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    // positional $N: decimal text like the shell sees it
+                    let v = self.store_ref(name);
+                    self.emit(&format!("if (mpz_set_str({target}, ({v}) ? ({v}) : \"0\", 10) != 0) mpz_set_si({target}, 0);"));
+                } else {
+                    let v = self.store_ref(name);
+                    self.emit(&format!("if (mpz_set_str({target}, ({v}) ? ({v}) : \"0\", 10) != 0) mpz_set_si({target}, 0);"));
+                }
+            }
+            ArithAst::Index { var, key } => {
+                self.arrays.insert(var.clone());
+                self.need_sh = true;
+                let id = self.c_ident(var);
+                // key could be bigint-tainted: evaluate for the index,
+                // then parse the element decimal (get_si truncates the
+                // index itself — indices are machine-range in practice)
+                let k = if self.is_bigint_arith(key) {
+                    let kt = self.bigint_eval_temp(key);
+                    format!("mpz_get_si({kt})")
+                } else {
+                    self.arith(key)
+                };
+                self.emit(&format!("if (mpz_set_str({target}, _sh_arr_get({id}, {id}_len, (long long)({k})), 10) != 0) mpz_set_si({target}, 0);"));
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let lt = self.bigint_operand(lhs);
+                let rt = self.bigint_operand(rhs);
+                match op.as_str() {
+                    "+" => self.emit(&format!("mpz_add({target}, {lt}, {rt});")),
+                    "-" => self.emit(&format!("mpz_sub({target}, {lt}, {rt});")),
+                    "*" => self.emit(&format!("mpz_mul({target}, {lt}, {rt});")),
+                    "/" => self.emit(&format!("if (mpz_sgn({rt}) == 0) mpz_set_si({target}, 0); else mpz_fdiv_q({target}, {lt}, {rt});")),
+                    "%" => self.emit(&format!("if (mpz_sgn({rt}) == 0) mpz_set_si({target}, 0); else mpz_fdiv_r({target}, {lt}, {rt});")),
+                    "**" => self.emit(&format!("if (mpz_sgn({rt}) < 0) mpz_set_si({target}, 0); else mpz_pow_ui({target}, {lt}, mpz_get_ui({rt}));")),
+                    _ => {
+                        self.mark_todo(&format!("bigint op {op}"));
+                        self.emit(&format!("mpz_set_si({target}, 0);"));
+                    }
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let at = self.bigint_operand(arg);
+                match op.as_str() {
+                    "-" => self.emit(&format!("mpz_neg({target}, {at});")),
+                    "+" => self.emit(&format!("mpz_set({target}, {at});")),
+                    "~" => self.emit(&format!("mpz_com({target}, {at});")),
+                    "!" => self.emit(&format!("mpz_set_si({target}, mpz_sgn({at}) == 0);")),
+                    _ => {
+                        self.mark_todo(&format!("bigint unop {op}"));
+                        self.emit(&format!("mpz_set_si({target}, 0);"));
+                    }
+                }
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                // test evaluates eagerly (like C ?:); branches stay lazy
+                let tt = self.bigint_operand(test);
+                self.emit(&format!("if (mpz_sgn({tt}) != 0) {{"));
+                self.depth += 1;
+                self.bigint_into(then, target);
+                self.depth -= 1;
+                self.emit("} else {");
+                self.depth += 1;
+                self.bigint_into(else_, target);
+                self.depth -= 1;
+                self.emit("}");
+            }
+            ArithAst::Assign { var, op, rhs } => {
+                if self.bigint_vars.contains(var) {
+                    let id = self.c_ident(var);
+                    let o = if op.ends_with('=') { op.as_str() } else { "=" };
+                    match o {
+                        "=" => self.bigint_into(rhs, &id),
+                        "+=" | "-=" | "*=" => {
+                            let rt = self.bigint_operand(rhs);
+                            let mop = match o {
+                                "+=" => "add",
+                                "-=" => "sub",
+                                _ => "mul",
+                            };
+                            self.emit(&format!("mpz_{mop}({id}, {id}, {rt});"));
+                        }
+                        _ => {
+                            self.mark_todo(&format!("bigint assign op {o}"));
+                        }
+                    }
+                    if id != target {
+                        self.emit(&format!("mpz_set({target}, {id});"));
+                    }
+                } else {
+                    // non-bigint target (nested assigns escape the
+                    // fixpoint): truncate through the i64 domain
+                    let rt = self.bigint_operand(rhs);
+                    if self.is_num(var) {
+                        self.emit(&format!("{} = mpz_get_si({rt});", self.c_ident(var)));
+                    } else {
+                        self.mark_todo("bigint value into non-bigint var");
+                    }
+                    if self.is_num(var) {
+                        self.emit(&format!("mpz_set_si({target}, {});", self.c_ident(var)));
+                    } else {
+                        self.emit(&format!("mpz_set_si({target}, 0);"));
+                    }
+                }
+            }
+            ArithAst::IncDec { var, delta, prefix } => {
+                if self.bigint_vars.contains(var) {
+                    let id = self.c_ident(var);
+                    let d = delta.unsigned_abs() as u64;
+                    if !prefix {
+                        self.emit(&format!("mpz_set({target}, {id});"));
+                    }
+                    if *delta >= 0 {
+                        self.emit(&format!("mpz_add_ui({id}, {id}, {d}ULL);"));
+                    } else {
+                        self.emit(&format!("mpz_sub_ui({id}, {id}, {d}ULL);"));
+                    }
+                    if *prefix {
+                        self.emit(&format!("mpz_set({target}, {id});"));
+                    }
+                } else {
+                    // int var: native value, then lift (documented
+                    // truncation past i64 — nested mixed incdec)
+                    let v = self.arith(a);
+                    self.emit(&format!("mpz_set_si({target}, (long long)({v}));"));
+                }
+            }
+            ArithAst::Sizeof(ty) => {
+                let n = ty.c_sizeof().unwrap_or(4);
+                self.emit(&format!("mpz_set_si({target}, {n});"));
+            }
+            ArithAst::Cast { arg, .. } => self.bigint_into(arg, target),
+        }
+    }
+
+    /// Materialize an operand as an mpz expression: bigint vars read
+    /// directly, everything else evaluates into a fresh static temp
+    /// (init-once guard; limbs reused across evaluations like the
+    /// _sh_vbuf high-water discipline — no leaks, no scope tracking).
+    fn bigint_operand(&mut self, a: &ArithAst) -> String {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name)
+                if self.bigint_vars.contains(name) =>
+            {
+                self.c_ident(name)
+            }
+            _ => self.bigint_eval_temp(a),
+        }
+    }
+
+    /// Evaluate bigint arith into a fresh static mpz temp; returns its
+    /// name for use as an operand, print source or assign RHS fragment.
+    fn bigint_eval_temp(&mut self, a: &ArithAst) -> String {
+        self.need_gmp = true;
+        let t = format!("_bt{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("static mpz_t {t}; static int {t}_i = 0; if (!{t}_i) {{ mpz_init({t}); {t}_i = 1; }}"));
+        self.bigint_into(a, &t);
+        t
+    }
+
+    /// Decimal text of a bigint value into a fresh vbuf; returns the
+    /// `.p` expression. Powers prints, string contexts, unbounded stores.
+    fn bigint_decimal(&mut self, a: &ArithAst) -> String {
+        let bt = self.bigint_eval_temp(a);
+        let vb = self.vbuf_temp();
+        self.emit(&format!("_sh_mpz_str(&{vb}, {bt});"));
+        format!("{vb}.p")
+    }
+
     fn value_c(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => Self::cstr(s),
             IrExpr::Int(i) => self.num_temp(&i.to_string()),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                if self.bigint_vars.contains(name) {
+                    // GMP slot in a string context: exact decimal text
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
+                    self.need_gmp = true;
+                    return format!("{vb}.p");
+                }
                 if self.is_num(name) {
                     self.num_temp(&self.c_ident(name))
                 } else {
@@ -2572,6 +2834,10 @@ impl Render {
                 }
             }
             IrExpr::Arith(a) => {
+                if self.is_bigint_arith(a) {
+                    // bigint value in a string context: exact decimal
+                    return self.bigint_decimal(a);
+                }
                 let a = self.arith(a);
                 self.num_temp(&a)
             }
@@ -2788,6 +3054,9 @@ impl Render {
                     format!("(int)atoll({})", Self::cstr(s))
                 }
             },
+            IrExpr::Var(name, _) | IrExpr::Ident(name) if self.bigint_vars.contains(name) => {
+                format!("mpz_get_si({})", self.c_ident(name))
+            }
             IrExpr::Var(name, _) | IrExpr::Ident(name) if self.is_num(name) => self.c_ident(name),
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(name) = Self::str_arg(args, 0) {
@@ -3034,7 +3303,14 @@ impl Render {
             IrExpr::Str(s, _) => word(self, Self::cstr(s)),
             IrExpr::Int(i) => word(self, format!("\"{i}\"")),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
-                if self.is_num(name) {
+                if self.bigint_vars.contains(name) {
+                    // GMP slot as a child-bash word: its decimal text
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
+                    self.need_gmp = true;
+                    let v = format!("{vb}.p");
+                    word(self, v);
+                } else if self.is_num(name) {
                     let t = self.num_temp(&self.c_ident(name));
                     word(self, t);
                 } else {
@@ -4539,10 +4815,18 @@ impl Render {
                     cargs.push(self.param_call(args));
                 }
                 HdSeg::Arith(a) => {
-                    fmt.push_str("%lld");
-                    // the arith() expression may be plain-int C — the
-                    // varargs promotion needs an explicit long long
-                    cargs.push(format!("(long long)({})", self.arith(a)));
+                    if self.is_bigint_arith(a) {
+                        // bigint in a heredoc: decimal text via temp
+                        // (mpz_get_si truncates past i64 — documented)
+                        let bt = self.bigint_eval_temp(a);
+                        fmt.push_str("%lld");
+                        cargs.push(format!("mpz_get_si({bt})"));
+                    } else {
+                        fmt.push_str("%lld");
+                        // the arith() expression may be plain-int C — the
+                        // varargs promotion needs an explicit long long
+                        cargs.push(format!("(long long)({})", self.arith(a)));
+                    }
                 }
                 HdSeg::Cmd(cmd) => {
                     fmt.push_str("%s");
@@ -7866,7 +8150,13 @@ impl Render {
                 // long long would segfault)
                 if let Some(base) = name.strip_prefix('#') {
                     if !base.is_empty() && is_ident(base) {
-                        let v = if self.is_num(base) {
+                        let v = if self.bigint_vars.contains(base) {
+                            // digits of the decimal text, not limbs
+                            let vb = self.vbuf_temp();
+                            self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(base)));
+                            self.need_gmp = true;
+                            format!("{vb}.p")
+                        } else if self.is_num(base) {
                             self.num_temp(&self.c_ident(base))
                         } else {
                             self.store_read(base)
@@ -7905,6 +8195,13 @@ impl Render {
                     // positional $N — a lifted fn's C param or the argv
                     self.need_sh = true;
                     return self.positional_str_l(&name);
+                }
+                if self.bigint_vars.contains(&name) {
+                    // GMP slot read as a string: exact decimal text
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(&name)));
+                    self.need_gmp = true;
+                    return format!("{vb}.p");
                 }
                 if let Some(rest) = name.strip_prefix('#') {
                     // ${#var} — the core spells the LENGTH expansion
@@ -8986,7 +9283,13 @@ impl Render {
             IrExpr::Str(s, _) => vec![Part::Lit(s.clone())],
             IrExpr::Int(i) => vec![Part::Arg(i.to_string(), self.num_spec(e))],
             IrExpr::Var(name, _) => {
-                if self.is_num(name) {
+                if self.bigint_vars.contains(name) {
+                    // GMP slot printed: exact decimal text
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
+                    self.need_gmp = true;
+                    vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)]
+                } else if self.is_num(name) {
                     vec![Part::Arg(self.c_ident(name), self.num_spec(e))]
                 } else {
                     vec![Part::Arg(self.c_ident(name), NumSpec::Str)]
@@ -9018,7 +9321,14 @@ impl Render {
                 }
                 out
             }
-            IrExpr::Arith(a) => vec![Part::Arg(self.arith(a), self.num_spec(e))],
+            IrExpr::Arith(a) => {
+                if self.is_bigint_arith(a) {
+                    // bigint print: exact decimal text
+                    vec![Part::Arg(self.bigint_decimal(a), NumSpec::Str)]
+                } else {
+                    vec![Part::Arg(self.arith(a), self.num_spec(e))]
+                }
+            }
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), self.num_spec(e))],
             IrExpr::Call { func, args } => {
                 let args = args.clone();
@@ -9053,6 +9363,13 @@ impl Render {
                             )];
                         }
                         if self.var_types.contains_key(name) {
+                            if self.bigint_vars.contains(name) {
+                                // GMP slot printed: exact decimal text
+                                let vb = self.vbuf_temp();
+                                self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
+                                self.need_gmp = true;
+                                return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
+                            }
                             let spec = if self.is_num(name) {
                                 self.num_spec(e)
                             } else {
@@ -9163,6 +9480,30 @@ impl Render {
         self.try_native_printf_into(words, None)
     }
 
+    /// A printf numeric arg that is bigint-tainted renders as decimal
+    /// text instead: hoist eval + getstr, return the `.p` expression.
+    /// None when the arg stays on the native integer path.
+    fn printf_bigint_arg(&mut self, a: &IrExpr) -> Option<String> {
+        let tainted = match a {
+            IrExpr::Arith(x) => self.is_bigint_arith(x),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => self.bigint_vars.contains(n),
+            _ => false,
+        };
+        if !tainted {
+            return None;
+        }
+        self.need_gmp = true;
+        match a {
+            IrExpr::Arith(x) => Some(self.bigint_decimal(x)),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                let vb = self.vbuf_temp();
+                self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(n)));
+                Some(format!("{vb}.p"))
+            }
+            _ => None,
+        }
+    }
+
     /// `printf -v VAR fmt args…` renders into VAR (a snprintf into the
     /// store) instead of stdout; `into == None` writes stdout.
     fn try_native_printf_into(&mut self, words: &[&IrExpr], into: Option<&str>) -> Option<String> {
@@ -9260,6 +9601,12 @@ impl Render {
                         'd' | 'i' => {
                             let a = *args.get(arg_i)?;
                             arg_i += 1;
+                            if let Some(v) = self.printf_bigint_arg(a) {
+                                fmt.push_str(&pre);
+                                fmt.push('s');
+                                cargs.push(v);
+                                continue;
+                            }
                             fmt.push_str(&pre);
                             fmt.push_str("lld");
                             cargs.push(format!("(long long)({})", self.value_num(a)));
@@ -9267,6 +9614,12 @@ impl Render {
                         'u' => {
                             let a = *args.get(arg_i)?;
                             arg_i += 1;
+                            if let Some(v) = self.printf_bigint_arg(a) {
+                                fmt.push_str(&pre);
+                                fmt.push('s');
+                                cargs.push(v);
+                                continue;
+                            }
                             fmt.push_str(&pre);
                             fmt.push_str("llu");
                             cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
@@ -9274,6 +9627,12 @@ impl Render {
                         'o' => {
                             let a = *args.get(arg_i)?;
                             arg_i += 1;
+                            if let Some(v) = self.printf_bigint_arg(a) {
+                                fmt.push_str(&pre);
+                                fmt.push('s');
+                                cargs.push(v);
+                                continue;
+                            }
                             fmt.push_str(&pre);
                             fmt.push_str("llo");
                             cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
@@ -9281,6 +9640,12 @@ impl Render {
                         'x' => {
                             let a = *args.get(arg_i)?;
                             arg_i += 1;
+                            if let Some(v) = self.printf_bigint_arg(a) {
+                                fmt.push_str(&pre);
+                                fmt.push('s');
+                                cargs.push(v);
+                                continue;
+                            }
                             fmt.push_str(&pre);
                             fmt.push_str("llx");
                             cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
@@ -9288,6 +9653,12 @@ impl Render {
                         'X' => {
                             let a = *args.get(arg_i)?;
                             arg_i += 1;
+                            if let Some(v) = self.printf_bigint_arg(a) {
+                                fmt.push_str(&pre);
+                                fmt.push('s');
+                                cargs.push(v);
+                                continue;
+                            }
                             fmt.push_str(&pre);
                             fmt.push_str("llX");
                             cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
@@ -10279,6 +10650,15 @@ impl Render {
                     ));
                     return;
                 }
+                // GMP bigint assign: the target is bigint-declared by
+                // the same taint fixpoint, so evaluate straight into it
+                if let IrExpr::Arith(a) = expr {
+                    if self.is_bigint_arith(a) {
+                        let name = self.c_ident(&t.var);
+                        self.bigint_into(a, &name);
+                        return;
+                    }
+                }
                 // const-markup lift: the declaration already carries the
                 // literal initializer (emit_var_decl) — the assignment
                 // statement is redundant (the verdict guarantees this is
@@ -10298,6 +10678,23 @@ impl Render {
                         a.as_ref(),
                         ArithAst::Assign { .. } | ArithAst::IncDec { .. }
                     ) {
+                        if self.is_bigint_arith(a) {
+                            // bigint side-effect statement (`((x++))`
+                            // with bigint x): the eval writes a temp;
+                            // publish value truthiness as status and
+                            // land the value per the target's type
+                            let bt = self.bigint_eval_temp(a);
+                            self.emit(&format!("_sh_rc = (mpz_sgn({bt}) != 0) ? 0 : 1;"));
+                            let name = self.c_ident(&t.var);
+                            if self.bigint_vars.contains(&t.var) {
+                                self.emit(&format!("mpz_set({name}, {bt});"));
+                            } else if self.is_num(&t.var) {
+                                self.emit(&format!("{name} = mpz_get_si({bt});"));
+                            } else {
+                                self.mark_todo("bigint arith statement into string var");
+                            }
+                            return;
+                        }
                         // a nested mutation (j = i++ + ++i) must not be
                         // reordered by hoisted temps — sequence it
                         let c = self.arith_sequenced(a);
@@ -11043,7 +11440,12 @@ impl Render {
                             .collect(),
                     )];
                     let cap = self.capture_call(&args);
-                    if self.managed_strings.contains(var.as_str()) {
+                    if self.bigint_vars.contains(var.as_str()) {
+                        // capture text into a GMP slot: decimal parse
+                        // (non-numeric -> 0, bash-atoll spirit)
+                        self.need_gmp = true;
+                        self.emit(&format!("if (mpz_set_str({id}, ({cap}) ? ({cap}) : \"0\", 10) != 0) mpz_set_si({id}, 0);"));
+                    } else if self.managed_strings.contains(var.as_str()) {
                         self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
                     } else {
                         self.emit(&format!("{id} = {cap};"));
@@ -11290,7 +11692,10 @@ impl Render {
                     self.store.insert(var.clone());
                     let id = self.c_ident(var);
                     let cap = self.capture_call(&call_args);
-                    if self.managed_strings.contains(var) {
+                    if self.bigint_vars.contains(var) {
+                        self.need_gmp = true;
+                        self.emit(&format!("if (mpz_set_str({id}, ({cap}) ? ({cap}) : \"0\", 10) != 0) mpz_set_si({id}, 0);"));
+                    } else if self.managed_strings.contains(var) {
                         self.emit(&format!("_sh_mstr_set(&{id}, {cap});"));
                     } else {
                         self.emit(&format!("{id} = {cap};"));
@@ -11964,6 +12369,12 @@ impl Render {
             self.emit("int main(int _mac, char **_mav) {");
             self.emit("  _sh_argc = _mac; _sh_argv = _mav;");
         }
+        if !self.bigint_declared.is_empty() {
+            // GMP slots init before any use (file-scope mpz_t)
+            for v in self.bigint_declared.clone() {
+                self.emit(&format!("  mpz_init({v});"));
+            }
+        }
         if self.need_sh {
             // bash seeds HOSTNAME itself — the gate env may not carry it
             // (064_21: ${HOSTNAME:-localhost} took the default).
@@ -12295,6 +12706,103 @@ fn lift_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
 
 /// The lift map: shell fn name → arity, for every function that passes
 /// the native-calling-convention analysis.
+/// GMP bigint verdicts: vars assigned from Cast(Int64)-tainted
+/// arithmetic (the py-sh-go proven-big regime — every bigint leaf
+/// arrives wrapped; the ESTree backend lowers the same nodes to JS
+/// BigInt). Fixpoint over var reads: `y = x + 1` with bigint x makes y
+/// bigint. Params are NOT included (shell boundary stays char*).
+fn arith_is_bigint(a: &ArithAst, vars: &BTreeSet<String>) -> bool {
+    match a {
+        ArithAst::Num(_) => false,
+        ArithAst::Var(n) | ArithAst::Ident(n) => vars.contains(n),
+        ArithAst::Index { key, .. } => arith_is_bigint(key, vars),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_is_bigint(lhs, vars) || arith_is_bigint(rhs, vars)
+        }
+        ArithAst::Un { arg, .. } => arith_is_bigint(arg, vars),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_is_bigint(test, vars)
+                || arith_is_bigint(then, vars)
+                || arith_is_bigint(else_, vars)
+        }
+        ArithAst::Assign { rhs, .. } => arith_is_bigint(rhs, vars),
+        ArithAst::IncDec { var, .. } => vars.contains(var),
+        ArithAst::Sizeof(_) => false,
+        ArithAst::Cast { ty, .. } => matches!(
+            ty,
+            IrType::Int64 | IrType::UInt64 | IrType::Int32 | IrType::UInt32
+        ),
+    }
+}
+
+fn analyze_bigint_vars(prog: &IrProgram) -> BTreeSet<String> {
+    fn harvest(stmts: &[IrStmt], out: &mut Vec<(String, ArithAst)>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                        if t.indices.is_empty()
+                            && !out.iter().any(|(v, _)| v == &t.var)
+                        {
+                            out.push((t.var.clone(), (**a).clone()));
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    harvest(then, out);
+                    for (_, b) in elsifs {
+                        harvest(b, out);
+                    }
+                    harvest(else_, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Function { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Block(body) => harvest(body, out),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    harvest(init, out);
+                    harvest(step, out);
+                    harvest(body, out);
+                }
+                IrStmt::Try { body, else_body, finally_body, .. } => {
+                    harvest(body, out);
+                    harvest(else_body, out);
+                    harvest(finally_body, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        harvest(&c.body, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => harvest(inner, out),
+                _ => {}
+            }
+        }
+    }
+    let mut pairs = Vec::new();
+    harvest(&prog.stmts, &mut pairs);
+    for sub in &prog.subs {
+        harvest(&sub.body, &mut pairs);
+    }
+    let mut vars = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (v, a) in &pairs {
+            if !vars.contains(v) && arith_is_bigint(a, &vars) {
+                vars.insert(v.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vars
+}
+
 fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
     let mut names = BTreeSet::new();
     let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
@@ -16064,6 +16572,73 @@ mod tests {
         let mut r = Render::default();
         r.store.insert(name.to_string());
         r
+    }
+
+    #[test]
+    fn bigint_cast_renders_mpz_with_floor_div() {
+        // Cast(Int64) is the frontend's proven-big verdict: such
+        // arithmetic must lower to GMP (exact past i64), with Python
+        // FLOOR semantics for / and % (mpz_fdiv_*, not truncation).
+        use crate::ir::{ArithAst, IrType};
+        fn cast(n: i64) -> ArithAst {
+            ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(n)),
+            }
+        }
+        let pow = ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(cast(2)),
+            rhs: Box::new(cast(100)),
+        };
+        let div = ArithAst::Bin {
+            op: "/".to_string(),
+            lhs: Box::new(cast(-7)),
+            rhs: Box::new(cast(2)),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(pow)),
+                    asm: None,
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Arith(Box::new(div))]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![("x".to_string(), IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        for pat in [
+            "#include <gmp.h>",
+            "mpz_t x;",
+            "mpz_init(x);",
+            "mpz_pow_ui",
+            "mpz_fdiv_q",
+            "_sh_mpz_str",
+        ] {
+            assert!(out.contains(pat), "missing {pat:?} in:\n{out}");
+        }
+        assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
     }
 
     #[test]
