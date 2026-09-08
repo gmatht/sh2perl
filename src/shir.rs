@@ -29,6 +29,20 @@ static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// `shir_to_estree`). Consulted by the arith read coercion: Int64/UInt64
 /// vars read as BigInt (Number would round past 2^53).
 static VAR_TYPES: Mutex<Option<HashMap<String, IrType>>> = Mutex::new(None);
+/// Arrays whose every write carries provably-integer elements (see the
+/// INT-ITEM analysis in [`shir_to_estree`]). `sort -n`/`-u` on their
+/// captured pipelines lowers to the exact numeric comparator.
+static INT_ITEM_ARRAYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` an int-item array (every element provably an integer)?
+fn int_item_array(name: &str) -> bool {
+    INT_ITEM_ARRAYS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false) // unset → conservative: string sort
+}
 /// `--true64`: bash arithmetic is true 64-bit. Off by default (numbers
 /// stay JS Numbers — silently wrong past 2^53). When on, `shir_to_estree`
 /// runs `analyze_true64` and homes out-of-±2^53 numeric vars in either a
@@ -16264,6 +16278,173 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         }
     }
     *VAR_TYPES.lock().unwrap() = Some(vt);
+    // INT-ITEM arrays (shared shIR analysis): an array variable whose
+    // every write (setArray / setArrayAppend, anywhere in the program)
+    // carries PROVABLY-integer elements — an Int literal, a bash arith
+    // tree, or a read of an Int-typed var ([`var_type_of`]). The
+    // native-capture pipeline lifts consult it: `sort -n` on integer
+    // strings is exact (canonical decimal spellings — equal keys ⇔ equal
+    // strings, which also makes `-u` exact), where GNU sort -n on
+    // arbitrary text would diverge from a numeric comparator.
+    let mut int_arrays: HashSet<String> = HashSet::new();
+    {
+        fn elem_int(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Int(_) => true,
+                IrExpr::Arith(_) => true,
+                IrExpr::Call { func, args }
+                    if func == "getVar" || func == "param" => {
+                        // getVar(name) / the first name slot of param
+                        let slot = if func == "param" { 1 } else { 0 };
+                        matches!(&args.get(slot), Some(IrExpr::Str(n, _))
+                            if matches!(var_type_of(n), Some(IrType::Int)
+                                | Some(IrType::Int32) | Some(IrType::Int64)
+                                | Some(IrType::UInt32) | Some(IrType::UInt64))
+                            || true64_int_var(n)
+                            || bigint_homed_var(n))
+                    }
+                _ => false,
+            }
+        }
+        fn scan_writes(
+            stmts: &[IrStmt],
+            writes: &mut HashMap<String, Vec<Vec<IrExpr>>>,
+            poisoned: &mut HashSet<String>,
+        ) {
+            for st in stmts {
+                match st {
+                    IrStmt::Expr(e) => {
+                        if let IrExpr::Call { func, args } = e {
+                            if (func == "setArray" || func == "setArrayAppend")
+                                && args.len() == 2
+                            {
+                                if let (IrExpr::Str(name, _), IrExpr::Array(elems)) =
+                                    (&args[0], &args[1])
+                                {
+                                    writes
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .push(elems.clone());
+                                    continue;
+                                } else if let IrExpr::Str(name, _) = &args[0] {
+                                    // setArray/Append with an unmodeled
+                                    // value shape — disqualify the array
+                                    poisoned.insert(name.clone());
+                                }
+                            }
+                        }
+                        // any other shape may carry nested writes
+                        scan_expr_writes(e, writes, poisoned);
+                    }
+                    IrStmt::Assign { targets, expr, .. } => {
+                        for t in targets {
+                            if !t.indices.is_empty() {
+                                poisoned.insert(t.var.clone());
+                            }
+                        }
+                        // an ASSIGN of a setArray/setArrayAppend call —
+                        // the frontend-emitted append shape (the expr's
+                        // value is the stored array; the target the same
+                        // array var)
+                        if let IrExpr::Call { func, args } = expr {
+                            if (func == "setArray" || func == "setArrayAppend")
+                                && args.len() == 2
+                            {
+                                if let (IrExpr::Str(name, _), IrExpr::Array(elems)) =
+                                    (&args[0], &args[1])
+                                {
+                                    writes
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .push(elems.clone());
+                                    scan_expr_writes(expr, writes, poisoned);
+                                    continue;
+                                } else if let IrExpr::Str(name, _) = &args[0] {
+                                    poisoned.insert(name.clone());
+                                }
+                            }
+                        }
+                        scan_expr_writes(expr, writes, poisoned);
+                    }
+                    IrStmt::Function { body, .. } => scan_writes(body, writes, poisoned),
+                    IrStmt::If { cond, then, elsifs, else_ } => {
+                        scan_expr_writes(cond, writes, poisoned);
+                        for (c, b) in elsifs {
+                            scan_expr_writes(c, writes, poisoned);
+                            scan_writes(b, writes, poisoned);
+                        }
+                        for b in [then, else_] {
+                            scan_writes(b, writes, poisoned);
+                        }
+                    }
+                    IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                        scan_writes(body, writes, poisoned)
+                    }
+                    IrStmt::For { iter, body, .. } => {
+                        scan_expr_writes(iter, writes, poisoned);
+                        scan_writes(body, writes, poisoned);
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for s in stages {
+                            scan_writes(s, writes, poisoned);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => scan_writes(inner, writes, poisoned),
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            scan_writes(&c.body, writes, poisoned);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn scan_expr_writes(
+            e: &IrExpr,
+            writes: &mut HashMap<String, Vec<Vec<IrExpr>>>,
+            poisoned: &mut HashSet<String>,
+        ) {
+            match e {
+                IrExpr::Arrow(stmts) => scan_writes(stmts, writes, poisoned),
+                IrExpr::Call { args, .. } => {
+                    for a in args {
+                        scan_expr_writes(a, writes, poisoned);
+                    }
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            scan_expr_writes(x, writes, poisoned);
+                        }
+                    }
+                }
+                IrExpr::Array(parts) => {
+                    for x in parts {
+                        scan_expr_writes(x, writes, poisoned);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut writes: HashMap<String, Vec<Vec<IrExpr>>> = HashMap::new();
+        let mut poisoned: HashSet<String> = HashSet::new();
+        scan_writes(&prog.stmts, &mut writes, &mut poisoned);
+        for sub in &prog.subs {
+            scan_writes(&sub.body, &mut writes, &mut poisoned);
+        }
+        for (name, sites) in writes {
+            if poisoned.contains(&name) {
+                continue;
+            }
+            if sites
+                .iter()
+                .all(|elems| elems.iter().all(elem_int))
+            {
+                int_arrays.insert(name);
+            }
+        }
+    }
+    *INT_ITEM_ARRAYS.lock().unwrap() = Some(int_arrays);
     // Never-written-var read fold (SH2_ASSUME_NO_ENV): names with no
     // write anywhere in the program. Must be set before the emission
     // (the getVar arms consult it) and after the transforms (the write
@@ -23113,6 +23294,220 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
 /// The file arg may be a literal path or a store/lifted var read (the
 /// is_plain_path_arg shapes); any other head/cat flag shape keeps the
 /// runtime.
+/// The awk stage of the `sorted()` lowering: EXACTLY the pair-printer
+/// `{printf "%s",SEP}{printf "%s",$0}` (optionally with the NR>1
+/// prefix — `NR>1{printf "%s",", "}{printf "%s",$0}`) — join the input
+/// lines with SEP and no trailing newline. Any other awk program
+/// refuses (open node model). Separators containing `"` or a
+/// backslash escape refuse (the unescape is not modeled).
+fn parse_awk_join(prog: &str) -> Option<String> {
+    const SUFFIX: &str = "}{printf \"%s\",$0}";
+    let body = prog.strip_prefix("NR>1").unwrap_or(prog);
+    let rest = body.strip_prefix("{printf \"%s\",")?;
+    let inner = rest.strip_suffix(SUFFIX)?;
+    // the separator: a double-quoted awk string, no escapes
+    let sep = inner.strip_prefix('"')?.strip_suffix('"')?;
+    if sep.contains('\\') || sep.contains('"') {
+        return None;
+    }
+    Some(sep.to_string())
+}
+
+/// `$(printf '%s\n' <whole-array> | sort [-n] [-u] | [awk join-printer])`
+/// — the dynamic-language `sorted()` lowering (py-sh-go t86): three
+/// subprocesses over an array the program ALREADY holds in memory.
+/// Native: `arr.map(String).sort(cmp).filter(dedupe).join(sep)` — no
+/// spawn, no pipeline machinery, no async capture arrow. Guards:
+///   * stage 1 is printf with EXACTLY the `"%s\n"` format and a
+///     whole-array read (param("slice",name,"@") / arrayValues(name)) —
+///     the flatten channel (any other argument keeps the runtime);
+///   * stage 2 is sort with any subset of {-n, -u} (at most one each):
+///     string mode is the C-locale byte order (the same plain `.sort()`
+///     the cut|sort lift already renders); `-n` REQUIRES the int-item
+///     array proof — canonical decimal spellings make the numeric
+///     comparator exact and make `-u`'s equal-key rule equal-string;
+///   * stage 3 is optional and must be exactly the awk pair-printer
+///     ([`parse_awk_join`]) — the joined string carries no trailing
+///     newline, so [`trim_capture`] is the identity on it; the 2-stage
+///     form's sort output ends with exactly one newline, which
+///     trim_capture strips — both byte-identical to the pipeline's
+///     stdout minus the capture strip.
+/// Status: printf/sort/awk all exit 0 on these fixed shapes (the same
+/// reasoning as the cut|sort lift) — the chain records 0.
+fn native_capture_printf_sort_awk(stages: &[IrExpr]) -> Option<Expr> {
+    if stages.is_empty() || stages.len() > 3 {
+        return None;
+    }
+    let (n1, a1) = pipeline_stage_exec(&stages[0])?;
+    if n1 != "printf" {
+        return None;
+    }
+    let [fmt, arg] = a1 else {
+        return None;
+    };
+    // the IR keeps printf's format text as the PARSED string (the A1
+    // JSON \n was already decoded — a REAL newline)
+    if static_text(fmt)? != "%s\n" {
+        return None;
+    }
+    // the whole-array read: param("slice", name, "@", "") or arrayValues(name)
+    let arr_name = match arg {
+        IrExpr::Call { func, args } if func == "param" => match args.as_slice() {
+            [IrExpr::Str(k, _), IrExpr::Str(n, _), IrExpr::Str(sg, _), IrExpr::Str(e, _)]
+                if k == "slice" && sg == "@" && e.is_empty() =>
+            {
+                n.clone()
+            }
+            _ => return None,
+        },
+        IrExpr::Call { func, args } if func == "arrayValues" => match args.as_slice() {
+            [IrExpr::Str(n, _)] => n.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (n2, a2) = pipeline_stage_exec(&stages[1])?;
+    if n2 != "sort" {
+        return None;
+    }
+    let mut numeric = false;
+    let mut unique = false;
+    for f in a2 {
+        match static_text(f)?.as_str() {
+            "-n" if !numeric => numeric = true,
+            "-u" if !unique => unique = true,
+            _ => return None,
+        }
+    }
+    if numeric && !int_item_array(&arr_name) {
+        return None;
+    }
+    let join_sep = if stages.len() == 3 {
+        let (n3, a3) = pipeline_stage_exec(&stages[2])?;
+        if n3 != "awk" {
+            return None;
+        }
+        let [IrExpr::Str(p, _)] = a3 else {
+            return None;
+        };
+        parse_awk_join(p)?
+    } else {
+        "\n".to_string()
+    };
+    // items = <array>.map(v => String(v)) — the printf %s of each word
+    let items = method_call(
+        expr_to_estree(arg),
+        "map",
+        vec![sync_arrow_expr_param("v", method_call(ident("v"), "toString", vec![]))],
+    );
+    // sort: numeric comparator (the cut|sort arm's exact shape —
+    // (a,b) => (parseFloat(a)||0) < (parseFloat(b)||0) ? -1 : …) or the
+    // plain C-locale string sort
+    let sorted = if numeric {
+        let num = |x: Expr| Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "parseFloat".to_string(),
+                }),
+                arguments: vec![x],
+                optional: false,
+            }),
+            right: Box::new(int_lit_expr(0)),
+        };
+        let na = num(ident("a"));
+        let nb = num(ident("b"));
+        let lt = Expr::BinaryExpression {
+            operator: "<".to_string(),
+            left: Box::new(na.clone()),
+            right: Box::new(nb.clone()),
+        };
+        let gt = Expr::BinaryExpression {
+            operator: ">".to_string(),
+            left: Box::new(na),
+            right: Box::new(nb),
+        };
+        method_call(
+            items,
+            "sort",
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![ident("a"), ident("b")],
+                body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
+                    test: Box::new(lt),
+                    consequent: Box::new(Expr::UnaryExpression {
+                        operator: "-".to_string(),
+                        prefix: true,
+                        argument: Box::new(int_lit_expr(1)),
+                    }),
+                    alternate: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(gt),
+                        consequent: Box::new(int_lit_expr(1)),
+                        alternate: Box::new(int_lit_expr(0)),
+                    }),
+                })),
+                expression: true,
+                r#async: false,
+            }],
+        )
+    } else {
+        method_call(items, "sort", vec![])
+    };
+    // -u: GNU sort -u suppresses repeated LINES; on canonical integer
+    // spellings (the -n gate) equal keys ⇔ equal strings, and on the
+    // string mode line equality IS string equality.
+    let deduped = if unique {
+        // .filter((v, i, arr) => i === 0 || arr[i - 1] !== v)
+        let test = Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(Expr::BinaryExpression {
+                operator: "===".to_string(),
+                left: Box::new(ident("i")),
+                right: Box::new(int_lit_expr(0)),
+            }),
+            right: Box::new(Expr::BinaryExpression {
+                operator: "!==".to_string(),
+                left: Box::new(Expr::MemberExpression {
+                    object: Box::new(ident("arr")),
+                    property: Box::new(Expr::BinaryExpression {
+                        operator: "-".to_string(),
+                        left: Box::new(ident("i")),
+                        right: Box::new(int_lit_expr(1)),
+                    }),
+                    computed: true,
+                    optional: false,
+                }),
+                right: Box::new(ident("v")),
+            }),
+        };
+        method_call(
+            sorted,
+            "filter",
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![ident("v"), ident("i"), ident("arr")],
+                body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
+                    test: Box::new(test),
+                    consequent: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(true),
+                        raw: None,
+                        regex: None,
+                    }),
+                    alternate: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(false),
+                        raw: None,
+                        regex: None,
+                    }),
+                })),
+                expression: true,
+                r#async: false,
+            }],
+        )
+    } else {
+        sorted
+    };
+    let joined = method_call(deduped, "join", vec![str_lit(&join_sep)]);
+    Some(trim_capture(joined))
+}
+
 fn native_capture_cat_head(stages: &[IrExpr]) -> Option<Expr> {
     if stages.len() != 2 {
         return None;
@@ -23559,9 +23954,24 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                 native_capture_grep_cut(stages)
                     .or_else(|| native_capture_cut_sort(stages))
                     .or_else(|| native_capture_cat_head(stages))
+                    .or_else(|| native_capture_printf_sort_awk(stages))
             }
             _ => None,
         },
+        // a RAW pipeline statement — FRONTEND-emitted A1 carries the
+        // pipeline stmt UN-wrapped (the bash path's capture bodies arrive
+        // as the lowered sh2.pipeline call — the Expr arm above). Only
+        // the printf|sort|awk lift understands this shape today.
+        [IrStmt::Pipeline { stages, .. }] => {
+            let mut stage_exprs: Vec<IrExpr> = Vec::new();
+            for st in stages {
+                let [IrStmt::Expr(e)] = st.as_slice() else {
+                    return None;
+                };
+                stage_exprs.push(IrExpr::Arrow(vec![IrStmt::Expr(e.clone())]));
+            }
+            native_capture_printf_sort_awk(&stage_exprs)
+        }
         // Statement-form redirect (reachable when a capture body lowers via
         // stmt_for_command rather than command_arrow_stmts): same lifts,
         // IrStmt::Redirect shape.
