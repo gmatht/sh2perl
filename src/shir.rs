@@ -3229,6 +3229,46 @@ fn fn_call_is_sync(name: &str) -> bool {
         .unwrap_or(false) // unset → conservative: keep the async exec path
 }
 
+/// Param-lifted functions: name -> arity. A function whose body reads
+/// ONLY `$1..$k` (no `$@`/`$*`/`$#`/`$0`, no shift/set-positional), whose
+/// every call site is a STATIC `exec("f", args)`/fnCall passing >= k
+/// args, and which is SYNC (await-free) — its define lowers to a native
+/// `let __fn_<name> = (p1, …, pk) => …` arrow (the `$i` reads render as
+/// the `pi` params) and its call sites to plain `__fn_<name>(a1, …, ak)`
+/// calls. The runtime function map is NOT consulted (the analysis proves
+/// no dynamic dispatch can reach the name), so the functions.set
+/// registration is skipped. The i32-provable pattern: a pure shIR
+/// analysis; the C backend already renders the same convention natively
+/// (`char *_p1` params).
+static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// The CURRENT function's param arity, pushed while the define arrow's
+/// body lowers — `positional_read`/`native_special_var` render `$i` as
+/// the `pi` param identifier inside it.
+static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+
+fn param_lift_arity(name: &str) -> Option<usize> {
+    PARAM_LIFT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
+}
+
+/// Is the current function param-lifted, and is `pos` (1-based) within
+/// its arity? Renders the `$pos` read as the `p{pos}` param.
+fn param_frame_read(pos: u32) -> Option<Expr> {
+    let frame = PARAM_FRAME.lock().unwrap();
+    let arity = *frame.as_ref()?;
+    if (pos as usize) <= arity {
+        Some(Expr::Identifier {
+            name: format!("p{pos}"),
+        })
+    } else {
+        None
+    }
+}
+
 /// Names of script-defined functions whose CALLS lower to the native
 /// `sh2.callDirect(__fn_f, args)` path (see [`direct_fn_set`] /
 /// [`try_native_fn_call`]): the SYNC subset whose every body is
@@ -4596,6 +4636,433 @@ fn fn_call_sync_set(
         .collect();
     (sync, direct)
 }
+
+/// Param-lift analysis (the i32-provable pattern — a pure shIR analysis;
+/// the C backend already renders the same convention natively as
+/// `char *_p1` params). A function is param-liftable with arity k when:
+///   - its body reads ONLY `$1..$k` positionals (no `$@`/`$*`/`$#`/`$0`,
+///     no `shift`/`set --` positional writes);
+///   - every call site is a STATIC `exec("f", args)` / `fnCall("f", args)`
+///     passing >= k args (the runtime function map is never consulted —
+///     the name appears nowhere else in the program);
+///   - the function is SYNC (await-free — the arrow is non-async and the
+///     calls are plain sync calls).
+/// The define then lowers to `let __fn_<name> = (p1, …, pk) => …` with
+/// `$i` reads rendering as the `pi` params, and the call sites to plain
+/// `__fn_<name>(a1, …, ak)` calls — no sh2.functions.set, no
+/// sh2.fnCall, no sh2.positional.
+fn param_lift_set(prog: &IrProgram) -> HashMap<String, usize> {
+    use std::collections::HashMap;
+
+    // per function: max positional index read, or None if disqualified
+    let mut arity: HashMap<String, Option<usize>> = HashMap::new();
+    let mut bodies: HashMap<String, Vec<&[IrStmt]>> = HashMap::new();
+    collect_fn_bodies(&prog.stmts, &mut bodies);
+    for sub in &prog.subs {
+        bodies.entry(sub.name.clone()).or_default().push(&sub.body);
+    }
+
+    fn walk_expr_pos(e: &IrExpr, max: &mut usize, bad: &mut bool, strings: &mut Vec<String>) {
+        match e {
+            IrExpr::Var(n, _) => {
+                if let Ok(d) = n.parse::<u32>() {
+                    if (1..=9).contains(&d) {
+                        *max = (*max).max(d as usize);
+                    } else {
+                        *bad = true; // $0 or a >9 positional
+                    }
+                } else if matches!(n.as_str(), "@" | "*" | "#" | "?" | "$" | "-") {
+                    *bad = true; // the special positional forms
+                }
+                // a regular variable name is fine
+            }
+            IrExpr::Arith(a) => walk_arith_pos(a, max, bad, strings),
+            IrExpr::Call { func, args } => {
+                if matches!(func.as_str(), "shift" | "set") {
+                    *bad = true; // positional writes
+                }
+                // a RUNTIME-evaluated string (arith/let/eval) referencing
+                // positionals would read the RUNTIME positional store —
+                // which a native call never populates (the param-lift
+                // skips fnCall's positional swap). The arith strings are
+                // collected and checked in the final loop (the parseability
+                // gate needs the FINAL arity — the `$1` refs are provably
+                // set only when the function is lifted with >= 1 params).
+                if matches!(func.as_str(), "arith" | "let" | "eval") {
+                    for a in args {
+                        if let IrExpr::Str(x, _) = a {
+                            if x.contains('$') {
+                                strings.push(x.clone());
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr_pos(a, max, bad, strings);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_pos(x, max, bad, strings);
+                    }
+                }
+            }
+            IrExpr::Array(parts) => {
+                for x in parts {
+                    walk_expr_pos(x, max, bad, strings);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_arith_pos(a: &ArithAst, max: &mut usize, bad: &mut bool, strings: &mut Vec<String>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                if let Ok(d) = n.parse::<u32>() {
+                    if (1..=9).contains(&d) {
+                        *max = (*max).max(d as usize);
+                    } else {
+                        *bad = true; // $0 or a >9 positional
+                    }
+                } else if matches!(n.as_str(), "@" | "*" | "#" | "?" | "$" | "-") {
+                    *bad = true; // the special positional forms
+                }
+                // a regular variable name is fine
+            }
+            ArithAst::Index { var, key } => {
+                if var.parse::<u32>().is_ok() {
+                    *bad = true;
+                }
+                walk_arith_pos(key, max, bad, strings);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith_pos(lhs, max, bad, strings);
+                walk_arith_pos(rhs, max, bad, strings);
+            }
+            ArithAst::Un { arg, .. } => walk_arith_pos(arg, max, bad, strings),
+            ArithAst::Cond { test, then, else_ } => {
+                walk_arith_pos(test, max, bad, strings);
+                walk_arith_pos(then, max, bad, strings);
+                walk_arith_pos(else_, max, bad, strings);
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                if var.parse::<u32>().is_ok() {
+                    *bad = true;
+                }
+                walk_arith_pos(rhs, max, bad, strings);
+            }
+            ArithAst::IncDec { var, .. } => {
+                if var.parse::<u32>().is_ok() {
+                    *bad = true;
+                }
+            }
+            ArithAst::Cast { arg, .. } => walk_arith_pos(arg, max, bad, strings),
+            _ => {}
+        }
+    }
+    fn walk_stmt_pos(st: &IrStmt, max: &mut usize, bad: &mut bool, strings: &mut Vec<String>) {
+        match st {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    if t.var.parse::<u32>().is_ok() {
+                        *bad = true;
+                    }
+                }
+                walk_expr_pos(expr, max, bad, strings);
+            }
+            IrStmt::Expr(e) => walk_expr_pos(e, max, bad, strings),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr_pos(cond, max, bad, strings);
+                for s in then {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+                for (c, b) in elsifs {
+                    walk_expr_pos(c, max, bad, strings);
+                    for s in b {
+                        walk_stmt_pos(s, max, bad, strings);
+                    }
+                }
+                for s in else_ {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr_pos(cond, max, bad, strings);
+                for s in body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                if var.parse::<u32>().is_ok() {
+                    *bad = true;
+                }
+                walk_expr_pos(iter, max, bad, strings);
+                for s in body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+                walk_expr_pos(cond, max, bad, strings);
+                for s in step {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+                for s in body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stg in stages {
+                    for s in stg {
+                        walk_stmt_pos(s, max, bad, strings);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr_pos(discriminant, max, bad, strings);
+                for c in clauses {
+                    for s in &c.body {
+                        walk_stmt_pos(s, max, bad, strings);
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                for s in body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for s in body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+                for ex in excepts {
+                    if let Some(m) = &ex.match_expr {
+                        walk_expr_pos(m, max, bad, strings);
+                    }
+                    for s in &ex.body {
+                        walk_stmt_pos(s, max, bad, strings);
+                    }
+                }
+                for s in else_body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+                for s in finally_body {
+                    walk_stmt_pos(s, max, bad, strings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (name, fns) in &bodies {
+        let mut max = 0usize;
+        let mut bad = false;
+        let mut strings: Vec<String> = Vec::new();
+        for body in fns {
+            for st in *body {
+                walk_stmt_pos(st, &mut max, &mut bad, &mut strings);
+            }
+        }
+        // the arith strings: parseable natively ONLY when the function's
+        // positionals 1..max are provably set (the lift's own arity)
+        if !bad {
+            let extra: HashSet<String> = (1..=max).map(|i| i.to_string()).collect();
+            for x in &strings {
+                if mathfunc_arith_js_with(x, &extra).is_none() {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        arity.insert(name.clone(), if bad { None } else { Some(max) });
+    }
+
+    // call sites + name-occurrence scan over the WHOLE program
+    fn walk_expr_calls(e: &IrExpr, name: &str, min_args: &mut Option<usize>, bad: &mut bool) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt_calls(st, name, min_args, bad);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if (func == "exec" || func == "fnCall") {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n == name {
+                            // a static call site: must pass >= k args
+                            let nargs = args.len().saturating_sub(1);
+                            *min_args = Some((*min_args).unwrap_or(usize::MAX).min(nargs));
+                        } else {
+                            // the name must not appear as any OTHER command
+                            if args.iter().any(|a| matches!(a, IrExpr::Str(x, _) if x == name)) {
+                                *bad = true;
+                            }
+                        }
+                    } else if args.iter().any(|a| matches!(a, IrExpr::Str(x, _) if x == name)) {
+                        *bad = true;
+                    }
+                } else if args.iter().any(|a| matches!(a, IrExpr::Str(x, _) if x == name)) {
+                    // the name in any other call's args (echo text, command
+                    // f, eval, …) — a dynamic reference
+                    *bad = true;
+                }
+                for a in args {
+                    walk_expr_calls(a, name, min_args, bad);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_calls(x, name, min_args, bad);
+                    }
+                }
+            }
+            IrExpr::Array(parts) => {
+                for x in parts {
+                    walk_expr_calls(x, name, min_args, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt_calls(st: &IrStmt, name: &str, min_args: &mut Option<usize>, bad: &mut bool) {
+        match st {
+            IrStmt::Assign { expr, .. } => walk_expr_calls(expr, name, min_args, bad),
+            IrStmt::Expr(e) => walk_expr_calls(e, name, min_args, bad),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr_calls(cond, name, min_args, bad);
+                for s in then {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+                for (c, b) in elsifs {
+                    walk_expr_calls(c, name, min_args, bad);
+                    for s in b {
+                        walk_stmt_calls(s, name, min_args, bad);
+                    }
+                }
+                for s in else_ {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr_calls(cond, name, min_args, bad);
+                for s in body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr_calls(iter, name, min_args, bad);
+                for s in body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+                walk_expr_calls(cond, name, min_args, bad);
+                for s in step {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+                for s in body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stg in stages {
+                    for s in stg {
+                        walk_stmt_calls(s, name, min_args, bad);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr_calls(discriminant, name, min_args, bad);
+                for c in clauses {
+                    for s in &c.body {
+                        walk_stmt_calls(s, name, min_args, bad);
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                for s in body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for s in body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+                for ex in excepts {
+                    if let Some(m) = &ex.match_expr {
+                        walk_expr_calls(m, name, min_args, bad);
+                    }
+                    for s in &ex.body {
+                        walk_stmt_calls(s, name, min_args, bad);
+                    }
+                }
+                for s in else_body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+                for s in finally_body {
+                    walk_stmt_calls(s, name, min_args, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: HashMap<String, usize> = HashMap::new();
+    for (name, k) in arity {
+        let Some(k) = k else { continue };
+        if k == 0 {
+            continue; // no positional reads — the direct tier already covers it
+        }
+        if !fn_call_is_sync(&name) {
+            continue;
+        }
+        let mut min_args: Option<usize> = None;
+        let mut bad = false;
+        for st in &prog.stmts {
+            walk_stmt_calls(st, &name, &mut min_args, &mut bad);
+        }
+        for sub in &prog.subs {
+            for st in &sub.body {
+                walk_stmt_calls(st, &name, &mut min_args, &mut bad);
+            }
+        }
+        if std::env::var("SH2_DBG_PL").is_ok() {
+            eprintln!("DBG pl {name}: k={k} min_args={min_args:?} bad={bad}");
+        }
+        if bad {
+            continue;
+        }
+        // every call site must pass >= k args (a call with fewer args
+        // would leave the trailing params undefined — bash pads with "")
+        if let Some(m) = min_args {
+            if m < k {
+                continue;
+            }
+        } else {
+            continue; // no call sites — dead function
+        }
+        out.insert(name, k);
+    }
+    out
+}
+
 
 /// `let __fn_<name>` — the module binding name for a native-direct
 /// function, or None when the composed identifier would be invalid JS
@@ -15362,6 +15829,405 @@ fn arith_text_dollar_strip(t: &str) -> Option<(String, Vec<(usize, usize, String
 /// `let` path, the lift walkers' store-mark skips, the numeric-lift
 /// fixpoint) must use THIS predicate so the marks and the emission always
 /// agree.
+/// The zsh-mathfunc arith text → native JS expression (the deterministic
+/// `evalArith` subset — the same shape as the C backend's
+/// `mathfunc_arith_c` and the runtime's `arithFuncs`): `int()` truncates
+/// toward zero (`Math.trunc`), `sqrt()` is `Math.sqrt`, `$N` reads the
+/// positional (under a param-lift frame, the `p{N}` param), `$name`
+/// coerces numerically. Refuses (the caller keeps the runtime
+/// `sh2.arith` string eval) anything outside the subset: `%`, `&&`/`||`/
+/// `!`/`~`, bitwise/shift, ternaries, assignments, `++`/`--`, `$?`/`$#`,
+/// array subscripts, and `/` (the runtime's `Math.trunc(v/d)` needs the
+/// zero-divisor throw the native form cannot express). `**` renders
+/// `Math.pow`. This is what lets a param-lifted function keep its
+/// `int(sqrt($1))` bound NATIVE — the runtime string eval would read the
+/// (never-populated) positional store.
+fn mathfunc_arith_js(t: &str) -> Option<Expr> {
+    // the emitter context: the current param-lift frame's positionals are
+    // PROVABLY set (every call site passes >= k args — the analysis
+    // verified it), so `$1..$k` refs render as the p{N} params
+    let extra: HashSet<String> = PARAM_FRAME
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|k| (1..=*k).map(|i| i.to_string()).collect())
+        .unwrap_or_default();
+    mathfunc_arith_js_with(t, &extra)
+}
+
+/// The gated core: `extra_set` names the refs provably set in THIS
+/// context (the param-lift analysis passes the function's positionals;
+/// the emitter passes the active frame's). A `$N`/`$name` ref outside
+/// the set refuses — the runtime's arithExpand would substitute the
+/// (possibly empty) value and re-parse, which the native form cannot
+/// reproduce.
+fn mathfunc_arith_js_with(t: &str, extra_set: &HashSet<String>) -> Option<Expr> {
+    // refuse the operators outside the deterministic subset UP FRONT —
+    // the grammar would otherwise mis-parse them (e.g. `i++ + ++i` as
+    // `i + (+i)` — the runtime's increment side effects and old/new
+    // value semantics cannot be native). `=`/`?`/`:`/`&`/`|`/`!`/`~`/
+    // `%`/`/`/`[`/`]`/`++`/`--` all refuse; `${name}` refs are the only
+    // `{`/`}` (the dollar arm handles them).
+    for c in t.chars() {
+        if matches!(c, '=' | '?' | ':' | '&' | '|' | '!' | '~' | '%' | '/' | '[' | ']') {
+            return None;
+        }
+    }
+    if t.contains("++") || t.contains("--") {
+        return None;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    let mut pos = 0usize;
+    fn ws(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+    fn cmp(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        let l = add(chars, pos, extra)?;
+        ws(chars, pos);
+        let rest: String = chars[*pos..].iter().collect();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if rest.starts_with(op) {
+                *pos += op.len();
+                let r = add(chars, pos, extra)?;
+                // JS comparisons yield booleans — the runtime's ints are
+                // 1/0 (the `? 1 : 0` the runtime's rel/eq emit)
+                return Some(Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression {
+                        operator: op.to_string(),
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    consequent: Box::new(int_lit_expr(1)),
+                    alternate: Box::new(int_lit_expr(0)),
+                });
+            }
+        }
+        Some(l)
+    }
+    fn add(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        let mut l = mul(chars, pos, extra)?;
+        loop {
+            ws(chars, pos);
+            let op = match chars.get(*pos) {
+                Some('+') => "+",
+                Some('-') => "-",
+                _ => return Some(l),
+            };
+            *pos += 1;
+            let r = mul(chars, pos, extra)?;
+            l = Expr::BinaryExpression {
+                operator: op.to_string(),
+                left: Box::new(l),
+                right: Box::new(r),
+            };
+        }
+    }
+    fn mul(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        let mut l = pow(chars, pos, extra)?;
+        loop {
+            ws(chars, pos);
+            if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) != Some(&'*') {
+                *pos += 1;
+                let r = pow(chars, pos, extra)?;
+                l = Expr::BinaryExpression {
+                    operator: "*".to_string(),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                };
+            } else if chars.get(*pos) == Some(&'/') {
+                // the runtime's `/` is Math.trunc(v/d) with a zero-divisor
+                // throw — the native form cannot express the throw, refuse
+                return None;
+            } else {
+                return Some(l);
+            }
+        }
+    }
+    fn pow(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        ws(chars, pos);
+        let signed = matches!(chars.get(*pos), Some('+') | Some('-'));
+        let base = unary(chars, pos, extra)?;
+        ws(chars, pos);
+        if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) == Some(&'*') {
+            if signed {
+                return None;
+            }
+            *pos += 2;
+            let exp = unary(chars, pos, extra)?;
+            return Some(Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "Math".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "pow".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![base, exp],
+                optional: false,
+            });
+        }
+        Some(base)
+    }
+    fn unary(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        ws(chars, pos);
+        match chars.get(*pos) {
+            Some('+') => {
+                *pos += 1;
+                unary(chars, pos, extra)
+            }
+            Some('-') => {
+                *pos += 1;
+                Some(Expr::UnaryExpression {
+                    operator: "-".to_string(),
+                    prefix: true,
+                    argument: Box::new(unary(chars, pos, extra)?),
+                })
+            }
+            _ => atom(chars, pos, extra),
+        }
+    }
+    fn atom(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        ws(chars, pos);
+        match chars.get(*pos) {
+            Some('(') => {
+                *pos += 1;
+                let e = cmp(chars, pos, extra)?;
+                ws(chars, pos);
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(e)
+            }
+            Some('$') => dollar(chars, pos, extra),
+            Some(c) if c.is_ascii_digit() || *c == '.' => number(chars, pos),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => named(chars, pos, extra),
+            _ => None,
+        }
+    }
+    fn number(chars: &[char], pos: &mut usize) -> Option<Expr> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '.' || *c == 'x' || *c == 'X' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        let raw: String = chars[start..*pos].iter().collect();
+        if raw.is_empty() || raw == "-" || raw == "." {
+            return None;
+        }
+        // decimal floats parse as JS floats; hex stays parseInt
+        let v: f64 = if raw.contains('.') && !raw.starts_with("0x") && !raw.starts_with("0X") {
+            raw.parse().ok()?
+        } else {
+            let hex = raw.starts_with("0x") || raw.starts_with("0X");
+            let n = if hex {
+                i64::from_str_radix(&raw[2..], 16).ok()?
+            } else {
+                raw.parse::<i64>().ok()?
+            };
+            n as f64
+        };
+        Some(Expr::Literal {
+            value: serde_json::Value::from(v),
+            raw: None,
+            regex: None,
+        })
+    }
+    fn dollar(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        *pos += 1; // consume `$`
+        if chars.get(*pos) == Some(&'{') {
+            *pos += 1;
+            let name = name(chars, pos)?;
+            ws(chars, pos);
+            if chars.get(*pos) != Some(&'}') {
+                return None;
+            }
+            *pos += 1;
+            return ref_read(&name, extra);
+        }
+        let name = name(chars, pos)?;
+        ref_read(&name, extra)
+    }
+    fn ref_read(n: &str, extra: &HashSet<String>) -> Option<Expr> {
+        // a positional ref is only sound when PROVABLY set (the
+        // param-lift frame / the analysis's extra set); a plain var ref
+        // needs the ARITH_REF_SET proof (a real assignment source — the
+        // runtime's arithExpand substitutes its decimal value)
+        if let Ok(d) = n.parse::<u32>() {
+            if (1..=9).contains(&d) && extra.contains(n) {
+                return numref(n);
+            }
+            return None;
+        }
+        let set_vars = ARITH_REF_SET.lock().unwrap().clone().unwrap_or_default();
+        if set_vars.contains(n) || extra.contains(n) {
+            return numref(n);
+        }
+        None
+    }
+    fn name(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+    fn named(chars: &[char], pos: &mut usize, extra: &HashSet<String>) -> Option<Expr> {
+        let n = name(chars, pos)?;
+        let save = *pos;
+        ws(chars, pos);
+        if chars.get(*pos) != Some(&'(') {
+            *pos = save;
+            return numref(&n);
+        }
+        *pos += 1;
+        let mut args: Vec<Expr> = Vec::new();
+        ws(chars, pos);
+        if chars.get(*pos) == Some(&')') {
+            *pos += 1;
+            return mf_call(&n, args);
+        }
+        loop {
+            args.push(cmp(chars, pos, extra)?);
+            ws(chars, pos);
+            match chars.get(*pos) {
+                Some(',') => {
+                    *pos += 1;
+                }
+                Some(')') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        mf_call(&n, args)
+    }
+    fn mf_call(name: &str, args: Vec<Expr>) -> Option<Expr> {
+        let math = |f: &str, a: Vec<Expr>| Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "Math".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: f.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: a,
+            optional: false,
+        };
+        match name {
+            "int" if args.len() == 1 => Some(math("trunc", args)),
+            "abs" | "fabs" if args.len() == 1 => Some(math("abs", args)),
+            "floor" | "ceil" | "round" | "trunc" | "sqrt" | "cbrt" | "exp" | "log"
+            | "log10" | "log2" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "rint"
+                if args.len() == 1 =>
+            {
+                let f = if name == "rint" { "round" } else { name };
+                Some(math(f, args))
+            }
+            "atan2" if args.len() == 2 => Some(math("atan2", args)),
+            "hypot" if !args.is_empty() => Some(math("hypot", args)),
+            "fmod" if args.len() == 2 => Some(Expr::BinaryExpression {
+                operator: "%".to_string(),
+                left: Box::new(args[0].clone()),
+                right: Box::new(args[1].clone()),
+            }),
+            "copysign" if args.len() == 2 => Some(Expr::ConditionalExpression {
+                test: Box::new(Expr::LogicalExpression {
+                    operator: "||".to_string(),
+                    left: Box::new(Expr::BinaryExpression {
+                        operator: "<".to_string(),
+                        left: Box::new(args[1].clone()),
+                        right: Box::new(int_lit_expr(0)),
+                    }),
+                    right: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Object".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "is".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![args[1].clone(), Expr::UnaryExpression {
+                            operator: "-".to_string(),
+                            prefix: true,
+                            argument: Box::new(int_lit_expr(0)),
+                        }],
+                        optional: false,
+                    }),
+                }),
+                consequent: Box::new(Expr::UnaryExpression {
+                    operator: "-".to_string(),
+                    prefix: true,
+                    argument: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Math".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "abs".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![args[0].clone()],
+                        optional: false,
+                    }),
+                }),
+                alternate: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "Math".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "abs".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![args[0].clone()],
+                    optional: false,
+                }),
+            }),
+            _ => None,
+        }
+    }
+    fn numref(n: &str) -> Option<Expr> {
+        // `$N` / `$name` — the exact numeric coercion the runtime's
+        // evalArith applies (Number(v) || 0); under a param-lift frame
+        // the positional reads render as the p{N} params
+        Some(arith_var_read(n))
+    }
+    let out = cmp(&chars, &mut pos, extra_set)?;
+    ws(&chars, &mut pos);
+    if pos != chars.len() {
+        return None;
+    }
+    Some(out)
+}
+
 fn native_arith_text(t: &str) -> Option<ArithAst> {
     if !t.contains('$') {
         return parse_arith_native(t);
@@ -16840,6 +17706,18 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let (sync_fns, direct_fns) = fn_call_sync_set(prog, &functions);
     *SYNC_FN_CALLS.lock().unwrap() = Some(sync_fns);
     *DIRECT_FN_CALLS.lock().unwrap() = Some(direct_fns.clone());
+    // Param-lift (native functions): a sync function whose body reads
+    // ONLY $1..$k and whose every call site is a static exec/fnCall
+    // passing >= k args — its define lowers to a native arrow with
+    // params and its calls to plain native calls. Must run after the
+    // sync set (it requires fn_call_is_sync).
+    let pl = param_lift_set(prog);
+    if std::env::var("SH2_DBG_PL").is_ok() {
+        eprintln!("DBG param_lift: {:?}", pl);
+        eprintln!("DBG sync: {:?}", SYNC_FN_CALLS.lock().unwrap().as_ref());
+        eprintln!("DBG direct: {:?}", DIRECT_FN_CALLS.lock().unwrap().as_ref());
+    }
+    *PARAM_LIFT.lock().unwrap() = Some(pl);
     // Native-echo-in-function analysis (see [`native_echo_fn_set`]): the
     // define arrows of eligible functions lower WITHOUT the sink-depth
     // bump, so their echo/printf statements go native. Must run after the
@@ -16994,6 +17872,19 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // direct-fn set is HashSet-backed; deterministic declaration order
     // keeps A1->ESTree output byte-stable across processes.
     let mut direct_sorted: Vec<&String> = direct_fns.iter().collect();
+    // param-lifted functions need the same module binding (their define
+    // is a bare reassignment of `__fn_<name>`)
+    let pl_names: Vec<String> = PARAM_LIFT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|pl| pl.keys().cloned().collect())
+        .unwrap_or_default();
+    for n in &pl_names {
+        if !direct_fns.contains(n) {
+            direct_sorted.push(n);
+        }
+    }
     direct_sorted.sort();
     for name in direct_sorted {
         let binding = direct_binding_name(name).expect("direct set is binding-valid");
@@ -21032,6 +21923,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     *ARROW_BODY_LOOP_DEAD.lock().unwrap() = Some(loop_dead);
                 }
             }
+            // PARAM-LIFT (native functions): a sync function whose body
+            // reads ONLY $1..$k with every call site a static exec/fnCall
+            // passing >= k args — the arrow takes the params and the $i
+            // reads render as the pi identifiers (the frame is pushed for
+            // the body's lowering, popped right after).
+            let lifted_arity = param_lift_arity(name);
+            if let Some(k) = lifted_arity {
+                *PARAM_FRAME.lock().unwrap() = Some(k);
+            }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
                 // powershell-sh-go): the define arrow wraps the blocks in
@@ -21041,13 +21941,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // from the sync set, so call sites await the arrow.
                 named_block_arrow(body, named_blocks)
             } else if fn_call_is_sync(name) {
+                let params = lifted_arity
+                    .map(|k| (1..=k).map(|i| ident(&format!("p{i}"))).collect())
+                    .unwrap_or_default();
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
                     // (see [`native_echo_fn_set`])
-                    arrow_native_echo_sync(vec![], IrExpr::Arrow(cloned_body))
+                    arrow_native_echo_sync(params, IrExpr::Arrow(cloned_body))
                 } else {
-                    arrow_sink_sync(vec![], IrExpr::Arrow(cloned_body))
+                    arrow_sink_sync(params, IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
                 arrow_native_echo(vec![], IrExpr::Arrow(cloned_body))
@@ -21061,8 +21964,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             *ARROW_BODY_COND_DEAD.lock().unwrap() = saved_cond_dead;
             *ARROW_BODY_LOOP_DEAD.lock().unwrap() = saved_loop_dead;
             FUNCTION_STACK.lock().unwrap().pop();
-            let binding = fn_call_is_direct(name)
-                .then(|| direct_binding_name(name).expect("direct set is binding-valid"));
+            if lifted_arity.is_some() {
+                *PARAM_FRAME.lock().unwrap() = None;
+            }
+            let binding = if lifted_arity.is_some() {
+                // param-lifted: the runtime map is never consulted (the
+                // analysis proved every call site is a static native
+                // call) — the binding alone defines the function
+                direct_binding_name(name)
+            } else {
+                fn_call_is_direct(name)
+                    .then(|| direct_binding_name(name).expect("direct set is binding-valid"))
+            };
             let mut items = vec![];
             if let Some(b) = &binding {
                 items.push(Expr::AssignmentExpression {
@@ -21071,24 +21984,26 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     right: Box::new(arrow.clone()),
                 });
             }
-            items.push(Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(sh2_member("functions")),
-                    property: Box::new(Expr::Identifier {
-                        name: "set".to_string(),
+            if lifted_arity.is_none() {
+                items.push(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(sh2_member("functions")),
+                        property: Box::new(Expr::Identifier {
+                            name: "set".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    computed: false,
+                    arguments: vec![
+                        str_lit(name),
+                        match &binding {
+                            Some(b) => Expr::Identifier { name: b.clone() },
+                            None => arrow,
+                        },
+                    ],
                     optional: false,
-                }),
-                arguments: vec![
-                    str_lit(name),
-                    match &binding {
-                        Some(b) => Expr::Identifier { name: b.clone() },
-                        None => arrow,
-                    },
-                ],
-                optional: false,
-            });
+                });
+            }
             items.push(bool_lit(true));
             Stmt::ExpressionStatement {
                 expression: seq(items),
@@ -24544,6 +25459,20 @@ fn try_native_fn_call(name: &str, args: &[IrExpr]) -> Option<Expr> {
     let a = expr_to_estree(&IrExpr::Array(args.to_vec()));
     if expr_has_await(&a) {
         return None;
+    }
+    // PARAM-LIFT: a plain native call `__fn_<name>(a1, …, ak)` — no
+    // fnCall dispatch, no positional save/restore, no Map lookup. The
+    // analysis proved every call site is static and passes >= k args.
+    if let Some(k) = param_lift_arity(name) {
+        if args.len() >= k {
+            let binding = direct_binding_name(name)?;
+            let lowered: Vec<Expr> = args.iter().map(expr_to_estree).collect();
+            return Some(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier { name: binding }),
+                arguments: lowered,
+                optional: false,
+            });
+        }
     }
     if direct_fn_call_is_ok(name, args) {
         return Some(sh2_call(
@@ -31018,6 +31947,10 @@ fn positional_read(name: &str) -> Option<Expr> {
         _ => {
             let d = name.parse::<u32>().ok()?;
             if (1..=9).contains(&d) {
+                // param-lifted function: the $i read IS the pi param
+                if let Some(p) = param_frame_read(d) {
+                    return Some(p);
+                }
                 Some(Expr::LogicalExpression {
                     operator: "??".to_string(),
                     left: Box::new(Expr::MemberExpression {
@@ -36141,6 +37074,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             }],
                         );
                     }
+                    // the zsh-mathfunc subset (`int(sqrt($1)) + 1` — the
+                    // py-sh-go bound): renders NATIVE (no runtime string
+                    // eval — which would read the never-populated
+                    // positional store under a param-lift). The subset
+                    // cannot throw (div/mod refused), so no arithEval
+                    // wrapper.
+                    if let Some(expr) = mathfunc_arith_js(t) {
+                        return expr;
+                    }
                 }
             }
             // `sh2.split(v)` — the field-split marker on UNQUOTED expansions
@@ -39371,6 +40313,14 @@ fn trim_capture(inner: Expr) -> Expr {
 /// corpus-observable state (the corpus is the oracle).
 fn native_special_var(name: &str) -> Option<Expr> {
     let positional = || sh2_member("positional");
+    // param-lifted function: the $i arith read IS the pi param
+    if let Ok(d) = name.parse::<u32>() {
+        if (1..=9).contains(&d) {
+            if let Some(p) = param_frame_read(d) {
+                return Some(p);
+            }
+        }
+    }
     match name {
         "?" => Some(sh2_member("lastExit")),
         "#" => Some(Expr::MemberExpression {
