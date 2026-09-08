@@ -327,7 +327,7 @@ pub struct Render {
     /// int-typed arrays (every element provably a 64-bit integer, only
     /// consumed by sortedIntJoin/sortedBigintJoin): stored as
     /// `long long name[N]` + `name_len` instead of `char* name[N]`
-    int_arrays: BTreeSet<String>,
+    int_arrays: HashSet<String>,
     /// associative-array names (`name_k`/`name_v`/`name_n` stores)
     assoc_arrays: BTreeSet<String>,
     /// `shopt -s nocasematch` → [[ == ]] globs match case-insensitively
@@ -443,6 +443,8 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
 /// `sortedIntJoin`/`sortedBigintJoin` consume it). Such arrays can be
 /// stored as `long long[]` instead of `char *[]` — no string round-trip.
 fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
+    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    let bigint_vars = analyze_bigint_vars(prog);
     let mut all_arrays: HashSet<String> = HashSet::new();
     let mut int_consumed: HashSet<String> = HashSet::new();
     let mut non_int_write: HashSet<String> = HashSet::new();
@@ -454,7 +456,8 @@ fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
             &mut int_consumed,
             &mut non_int_write,
             &mut string_read,
-            &prog.var_types,
+            &vt,
+            &bigint_vars,
         );
     }
     all_arrays
@@ -472,38 +475,39 @@ fn walk_int_array_stmt(
     non_int: &mut HashSet<String>,
     str_read: &mut HashSet<String>,
     vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
 ) {
     match s {
-        IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt),
-        IrStmt::Assign { expr, .. } => walk_int_array_expr(expr, all, consumed, non_int, str_read, vt),
-        IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt),
+        IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt, big),
+        IrStmt::Assign { expr, .. } => walk_int_array_expr(expr, all, consumed, non_int, str_read, vt, big),
+        IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt, big),
         IrStmt::If { cond, then, elsifs, else_ } => {
-            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt);
-            for b in then { walk_int_array_stmt(b, all, consumed, non_int, str_read, vt); }
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for b in then { walk_int_array_stmt(b, all, consumed, non_int, str_read, vt, big); }
             for (c, b) in elsifs {
-                walk_int_array_expr(c, all, consumed, non_int, str_read, vt);
-                for st in b { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+                walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big);
+                for st in b { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
             }
-            for st in else_ { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            for st in else_ { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::While { cond, body, .. } => {
-            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt);
-            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::For { body, .. } => {
-            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::Function { body, .. } => {
-            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::Block(body) => {
-            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::Pipeline { stages, .. } => {
-            for st in stages.iter().flatten() { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt); }
+            for st in stages.iter().flatten() { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::Ext(n) => {
-            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt); }
+            for c in n.children() { walk_int_array_stmt(c, all, consumed, non_int, str_read, vt, big); }
         }
         _ => {}
     }
@@ -516,6 +520,7 @@ fn walk_int_array_expr(
     non_int: &mut HashSet<String>,
     str_read: &mut HashSet<String>,
     vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
 ) {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
@@ -525,24 +530,32 @@ fn walk_int_array_expr(
                     // the values are args[1] (an Array of items)
                     if let Some(IrExpr::Array(items)) = args.get(1) {
                         for it in items {
-                            if !is_int_expr(it, vt) {
+                            if !is_int_expr(it, vt, big) {
                                 non_int.insert(name.clone());
                             }
                         }
                     }
                 }
-                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
-            "sortedIntJoin" | "sortedBigintJoin" => {
+            "sortedIntJoin" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     all.insert(name.clone());
                     consumed.insert(name.clone());
                 }
-                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "sortedBigintJoin" => {
+                // arbitrary-precision elements CANNOT live in long long[] —
+                // force char* (exact decimal text, mpz order).
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    non_int.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
             "exec" | "builtin" => {
                 // the array may appear in the argv (a string context)
-                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
             "arrayIndex" | "arrayItems" | "arrayLen" => {
                 // reading the array as a value — if it's used in a string
@@ -551,7 +564,7 @@ fn walk_int_array_expr(
                     all.insert(name.clone());
                     str_read.insert(name.clone());
                 }
-                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -561,46 +574,47 @@ fn walk_int_array_expr(
                 }
             }
             _ => {
-                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt); }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
         },
         IrExpr::Array(items) => {
-            for it in items { walk_int_array_expr(it, all, consumed, non_int, str_read, vt); }
+            for it in items { walk_int_array_expr(it, all, consumed, non_int, str_read, vt, big); }
         }
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
-                    walk_int_array_expr(x, all, consumed, non_int, str_read, vt);
+                    walk_int_array_expr(x, all, consumed, non_int, str_read, vt, big);
                 }
             }
         }
         IrExpr::BinOp { lhs, rhs, .. } => {
-            walk_int_array_expr(lhs, all, consumed, non_int, str_read, vt);
-            walk_int_array_expr(rhs, all, consumed, non_int, str_read, vt);
+            walk_int_array_expr(lhs, all, consumed, non_int, str_read, vt, big);
+            walk_int_array_expr(rhs, all, consumed, non_int, str_read, vt, big);
         }
         IrExpr::Ext(n) => {
-            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt); }
+            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big); }
         }
         _ => {}
     }
 }
 
-/// Is `e` a provable 64-bit integer expression (a literal, arithmetic, or
-/// an int-typed var read)?
-fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>) -> bool {
+/// Is `e` a provable 64-bit integer expression (a non-bigint literal,
+/// native arith, or an int-typed non-bigint var read)? Bigint arith and
+/// bigint-typed vars are excluded — they cannot fit a `long long[]` slot.
+fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>) -> bool {
     match e {
         IrExpr::Int(_) => true,
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(a) => !arith_is_bigint(a, big),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
             vt.get(name),
             Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
-        ),
+        ) && !big.contains(name),
         IrExpr::Call { func, args } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
                 matches!(
                     vt.get(name),
                     Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
-                )
+                ) && !big.contains(name)
             } else {
                 false
             }
@@ -9868,6 +9882,37 @@ impl Render {
     }
 
     /// `arr=(a b c)` / `declare -A map; map=([k]=v ...)`
+    /// Render an int-array ELEMENT to a native 64-bit C expression (the
+    /// `long long[]` storage path) instead of a string temp round-trip
+    /// (`snprintf("%lld", …)` then `atoll`). Falls back to the atoll of
+    /// the string value for anything not a plain int / native-arith shape.
+    fn store_int_item_c(&mut self, e: &IrExpr) -> String {
+        let native = match e {
+            IrExpr::Int(i) => Some(format!("(long long)({i}LL)")),
+            IrExpr::Arith(a) => Some(format!("(long long)({})", self.arith(a))),
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                if self.is_num(name) {
+                    Some(format!("(long long)({})", self.c_ident(name)))
+                } else {
+                    None
+                }
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Self::str_arg(args, 0) {
+                    Some(name) if self.is_num(&name) => {
+                        Some(format!("(long long)({})", self.c_ident(&name)))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match native {
+            Some(x) => x,
+            None => format!("(long long)atoll((char*)({}))", self.value_c(e)),
+        }
+    }
+
     fn emit_set_array(&mut self, var: &str, args: &[IrExpr]) {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
@@ -9949,7 +9994,9 @@ impl Render {
             }
             let v = self.value_c(it);
             if self.int_arrays.contains(var) {
-                self.emit(&format!("{id}[{ai}] = atoll((char*)({v}));"));
+                // int-typed array: store the native 64-bit value directly
+                let nv = self.store_int_item_c(it);
+                self.emit(&format!("{id}[{ai}] = {nv};"));
             } else {
                 self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
             }
@@ -9966,11 +10013,12 @@ impl Render {
             _ => vec![],
         };
         for (i, it) in items.iter().enumerate() {
-            let v = self.value_c(it);
             if self.int_arrays.contains(var) {
-                // int-typed array: store the parsed 64-bit value directly
-                self.emit(&format!("{id}[{id}_len + {i}] = atoll((char*)({v}));"));
+                // int-typed array: store the native 64-bit value directly
+                let nv = self.store_int_item_c(it);
+                self.emit(&format!("{id}[{id}_len + {i}] = {nv};"));
             } else {
+                let v = self.value_c(it);
                 self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
             }
         }
@@ -17908,6 +17956,131 @@ mod tests {
                 "{func}: GMP presence wrong:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn int_array_sorted_join_stores_long_long_natively() {
+        // A sortedIntJoin-consumed array of PROVEN int elements (Int
+        // leaves) must be stored as `long long[]` with the native 64-bit
+        // value written directly — no snprintf→atoll string round-trip.
+        use crate::ir::StrStyle;
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "a".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "setArray".to_string(),
+                        args: vec![
+                            IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Int(3), IrExpr::Int(1)]),
+                        ],
+                    },
+                    asm: None,
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "sortedIntJoin".to_string(),
+                            args: vec![IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted)],
+                        }]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("long long a[1024]"), "int array not long long[]:\n{out}");
+        assert!(
+            out.contains("_sh_sorted_int64_join"),
+            "int64 join helper missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_sorted_int_join"),
+            "char** join used for int array:\n{out}"
+        );
+        assert!(
+            !out.contains("= atoll((char*)("),
+            "string round-trip at the int-array store:\n{out}"
+        );
+        assert!(
+            out.contains("a[_ai0] = (long long)(3LL);"),
+            "native int store missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bigint_join_array_stays_char_ptr() {
+        // sortedBigintJoin arrays hold arbitrary-precision values that
+        // overflow long long — they must stay `char*[]` (exact decimal
+        // text, mpz order), never be truncated into a long long[] slot.
+        use crate::ir::StrStyle;
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "a".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "setArray".to_string(),
+                        args: vec![
+                            IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Int(5)]),
+                        ],
+                    },
+                    asm: None,
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "sortedBigintJoin".to_string(),
+                            args: vec![IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted)],
+                        }]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("char *a[1024]"), "bigint array not char*[]:\n{out}");
+        assert!(
+            out.contains("_sh_sorted_bigint_join"),
+            "bigint join helper missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_sorted_int64_join"),
+            "bigint array mis-typed to int64 join:\n{out}"
+        );
+        assert!(!out.contains("long long a["), "bigint array truncated:\n{out}");
     }
 
     #[test]
