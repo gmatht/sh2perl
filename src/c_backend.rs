@@ -5605,6 +5605,12 @@ impl Render {
                                     self.emit("fputc('\\n', stdout);");
                                 }
                                 self.emit("_sh_rc = 0;");
+                                // statement position: the value is discarded —
+                                // return empty so the caller emits no `1;`
+                                // no-op (mirrors the chain-peel `, 1` drop).
+                                if self.value_discarded {
+                                    return String::new();
+                                }
                                 return "1".into();
                             }
                         }
@@ -11138,7 +11144,12 @@ impl Render {
                 self.value_discarded = true;
                 let x = self.expr(e);
                 self.value_discarded = was;
-                self.emit(&format!("{x};"));
+                // a discarded expression that produced no value (e.g. the
+                // bigint echo's `1` tail) emits nothing — a bare `1;` is a
+                // no-op. Side-effecting values still emit.
+                if !x.is_empty() {
+                    self.emit(&format!("{x};"));
+                }
             }
             IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
@@ -17385,6 +17396,56 @@ mod tests {
         assert!(
             !out.contains("1234567890123456789012345678901"),
             "chain+1 mis-folded by appending the 1:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bigint_print_statement_emits_no_noop_tail() {
+        // A lone bigint print in statement position must not emit a
+        // trailing `1;` no-op (the discarded chain-verdict tail).
+        // Regression: the GMP fast path returned "1" unconditionally, so
+        // every bigint print emitted a bare `1;` after the
+        // mpz_out_str/fputc.
+        use crate::ir::{ArithAst, IrType};
+        let x = ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(2)),
+            }),
+            rhs: Box::new(ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(100)),
+            }),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(x))]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("mpz_out_str(stdout, 10,"),
+            "bigint print missing:\n{out}"
+        );
+        assert!(
+            !out.lines().any(|l| l.trim() == "1;"),
+            "no-op `1;` tail emitted:\n{out}"
         );
     }
 
