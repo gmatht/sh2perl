@@ -813,6 +813,22 @@ impl Render {
             self.emit("  memcpy(_sh_wb + l, s, n + 1);");
             self.emit("}");
             self.emit("static void _sh_wb_reset(void) { _sh_grow(&_sh_wb, &_sh_wcap, 1); _sh_wb[0] = 0; }");
+            // bigint decimal rendering (mpz -> text). Lives INSIDE the
+            // trimmed runtime region (unlike need_pow & co. below) so an
+            // unreferenced _sh_mpz_str is dropped with the other dead
+            // helpers instead of lingering as dead code.
+            if self.need_gmp {
+            self.emit("static char *_sh_mpz_str(_sh_vbuf *d, const mpz_t v) {");
+            self.emit("  char *s = mpz_get_str(0, 10, v);");
+            self.emit("  if (!s) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
+            self.emit("  size_t n = strlen(s);");
+            self.emit("  _sh_vgrow(d, n + 1);");
+            self.emit("  memcpy(d->p, s, n + 1);");
+            self.emit("  free(s);");
+            self.emit("  return d->p;");
+            self.emit("}");
+            self.emit("");
+            }
             self.emit("/* append s as ONE shell word (single-quoted, so no re-expansion) */");
             self.emit("static void _sh_word(const char *s) {");
             self.emit("  _sh_add(\" '\");");
@@ -1480,23 +1496,6 @@ impl Render {
             self.emit("static int _sh_is_r(const char *p) { return access(p, R_OK) == 0; }");
             self.emit("static int _sh_is_w(const char *p) { return access(p, W_OK) == 0; }");
             self.emit("static int _sh_is_x(const char *p) { return access(p, X_OK) == 0; }");
-        }
-        if self.need_gmp {
-            // bigint decimal rendering: mpz -> decimal text into a
-            // growable buffer (mpz_get_str mallocs; the copy is freed
-            // — GMP's default allocator is malloc/free, so free() is
-            // the matching deallocator). Powers prints, string contexts
-            // and unbounded-var stores.
-            self.emit("static char *_sh_mpz_str(_sh_vbuf *d, const mpz_t v) {");
-            self.emit("  char *s = mpz_get_str(0, 10, v);");
-            self.emit("  if (!s) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
-            self.emit("  size_t n = strlen(s);");
-            self.emit("  _sh_vgrow(d, n + 1);");
-            self.emit("  memcpy(d->p, s, n + 1);");
-            self.emit("  free(s);");
-            self.emit("  return d->p;");
-            self.emit("}");
-            self.emit("");
         }
         if self.need_pow {
             self.emit("/* integer power (no libm on the gate's cc) */");
@@ -5125,6 +5124,37 @@ impl Render {
                                 items.remove(0);
                             } else {
                                 break;
+                            }
+                        }
+                        // GMP fast path: a lone bigint print needs no
+                        // printf, no vbuf, no _sh_ at all — mpz_out_str
+                        // writes the decimal directly (t87's whole body).
+                        // Checked BEFORE parts_of (which would otherwise
+                        // emit the eval+getstr statements as a side
+                        // effect). -e is irrelevant (no literal text).
+                        if items.len() == 1 {
+                            let mut direct: Option<String> = None;
+                            match items[0] {
+                                IrExpr::Arith(a) if self.is_bigint_arith(a) => {
+                                    direct = Some(self.bigint_eval_temp(a));
+                                }
+                                IrExpr::Call { func, args } if func == "getVar" => {
+                                    if let Some(name) = Self::str_arg(args, 0) {
+                                        if self.bigint_vars.contains(&name) {
+                                            self.need_gmp = true;
+                                            direct = Some(self.c_ident(&name));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if let Some(src) = direct {
+                                self.emit(&format!("mpz_out_str(stdout, 10, {src});"));
+                                if !skip_nl {
+                                    self.emit("fputc('\\n', stdout);");
+                                }
+                                self.emit("_sh_rc = 0;");
+                                return "1".into();
                             }
                         }
                         for (i, item) in items.iter().enumerate() {
@@ -16634,11 +16664,59 @@ mod tests {
             "mpz_init(x);",
             "mpz_pow_ui",
             "mpz_fdiv_q",
-            "_sh_mpz_str",
+            // lone bigint prints lower direct (no printf/vbuf/_sh_)
+            "mpz_out_str(stdout, 10,",
         ] {
             assert!(out.contains(pat), "missing {pat:?} in:\n{out}");
         }
         assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
+        assert!(!out.contains("_sh_"), "_sh_ runtime leaked into pure-bigint output:\n{out}");
+    }
+
+    #[test]
+    fn bigint_string_use_keeps_mpz_str_helper() {
+        // A bigint value flowing to a STRING slot (mixed echo: literal
+        // word + bigint word) still needs decimal text: _sh_mpz_str
+        // must survive the trim. (A bare `s = <bigint>` instead makes
+        // s itself bigint via the fixpoint — no text involved.)
+        use crate::ir::{ArithAst, IrType};
+        let add = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(1)),
+            }),
+            rhs: Box::new(ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(2)),
+            }),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![
+                        IrExpr::Str("v=".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Arith(Box::new(add)),
+                    ]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("_sh_mpz_str"), "helper trimmed while referenced:\n{out}");
+        assert!(out.contains("mpz_add"), "add not lowered:\n{out}");
     }
 
     #[test]
