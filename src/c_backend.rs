@@ -2986,6 +2986,55 @@ impl Render {
         arith_is_bigint(a, &self.bigint_vars)
     }
 
+    /// Strip Cast wrappers (the frontend wraps every Num leaf in
+    /// Cast(Int64)) to reach the underlying node.
+    fn unwrap_cast(a: &ArithAst) -> &ArithAst {
+        match a {
+            ArithAst::Cast { arg, .. } => Self::unwrap_cast(arg),
+            _ => a,
+        }
+    }
+
+    /// Fold a Horner digit chain — the frontend's >i64 literal form
+    /// `((((0*10+d1)*10+d2)...)*10+dn)` — into its decimal string.
+    /// Returns None for anything that isn't exactly that shape, so a
+    /// genuine `X + 1` (whose lhs is a `+` node, not a `*10` node) is
+    /// never mis-folded.
+    fn horner_chain_digits(a: &ArithAst) -> Option<String> {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } if op == "+" => {
+                // a `+` node is a chain step only when its lhs is a
+                // `*10` node (the previous partial) and its rhs is a
+                // single digit
+                if let ArithAst::Bin { op: m, .. } = lhs.as_ref() {
+                    if m == "*" {
+                        if let ArithAst::Num(d) = Self::unwrap_cast(rhs) {
+                            if (0..=9).contains(d) {
+                                let s = Self::horner_chain_digits(lhs)?;
+                                return Some(format!("{s}{d}"));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ArithAst::Bin { op, lhs, rhs } if op == "*" => {
+                // base: 0*10 starts the chain
+                if let (ArithAst::Num(0), ArithAst::Num(10)) =
+                    (Self::unwrap_cast(lhs), Self::unwrap_cast(rhs))
+                {
+                    return Some(String::new());
+                }
+                // a `*10` node continues the chain (no digit)
+                if let ArithAst::Num(10) = Self::unwrap_cast(rhs) {
+                    return Self::horner_chain_digits(lhs);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate bigint arith `a` into the already-initialized mpz
     /// `target` (a bigint var or temp). Operands materialize via
     /// bigint_operand; GMP permits dest==src overlap. `//`/`%` are
@@ -3029,6 +3078,15 @@ impl Render {
                 self.emit(&format!("if (mpz_set_str({target}, _sh_arr_get({id}, {id}_len, (long long)({k})), 10) != 0) mpz_set_si({target}, 0);"));
             }
             ArithAst::Bin { op, lhs, rhs } => {
+                // Fold a Horner digit chain (the frontend's >i64 literal
+                // form) into a single mpz_set_str — one temp + one call
+                // instead of ~4 temps per digit. Only folds when the WHOLE
+                // node is exactly a chain, so a genuine `X + 1` (lhs not a
+                // *10 node) is never mis-folded.
+                if let Some(digits) = Self::horner_chain_digits(a) {
+                    self.emit(&format!("mpz_set_str({target}, \"{digits}\", 10);"));
+                    return;
+                }
                 let lt = self.bigint_operand(lhs);
                 let rt = self.bigint_operand(rhs);
                 match op.as_str() {
@@ -17185,6 +17243,149 @@ mod tests {
         }
         assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
         assert!(!out.contains("_sh_"), "_sh_ runtime leaked into pure-bigint output:\n{out}");
+    }
+
+    #[test]
+    fn bigint_horner_chain_folds_to_single_mpz_set_str() {
+        // The frontend emits a >i64 literal as a Horner digit chain
+        // ((((0*10+d1)*10+d2)...)*10+dn). The C renderer must fold the
+        // whole chain into ONE mpz_set_str (one temp + one call) instead
+        // of ~4 temps per digit.
+        use crate::ir::{ArithAst, IrType};
+        fn cast(n: i64) -> ArithAst {
+            ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(n)),
+            }
+        }
+        fn horner(digits: &str) -> ArithAst {
+            let mut chars = digits.chars();
+            let first = chars.next().unwrap().to_digit(10).unwrap() as i64;
+            let mut acc = ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(cast(0)),
+                    rhs: Box::new(cast(10)),
+                }),
+                rhs: Box::new(cast(first)),
+            };
+            for c in chars {
+                let d = c.to_digit(10).unwrap() as i64;
+                acc = ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(acc),
+                        rhs: Box::new(cast(10)),
+                    }),
+                    rhs: Box::new(cast(d)),
+                };
+            }
+            acc
+        }
+        let lit = horner("123456789012345678901234567890");
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(lit))]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("mpz_set_str(_bt0, \"123456789012345678901234567890\", 10);"),
+            "chain not folded to one set_str:\n{out}"
+        );
+        // the chain's per-digit mpz_mul/mpz_add steps must be gone
+        assert!(!out.contains("mpz_mul"), "chain *10 steps not folded:\n{out}");
+        assert!(!out.contains("mpz_add"), "chain +digit steps not folded:\n{out}");
+    }
+
+    #[test]
+    fn bigint_horner_chain_plus_one_not_misfolded() {
+        // `123456789012345678901234567890 + 1` must NOT fold the whole
+        // expression into "1234567890123456789012345678901" (appending
+        // the 1) — the top-level `+` has a `+` lhs, not a `*10` node, so
+        // it is not a chain step. The chain operand folds; the `+ 1`
+        // stays an mpz_add.
+        use crate::ir::{ArithAst, IrType};
+        fn cast(n: i64) -> ArithAst {
+            ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(n)),
+            }
+        }
+        fn horner(digits: &str) -> ArithAst {
+            let mut chars = digits.chars();
+            let first = chars.next().unwrap().to_digit(10).unwrap() as i64;
+            let mut acc = ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(cast(0)),
+                    rhs: Box::new(cast(10)),
+                }),
+                rhs: Box::new(cast(first)),
+            };
+            for c in chars {
+                let d = c.to_digit(10).unwrap() as i64;
+                acc = ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(acc),
+                        rhs: Box::new(cast(10)),
+                    }),
+                    rhs: Box::new(cast(d)),
+                };
+            }
+            acc
+        }
+        let expr = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(horner("123456789012345678901234567890")),
+            rhs: Box::new(cast(1)),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(expr))]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("mpz_add"), "X+1 must stay an add:\n{out}");
+        assert!(
+            !out.contains("1234567890123456789012345678901"),
+            "chain+1 mis-folded by appending the 1:\n{out}"
+        );
     }
 
     #[test]
