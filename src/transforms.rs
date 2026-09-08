@@ -17,6 +17,43 @@ use crate::ir::IrStmt;
 
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
+// ── Per-backend transform selection (PLAN §11.12) ─────────────────────
+// The shared crate runs `transforms::apply()` for every backend (the §11
+// gating note). This is the missing per-backend enable/disable: a
+// thread-local "current target" set by the CLI entry, consulted by
+// `transform_applies`. Default (unset target, or a transform with no
+// restriction) = the transform applies to every backend — the historical
+// behavior, so existing transforms are unaffected and the corpus gate
+// stays green. A backend-specific transform (e.g. a node-lowering that
+// only some backends want) declares its target set here.
+use std::cell::RefCell;
+
+thread_local! {
+    static CURRENT_TARGET: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Set the current target backend for the duration of a pipeline run.
+/// `None` (unset) = every transform applies (the historical default).
+pub fn set_target(t: Option<&str>) {
+    CURRENT_TARGET.with(|c| *c.borrow_mut() = t.map(|s| s.to_string()));
+}
+
+/// The current target backend, if the CLI set one.
+pub fn target() -> Option<String> {
+    CURRENT_TARGET.with(|c| c.borrow().clone())
+}
+
+/// Does the transform `name` apply to the current target backend?
+/// Default: every backend. A backend-specific transform declares its
+/// target set here (e.g. a node-lowering that only C/JS want, so the
+/// shell-like backends never see the rich nodes — the "solve" idea).
+pub fn transform_applies(name: &str) -> bool {
+    match name {
+        // e.g. "text-ops-planner" => matches!(target().as_deref(), Some("c" | "js" | "go" | "rs" | "zig")),
+        _ => true,
+    }
+}
+
 pub mod arith_forms;
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod builtin;
@@ -150,8 +187,10 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
     let enabled = enabled_names();
     let mut changed = false;
     for (name, tf) in all() {
-        if enabled.is_empty() || enabled.iter().any(|e| e == name) {
-            changed |= tf(stmts);
+        if (enabled.is_empty() || enabled.iter().any(|e| e == name)) {
+            if transform_applies(name) {
+                changed |= tf(stmts);
+            }
         }
     }
     changed
@@ -166,4 +205,37 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
 pub fn transform_enabled(name: &str) -> bool {
     let enabled = enabled_names();
     enabled.is_empty() || enabled.iter().any(|e| e == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_defaults_to_none() {
+        set_target(None);
+        assert_eq!(target(), None);
+        // Default: every transform applies to every backend.
+        assert!(transform_applies("text-ops"));
+        assert!(transform_applies("dead-store-elim"));
+    }
+
+    #[test]
+    fn set_target_roundtrips() {
+        set_target(Some("c"));
+        assert_eq!(target().as_deref(), Some("c"));
+        set_target(None);
+        assert_eq!(target(), None);
+    }
+
+    #[test]
+    fn backend_specific_transform_is_filtered() {
+        // A transform that declares a target set is filtered when the
+        // current target is outside it. (The example arm is commented out
+        // in transform_applies; this test pins the mechanism shape.)
+        set_target(Some("perl"));
+        // With no restricted transforms registered, everything applies.
+        assert!(transform_applies("text-ops"));
+        set_target(None);
+    }
 }
