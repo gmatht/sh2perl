@@ -70,6 +70,302 @@ pub fn true64_int_var(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── BigInt homing (shared shIR analysis) ──────────────────────────────
+
+/// Vars whose EVERY runtime value is a BigInt (see
+/// [`analyze_bigint_homed`]). A bare var read inside an arith tree of a
+/// homed var is a BigInt-typed operand — the native BigInt div/mod arm
+/// fires instead of the `sh2.idiv` helper.
+static BIGINT_HOMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` BigInt-homed — every runtime value a BigInt?
+pub fn bigint_homed_var(name: &str) -> bool {
+    BIGINT_HOMED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// BigInt-homing fixpoint (the i32-provable pattern: a pure shIR
+/// analysis every backend can re-derive for its int64 typing).
+///
+/// A var is bigint-homed iff:
+///   - the A2 typing marks it `Int` (an Int-typed var cannot be written
+///     by a string channel — echo/read/word-split — so the ONLY writes
+///     are the visible Assign/setVar ones), AND
+///   - every visible write is a fully-bigint arith tree
+///     ([`arith_fully_bigint`], which itself accepts already-homed vars
+///     — the fixpoint propagates through assignment chains like
+///     `y = x + 1`).
+///
+/// `i++` is class-preserving (JS BigInt `++` is exact) and registers a
+/// write with no constraint. Pure function of the IR; no verdict
+/// statics beyond the render-scoped homed set.
+pub fn analyze_bigint_homed(prog: &IrProgram) -> HashSet<String> {
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    enum Write {
+        /// every write so far was one of these arith trees
+        Arith(Vec<ArithAst>),
+        /// a non-arith write channel — disqualified
+        Other,
+    }
+
+    fn disq(w: &mut HashMap<String, Write>, v: &str) {
+        w.insert(v.to_string(), Write::Other);
+    }
+
+    fn walk_expr(e: &IrExpr, w: &mut HashMap<String, Write>) {
+        match e {
+            IrExpr::Arith(a) => walk_arith(a, w),
+            IrExpr::Call { func, args } => {
+                if func == "setVar" {
+                    match args.as_slice() {
+                        [IrExpr::Str(v, _), IrExpr::Arith(a)] => {
+                            match w.entry(v.clone()).or_insert(Write::Arith(vec![])) {
+                                Write::Arith(trees) => trees.push((**a).clone()),
+                                Write::Other => {}
+                            }
+                        }
+                        [IrExpr::Str(v, _), ..] => disq(w, v),
+                        _ => {}
+                    }
+                }
+                for a in args {
+                    walk_expr(a, w);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, w);
+                    }
+                }
+            }
+            IrExpr::Array(parts) => {
+                for x in parts {
+                    walk_expr(x, w);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_arith(a: &ArithAst, w: &mut HashMap<String, Write>) {
+        match a {
+            ArithAst::Assign { var, rhs, .. } => {
+                match w.entry(var.clone()).or_insert(Write::Arith(vec![])) {
+                    Write::Arith(trees) => trees.push((**rhs).clone()),
+                    Write::Other => {}
+                }
+                walk_arith(rhs, w);
+            }
+            // class-preserving: register the var as written, no constraint
+            ArithAst::IncDec { var, .. } => {
+                w.entry(var.clone()).or_insert(Write::Arith(vec![]));
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith(lhs, w);
+                walk_arith(rhs, w);
+            }
+            ArithAst::Un { arg, .. } => walk_arith(arg, w),
+            ArithAst::Cond { test, then, else_ } => {
+                walk_arith(test, w);
+                walk_arith(then, w);
+                walk_arith(else_, w);
+            }
+            ArithAst::Index { key, .. } => walk_arith(key, w),
+            ArithAst::Cast { arg, .. } => walk_arith(arg, w),
+            _ => {}
+        }
+    }
+
+    fn walk_stmt(st: &IrStmt, w: &mut HashMap<String, Write>) {
+        match st {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        if let IrExpr::Arith(a) = expr {
+                            match w.entry(t.var.clone()).or_insert(Write::Arith(vec![])) {
+                                Write::Arith(trees) => trees.push((**a).clone()),
+                                Write::Other => {}
+                            }
+                        } else {
+                            disq(w, &t.var);
+                        }
+                    } else {
+                        disq(w, &t.var); // array/hash element store
+                    }
+                }
+                walk_expr(expr, w);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for d in vars {
+                    disq(w, &d.name); // shell decl init is a shared word
+                }
+                if let Some(e) = init {
+                    walk_expr(e, w);
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                disq(w, var);
+                for e in elements {
+                    walk_expr(e, w);
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, w),
+            IrStmt::Output { value, .. } => walk_expr(value, w),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, w);
+                walk_expr(content, w);
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, w);
+                for s in then {
+                    walk_stmt(s, w);
+                }
+                for (c, b) in elsifs {
+                    walk_expr(c, w);
+                    for s in b {
+                        walk_stmt(s, w);
+                    }
+                }
+                for s in else_ {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for s in body {
+                    walk_stmt(s, w);
+                }
+                for ex in excepts {
+                    if let Some(m) = &ex.match_expr {
+                        walk_expr(m, w);
+                    }
+                    for s in &ex.body {
+                        walk_stmt(s, w);
+                    }
+                }
+                for s in else_body {
+                    walk_stmt(s, w);
+                }
+                for s in finally_body {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                disq(w, var); // word-split items: string channel
+                walk_expr(iter, w);
+                for s in body {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    walk_stmt(s, w);
+                }
+                walk_expr(cond, w);
+                for s in step {
+                    walk_stmt(s, w);
+                }
+                for s in body {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, w);
+                for s in body {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for s in stage {
+                        walk_stmt(s, w);
+                    }
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr(discriminant, w);
+                for c in clauses {
+                    for s in &c.body {
+                        walk_stmt(s, w);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                for s in body {
+                    walk_stmt(s, w);
+                }
+            }
+            IrStmt::Warn { expr, .. } | IrStmt::Die { expr, .. } => walk_expr(expr, w),
+            IrStmt::Exec { cmd, args, .. } => {
+                walk_expr(cmd, w);
+                for e in args {
+                    walk_expr(e, w);
+                }
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(e) = e {
+                    walk_expr(e, w);
+                }
+            }
+            IrStmt::SetChildError(e) => walk_expr(e, w),
+            // Die/Continue/Break/Require/RawText/Select/Asm: no arith
+            // write channels this analysis models — nothing to walk
+            // (Asm outputs are object-file symbols, not shell vars).
+            _ => {}
+        }
+    }
+
+    let mut writes: HashMap<String, Write> = HashMap::new();
+    for st in &prog.stmts {
+        walk_stmt(st, &mut writes);
+    }
+    for sub in &prog.subs {
+        for st in &sub.body {
+            walk_stmt(st, &mut writes);
+        }
+    }
+
+    let is_int_typed = |v: &str| {
+        prog.var_types
+            .iter()
+            .any(|(n, ty)| n == v && matches!(ty, IrType::Int))
+    };
+    let mut homed: HashSet<String> = HashSet::new();
+    for _round in 0..=64 {
+        *BIGINT_HOMED.lock().unwrap() = Some(homed.clone());
+        let mut next = homed.clone();
+        let mut changed = false;
+        for (v, wr) in writes.iter() {
+            if next.contains(v) || !is_int_typed(v) {
+                continue;
+            }
+            if let Write::Arith(trees) = wr {
+                if !trees.is_empty() && trees.iter().all(arith_fully_bigint) {
+                    next.insert(v.clone());
+                    changed = true;
+                }
+            }
+        }
+        homed = next;
+        if !changed {
+            break;
+        }
+    }
+    *BIGINT_HOMED.lock().unwrap() = Some(homed.clone());
+    homed
+}
+
 /// `--true64` arith leaf wrapping: an ArithAst mentioning a slot var or
 /// an out-of-range Int64 var must render pure BigInt arithmetic (a mixed
 /// BigInt/Number binary op would throw). Num leaves become
@@ -11600,6 +11896,86 @@ fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
     }
 }
 
+/// Can this arith tree NEVER trigger the bash zero-divisor abort?
+/// Every `/` and `%` divisor is a provably-nonzero numeric literal
+/// (optionally sign-flipped), recursively through the compound shapes.
+///
+/// SHARED shIR analysis — the i32-provable pattern (a pure function of
+/// the IR; every backend re-derives it in O(tree), no verdict statics):
+/// the one non-native ingredient of shell div/mod is the zero-divisor
+/// abort of the WHOLE expansion. When no divisor can be zero, div/mod
+/// lowers bare-native everywhere (C `/`, Go `/`, Perl `int()`, and the
+/// estree path: native `/`/`%` with NO `sh2.arithEval` try/catch and NO
+/// `sh2.idiv`/`imod` helper — the abort channel they exist for is
+/// provably unreachable).
+pub fn arith_div_safe(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            let op_safe = if op == "/" || op == "%" {
+                arith_is_nonzero(rhs)
+            } else {
+                true
+            };
+            op_safe && arith_div_safe(lhs) && arith_div_safe(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_div_safe(arg),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_div_safe(test) && arith_div_safe(then) && arith_div_safe(else_)
+        }
+        ArithAst::Assign { rhs, .. } => arith_div_safe(rhs),
+        ArithAst::Index { key, .. } => arith_div_safe(key),
+        ArithAst::Cast { arg, .. } => arith_div_safe(arg),
+        // no div/mod inside any of these leaf/compound-free shapes
+        ArithAst::Num(_)
+        | ArithAst::Var(_)
+        | ArithAst::Ident(_)
+        | ArithAst::IncDec { .. }
+        | ArithAst::Sizeof(_) => true,
+    }
+}
+
+/// Does EVERY leaf of this arith tree render a runtime BigInt (the
+/// exact-i64 regime)? SHARED shIR analysis, mirroring the per-leaf
+/// renders of the estree arith lowering:
+///   - Num literals render `BigInt("…")` iff true64 mode is on;
+///   - Var/Ident reads render exact BigInt iff the A2 typing marks the
+///     variable int64 ([`true64_int_var`]) or it is a lifted int64 slot;
+///   - a `Cast{Int64|UInt64}` node's OUTPUT is
+///     `BigInt.asIntN(64, BigInt(…))` — always BigInt — regardless of
+///     its argument's runtime type (the cast coerces it away), so the
+///     recursion STOPS at the cast;
+///   - array elements are untyped stores (string OR number) — refuse.
+/// A fully-bigint tree can use the NATIVE BigInt operators: `/` is
+/// exactly bash's truncate-toward-zero integer division (no idiv
+/// helper), and no mixed Number/BigInt arity throw can occur.
+pub fn arith_fully_bigint(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Num(_) => true64_enabled(),
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            true64_int_var(n) || slot_var_index(n).is_some() || bigint_homed_var(n)
+        }
+        ArithAst::Cast { ty, .. } => matches!(ty, IrType::Int64 | IrType::UInt64),
+        ArithAst::Index { .. } => false,
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_fully_bigint(lhs) && arith_fully_bigint(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_fully_bigint(arg),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_fully_bigint(test)
+                && arith_fully_bigint(then)
+                && arith_fully_bigint(else_)
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            (true64_int_var(var) || slot_var_index(var).is_some())
+                && arith_fully_bigint(rhs)
+        }
+        ArithAst::IncDec { var, .. } => {
+            true64_int_var(var) || slot_var_index(var).is_some()
+        }
+        ArithAst::Sizeof(_) => true64_enabled(), // folded to a Num
+    }
+}
+
 /// Does an ArithAst already carry an Int64/UInt64 cast (pre-wrapped by
 /// [`wrap_true64_arith`], or C-frontend-typed)? Re-wrapping would nest
 /// redundant `BigInt.asIntN(64, BigInt(...))` layers.
@@ -11958,6 +12334,27 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     || arith_has_cast(rhs)
                     || arith_has_var_read(lhs)
                     || arith_has_var_read(rhs);
+                // FULLY-bigint tree with a provably-nonzero divisor:
+                // native BigInt `/` IS bash's truncate-toward-zero integer
+                // division — exact, no helper, and no abort can occur
+                // ([`arith_div_safe`]). This is the A1 frontends' bigint
+                // regime (t87_bignum: `x // 7` on Cast{Int64} operands —
+                // the sh2.idiv dispatch was the only thing left between
+                // the IR and pure JS). Ordering note: this arm must run
+                // BEFORE the Number Math.trunc arm — Math.trunc(BigInt)
+                // throws, so a fully-bigint tree must never take it.
+                if *op == "/"
+                    && may_bigint
+                    && arith_is_nonzero(rhs)
+                    && arith_fully_bigint(lhs)
+                    && arith_fully_bigint(rhs)
+                {
+                    return Expr::BinaryExpression {
+                        operator: "/".to_string(),
+                        left: Box::new(arith_to_estree(lhs)),
+                        right: Box::new(r),
+                    };
+                }
                 if arith_is_nonzero(rhs) && !may_bigint {
                     if *op == "/" {
                         // Math.trunc(l / r) — bash integer division
@@ -15768,6 +16165,16 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     }
     *TRUE64_INT.lock().unwrap() = Some(true64_int.clone());
     *TRUE64_SLOTS.lock().unwrap() = Some(true64_slots.clone());
+    // BIGINT-HOMED (shared shIR analysis): a var whose runtime values are
+    // ALL BigInt — the A2 typing marks it Int (no string/exec write
+    // channel can reach it) AND every visible write (Assign / setVar) is
+    // a fully-bigint arith tree ([`arith_fully_bigint`], which consults
+    // this very set — fixpoint). This is what lets the div/mod lowering
+    // treat a BARE var read as BigInt (t87_bignum: `x // 7` with x =
+    // 2**100 — the var is homed by its Cast{Int64} assignments, so the
+    // native BigInt `/` arm fires instead of the sh2.idiv helper).
+    let homed = analyze_bigint_homed(prog);
+    *BIGINT_HOMED.lock().unwrap() = Some(homed);
     // StoreToNative (core request shir-passes-store-to-native-20260806):
     // convert provably store-only `setVar("v", e)` Expr-stmts to Assign
     // stmts on a clone, so the native lift below fires (a native `x = v`
@@ -36583,7 +36990,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // abort→false semantics (see arith_to_estree_wrapped), so the
             // wrapper is dead weight there too — and it is the hot
             // divisibility-loop shape (py-sh-go t86: ~2x per-iteration).
-            if !arith_has_div_mod(a) || arith_is_zero_cmp(a) {
+            // Also excepted: DIVISOR-SAFE trees ([`arith_div_safe`] — the
+            // shared shIR analysis): no divisor can be zero, so no abort
+            // can occur and the catch is provably unreachable
+            // (t87_bignum: `x % 7` / `x % 1000000007` — the wrapper was
+            // the last sh2 dispatch between the IR and pure JS).
+            if !arith_has_div_mod(a) || arith_is_zero_cmp(a) || arith_div_safe(a) {
                 return inner;
             }
             sh2_call(
@@ -38268,6 +38680,10 @@ fn arith_is_nonzero(a: &ArithAst) -> bool {
     match a {
         ArithAst::Num(v) => *v != 0,
         ArithAst::Un { op, arg } => matches!(op.as_str(), "-" | "+") && arith_is_nonzero(arg),
+        // An integer width cast preserves zero-ness (0 ↦ 0, nonzero ↦
+        // nonzero — the A1 frontends' bigint regime wraps EVERY literal
+        // in Cast{Int64}, which must not blind the divisor proof).
+        ArithAst::Cast { ty, arg } if !matches!(ty, IrType::Float(_)) => arith_is_nonzero(arg),
         _ => false,
     }
 }
