@@ -7279,6 +7279,348 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
 // fixpoint) → None (Any). Returns var -> (lo, hi) for provably-integer
 // vars.
 
+// ── Nonzero-divisor proof (shared shIR analysis) ──────────────────────
+
+/// Per-scope nonzero var verdicts (see [`compute_nonzero_vars`]).
+static NONZERO_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The bounded subset (see [`bounded_nonzero_var`]).
+static BOUNDED_NONZERO_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` PROVABLY never zero (its proven range excludes 0 in every
+/// scope that mentions it)? Renderers consult this to drop the
+/// zero-divisor guard: the estree div/mod arms lower natively without
+/// the arithEval/idiv abort channel; the C mpz path emits the bare
+/// `mpz_fdiv_*` without the `mpz_sgn==0` branch.
+pub fn nonzero_var(name: &str) -> bool {
+    NONZERO_VARS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false) // unset → conservative: divisor may be zero
+}
+
+/// Can THIS divisor expression never evaluate to zero? A nonzero numeric
+/// literal (optionally sign-flipped, through integer casts), or a
+/// variable read with the [`nonzero_var`] range proof.
+pub fn arith_divisor_nonzero(a: &ArithAst) -> bool {
+    if arith_is_nonzero(a) {
+        return true;
+    }
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => nonzero_var(n),
+        // the true64 leaf wrap wraps EVERY leaf Cast{Int64, …} before the
+        // div arm sees the tree — the proof must look through the cast
+        // (an integer width cast preserves zero-ness)
+        ArithAst::Cast { ty, arg } if !matches!(ty, IrType::Float(_)) => {
+            arith_divisor_nonzero(arg)
+        }
+        _ => false,
+    }
+}
+
+/// Is this divisor expression PROVABLY never zero under a WRAPPING i64
+/// render (C `long long`)? A nonzero literal (through integer casts), or
+/// a var with the BOUNDED range proof ([`bounded_nonzero_var`]) — the
+/// unbounded widened ranges saturate at the i64 extreme, where the next
+/// increment could overflow through zero, so those keep their guard.
+pub fn arith_divisor_bounded_nonzero(a: &ArithAst) -> bool {
+    if arith_is_nonzero(a) {
+        return true;
+    }
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => bounded_nonzero_var(n),
+        ArithAst::Cast { ty, arg } if !matches!(ty, IrType::Float(_)) => {
+            arith_divisor_bounded_nonzero(arg)
+        }
+        _ => false,
+    }
+}
+
+/// Set the per-render nonzero verdicts (both the estree and C renders
+/// call this with [`compute_nonzero_vars`]).
+pub fn set_nonzero_vars(v: HashSet<String>) {
+    *NONZERO_VARS.lock().unwrap() = Some(v);
+}
+
+/// The BOUNDED subset: nonzero vars whose proven range stays STRICTLY
+/// inside ±i64::MAX — a wrapping i64 render can never overflow through
+/// zero, so the same guard elision is sound there (the estree Number /
+/// BigInt renders never wrap; only a C `long long` divisor site needs
+/// this stricter gate).
+pub fn bounded_nonzero_var(name: &str) -> bool {
+    BOUNDED_NONZERO_VARS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// The nonzero-var proof: a var's PROVEN VALUE RANGE ([`analyze_var_ranges`]
+/// — the loop-fixpoint widening) excludes zero in every scope that
+/// MENTIONS the var. Function bodies are their own scopes (the top-level
+/// walk skips them — they cannot change the parent's ranges): each body
+/// is walked with a FRESH state (the positional channel is unknown — a
+/// `n = $1` read is no proof), the loop fixpoint tracks counters (t86:
+/// `i = 1; … i++` inside `while i < bound` → [1, …] — lo > 0 PROVES the
+/// divisor can never be zero, so `n // i` lowers native).
+///
+/// Soundness under name collisions: the flat verdict admits a var only
+/// when EVERY scope either proves it or never mentions it (assigned or
+/// arith-read). Overflow note: the range analyzer models exact math; the
+/// estree renders (Number/BigInt) never wrap; the C consult sites are
+/// the mpz (GMP) paths — also exact. A wrapping i64 divisor site must
+/// NOT consult this (its guard stays).
+pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
+    use std::collections::HashMap;
+
+    type State = HashMap<String, Option<(i128, i128)>>;
+
+    // every var name the scope ASSIGNS or arith-reads (the collision
+    // guard — a name mentioned with no range verdict is unprovable)
+    fn mention_names(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        fn walk_expr(e: &IrExpr, out: &mut HashSet<String>) {
+            match e {
+                IrExpr::Var(n, _) => {
+                    out.insert(n.clone());
+                }
+                IrExpr::Arith(a) => walk_arith(a, out),
+                IrExpr::Call { func, args } => {
+                    if matches!(func.as_str(), "getVar" | "param" | "listVar" | "arrayIndex")
+                    {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            out.insert(n.clone());
+                        }
+                    }
+                    for a in args {
+                        walk_expr(a, out);
+                    }
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            walk_expr(x, out);
+                        }
+                    }
+                }
+                IrExpr::Array(parts) => {
+                    for x in parts {
+                        walk_expr(x, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn walk_arith(a: &ArithAst, out: &mut HashSet<String>) {
+            match a {
+                ArithAst::Var(n) | ArithAst::Ident(n) => {
+                    out.insert(n.clone());
+                }
+                ArithAst::Index { var, key } => {
+                    out.insert(var.clone());
+                    walk_arith(key, out);
+                }
+                ArithAst::Bin { lhs, rhs, .. } => {
+                    walk_arith(lhs, out);
+                    walk_arith(rhs, out);
+                }
+                ArithAst::Un { arg, .. } => walk_arith(arg, out),
+                ArithAst::Cond { test, then, else_ } => {
+                    walk_arith(test, out);
+                    walk_arith(then, out);
+                    walk_arith(else_, out);
+                }
+                ArithAst::Assign { var, rhs, .. } => {
+                    out.insert(var.clone());
+                    walk_arith(rhs, out);
+                }
+                ArithAst::IncDec { var, .. } => {
+                    out.insert(var.clone());
+                }
+                ArithAst::Cast { arg, .. } => walk_arith(arg, out),
+                _ => {}
+            }
+        }
+        for st in stmts {
+            match st {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        out.insert(t.var.clone());
+                    }
+                    walk_expr(expr, out);
+                }
+                IrStmt::Expr(e) => walk_expr(e, out),
+                IrStmt::Declare { vars, init, .. } => {
+                    for d in vars {
+                        out.insert(d.name.clone());
+                    }
+                    if let Some(e) = init {
+                        walk_expr(e, out);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    out.insert(var.clone());
+                    for e in elements {
+                        walk_expr(e, out);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    walk_expr(cond, out);
+                    for s in then {
+                        mention_names(std::slice::from_ref(s), out);
+                    }
+                    for (c, b) in elsifs {
+                        walk_expr(c, out);
+                        mention_names(b, out);
+                    }
+                    mention_names(else_, out);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, out);
+                    mention_names(body, out);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    for s in init {
+                        mention_names(std::slice::from_ref(s), out);
+                    }
+                    walk_expr(cond, out);
+                    for s in step {
+                        mention_names(std::slice::from_ref(s), out);
+                    }
+                    mention_names(body, out);
+                }
+                IrStmt::For { var, iter, body } => {
+                    out.insert(var.clone());
+                    walk_expr(iter, out);
+                    mention_names(body, out);
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for s in stages {
+                        mention_names(s, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => mention_names(inner, out),
+                IrStmt::Case { discriminant, clauses } => {
+                    walk_expr(discriminant, out);
+                    for c in clauses {
+                        mention_names(&c.body, out);
+                    }
+                }
+                // Function bodies are their OWN scopes (collected
+                // separately below) — descending here would poison the
+                // parent scope's mentions with the body's locals and kill
+                // every local var's proof
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    mention_names(body, out);
+                    for ex in excepts {
+                        if let Some(m) = &ex.match_expr {
+                            walk_expr(m, out);
+                        }
+                        mention_names(&ex.body, out);
+                    }
+                    mention_names(else_body, out);
+                    mention_names(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scope_nonzero(state: State) -> HashSet<String> {
+        state
+            .into_iter()
+            .filter_map(|(n, r)| {
+                r.filter(|(lo, hi)| *lo > 0 || *hi < 0).map(|_| n)
+            })
+            .collect()
+    }
+
+    // per-scope (nonzero, mentions, ranges)
+    let mut scopes: Vec<(HashSet<String>, HashSet<String>, HashMap<String, (i128, i128)>)> =
+        Vec::new();
+    let top_state: State = analyze_var_ranges(prog)
+        .into_iter()
+        .map(|(n, r)| (n, Some(r)))
+        .collect();
+    let mut top_mentions = HashSet::new();
+    mention_names(&prog.stmts, &mut top_mentions);
+    let top_nz = scope_nonzero(top_state.clone());
+    let top_ranges: HashMap<String, (i128, i128)> = top_state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect();
+    scopes.push((top_nz, top_mentions, top_ranges));
+    let mut fn_bodies: Vec<&Vec<IrStmt>> = Vec::new();
+    for st in &prog.stmts {
+        if let IrStmt::Function { body, .. } = st {
+            fn_bodies.push(body);
+        }
+    }
+    for sub in &prog.subs {
+        fn_bodies.push(&sub.body);
+    }
+    for body in fn_bodies {
+        let mut state: State = HashMap::new();
+        for s in body {
+            walk_stmt_ranges(s, &mut state);
+        }
+        let nz = scope_nonzero(state.clone());
+        let mut mentions = HashSet::new();
+        mention_names(body, &mut mentions);
+        let ranges: HashMap<String, (i128, i128)> = state
+            .into_iter()
+            .filter_map(|(n, r)| r.map(|r| (n, r)))
+            .collect();
+        scopes.push((nz, mentions, ranges));
+    }
+
+    // flat verdict: mentioned-and-proven in EVERY scope that mentions it
+    // (seed = the union of the per-scope proofs, then every scope must
+    // either prove the var or never mention it)
+    let mut flat: HashSet<String> = scopes
+        .iter()
+        .flat_map(|(nz, _, _)| nz.iter().cloned())
+        .collect();
+    for (nz, mentions, _) in scopes.iter() {
+        flat.retain(|v| !mentions.contains(v) || nz.contains(v));
+    }
+    // a var is only provable if some scope proves it with a mention
+    // anywhere (vacuous names — e.g. the $1 positional read surfaces as
+    // name "1" — carry no write channel and stay out)
+    let proven_anywhere: HashSet<String> = scopes
+        .iter()
+        .flat_map(|(nz, _, _)| nz.iter().cloned())
+        .collect();
+    let mut all_mentions = HashSet::new();
+    for (_, m, _) in &scopes {
+        all_mentions.extend(m.iter().cloned());
+    }
+    flat.retain(|v| proven_anywhere.contains(v) && all_mentions.contains(v));
+
+    // the BOUNDED subset (for wrapping i64 renders): same rule but every
+    // PROVING scope's range must also stay strictly inside the i64
+    // extremes — the widening saturates at INT_DOMAIN, so a range that
+    // touches it could overflow through zero on the next increment
+    let mut flat_bounded: HashSet<String> = flat.clone();
+    for v in flat_bounded.clone() {
+        for (_, mentions, ranges) in scopes.iter() {
+            if let Some((lo, hi)) = ranges.get(&v) {
+                if *lo <= INT_DOMAIN.0 || *hi >= INT_DOMAIN.1 {
+                    flat_bounded.remove(&v);
+                    break;
+                }
+            } else if mentions.contains(&v) {
+                // mentioned with no range in this scope — unproven there
+                flat_bounded.remove(&v);
+                break;
+            }
+        }
+    }
+    *BOUNDED_NONZERO_VARS.lock().unwrap() = Some(flat_bounded);
+    flat
+}
+
 pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
     let mut state: HashMap<String, Option<(i128, i128)>> = HashMap::new();
     for s in &prog.stmts {
@@ -8636,6 +8978,15 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         }
         // multi-target / indexed assignments — no single-variable range
         IrStmt::Assign { .. } => {}
+        // `((i++))` / `((x+=2))` — a BARE arith statement (the arith-forms
+        // shapes): the IncDec/Assign writes update the var's range exactly
+        // like the Assign arm's in-expression writes. Without this arm the
+        // loop fixpoint never sees the counter's growth (the stale pre-loop
+        // range would masquerade as a proof — i in t86 looked like [1,1]
+        // forever).
+        IrStmt::Expr(IrExpr::Arith(a)) => {
+            arith_stmt_writes(a, state);
+        }
         // setVar(name, v) — the plain write; `assign(name, op, v)` — the
         // runtime compound form (v+=1, a && v=x): both name the target
         // first and store the ARITHMETIC result (always an integer).
@@ -11926,7 +12277,7 @@ pub fn arith_div_safe(a: &ArithAst) -> bool {
     match a {
         ArithAst::Bin { op, lhs, rhs } => {
             let op_safe = if op == "/" || op == "%" {
-                arith_is_nonzero(rhs)
+                arith_divisor_nonzero(rhs)
             } else {
                 true
             };
@@ -12359,7 +12710,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 // throws, so a fully-bigint tree must never take it.
                 if *op == "/"
                     && may_bigint
-                    && arith_is_nonzero(rhs)
+                    && arith_divisor_nonzero(rhs)
                     && arith_fully_bigint(lhs)
                     && arith_fully_bigint(rhs)
                 {
@@ -14848,7 +15199,7 @@ fn arith_has_div_mod(a: &ArithAst) -> bool {
             // literal, optionally sign-flipped) emits the plain native
             // operation (see arith_to_estree's Bin arm), so its
             // arithEval wrapper is dead weight and does not count.
-            ((*op == "/" || *op == "%") && !arith_is_nonzero(rhs))
+            ((*op == "/" || *op == "%") && !arith_divisor_nonzero(rhs))
                 || arith_has_div_mod(lhs)
                 || arith_has_div_mod(rhs)
         }
@@ -16189,6 +16540,10 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // native BigInt `/` arm fires instead of the sh2.idiv helper).
     let homed = analyze_bigint_homed(prog);
     *BIGINT_HOMED.lock().unwrap() = Some(homed);
+    // NONZERO-DIVISOR proof (shared shIR analysis): a var whose proven
+    // range excludes 0 in every scope that mentions it — the div/mod
+    // lowering drops the zero-divisor abort channel for such divisors.
+    set_nonzero_vars(compute_nonzero_vars(prog));
     // StoreToNative (core request shir-passes-store-to-native-20260806):
     // convert provably store-only `setVar("v", e)` Expr-stmts to Assign
     // stmts on a clone, so the native lift below fires (a native `x = v`

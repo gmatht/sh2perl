@@ -359,6 +359,77 @@ const FIXED_BUF_CAP: u64 = 1024;
 /// Static capacity of the array stores (elements / assoc pairs).
 const ARR_CAP: usize = 1024;
 
+/// The exact awk join program py-sh-go emits for printing a sorted
+/// list (`print(sorted(...))`): first line bare, rest `, `-prefixed.
+/// The C backend recognizes this pipeline idiom (with `sort -n -u`)
+/// and lowers it to in-memory sort+join — no fork/exec. If the
+/// frontend ever changes the text, the shape match below fails and
+/// the pipeline keeps the faithful fork path (refuse > guess).
+const SORTED_JOIN_AWK: &str = "NR>1{printf \"%s\",\", \"}{printf \"%s\",$0}";
+
+/// Recognize `printf '%s\\n' "${arr[@]}" | sort -n -u | awk-JOIN`
+/// (py-sh-go's sorted-list print) and return the array name. Every
+/// element of the shape is checked literally: 3 single-exec stages,
+/// exact "%s\\n" format, whole-array `@` slice with no bounds,
+/// exact sort flags, exact awk program. Anything else -> None (the
+/// fork/exec engine handles it).
+fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
+    if stages.len() != 3 {
+        return None;
+    }
+    fn stage_call(s: &IrExpr) -> Option<(&str, Vec<IrExpr>)> {
+        let IrExpr::Arrow(stmts) = s else {
+            return None;
+        };
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let cmd = Render::str_arg(args, 0)?;
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.clone(),
+            _ => vec![],
+        };
+        Some((cmd_leak(cmd), words))
+    }
+    // 'static promotion for the borrowed cmd: str_arg clones already
+    fn cmd_leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+    let (c0, w0) = stage_call(&stages[0])?;
+    let (c1, w1) = stage_call(&stages[1])?;
+    let (c2, w2) = stage_call(&stages[2])?;
+    if c0 != "printf" || c1 != "sort" || c2 != "awk" {
+        return None;
+    }
+    let [IrExpr::Str(fmt, _), IrExpr::Call { func, args }] = w0.as_slice() else {
+        return None;
+    };
+    if fmt != "%s\\n" || func != "param" {
+        return None;
+    }
+    let [IrExpr::Str(op, _), IrExpr::Str(arr, _), IrExpr::Str(at, _), IrExpr::Str(len, _)] =
+        args.as_slice()
+    else {
+        return None;
+    };
+    if op != "slice" || at != "@" || !len.is_empty() || !is_ident(arr) {
+        return None;
+    }
+    if w1.len() != 2
+        || !matches!(&w1[0], IrExpr::Str(s, _) if s == "-n")
+        || !matches!(&w1[1], IrExpr::Str(s, _) if s == "-u")
+    {
+        return None;
+    }
+    if w2.len() != 1 || !matches!(&w2[0], IrExpr::Str(s, _) if s == SORTED_JOIN_AWK) {
+        return None;
+    }
+    Some(arr.clone())
+}
+
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
@@ -372,6 +443,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
     prog.var_storage = crate::shir::select_storage_classes(&prog);
     prog.var_const = crate::shir::analyze_var_const(&prog);
+    // NONZERO-DIVISOR proof (shared shIR analysis): a var whose proven
+    // range excludes 0 in every scope that mentions it — the mpz div/mod
+    // emit drops the `mpz_sgn==0` guard for such divisors.
+    crate::shir::set_nonzero_vars(crate::shir::compute_nonzero_vars(&prog));
     // Range analysis (M8 spike): conservative [lo, hi] per assigned var,
     // + the Range/seq for-iter seeds the analysis doesn't track (loop
     // vars are excluded from its assign set).
@@ -813,6 +888,115 @@ impl Render {
             self.emit("  memcpy(_sh_wb + l, s, n + 1);");
             self.emit("}");
             self.emit("static void _sh_wb_reset(void) { _sh_grow(&_sh_wb, &_sh_wcap, 1); _sh_wb[0] = 0; }");
+            // native `printf '%s\\n' "${a[@]}" | sort -n -u | awk-join`:
+            // GNU `sort -n` numeric-key order, arbitrary precision (length
+            // + lex, never atoll — magnitudes past i64 compare exactly).
+            // Only [ \t] are blanks, only '-' signs (a leading '+' is a
+            // literal that ends the key, so "+2" keys as zero); fraction
+            // trailing zeros are insignificant ("1.5" == "1.50").
+            // qsort is decorated with the input index, so ties keep
+            // input order — matching `sort -n -u`'s first-in-input
+            // dedupe (probed: "01" beats "1"/" 1" iff first).
+            self.emit("typedef struct { const char *p; size_t idx; } _sh_sline;");
+            self.emit("static int _sh_numkey_cmp(const char *a, const char *b) {");
+            self.emit("  while (*a == ' ' || *a == '\\t') a++;");
+            self.emit("  while (*b == ' ' || *b == '\\t') b++;");
+            self.emit("  int sa = 1, sb = 1;");
+            self.emit("  if (*a == '-') { sa = -1; a++; }");
+            self.emit("  if (*b == '-') { sb = -1; b++; }");
+            self.emit("  while (*a == '0') a++;");
+            self.emit("  while (*b == '0') b++;");
+            self.emit("  const char *ia = a; while (*a >= '0' && *a <= '9') a++;");
+            self.emit("  const char *ib = b; while (*b >= '0' && *b <= '9') b++;");
+            self.emit("  size_t la = (size_t)(a - ia), lb = (size_t)(b - ib);");
+            self.emit("  const char *fa = 0, *fb = 0; size_t lfa = 0, lfb = 0;");
+            self.emit("  if (*a == '.') { a++; fa = a; while (*a >= '0' && *a <= '9') a++; lfa = (size_t)(a - fa); }");
+            self.emit("  if (*b == '.') { b++; fb = b; while (*b >= '0' && *b <= '9') b++; lfb = (size_t)(b - fb); }");
+            self.emit("  int za = 1, zb = 1, k;");
+            self.emit("  for (k = 0; (size_t)k < la; k++) if (ia[k] != '0') za = 0;");
+            self.emit("  for (k = 0; (size_t)k < lb; k++) if (ib[k] != '0') zb = 0;");
+            self.emit("  for (k = 0; (size_t)k < lfa; k++) if (fa[k] != '0') za = 0;");
+            self.emit("  for (k = 0; (size_t)k < lfb; k++) if (fb[k] != '0') zb = 0;");
+            self.emit("  if (za && zb) return 0;");
+            self.emit("  if (za) return -sb; if (zb) return sa;");
+            self.emit("  if (sa != sb) return sa > sb ? 1 : -1;");
+            self.emit("  int m = 0;");
+            self.emit("  if (la != lb) m = la > lb ? 1 : -1;");
+            self.emit("  else if ((m = memcmp(ia, ib, la)) != 0) m = m > 0 ? 1 : -1;");
+            self.emit("  else {");
+            self.emit("    size_t fl = lfa > lfb ? lfa : lfb, f;");
+            self.emit("    for (f = 0; f < fl; f++) {");
+            self.emit("      int da = f < lfa ? fa[f] - '0' : 0;");
+            self.emit("      int db = f < lfb ? fb[f] - '0' : 0;");
+            self.emit("      if (da != db) { m = da > db ? 1 : -1; break; }");
+            self.emit("    }");
+            self.emit("  }");
+            self.emit("  return sa > 0 ? m : -m;");
+            self.emit("}");
+            self.emit("static int _sh_sline_cmp(const void *pa, const void *pb) {");
+            self.emit("  const _sh_sline *a = (const _sh_sline *)pa, *b = (const _sh_sline *)pb;");
+            self.emit("  int m = _sh_numkey_cmp(a->p, b->p);");
+            self.emit("  if (m != 0) return m;");
+            self.emit("  return a->idx < b->idx ? -1 : a->idx > b->idx ? 1 : 0;");
+            self.emit("}");
+            // native sorted-print: the LINES stage 0 would emit (each
+            // element + '\\n', exactly printf '%s\\n' semantics — an
+            // element with an interior newline fragments like the real
+            // pipeline sees it), stable-sorted, first-in-input deduped,
+            // joined with ", " (the awk join's output, no trailing
+            // newline — the caller adds brackets/newlines). Empty array
+            // yields "" (the pipeline prints nothing). Returns d->p.
+            self.emit("static char *_sh_sorted_join(_sh_vbuf *d, char **a, size_t n) {");
+            self.emit("  static _sh_vbuf _sj = {0, 0};");
+            self.emit("  static _sh_sline *_sj_ln = 0; static size_t _sj_lncap = 0;");
+            self.emit("  size_t i, ln = 0;");
+            self.emit("  _sh_vgrow(d, 1); d->p[0] = 0;");
+            self.emit("  _sh_vgrow(&_sj, 1); _sj.p[0] = 0;");
+            self.emit("  size_t tot = 1, pos = 0;");
+            self.emit("  for (i = 0; i < n; i++) tot += (a[i] ? strlen(a[i]) : 0) + 1;");
+            self.emit("  _sh_vgrow(&_sj, tot);");
+            self.emit("  for (i = 0; i < n; i++) {");
+            self.emit("    const char *s = a[i] ? a[i] : \"\";");
+            self.emit("    size_t l = strlen(s);");
+            self.emit("    memcpy(_sj.p + pos, s, l); pos += l;");
+            self.emit("    _sj.p[pos++] = '\\n';");
+            self.emit("  }");
+            self.emit("  _sj.p[pos] = 0;");
+            self.emit("  /* split on '\\n', NUL-terminating the scratch (the array is\n");
+            self.emit("     never mutated); then drop the post-terminator artifact\n");
+            self.emit("     piece so [a] and [a, \"\"] come out as [a] and [a, \"\"]:");
+            self.emit("     printf '%s\\n' \"a\" emits \"a\\n\" (one line), while \"a\\n\"\\n");
+            self.emit("     (element with trailing newline) emits lines \"a\" and \"\". */");
+            self.emit("  i = 0;");
+            self.emit("  while (i <= pos) {");
+            self.emit("    size_t j = i;");
+            self.emit("    while (j < pos && _sj.p[j] != '\\n') j++;");
+            self.emit("    _sj.p[j] = 0;");
+            self.emit("    if (ln + 1 >= _sj_lncap) {");
+            self.emit("      size_t nc = _sj_lncap ? _sj_lncap * 2 : 64;");
+            self.emit("      while (nc < ln + 1) nc *= 2;");
+            self.emit("      _sh_sline *np = (_sh_sline *)realloc(_sj_ln, nc * sizeof *_sj_ln);");
+            self.emit("      if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("      _sj_ln = np; _sj_lncap = nc;");
+            self.emit("    }");
+            self.emit("    _sj_ln[ln].p = _sj.p + i; _sj_ln[ln].idx = ln;");
+            self.emit("    ln++;");
+            self.emit("    i = j + 1;");
+            self.emit("  }");
+            self.emit("  if (ln > 0) ln--; /* post-terminator artifact */");
+            self.emit("  if (ln > 0) qsort(_sj_ln, ln, sizeof *_sj_ln, _sh_sline_cmp);");
+            self.emit("  size_t dn = 0, k;");
+            self.emit("  _sh_vgrow(d, 1);");
+            self.emit("  for (k = 0; k < ln; k++) {");
+            self.emit("    if (k > 0 && _sh_numkey_cmp(_sj_ln[k].p, _sj_ln[k-1].p) == 0) continue;");
+            self.emit("    size_t l = strlen(_sj_ln[k].p);");
+            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
+            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("    memcpy(d->p + dn, _sj_ln[k].p, l); dn += l;");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("  return d->p;");
+            self.emit("}");
             // bigint decimal rendering (mpz -> text). Lives INSIDE the
             // trimmed runtime region (unlike need_pow & co. below) so an
             // unreferenced _sh_mpz_str is dropped with the other dead
@@ -1980,8 +2164,16 @@ impl Render {
                     format!("_sh_pow({l},{r})")
                 } else if *op == "/" || *op == "%" {
                     // bash survives division by zero (result: error, the
-                    // expansion vanishes); C would SIGFPE — guard it
-                    format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                    // expansion vanishes); C would SIGFPE — guard it.
+                    // A BOUNDED-nonzero divisor (the shared range proof:
+                    // strictly inside ±i64, so the render can never
+                    // overflow through zero) makes the guard dead — bare
+                    // division.
+                    if crate::shir::arith_divisor_bounded_nonzero(rhs) {
+                        format!("({l} {op} {r})")
+                    } else {
+                        format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                    }
                 } else {
                     format!("({l} {op} {r})")
                 }
@@ -2676,6 +2868,16 @@ impl Render {
                     "+" => self.emit(&format!("mpz_add({target}, {lt}, {rt});")),
                     "-" => self.emit(&format!("mpz_sub({target}, {lt}, {rt});")),
                     "*" => self.emit(&format!("mpz_mul({target}, {lt}, {rt});")),
+                    // PROVEN-nonzero divisor (the shared range proof):
+                    // the guard branch is dead — emit the bare fdiv. The
+                    // guarded form is the documented bash-guard shape
+                    // (result 0 on a zero divisor).
+                    "/" if crate::shir::arith_divisor_nonzero(rhs) => {
+                        self.emit(&format!("mpz_fdiv_q({target}, {lt}, {rt});"))
+                    }
+                    "%" if crate::shir::arith_divisor_nonzero(rhs) => {
+                        self.emit(&format!("mpz_fdiv_r({target}, {lt}, {rt});"))
+                    }
                     "/" => self.emit(&format!("if (mpz_sgn({rt}) == 0) mpz_set_si({target}, 0); else mpz_fdiv_q({target}, {lt}, {rt});")),
                     "%" => self.emit(&format!("if (mpz_sgn({rt}) == 0) mpz_set_si({target}, 0); else mpz_fdiv_r({target}, {lt}, {rt});")),
                     "**" => self.emit(&format!("if (mpz_sgn({rt}) < 0) mpz_set_si({target}, 0); else mpz_pow_ui({target}, {lt}, mpz_get_ui({rt}));")),
@@ -6920,7 +7122,13 @@ impl Render {
                     self.need_pow = true;
                     format!("_sh_pow({l},{r})")
                 } else if op == "/" || op == "%" {
-                    format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                    // the seq-position div/mod guard — same bounded
+                    // proof elision as the value position above
+                    if crate::shir::arith_divisor_bounded_nonzero(rhs) {
+                        format!("({l} {op} {r})")
+                    } else {
+                        format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                    }
                 } else {
                     format!("({l} {op} {r})")
                 }
