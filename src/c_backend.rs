@@ -2473,6 +2473,21 @@ impl Render {
                 }
             },
             IrExpr::Ext(node) => self.ext_value_c(&**node),
+            IrExpr::Index { var, key, .. } => {
+                // `arr[i]` / `map[key]` — element read. A literal string
+                // key is used directly; a bare var key passes its NAME so
+                // array_index_read resolves the live value (stringifying
+                // it would atoll a constant 0).
+                let k = match key.as_ref() {
+                    IrExpr::Str(s, _) => s.clone(),
+                    IrExpr::Var(name, _) | IrExpr::Ident(name) => name.clone(),
+                    IrExpr::Call { func, args } if func == "getVar" => {
+                        Self::str_arg(args, 0).unwrap_or_default()
+                    }
+                    other => self.value_c(other),
+                };
+                self.array_index_read(var, &k)
+            }
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "0".into()
@@ -9165,6 +9180,23 @@ impl Render {
                 let p = self.value_c(&args[1]);
                 format!("(strstr({s}, {p}) != NULL)")
             }
+            "caseMatch" => {
+                // glob match: `[[ "$s" == pat ]]` — fnmatch (bash glob
+                // semantics). Multiple patterns OR together.
+                self.need_fnmatch = true;
+                let s = self.value_c(&args[0]);
+                let pats: Vec<String> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => {
+                        items.iter().map(|p| self.value_c(p)).collect()
+                    }
+                    _ => vec![self.value_c(&args[1])],
+                };
+                let conds: Vec<String> = pats
+                    .iter()
+                    .map(|p| format!("(fnmatch({p}, {s}, 0) == 0)"))
+                    .collect();
+                format!("({})", conds.join(" || "))
+            }
             "setVar" => {
                 let (Some(name), Some(value)) = (Self::str_arg(args, 0), args.get(1)) else {
                     return "0".into();
@@ -9949,16 +9981,153 @@ impl Render {
         }
     }
 
+    /// `x = [elem for var in iter if cond]` — a Python list
+    /// comprehension (ArrayComp). Iterate the literal items, assign the
+    /// loop var, and append elem when cond holds.
+    fn emit_array_comp(
+        &mut self,
+        arr: &str,
+        cvar: &str,
+        iter: &IrExpr,
+        elem: &IrExpr,
+        cond: Option<&IrExpr>,
+    ) {
+        let id = self.c_ident(arr);
+        let items: Vec<IrExpr> = match iter {
+            IrExpr::Array(items) => items.clone(),
+            _ => {
+                self.mark_todo("ArrayComp iter not Array");
+                return;
+            }
+        };
+        let n = items.len();
+        self.emit(&format!("{id}_len = 0;"));
+        if n == 0 {
+            return;
+        }
+        let var_name = self.c_ident(cvar);
+        // the loop var is declared inside the comprehension (it's in
+        // for_vars, not hoisted). Numeric when the var is typed numeric
+        // OR every item is a plain integer.
+        let all_num = items.iter().all(|it| match it {
+            IrExpr::Int(_) => true,
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+            _ => false,
+        });
+        let is_num = self.is_num(cvar) || all_num;
+        // temporarily type the loop var so `$i` reads resolve to the
+        // local (not getenv) — mirror the For loop's prev_type dance.
+        let prev_type = self.var_types.get(cvar).copied();
+        if is_num {
+            self.var_types.insert(cvar.to_string(), IrType::Int);
+        }
+        let seq = self.site_seq;
+        self.site_seq += 1;
+        let arr_id = format!("_ac_{var_name}_{seq}");
+        let mut vals = Vec::new();
+        for item in &items {
+            match item {
+                IrExpr::Int(i) => vals.push(i.to_string()),
+                IrExpr::Str(s, _) => vals.push(s.clone()),
+                other => vals.push(self.value_c(other)),
+            }
+        }
+        let lit = vals
+            .iter()
+            .map(|v| Self::cstr(v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.emit(&format!("const char *{arr_id}[] = {{{lit}}};"));
+        if is_num {
+            self.emit(&format!("long long {var_name};"));
+        } else {
+            self.emit(&format!("char *{var_name};"));
+        }
+        self.emit(&format!("for (size_t _k{seq} = 0; _k{seq} < {n}; _k{seq}++) {{"));
+        self.depth += 1;
+        if is_num {
+            self.emit(&format!("{var_name} = (long long)atoll({arr_id}[_k{seq}]);"));
+        } else {
+            self.emit(&format!("{var_name} = strdup({arr_id}[_k{seq}]);"));
+        }
+        if let Some(c) = cond {
+            let cc = self.expr(c);
+            self.emit(&format!("if ({cc}) {{"));
+            self.depth += 1;
+        }
+        let ev = self.value_c(elem);
+        self.emit(&format!("{id}[{id}_len++] = strdup((char*)({ev}));"));
+        if cond.is_some() {
+            self.depth -= 1;
+            self.emit("}");
+        }
+        self.depth -= 1;
+        self.emit("}");
+        match prev_type {
+            Some(t) => {
+                self.var_types.insert(cvar.to_string(), t);
+            }
+            None => {
+                self.var_types.remove(cvar);
+            }
+        }
+    }
+
     fn emit_set_array(&mut self, var: &str, args: &[IrExpr]) {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
-        let is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)));
+        // ArrayComp: `x = [elem for var in iter if cond]` — a Python
+        // list comprehension. Render a loop that appends elem for each
+        // iter item passing cond.
+        if let Some(IrExpr::ArrayComp { var: cvar, iter, elem, cond }) = args.get(1) {
+            self.emit_array_comp(var, cvar, iter, elem, cond.as_deref());
+            return;
+        }
+        let mut is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)));
         let items: Vec<IrExpr> = match args.get(1) {
             Some(IrExpr::Array(items)) => items.clone(),
             _ => vec![],
         };
+        // Python dict → setArray("d", ["[a]=1", "[b]=2"]) — the `[k]=v`
+        // literal elements mark an assoc array even without the Bool flag.
+        if !is_assoc {
+            is_assoc = items.iter().any(|it| match it {
+                IrExpr::Str(s, _) => {
+                    let t = s.trim_start();
+                    t.starts_with('[') && t.contains("]=")
+                }
+                _ => false,
+            });
+        }
         if is_assoc {
             self.assoc_arrays.insert(var.to_string());
+            // `[k]=v` literal elements (Python dict): parse each into a
+            // key/value pair.
+            let kv_literals = items.iter().all(|it| match it {
+                IrExpr::Str(s, _) => {
+                    let t = s.trim_start();
+                    t.starts_with('[') && t.contains("]=")
+                }
+                _ => false,
+            });
+            if kv_literals && !items.is_empty() {
+                for it in &items {
+                    if let IrExpr::Str(s, _) = it {
+                        let t = s.trim();
+                        let inner = t.trim_start_matches('[');
+                        if let Some(eq) = inner.find("]=") {
+                            let k = inner[..eq].trim().trim_matches('"').trim_matches('\'');
+                            let v = inner[eq + 2..].trim();
+                            self.emit(&format!(
+                                "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {});",
+                                Self::cstr(k),
+                                Self::cstr(v)
+                            ));
+                        }
+                    }
+                }
+                return;
+            }
             // flat pairs: k1, v1, k2, v2 ...
             let mut i = 0;
             while i + 1 < items.len() {
@@ -14443,6 +14612,13 @@ fn rc_is_read(s: &str) -> bool {
             if b.get(j) != Some(&b'=') || b.get(j + 1) == Some(&b'=') {
                 return true;
             }
+            // `!(_sh_rc = X ? 1 : 0)` — the Not BinOp's negation
+            // expression. The `_sh_rc =` is an assignment EXPRESSION that
+            // must stay (strip_rc_line keeps it), so the declaration
+            // must too — treat it as a live reference.
+            if i >= 2 && b[i - 1] == b'(' && b[i - 2] == b'!' {
+                return true;
+            }
             i = j;
         } else {
             i += 1;
@@ -14507,6 +14683,12 @@ fn strip_rc_line(line: &str) -> Option<String> {
         // inline `…; _sh_rc = …;` / `{ _sh_rc = …;` status store
         if (line[i..].starts_with("_sh_rc ") || line[i..].starts_with("_sh_rc="))
             && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            // `!(_sh_rc = X ? 1 : 0)` — the Not BinOp's negation
+            // expression. The `_sh_rc =` here is an ASSIGNMENT EXPRESSION
+            // whose value is the flipped status; stripping it (dead-rc)
+            // would leave a broken `!()`. Keep it — the write is a
+            // harmless dead store and `_sh_rc` stays declared.
+            && !(i >= 2 && b[i - 1] == b'(' && b[i - 2] == b'!')
         {
             let mut j = i + 6;
             while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
@@ -15905,6 +16087,9 @@ fn collect_vars_full(
                     out.insert(t.var.clone());
                 }
                 collect_vars_expr(expr, out);
+                // ArrayComp loop vars are declared inside the
+                // comprehension loop (like for-loop vars), not at top.
+                collect_array_comp_vars(expr, for_vars);
             }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -15951,6 +16136,32 @@ fn collect_vars_full(
             }
             _ => {}
         }
+    }
+}
+
+/// Collect ArrayComp loop vars (declared inside the comprehension loop,
+/// mirroring for-loop vars).
+fn collect_array_comp_vars(e: &IrExpr, for_vars: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::ArrayComp { var, iter, elem, cond, .. } => {
+            for_vars.insert(var.clone());
+            collect_array_comp_vars(iter, for_vars);
+            collect_array_comp_vars(elem, for_vars);
+            if let Some(c) = cond {
+                collect_array_comp_vars(c, for_vars);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_array_comp_vars(a, for_vars);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_array_comp_vars(i, for_vars);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -18176,6 +18387,211 @@ mod tests {
             "bigint array mis-typed to int64 join:\n{out}"
         );
         assert!(!out.contains("long long a["), "bigint array truncated:\n{out}");
+    }
+
+    #[test]
+    fn case_match_renders_fnmatch_not_sh2_stub() {
+        // `s.startswith("h")` lowers to caseMatch(s, ["h*"]); it must
+        // render natively via fnmatch, not a sh2.* TODO stub.
+        use crate::ir::StrStyle;
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::If {
+                cond: IrExpr::Call {
+                    func: "caseMatch".to_string(),
+                    args: vec![
+                        IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![IrExpr::Str("s".to_string(), StrStyle::DoubleQuoted)],
+                        },
+                        IrExpr::Array(vec![IrExpr::Str("h*".to_string(), StrStyle::DoubleQuoted)]),
+                    ],
+                },
+                then: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str("star".to_string(), StrStyle::DoubleQuoted)]),
+                    ],
+                })],
+                elsifs: vec![],
+                else_: vec![],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("fnmatch("), "caseMatch not native:\n{out}");
+        assert!(
+            !out.contains("sh2_caseMatch"),
+            "caseMatch fell to sh2 stub:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_comp_renders_loop() {
+        // `x = [i for i in [1,2,3,4] if i > 2]` — the ArrayComp must
+        // render a loop that appends, not an empty array.
+        use crate::ir::StrStyle;
+        let comp = IrExpr::ArrayComp {
+            var: "i".to_string(),
+            iter: Box::new(IrExpr::Array(vec![
+                IrExpr::Str("1".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Str("2".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Str("3".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Str("4".to_string(), StrStyle::DoubleQuoted),
+            ])),
+            elem: Box::new(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str("i".to_string(), StrStyle::DoubleQuoted)],
+            }),
+            cond: Some(Box::new(IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![IrExpr::Str("\"$i\" -gt 2".to_string(), StrStyle::DoubleQuoted)],
+            })),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: "setArray".to_string(),
+                    args: vec![
+                        IrExpr::Str("x".to_string(), StrStyle::DoubleQuoted),
+                        comp,
+                    ],
+                },
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("x[x_len++]"), "ArrayComp no append:\n{out}");
+        assert!(out.contains("for (size_t"), "ArrayComp no loop:\n{out}");
+        assert!(
+            !out.contains("TODO(unsupported)"),
+            "ArrayComp fell to TODO:\n{out}"
+        );
+    }
+
+    #[test]
+    fn index_read_renders_arr_get() {
+        // `a[i]` (IrExpr::Index) must render via _sh_arr_get, not a TODO.
+        use crate::ir::StrStyle;
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Index {
+                        var: "a".to_string(),
+                        key: Box::new(IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![IrExpr::Str("i".to_string(), StrStyle::DoubleQuoted)],
+                        }),
+                    }]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("_sh_arr_get"),
+            "Index read not via _sh_arr_get:\n{out}"
+        );
+        assert!(
+            !out.contains("TODO(unsupported)"),
+            "Index read fell to TODO:\n{out}"
+        );
+    }
+
+    #[test]
+    fn not_binop_condition_keeps_sh_rc() {
+        // `while not (i >= 3)` — the Not BinOp renders `!(_sh_rc = X ?
+        // 1 : 0)`. strip_dead_rc must NOT strip the `_sh_rc =` from
+        // inside the `!()` (that would leave a broken `!()`), and must
+        // keep the `_sh_rc` declaration.
+        use crate::ir::{ArithAst, BinOpKind, StrStyle};
+        let cond = IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: ">=".to_string(),
+                lhs: Box::new(ArithAst::Var("i".to_string())),
+                rhs: Box::new(ArithAst::Num(3)),
+            }))),
+            op: BinOpKind::Not,
+            rhs: Box::new(IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: ">=".to_string(),
+                lhs: Box::new(ArithAst::Var("i".to_string())),
+                rhs: Box::new(ArithAst::Num(3)),
+            }))),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::While {
+                cond,
+                body: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str("u".to_string(), StrStyle::DoubleQuoted)]),
+                    ],
+                })],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("!(_sh_rc ="),
+            "Not BinOp lost its _sh_rc write:\n{out}"
+        );
+        assert!(
+            !out.contains("(!())"),
+            "Not BinOp stripped to broken !():\n{out}"
+        );
+        assert!(
+            out.contains("static int _sh_rc = 0;"),
+            "_sh_rc declaration stripped:\n{out}"
+        );
     }
 
     #[test]
