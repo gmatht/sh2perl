@@ -958,6 +958,11 @@ impl Render {
             // GMP bigint path (proven-big regime): <gmp.h> must precede
             // every use; linked with -lgmp (libgmp-dev on the gate).
             self.emit("#include <gmp.h>");
+            // One-time init of a function-local static mpz temp. The
+            // `static int name##_i` guard runs mpz_init exactly once
+            // (mpz_init is a call, so it can't live at file scope); the
+            // flag is only ever 0->1 and never read.
+            self.emit("#define _SH_MPZ_INIT(name) static mpz_t name; static int name##_i = 0; if (!name##_i) { mpz_init(name); name##_i = 1; }");
         }
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
@@ -3580,9 +3585,9 @@ impl Render {
     /// name for use as an operand, print source or assign RHS fragment.
     fn bigint_eval_temp(&mut self, a: &ArithAst) -> String {
         self.need_gmp = true;
-        let t = format!("_bt{}", self.temp_seq);
+        let t = format!("_bigint_64_{}", self.temp_seq);
         self.temp_seq += 1;
-        self.emit(&format!("static mpz_t {t}; static int {t}_i = 0; if (!{t}_i) {{ mpz_init({t}); {t}_i = 1; }}"));
+        self.emit(&format!("_SH_MPZ_INIT({t});"));
         self.bigint_into(a, &t);
         t
     }
@@ -18015,7 +18020,7 @@ mod tests {
         };
         let out = shir_to_c(&prog);
         assert!(
-            out.contains("mpz_set_str(_bt0, \"123456789012345678901234567890\", 10);"),
+            out.contains("mpz_set_str(_bigint_64_0, \"123456789012345678901234567890\", 10);"),
             "chain not folded to one set_str:\n{out}"
         );
         // the chain's per-digit mpz_mul/mpz_add steps must be gone
