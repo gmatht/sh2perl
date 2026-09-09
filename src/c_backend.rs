@@ -924,6 +924,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.lifted_fns = scan_fn_lifts(&prog.stmts);
+    r.native_num_fns = analyze_native_num_fns(&prog);
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
@@ -3181,13 +3182,20 @@ impl Render {
         match self.lifted_fns.get(name) {
             None => format!("static void {fname}(void)"),
             Some(&0) => format!("static char *{fname}(void)"),
-            Some(&n) => format!(
-                "static char *{fname}({})",
-                (1..=n)
-                    .map(|i| format!("char *_p{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Some(&n) => {
+                let native = self.native_num_fns.contains(name);
+                format!(
+                    "static char *{fname}({})",
+                    (1..=n)
+                        .map(|i| if native {
+                            format!("long long _p{i}")
+                        } else {
+                            format!("char *_p{i}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         }
     }
 
@@ -3254,6 +3262,8 @@ impl Render {
         // consumed it as the $(fn) capture's text)
         let lifted_arity = self.lifted_fns.get(name).copied();
         let saved_params = std::mem::take(&mut self.cur_params);
+        let saved_native = self.cur_native_num;
+        self.cur_native_num = lifted_arity.is_some() && self.native_num_fns.contains(name);
         if let Some(arity) = lifted_arity {
             self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
         }
@@ -3300,6 +3310,7 @@ impl Render {
             }
         }
         self.cur_params = saved_params;
+        self.cur_native_num = saved_native;
         let fn_file_vars: BTreeSet<String> = self
             .site_file_vars
             .difference(&fn_vars_before)
@@ -3454,6 +3465,10 @@ impl Render {
     /// Numeric `$N` read: the lifted fn's param, else the caller's argv.
     fn positional_read_l(&self, n: &str) -> String {
         if let Some(p) = self.lifted_param(n) {
+            if self.cur_native_num {
+                // native numeric param: `_pN` is already the value
+                return format!("({p})");
+            }
             return format!("(atoll((({p}) ? ({p}) : \"\")))");
         }
         if self.pos_const && !self.in_function {
@@ -4181,6 +4196,39 @@ impl Render {
                 _ => self.expr(e),
             },
             _ => self.expr(e),
+        }
+    }
+
+    /// A `long long` C value for a word passed to a NATIVE-NUMERIC
+    /// function param (preserves 64-bit — unlike value_num's `(int)`
+    /// casts). Numeric vars/arith stay numeric; strings atoll.
+    fn value_ll(&mut self, e: &IrExpr) -> String {
+        match e {
+            IrExpr::Int(i) => i.to_string(),
+            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                if self.is_num(name) {
+                    self.c_ident(name)
+                } else {
+                    format!("(long long)atoll({})", self.store_ref(name))
+                }
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(name) = Self::str_arg(args, 0) {
+                    if self.is_num(&name) {
+                        self.c_ident(&name)
+                    } else {
+                        format!("(long long)atoll({})", self.store_ref(&name))
+                    }
+                } else {
+                    "0".into()
+                }
+            }
+            IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                Ok(n) => n.to_string(),
+                Err(_) => format!("(long long)atoll({})", Self::cstr(s)),
+            },
+            _ => format!("(long long)atoll((char*)({}))", self.value_c(e)),
         }
     }
 
@@ -6692,11 +6740,18 @@ impl Render {
                 }
                 if let Some(&arity) = self.lifted_fns.get(&cmd) {
                     // LIFTED fn: plain C call with the args as params
+                    let native = self.native_num_fns.contains(&cmd);
                     let mut a: Vec<String> = Vec::new();
                     for i in 0..arity {
                         let v = match words.get(i) {
-                            Some(w) => self.value_c(w),
-                            None => "\"\"".into(),
+                            Some(w) => {
+                                if native {
+                                    self.value_ll(w)
+                                } else {
+                                    self.value_c(w)
+                                }
+                            }
+                            None => "0".into(),
                         };
                         a.push(v);
                     }
@@ -7241,6 +7296,27 @@ impl Render {
                                     Some(IrExpr::Array(items)) => items.clone(),
                                     _ => vec![],
                                 };
+                                // native-numeric lifted fn: its return IS
+                                // the value (no stdout to capture) — call
+                                // it directly and return the result.
+                                if let Some(&arity) = r.lifted_fns.get(&fname) {
+                                    if r.native_num_fns.contains(&fname) {
+                                        let mut a: Vec<String> = Vec::new();
+                                        for i in 0..arity {
+                                            let v = match call_args.get(i) {
+                                                Some(w) => r.value_ll(w),
+                                                None => "0".into(),
+                                            };
+                                            a.push(v);
+                                        }
+                                        let v = format!("{}({})", r.c_ident(&fname), a.join(", "));
+                                        r.emit(&format!(
+                                            "_sh_vgrow(&buf, strlen({v}) + 1); strcpy(buf.p, {v});"
+                                        ));
+                                        r.emit("return buf.p;");
+                                        return;
+                                    }
+                                }
                                 r.need_sh = true;
                                 let n = call_args.len() + 1;
                                 let av = format!("_sh_av{}", r.temp_seq);
@@ -9946,11 +10022,24 @@ impl Render {
                     // params and returns its value — a plain call. No
                     // argv swap (the body reads _pN), no stdout capture,
                     // no helper. Missing args pad "" (unset positionals).
+                    let native = self.native_num_fns.contains(&fname);
                     let mut a: Vec<String> = Vec::new();
                     for i in 0..arity {
                         let v = match call_args.get(i) {
-                            Some(w) => self.value_c(w),
-                            None => "\"\"".into(),
+                            Some(w) => {
+                                if native {
+                                    self.value_ll(w)
+                                } else {
+                                    self.value_c(w)
+                                }
+                            }
+                            None => {
+                                if native {
+                                    "0".into()
+                                } else {
+                                    "\"\"".into()
+                                }
+                            }
                         };
                         a.push(v);
                     }
@@ -14406,6 +14495,355 @@ fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
     }
     out
 }
+
+/// Lifted functions whose params are all provably-numeric (Int-typed,
+/// not bigint) AND every call site passes a provably-small (non-bigint)
+/// arg — eligible for a native `long long _pN` signature.
+fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
+    let lifted = scan_fn_lifts(&prog.stmts);
+    let bigint = analyze_bigint_vars(prog);
+    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    let mut out = BTreeSet::new();
+    for (name, _arity) in &lifted {
+        let Some(body) = defmap.get(name) else { continue };
+        // find the param vars materialized from positionals (`n = $1`)
+        let mut param_vars = BTreeSet::new();
+        for st in body {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                if let Some(t) = targets.first() {
+                    if let IrExpr::Arith(a) = expr {
+                        if arith_refs_positional(a) {
+                            param_vars.insert(t.var.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let all_num = !param_vars.is_empty()
+            && param_vars.iter().all(|v| {
+                matches!(
+                    vt.get(v),
+                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+                )
+            });
+        if std::env::var("SH2_DBG_W").is_ok() { eprintln!("DBG {name}: all_num={all_num} bigint_arith={} calls_small={}", body_has_bigint_arith(body, &bigint), fn_call_sites_small(name, &prog.stmts, &bigint)); }
+        if !all_num {
+            continue;
+        }
+        if body_has_bigint_arith(body, &bigint) {
+            continue;
+        }
+        if !fn_call_sites_small(name, &prog.stmts, &bigint) {
+            continue;
+        }
+        out.insert(name.clone());
+    }
+    out
+}
+
+/// True if the function body uses bigint arith anywhere EXCEPT the param
+/// materialization Assigns (`a = $N`). Bigint is detected via Cast(Int64)
+/// leaves only (an empty var set) — the frontend over-annotates every
+/// param as Cast(Int64), so the over-marked `bigint` var set would
+/// wrongly exclude a function whose params are actually small.
+fn body_has_bigint_arith(body: &[IrStmt], _bigint: &BTreeSet<String>) -> bool {
+    let empty = BTreeSet::new();
+    let mut found = false;
+    walk_body_bigint(body, &empty, &mut found);
+    found
+}
+
+fn walk_body_bigint(stmts: &[IrStmt], bigint: &BTreeSet<String>, found: &mut bool) {
+    if *found {
+        return;
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Assign { expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    // skip the param materialization `a = $N` entirely
+                    if arith_refs_positional(a) {
+                        continue;
+                    }
+                }
+                walk_expr_bigint(expr, bigint, found);
+            }
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr_bigint(e, bigint, found),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr_bigint(cond, bigint, found);
+                walk_body_bigint(then, bigint, found);
+                for (c, b) in elsifs {
+                    walk_expr_bigint(c, bigint, found);
+                    walk_body_bigint(b, bigint, found);
+                }
+                walk_body_bigint(else_, bigint, found);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr_bigint(cond, bigint, found);
+                walk_body_bigint(body, bigint, found);
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr_bigint(iter, bigint, found);
+                walk_body_bigint(body, bigint, found);
+            }
+            IrStmt::Function { body, .. } => walk_body_bigint(body, bigint, found),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                walk_body_bigint(b, bigint, found)
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                walk_body_bigint(init, bigint, found);
+                walk_expr_bigint(cond, bigint, found);
+                walk_body_bigint(step, bigint, found);
+                walk_body_bigint(body, bigint, found);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                walk_expr_bigint(discriminant, bigint, found);
+                for c in clauses {
+                    walk_body_bigint(&c.body, bigint, found);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                walk_body_bigint(inner, bigint, found);
+                for r in redirects {
+                    walk_expr_bigint(&r.target, bigint, found);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages.iter().flatten() {
+                    walk_body_bigint(std::slice::from_ref(st), bigint, found);
+                }
+            }
+            IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. } => walk_expr_bigint(e, bigint, found),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_expr_bigint(e, bigint, found);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    walk_expr_bigint(e, bigint, found);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr_bigint(path, bigint, found);
+                walk_expr_bigint(content, bigint, found);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                walk_body_bigint(body, bigint, found);
+                for e in excepts {
+                    walk_body_bigint(&e.body, bigint, found);
+                }
+                walk_body_bigint(else_body, bigint, found);
+                walk_body_bigint(finally_body, bigint, found);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_expr_bigint(e: &IrExpr, bigint: &BTreeSet<String>, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match e {
+        IrExpr::Arith(a) => {
+            if arith_is_bigint(a, bigint) {
+                *found = true;
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                walk_expr_bigint(a, bigint, found);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                walk_expr_bigint(i, bigint, found);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_expr_bigint(lhs, bigint, found);
+            walk_expr_bigint(rhs, bigint, found);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_expr_bigint(x, bigint, found);
+                }
+            }
+        }
+        IrExpr::Index { key, .. } => walk_expr_bigint(key, bigint, found),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            walk_expr_bigint(iter, bigint, found);
+            walk_expr_bigint(elem, bigint, found);
+            if let Some(c) = cond {
+                walk_expr_bigint(c, bigint, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True if every call to `name` passes only non-bigint args.
+fn fn_call_sites_small(name: &str, stmts: &[IrStmt], bigint: &BTreeSet<String>) -> bool {
+    let mut ok = true;
+    walk_call_sites(stmts, name, bigint, &mut ok);
+    ok
+}
+
+fn walk_call_sites(stmts: &[IrStmt], name: &str, bigint: &BTreeSet<String>, ok: &mut bool) {
+    if !*ok {
+        return;
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_call_sites_expr(e, name, bigint, ok),
+            IrStmt::Assign { expr, .. } => walk_call_sites_expr(expr, name, bigint, ok),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_call_sites_expr(cond, name, bigint, ok);
+                walk_call_sites(then, name, bigint, ok);
+                for (c, b) in elsifs {
+                    walk_call_sites_expr(c, name, bigint, ok);
+                    walk_call_sites(b, name, bigint, ok);
+                }
+                walk_call_sites(else_, name, bigint, ok);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_call_sites_expr(cond, name, bigint, ok);
+                walk_call_sites(body, name, bigint, ok);
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_call_sites_expr(iter, name, bigint, ok);
+                walk_call_sites(body, name, bigint, ok);
+            }
+            IrStmt::Function { body, .. } => walk_call_sites(body, name, bigint, ok),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                walk_call_sites(b, name, bigint, ok)
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                walk_call_sites(init, name, bigint, ok);
+                walk_call_sites_expr(cond, name, bigint, ok);
+                walk_call_sites(step, name, bigint, ok);
+                walk_call_sites(body, name, bigint, ok);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                walk_call_sites_expr(discriminant, name, bigint, ok);
+                for c in clauses {
+                    walk_call_sites(&c.body, name, bigint, ok);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                walk_call_sites(inner, name, bigint, ok);
+                for r in redirects {
+                    walk_call_sites_expr(&r.target, name, bigint, ok);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages.iter().flatten() {
+                    walk_call_sites(std::slice::from_ref(st), name, bigint, ok);
+                }
+            }
+            IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. } => walk_call_sites_expr(e, name, bigint, ok),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_call_sites_expr(e, name, bigint, ok);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    walk_call_sites_expr(e, name, bigint, ok);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_call_sites_expr(path, name, bigint, ok);
+                walk_call_sites_expr(content, name, bigint, ok);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                walk_call_sites(body, name, bigint, ok);
+                for e in excepts {
+                    walk_call_sites(&e.body, name, bigint, ok);
+                }
+                walk_call_sites(else_body, name, bigint, ok);
+                walk_call_sites(finally_body, name, bigint, ok);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_call_sites_expr(e: &IrExpr, name: &str, bigint: &BTreeSet<String>, ok: &mut bool) {
+    if !*ok {
+        return;
+    }
+    match e {
+        IrExpr::Call { func, args } if func == name => {
+            for a in args {
+                if expr_is_bigint(a, bigint) {
+                    *ok = false;
+                    return;
+                }
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                walk_call_sites_expr(a, name, bigint, ok);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                walk_call_sites_expr(i, name, bigint, ok);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_call_sites_expr(lhs, name, bigint, ok);
+            walk_call_sites_expr(rhs, name, bigint, ok);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_call_sites_expr(x, name, bigint, ok);
+                }
+            }
+        }
+        IrExpr::Index { key, .. } => walk_call_sites_expr(key, name, bigint, ok),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            walk_call_sites_expr(iter, name, bigint, ok);
+            walk_call_sites_expr(elem, name, bigint, ok);
+            if let Some(c) = cond {
+                walk_call_sites_expr(c, name, bigint, ok);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True if an expression can hold a bigint value (a bigint arith or a
+/// bigint-typed var read).
+fn expr_is_bigint(e: &IrExpr, bigint: &BTreeSet<String>) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_is_bigint(a, bigint),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => bigint.contains(name),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                bigint.contains(name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 
 /// fn names whose body CALLS a defined fn as a bare statement (the
 /// stdout of a bare call prints to the program's stdout — such a callee
@@ -19071,6 +19509,84 @@ mod tests {
         assert!(
             out.contains("static int _sh_rc = 0;"),
             "_sh_rc declaration stripped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn native_num_fn_detected() {
+        // A lifted function whose params are all Int-typed (not bigint)
+        // and whose call sites pass small values is eligible for a native
+        // `long long _pN` signature.
+        use crate::ir::{ArithAst, IrType, StrStyle};
+        let cast = |arg: ArithAst| ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(arg),
+        };
+        let assign = |var: &str, pos: &str| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var(pos.to_string())))),
+            asm: None,
+        };
+        let sum = IrExpr::Arith(Box::new(ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(ArithAst::Var("a".to_string())),
+            rhs: Box::new(ArithAst::Var("b".to_string())),
+        }));
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "add".to_string(),
+                    named_blocks: vec![],
+                    body: vec![
+                        assign("a", "1"),
+                        assign("b", "2"),
+                        IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![sum]),
+                            ],
+                        }),
+                    ],
+                },
+                // a value-position call (echo <add(3,4)>) uses the
+                // plain-call path with numeric args
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "add".to_string(),
+                            args: vec![IrExpr::Int(3), IrExpr::Int(4)],
+                        }]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![
+                ("a".to_string(), IrType::Int),
+                ("b".to_string(), IrType::Int),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let native = analyze_native_num_fns(&prog);
+        assert!(native.contains("add"), "add not native-numeric: {native:?}");
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static char *add(long long _p1, long long _p2)"),
+            "native signature missing:\n{out}"
         );
     }
 
