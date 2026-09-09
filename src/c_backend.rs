@@ -643,6 +643,15 @@ fn walk_int_array_expr(
                 }
                 for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
+            "max" | "min" | "sum" => {
+                // a typed reduction over the array — an int consumer
+                // (keeps the array on the long long[] fast path)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
             "sortedBigintJoin" => {
                 // arbitrary-precision elements CANNOT live in long long[] —
                 // force char* (exact decimal text, mpz order).
@@ -702,6 +711,9 @@ fn walk_int_array_expr(
 fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>) -> bool {
     match e {
         IrExpr::Int(_) => true,
+        // a string literal that parses as a 64-bit integer (the
+        // frontend emits list literals as Str)
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
         IrExpr::Arith(a) => !arith_is_bigint(a, big),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
             vt.get(name),
@@ -3743,6 +3755,61 @@ impl Render {
         t
     }
 
+    /// `max`/`min`/`sum` over an array: emit a native reduction and
+    /// return the value expression. Int arrays scan i64; bigint arrays
+    /// (char *[] of decimal text) parse each element into an mpz temp
+    /// and reduce exactly.
+    fn reduce_array(&mut self, func: &str, name: &str) -> String {
+        if !self.arrays.contains(name) || self.assoc_arrays.contains(name) {
+            self.mark_todo(&format!("{func} of non-array {name}"));
+            return "0".into();
+        }
+        let id = self.c_ident(name);
+        let acc = format!("_r{}", self.temp_seq);
+        self.temp_seq += 1;
+        let li = format!("_i{}", self.temp_seq);
+        self.temp_seq += 1;
+        if self.int_arrays.contains(name) {
+            let w = self.int_array_widths.get(name).copied().unwrap_or(Width::I64);
+            let ct = w.c_type();
+            self.emit(&format!("{ct} {acc} = ({id}_len > 0) ? {id}[0] : 0;"));
+            match func {
+                "max" => self.emit(&format!(
+                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) if ({id}[{li}] > {acc}) {acc} = {id}[{li}];"
+                )),
+                "min" => self.emit(&format!(
+                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) if ({id}[{li}] < {acc}) {acc} = {id}[{li}];"
+                )),
+                "sum" => self.emit(&format!(
+                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) {acc} += {id}[{li}];"
+                )),
+                _ => {}
+            }
+            return self.num_temp(&acc);
+        }
+        // bigint array (char *[] of decimal text): parse + reduce
+        self.need_gmp = true;
+        self.emit(&format!("_SH_MPZ_INIT({acc});"));
+        self.emit(&format!(
+            "if ({id}_len > 0) {{ if (mpz_set_str({acc}, {id}[0] ? {id}[0] : \"0\", 10) != 0) mpz_set_si({acc}, 0); }} else mpz_set_si({acc}, 0);"
+        ));
+        match func {
+            "max" => self.emit(&format!(
+                "for (size_t {li} = 1; {li} < {id}_len; {li}++) {{ mpz_t _t{li}; mpz_init(_t{li}); if (mpz_set_str(_t{li}, {id}[{li}] ? {id}[{li}] : \"0\", 10) != 0) mpz_set_si(_t{li}, 0); if (mpz_cmp(_t{li}, {acc}) > 0) mpz_set({acc}, _t{li}); mpz_clear(_t{li}); }}"
+            )),
+            "min" => self.emit(&format!(
+                "for (size_t {li} = 1; {li} < {id}_len; {li}++) {{ mpz_t _t{li}; mpz_init(_t{li}); if (mpz_set_str(_t{li}, {id}[{li}] ? {id}[{li}] : \"0\", 10) != 0) mpz_set_si(_t{li}, 0); if (mpz_cmp(_t{li}, {acc}) < 0) mpz_set({acc}, _t{li}); mpz_clear(_t{li}); }}"
+            )),
+            "sum" => self.emit(&format!(
+                "for (size_t {li} = 1; {li} < {id}_len; {li}++) {{ mpz_t _t{li}; mpz_init(_t{li}); if (mpz_set_str(_t{li}, {id}[{li}] ? {id}[{li}] : \"0\", 10) != 0) mpz_set_si(_t{li}, 0); mpz_add({acc}, {acc}, _t{li}); mpz_clear(_t{li}); }}"
+            )),
+            _ => {}
+        }
+        let vb = self.vbuf_temp();
+        self.emit(&format!("_sh_mpz_str(&{vb}, {acc});"));
+        format!("{vb}.p")
+    }
+
     /// Render a transform-declared primitive Ext node (StrLen/WordCount/
     /// RegCount/ArrayLen(Split)) to a C value expression. Anything else is
     /// a loud TODO (the C backend implements the primitives, not every
@@ -4350,6 +4417,13 @@ impl Render {
                         self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
                     }
                     format!("{vb}.p")
+                }
+                "max" | "min" | "sum" => {
+                    // typed reduction over an array (py-sh-go node)
+                    let Some(name) = Self::str_arg(args, 0) else {
+                        return "0".into();
+                    };
+                    self.reduce_array(func, &name)
                 }
                 "arith" => {
                     if std::env::var("SH2_DBG_VARS").is_ok() {
@@ -10357,6 +10431,11 @@ impl Render {
                     Self::cstr(strip_glob(&pat)),
                     Self::cstr(&flags)
                 )
+            }
+            "max" | "min" | "sum" => {
+                // typed reduction over an array (py-sh-go node)
+                let name = Self::str_arg(args, 0).unwrap_or_default();
+                self.reduce_array(func, &name)
             }
             _ => self.sh2_stub(func, args, func),
         }
@@ -19630,7 +19709,9 @@ mod tests {
             let helper = if want_mpz {
                 "_sh_sorted_bigint_join"
             } else {
-                "_sh_sorted_int_join"
+                // int arrays lower to the width-specific helper
+                // (_sh_sorted_int_i64_join) or the generic one
+                "_sh_sorted_int"
             };
             assert!(out.contains(helper), "{func}: helper missing:\n{out}");
             assert!(!out.contains("_sh_pipeline("), "{func}: fork kept:\n{out}");
