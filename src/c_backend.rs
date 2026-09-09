@@ -255,6 +255,10 @@ pub struct Render {
     /// var name -> lifetime (first/last access, escapes) for the
     /// end-of-scope free pass.
     var_lifetimes: std::collections::HashMap<String, crate::ir::VarLifetime>,
+    /// heap-return temps (`_cnN`) created by native function calls that
+    /// the caller must free after the enclosing statement (unless moved
+    /// into a store var). Flushed at statement boundaries.
+    pending_frees: Vec<String>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -1160,11 +1164,33 @@ impl Render {
     /// (strdup'd temps). Must be called BEFORE the function's return
     /// statement — after it, the frees would be unreachable dead code.
     fn emit_fn_frees(&mut self, fvars: &BTreeSet<String>) {
+        self.emit_fn_frees_excluding(fvars, &[]);
+    }
+
+    /// Like `emit_fn_frees`, but skips the named vars (a var being
+    /// MOVED into the return value must not be freed — the caller owns
+    /// it now).
+    fn emit_fn_frees_excluding(&mut self, fvars: &BTreeSet<String>, exclude: &[&str]) {
         let lifetimes = self.var_lifetimes.clone();
         for (name, lt) in &lifetimes {
-            if !lt.escapes && fvars.contains(name) && self.is_heap_store_var(name) {
+            if !lt.escapes
+                && fvars.contains(name)
+                && self.is_heap_store_var(name)
+                && !exclude.contains(&name.as_str())
+            {
                 self.emit(&format!("free({});", self.c_ident(name)));
             }
+        }
+    }
+
+    /// Free the heap-return temps (`_cnN`) created by native function
+    /// calls in the current logical statement that were not moved into a
+    /// store var. Called at logical-statement boundaries (after each
+    /// top-level statement, and before a function's return).
+    fn flush_pending_frees(&mut self) {
+        let frees = std::mem::take(&mut self.pending_frees);
+        for cn in frees {
+            self.emit(&format!("free({cn});"));
         }
     }
 
@@ -3358,11 +3384,6 @@ impl Render {
             self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
         }
         let lifted = lifted_arity.is_some();
-        if lifted {
-            self.emit(&format!(
-                "static _sh_vbuf _fnret_{fname} = {{0, 0}};"
-            ));
-        }
         let n_body = body.len();
         for (bi, st) in body.iter().enumerate() {
             if lifted && bi == n_body - 1 {
@@ -3392,33 +3413,49 @@ impl Render {
                 if let IrStmt::Expr(IrExpr::Call { args, .. }) = body.last().unwrap() {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(val) = items.first() {
-                        let v = self.value_c(val);
-                        let rv = format!("_rv{}", self.temp_seq);
-                        let ret = format!("_ret{}", self.temp_seq);
-                        self.temp_seq += 1;
-                        // Compute the return value into a temp FIRST (so
-                        // the frees below can't dangle it — the trailing
-                        // echo's value may BE a heap store var, e.g.
-                        // `return msg` lowers to `echo msg`), then free
-                        // the function's non-escaping heap store vars,
-                        // then return the temp. The temp points into the
-                        // static _fnret_ buffer, which is never freed.
-                        if v.contains("_sh_pipeline(") || v.contains("_cap_")
-                            || v.contains("_sh_call_fn(")
-                            || v.contains("_sh_sorted_join(")
-                        {
-                            // impure value exprs must run exactly once
-                            self.emit(&format!("char *{rv} = {v};"));
-                            self.emit(&format!(
-                                "char *{ret} = _sh_ret_val(&_fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
-                            ));
+                        // MOVE: if the return value is a heap store var,
+                        // return it directly (ownership transfers to the
+                        // caller) — no copy into the static _fnret_
+                        // buffer, no strdup. The moved var is excluded
+                        // from the frees (the caller owns it now).
+                        let moved_name: Option<String> = match val {
+                            IrExpr::Var(name, _) if self.is_heap_store_var(name) => {
+                                Some(name.clone())
+                            }
+                            // `return msg` lowers to `echo msg` -> the
+                            // echo arg is `getVar("msg")` — a heap
+                            // store var read is a move.
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                Self::str_arg(args, 0).filter(|n| self.is_heap_store_var(n))
+                            }
+                            _ => None,
+                        };
+                        if let Some(moved_name) = moved_name {
+                            self.emit_fn_frees_excluding(&fvars, &[&moved_name]);
+                            self.flush_pending_frees();
+                            self.emit(&format!("return {};", self.c_ident(&moved_name)));
                         } else {
-                            self.emit(&format!(
-                                "char *{ret} = _sh_ret_val(&_fnret_{fname}, (({v}) ? ({v}) : \"\"));"
-                            ));
+                            // otherwise the return value is a
+                            // temp/literal: strdup it into a fresh heap
+                            // allocation the caller owns.
+                            let v = self.value_c(val);
+                            let rv = format!("_rv{}", self.temp_seq);
+                            let ret = format!("_ret{}", self.temp_seq);
+                            self.temp_seq += 1;
+                            if v.contains("_sh_pipeline(") || v.contains("_cap_")
+                                || v.contains("_sh_call_fn(")
+                                || v.contains("_sh_sorted_join(")
+                            {
+                                // impure value exprs must run exactly once
+                                self.emit(&format!("char *{rv} = {v};"));
+                                self.emit(&format!("char *{ret} = strdup((char*)({rv}));"));
+                            } else {
+                                self.emit(&format!("char *{ret} = strdup((char*)({v}));"));
+                            }
+                            self.emit_fn_frees(&fvars);
+                            self.flush_pending_frees();
+                            self.emit(&format!("return {ret};"));
                         }
-                        self.emit_fn_frees(&fvars);
-                        self.emit(&format!("return {ret};"));
                     }
                 }
             }
@@ -10217,6 +10254,10 @@ impl Render {
                             a.join(", ")
                         ));
                     }
+                    // the native call returns a heap string the caller
+                    // owns — free it after the enclosing statement
+                    // (unless a store-var assignment moves it).
+                    self.pending_frees.push(cn.clone());
                 } else {
                     // arg values FIRST: their value_c temps must precede the
                     // compound-literal statement below
@@ -12541,6 +12582,12 @@ impl Render {
                     // static buffer).
                     if self.managed_strings.contains(&name) {
                         self.emit(&format!("_sh_mstr_set(&{name}, {rhs});"));
+                    } else if self.pending_frees.contains(&rhs) {
+                        // MOVE: the RHS is a native-call heap return —
+                        // transfer ownership to the store var (no strdup),
+                        // and it is no longer pending a free.
+                        self.emit(&format!("{name} = {rhs};"));
+                        self.pending_frees.retain(|x| x != &rhs);
                     } else {
                         self.emit(&format!("{name} = strdup((char*)({rhs}));"));
                     }
@@ -14008,6 +14055,9 @@ impl Render {
         }
         for s in &prog.stmts {
             self.stmt(s);
+            // free heap-return temps (native-call results) not moved
+            // into a store var, at each logical-statement boundary.
+            self.flush_pending_frees();
         }
         // EXIT trap: run the registered cleanup body before returning
         if let Some(body) = &self.exit_trap_body {
