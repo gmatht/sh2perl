@@ -1203,30 +1203,12 @@ impl Render {
     }
 
     /// A distinctive, unique, concise, user-meaningful temp name for a
-    /// native function call result. See docs/MEANINGFUL_NAMES.md.
-    /// `_cn_<fn-part>_<arg-part>_<seq?>` — the callee name (abbreviated
-    /// when long) plus short literal args, with a sequence suffix only
-    /// when the base would collide.
+    /// native function call result. The base name comes from the shared
+    /// `naming::temp_base_name` heuristic (see docs/MEANINGFUL_NAMES.md);
+    /// the C prefix `_` and a per-function sequence suffix on collision
+    /// are added here.
     fn call_temp_name(&mut self, fname: &str, args: &[IrExpr]) -> String {
-        let fn_part = if fname.contains('_') {
-            // multi-word: first letter of each word (all_factors -> af)
-            fname
-                .split('_')
-                .filter(|w| !w.is_empty())
-                .map(|w| w.chars().next().unwrap())
-                .collect::<String>()
-        } else if fname.len() <= 6 {
-            // short single word: keep whole (greet -> greet)
-            fname.to_string()
-        } else {
-            // long single word: first 3 chars
-            fname.chars().take(3).collect::<String>()
-        };
-        let mut parts = vec![fn_part];
-        for a in args {
-            parts.push(self.abbrev_arg(a));
-        }
-        let base = format!("_cn_{}", parts.join("_"));
+        let base = format!("_{}", crate::naming::temp_base_name(fname, args));
         if self.used_temp_names.insert(base.clone()) {
             base
         } else {
@@ -1234,49 +1216,6 @@ impl Render {
             self.cn_seq += 1;
             self.used_temp_names.insert(name.clone());
             name
-        }
-    }
-
-    /// A short, stable tag for an argument in a temp name. The signal
-    /// depends on the arg shape (see docs/MEANINGFUL_NAMES.md): a small
-    /// integer or short string literal is kept verbatim (distinctive —
-    /// identifies the exact call); a variable keeps its NAME (stable —
-    /// does not change when the value changes, and meaningful if the
-    /// variable is descriptive); anything else is reduced to a short
-    /// hash so the name stays concise.
-    fn abbrev_arg(&self, e: &IrExpr) -> String {
-        match e {
-            IrExpr::Int(i) => i.to_string(),
-            // numeric strings are meaningful verbatim (shell values are
-            // strings, so `2147483645` arrives as Str); short non-numeric
-            // strings too; long opaque strings are hashed.
-            IrExpr::Str(s, _) if s.len() <= 8 || s.chars().all(|c| c.is_ascii_digit()) => {
-                s.to_string()
-            }
-            IrExpr::Var(name, _) | IrExpr::Ident(name) if name.len() <= 8 => name.to_string(),
-            _ => {
-                let s = format!("{:?}", e);
-                // a literal operand is the most meaningful prefix: take
-                // the first digit sequence (e.g. `67108847LL * 67108837LL`
-                // -> `67108847_`), so the reader sees the beginning of
-                // the expression instead of an opaque hash. Fall back to
-                // a hash when the expression has no literal (a long
-                // nested call) — the prefix would be opaque anyway.
-                let digits: String = s
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if digits.len() >= 3 {
-                    format!("{digits}_")
-                } else {
-                    let mut h = 0u64;
-                    for b in s.bytes() {
-                        h = h.wrapping_mul(31).wrapping_add(b as u64);
-                    }
-                    format!("x{:x}", h & 0xffff)
-                }
-            }
         }
     }
 

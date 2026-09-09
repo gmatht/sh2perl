@@ -13,6 +13,7 @@ pub mod estree;
 pub mod ir;
 pub mod pipeline_native;
 pub mod shir;
+pub mod naming;
 pub mod render_ext;
 pub mod render_ext_expr;
 pub mod render_ext_estree;
