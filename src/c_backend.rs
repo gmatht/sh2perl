@@ -259,6 +259,10 @@ pub struct Render {
     /// the caller must free after the enclosing statement (unless moved
     /// into a store var). Flushed at statement boundaries.
     pending_frees: Vec<String>,
+    /// GMP bigint temps (_mpzN) created inline for bigint-param calls,
+    /// dead after the enclosing statement. Cleared (mpz_clear) at the
+    /// same statement boundaries as pending_frees.
+    pending_mpz_frees: Vec<String>,
     /// temp names already emitted, so a descriptive base name that would
     /// collide falls back to a sequence suffix (uniqueness case-by-case).
     /// Reset per function so names are stable across functions (adding a
@@ -1199,6 +1203,13 @@ impl Render {
         let frees = std::mem::take(&mut self.pending_frees);
         for cn in frees {
             self.emit(&format!("free({cn});"));
+        }
+        // GMP bigint temps (_mpzN) created inline for bigint-param calls
+        // are dead after the enclosing statement — clear them here too
+        // (mpz_clear, not free).
+        let mpz = std::mem::take(&mut self.pending_mpz_frees);
+        for t in mpz {
+            self.emit(&format!("mpz_clear({t});"));
         }
     }
 
@@ -4410,6 +4421,9 @@ impl Render {
         self.temp_seq += 1;
         let v = self.value_c(e);
         self.emit(&format!("mpz_t {t}; mpz_init_set_str({t}, {v}, 10);"));
+        // the temp is dead after the enclosing statement — clear it at
+        // the next statement boundary (mpz_clear, not free).
+        self.pending_mpz_frees.push(t.clone());
         t
     }
 
@@ -11567,9 +11581,10 @@ impl Render {
         };
         let var_name = var.as_ref().map(|v| self.c_ident(v)).unwrap_or_default();
         if var.is_some() {
-            self.emit(&format!(
-                "for (long long {var_name} = {init_c}; {cond_c}; {incr_c}) {{"
-            ));
+            // the loop var is hoisted at Int (mark_cstyle_for_vars) —
+            // use the file/function-scope var, no local shadowing
+            // declaration (bash leaves $i = LAST after the loop)
+            self.emit(&format!("for ({var_name} = {init_c}; {cond_c}; {incr_c}) {{"));
         } else {
             self.emit(&format!("for ({init_c}; {cond_c}; {incr_c}) {{"));
         }
@@ -12621,6 +12636,19 @@ impl Render {
                         self.emit(&format!("{name} = {rhs};"));
                         self.pending_frees.retain(|x| x != &rhs);
                     } else {
+                        // free-before-reassign: a FILE-SCOPE heap store
+                        // var (hoisted to file scope because a function
+                        // assigns it — bash function assigns touch the
+                        // global) is reassigned on every call, leaking
+                        // the previous strdup'd value (LSan/valgrind
+                        // flag it). Free the old value first — free(NULL)
+                        // is a no-op, and the end-of-main/end-of-fn free
+                        // still owns the LAST value. Guard against a
+                        // self-referential RHS (`X = strdup(X)`), which
+                        // would free the source before the copy.
+                        if self.top_vars.contains(&t.var) && !rhs.contains(&name) {
+                            self.emit(&format!("free({name});"));
+                        }
                         self.emit(&format!("{name} = strdup((char*)({rhs}));"));
                     }
                 } else {
@@ -13929,6 +13957,15 @@ impl Render {
         for s in &prog.stmts {
             mark_seq_loop_vars(s, &mut self.var_types);
         }
+        // cstyleFor header vars: the C backend renders the header
+        // natively, so the loop var and cond operands are numeric (Int),
+        // not the string store reads the shared type analysis assumes
+        // (the shell runtime evaluates the header as arith text). Mark
+        // them Int so the hoisted declarations and the native cond
+        // render numerically.
+        for s in &prog.stmts {
+            mark_cstyle_for_vars(s, &mut self.var_types);
+        }
         // collect the untyped store names (getVar/param reads, Assign
         // targets, Declare lists) — they hoist as `char*` entries
         collect_store_names(&prog.stmts, &mut self.store);
@@ -14108,6 +14145,19 @@ impl Render {
             if !lt.escapes && self.top_vars.contains(name) && self.is_heap_store_var(name) {
                 self.emit(&format!("free({});", self.c_ident(name)));
             }
+        }
+        // GMP bigint slots: mpz_clear (not free) at the end of main so
+        // the heap limbs don't leak (LSan/valgrind flag them). Both the
+        // runtime bigint vars (mpz_init'd in the prologue) and the
+        // compile-time const bigints (_bigint_init'd) are initialized
+        // before any use, so clearing is safe.
+        let bigint_declared = self.bigint_declared.clone();
+        for v in &bigint_declared {
+            self.emit(&format!("  mpz_clear({v});"));
+        }
+        let bigint_consts = self.bigint_consts.clone();
+        for v in &bigint_consts {
+            self.emit(&format!("  mpz_clear(_bigint_{v});"));
         }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
@@ -16382,6 +16432,79 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
         IrStmt::Function { body, .. } => {
             for x in body {
                 mark_seq_loop_vars(x, var_types);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// cstyleFor header vars: the C backend renders the header natively, so
+/// the loop var and cond operands are numeric (Int), not the string
+/// store reads the shared type analysis assumes (the shell runtime
+/// evaluates the header as arith text). Mark them Int so the hoisted
+/// declarations and the native cond render numerically.
+fn mark_cstyle_for_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
+    match s {
+        IrStmt::Expr(e) => {
+            if let IrExpr::Call { func, args } = e {
+                if func == "cstyleFor" {
+                    if let Some(IrExpr::Str(spec, _)) = args.first() {
+                        for part in spec.split(';') {
+                            let part = part.trim();
+                            if part.is_empty() {
+                                continue;
+                            }
+                            // init: `i = 1` — the LHS is the loop var
+                            if let Some(eq) = part.find('=') {
+                                let v = part[..eq].trim();
+                                if is_ident(v) {
+                                    var_types.insert(v.to_string(), IrType::Int);
+                                }
+                            }
+                            // cond: `i < n` — both operands are numeric
+                            for op in ["<=", ">=", "==", "!=", "<", ">"] {
+                                if let Some(pos) = part.find(op) {
+                                    let l = part[..pos].trim();
+                                    let r = part[pos + op.len()..].trim();
+                                    if is_ident(l) {
+                                        var_types.insert(l.to_string(), IrType::Int);
+                                    }
+                                    if is_ident(r) {
+                                        var_types.insert(r.to_string(), IrType::Int);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            for x in b {
+                mark_cstyle_for_vars(x, var_types);
+            }
+        }
+        IrStmt::If { then, elsifs, else_, .. } => {
+            for x in then {
+                mark_cstyle_for_vars(x, var_types);
+            }
+            for (_, b) in elsifs {
+                for x in b {
+                    mark_cstyle_for_vars(x, var_types);
+                }
+            }
+            for x in else_ {
+                mark_cstyle_for_vars(x, var_types);
+            }
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+            for x in body {
+                mark_cstyle_for_vars(x, var_types);
+            }
+        }
+        IrStmt::Function { body, .. } => {
+            for x in body {
+                mark_cstyle_for_vars(x, var_types);
             }
         }
         _ => {}
