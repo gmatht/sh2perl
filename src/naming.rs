@@ -29,6 +29,14 @@ pub fn temp_base_name(fname: &str, args: &[IrExpr]) -> String {
     parts.join("_")
 }
 
+/// A meaningful name for a positional-param temp: the positional index
+/// IS the signal (`p1` = param 1), so the name is kept as-is. Backends
+/// add their own prefix and a kind suffix (`_p1` in C, `__p1n` in JS
+/// where `n` marks the numeric form).
+pub fn param_temp_name(p: &str) -> String {
+    p.to_string()
+}
+
 fn abbrev_fn_name(fname: &str) -> String {
     if fname.contains('_') {
         // multi-word: first letter of each word (all_factors -> af)
