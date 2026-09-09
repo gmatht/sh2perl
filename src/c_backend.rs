@@ -1156,6 +1156,18 @@ impl Render {
             && self.buf_bound(name).is_none()
     }
 
+    /// Emit `free()` for the function's non-escaping heap store vars
+    /// (strdup'd temps). Must be called BEFORE the function's return
+    /// statement — after it, the frees would be unreachable dead code.
+    fn emit_fn_frees(&mut self, fvars: &BTreeSet<String>) {
+        let lifetimes = self.var_lifetimes.clone();
+        for (name, lt) in &lifetimes {
+            if !lt.escapes && fvars.contains(name) && self.is_heap_store_var(name) {
+                self.emit(&format!("free({});", self.c_ident(name)));
+            }
+        }
+    }
+
     /// The fixed-buffer bound for a Str var (Some(N) -> `char v[N+1]`),
     /// or None (stay `char*`). INT vars are excluded — the length
     /// analysis also bounds numeric RHS (`i=$((i+1))` -> 20), and
@@ -3363,6 +3375,15 @@ impl Render {
             if let Some(arr) = self.array_return_arrays.get(name) {
                 let aid = self.c_ident(arr);
                 self.emit(&format!("*len = {aid}_len;"));
+                // free the function's non-escaping heap store vars
+                // (strdup'd temps) before the return — a one-shot temp
+                // like __fl0 is read once and never freed. Only
+                // heap-owning store vars (not num/bigint/const/buffer)
+                // are freed, and only non-escaping ones (a
+                // returned/closure-captured value is still live in the
+                // caller). The array itself is not a store var, so it is
+                // not freed.
+                self.emit_fn_frees(&fvars);
                 self.emit(&format!("return {aid};"));
             } else {
                 // the trailing echo's single element — its VALUE is the
@@ -3373,22 +3394,31 @@ impl Render {
                     if let Some(val) = items.first() {
                         let v = self.value_c(val);
                         let rv = format!("_rv{}", self.temp_seq);
+                        let ret = format!("_ret{}", self.temp_seq);
                         self.temp_seq += 1;
-                        // impure value exprs (native pipeline calls)
-                        // must run exactly once — hoist to a temp
+                        // Compute the return value into a temp FIRST (so
+                        // the frees below can't dangle it — the trailing
+                        // echo's value may BE a heap store var, e.g.
+                        // `return msg` lowers to `echo msg`), then free
+                        // the function's non-escaping heap store vars,
+                        // then return the temp. The temp points into the
+                        // static _fnret_ buffer, which is never freed.
                         if v.contains("_sh_pipeline(") || v.contains("_cap_")
                             || v.contains("_sh_call_fn(")
                             || v.contains("_sh_sorted_join(")
                         {
+                            // impure value exprs must run exactly once
                             self.emit(&format!("char *{rv} = {v};"));
                             self.emit(&format!(
-                                "return _sh_ret_val(&_fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
+                                "char *{ret} = _sh_ret_val(&_fnret_{fname}, (({rv}) ? ({rv}) : \"\"));"
                             ));
                         } else {
                             self.emit(&format!(
-                                "return _sh_ret_val(&_fnret_{fname}, (({v}) ? ({v}) : \"\"));"
+                                "char *{ret} = _sh_ret_val(&_fnret_{fname}, (({v}) ? ({v}) : \"\"));"
                             ));
                         }
+                        self.emit_fn_frees(&fvars);
+                        self.emit(&format!("return {ret};"));
                     }
                 }
             }
@@ -3500,17 +3530,11 @@ impl Render {
             self.emit("");
         }
         self.out.extend(body_out.iter().cloned());
-        // free the function's non-escaping heap store vars (strdup'd
-        // temps) at the end of the function — a one-shot temp like
-        // __fl0 is read once and never freed. Only heap-owning store
-        // vars (not num/bigint/const/buffer) are freed, and only
-        // non-escaping ones (a returned/closure-captured value is
-        // still live in the caller).
-        let lifetimes = self.var_lifetimes.clone();
-        for (name, lt) in &lifetimes {
-            if !lt.escapes && fvars.contains(name) && self.is_heap_store_var(name) {
-                self.emit(&format!("free({});", self.c_ident(name)));
-            }
+        // non-lifted functions have no trailing echo->return, so free
+        // their non-escaping heap store vars at the end of the body
+        // (lifted functions already freed them before the return).
+        if lifted_arity.is_none() {
+            self.emit_fn_frees(&fvars);
         }
         self.depth -= 1;
         self.emit("}");
