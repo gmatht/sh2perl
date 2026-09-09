@@ -3994,8 +3994,9 @@ impl Render {
             self.bigint_consts.insert(v.clone());
             return format!("_bigint_{}", v);
         }
-        // a computed temp: 64-bit-bigint sequence name (unique).
-        let t = format!("_bigint_64_{}", self.temp_seq);
+        // a computed temp: a clear `_bigint_tmp_<seq>` name (distinct
+        // from the value-named constants `_bigint_<value>`).
+        let t = format!("_bigint_tmp_{}", self.temp_seq);
         self.temp_seq += 1;
         self.emit(&format!("_SH_MPZ_INIT({t});"));
         self.bigint_into(a, &t);
