@@ -99,6 +99,20 @@ const ZIG_RESERVED: &[&str] = &[
     "sh2B2S",
 ];
 
+/// sh2.* callee names that collide with a real runtime helper (or the
+/// generic sh2TODO) — their per-callee stub gets a `Stub` suffix so the
+/// call site and the definition agree.
+const RESERVED_STUB: &[&str] = &[
+    "sh2TODO",
+    "sh2ToInt",
+    "sh2IntStr",
+    "sh2Truthy",
+    "sh2StrCat",
+    "sh2B2S",
+    "sh2Test",
+    "sh2Arith",
+];
+
 #[derive(Default)]
 pub struct Render {
     out: Vec<String>,
@@ -986,7 +1000,7 @@ impl Render {
             ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
                 // runtime setVar semantics (x=, x+=, x++) — sh2.arith stub
                 self.sh2_calls.insert("arith".into());
-                "sh2Arith()".to_string()
+                "sh2ArithStub()".to_string()
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
@@ -1038,8 +1052,254 @@ impl Render {
             })
             .collect();
         let norm = norm.replace('{', " ").replace('}', " ");
+        if let Some(v) = self.mathfunc_arith_zig(norm.trim()) {
+            return Some(v);
+        }
         let ast = crate::shir::parse_arith(norm.trim())?;
         Some(self.arith(&ast))
+    }
+
+    /// zsh-mathfunc arith text → native Zig numeric expression. The
+    /// py-sh-go frontend emits `int(sqrt($1)) + 1`-style loop bounds as
+    /// arith texts; real bash cannot even parse a mathfunc call (it is a
+    /// bash arith SYNTAX error), so this is a dedicated parser (the same
+    /// shape as the C backend's mathfunc_arith_c). `int()` truncates
+    /// toward zero (@intFromFloat); the other names are the same-named
+    /// Zig float builtins.
+    fn mathfunc_arith_zig(&mut self, src: &str) -> Option<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut pos = 0usize;
+        let out = self.mf_cmp(&chars, &mut pos)?;
+        Self::mf_ws(&chars, &mut pos);
+        if pos != chars.len() {
+            return None;
+        }
+        Some(out)
+    }
+
+    fn mf_ws(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+
+    fn mf_cmp(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let l = self.mf_add(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        let rest: String = chars[*pos..].iter().collect();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if rest.starts_with(op) {
+                *pos += op.len();
+                let r = self.mf_add(chars, pos)?;
+                return Some(format!("@intFromBool(({l}) {op} ({r}))"));
+            }
+        }
+        Some(l)
+    }
+
+    fn mf_add(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_mul(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            let op = match chars.get(*pos) {
+                Some('+') => "+",
+                Some('-') => "-",
+                _ => return Some(l),
+            };
+            *pos += 1;
+            let r = self.mf_mul(chars, pos)?;
+            l = format!("(({l}) {op} ({r}))");
+        }
+    }
+
+    fn mf_mul(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_pow(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) != Some(&'*') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("(({l}) * ({r}))");
+            } else if chars.get(*pos) == Some(&'/') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("(@as(f64, @floatFromInt({l})) / @as(f64, @floatFromInt({r})))");
+            } else {
+                return Some(l);
+            }
+        }
+    }
+
+    fn mf_pow(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        let signed = matches!(chars.get(*pos), Some('+') | Some('-'));
+        let base = self.mf_unary(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) == Some(&'*') {
+            if signed {
+                return None;
+            }
+            *pos += 2;
+            let exp = self.mf_unary(chars, pos)?;
+            return Some(format!("std.math.pow(f64, @as(f64, @floatFromInt({base})), @as(f64, @floatFromInt({exp})))"));
+        }
+        Some(base)
+    }
+
+    fn mf_unary(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('+') => {
+                *pos += 1;
+                self.mf_unary(chars, pos)
+            }
+            Some('-') => {
+                *pos += 1;
+                Some(format!("(-{})", self.mf_unary(chars, pos)?))
+            }
+            _ => self.mf_atom(chars, pos),
+        }
+    }
+
+    fn mf_atom(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('(') => {
+                *pos += 1;
+                let e = self.mf_cmp(chars, pos)?;
+                Self::mf_ws(chars, pos);
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(format!("({e})"))
+            }
+            Some('$') => self.mf_dollar(chars, pos),
+            Some(c) if c.is_ascii_digit() || *c == '.' => Self::mf_number(chars, pos),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => self.mf_named(chars, pos),
+            _ => None,
+        }
+    }
+
+    fn mf_dollar(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        *pos += 1;
+        if chars.get(*pos) == Some(&'{') {
+            *pos += 1;
+            let name = Self::mf_name(chars, pos)?;
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) != Some(&'}') {
+                return None;
+            }
+            *pos += 1;
+            return Some(self.mf_numref(&name));
+        }
+        let name = Self::mf_name(chars, pos)?;
+        Some(self.mf_numref(&name))
+    }
+
+    fn mf_name(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    fn mf_named(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let name = Self::mf_name(chars, pos)?;
+        let save = *pos;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) != Some(&'(') {
+            *pos = save;
+            return Some(self.mf_numref(&name));
+        }
+        *pos += 1;
+        let mut args: Vec<String> = Vec::new();
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&')') {
+            *pos += 1;
+            return self.mf_call(&name, args);
+        }
+        loop {
+            args.push(self.mf_cmp(chars, pos)?);
+            Self::mf_ws(chars, pos);
+            match chars.get(*pos) {
+                Some(',') => {
+                    *pos += 1;
+                }
+                Some(')') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        self.mf_call(&name, args)
+    }
+
+    fn mf_call(&mut self, name: &str, args: Vec<String>) -> Option<String> {
+        let dbl = |a: &String| format!("@as(f64, @floatFromInt({}))", a);
+        match name {
+            "int" if args.len() == 1 => Some(format!("@as(i64, @intFromFloat({}))", args[0])),
+            "abs" | "fabs" if args.len() == 1 => Some(format!("@abs({})", args[0])),
+            "floor" | "ceil" | "round" | "trunc" | "sqrt" | "cbrt" | "exp"
+            | "log" | "log10" | "log2" | "sin" | "cos" | "tan" | "asin"
+            | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+            | "atanh" if args.len() == 1 => Some(format!("@as(i64, @intFromFloat(@{}({})))", name, dbl(&args[0]))),
+            "atan2" | "fmod" | "copysign" if args.len() == 2 => Some(format!(
+                "@as(i64, @intFromFloat(@{}({}, {})))",
+                name,
+                dbl(&args[0]),
+                dbl(&args[1])
+            )),
+            _ => None,
+        }
+    }
+
+    fn mf_number(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_digit() || *c == '.' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    /// Numeric read of a `$`-ref or bare name in a mathfunc text. A
+    /// positional param ($1) reads the function's param via the getVar
+    /// stub (matching the function body's own $N read); a typed-Int var
+    /// reads its ident; anything else atolls the store read.
+    fn mf_numref(&mut self, name: &str) -> String {
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            self.sh2_calls.insert("getVar".into());
+            self.need_toint = true;
+            return "sh2ToInt(sh2GetVar())".to_string();
+        }
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            if self.is_num(name) {
+                return m;
+            }
+            self.need_toint = true;
+            return format!("sh2ToInt({m})");
+        }
+        self.sh2_calls.insert("getVar".into());
+        self.need_toint = true;
+        "sh2ToInt(sh2GetVar())".to_string()
     }
 
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
@@ -1064,7 +1324,7 @@ impl Render {
                         _ => None,
                     })
                     .unwrap_or_default();
-                format!("{name}(&[_][]const u8{{ {} }})", call_args.join(", "))
+                format!("{name}(init, &[_][]const u8{{ {} }})", call_args.join(", "))
             }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -1120,7 +1380,8 @@ impl Render {
                     }
                 }
                 self.need_intstr = true;
-                format!("sh2IntStr(sh2Arith())")
+                self.sh2_calls.insert("arith".into());
+                format!("sh2IntStr(sh2ArithStub())")
             }
             _ => self.sh2_stub(func, func),
         }
@@ -1135,7 +1396,8 @@ impl Render {
                         return x;
                     }
                 }
-                "sh2Arith()".to_string()
+                self.sh2_calls.insert("arith".into());
+                "sh2ArithStub()".to_string()
             }
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
@@ -1174,7 +1436,8 @@ impl Render {
                         return format!("({x} != 0)");
                     }
                 }
-                "(sh2Arith() != 0)".to_string()
+                self.sh2_calls.insert("arith".into());
+                "(sh2ArithStub() != 0)".to_string()
             }
             "getVar" => {
                 self.need_truthy = true;
@@ -1262,7 +1525,11 @@ impl Render {
         self.sh2_calls.insert(name.to_string());
         self.mark_todo(&format!("{note} → sh2.{name}"));
         self.mark_todo(&format!("{note} → sh2.{name}"));
-        format!("sh2{}()", camel(name))
+        let mut fname = format!("sh2{}", camel(name));
+        if RESERVED_STUB.contains(&fname.as_str()) {
+            fname.push_str("Stub");
+        }
+        format!("{fname}()")
     }
 
     /// The generic expression form (used by `_ = expr;` statements and
@@ -2351,11 +2618,23 @@ impl Render {
                             locals.insert(d.name.clone());
                         }
                     }
+                    if let IrStmt::For { var, .. } = st {
+                        locals.insert(var.clone());
+                    }
                 }
                 self.fn_locals.extend(locals.iter().cloned());
+                let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
                 let mut fntext = format!(
-                    "fn {id}(__args: []const []const u8) []const u8 {{\n"
+                    "fn {id}(init: std.process.Init, __args: []const []const u8) []const u8 {{\n"
                 );
+                if uses_stdout {
+                    fntext.push_str("    var stdout_buffer: [4096]u8 = undefined;\n");
+                    fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);\n");
+                    fntext.push_str("    const stdout = &stdout_file_writer.interface;\n");
+                }
+                // mark __args used even when the body reads params via a
+                // stub (Zig rejects an unused function parameter)
+                fntext.push_str("    _ = __args;\n");
                 for v in &locals {
                     let m = self.zig_ident(v);
                     if self.is_num(v) {
@@ -2398,10 +2677,11 @@ impl Render {
             }
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),
+            IrStmt::Shaderize { .. } => {
+                self.mark_todo("shaderize (autoshaderization) not supported by the Zig backend");
+            }
         }
     }
-
-    // ── program ──────────────────────────────────────────────────────
 
     fn program(&mut self, prog: &IrProgram) {
         // Pass 1: collect written vars so declarations are hoisted.
@@ -2432,7 +2712,7 @@ impl Render {
         }
         // dead-var guard: Zig rejects declared-but-never-read variables
         for v in &written {
-            if !self.read.contains(v) {
+            if !self.read.contains(v) && !self.fn_locals.contains(v) {
                 let m = self
                     .mangle
                     .get(v)
@@ -2649,16 +2929,6 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("}");
         }
         // per-callee stubs: compile-able, exit(2) at runtime
-        const RESERVED_STUB: &[&str] = &[
-            "sh2TODO",
-            "sh2ToInt",
-            "sh2IntStr",
-            "sh2Truthy",
-            "sh2StrCat",
-            "sh2B2S",
-            "sh2Test",
-            "sh2Arith",
-        ];
         if !self.sh2_calls.is_empty() {
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
