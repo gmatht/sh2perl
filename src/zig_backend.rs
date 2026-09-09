@@ -147,10 +147,15 @@ pub struct Render {
     pending_fns: Vec<String>,
     /// vars local to a hoisted user function (never declared in main)
     fn_locals: BTreeSet<String>,
+    /// set-typed arrays (`factors = set(); factors.add(x)`) — lowered to
+    /// a fixed i64 array + length counter (the C backend's model)
+    set_arrays: BTreeSet<String>,
     /// counter for generated temp names (for-loop item bindings)
     tmp_counter: usize,
     /// text-ops primitive helpers (sh2Contains/sh2Sub/…) needed
     need_ext: bool,
+    /// sortedIntJoin helper (set-array sort+dedup+join) needed
+    need_sorted: bool,
 }
 
 /// Render an `IrProgram` to Zig source.
@@ -184,6 +189,31 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
 }
 
 /// The Zig format specifier for a statically-typed part.
+/// A bare identifier (no spaces/operators) — used to recognize the
+/// cstyleFor loop var and increment LHS.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The single value of a trailing `echo V` statement (the function-return
+/// convention), or None for any other shape.
+fn trailing_echo_value(s: &IrStmt) -> Option<IrExpr> {
+    if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+        if func == "exec" {
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                if cmd == "echo" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if items.len() == 1 {
+                            return items.first().cloned();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn spec_char(spec: char) -> &'static str {
     match spec {
         'd' => "{d}",
@@ -947,6 +977,18 @@ impl Render {
         match a {
             ArithAst::Num(n) => n.to_string(),
             ArithAst::Var(name) | ArithAst::Ident(name) => {
+                // inside a user function, a bare positional (`$1`) reads
+                // the param channel, not the process env
+                if self.in_function
+                    && !name.is_empty()
+                    && name.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let idx: usize = name.parse().unwrap_or(1);
+                    self.need_toint = true;
+                    return format!(
+                        "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                    );
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
@@ -1247,14 +1289,16 @@ impl Render {
     fn mf_call(&mut self, name: &str, args: Vec<String>) -> Option<String> {
         let dbl = |a: &String| format!("@as(f64, @floatFromInt({}))", a);
         match name {
+            // `int(x)` truncates toward zero: the arg is a float expr
             "int" if args.len() == 1 => Some(format!("@as(i64, @intFromFloat({}))", args[0])),
             "abs" | "fabs" if args.len() == 1 => Some(format!("@abs({})", args[0])),
+            // float builtins return f64 (a later `int()` truncates)
             "floor" | "ceil" | "round" | "trunc" | "sqrt" | "cbrt" | "exp"
             | "log" | "log10" | "log2" | "sin" | "cos" | "tan" | "asin"
             | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
-            | "atanh" if args.len() == 1 => Some(format!("@as(i64, @intFromFloat(@{}({})))", name, dbl(&args[0]))),
+            | "atanh" if args.len() == 1 => Some(format!("@{}({})", name, dbl(&args[0]))),
             "atan2" | "fmod" | "copysign" if args.len() == 2 => Some(format!(
-                "@as(i64, @intFromFloat(@{}({}, {})))",
+                "@{}({}, {})",
                 name,
                 dbl(&args[0]),
                 dbl(&args[1])
@@ -1284,6 +1328,13 @@ impl Render {
     /// reads its ident; anything else atolls the store read.
     fn mf_numref(&mut self, name: &str) -> String {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            if self.in_function {
+                let idx: usize = name.parse().unwrap_or(1);
+                self.need_toint = true;
+                return format!(
+                    "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                );
+            }
             self.sh2_calls.insert("getVar".into());
             self.need_toint = true;
             return "sh2ToInt(sh2GetVar())".to_string();
@@ -1325,6 +1376,34 @@ impl Render {
                     })
                     .unwrap_or_default();
                 format!("{name}(init, &[_][]const u8{{ {} }})", call_args.join(", "))
+            }
+            "capture" | "captureWords" => {
+                // `$(fn args…)` of a user function DEFINED in this
+                // program: call it and use its return value. The capture
+                // body is a single `exec fn [args]`.
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
+                        if func == "exec" {
+                            if let Some(IrExpr::Str(fname, _)) = cargs.first() {
+                                let m = self.zig_ident(fname);
+                                let call_args: Vec<String> = cargs
+                                    .get(1)
+                                    .and_then(|a| match a {
+                                        IrExpr::Array(items) => Some(
+                                            items.iter().map(|e| self.expr_str(e)).collect(),
+                                        ),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                return format!(
+                                    "{m}(init, &[_][]const u8{{ {} }})",
+                                    call_args.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+                self.sh2_stub("capture", "capture")
             }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -1371,6 +1450,18 @@ impl Render {
                     }
                 }
                 format!("[_] []const u8{{{}}}", parts.join(", "))
+            }
+            "sortedIntJoin" => {
+                // `sorted(list(factors))` — sort+dedup+join the set array
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.set_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_sorted = true;
+                        return format!("sh2SortedIntJoin(&{m}, {m}_len)");
+                    }
+                }
+                self.sh2_stub("sortedIntJoin", "sortedIntJoin")
             }
             "arith" => {
                 if let Some(IrExpr::Str(sv, _)) = args.first() {
@@ -1507,6 +1598,138 @@ impl Render {
         }
         None
     }
+
+    /// `for (( i=1; i<n; i++ ))` — render as a native while loop. The
+    /// loop var is hoisted at i64 (function scope; bash leaves $i = LAST
+    /// after the loop), so the header's init assigns it and the body's
+    /// reads see the same ident.
+    fn emit_cstyle_for(&mut self, spec: &str, body: &[IrStmt]) {
+        let parts: Vec<&str> = spec.split(';').map(|s| s.trim()).collect();
+        let init = parts.first().copied().unwrap_or("");
+        let cond = parts.get(1).copied().unwrap_or("1");
+        let incr = parts.get(2).copied().unwrap_or("");
+        // the loop var: `i = 1` / `i=1` — the init's LHS
+        let (var, init_c) = if let Some(eq) = init.find('=') {
+            let v = init[..eq].trim().to_string();
+            let rhs = init[eq + 1..].trim().to_string();
+            if is_ident(&v) {
+                (Some(v), rhs)
+            } else {
+                (None, init.to_string())
+            }
+        } else if !init.is_empty() {
+            (None, init.to_string())
+        } else {
+            (None, String::new())
+        };
+        if let Some(v) = &var {
+            self.var_types.insert(v.clone(), IrType::Int);
+        }
+        let cond_c = self.cstyle_cond(cond);
+        let incr_c = if incr.is_empty() {
+            String::new()
+        } else {
+            self.cstyle_incr(incr)
+        };
+        let var_name = var.as_ref().map(|v| self.zig_ident(v)).unwrap_or_default();
+        if var.is_some() {
+            self.emit(&format!("{var_name} = {init_c};"));
+            self.emit(&format!("while ({cond_c}) {{"));
+        } else {
+            self.emit(&format!("{init_c};"));
+            self.emit(&format!("while ({cond_c}) {{"));
+        }
+        self.loop_depth += 1;
+        self.depth += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        if !incr_c.is_empty() {
+            self.emit(&format!("{incr_c};"));
+        }
+        self.depth -= 1;
+        self.loop_depth -= 1;
+        self.emit("}");
+    }
+
+    /// The cstyleFor condition: split on the comparison ops, map the
+    /// operand names to Zig idents (numeric now) or literals.
+    fn cstyle_cond(&mut self, c: &str) -> String {
+        let c = c.trim();
+        if c.is_empty() {
+            return "true".into();
+        }
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if let Some(pos) = c.find(op) {
+                let l = c[..pos].trim();
+                let r = c[pos + op.len()..].trim();
+                let lc = self.cstyle_operand(l);
+                let rc = self.cstyle_operand(r);
+                let c_op = match op {
+                    "<=" => "<=",
+                    ">=" => ">=",
+                    "==" => "==",
+                    "!=" => "!=",
+                    "<" => "<",
+                    _ => ">",
+                };
+                return format!("({lc} {c_op} {rc})");
+            }
+        }
+        self.cstyle_operand(c)
+    }
+
+    /// A cstyleFor operand: a var name → the numeric Zig expr.
+    fn cstyle_operand(&mut self, name: &str) -> String {
+        let name = name.trim();
+        if name.is_empty() {
+            return "0".into();
+        }
+        if let Ok(n) = name.parse::<i64>() {
+            return n.to_string();
+        }
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if self.declared(name) {
+                let m = self.zig_ident(name);
+                self.mark_read(name);
+                if self.is_num(name) {
+                    return m;
+                }
+                // a string-homed var in an arith cond — coerce
+                self.need_toint = true;
+                return format!("sh2ToInt({m})");
+            }
+            return "0".into();
+        }
+        "0".into()
+    }
+
+    /// The cstyleFor increment: `i++` / `i--` / `i += 2`.
+    fn cstyle_incr(&mut self, s: &str) -> String {
+        let s = s.trim();
+        if s.ends_with("++") {
+            let v = s.trim_end_matches("++").trim();
+            if is_ident(v) {
+                return format!("{} += 1", self.zig_ident(v));
+            }
+        }
+        if s.ends_with("--") {
+            let v = s.trim_end_matches("--").trim();
+            if is_ident(v) {
+                return format!("{} -= 1", self.zig_ident(v));
+            }
+        }
+        for op in ["+=", "-=", "*=", "/=", "%="] {
+            if let Some((l, r)) = s.split_once(op) {
+                let l = l.trim();
+                if is_ident(l) {
+                    return format!("{} {op} {}", self.zig_ident(l), r.trim());
+                }
+            }
+        }
+        s.to_string()
+    }
+
 
     /// Build the argv literals for an external `exec` command
     /// (`["cmd", "arg", …]`). The command name is args[0]; the trailing
@@ -2232,6 +2455,19 @@ impl Render {
                         self.emit("continue;");
                         return;
                     }
+                    if func == "cstyleFor" {
+                        // `for (( i=1; i<n; i++ ))` — init; cond; incr.
+                        // The loop var is hoisted at i64 (function scope,
+                        // bash leaves $i = LAST after the loop).
+                        if let Some(IrExpr::Str(spec, _)) = args.first() {
+                            if let Some(IrExpr::Arrow(body)) = args.get(1) {
+                                self.emit_cstyle_for(spec, body);
+                                return;
+                            }
+                        }
+                        self.mark_todo("cstyleFor args");
+                        return;
+                    }
                 }
                 let x = self.expr_any(e);
                 self.emit(&format!("_ = {x};"));
@@ -2253,6 +2489,27 @@ impl Render {
                 if !t.indices.is_empty() {
                     self.mark_todo("array-index assign");
                     return;
+                }
+                // set-array writes: `factors = set()` resets the length;
+                // `factors.add(x)` appends (dedup happens at sortedIntJoin)
+                if let IrExpr::Call { func, args } = expr {
+                    if matches!(func.as_str(), "setArray" | "setArrayAppend")
+                        && self.set_arrays.contains(&t.var)
+                    {
+                        if func == "setArray" {
+                            self.emit(&format!("{m}_len = 0;"));
+                        } else {
+                            // append each element
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    let v = self.expr_num(it);
+                                    self.emit(&format!("{m}[{m}_len] = {v};"));
+                                    self.emit(&format!("{m}_len += 1;"));
+                                }
+                            }
+                        }
+                        return;
+                    }
                 }
                 let rhs = if self.is_num(&t.var) {
                     // arith-assign / inc-dec render natively (not via
@@ -2601,7 +2858,17 @@ impl Render {
                 let prev_in_fn = self.in_function;
                 self.in_function = true;
                 let mut saved = std::mem::take(&mut self.out);
-                for s in body {
+                let n_body = body.len();
+                for (bi, s) in body.iter().enumerate() {
+                    // the single trailing `echo V` becomes the return
+                    // value (the caller consumed it as the $(fn) capture)
+                    if bi == n_body - 1 {
+                        if let Some(v) = trailing_echo_value(s) {
+                            let r = self.expr_str(&v);
+                            self.emit(&format!("return {r};"));
+                            continue;
+                        }
+                    }
                     self.stmt(s);
                 }
                 std::mem::swap(&mut saved, &mut self.out);
@@ -2621,9 +2888,25 @@ impl Render {
                     if let IrStmt::For { var, .. } = st {
                         locals.insert(var.clone());
                     }
+                    if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+                        if func == "cstyleFor" {
+                            if let Some(IrExpr::Str(spec, _)) = args.first() {
+                                for part in spec.split(';') {
+                                    let part = part.trim();
+                                    if let Some(eq) = part.find('=') {
+                                        let v = part[..eq].trim();
+                                        if is_ident(v) {
+                                            locals.insert(v.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.fn_locals.extend(locals.iter().cloned());
                 let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
+                let uses_args = saved.iter().any(|l| l.contains("__args"));
                 let mut fntext = format!(
                     "fn {id}(init: std.process.Init, __args: []const []const u8) []const u8 {{\n"
                 );
@@ -2631,13 +2914,22 @@ impl Render {
                     fntext.push_str("    var stdout_buffer: [4096]u8 = undefined;\n");
                     fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);\n");
                     fntext.push_str("    const stdout = &stdout_file_writer.interface;\n");
+                } else {
+                    // a pure value-return fn never touches init
+                    fntext.push_str("    _ = init;\n");
                 }
-                // mark __args used even when the body reads params via a
-                // stub (Zig rejects an unused function parameter)
-                fntext.push_str("    _ = __args;\n");
+                // mark __args used only when the body never reads a param
+                // (Zig rejects an unused function parameter)
+                if !uses_args {
+                    fntext.push_str("    _ = __args;\n");
+                }
                 for v in &locals {
                     let m = self.zig_ident(v);
-                    if self.is_num(v) {
+                    if self.set_arrays.contains(v) {
+                        // set → fixed i64 array + length counter
+                        fntext.push_str(&format!("    var {m}: [1024]i64 = undefined;\n"));
+                        fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
+                    } else if self.is_num(v) {
                         fntext.push_str(&format!("    var {m}: i64 = 0;\n"));
                     } else {
                         fntext.push_str(&format!("    var {m}: []const u8 = \"\";\n"));
@@ -2693,6 +2985,12 @@ impl Render {
         // `declared()` consults this during rendering (a var reference
         // before its assignment in source order still lowers natively).
         self.written = written.clone();
+
+        // set-typed arrays (setArray/setArrayAppend) — lowered to a
+        // fixed i64 array + length counter
+        let mut set_arrays = BTreeSet::new();
+        collect_set_arrays(&prog.stmts, &mut set_arrays);
+        self.set_arrays = set_arrays;
 
         // Pass 2: render the body first (helper flags known before
         // preamble). The hoisted declarations must precede the statements
@@ -2921,6 +3219,28 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return s;");
             self.emit("}");
         }
+        if self.need_sorted {
+            self.emit("");
+            self.emit("fn sh2SortedIntJoin(a: []const i64, n: usize) []const u8 {");
+            self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
+            self.emit("    for (0..n) |i| ix[i] = i;");
+            self.emit("    std.mem.sort(usize, ix, a, struct {");
+            self.emit("        fn lt(ctx: []const i64, x: usize, y: usize) bool {");
+            self.emit("            return ctx[x] < ctx[y];");
+            self.emit("        }");
+            self.emit("    }.lt);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var prev: ?i64 = null;");
+            self.emit("    for (ix) |j| {");
+            self.emit("        if (prev != null and prev.? == a[j]) continue;");
+            self.emit("        if (out.items.len != 0) out.appendSlice(std.heap.page_allocator, \", \") catch return \"\";");
+            self.emit("        const num = std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{a[j]}) catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, num) catch return \"\";");
+            self.emit("        prev = a[j];");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
         if self.need_run {
             self.emit("");
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
@@ -3054,6 +3374,50 @@ fn camel(s: &str) -> String {
         out.push_str("X");
     }
     out
+}
+
+/// Collect set-typed arrays (`factors = set(); factors.add(x)`) — the
+/// setArray/setArrayAppend call targets.
+fn collect_set_arrays(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Call { func, .. } = expr {
+                    if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                        for t in targets {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+                collect_set_arrays_expr(expr, out);
+            }
+            IrStmt::Expr(e) => collect_set_arrays_expr(e, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_set_arrays(then, out);
+                for (_, b) in elsifs {
+                    collect_set_arrays(b, out);
+                }
+                collect_set_arrays(else_, out);
+            }
+            IrStmt::For { body, .. } => collect_set_arrays(body, out),
+            IrStmt::ForInit { body, .. } => collect_set_arrays(body, out),
+            IrStmt::While { body, .. } => collect_set_arrays(body, out),
+            IrStmt::Function { body, .. } => collect_set_arrays(body, out),
+            IrStmt::Subshell(body) => collect_set_arrays(body, out),
+            IrStmt::Background(body) => collect_set_arrays(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_set_arrays_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    if let IrExpr::Call { func, args } = e {
+        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                out.insert(name.clone());
+            }
+        }
+    }
 }
 
 /// Collect every variable written by statements (assign targets, declare
