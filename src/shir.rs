@@ -8103,7 +8103,15 @@ pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
 /// u64 fires only past signed-64 — a range only a C-frontend unsigned
 /// integer can produce (bash's arithmetic never leaves i64).
 pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
-    if lo >= 0 && hi <= u32::MAX as i128 {
+    if lo >= 0 && hi <= u8::MAX as i128 {
+        "u8"
+    } else if lo >= i8::MIN as i128 && hi <= i8::MAX as i128 {
+        "i8"
+    } else if lo >= 0 && hi <= u16::MAX as i128 {
+        "u16"
+    } else if lo >= i16::MIN as i128 && hi <= i16::MAX as i128 {
+        "i16"
+    } else if lo >= 0 && hi <= u32::MAX as i128 {
         "u32"
     } else if lo >= i32::MIN as i128 && hi <= i32::MAX as i128 {
         "i32"
@@ -9635,9 +9643,15 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             }
             *state = post;
         }
+        // Function bodies: walk them so function-local vars get ranges
+        // (the global map over-approximates across functions — safe).
+        IrStmt::Function { body, .. } => {
+            for s in body {
+                walk_stmt_ranges(s, state);
+            }
+        }
         IrStmt::Subshell(_)
         | IrStmt::Background(_)
-        | IrStmt::Function { .. }
         | IrStmt::Case { .. }
         | IrStmt::Pipeline { .. }
         | IrStmt::Return(_)

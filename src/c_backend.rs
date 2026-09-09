@@ -72,17 +72,27 @@ impl PartialEq for NumSpec {
 /// exprs mentioning it always share a common width).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Width {
+    I8,
+    U8,
+    I16,
+    U16,
     U32,
     I32,
     I64,
+    U64,
 }
 
 impl Width {
     fn c_type(self) -> &'static str {
         match self {
+            Width::I8 => "int8_t",
+            Width::U8 => "uint8_t",
+            Width::I16 => "int16_t",
+            Width::U16 => "uint16_t",
             Width::U32 => "unsigned int",
             Width::I32 => "int",
             Width::I64 => "long long",
+            Width::U64 => "unsigned long long",
         }
     }
 
@@ -92,25 +102,49 @@ impl Width {
     /// [`Render::expr_type_matches`] / [`Render::num_spec`]).
     fn format(self) -> &'static str {
         match self {
+            Width::I8 => "%hhd",
+            Width::U8 => "%hhu",
+            Width::I16 => "%hd",
+            Width::U16 => "%hu",
             Width::U32 => "%u",
             Width::I32 => "%d",
             Width::I64 => "%lld",
+            Width::U64 => "%llu",
         }
     }
 
     fn from_range_name(name: &str) -> Width {
         match name {
+            "u8" => Width::U8,
+            "i8" => Width::I8,
+            "u16" => Width::U16,
+            "i16" => Width::I16,
             "u32" => Width::U32,
             "i32" => Width::I32,
+            "u64" => Width::U64,
             _ => Width::I64,
         }
     }
 
+    /// A rank for `widen` (the wider of two widths wins).
+    fn rank(self) -> u8 {
+        match self {
+            Width::I8 => 0,
+            Width::U8 => 1,
+            Width::I16 => 2,
+            Width::U16 => 3,
+            Width::I32 => 4,
+            Width::U32 => 5,
+            Width::I64 => 6,
+            Width::U64 => 7,
+        }
+    }
+
     fn widen(self, other: Width) -> Width {
-        match (self, other) {
-            (Width::I64, _) | (_, Width::I64) => Width::I64,
-            (Width::I32, _) | (_, Width::I32) => Width::I32,
-            _ => Width::U32,
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
         }
     }
 }
@@ -178,6 +212,12 @@ pub struct Render {
     /// compile-time-constant bigint values (decimal strings) materialized
     /// as GLOBAL `mpz_t _bigint_<v>` constants, shared across functions.
     bigint_consts: std::collections::BTreeSet<String>,
+    /// lifted functions whose params are all provably-numeric (native
+    /// `long long _pN` signature instead of `char *_pN`).
+    native_num_fns: std::collections::BTreeSet<String>,
+    /// true while rendering a native-numeric function (its `$N` reads are
+    /// the numeric `_pN`, not `atoll(_pN)`).
+    cur_native_num: bool,
     todo: usize,
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
@@ -961,6 +1001,7 @@ impl Render {
         self.emit("#include <stdio.h>");
         self.emit("#include <stdlib.h>");
         self.emit("#include <limits.h>"); // LLONG_MAX for the i64 fast-path check
+        self.emit("#include <stdint.h>"); // int8_t/int16_t/uint8_t/uint16_t narrow widths
         self.emit("#include <string.h>");
         self.emit("#include <sys/wait.h>");
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
@@ -17139,9 +17180,14 @@ fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool)
 
 fn width_buf_len(w: Width) -> usize {
     match w {
+        Width::I8 => 4,
+        Width::U8 => 4,
+        Width::I16 => 6,
+        Width::U16 => 6,
         Width::U32 => 11,
         Width::I32 => 12,
         Width::I64 => 21,
+        Width::U64 => 21,
     }
 }
 
