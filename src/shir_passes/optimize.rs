@@ -1713,6 +1713,24 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         collect_expr_read_names(a, out);
                     }
                 }
+            } else if matches!(func.as_str(), "cstyleFor" | "arith" | "arithEval") {
+                // the header/expr string is ARITHMETIC TEXT the runtime
+                // evaluates via evalArith — bare identifiers are STORE
+                // reads (the `$`-ref scan above would miss
+                // `i < _i_sqrt_nv` in a cstyleFor header, dropping the
+                // loop bound's only store as dead → the runtime reads
+                // the never-written "" fold → the loop never runs — the
+                // py-sh-go t86/t88 JS-gate regression). Over-marking
+                // only shrinks the elimination set.
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        for nm in bare_arith_idents(s) {
+                            out.push(nm);
+                        }
+                    } else {
+                        collect_expr_read_names(a, out);
+                    }
+                }
             }
             for a in args {
                 collect_expr_read_names(a, out);
@@ -1752,6 +1770,35 @@ fn bare_dollar_names(s: &str) -> Vec<String> {
                 out.push(nm.to_string());
             }
             i = if braced && j < bytes.len() { j + 1 } else { j };
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Bare identifiers inside an ARITHMETIC-TEXT string operand (a
+/// `cstyleFor` header, an `arith`/`arithEval` expression): the runtime's
+/// evalArith resolves them from the STORE, so a store whose only read is
+/// such a mention must survive DCE. Mirrors the lift walkers' `mark_all_idents`
+/// (shir.rs) — the `$`-ref scan above would miss `i < _i_sqrt_nv` (no `$`).
+fn bare_arith_idents(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if (c.is_ascii_alphabetic() || c == '_')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let w = &s[start..i];
+            if !w.is_empty() {
+                out.push(w.to_string());
+            }
         } else {
             i += 1;
         }
