@@ -237,6 +237,12 @@ pub struct Render {
     /// true while rendering a native-numeric function (its `$N` reads are
     /// the numeric `_pN`, not `atoll(_pN)`).
     cur_native_num: bool,
+    /// lifted functions whose params are bigint (used in bigint arith) —
+    /// native `mpz_t _pN` signature instead of `char *_pN`.
+    bigint_param_fns: std::collections::BTreeSet<String>,
+    /// true while rendering a bigint-param function (its `$N` reads are
+    /// the mpz_t `_pN`).
+    cur_bigint_param: bool,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -925,6 +931,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_widths = widths;
     r.lifted_fns = scan_fn_lifts(&prog.stmts);
     r.native_num_fns = analyze_native_num_fns(&prog);
+    r.bigint_param_fns = analyze_bigint_param_fns(&prog);
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
@@ -3184,13 +3191,18 @@ impl Render {
             Some(&0) => format!("static char *{fname}(void)"),
             Some(&n) => {
                 let native = self.native_num_fns.contains(name);
+                let big = self.bigint_param_fns.contains(name);
                 format!(
                     "static char *{fname}({})",
                     (1..=n)
-                        .map(|i| if native {
-                            format!("long long _p{i}")
-                        } else {
-                            format!("char *_p{i}")
+                        .map(|i| {
+                            if native {
+                                format!("long long _p{i}")
+                            } else if big {
+                                format!("mpz_t _p{i}")
+                            } else {
+                                format!("char *_p{i}")
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -3263,7 +3275,9 @@ impl Render {
         let lifted_arity = self.lifted_fns.get(name).copied();
         let saved_params = std::mem::take(&mut self.cur_params);
         let saved_native = self.cur_native_num;
+        let saved_big = self.cur_bigint_param;
         self.cur_native_num = lifted_arity.is_some() && self.native_num_fns.contains(name);
+        self.cur_bigint_param = lifted_arity.is_some() && self.bigint_param_fns.contains(name);
         if let Some(arity) = lifted_arity {
             self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
         }
@@ -3311,6 +3325,7 @@ impl Render {
         }
         self.cur_params = saved_params;
         self.cur_native_num = saved_native;
+        self.cur_bigint_param = saved_big;
         let fn_file_vars: BTreeSet<String> = self
             .site_file_vars
             .difference(&fn_vars_before)
@@ -3467,6 +3482,10 @@ impl Render {
         if let Some(p) = self.lifted_param(n) {
             if self.cur_native_num {
                 // native numeric param: `_pN` is already the value
+                return format!("({p})");
+            }
+            if self.cur_bigint_param {
+                // native bigint param: `_pN` is the mpz_t
                 return format!("({p})");
             }
             return format!("(atoll((({p}) ? ({p}) : \"\")))");
@@ -3736,9 +3755,15 @@ impl Render {
                 } else if self.is_num(name) {
                     self.emit(&format!("mpz_set_si({target}, {});", self.c_ident(name)));
                 } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-                    // positional $N: decimal text like the shell sees it
-                    let v = self.store_ref(name);
-                    self.emit(&format!("if (mpz_set_str({target}, ({v}) ? ({v}) : \"0\", 10) != 0) mpz_set_si({target}, 0);"));
+                    if self.cur_bigint_param {
+                        // native bigint param: copy the mpz_t
+                        let p = self.lifted_param(name).unwrap_or_default();
+                        self.emit(&format!("mpz_set({target}, {p});"));
+                    } else {
+                        // positional $N: decimal text like the shell sees it
+                        let v = self.store_ref(name);
+                        self.emit(&format!("if (mpz_set_str({target}, ({v}) ? ({v}) : \"0\", 10) != 0) mpz_set_si({target}, 0);"));
+                    }
                 } else {
                     let v = self.store_ref(name);
                     self.emit(&format!("if (mpz_set_str({target}, ({v}) ? ({v}) : \"0\", 10) != 0) mpz_set_si({target}, 0);"));
@@ -4197,6 +4222,18 @@ impl Render {
             },
             _ => self.expr(e),
         }
+    }
+
+    /// Materialize an `mpz_t` temp from a string value (for a native
+    /// bigint-param call). Emits the init statements; returns the temp
+    /// name. The temp is a small per-call leak (acceptable for a
+    /// transpiled program).
+    fn value_mpz(&mut self, e: &IrExpr) -> String {
+        let t = format!("_mpz{}", self.temp_seq);
+        self.temp_seq += 1;
+        let v = self.value_c(e);
+        self.emit(&format!("mpz_t {t}; mpz_init_set_str({t}, {v}, 10);"));
+        t
     }
 
     /// A `long long` C value for a word passed to a NATIVE-NUMERIC
@@ -10023,18 +10060,21 @@ impl Render {
                     // argv swap (the body reads _pN), no stdout capture,
                     // no helper. Missing args pad "" (unset positionals).
                     let native = self.native_num_fns.contains(&fname);
+                    let big = self.bigint_param_fns.contains(&fname);
                     let mut a: Vec<String> = Vec::new();
                     for i in 0..arity {
                         let v = match call_args.get(i) {
                             Some(w) => {
                                 if native {
                                     self.value_ll(w)
+                                } else if big {
+                                    self.value_mpz(w)
                                 } else {
                                     self.value_c(w)
                                 }
                             }
                             None => {
-                                if native {
+                                if native || big {
                                     "0".into()
                                 } else {
                                     "\"\"".into()
@@ -14689,6 +14729,37 @@ fn walk_expr_bigint(e: &IrExpr, bigint: &BTreeSet<String>, found: &mut bool) {
         }
         _ => {}
     }
+}
+
+/// Lifted functions whose params are all bigint (used in bigint arith) —
+/// eligible for a native `mpz_t _pN` signature.
+fn analyze_bigint_param_fns(prog: &IrProgram) -> BTreeSet<String> {
+    let lifted = scan_fn_lifts(&prog.stmts);
+    let bigint = analyze_bigint_vars(prog);
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    let mut out = BTreeSet::new();
+    for (name, _arity) in &lifted {
+        let Some(body) = defmap.get(name) else { continue };
+        let mut param_vars = BTreeSet::new();
+        for st in body {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                if let Some(t) = targets.first() {
+                    if let IrExpr::Arith(a) = expr {
+                        if arith_refs_positional(a) {
+                            param_vars.insert(t.var.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !param_vars.is_empty() && param_vars.iter().all(|v| bigint.contains(v)) {
+            out.insert(name.clone());
+        }
+    }
+    out
 }
 
 /// True if every call to `name` passes only non-bigint args.
@@ -19587,6 +19658,67 @@ mod tests {
         assert!(
             out.contains("static char *add(long long _p1, long long _p2)"),
             "native signature missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bigint_param_fn_detected() {
+        // A lifted function whose param is bigint (used in bigint arith)
+        // is eligible for a native `mpz_t _p1` signature.
+        use crate::ir::{ArithAst, IrType, StrStyle};
+        let cast = |arg: ArithAst| ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(arg),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    named_blocks: vec![],
+                    body: vec![
+                        IrStmt::Assign {
+                            targets: vec![crate::ir::AssignTarget {
+                                var: "n".to_string(),
+                                sigil: None,
+                                indices: vec![],
+                            }],
+                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string())))),
+                            asm: None,
+                        },
+                        IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![IrExpr::Arith(Box::new(cast(
+                                    ArithAst::Var("n".to_string()),
+                                )))]),
+                            ],
+                        }),
+                    ],
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "f".to_string(),
+                    args: vec![IrExpr::Int(5)],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![("n".to_string(), IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let big = analyze_bigint_param_fns(&prog);
+        assert!(big.contains("f"), "f not bigint-param: {big:?}");
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static char *f(mpz_t _p1)"),
+            "bigint signature missing:\n{out}"
         );
     }
 
