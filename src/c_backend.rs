@@ -10277,16 +10277,27 @@ impl Render {
             _ => vec![],
         };
         for (i, it) in items.iter().enumerate() {
+            // `arr[len + 0]` -> `arr[len]` (drop the +0 for the first)
+            let idx = if i == 0 {
+                format!("{id}_len")
+            } else {
+                format!("{id}_len + {i}")
+            };
             if self.int_arrays.contains(var) {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
-                self.emit(&format!("{id}[{id}_len + {i}] = {nv};"));
+                self.emit(&format!("{id}[{idx}] = {nv};"));
             } else {
                 let v = self.value_c(it);
-                self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
+                self.emit(&format!("{id}[{idx}] = strdup((char*)({v}));"));
             }
         }
-        self.emit(&format!("{id}_len += {};", items.len()));
+        // a single append is `++len`; more is `len += n`
+        if items.len() == 1 {
+            self.emit(&format!("++{id}_len;"));
+        } else {
+            self.emit(&format!("{id}_len += {};", items.len()));
+        }
     }
 
     /// `${arr[i]}` — an element read (char* value)
