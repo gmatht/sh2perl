@@ -147,6 +147,25 @@ impl Width {
             other
         }
     }
+
+    /// A short suffix for width-specific helper/global names
+    /// (`_sh_sij_i8_v`, `_sh_sorted_int16_join`, ...).
+    fn suffix(self) -> &'static str {
+        match self {
+            Width::I8 => "i8",
+            Width::U8 => "u8",
+            Width::I16 => "i16",
+            Width::U16 => "u16",
+            Width::I32 => "i32",
+            Width::U32 => "u32",
+            Width::I64 => "i64",
+            Width::U64 => "u64",
+        }
+    }
+
+    fn is_signed(self) -> bool {
+        matches!(self, Width::I8 | Width::I16 | Width::I32 | Width::I64)
+    }
 }
 
 #[derive(Default)]
@@ -218,6 +237,8 @@ pub struct Render {
     /// true while rendering a native-numeric function (its `$N` reads are
     /// the numeric `_pN`, not `atoll(_pN)`).
     cur_native_num: bool,
+    /// int-array name -> narrowest element width (from the element ranges).
+    int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
@@ -666,6 +687,191 @@ fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>)
     }
 }
 
+/// The narrowest width that fits every element of an int-array, from the
+/// element expressions' ranges. An element with an unknown/unbounded range
+/// (e.g. `n / i` where `n` is a param) widens to I64.
+fn int_array_widths(
+    prog: &IrProgram,
+    ranges: &HashMap<String, (i128, i128)>,
+) -> HashMap<String, Width> {
+    let int_arrays = analyze_int_arrays(prog);
+    let state: HashMap<String, Option<(i128, i128)>> = ranges
+        .iter()
+        .map(|(k, v)| (k.clone(), Some(*v)))
+        .collect();
+    let mut elements: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    collect_array_elements(&prog.stmts, &mut elements);
+    let mut out = HashMap::new();
+    for arr in &int_arrays {
+        let mut w: Option<Width> = None;
+        if let Some(es) = elements.get(arr) {
+            for e in es {
+                let ew = expr_width(e, &state);
+                w = Some(match w {
+                    Some(cur) => cur.widen(ew),
+                    None => ew,
+                });
+            }
+        }
+        out.insert(arr.clone(), w.unwrap_or(Width::I64));
+    }
+    out
+}
+
+/// Collect every setArray/setArrayAppend element expression per array.
+fn collect_array_elements(stmts: &[IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => collect_array_elements_expr(e, out),
+            IrStmt::Assign { expr, .. } => collect_array_elements_expr(expr, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(then, out);
+                for (c, b) in elsifs {
+                    collect_array_elements_expr(c, out);
+                    collect_array_elements(b, out);
+                }
+                collect_array_elements(else_, out);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_array_elements_expr(iter, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::Function { body, .. } => collect_array_elements(body, out),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_array_elements(b, out)
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                collect_array_elements(init, out);
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(step, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                collect_array_elements_expr(discriminant, out);
+                for c in clauses {
+                    collect_array_elements(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_array_elements(inner, out);
+                for r in redirects {
+                    collect_array_elements_expr(&r.target, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages.iter().flatten() {
+                    collect_array_elements(std::slice::from_ref(st), out);
+                }
+            }
+            IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. } => collect_array_elements_expr(e, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    collect_array_elements_expr(e, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    collect_array_elements_expr(e, out);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                collect_array_elements_expr(path, out);
+                collect_array_elements_expr(content, out);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_array_elements(body, out);
+                for e in excepts {
+                    collect_array_elements(&e.body, out);
+                }
+                collect_array_elements(else_body, out);
+                collect_array_elements(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_array_elements_expr(e: &IrExpr, out: &mut HashMap<String, Vec<IrExpr>>) {
+    match e {
+        IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+            if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                (args.first(), args.get(1))
+            {
+                out.entry(name.clone()).or_default().extend(items.iter().cloned());
+            }
+            for a in args {
+                collect_array_elements_expr(a, out);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_array_elements_expr(a, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_array_elements_expr(i, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_array_elements_expr(lhs, out);
+            collect_array_elements_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_array_elements_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Index { key, .. } => collect_array_elements_expr(key, out),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            collect_array_elements_expr(iter, out);
+            collect_array_elements_expr(elem, out);
+            if let Some(c) = cond {
+                collect_array_elements_expr(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The width of an array-element expression (from its range).
+fn expr_width(e: &IrExpr, state: &HashMap<String, Option<(i128, i128)>>) -> Width {
+    match e {
+        IrExpr::Int(i) => Width::from_range_name(crate::shir::range_width_name(*i as i128, *i as i128)),
+        IrExpr::Arith(a) => match arith_range_local(a, state) {
+            Some((lo, hi)) => Width::from_range_name(crate::shir::range_width_name(lo, hi)),
+            None => Width::I64,
+        },
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => match state.get(name) {
+            Some(Some((lo, hi))) => Width::from_range_name(crate::shir::range_width_name(*lo, *hi)),
+            _ => Width::I64,
+        },
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                match state.get(name) {
+                    Some(Some((lo, hi))) => {
+                        Width::from_range_name(crate::shir::range_width_name(*lo, *hi))
+                    }
+                    _ => Width::I64,
+                }
+            } else {
+                Width::I64
+            }
+        }
+        _ => Width::I64,
+    }
+}
+
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
@@ -699,6 +905,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     r.int_arrays = analyze_int_arrays(&prog);
+    r.int_array_widths = int_array_widths(&prog, &ranges);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
     // Arena-scope safety: if ALL capture-assigned vars are non-escaping,
@@ -990,6 +1197,55 @@ impl Render {
     //     hoisted before the loop),
     //   - captures get a private command-text buffer per site (nested
     //     captures can't clobber an outer build).
+
+    /// Emit a width-specific sorted-unique int-join helper
+    /// (`_sh_sorted_int<W>_join`): sorts the raw values of the given
+    /// width directly, dedupes, and joins with ", ".
+    fn emit_sorted_int_join(&mut self, w: Width) {
+        let s = w.suffix();
+        let ct = w.c_type();
+        // the snprintf casts to a wide type so the format always matches
+        // the promoted vararg (narrow signed/unsigned promote to int).
+        let (cast, fmt) = if w.is_signed() {
+            ("(long long)", "%lld")
+        } else {
+            ("(unsigned long long)", "%llu")
+        };
+        self.emit(&format!("static {ct} *_sh_sij_{s}_v = 0;"));
+        self.emit(&format!("static int _sh_sij_{s}_cmp(const void *pa, const void *pb) {{"));
+        self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
+        self.emit(&format!("  {ct} x = _sh_sij_{s}_v[a], y = _sh_sij_{s}_v[b];"));
+        self.emit("  if (x != y) return x < y ? -1 : 1;");
+        self.emit("  return a < b ? -1 : a > b;");
+        self.emit("}");
+        self.emit(&format!("static void _sh_sorted_int{s}_join(_sh_vbuf *d, {ct} *a, size_t n) {{"));
+        self.emit("  static size_t *_sh_sij_ix = 0; static size_t _sh_sij_ixcap = 0;");
+        self.emit("  size_t i;");
+        self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
+        self.emit("  if (_sh_sij_ixcap < n) {");
+        self.emit("    size_t nc = _sh_sij_ixcap ? _sh_sij_ixcap : 64;");
+        self.emit("    while (nc < n) nc *= 2;");
+        self.emit("    size_t *np = (size_t *)realloc(_sh_sij_ix, nc * sizeof *_sh_sij_ix);");
+        self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+        self.emit("    _sh_sij_ix = np; _sh_sij_ixcap = nc;");
+        self.emit("  }");
+        self.emit(&format!("  _sh_sij_{s}_v = a;"));
+        self.emit("  for (i = 0; i < n; i++) _sh_sij_ix[i] = i;");
+        self.emit(&format!("  if (n > 0) qsort(_sh_sij_ix, n, sizeof *_sh_sij_ix, _sh_sij_{s}_cmp);"));
+        self.emit("  size_t dn = 0, k;");
+        self.emit("  for (k = 0; k < n; k++) {");
+        self.emit("    size_t j = _sh_sij_ix[k];");
+        self.emit("    if (k > 0 && a[j] == a[_sh_sij_ix[k-1]]) continue;");
+        self.emit("    char _s[32];");
+        self.emit(&format!("    snprintf(_s, sizeof _s, \"{fmt}\", {cast}a[j]);"));
+        self.emit("    size_t l = strlen(_s);");
+        self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
+        self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+        self.emit("    memcpy(d->p + dn, _s, l); dn += l;");
+        self.emit("  }");
+        self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+        self.emit("}");
+    }
 
     /// Emit the runtime preamble pieces the renderer has flagged.
     fn emit_runtime(&mut self) {
@@ -1509,42 +1765,18 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
-            // int-typed array (long long[]): sort the raw 64-bit values
-            // directly — no atoll parse, no string round-trip.
-            self.emit("static long long *_sh_sij64_v = 0;");
-            self.emit("static int _sh_sij64_cmp(const void *pa, const void *pb) {");
-            self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
-            self.emit("  long long x = _sh_sij64_v[a], y = _sh_sij64_v[b];");
-            self.emit("  if (x != y) return x < y ? -1 : 1;");
-            self.emit("  return a < b ? -1 : a > b;");
-            self.emit("}");
-            self.emit("static void _sh_sorted_int64_join(_sh_vbuf *d, long long *a, size_t n) {");
-            self.emit("  static size_t *_sh_sij_ix = 0; static size_t _sh_sij_ixcap = 0;");
-            self.emit("  size_t i;");
-            self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
-            self.emit("  if (_sh_sij_ixcap < n) {");
-            self.emit("    size_t nc = _sh_sij_ixcap ? _sh_sij_ixcap : 64;");
-            self.emit("    while (nc < n) nc *= 2;");
-            self.emit("    size_t *np = (size_t *)realloc(_sh_sij_ix, nc * sizeof *_sh_sij_ix);");
-            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
-            self.emit("    _sh_sij_ix = np; _sh_sij_ixcap = nc;");
-            self.emit("  }");
-            self.emit("  _sh_sij64_v = a;");
-            self.emit("  for (i = 0; i < n; i++) _sh_sij_ix[i] = i;");
-            self.emit("  if (n > 0) qsort(_sh_sij_ix, n, sizeof *_sh_sij_ix, _sh_sij64_cmp);");
-            self.emit("  size_t dn = 0, k;");
-            self.emit("  for (k = 0; k < n; k++) {");
-            self.emit("    size_t j = _sh_sij_ix[k];");
-            self.emit("    if (k > 0 && a[j] == a[_sh_sij_ix[k-1]]) continue;");
-            self.emit("    char _s[32];");
-            self.emit("    snprintf(_s, sizeof _s, \"%lld\", a[j]);");
-            self.emit("    size_t l = strlen(_s);");
-            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
-            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
-            self.emit("    memcpy(d->p + dn, _s, l); dn += l;");
-            self.emit("  }");
-            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
-            self.emit("}");
+            // int-typed arrays: sort the raw values directly — no atoll
+            // parse, no string round-trip. One helper per width actually
+            // used (I64 always, plus any narrower array widths).
+            let mut widths: Vec<Width> = vec![Width::I64];
+            for w in self.int_array_widths.values() {
+                if !widths.contains(w) {
+                    widths.push(*w);
+                }
+            }
+            for w in widths {
+                self.emit_sorted_int_join(w);
+            }
             self.emit("static mpz_t *_sh_sbj_v = 0; static size_t _sh_sbj_cap = 0; static size_t _sh_sbj_init = 0;");
             self.emit("static int _sh_sbj_cmp(const void *pa, const void *pb) {");
             self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
@@ -3880,7 +4112,8 @@ impl Render {
                     let vb = self.vbuf_temp();
                     if func == "sortedIntJoin" {
                         if self.int_arrays.contains(&name) {
-                            self.emit(&format!("_sh_sorted_int64_join(&{vb}, {id}, {id}_len);"));
+                            let w = self.int_array_widths.get(&name).copied().unwrap_or(Width::I64);
+                            self.emit(&format!("_sh_sorted_int{}_join(&{vb}, {id}, {id}_len);", w.suffix()));
                         } else {
                             self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
                         }
@@ -10635,7 +10868,8 @@ impl Render {
                             let vb = self.vbuf_temp();
                             if func == "sortedIntJoin" {
                                 if self.int_arrays.contains(name) {
-                                    self.emit(&format!("_sh_sorted_int64_join(&{vb}, {id}, {id}_len);"));
+                                    let w = self.int_array_widths.get(name).copied().unwrap_or(Width::I64);
+                                    self.emit(&format!("_sh_sorted_int{}_join(&{vb}, {id}, {id}_len);", w.suffix()));
                                 } else {
                                     self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
                                 }
@@ -13472,9 +13706,11 @@ impl Render {
                 self.emit(&format!("static size_t {id}_n = 0;"));
             } else if self.int_arrays.contains(a) {
                 // int-typed array: every element is a provable 64-bit
-                // integer, only consumed by sortedIntJoin — store as
-                // long long[], no string round-trip.
-                self.emit(&format!("static long long {id}[{ARR_CAP}] = {{0}};"));
+                // integer, only consumed by sortedIntJoin — store as the
+                // narrowest width that fits all elements, no string
+                // round-trip.
+                let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
+                self.emit(&format!("static {} {id}[{ARR_CAP}] = {{0}};", w.c_type()));
                 self.emit(&format!("static size_t {id}_len = 0;"));
             } else {
                 self.emit(&format!("static char *{id}[{ARR_CAP}] = {{0}};"));
@@ -18510,8 +18746,9 @@ mod tests {
     #[test]
     fn int_array_sorted_join_stores_long_long_natively() {
         // A sortedIntJoin-consumed array of PROVEN int elements (Int
-        // leaves) must be stored as `long long[]` with the native 64-bit
-        // value written directly — no snprintf→atoll string round-trip.
+        // leaves) must be stored as a native int array (narrowest width
+        // that fits — here int8_t) with the value written directly — no
+        // snprintf→atoll string round-trip.
         use crate::ir::StrStyle;
         let prog = IrProgram {
             imports: vec![],
@@ -18554,10 +18791,10 @@ mod tests {
             var_bash_env: vec![],
         };
         let out = shir_to_c(&prog);
-        assert!(out.contains("long long a[1024]"), "int array not long long[]:\n{out}");
+        assert!(out.contains("uint8_t a[1024]"), "int array not narrowed uint8_t[]:\n{out}");
         assert!(
-            out.contains("_sh_sorted_int64_join"),
-            "int64 join helper missing:\n{out}"
+            out.contains("_sh_sorted_intu8_join"),
+            "u8 join helper missing:\n{out}"
         );
         assert!(
             !out.contains("_sh_sorted_int_join"),
