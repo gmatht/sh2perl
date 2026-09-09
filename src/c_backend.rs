@@ -175,6 +175,9 @@ pub struct Render {
     /// named-temp counter for statement-level snprintf buffers
     /// (`char _sN[cap]; snprintf(_sN, ...)` before the enclosing stmt)
     temp_seq: usize,
+    /// compile-time-constant bigint values (decimal strings) materialized
+    /// as GLOBAL `mpz_t _bigint_<v>` constants, shared across functions.
+    bigint_consts: std::collections::BTreeSet<String>,
     todo: usize,
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
@@ -685,6 +688,15 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     if !r.bigint_vars.is_empty() {
         r.need_gmp = true;
     }
+    // compile-time-constant bigints become GLOBAL mpz_t constants
+    // (shared across functions, init once in main).
+    collect_bigint_consts(&prog.stmts, &mut r.bigint_consts);
+    for sub in &prog.subs {
+        collect_bigint_consts(&sub.body, &mut r.bigint_consts);
+    }
+    if !r.bigint_consts.is_empty() {
+        r.need_gmp = true;
+    }
     {
         // positional-constness: reads use main's params directly
         let mut vars = BTreeSet::new();
@@ -963,6 +975,28 @@ impl Render {
             // (mpz_init is a call, so it can't live at file scope); the
             // flag is only ever 0->1 and never read.
             self.emit("#define _SH_MPZ_INIT(name) static mpz_t name; static int name##_i = 0; if (!name##_i) { mpz_init(name); name##_i = 1; }");
+            // compile-time-constant bigints are GLOBAL `mpz_t _bigint_<v>`
+            // shared across functions, initialized once by _bigint_init
+            // (called at the top of main). mpz_init_set_str is a call, so
+            // it can't live at file scope — hence the init function.
+            if !self.bigint_consts.is_empty() {
+                let names: Vec<String> = self
+                    .bigint_consts
+                    .iter()
+                    .map(|v| format!("_bigint_{}", v))
+                    .collect();
+                self.emit(&format!("mpz_t {};", names.join(", ")));
+                self.emit("static void _bigint_init(void) {");
+                let consts = self.bigint_consts.clone();
+                for v in &consts {
+                    self.emit(&format!(
+                        "  mpz_init_set_str(_bigint_{}, \"{}\", 10);",
+                        v, v
+                    ));
+                }
+                self.emit("}");
+                self.emit("");
+            }
         }
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
@@ -3585,11 +3619,31 @@ impl Render {
     /// name for use as an operand, print source or assign RHS fragment.
     fn bigint_eval_temp(&mut self, a: &ArithAst) -> String {
         self.need_gmp = true;
+        // A COMPILE-TIME-CONSTANT bigint is a GLOBAL `mpz_t _bigint_<v>`
+        // shared across every function (initialized once by
+        // _bigint_init at the top of main). No local temp, no
+        // per-function duplication, no scope/lifetime juggling.
+        if let Some(v) = Self::bigint_const_value(a) {
+            self.bigint_consts.insert(v.clone());
+            return format!("_bigint_{}", v);
+        }
+        // a computed temp: 64-bit-bigint sequence name (unique).
         let t = format!("_bigint_64_{}", self.temp_seq);
         self.temp_seq += 1;
         self.emit(&format!("_SH_MPZ_INIT({t});"));
         self.bigint_into(a, &t);
         t
+    }
+
+    /// The decimal value of a COMPILE-TIME-CONSTANT bigint arith (a
+    /// literal or a Horner digit chain), else None. Lets a constant temp
+    /// be named after its value.
+    fn bigint_const_value(a: &ArithAst) -> Option<String> {
+        let a = Self::unwrap_cast(a);
+        match a {
+            ArithAst::Num(n) => Some(n.to_string()),
+            _ => Self::horner_chain_digits(a),
+        }
     }
 
     /// Decimal text of a bigint value into a fresh vbuf; returns the
@@ -13589,6 +13643,10 @@ impl Render {
                 self.emit(&format!("  mpz_init({v});"));
             }
         }
+        if !self.bigint_consts.is_empty() {
+            // global bigint constants init once, before any use
+            self.emit("  _bigint_init();");
+        }
         if self.need_sh {
             // bash seeds HOSTNAME itself — the gate env may not carry it
             // (064_21: ${HOSTNAME:-localhost} took the default).
@@ -16144,6 +16202,129 @@ fn collect_vars_full(
     }
 }
 
+/// Collect compile-time-constant bigint values (decimal strings) from
+/// every arith node, so they can be materialized as GLOBAL `mpz_t
+/// _bigint_<v>` constants (shared across functions, init once in main).
+fn collect_bigint_consts(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => collect_bigint_consts_expr(e, out),
+            IrStmt::Assign { expr, .. } => collect_bigint_consts_expr(expr, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_bigint_consts_expr(cond, out);
+                collect_bigint_consts(then, out);
+                for (c, b) in elsifs {
+                    collect_bigint_consts_expr(c, out);
+                    collect_bigint_consts(b, out);
+                }
+                collect_bigint_consts(else_, out);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_bigint_consts_expr(cond, out);
+                collect_bigint_consts(body, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_bigint_consts_expr(iter, out);
+                collect_bigint_consts(body, out);
+            }
+            IrStmt::Function { body, .. } => collect_bigint_consts(body, out),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_bigint_consts(b, out)
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                collect_bigint_consts(init, out);
+                collect_bigint_consts_expr(cond, out);
+                collect_bigint_consts(step, out);
+                collect_bigint_consts(body, out);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                collect_bigint_consts_expr(discriminant, out);
+                for c in clauses {
+                    collect_bigint_consts(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_bigint_consts(inner, out);
+                for r in redirects {
+                    collect_bigint_consts_expr(&r.target, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages.iter().flatten() {
+                    collect_bigint_consts(std::slice::from_ref(st), out);
+                }
+            }
+            IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. } => collect_bigint_consts_expr(e, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    collect_bigint_consts_expr(e, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    collect_bigint_consts_expr(e, out);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                collect_bigint_consts_expr(path, out);
+                collect_bigint_consts_expr(content, out);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_bigint_consts(body, out);
+                for e in excepts {
+                    collect_bigint_consts(&e.body, out);
+                }
+                collect_bigint_consts(else_body, out);
+                collect_bigint_consts(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_bigint_consts_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Arith(a) => {
+            if let Some(v) = Render::bigint_const_value(a) {
+                out.insert(v);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_bigint_consts_expr(a, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_bigint_consts_expr(i, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_bigint_consts_expr(lhs, out);
+            collect_bigint_consts_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_bigint_consts_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Index { key, .. } => collect_bigint_consts_expr(key, out),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            collect_bigint_consts_expr(iter, out);
+            collect_bigint_consts_expr(elem, out);
+            if let Some(c) = cond {
+                collect_bigint_consts_expr(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Collect ArrayComp loop vars (declared inside the comprehension loop,
 /// mirroring for-loop vars).
 fn collect_array_comp_vars(e: &IrExpr, for_vars: &mut BTreeSet<String>) {
@@ -18020,7 +18201,7 @@ mod tests {
         };
         let out = shir_to_c(&prog);
         assert!(
-            out.contains("mpz_set_str(_bigint_64_0, \"123456789012345678901234567890\", 10);"),
+            out.contains("mpz_init_set_str(_bigint_123456789012345678901234567890, \"123456789012345678901234567890\", 10);"),
             "chain not folded to one set_str:\n{out}"
         );
         // the chain's per-digit mpz_mul/mpz_add steps must be gone
