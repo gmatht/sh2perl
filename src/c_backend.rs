@@ -10199,7 +10199,11 @@ impl Render {
                         self.emit(&format!("char *{sv_tag}_{id} = {id};"));
                     }
                 }
-                let cn = format!("_cn{}", self.temp_seq);
+                // human-readable temp name: `_cn_<fname>_<seq>` so a
+                // call result reads as `_cn_all_factors_3` instead of
+                // the opaque `_cn3`. The seq keeps multiple calls to the
+                // same function distinct.
+                let cn = format!("_cn_{}_{}", fname, self.temp_seq);
                 self.temp_seq += 1;
                 if let Some(&arity) = self.lifted_fns.get(&fname) {
                     // NATIVE calling convention: the fn takes real C
