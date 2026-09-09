@@ -252,6 +252,9 @@ pub struct Render {
     /// the return array of the array-return function currently being
     /// rendered (None otherwise) — its storage is `mpz_t[]`.
     cur_array_return_arr: Option<String>,
+    /// var name -> lifetime (first/last access, escapes) for the
+    /// end-of-scope free pass.
+    var_lifetimes: std::collections::HashMap<String, crate::ir::VarLifetime>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -898,6 +901,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     prog.var_storage = crate::shir::select_storage_classes(&prog);
     prog.var_const = crate::shir::analyze_var_const(&prog);
     // NONZERO-DIVISOR proof (shared shIR analysis): a var whose proven
@@ -915,6 +919,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     let widths = effective_widths(&prog, &ranges);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.var_lifetimes = prog.var_lifetimes.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
     r.var_storage = prog.var_storage.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
@@ -1135,6 +1140,20 @@ impl Render {
 
     fn is_num(&self, name: &str) -> bool {
         self.var_types.get(name).copied() == Some(IrType::Int)
+    }
+
+    /// A store var that OWNS heap storage (a `char*` assigned via
+    /// strdup/malloc) and is therefore safe to `free()`. Excludes the
+    /// non-heap store shapes: Int vars (`long long`), bigint vars
+    /// (`mpz_t` — need `mpz_clear`, not `free`), const-lifted string
+    /// literals (lifted to `const char*` pointing at static storage),
+    /// and fixed-size buffers (`char v[N+1]` — `buf_bound` is Some).
+    fn is_heap_store_var(&self, name: &str) -> bool {
+        self.store.contains(name)
+            && !self.is_num(name)
+            && !self.bigint_vars.contains(name)
+            && !self.const_lifted.contains(name)
+            && self.buf_bound(name).is_none()
     }
 
     /// The fixed-buffer bound for a Str var (Some(N) -> `char v[N+1]`),
@@ -3481,6 +3500,18 @@ impl Render {
             self.emit("");
         }
         self.out.extend(body_out.iter().cloned());
+        // free the function's non-escaping heap store vars (strdup'd
+        // temps) at the end of the function — a one-shot temp like
+        // __fl0 is read once and never freed. Only heap-owning store
+        // vars (not num/bigint/const/buffer) are freed, and only
+        // non-escaping ones (a returned/closure-captured value is
+        // still live in the caller).
+        let lifetimes = self.var_lifetimes.clone();
+        for (name, lt) in &lifetimes {
+            if !lt.escapes && fvars.contains(name) && self.is_heap_store_var(name) {
+                self.emit(&format!("free({});", self.c_ident(name)));
+            }
+        }
         self.depth -= 1;
         self.emit("}");
     }
@@ -13960,6 +13991,17 @@ impl Render {
                 "_sh_wrap_cmd({}); system(_sh_wrap);",
                 Self::cstr(body)
             ));
+        }
+        // free non-escaping store vars (strdup'd temps) at the end of
+        // main — a one-shot temp like __fl0 is read once and never freed.
+        let lifetimes = self.var_lifetimes.clone();
+        for (name, lt) in &lifetimes {
+            if std::env::var("SH2_DBG_FREE").is_ok() {
+                eprintln!("DBG free {name}: esc={} store={} top={}", lt.escapes, self.store.contains(name), self.top_vars.contains(name));
+            }
+            if !lt.escapes && self.top_vars.contains(name) && self.is_heap_store_var(name) {
+                self.emit(&format!("free({});", self.c_ident(name)));
+            }
         }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
