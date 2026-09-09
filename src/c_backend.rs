@@ -243,6 +243,15 @@ pub struct Render {
     /// true while rendering a bigint-param function (its `$N` reads are
     /// the mpz_t `_pN`).
     cur_bigint_param: bool,
+    /// lifted functions whose return is `echo sortedIntJoin/sortedBigintJoin("arr")`
+    /// — eligible for a native `mpz_t *f(…, size_t *len)` array return.
+    array_return_fns: std::collections::BTreeSet<String>,
+    /// array-return function name -> the array it returns (for the
+    /// `mpz_t[]` storage + return).
+    array_return_arrays: std::collections::HashMap<String, String>,
+    /// the return array of the array-return function currently being
+    /// rendered (None otherwise) — its storage is `mpz_t[]`.
+    cur_array_return_arr: Option<String>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -932,6 +941,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.lifted_fns = scan_fn_lifts(&prog.stmts);
     r.native_num_fns = analyze_native_num_fns(&prog);
     r.bigint_param_fns = analyze_bigint_param_fns(&prog);
+    r.array_return_arrays = analyze_array_return_fns(&prog);
+    r.array_return_fns = r.array_return_arrays.keys().cloned().collect();
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
@@ -1785,6 +1796,23 @@ impl Render {
             for w in widths {
                 self.emit_sorted_int_join(w);
             }
+            // format an mpz_t[] as "1, 2, 3" (the array-return ABI's
+            // call-site formatting; the caller's print adds the brackets).
+            self.emit("static char *_sh_mpz_arr_join(mpz_t *a, size_t n) {");
+            self.emit("  static _sh_vbuf d = {0, 0};");
+            self.emit("  _sh_vgrow(&d, 1); d.p[0] = 0;");
+            self.emit("  size_t dn = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    char *s = mpz_get_str(0, 10, a[i]);");
+            self.emit("    size_t l = strlen(s);");
+            self.emit("    _sh_vgrow(&d, dn + (i > 0 ? 2 : 0) + l + 1);");
+            self.emit("    if (i > 0) { d.p[dn++] = ','; d.p[dn++] = ' '; }");
+            self.emit("    memcpy(d.p + dn, s, l); dn += l;");
+            self.emit("    free(s);");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(&d, dn + 1); d.p[dn] = 0;");
+            self.emit("  return d.p;");
+            self.emit("}");
             self.emit("static mpz_t *_sh_sbj_v = 0; static size_t _sh_sbj_cap = 0; static size_t _sh_sbj_init = 0;");
             self.emit("static int _sh_sbj_cmp(const void *pa, const void *pb) {");
             self.emit("  size_t a = *(const size_t *)pa, b = *(const size_t *)pb;");
@@ -3190,23 +3218,38 @@ impl Render {
             None => format!("static void {fname}(void)"),
             Some(&0) => format!("static char *{fname}(void)"),
             Some(&n) => {
-                let native = self.native_num_fns.contains(name);
-                let big = self.bigint_param_fns.contains(name);
-                format!(
-                    "static char *{fname}({})",
-                    (1..=n)
+                if self.array_return_fns.contains(name) {
+                    // native array return: mpz_t *f(params..., size_t *len)
+                    let params = (1..=n)
                         .map(|i| {
-                            if native {
+                            if self.native_num_fns.contains(name) {
                                 format!("long long _p{i}")
-                            } else if big {
-                                format!("mpz_t _p{i}")
                             } else {
-                                format!("char *_p{i}")
+                                format!("mpz_t _p{i}")
                             }
                         })
                         .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                        .join(", ");
+                    format!("static mpz_t *{fname}({params}, size_t *len)")
+                } else {
+                    let native = self.native_num_fns.contains(name);
+                    let big = self.bigint_param_fns.contains(name);
+                    format!(
+                        "static char *{fname}({})",
+                        (1..=n)
+                            .map(|i| {
+                                if native {
+                                    format!("long long _p{i}")
+                                } else if big {
+                                    format!("mpz_t _p{i}")
+                                } else {
+                                    format!("char *_p{i}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             }
         }
     }
@@ -3276,8 +3319,10 @@ impl Render {
         let saved_params = std::mem::take(&mut self.cur_params);
         let saved_native = self.cur_native_num;
         let saved_big = self.cur_bigint_param;
+        let saved_arr = self.cur_array_return_arr.take();
         self.cur_native_num = lifted_arity.is_some() && self.native_num_fns.contains(name);
         self.cur_bigint_param = lifted_arity.is_some() && self.bigint_param_fns.contains(name);
+        self.cur_array_return_arr = self.array_return_arrays.get(name).cloned();
         if let Some(arity) = lifted_arity {
             self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
         }
@@ -3295,10 +3340,16 @@ impl Render {
             self.stmt(st);
         }
         if let (Some(_arity), true) = (lifted_arity, lifted && n_body > 0) {
-            // the trailing echo's single element — its VALUE is the
-            // function's value (echo printed value+\n; the $( ) capture
-            // strips trailing newlines; _sh_ret_val does the same)
-            if let IrStmt::Expr(IrExpr::Call { args, .. }) = body.last().unwrap() {
+            // array-return function: return the mpz_t[] and its length
+            if let Some(arr) = self.array_return_arrays.get(name) {
+                let aid = self.c_ident(arr);
+                self.emit(&format!("*len = {aid}_len;"));
+                self.emit(&format!("return {aid};"));
+            } else {
+                // the trailing echo's single element — its VALUE is the
+                // function's value (echo printed value+\n; the $( ) capture
+                // strips trailing newlines; _sh_ret_val does the same)
+                if let IrStmt::Expr(IrExpr::Call { args, .. }) = body.last().unwrap() {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(val) = items.first() {
                         let v = self.value_c(val);
@@ -3322,10 +3373,12 @@ impl Render {
                     }
                 }
             }
+            }
         }
         self.cur_params = saved_params;
         self.cur_native_num = saved_native;
         self.cur_bigint_param = saved_big;
+        self.cur_array_return_arr = saved_arr;
         let fn_file_vars: BTreeSet<String> = self
             .site_file_vars
             .difference(&fn_vars_before)
@@ -3404,6 +3457,7 @@ impl Render {
         // forward declaration: a function may CALL another defined later
         // (nested defs are hoisted in collection order — 081 inner/outer)
         let sig = self.fn_c_sig(name, &fname);
+        if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG sig {name}: {sig:?}"); }
         self.fn_fwd_decls.push(format!("{sig};"));
         self.emit(&format!("{sig} {{"));
         self.depth += 1;
@@ -10061,6 +10115,7 @@ impl Render {
                     // no helper. Missing args pad "" (unset positionals).
                     let native = self.native_num_fns.contains(&fname);
                     let big = self.bigint_param_fns.contains(&fname);
+                    let arr_ret = self.array_return_fns.contains(&fname);
                     let mut a: Vec<String> = Vec::new();
                     for i in 0..arity {
                         let v = match call_args.get(i) {
@@ -10083,11 +10138,29 @@ impl Render {
                         };
                         a.push(v);
                     }
-                    self.emit(&format!(
-                        "char *{cn} = {}({});",
-                        self.c_ident(&fname),
-                        a.join(", ")
-                    ));
+                    if arr_ret {
+                        // array-return ABI: call with a length out-param,
+                        // then format the mpz_t[] back to a string.
+                        let lenv = format!("_len{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let arrv = format!("_arr{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("size_t {lenv};"));
+                        self.emit(&format!(
+                            "mpz_t *{arrv} = {}({}, &{lenv});",
+                            self.c_ident(&fname),
+                            a.join(", ")
+                        ));
+                        self.emit(&format!(
+                            "char *{cn} = _sh_mpz_arr_join({arrv}, {lenv});"
+                        ));
+                    } else {
+                        self.emit(&format!(
+                            "char *{cn} = {}({});",
+                            self.c_ident(&fname),
+                            a.join(", ")
+                        ));
+                    }
                 } else {
                     // arg values FIRST: their value_c temps must precede the
                     // compound-literal statement below
@@ -10686,7 +10759,11 @@ impl Render {
             } else {
                 format!("{id}_len + {i}")
             };
-            if self.int_arrays.contains(var) {
+            if self.cur_array_return_arr.as_deref() == Some(var) {
+                // the return array of an array-return function: mpz_t[]
+                let v = self.value_c(it);
+                self.emit(&format!("mpz_set_str({id}[{idx}], {v}, 10);"));
+            } else if self.int_arrays.contains(var) {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
                 self.emit(&format!("{id}[{idx}] = {nv};"));
@@ -13828,11 +13905,18 @@ impl Render {
         self.store.retain(|v| !v.contains('['));
         let arrays: Vec<String> = self.arrays.iter().cloned().collect();
         for a in &arrays {
+            if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG decl array {a}"); }
             let id = self.c_ident(a);
             if self.assoc_arrays.contains(a) {
+                if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} assoc"); }
                 self.emit(&format!("static char *{id}_k[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static char *{id}_v[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_n = 0;"));
+            } else if self.array_return_arrays.values().any(|ra| ra == a) {
+                if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} arr_ret"); }
+                // the return array of an array-return function: mpz_t[]
+                self.emit(&format!("static mpz_t {id}[{ARR_CAP}];"));
+                self.emit(&format!("static size_t {id}_len = 0;"));
             } else if self.int_arrays.contains(a) {
                 // int-typed array: every element is a provable 64-bit
                 // integer, only consumed by sortedIntJoin — store as the
@@ -14757,6 +14841,40 @@ fn analyze_bigint_param_fns(prog: &IrProgram) -> BTreeSet<String> {
         }
         if !param_vars.is_empty() && param_vars.iter().all(|v| bigint.contains(v)) {
             out.insert(name.clone());
+        }
+    }
+    out
+}
+
+/// Lifted functions whose return is `echo sortedBigintJoin("arr")` —
+/// eligible for a native `mpz_t *f(…, size_t *len)` array return. Only
+/// BIGINT joins qualify (small factors stay on the string return).
+/// Returns function name -> the array it returns.
+fn analyze_array_return_fns(prog: &IrProgram) -> HashMap<String, String> {
+    let lifted = scan_fn_lifts(&prog.stmts);
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    let mut out = HashMap::new();
+    for (name, _arity) in &lifted {
+        let Some(body) = defmap.get(name) else { continue };
+        if let Some(IrStmt::Expr(IrExpr::Call { func, args })) = body.last() {
+            if matches!(func.as_str(), "exec" | "builtin") {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    if cmd == "echo" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let [IrExpr::Call { func: jf, args: jargs }] = items.as_slice() {
+                                if jf == "sortedBigintJoin" {
+                                    if let Some(IrExpr::Str(arr, _)) = jargs.first() {
+                                        out.insert(name.clone(), arr.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     out
@@ -19719,6 +19837,69 @@ mod tests {
         assert!(
             out.contains("static char *f(mpz_t _p1)"),
             "bigint signature missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_return_fn_detected() {
+        // A lifted function whose return is `echo sortedBigintJoin("f")`
+        // is eligible for a native `mpz_t *f(…, size_t *len)` array
+        // return.
+        use crate::ir::{ArithAst, IrType, StrStyle};
+        let cast = |arg: ArithAst| ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(arg),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    named_blocks: vec![],
+                    body: vec![
+                        IrStmt::Assign {
+                            targets: vec![crate::ir::AssignTarget {
+                                var: "n".to_string(),
+                                sigil: None,
+                                indices: vec![],
+                            }],
+                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string())))),
+                            asm: None,
+                        },
+                        IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![IrExpr::Call {
+                                    func: "sortedBigintJoin".to_string(),
+                                    args: vec![IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted)],
+                                }]),
+                            ],
+                        }),
+                    ],
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "f".to_string(),
+                    args: vec![IrExpr::Int(5)],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![("n".to_string(), IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let arr = analyze_array_return_fns(&prog);
+        assert_eq!(arr.get("f").map(|s| s.as_str()), Some("f"), "f not array-return: {arr:?}");
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static mpz_t *f(long long _p1, size_t *len)"),
+            "array-return signature missing:\n{out}"
         );
     }
 
