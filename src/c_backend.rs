@@ -1115,27 +1115,24 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             *line = format!("{}{};", indent, &t[1..t.len() - 2]);
         }
     }
-    // P1 OOM policy: redirect every strdup through the checking
-    // _sh_xstrdup (fail-stop on allocation failure — never a NULL that
-    // flows to a print guard as empty output). Inserted here, after
-    // render and before trim_includes, and only when a call site
-    // exists: the helper is present iff used (no unused-function
-    // warning), the include trim sees the final text, and the #define
-    // lands after every #include (no header is emitted later) but
-    // before every use. The helper body calls (strdup) — parenthesized
-    // to exempt it from its own macro.
+    // P1 OOM policy: every strdup call site in the output reads
+    // _sh_xstrdup explicitly (fail-stop on allocation failure — never
+    // a NULL that flows to a print guard as empty output). The helper
+    // is inserted here, after render and before trim_includes, and
+    // only when a call site exists: present iff used (no
+    // unused-function warning), and the include trim sees the final
+    // text (call sites keep <string.h> via the "strdup(" trigger).
     {
         let full = r.out.join("\n");
-        if full.contains("strdup(") {
+        if full.contains("_sh_xstrdup(") {
             let pos = r.out.iter().rposition(|l| l.trim_start().starts_with("#include ")).map(|i| i + 1).unwrap_or(0);
             let helper = vec![
                 "/* checked strdup (P1 OOM policy): fail-stop, never NULL-on-OOM */".to_string(),
                 "static char *_sh_xstrdup(const char *s) {".to_string(),
-                "  char *p = (strdup)(s);".to_string(),
+                "  char *p = strdup(s);".to_string(),
                 "  if (s && !p) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }".to_string(),
                 "  return p;".to_string(),
                 "}".to_string(),
-                "#define strdup _sh_xstrdup".to_string(),
                 "".to_string(),
             ];
             r.out.splice(pos..pos, helper);
@@ -1617,7 +1614,7 @@ impl Render {
             self.emit("typedef struct { char buf[SH2_ARENA_CAP]; size_t used; } _sh_arena;");
             self.emit("static char *_sh_adup(_sh_arena *a, const char *s) {");
             self.emit("  size_t n = strlen(s) + 1;");
-            self.emit("  if (a->used + n > SH2_ARENA_CAP) return strdup(s);");
+            self.emit("  if (a->used + n > SH2_ARENA_CAP) return _sh_xstrdup(s);");
             self.emit("  char *r = a->buf + a->used; memcpy(r, s, n); a->used += n; return r;");
             self.emit("}");
             self.emit("static void _sh_arena_reset(_sh_arena *a) { a->used = 0; }");
@@ -1625,7 +1622,7 @@ impl Render {
             self.emit("typedef struct { char *p; } _sh_mstr;");
             self.emit("static void _sh_mstr_set(_sh_mstr *v, const char *val) {");
             self.emit("  free(v->p);");
-            self.emit("  v->p = val ? strdup(val) : NULL;");
+            self.emit("  v->p = val ? _sh_xstrdup(val) : NULL;");
             self.emit("}");
             self.emit("static const char *_sh_mstr_get(const _sh_mstr *v) {");
             self.emit("  return (v->p) ? v->p : \"\";");
@@ -1913,7 +1910,7 @@ impl Render {
             self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             // strdup: the source may be a stack temp that dies when its
             // block closes (a capture/arith string in a loop body)
-            self.emit("  a[i] = (char*)strdup(v);");
+            self.emit("  a[i] = (char*)_sh_xstrdup(v);");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -1923,8 +1920,8 @@ impl Render {
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
-            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)strdup(val ? val : \"\"); return; }");
-            self.emit("  if (*n < cap) { k[*n] = (char*)strdup(key); v[*n] = (char*)strdup(val ? val : \"\"); (*n)++; }");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)_sh_xstrdup(val ? val : \"\"); return; }");
+            self.emit("  if (*n < cap) { k[*n] = (char*)_sh_xstrdup(key); v[*n] = (char*)_sh_xstrdup(val ? val : \"\"); (*n)++; }");
             self.emit("  else { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             self.emit("}");
             self.emit("static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {");
@@ -2254,12 +2251,12 @@ impl Render {
             self.emit("static long long _sh_postinc(char **v, int d) {");
             self.emit("  long long r = atoll(*v ? *v : \"\");");
             self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", (long long)(r + d));");
-            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("  free(*v); *v = _sh_xstrdup(b); return r;");
             self.emit("}");
             self.emit("static long long _sh_preinc(char **v, int d) {");
             self.emit("  long long r = atoll(*v ? *v : \"\") + d;");
             self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", r);");
-            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("  free(*v); *v = _sh_xstrdup(b); return r;");
             self.emit("}");
             self.emit("/* fixed-buffer forms: write in place (bound asserted elsewhere) */");
             self.emit("static long long _sh_postinc_buf(char *v, int d) {");
@@ -2490,7 +2487,7 @@ impl Render {
             self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
             self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
             self.emit("  /* no free: the slot may be a fixed buffer, not heap */");
-            self.emit("  *slot = val ? strdup(val) : \"\";");
+            self.emit("  *slot = val ? _sh_xstrdup(val) : \"\";");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
@@ -3685,9 +3682,9 @@ impl Render {
                             {
                                 // impure value exprs must run exactly once
                                 self.emit(&format!("char *{rv} = {v};"));
-                                self.emit(&format!("char *{ret} = strdup((char*)({rv}));"));
+                                self.emit(&format!("char *{ret} = _sh_xstrdup((char*)({rv}));"));
                             } else {
-                                self.emit(&format!("char *{ret} = strdup((char*)({v}));"));
+                                self.emit(&format!("char *{ret} = _sh_xstrdup((char*)({v}));"));
                             }
                             self.emit_fn_frees(&fvars);
                             self.flush_pending_frees();
@@ -7104,9 +7101,9 @@ impl Render {
                             let v = self.value_c(w);
                             match guard {
                                 Some(g) => self.emit(&format!(
-                                    "if ({g}) {{ {av}[{sk}++] = strdup({v}); }}"
+                                    "if ({g}) {{ {av}[{sk}++] = _sh_xstrdup({v}); }}"
                                 )),
-                                None => self.emit(&format!("{av}[{sk}++] = strdup({v});")),
+                                None => self.emit(&format!("{av}[{sk}++] = _sh_xstrdup({v});")),
                             }
                         }
                         self.emit(&format!("_sh_argv = {av}; _sh_argc = {sk};"));
@@ -11049,7 +11046,7 @@ impl Render {
         if is_num {
             self.emit(&format!("{var_name} = (long long)atoll({arr_id}[_k{seq}]);"));
         } else {
-            self.emit(&format!("{var_name} = strdup({arr_id}[_k{seq}]);"));
+            self.emit(&format!("{var_name} = _sh_xstrdup({arr_id}[_k{seq}]);"));
         }
         if let Some(c) = cond {
             let cc = self.expr(c);
@@ -11060,7 +11057,7 @@ impl Render {
         // P1: the loop appends into a fixed [ARR_CAP] array — refuse
         // past the cap instead of overflowing.
         self.emit(&format!("if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
-        self.emit(&format!("{id}[{id}_len++] = strdup((char*)({ev}));"));
+        self.emit(&format!("{id}[{id}_len++] = _sh_xstrdup((char*)({ev}));"));
         if cond.is_some() {
             self.depth -= 1;
             self.emit("}");
@@ -11178,7 +11175,7 @@ impl Render {
                         "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
                     ));
                     self.emit(&format!(
-                        "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = strdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
+                        "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = _sh_xstrdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
                     ));
                     self.emit(&format!(
                         "{id}_len = {ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
@@ -11209,7 +11206,7 @@ impl Render {
                         "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
                     ));
                     self.emit(&format!(
-                        "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = strdup({t}_w[_sk{t}]);"
+                        "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = _sh_xstrdup({t}_w[_sk{t}]);"
                     ));
                     self.emit(&format!("{id}_len = {ai} + _sn{t};"));
                     self.emit(&format!("{ai} += _sn{t};"));
@@ -11233,7 +11230,7 @@ impl Render {
                     self.emit("}");
                 }
             } else {
-                self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
+                self.emit(&format!("{id}[{ai}] = _sh_xstrdup((char*)({v}));"));
             }
             self.emit(&format!("{id}_len = ++{ai};"));
         }
@@ -11279,7 +11276,7 @@ impl Render {
                 }
             } else {
                 let v = self.value_c(it);
-                self.emit(&format!("{id}[{idx}] = strdup((char*)({v}));"));
+                self.emit(&format!("{id}[{idx}] = _sh_xstrdup((char*)({v}));"));
             }
         }
         // a single append is `++len`; more is `len += n`
@@ -11889,7 +11886,7 @@ impl Render {
             let store = if self.buf_bound(name).is_some() {
                 format!("strcpy({}, {t}.p)", name)
             } else {
-                format!("{name} = strdup({t}.p);")
+                format!("{name} = _sh_xstrdup({t}.p);")
             };
             return Some(format!(
                 "({{ {sn} {store} }})",
@@ -12230,10 +12227,10 @@ impl Render {
                             Some(s) if s.is_empty() => {
                                 // IFS= : raw whole line to the FIRST var
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
+                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
                                 for (vi, v) in vars_c.iter().enumerate().skip(1) {
                                     let vid2 = self.c_ident(v);
-                                    self.emit(&format!("{vid2} = strdup(\"\");"));
+                                    self.emit(&format!("{vid2} = _sh_xstrdup(\"\");"));
                                 }
                             }
                             Some(cs) => {
@@ -12367,16 +12364,16 @@ impl Render {
                                     "{{ size_t _sk{id} = 0; while (_rl{id}.p[_sk{id}] == ' ' || _rl{id}.p[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}.p, _rl{id}.p + _sk{id}, strlen(_rl{id}.p + _sk{id}) + 1); }}"
                                 ));
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
+                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
                             }
                             Some(s) if s.is_empty() => {
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = strdup(_rl{id}.p);"));
+                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
                             }
                             Some(cs) if nv == 1 => {
                                 let vid = self.c_ident(&vars_c[0]);
                                 self.emit(&format!(
-                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {vid} = strdup(_rl{id}.p); }}",
+                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {vid} = _sh_xstrdup(_rl{id}.p); }}",
                                     cs_byte = cs.as_bytes()[0]
                                 ));
                             }
@@ -12467,7 +12464,7 @@ impl Render {
                         let t = self.value_c(target);
                         let strip = if striptail { "1" } else { "0" };
                         self.emit(&format!(
-                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[{id}_len++] = strdup(_mfl.p); }} fclose(_mf); }} }}"
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[{id}_len++] = _sh_xstrdup(_mfl.p); }} fclose(_mf); }} }}"
                         ));
                         return;
                     }
@@ -13016,7 +13013,7 @@ impl Render {
                         if self.top_vars.contains(&t.var) && !rhs.contains(&name) {
                             self.emit(&format!("free({name});"));
                         }
-                        self.emit(&format!("{name} = strdup((char*)({rhs}));"));
+                        self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
                     }
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
@@ -13059,7 +13056,7 @@ impl Render {
                                     );
                                 } else {
                                     self.emit(&format!(
-                                        "{name} = strdup((char*)({v}));"
+                                        "{name} = _sh_xstrdup((char*)({v}));"
                                     ));
                                 }
                             }
@@ -13778,7 +13775,7 @@ impl Render {
                     } else {
                         // deep copy for unbounded char* — an alias would
                         // let body mutations leak through the restore
-                        saves.push(format!("char* _sv_{id} = {id} ? strdup({id}) : NULL;"));
+                        saves.push(format!("char* _sv_{id} = {id} ? _sh_xstrdup({id}) : NULL;"));
                         restores.push(format!("free({id}); {id} = _sv_{id};"));
                     }
                 }
@@ -13905,7 +13902,7 @@ impl Render {
                 }
                 for (i, e) in elements.iter().enumerate() {
                     let v = self.value_c(e);
-                    self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
+                    self.emit(&format!("{id}[{i}] = _sh_xstrdup((char*)({v}));"));
                 }
                 self.emit(&format!("{id}_len = {};", elements.len()));
             }
@@ -14094,7 +14091,7 @@ impl Render {
                 self.emit(&format!(
                     "size_t _fn{k} = strlen(_fll{k}.p); while (_fn{k} && (_fll{k}.p[_fn{k}-1]=='\\n' || _fll{k}.p[_fn{k}-1]=='\\r')) _fll{k}.p[--_fn{k}] = 0;"
                 ));
-                self.emit(&format!("{var} = strdup(_fll{k}.p);"));
+                self.emit(&format!("{var} = _sh_xstrdup(_fll{k}.p);"));
                 for b in &fl.body {
                     self.stmt(b);
                 }
@@ -14146,7 +14143,7 @@ impl Render {
                         // `except E as e:` — bind the raised value
                         let id = self.c_ident(name);
                         self.emit(&format!(
-                            "  {id} = strdup(_sh_exc_val ? _sh_exc_val : \"\");"
+                            "  {id} = _sh_xstrdup(_sh_exc_val ? _sh_exc_val : \"\");"
                         ));
                     }
                     for st in &ex.body {
@@ -20912,32 +20909,37 @@ mod tests {
     }
 
     #[test]
-    fn p1_strdup_redirected_through_xstrdup() {
-        // P1 OOM policy: every strdup in the output must route through
-        // the checking _sh_xstrdup (fail-stop, never NULL-on-OOM that
-        // flows to a print guard as empty output). A capture+echo
-        // program has strdup sites; pure arithmetic has none.
+    fn p1_strdup_checked_at_call_sites() {
+        // P1 OOM policy: every strdup call site in the output must read
+        // _sh_xstrdup explicitly (fail-stop, never NULL-on-OOM that
+        // flows to a print guard as empty output) — no bare strdup
+        // calls, no macro hiding the check. A capture+echo program has
+        // strdup sites; pure arithmetic has none.
         let src = "x=$(echo hi); echo \"$x\"";
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = crate::shir::ast_to_ir(&cmds);
         let out = shir_to_c(&prog);
         assert!(out.contains("static char *_sh_xstrdup(const char *s) {"), "helper missing:\n{out}");
-        assert!(out.contains("#define strdup _sh_xstrdup"), "macro missing:\n{out}");
-        assert!(out.contains("(strdup)(s)"), "helper must call the real strdup:\n{out}");
         assert!(out.contains("sh2c: out of memory"), "diagnostic missing:\n{out}");
+        assert!(!out.contains("#define strdup"), "macro hides the check:\n{out}");
+        assert!(out.contains("_sh_xstrdup((char*)"), "no checked call site:\n{out}");
+        // every strdup( is either a checked call or the helper body's
+        // own real call — no bare unchecked calls remain.
+        let total = out.match_indices("strdup(").count();
+        let checked = out.match_indices("_sh_xstrdup(").count();
+        assert_eq!(total, checked + 1, "bare strdup calls remain:\n{out}");
+        // the helper precedes its uses and follows the header.
         let inc = out.find("#include <string.h>").expect("string.h kept");
-        let def = out.find("#define strdup _sh_xstrdup").unwrap();
-        let use_ = out.find("strdup((char*)").expect("a call site exists");
-        assert!(inc < def, "macro must follow the header");
-        assert!(def < use_, "macro must precede every use");
-        // no strdup sites → no helper, no macro (no dead code, and no
-        // risk to the include trim).
+        let def = out.find("static char *_sh_xstrdup").unwrap();
+        let use_ = out.find("_sh_xstrdup((char*)").unwrap();
+        assert!(inc < def && def < use_, "helper misplaced");
+        // no strdup sites → no helper (no dead code, and no risk to
+        // the include trim).
         let src2 = "echo $((1+2))";
         let cmds2 = crate::Parser::new(src2).parse().expect("parse");
         let prog2 = crate::shir::ast_to_ir(&cmds2);
         let out2 = shir_to_c(&prog2);
         assert!(!out2.contains("_sh_xstrdup"), "helper emitted without a site:\n{out2}");
-        assert!(!out2.contains("#define strdup"), "macro emitted without a site:\n{out2}");
     }
 
     #[test]
