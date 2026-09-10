@@ -2010,8 +2010,13 @@ impl Render {
             self.emit("  if (m != 0) return m;");
             self.emit("  return a < b ? -1 : a > b;");
             self.emit("}");
+            self.emit("static int _sh_sbj_i64_cmp(const void *pa, const void *pb) {");
+            self.emit("  long long a = *(const long long *)pa, b = *(const long long *)pb;");
+            self.emit("  return (a > b) - (a < b);");
+            self.emit("}");
             self.emit("static void _sh_sorted_bigint_join(_sh_vbuf *d, char **a, size_t n) {");
             self.emit("  static size_t *_sh_sbj_ix = 0; static size_t _sh_sbj_ixcap = 0;");
+            self.emit("  static long long *_sh_sbj_i64 = 0; static size_t _sh_sbj_i64cap = 0;");
             self.emit("  size_t i;");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  if (_sh_sbj_cap < n) {");
@@ -2030,21 +2035,55 @@ impl Render {
             self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
             self.emit("    _sh_sbj_ix = np; _sh_sbj_ixcap = nc;");
             self.emit("  }");
+            self.emit("  if (_sh_sbj_i64cap < n) {");
+            self.emit("    size_t nc = _sh_sbj_i64cap ? _sh_sbj_i64cap : 64;");
+            self.emit("    while (nc < n) nc *= 2;");
+            self.emit("    long long *np = (long long *)realloc(_sh_sbj_i64, nc * sizeof *_sh_sbj_i64);");
+            self.emit("    if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("    _sh_sbj_i64 = np; _sh_sbj_i64cap = nc;");
+            self.emit("  }");
+            self.emit("  // partition into the i64 extent (fast native sort) and the");
+            self.emit("  // bigint extent (mpz sort); bigints outside i64 range are all");
+            self.emit("  // < i64_min (negative) or > i64_max (positive), so the merged");
+            self.emit("  // order is: -bigint, i64, +bigint (Optimisation 2).");
+            self.emit("  size_t ni = 0, nb = 0;");
             self.emit("  for (i = 0; i < n; i++) {");
             self.emit("    const char *s = a[i] ? a[i] : \"0\";");
             self.emit("    if (mpz_set_str(_sh_sbj_v[i], s, 10) != 0) mpz_set_ui(_sh_sbj_v[i], 0);");
-            self.emit("    _sh_sbj_ix[i] = i;");
+            self.emit("    if (mpz_fits_slong_p(_sh_sbj_v[i])) { _sh_sbj_i64[ni++] = mpz_get_si(_sh_sbj_v[i]); }");
+            self.emit("    else { _sh_sbj_ix[nb++] = i; }");
             self.emit("  }");
-            self.emit("  if (n > 0) qsort(_sh_sbj_ix, n, sizeof *_sh_sbj_ix, _sh_sbj_cmp);");
-            self.emit("  size_t dn = 0, k;");
-            self.emit("  for (k = 0; k < n; k++) {");
+            self.emit("  // sort the i64 extent natively (never an mpz compare)");
+            self.emit("  if (ni > 1) qsort(_sh_sbj_i64, ni, sizeof *_sh_sbj_i64, _sh_sbj_i64_cmp);");
+            self.emit("  // sort the bigint extent (stable index qsort by mpz_cmp)");
+            self.emit("  if (nb > 1) qsort(_sh_sbj_ix, nb, sizeof *_sh_sbj_ix, _sh_sbj_cmp);");
+            self.emit("  size_t dn = 0;");
+            self.emit("  // negative bigints (all < i64_min)");
+            self.emit("  for (size_t k = 0; k < nb; k++) {");
             self.emit("    size_t j = _sh_sbj_ix[k];");
-            self.emit("    if (k > 0 && mpz_cmp(_sh_sbj_v[j], _sh_sbj_v[_sh_sbj_ix[k-1]]) == 0) continue;");
-            self.emit("    const char *s = a[j] ? a[j] : \"\";");
-            self.emit("    size_t l = strlen(s);");
-            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1);");
-            self.emit("    if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
-            self.emit("    memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("    if (mpz_sgn(_sh_sbj_v[j]) >= 0) break;");
+            self.emit("    if (k == 0 || mpz_cmp(_sh_sbj_v[j], _sh_sbj_v[_sh_sbj_ix[k-1]]) != 0) {");
+            self.emit("      const char *s = a[j] ? a[j] : \"\"; size_t l = strlen(s);");
+            self.emit("      _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1); if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("      memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("    }");
+            self.emit("  }");
+            self.emit("  // the i64 extent (dedup, native)");
+            self.emit("  for (size_t k = 0; k < ni; k++) {");
+            self.emit("    if (k > 0 && _sh_sbj_i64[k] == _sh_sbj_i64[k-1]) continue;");
+            self.emit("    char _s[32]; int _ln = snprintf(_s, sizeof _s, \"%lld\", _sh_sbj_i64[k]);");
+            self.emit("    _sh_vgrow(d, dn + (dn ? 2 : 0) + (size_t)_ln + 1); if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("    memcpy(d->p + dn, _s, (size_t)_ln); dn += (size_t)_ln;");
+            self.emit("  }");
+            self.emit("  // positive bigints (all > i64_max)");
+            self.emit("  for (size_t k = 0; k < nb; k++) {");
+            self.emit("    size_t j = _sh_sbj_ix[k];");
+            self.emit("    if (mpz_sgn(_sh_sbj_v[j]) < 0) continue;");
+            self.emit("    if (k == 0 || mpz_cmp(_sh_sbj_v[j], _sh_sbj_v[_sh_sbj_ix[k-1]]) != 0) {");
+            self.emit("      const char *s = a[j] ? a[j] : \"\"; size_t l = strlen(s);");
+            self.emit("      _sh_vgrow(d, dn + (dn ? 2 : 0) + l + 1); if (dn) { d->p[dn++] = ','; d->p[dn++] = ' '; }");
+            self.emit("      memcpy(d->p + dn, s, l); dn += l;");
+            self.emit("    }");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
@@ -3840,6 +3879,29 @@ impl Render {
         t
     }
 
+    /// `sortedIntJoin`/`sortedBigintJoin` over an array — the native
+    /// typed sorted-unique join (shared by the value_c and call paths).
+    fn sorted_join_call(&mut self, func: &str, name: &str) -> String {
+        if !self.arrays.contains(name) || self.assoc_arrays.contains(name) {
+            self.mark_todo(&format!("sorted join of non-array {name}"));
+            return "\"\"".into();
+        }
+        let id = self.c_ident(name);
+        let vb = self.vbuf_temp();
+        if func == "sortedIntJoin" {
+            if self.int_arrays.contains(name) {
+                let w = self.int_array_widths.get(name).copied().unwrap_or(Width::I64);
+                self.emit(&format!("_sh_sorted_int{}_join(&{vb}, {id}, {id}_len);", w.suffix()));
+            } else {
+                self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
+            }
+        } else {
+            self.need_gmp = true;
+            self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
+        }
+        format!("{vb}.p")
+    }
+
     /// `max`/`min`/`sum` over an array: emit a native reduction and
     /// return the value expression. Int arrays scan i64; bigint arrays
     /// (char *[] of decimal text) parse each element into an mpz temp
@@ -4484,33 +4546,11 @@ impl Render {
                 },
                 "join" => self.join_value(args),
                 "sortedIntJoin" | "sortedBigintJoin" => {
-                    // typed sorted-unique join (py-sh-go node): elements
-                    // contractually canonical ints — plain atoll/mpz
-                    // compare is exact (no GNU -n fringe). Plain arrays
-                    // only; anything else is a loud TODO (cannot happen
-                    // from the frontend: it emits the legacy pipeline
-                    // for untracked shapes).
+                    // typed sorted-unique join (py-sh-go node)
                     let Some(name) = Self::str_arg(args, 0) else {
                         return "\"\"".into();
                     };
-                    if !self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
-                        self.mark_todo(&format!("sorted join of non-array {name}"));
-                        return "\"\"".into();
-                    }
-                    let id = self.c_ident(&name);
-                    let vb = self.vbuf_temp();
-                    if func == "sortedIntJoin" {
-                        if self.int_arrays.contains(&name) {
-                            let w = self.int_array_widths.get(&name).copied().unwrap_or(Width::I64);
-                            self.emit(&format!("_sh_sorted_int{}_join(&{vb}, {id}, {id}_len);", w.suffix()));
-                        } else {
-                            self.emit(&format!("_sh_sorted_int_join(&{vb}, {id}, {id}_len);"));
-                        }
-                    } else {
-                        self.need_gmp = true;
-                        self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
-                    }
-                    format!("{vb}.p")
+                    self.sorted_join_call(func, &name)
                 }
                 "max" | "min" | "sum" => {
                     // typed reduction over an array (py-sh-go node)
@@ -10530,6 +10570,13 @@ impl Render {
                 // typed reduction over an array (py-sh-go node)
                 let name = Self::str_arg(args, 0).unwrap_or_default();
                 self.reduce_array(func, &name)
+            }
+            "sortedIntJoin" | "sortedBigintJoin" => {
+                // typed sorted-unique join over an array — delegate to the
+                // value_c path (native helpers) so an Interpolate-embedded
+                // call compiles, not a stub
+                let name = Self::str_arg(args, 0).unwrap_or_default();
+                self.sorted_join_call(func, &name)
             }
             _ => self.sh2_stub(func, args, func),
         }
