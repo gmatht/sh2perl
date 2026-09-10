@@ -12508,9 +12508,10 @@ impl Render {
                         // A NULL char* prints "(null)" (glibc) where bash
                         // prints "" — guard every %s arg UNLESS proven
                         // non-NULL (P1 follow-up: OOM aborts, so a proven
-                        // fresh call temp can never be NULL here).
+                        // fresh call temp can never be NULL here). A
+                        // proven `char*` needs neither guard nor cast.
                         if self.nonnull.contains(&v) || self.nonnull_var.contains(&v) {
-                            cargs.push(format!("(char*)({v})"));
+                            cargs.push(v);
                         } else {
                             cargs.push(format!(
                                 "((char*)({v}) ? (char*)({v}) : \"\")"
@@ -22682,7 +22683,7 @@ mod tests {
             assign("x", str_lit("hi")),
             echo_var("x"),
         ]));
-        assert!(out.contains("(char*)(x)"), "no guard expected:\n{out}");
+        assert!(out.contains("printf(\"%s\\n\", x)"), "no bare proven use:\n{out}");
         assert!(!out.contains("? (char*)(x)"), "guard kept:\n{out}");
         // move chain through proven var → guard dropped.
         let out = shir_to_c(&prog_of(vec![
@@ -22728,7 +22729,7 @@ mod tests {
         let mut r = Render::default();
         r.nonnull.insert("_af_12".to_string());
         let out = r.printf_from_parts(vec![Part::Arg("_af_12".to_string(), NumSpec::Str)]);
-        assert_eq!(out, "printf(\"%s\", (char*)(_af_12))", "guard not dropped: {out}");
+        assert_eq!(out, "printf(\"%s\", _af_12)", "guard/cast not dropped: {out}");
         let mut r2 = Render::default();
         let out2 = r2.printf_from_parts(vec![Part::Arg("_af_12".to_string(), NumSpec::Str)]);
         assert!(out2.contains("? (char*)(_af_12) : \"\""), "guard missing: {out2}");
