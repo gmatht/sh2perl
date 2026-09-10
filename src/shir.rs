@@ -17689,12 +17689,14 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // A PURE-VALUE `Declare { local: true }` is not a store
                 // write (the emit rewrites it to the native binding write
                 // path — mirror of the exec pure_value_declare skip): no
-                // exclusion marks. Other Declare forms (plain, dynamic
-                // init) stay store-bound.
+                // exclusion marks. A BARE Declare (no init) likewise
+                // writes nothing — pure scope annotation (frontend
+                // param/local pins); never an exclusion mark. Other
+                // Declare forms (plain, dynamic init) stay store-bound.
                 let pure_local = *local
                     && vars.len() == 1
                     && init.as_ref().and_then(literal_decl_value).is_some();
-                if !pure_local {
+                if init.is_some() && !pure_local {
                     for v in vars {
                         excluded.insert(v.name.clone());
                     }

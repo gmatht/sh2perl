@@ -15993,6 +15993,13 @@ fn lift_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
     match s {
         IrStmt::Expr(e) => lift_scan_expr(e, spawn, fname, st),
         IrStmt::Assign { expr, .. } => lift_scan_expr(expr, spawn, fname, st),
+        IrStmt::Declare { init, .. } => {
+            // bare Declare (scope annotation, no init) is lift-neutral;
+            // a Declare with init scans like an Assign RHS.
+            if let Some(e) = init {
+                lift_scan_expr(e, spawn, fname, st);
+            }
+        }
         IrStmt::If {
             cond, then, elsifs, else_,
         } => {
