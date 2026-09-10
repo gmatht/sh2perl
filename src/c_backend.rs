@@ -1816,6 +1816,15 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // vars are excluded from its assign set).
     let mut ranges = crate::shir::analyze_var_ranges(&prog);
     seed_loop_var_ranges(&prog.stmts, &mut ranges);
+    // isqrt-idiom bound temps (`int(n**0.5)` hoists): the arith-text
+    // Call has no range, so seed the `_sh_isqrt` result range ([0,
+    // ISQRT_MAX]) and propagate through the numeric follow-up. Loop
+    // vars are deliberately NOT seeded (their arithmetic needs
+    // promotion analysis before narrowing is sound).
+    seed_isqrt_bounds(&prog.stmts, &mut ranges);
+    for sub in &prog.subs {
+        seed_isqrt_bounds(&sub.body, &mut ranges);
+    }
     // Effective widths: a var's width must cover every arith-expr result
     // mentioning it (e.g. i in [1, 70000] is u32, but i*i needs i64), so
     // narrow only when the var AND all its arithmetic stay in width.
@@ -20397,6 +20406,254 @@ fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i1
     }
 }
 
+/// Max floor-sqrt of any `long long` input: isqrt(i64::MAX) = 3037000499.
+/// `_sh_isqrt` returns within [0, ISQRT_MAX] for every input (0 for n ≤ 0).
+const ISQRT_MAX: i128 = 3037000499;
+
+/// Strip at most one balanced outer paren pair ("(…)" → "…").
+fn strip_one_outer_paren(t: &str) -> &str {
+    let t = t.trim();
+    if t.len() >= 2 && t.starts_with('(') && t.ends_with(')') {
+        let inner = &t[1..t.len() - 1];
+        let mut depth = 0i32;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return t;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return inner.trim();
+        }
+    }
+    t
+}
+
+/// Max value of an `int(sqrt(X))` isqrt-idiom arith text, if the text is
+/// EXACTLY the idiom `int(sqrt(X))` (or `(int(sqrt(X)) + K)`) with a
+/// simple int operand X (bare `$var`/`$N`/int literal — no calls, no
+/// float dots, no operators) and a small nonneg `+ K`: `int(sqrt(X))`
+/// → ISQRT_MAX, plus K. `_sh_isqrt` returns within [0, ISQRT_MAX] for
+/// every `long long` input, so the idiom always fits in u32 (returns
+/// None when ISQRT_MAX + K would exceed u32::MAX). Mirrors the mf_named
+/// isqrt-render condition — a float operand keeps libm sqrt, whose
+/// result is NOT u32-bounded — so seeding fires exactly when the
+/// renderer emits `_sh_isqrt`, never on a float path. Anything but the
+/// exact int shape leaves the range unknown (current behavior).
+fn isqrt_text_max(text: &str) -> Option<i128> {
+    let t = strip_one_outer_paren(text.trim());
+    let rest = t.strip_prefix("int(sqrt(")?;
+    let mut depth = 1i32;
+    let mut end = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let ei = end?;
+    let x = rest[..ei].trim();
+    // consume the `int(` close paren, then expect end or `+ K`.
+    let tail = rest[ei + 1..].trim_start().strip_prefix(')')?.trim();
+    let x_ok = if let Some(w) = x.strip_prefix('$') {
+        !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_')
+    } else {
+        !x.is_empty() && x.chars().all(|c| c.is_ascii_digit())
+    };
+    if !x_ok {
+        return None;
+    }
+    let k: i128 = if tail.is_empty() {
+        0
+    } else if let Some(ks) = tail.strip_prefix('+') {
+        let ks = ks.trim();
+        if ks.is_empty() || !ks.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        ks.parse().ok()?
+    } else {
+        return None;
+    };
+    let hi = ISQRT_MAX + k;
+    if hi > u32::MAX as i128 {
+        return None;
+    }
+    Some(hi)
+}
+
+/// Merge [lo, hi] into ranges[var] by widening (min/max) — never narrows
+/// an existing proof. Mirrors seed_loop_var_ranges' merge.
+fn merge_range(ranges: &mut HashMap<String, (i128, i128)>, var: &str, lo: i128, hi: i128) {
+    match ranges.get(var) {
+        Some((l0, h0)) => {
+            ranges.insert(var.to_string(), ((*l0).min(lo), (*h0).max(hi)));
+        }
+        None => {
+            ranges.insert(var.to_string(), (lo, hi));
+        }
+    }
+}
+
+/// Range of `n = <arith>` when it derives from an isqrt-seeded temp:
+/// `s` (copy) or `s + k` / `s - k` (k: small Num). Requires the source
+/// temp's hi ≤ u32::MAX (the isqrt invariant) and |k| ≤ 65536 with the
+/// result inside i64 — plain interval math is then wraparound-free and
+/// sound. None otherwise (anything else keeps the current behavior).
+fn isqrt_derive_range(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
+    match a {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
+            let (lo, hi) = ranges.get(name.as_str()).copied()?;
+            if hi > u32::MAX as i128 {
+                return None;
+            }
+            Some((lo, hi))
+        }
+        ArithAst::Bin { op, lhs, rhs } if op == "+" || op == "-" => {
+            let (sl, sh) = match lhs.as_ref() {
+                ArithAst::Var(name) | ArithAst::Ident(name) => ranges.get(name.as_str()).copied()?,
+                _ => return None,
+            };
+            if sh > u32::MAX as i128 {
+                return None;
+            }
+            let k = match rhs.as_ref() {
+                ArithAst::Num(n) => *n as i128,
+                _ => return None,
+            };
+            if k.abs() > 65536 {
+                return None;
+            }
+            let (lo, hi) = if op == "+" { (sl + k, sh + k) } else { (sl - k, sh - k) };
+            if lo < i64::MIN as i128 || hi > i64::MAX as i128 {
+                return None;
+            }
+            Some((lo, hi))
+        }
+        _ => None,
+    }
+}
+
+/// Seed u32-bounded ranges for isqrt-idiom bound temps (range-proof
+/// wiring): `s = arith("...int(sqrt(X))...")` provably holds within
+/// [0, isqrt_text_max] (the `_sh_isqrt` result range), and the numeric
+/// follow-up `n = s ± k` / `n = s` propagates it. Without this the
+/// arith-text Call has no range and every downstream temp stays i64.
+/// Merges (widens) into existing proofs — never narrows one. Loop vars
+/// are deliberately NOT seeded here: their bound is proven but their
+/// arithmetic needs promotion analysis before narrowing is sound.
+fn seed_isqrt_bounds(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i128)>) {
+    // pass 1: direct isqrt assigns (any depth)
+    collect_isqrt_assigns(stmts, ranges);
+    // pass 2: numeric derives `n = s ± k` / `n = s` (fixpoint, capped —
+    // the frontend emits one level; chains converge in a few rounds)
+    for _ in 0..8 {
+        let mut changed = false;
+        propagate_isqrt_derives(stmts, ranges, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn collect_isqrt_assigns(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i128)>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let (Some(t), IrExpr::Call { func, args }) = (targets.first(), expr) {
+                    if func == "arith" && t.indices.is_empty() {
+                        for a in args {
+                            if let IrExpr::Str(text, _) = a {
+                                if let Some(hi) = isqrt_text_max(text) {
+                                    merge_range(ranges, &t.var, 0, hi);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_isqrt_assigns(b, ranges)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_isqrt_assigns(then, ranges);
+                for (_, b) in elsifs {
+                    collect_isqrt_assigns(b, ranges);
+                }
+                collect_isqrt_assigns(else_, ranges);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_isqrt_assigns(body, ranges)
+            }
+            IrStmt::For { body, .. } => collect_isqrt_assigns(body, ranges),
+            IrStmt::ForInit { init, body, .. } => {
+                collect_isqrt_assigns(init, ranges);
+                collect_isqrt_assigns(body, ranges);
+            }
+            IrStmt::Function { body, .. } => collect_isqrt_assigns(body, ranges),
+            IrStmt::Redirect { inner, .. } => collect_isqrt_assigns(inner, ranges),
+            _ => {}
+        }
+    }
+}
+
+fn propagate_isqrt_derives(
+    stmts: &[IrStmt],
+    ranges: &mut HashMap<String, (i128, i128)>,
+    changed: &mut bool,
+) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                    if t.indices.is_empty() {
+                        if let Some((lo, hi)) = isqrt_derive_range(a, ranges) {
+                            let (lo0, hi0) = ranges.get(&t.var).copied().unwrap_or((lo, hi));
+                            let (nlo, nhi) = (lo0.min(lo), hi0.max(hi));
+                            if (nlo, nhi) != (lo0, hi0) || !ranges.contains_key(&t.var) {
+                                ranges.insert(t.var.clone(), (nlo, nhi));
+                                *changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                propagate_isqrt_derives(b, ranges, changed)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                propagate_isqrt_derives(then, ranges, changed);
+                for (_, b) in elsifs {
+                    propagate_isqrt_derives(b, ranges, changed);
+                }
+                propagate_isqrt_derives(else_, ranges, changed);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                propagate_isqrt_derives(body, ranges, changed)
+            }
+            IrStmt::For { body, .. } => propagate_isqrt_derives(body, ranges, changed),
+            IrStmt::ForInit { init, body, .. } => {
+                propagate_isqrt_derives(init, ranges, changed);
+                propagate_isqrt_derives(body, ranges, changed);
+            }
+            IrStmt::Function { body, .. } => propagate_isqrt_derives(body, ranges, changed),
+            IrStmt::Redirect { inner, .. } => propagate_isqrt_derives(inner, ranges, changed),
+            _ => {}
+        }
+    }
+}
 /// Effective C width per Int-typed var: the widest of the var's own
 /// [lo, hi] (range_width_name) and every arith-expr result range that
 /// mentions it. Sound: a var's width must cover the RESULTS of the
@@ -20503,6 +20760,14 @@ fn walk_widths_expr(
 ) {
     match e {
         IrExpr::Arith(a) => {
+            // comparisons only READ their operands (C promotes; cannot
+            // wrap), so they neither constrain nor widen participant
+            // widths — skip them. Forcing I64 here kept every compared
+            // var wide, defeating range-narrowing for loop bounds like
+            // `i < _i_sqrt_nv` (and could even narrow a u64 to i64).
+            if matches!(a.as_ref(), ArithAst::Bin { op, .. } if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!=")) {
+                return;
+            }
             let rng = arith_range_local(a, state);
             let mut vs = Vec::new();
             arith_vars(a, &mut vs);
@@ -22433,6 +22698,80 @@ mod tests {
         );
         assert!(out.contains("_sh_add(\"'\")"), "closes quote, got: {out}");
         assert!(!out.contains("\\\\\""), "no backslash escape, got: {out}");
+    }
+
+    #[test]
+    fn isqrt_text_max_shapes() {
+        // the exact isqrt idiom with an int operand → bounded (u32);
+        // anything else leaves the range unknown.
+        assert_eq!(isqrt_text_max("(int(sqrt($1)) + 1)"), Some(3037000500));
+        assert_eq!(isqrt_text_max("int(sqrt($1))"), Some(3037000499));
+        assert_eq!(isqrt_text_max("int(sqrt($n))"), Some(3037000499));
+        assert_eq!(isqrt_text_max("(int(sqrt(5)) + 0)"), Some(3037000499));
+        // float operand keeps libm sqrt (not u32-bounded) → None.
+        assert_eq!(isqrt_text_max("int(sqrt(2.5))"), None);
+        assert_eq!(isqrt_text_max("(int(sqrt($n)) + 0.5)"), None);
+        // huge +K exceeding u32 → None.
+        assert_eq!(isqrt_text_max("int(sqrt($n)) + 10000000000"), None);
+        // subtraction could drive the min below zero → None.
+        assert_eq!(isqrt_text_max("int(sqrt($n)) - 1"), None);
+        // not the idiom → None.
+        assert_eq!(isqrt_text_max("sqrt($n)"), None);
+        assert_eq!(isqrt_text_max("int($n)"), None);
+        assert_eq!(isqrt_text_max("int(sqrt($a+$b))"), None);
+        assert_eq!(isqrt_text_max("int(sqrt(1e5))"), None);
+        assert_eq!(isqrt_text_max(""), None);
+    }
+
+    #[test]
+    fn isqrt_bound_temp_narrows_to_u32() {
+        // range-proof wiring end to end: an isqrt-idiom bound temp and
+        // its numeric follow-up narrow to uint32_t (not long long).
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "_h".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "arith".to_string(),
+                        args: vec![IrExpr::Str(
+                            "(int(sqrt($1)) + 1)".to_string(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )],
+                    },
+                    asm: None,
+                },
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "_hv".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "+".to_string(),
+                        lhs: Box::new(ArithAst::Var("_h".to_string())),
+                        rhs: Box::new(ArithAst::Num(0)),
+                    })),
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("uint32_t _hv"), "bound temp not narrowed:\n{out}");
     }
 
     #[test]
