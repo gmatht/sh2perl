@@ -300,6 +300,11 @@ pub struct Render {
     fn_written: HashSet<String>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
+    /// String-stored arrays whose every element provably fits i64 with
+    /// no exotic writes (for the native small-int sum/max/min fast path
+    /// — exact via atoll/__int128, no GMP per element). Computed in
+    /// shir_to_c; consulted at reduce sites.
+    small_int_arrays: HashSet<String>,
     todo: usize,
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
@@ -363,6 +368,8 @@ pub struct Render {
     /// rounds), so the loop bound would be off by 1 for huge n — the
     /// Newton isqrt is exact for every long long.
     need_isqrt: bool,
+    /// exact __int128-to-decimal helper (small-int sum past i64)
+    need_i128: bool,
     /// GMP bigint runtime (the py-sh-go proven-big regime): set when
     /// any Cast(Int64) arith is rendered — <gmp.h> + _sh_mpz_* helpers.
     /// The gate links -lgmp (libgmp-dev installed); programs without
@@ -1633,6 +1640,238 @@ fn int_array_widths(
     out
 }
 
+/// An element value provably fitting i64 (so `atoll` is exact — no
+/// GMP needed to read it). Like `is_int_expr` but WITHOUT UInt64
+/// (`atoll` truncates past i64::MAX; `is_int_expr` accepts UInt64 for
+/// the int-array storage verdict, where native `long long` stores
+/// would wrap the same way — out of scope here, must not widen it).
+fn elem_fits_i64(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+        IrExpr::Arith(a) => !arith_is_bigint(a, big),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
+            vt.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32)
+        ) && !big.contains(name),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                matches!(
+                    vt.get(name),
+                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32)
+                ) && !big.contains(name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Arrays whose every element value provably fits i64 with no exotic
+/// writes (for the native small-int sum/max/min fast path): literal
+/// elements come from setArray/setArrayAppend Array items,
+/// DeclareArray elements, and Array-literal Assign RHS; anything else
+/// writing the array (indexed stores, setVar/read/unset/declare,
+/// non-literal whole-array assigns, unknown calls naming it)
+/// disqualifies it (fail-closed — GMP preserved). Empty element lists
+/// qualify vacuously (nothing to misread).
+fn small_int_arrays(
+    prog: &IrProgram,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) -> HashSet<String> {
+    struct Acc {
+        elems: Vec<IrExpr>,
+        exotic: bool,
+    }
+    let mut map: HashMap<String, Acc> = HashMap::new();
+    fn elems_of(stmts: &[IrStmt], map: &mut HashMap<String, Acc>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if !t.indices.is_empty() {
+                            // indexed store `a[i] = v` — value unknown
+                            // here (checked below via expr walk only
+                            // for nested writes); mark exotic.
+                            map.entry(t.var.clone()).or_insert(Acc { elems: vec![], exotic: false }).exotic = true;
+                        } else if let IrExpr::Array(items) = expr {
+                            map.entry(t.var.clone()).or_insert(Acc { elems: vec![], exotic: false }).elems.extend(items.iter().cloned());
+                        } else if !matches!(expr, IrExpr::Call { .. }) {
+                            // whole-array copy or computed non-call value
+                            // — contents unknown. (Calls are handled by
+                            // the expr walk below: setArray collects,
+                            // suspicious ones flag exotic.)
+                            map.entry(t.var.clone()).or_insert(Acc { elems: vec![], exotic: false }).exotic = true;
+                        }
+                    }
+                    elems_expr_of(expr, map);
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    map.entry(var.clone()).or_insert(Acc { elems: vec![], exotic: false }).elems.extend(elements.iter().cloned());
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for v in vars {
+                        // plain `local a` / `declare -a a` without a
+                        // literal init may rebind the array.
+                        map.entry(v.name.clone()).or_insert(Acc { elems: vec![], exotic: false }).exotic = true;
+                    }
+                    if let Some(e) = init {
+                        elems_expr_of(e, map);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    elems_expr_of(cond, map);
+                    elems_of(then, map);
+                    for (_, b) in elsifs {
+                        elems_of(b, map);
+                    }
+                    elems_of(else_, map);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                    elems_expr_of(cond, map);
+                    elems_of(body, map);
+                }
+                IrStmt::For { body, .. } => elems_of(body, map),
+                IrStmt::ForInit { init, cond, step, body } => {
+                    elems_of(init, map);
+                    elems_expr_of(cond, map);
+                    elems_of(step, map);
+                    elems_of(body, map);
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    elems_of(body, map);
+                    for e in excepts {
+                        elems_of(&e.body, map);
+                    }
+                    elems_of(else_body, map);
+                    elems_of(finally_body, map);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    elems_expr_of(discriminant, map);
+                    for c in clauses {
+                        elems_of(&c.body, map);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => elems_of(inner, map),
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    elems_of(b, map)
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    elems_of(body, map);
+                    for (_, b) in named_blocks {
+                        elems_of(b, map);
+                    }
+                }
+                IrStmt::Output { value, .. } | IrStmt::WriteFile { content: value, .. } => {
+                    elems_expr_of(value, map);
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        elems_expr_of(x, map);
+                    }
+                }
+                IrStmt::Expr(e) => elems_expr_of(e, map),
+                _ => {}
+            }
+        }
+    }
+    fn elems_expr_of(e: &IrExpr, map: &mut HashMap<String, Acc>) {
+        match e {
+            IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+                if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                {
+                    map.entry(name.clone()).or_insert(Acc { elems: vec![], exotic: false }).elems.extend(items.iter().cloned());
+                }
+                for a in args {
+                    elems_expr_of(a, map);
+                }
+            }
+            // read-only array consumers (join/reduce/len/index/getVar)
+            // never write — recurse for nested literals only.
+            IrExpr::Call { func, args }
+                if matches!(func.as_str(), "sortedIntJoin" | "sortedBigintJoin" | "max" | "min" | "sum" | "arrayIndex" | "arrayItems" | "arrayLen" | "getVar") =>
+            {
+                for a in args {
+                    elems_expr_of(a, map);
+                }
+            }
+            // any other call naming an array first is an exotic write
+            // until proven otherwise (fail-closed).
+            IrExpr::Call { func: _, args } => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // setVar/assign/read-style calls write their target;
+                    // unknown calls might too — flag them all.
+                    map.entry(name.clone()).or_insert(Acc { elems: vec![], exotic: false }).exotic = true;
+                }
+                for a in args {
+                    elems_expr_of(a, map);
+                }
+            }
+            IrExpr::Array(items) => {
+                for x in items {
+                    elems_expr_of(x, map);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                elems_expr_of(lhs, map);
+                elems_expr_of(rhs, map);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        elems_expr_of(x, map);
+                    }
+                }
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                elems_expr_of(iter, map);
+                elems_expr_of(elem, map);
+                if let Some(c) = cond {
+                    elems_expr_of(c, map);
+                }
+            }
+            IrExpr::Arith(a) => elems_arith_of(a, map),
+            _ => {}
+        }
+    }
+    fn elems_arith_of(a: &ArithAst, map: &mut HashMap<String, Acc>) {
+        // arith values never name arrays; nested calls might.
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => {
+                elems_arith_of(lhs, map);
+                elems_arith_of(rhs, map);
+            }
+            ArithAst::Un { arg, .. } => elems_arith_of(arg, map),
+            ArithAst::Cond { test, then, else_, .. } => {
+                elems_arith_of(test, map);
+                elems_arith_of(then, map);
+                elems_arith_of(else_, map);
+            }
+            ArithAst::Cast { arg, .. } => elems_arith_of(arg, map),
+            ArithAst::Assign { rhs, .. } => elems_arith_of(rhs, map),
+            ArithAst::IncDec { .. } => {}
+            _ => {}
+        }
+    }
+    elems_of(&prog.stmts, &mut map);
+    for sub in &prog.subs {
+        elems_of(&sub.body, &mut map);
+    }
+    let mut out = HashSet::new();
+    for (arr, acc) in &map {
+        if acc.exotic {
+            continue;
+        }
+        if acc.elems.iter().all(|e| elem_fits_i64(e, vt, big)) {
+            out.insert(arr.clone());
+        }
+    }
+    out
+}
+
 /// Collect every setArray/setArrayAppend element expression per array.
 fn collect_array_elements(stmts: &[IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
     for s in stmts {
@@ -1903,6 +2142,14 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     fold_range_for(&mut prog.stmts);
     for sub in &mut prog.subs {
         fold_range_for(&mut sub.body);
+    }
+    // small-int arrays (native sum/max/min fast path): string-stored
+    // arrays with int-domain elements only. After fold_range_for
+    // (final statement layout) and before rendering; needs var_types
+    // + bigint verdicts (element check).
+    {
+        let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+        r.small_int_arrays = small_int_arrays(&prog, &vt, &r.bigint_vars);
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -3534,6 +3781,27 @@ impl Render {
             self.emit("}");
             self.emit("");
         }
+        if self.need_i128 {
+            // exact decimal rendering of a __int128 accumulator (the
+            // rare huge small-int sum past i64; the common case could
+            // use %lld, but one uniform exact path is simpler to verify
+            // than a branch). Handles 0, negatives, and INT128_MIN
+            // (via the -(v+1)+1 magnitude trick — plain -v overflows).
+            self.emit("/* exact __int128 → decimal (small-int sum past i64) */");
+            self.emit("static void _sh_i128_str(_sh_vbuf *d, __int128 v) {");
+            self.emit("  char tmp[64]; int n = 0, neg = 0;");
+            self.emit("  unsigned __int128 u;");
+            self.emit("  if (v == 0) { _sh_vgrow(d, 2); d->p[0] = '0'; d->p[1] = 0; return; }");
+            self.emit("  if (v < 0) { neg = 1; u = (unsigned __int128)(-(v + 1)) + 1; }");
+            self.emit("  else u = (unsigned __int128)v;");
+            self.emit("  while (u > 0) { tmp[n++] = (char)('0' + u % 10); u /= 10; }");
+            self.emit("  _sh_vgrow(d, (size_t)(n + neg + 1));");
+            self.emit("  if (neg) d->p[0] = '-';");
+            self.emit("  for (int i = 0; i < n; i++) d->p[neg + i] = tmp[n - 1 - i];");
+            self.emit("  d->p[neg + n] = 0;");
+            self.emit("}");
+            self.emit("");
+        }
         if self.need_isqrt {
             // integer floor sqrt (Newton): exact for every long long,
             // where the float sqrt's int→double conversion rounds above
@@ -4819,6 +5087,31 @@ impl Render {
                 _ => {}
             }
             return self.num_temp(&acc);
+        }
+        // small-int string array (every element proven i64-domain, no
+        // exotic writes): native atoll loop — exact, no per-element GMP.
+        // sum accumulates in __int128 (exact for any memory-sized array;
+        // rendered exact-decimal, so huge sums match Python instead of
+        // aborting or wrapping). max/min compare directly (no overflow
+        // possible). NULL guards preserved (same as the GMP path).
+        if self.small_int_arrays.contains(name) {
+            if func == "sum" {
+                self.need_i128 = true;
+                self.emit(&format!("__int128 {acc} = 0;"));
+                self.emit(&format!(
+                    "for (size_t {li} = 0; {li} < {id}_len; {li}++) {acc} += atoll({id}[{li}] ? {id}[{li}] : \"0\");"
+                ));
+                let vb = self.vbuf_temp();
+                self.emit(&format!("_sh_i128_str(&{vb}, {acc});"));
+                return format!("{vb}.p");
+            } else {
+                let cmp = if func == "max" { ">" } else { "<" };
+                self.emit(&format!("long long {acc} = ({id}_len > 0) ? atoll({id}[0] ? {id}[0] : \"0\") : 0;"));
+                self.emit(&format!(
+                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) if (atoll({id}[{li}] ? {id}[{li}] : \"0\") {cmp} {acc}) {acc} = atoll({id}[{li}] ? {id}[{li}] : \"0\");"
+                ));
+                return self.num_temp(&acc);
+            }
         }
         // bigint array (char *[] of decimal text): parse + reduce
         self.need_gmp = true;
@@ -23460,6 +23753,95 @@ mod tests {
         stmts.push(range_while("i", "1"));
         let out = shir_to_c(&prog_of(stmts));
         assert!(out.contains("long long i"), "unknown bound narrowed:\n{out}");
+    }
+
+    #[test]
+    fn small_int_sum_native_no_gmp() {
+        // P1 follow-up: sum() over int-domain string elements lowers to
+        // a native atoll/__int128 loop (exact, no per-element GMP).
+        fn sum_call(arr: &str) -> IrExpr {
+            IrExpr::Call {
+                func: "sum".to_string(),
+                args: vec![IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            }
+        }
+        fn setarray(arr: &str, items: Vec<IrExpr>) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: arr.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: "setArray".to_string(),
+                    args: vec![
+                        IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(items),
+                    ],
+                },
+                asm: None,
+            }
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        fn echo_expr(e: IrExpr) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![e]),
+                ],
+            })
+        }
+        fn index_read(arr: &str, idx: &str) -> IrExpr {
+            IrExpr::Call {
+                func: "arrayIndex".to_string(),
+                args: vec![
+                    IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Str(idx.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                ],
+            }
+        }
+        // small ints + a string read (forces char*[] storage, like
+        // t96's sum+index mix) → native __int128 loop, no GMP.
+        let out = shir_to_c(&prog_of(vec![
+            setarray("xs", vec![IrExpr::Int(10), IrExpr::Int(20)]),
+            echo_expr(sum_call("xs")),
+            echo_expr(index_read("xs", "0")),
+        ]));
+        assert!(out.contains("_sh_i128_str"), "no native sum helper:\n{out}");
+        assert!(out.contains("atoll(xs["), "no atoll loop:\n{out}");
+        assert!(!out.contains("mpz_add"), "GMP kept for small ints:\n{out}");
+        // a bigint element keeps the exact GMP path.
+        let out = shir_to_c(&prog_of(vec![
+            setarray(
+                "xb",
+                vec![
+                    IrExpr::Int(10),
+                    IrExpr::Str(
+                        "1267650600228229401496703205389".to_string(),
+                        crate::ir::StrStyle::DoubleQuoted,
+                    ),
+                ],
+            ),
+            echo_expr(sum_call("xb")),
+        ]));
+        assert!(out.contains("mpz_add"), "GMP dropped for bigint:\n{out}");
+        assert!(!out.contains("_sh_i128_str"), "native sum on bigint:\n{out}");
     }
 
     #[test]
