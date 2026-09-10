@@ -89,8 +89,8 @@ impl Width {
             Width::U8 => "uint8_t",
             Width::I16 => "int16_t",
             Width::U16 => "uint16_t",
-            Width::U32 => "unsigned int",
-            Width::I32 => "int",
+            Width::U32 => "uint32_t",
+            Width::I32 => "int32_t",
             Width::I64 => "long long",
             Width::U64 => "unsigned long long",
         }
@@ -20920,11 +20920,14 @@ mod tests {
     #[test]
     fn width_format_matches_c_type() {
         // the format must read exactly what the width's C type declares
+        // (the narrow widths use the stdint.h fixed-width types — C only
+        // guarantees `int` ≥ 16 bits, so `int`/`unsigned int` would be
+        // wrong on a hypothetical 16-bit-int platform)
         assert_eq!(Width::U32.format(), "%u");
         assert_eq!(Width::I32.format(), "%d");
         assert_eq!(Width::I64.format(), "%lld");
-        assert_eq!(Width::U32.c_type(), "unsigned int");
-        assert_eq!(Width::I32.c_type(), "int");
+        assert_eq!(Width::U32.c_type(), "uint32_t");
+        assert_eq!(Width::I32.c_type(), "int32_t");
         assert_eq!(Width::I64.c_type(), "long long");
     }
 
