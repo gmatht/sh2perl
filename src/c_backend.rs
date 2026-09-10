@@ -271,6 +271,21 @@ pub struct Render {
     /// per-function sequence for the `_cn` collision fallback (stable
     /// across functions, unlike the global `temp_seq`).
     cn_seq: usize,
+    /// C idents proven to hold non-NULL `char*` at the current render
+    /// point (P1 follow-up: drop the `? : ""` guards). Call temps are
+    /// timeless — fresh per creation (`used_temp_names` + per-function
+    /// reset), single-assign by construction, freed at their shIR
+    /// statement boundary — so a temp proven at creation stays proven
+    /// without flow tracking. Cleared on function entry (temp names
+    /// reuse across functions, each with its own storage).
+    nonnull: HashSet<String>,
+    /// Generated function names proven to never return NULL: every
+    /// return goes through `_sh_xstrdup` (aborts on OOM instead of
+    /// returning NULL), with no early bare `return`. Computed by a
+    /// pre-pass (render order is caller-first, so render-time recording
+    /// would always arrive too late). Consulted when a fresh call temp
+    /// is created.
+    nonnull_returns: HashSet<String>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -4368,7 +4383,12 @@ impl Render {
         self.depth = 1;
         let prev_fn = self.in_function;
         self.in_function = true;
+        let prev_current = self.current_fn.clone();
         self.current_fn = Some(name.to_string());
+        // fresh scope: call temps reuse names across functions (each
+        // with its own storage), so proofs never cross the boundary —
+        // save/restore around the body (nested defs included).
+        let saved_nonnull = std::mem::take(&mut self.nonnull);
         let site_mark = self.site_bodies.len();
         let cap_mark = self.cap_bodies.len();
         self.decl_line_idx.clear();
@@ -4478,6 +4498,8 @@ impl Render {
         let mut body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         self.in_function = prev_fn;
+        self.current_fn = prev_current;
+        self.nonnull = saved_nonnull;
         for n in &fvars {
             let id = self.c_ident(n);
             if body_out.iter().any(|l| text_contains_ident(l, &id)) {
@@ -11377,6 +11399,14 @@ impl Render {
                             self.c_ident(&fname),
                             a.join(", ")
                         ));
+                        // the callee provably never returns NULL (see
+                        // nonnull_returns) and this temp is fresh +
+                        // statement-scoped (freed at the shIR boundary),
+                        // so it holds non-NULL from here to its free —
+                        // no flow tracking needed.
+                        if self.nonnull_returns.contains(&fname) {
+                            self.nonnull.insert(cn.clone());
+                        }
                     }
                     // the native call returns a heap string the caller
                     // owns — free it after the enclosing statement
@@ -12422,10 +12452,16 @@ impl Render {
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
                         // A NULL char* prints "(null)" (glibc) where bash
-                        // prints "" — guard every %s arg
-                        cargs.push(format!(
-                            "((char*)({v}) ? (char*)({v}) : \"\")"
-                        ));
+                        // prints "" — guard every %s arg UNLESS proven
+                        // non-NULL (P1 follow-up: OOM aborts, so a proven
+                        // fresh call temp can never be NULL here).
+                        if self.nonnull.contains(&v) {
+                            cargs.push(format!("(char*)({v})"));
+                        } else {
+                            cargs.push(format!(
+                                "((char*)({v}) ? (char*)({v}) : \"\")"
+                            ));
+                        }
                     }
                 },
             }
@@ -15103,6 +15139,11 @@ impl Render {
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        // never-NULL return proofs (P1 follow-up): which generated
+        // functions provably never return NULL — consulted when a fresh
+        // call temp is created (a pre-pass because render order is
+        // caller-first). See analyze_nonnull_returns.
+        self.nonnull_returns = analyze_nonnull_returns(&self.fn_defs, &self.lifted_fns);
         // vars that appear ONLY inside function bodies (var_types covers
         // them too, but they must NOT be hoisted into main — the
         // function declares its own copy).
@@ -17120,6 +17161,145 @@ fn is_prologue_line(line: &str) -> bool {
 
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
+}
+
+/// Functions proven to never return NULL (for `nonnull_returns`): every
+/// return path goes through `_sh_xstrdup` (aborts on OOM instead of
+/// returning NULL). Mirror of emit_function's trailing-echo logic — a
+/// function qualifies iff it is lifted (only lifted functions return C
+/// values at all), its body has no early `return` (value or builtin,
+/// at any depth — see `nonnull_has_early_return`), and its trailing
+/// echo value is not a bare `Var`/`getVar` (those take the move arm,
+/// which can return an unset NULL). Anything else leaves the function
+/// unproven (guards kept — conservative miss, never unsound). In
+/// particular this never inspects renderer state, so render order
+/// (caller-first) cannot stale it.
+fn analyze_nonnull_returns(
+    fn_defs: &[(String, Vec<IrStmt>)],
+    lifted: &BTreeMap<String, usize>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (name, body) in fn_defs {
+        if !lifted.contains_key(name) {
+            continue;
+        }
+        if body.is_empty() {
+            continue;
+        }
+        if nonnull_has_early_return(body) {
+            continue;
+        }
+        let ok = match body.last() {
+            Some(IrStmt::Expr(IrExpr::Call { args, .. })) => match args.get(1) {
+                Some(IrExpr::Array(items)) => match items.first() {
+                    Some(IrExpr::Var(..)) | Some(IrExpr::Ident(..)) => false,
+                    Some(IrExpr::Call { func, .. }) if func == "getVar" => false,
+                    Some(_) => true,
+                    None => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        };
+        if ok {
+            out.insert(name.clone());
+        }
+    }
+    out
+}
+
+/// Does this statement list contain an early `return` — an `IrStmt::Return`
+/// or a statement-level `return`-builtin call, at any depth? Recurses
+/// through inline scopes (blocks, branches, loops, try/case/select,
+/// redirects, pipelines); nested `Function` definitions are skipped
+/// (their returns belong to the inner function, analyzed separately).
+/// Opaque nodes (`Ext`, `Shaderize`, `Asm`) veto conservatively — a
+/// hidden return there must not pass as proven (missed opt, sound).
+fn nonnull_has_early_return(stmts: &[IrStmt]) -> bool {
+    for s in stmts {
+        match s {
+            IrStmt::Return(_) => return true,
+            IrStmt::Expr(IrExpr::Call { func, .. }) if func == "return" => return true,
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                if nonnull_has_early_return(b) {
+                    return true;
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                if nonnull_has_early_return(then) {
+                    return true;
+                }
+                for (_, b) in elsifs {
+                    if nonnull_has_early_return(b) {
+                        return true;
+                    }
+                }
+                if nonnull_has_early_return(else_) {
+                    return true;
+                }
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                if nonnull_has_early_return(body) {
+                    return true;
+                }
+            }
+            IrStmt::For { body, .. } => {
+                if nonnull_has_early_return(body) {
+                    return true;
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                if nonnull_has_early_return(init)
+                    || nonnull_has_early_return(step)
+                    || nonnull_has_early_return(body)
+                {
+                    return true;
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                if nonnull_has_early_return(body)
+                    || nonnull_has_early_return(else_body)
+                    || nonnull_has_early_return(finally_body)
+                {
+                    return true;
+                }
+                for e in excepts {
+                    if nonnull_has_early_return(&e.body) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    if nonnull_has_early_return(&c.body) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                if nonnull_has_early_return(inner) {
+                    return true;
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    if nonnull_has_early_return(st) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    if nonnull_has_early_return(&c.body) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Ext(_) | IrStmt::Shaderize { .. } | IrStmt::Asm { .. } => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Collect Function definitions at any depth (names + bodies).
@@ -21947,6 +22127,109 @@ mod tests {
         assert!(out.contains("capacity exceeded: big"), "no cap refusal:\n{out}");
         assert!(out.contains("exit(127)"), "no fail-stop:\n{out}");
         assert!(!out.contains("big[1024]"), "over-cap store emitted:\n{out}");
+    }
+
+    fn echo_call(item: IrExpr) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![item]),
+            ],
+        })
+    }
+
+    fn str_lit(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), crate::ir::StrStyle::DoubleQuoted)
+    }
+
+    #[test]
+    fn nonnull_returns_proven_and_vetoed() {
+        // P1 follow-up: only functions whose every return goes through
+        // _sh_xstrdup may drop their callers' printf guards.
+        let lifted: BTreeMap<String, usize> =
+            [("f".to_string(), 1)].into_iter().collect();
+        let empty_lifted: BTreeMap<String, usize> = BTreeMap::new();
+        // trailing echo of a literal → proven (xstrdup arm).
+        let ok_body = vec![echo_call(str_lit("hi"))];
+        assert!(analyze_nonnull_returns(&[("f".to_string(), ok_body)], &lifted).contains("f"));
+        // trailing echo of a bare Var → moved arm (may return unset
+        // NULL) → unproven.
+        let var_body = vec![echo_call(IrExpr::Var("x".to_string(), None))];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), var_body)], &lifted).contains("f"));
+        // trailing echo of getVar → moved arm → unproven.
+        let get_body = vec![echo_call(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![str_lit("x")],
+        })];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), get_body)], &lifted).contains("f"));
+        // trailing echo of any other value (capture call here) →
+        // xstrdup arm → proven.
+        let cap_body = vec![echo_call(IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![],
+        })];
+        assert!(analyze_nonnull_returns(&[("f".to_string(), cap_body)], &lifted).contains("f"));
+        // early value return anywhere → vetoed.
+        let early = vec![
+            IrStmt::Return(Some(str_lit("x"))),
+            echo_call(str_lit("hi")),
+        ];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), early)], &lifted).contains("f"));
+        // early return nested in a branch → vetoed.
+        let nested = vec![
+            IrStmt::If {
+                cond: str_lit("c"),
+                then: vec![IrStmt::Return(None)],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            echo_call(str_lit("hi")),
+        ];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), nested)], &lifted).contains("f"));
+        // `return` builtin call → vetoed.
+        let builtin = vec![
+            IrStmt::Expr(IrExpr::Call {
+                func: "return".to_string(),
+                args: vec![str_lit("1")],
+            }),
+            echo_call(str_lit("hi")),
+        ];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), builtin)], &lifted).contains("f"));
+        // not lifted → unproven (shell-text function, no C return).
+        let ok_body2 = vec![echo_call(str_lit("hi"))];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), ok_body2)], &empty_lifted).contains("f"));
+        // empty body / non-echo tail → unproven.
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), vec![])], &lifted).contains("f"));
+        let assign_tail = vec![IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "x".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_lit("hi"),
+            asm: None,
+        }];
+        assert!(!analyze_nonnull_returns(&[("f".to_string(), assign_tail)], &lifted).contains("f"));
+    }
+
+    #[test]
+    fn nonnull_printf_guard_dropped_when_proven() {
+        // P1 follow-up: a proven call temp prints without the
+        // `? : ""` guard; anything else keeps it.
+        let mut r = Render::default();
+        r.nonnull.insert("_af_12".to_string());
+        let out = r.printf_from_parts(vec![Part::Arg("_af_12".to_string(), NumSpec::Str)]);
+        assert_eq!(out, "printf(\"%s\", (char*)(_af_12))", "guard not dropped: {out}");
+        let mut r2 = Render::default();
+        let out2 = r2.printf_from_parts(vec![Part::Arg("_af_12".to_string(), NumSpec::Str)]);
+        assert!(out2.contains("? (char*)(_af_12) : \"\""), "guard missing: {out2}");
+        // a non-ident arg (vbuf member) never matches, even if named
+        // confusingly — only exact temp idents drop the guard.
+        let mut r3 = Render::default();
+        r3.nonnull.insert("_af_12".to_string());
+        let out3 = r3.printf_from_parts(vec![Part::Arg("_v7.p".to_string(), NumSpec::Str)]);
+        assert!(out3.contains("? (char*)(_v7.p) : \"\""), "guard missing: {out3}");
     }
 
     fn phase3_numeric_var_declares_numeric() {
