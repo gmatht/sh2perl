@@ -305,6 +305,12 @@ pub struct Render {
     /// — exact via atoll/__int128, no GMP per element). Computed in
     /// shir_to_c; consulted at reduce sites.
     small_int_arrays: HashSet<String>,
+    /// Fixed array name -> exact decl capacity (sizing from proofs:
+    /// max literal reset bulk + bounded appends). Absent = ARR_CAP
+    /// (unbounded or unproven). Decl and every fixed guard consult
+    /// it, so they always agree (never UB; a miscounted proof can
+    /// only exit-127 loudly). Computed in shir_to_c.
+    array_caps: HashMap<String, usize>,
     todo: usize,
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
@@ -1952,6 +1958,365 @@ fn collect_array_elements(stmts: &[IrStmt], out: &mut HashMap<String, Vec<IrExpr
         }
     }
 }
+/// Exact fixed capacity per array (sizing from proofs, not the blanket
+/// ARR_CAP): max literal reset bulk + bounded appends (straight-line
+/// appends plus const-trip loop appends). Only arrays with fully bounded
+/// growth qualify; everything else keeps ARR_CAP. Indexed writes are
+/// excluded (the _sh_arr_set sites stay on ARR_CAP — smaller blast
+/// radius); unbounded fills (split/$@/ArrayComp/non-literal bulk,
+/// unknown calls/fills, appends inside unboundable loops) and Ext nodes
+/// (opaque, could hide anything) disqualify. Decl and guard always
+/// agree (both via array_cap), so a miscounted proof exits 127 loudly —
+/// it never overflows.
+///
+/// Loop-contained `setArray` counts as append (the For renderer emits
+/// `xs[xs_len++]`, not a reset — t96's 100 appends prove it); only
+/// loop-free `setArray`/DeclareArray/Array-assign count as resets.
+/// Trip counts come from const `For` iters only (Range bounds, Array
+/// length); While/cstyleFor/unknown-iter bodies are unboundable
+/// (writes inside poison the array to ARR_CAP).
+fn array_fixed_caps(
+    prog: &IrProgram,
+    exclude: &HashSet<String>,
+) -> HashMap<String, usize> {
+    #[derive(Default)]
+    struct Info {
+        max_reset: u64,
+        appends: u64,
+        defined: bool,
+        indexed_write: bool,
+        unbounded: bool,
+    }
+    // a bulk item that expands to a runtime-unknown element count
+    fn is_multi(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                func == "split"
+                    || ((func == "listVar" || func == "arrayItems")
+                        && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "@"))
+            }
+            _ => false,
+        }
+    }
+    // const trip count of a For iter, or None when unboundable
+    fn for_trips(iter: &IrExpr) -> Option<u64> {
+        match iter {
+            IrExpr::Range { start, end } => Some(if *end >= *start {
+                (*end as i128 - *start as i128 + 1).min(u64::MAX as i128) as u64
+            } else {
+                0
+            }),
+            IrExpr::Array(items) => Some(items.len() as u64),
+            _ => None,
+        }
+    }
+    // record a setArray/setArrayAppend bulk under the current context:
+    // loop-free setArray is a reset (max), everything else appends.
+    fn record_bulk(
+        func: &str,
+        args: &[IrExpr],
+        info: &mut Info,
+        mult: Option<u64>,
+        depth: u32,
+    ) {
+        match args.get(1) {
+            Some(IrExpr::Array(items)) => {
+                if items.iter().any(is_multi) {
+                    info.unbounded = true;
+                    return;
+                }
+                let n = items.len() as u64;
+                info.defined = true;
+                if func == "setArray" && depth == 0 {
+                    info.max_reset = info.max_reset.max(n);
+                } else {
+                    match mult {
+                        Some(k) => {
+                            info.appends =
+                                info.appends.saturating_add(n.saturating_mul(k));
+                        }
+                        None => {
+                            info.unbounded = true;
+                        }
+                    }
+                }
+            }
+            // ArrayComp bulk: the comp loop appends per iter item — the
+            // trip counter here doesn't model it; stay at 1024.
+            _ => {
+                info.defined = true;
+                info.unbounded = true;
+            }
+        }
+    }
+    fn caps_expr_of(
+        e: &IrExpr,
+        map: &mut HashMap<String, Info>,
+        mult: Option<u64>,
+        depth: u32,
+    ) {
+        match e {
+            IrExpr::Call { func, args }
+                if func == "setArray" || func == "setArrayAppend" =>
+            {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let info = map.entry(name.clone()).or_default();
+                    record_bulk(func, args, info, mult, depth);
+                }
+                for a in args {
+                    caps_expr_of(a, map, mult, depth);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // unknown calls naming an array first might fill it
+                // (file reads, `read`, ...) — unbounded until proven
+                // otherwise. Read-only consumers never write.
+                if !matches!(func.as_str(), "sortedIntJoin" | "sortedBigintJoin" | "max" | "min" | "sum" | "arrayIndex" | "arrayItems" | "arrayLen" | "getVar")
+                {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let info = map.entry(name.clone()).or_default();
+                        info.defined = true;
+                        info.unbounded = true;
+                    }
+                }
+                for a in args {
+                    caps_expr_of(a, map, mult, depth);
+                }
+            }
+            IrExpr::Array(items) => {
+                for x in items {
+                    caps_expr_of(x, map, mult, depth);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                caps_expr_of(lhs, map, mult, depth);
+                caps_expr_of(rhs, map, mult, depth);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        caps_expr_of(x, map, mult, depth);
+                    }
+                }
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                caps_expr_of(iter, map, mult, depth);
+                caps_expr_of(elem, map, mult, depth);
+                if let Some(c) = cond {
+                    caps_expr_of(c, map, mult, depth);
+                }
+            }
+            IrExpr::Arith(a) => caps_arith_of(a, map, mult, depth),
+            _ => {}
+        }
+    }
+    fn caps_arith_of(
+        a: &ArithAst,
+        map: &mut HashMap<String, Info>,
+        mult: Option<u64>,
+        depth: u32,
+    ) {
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => {
+                caps_arith_of(lhs, map, mult, depth);
+                caps_arith_of(rhs, map, mult, depth);
+            }
+            ArithAst::Un { arg, .. } => caps_arith_of(arg, map, mult, depth),
+            ArithAst::Cond { test, then, else_, .. } => {
+                caps_arith_of(test, map, mult, depth);
+                caps_arith_of(then, map, mult, depth);
+                caps_arith_of(else_, map, mult, depth);
+            }
+            ArithAst::Cast { arg, .. } => caps_arith_of(arg, map, mult, depth),
+            ArithAst::Assign { rhs, .. } => caps_arith_of(rhs, map, mult, depth),
+            ArithAst::IncDec { .. } => {}
+            _ => {}
+        }
+    }
+    fn caps_of(
+        stmts: &[IrStmt],
+        map: &mut HashMap<String, Info>,
+        mult: Option<u64>,
+        depth: u32,
+        ext: &mut bool,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        // every index-write shape the renderer honors
+                        // (structured indices AND flattened `arr[1]` names)
+                        if !t.indices.is_empty() || t.var.contains('[') {
+                            let base = t.var.split('[').next().unwrap_or(&t.var);
+                            let info = map.entry(base.to_string()).or_default();
+                            info.defined = true;
+                            info.indexed_write = true;
+                        } else if let IrExpr::Array(items) = expr {
+                            // `xs = (...)` literal: reset at any depth
+                            // (Assign-Array always re-fills from len).
+                            let info = map.entry(t.var.clone()).or_default();
+                            info.defined = true;
+                            if items.iter().any(is_multi) {
+                                info.unbounded = true;
+                            } else {
+                                info.max_reset =
+                                    info.max_reset.max(items.len() as u64);
+                            }
+                        }
+                    }
+                    caps_expr_of(expr, map, mult, depth);
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let info = map.entry(var.clone()).or_default();
+                    info.defined = true;
+                    if elements.iter().any(is_multi) {
+                        info.unbounded = true;
+                    } else {
+                        info.max_reset = info.max_reset.max(elements.len() as u64);
+                    }
+                    for e in elements {
+                        caps_expr_of(e, map, mult, depth);
+                    }
+                }
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        caps_expr_of(e, map, mult, depth);
+                    }
+                }
+                IrStmt::Expr(e) => caps_expr_of(e, map, mult, depth),
+                IrStmt::Output { value, .. } => caps_expr_of(value, map, mult, depth),
+                IrStmt::WriteFile { path, content, .. } => {
+                    caps_expr_of(path, map, mult, depth);
+                    caps_expr_of(content, map, mult, depth);
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        caps_expr_of(x, map, mult, depth);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    caps_expr_of(cond, map, mult, depth);
+                    caps_of(then, map, mult, depth, ext);
+                    for (c, b) in elsifs {
+                        caps_expr_of(c, map, mult, depth);
+                        caps_of(b, map, mult, depth, ext);
+                    }
+                    caps_of(else_, map, mult, depth, ext);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                    caps_expr_of(cond, map, mult, depth);
+                    // unboundable trip count: writes inside stay at 1024.
+                    caps_of(body, map, None, depth + 1, ext);
+                }
+                IrStmt::For { var: _, iter, body } => {
+                    match (mult, for_trips(iter)) {
+                        (Some(m), Some(t)) => caps_of(
+                            body,
+                            map,
+                            Some(m.saturating_mul(t)),
+                            depth + 1,
+                            ext,
+                        ),
+                        _ => caps_of(body, map, None, depth + 1, ext),
+                    }
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    caps_of(init, map, mult, depth, ext);
+                    caps_expr_of(cond, map, mult, depth);
+                    caps_of(step, map, mult, depth, ext);
+                    caps_of(body, map, None, depth + 1, ext);
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    caps_of(body, map, mult, depth, ext);
+                    for e in excepts {
+                        caps_of(&e.body, map, mult, depth, ext);
+                    }
+                    caps_of(else_body, map, mult, depth, ext);
+                    caps_of(finally_body, map, mult, depth, ext);
+                }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    caps_expr_of(discriminant, map, mult, depth);
+                    for c in clauses {
+                        caps_of(&c.body, map, mult, depth, ext);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    // called an unknown number of times: unbounded inside.
+                    caps_of(body, map, None, depth + 1, ext);
+                    for (_, b) in named_blocks {
+                        caps_of(b, map, None, depth + 1, ext);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        caps_of(st, map, mult, depth, ext);
+                    }
+                }
+                IrStmt::Select { clauses, .. } => {
+                    // select repeats until break: unbounded inside.
+                    for c in clauses {
+                        caps_of(&c.body, map, None, depth + 1, ext);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    caps_of(inner, map, mult, depth, ext)
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    caps_of(b, map, mult, depth, ext)
+                }
+                IrStmt::Exec { cmd, args, redirects, .. } => {
+                    caps_expr_of(cmd, map, mult, depth);
+                    for a in args {
+                        caps_expr_of(a, map, mult, depth);
+                    }
+                    for r in redirects {
+                        caps_expr_of(r, map, mult, depth);
+                    }
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                    caps_expr_of(expr, map, mult, depth);
+                }
+                IrStmt::SetChildError(e) => caps_expr_of(e, map, mult, depth),
+                // opaque extension node: could hide any write — bail
+                // the whole map (fail-closed) rather than risk a
+                // miscounted cap.
+                IrStmt::Ext(_) => {
+                    *ext = true;
+                }
+                // Continue/Break/Require/RawText/Asm: no statement or
+                // array-write children (Asm templates reference
+                // registers, never array stores).
+                _ => {}
+            }
+        }
+    }
+    let mut map: HashMap<String, Info> = HashMap::new();
+    let mut ext = false;
+    caps_of(&prog.stmts, &mut map, Some(1), 0, &mut ext);
+    for sub in &prog.subs {
+        // subs are functions: called an unknown number of times.
+        caps_of(&sub.body, &mut map, None, 1, &mut ext);
+    }
+    if ext {
+        return HashMap::new();
+    }
+    let mut out = HashMap::new();
+    for (name, info) in &map {
+        if info.indexed_write || info.unbounded || !info.defined {
+            continue;
+        }
+        if exclude.contains(name) {
+            continue;
+        }
+        let need = info.max_reset.saturating_add(info.appends);
+        // defined-but-always-empty still needs one slot; need >=
+        // ARR_CAP keeps the status quo.
+        if need < ARR_CAP as u64 {
+            out.insert(name.clone(), need.max(1) as usize);
+        }
+    }
+    out
+}
 
 fn collect_array_elements_expr(e: &IrExpr, out: &mut HashMap<String, Vec<IrExpr>>) {
     match e {
@@ -2150,6 +2515,16 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     {
         let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
         r.small_int_arrays = small_int_arrays(&prog, &vt, &r.bigint_vars);
+    }
+    // exact fixed capacities (sizing from proofs, not blanket 1024).
+    // Same point: final layout, all verdicts/sets ready. Array-return
+    // and bigint-homed arrays never consult the map (separate
+    // decls/paths), so excluding them is hygiene.
+    {
+        let mut exclude: HashSet<String> = r.array_return_fns.iter().cloned().collect();
+        exclude.extend(r.array_return_arrays.values().cloned());
+        exclude.extend(r.bigint_vars.iter().cloned());
+        r.array_caps = array_fixed_caps(&prog, &exclude);
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -5051,6 +5426,12 @@ impl Render {
     /// return the value expression. Int arrays scan i64; bigint arrays
     /// (char *[] of decimal text) parse each element into an mpz temp
     /// and reduce exactly.
+    /// Exact fixed capacity for an array (sizing from proofs), or
+    /// ARR_CAP when unbounded/unproven. Decl and every fixed guard go
+    /// through here so they always agree.
+    fn array_cap(&self, var: &str) -> usize {
+        self.array_caps.get(var).copied().unwrap_or(ARR_CAP)
+    }
     fn reduce_array(&mut self, func: &str, name: &str) -> String {
         if !self.arrays.contains(name) || self.assoc_arrays.contains(name) {
             self.mark_todo(&format!("{func} of non-array {name}"));
@@ -12194,7 +12575,8 @@ impl Render {
         let ev = self.value_c(elem);
         // P1: the loop appends into a fixed [ARR_CAP] array — refuse
         // past the cap instead of overflowing.
-        self.emit(&format!("if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+        let cap = self.array_cap(arr);
+        self.emit(&format!("if ({id}_len >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
         self.emit(&format!("{id}[{id}_len++] = _sh_xstrdup((char*)({ev}));"));
         if cond.is_some() {
             self.depth -= 1;
@@ -12354,7 +12736,8 @@ impl Render {
             let v = self.value_c(it);
             // P1: {ai} is the running index into a fixed [ARR_CAP]
             // array — refuse past the cap instead of overflowing.
-            self.emit(&format!("if ({ai} >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+                let cap = self.array_cap(var);
+                self.emit(&format!("if ({ai} >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
             if self.int_arrays.contains(var) {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
@@ -12387,7 +12770,8 @@ impl Render {
         // check covers every arm (mpz/int/string) instead of silent
         // overflow past the cap.
         if !items.is_empty() {
-            self.emit(&format!("if ({id}_len + {} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
+                let cap = self.array_cap(var);
+                self.emit(&format!("if ({id}_len + {} > {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
         }
         for (i, it) in items.iter().enumerate() {
             // `arr[len + 0]` -> `arr[len]` (drop the +0 for the first)
@@ -15761,7 +16145,8 @@ impl Render {
                 // narrowest width that fits all elements, no string
                 // round-trip.
                 let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
-                self.emit(&format!("static {} {id}[{ARR_CAP}] = {{0}};", w.c_type()));
+                let cap = self.array_cap(a);
+                self.emit(&format!("static {} {id}[{cap}] = {{0}};", w.c_type()));
                 self.emit(&format!("static size_t {id}_len = 0;"));
                 if self.reduce_arrays.contains(a) {
                     // maintained max/min/sum aggregates (Optimisation 1)
@@ -15770,7 +16155,9 @@ impl Render {
                     self.emit(&format!("static long long {id}_sum = 0;"));
                 }
             } else {
-                self.emit(&format!("static char *{id}[{ARR_CAP}] = {{0}};"));
+                // exact proven capacity (sizing from proofs) or ARR_CAP
+                let cap = self.array_cap(a);
+                self.emit(&format!("static char *{id}[{cap}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_len = 0;"));
             }
         }
@@ -22795,7 +23182,7 @@ mod tests {
             var_bash_env: vec![],
         };
         let out = shir_to_c(&prog);
-        assert!(out.contains("uint8_t a[1024]"), "int array not narrowed uint8_t[]:\n{out}");
+        assert!(out.contains("uint8_t a["), "int array not narrowed uint8_t[]:\n{out}");
         assert!(
             out.contains("_sh_sorted_intu8_join"),
             "u8 join helper missing:\n{out}"
@@ -22861,7 +23248,7 @@ mod tests {
             var_bash_env: vec![],
         };
         let out = shir_to_c(&prog);
-        assert!(out.contains("char *a[1024]"), "bigint array not char*[]:\n{out}");
+        assert!(out.contains("char *a["), "bigint array not char*[]:\n{out}");
         assert!(
             out.contains("_sh_sorted_bigint_join"),
             "bigint join helper missing:\n{out}"
@@ -23756,6 +24143,102 @@ mod tests {
     }
 
     #[test]
+    fn fixed_array_sized_from_proofs() {
+        // exact decl capacity from proofs (max reset bulk + bounded
+        // appends); decl and guard agreeing; unbounded/indexed keep 1024.
+        fn setarray(func: &str, arr: &str, items: Vec<IrExpr>) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: arr.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: func.to_string(),
+                    args: vec![
+                        IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(items),
+                    ],
+                },
+                asm: None,
+            }
+        }
+        fn index_write(arr: &str, idx: &str) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: arr.to_string(),
+                    sigil: None,
+                    indices: vec![IrExpr::Str(idx.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                }],
+                expr: IrExpr::Int(7),
+                asm: None,
+            }
+        }
+        fn echo_len(arr: &str) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Call {
+                        func: "arrayLen".to_string(),
+                        args: vec![IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                    }]),
+                ],
+            })
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        // three literals, no appends → exact small decl (not 1024),
+        // decl and guard agreeing on the number.
+        let out = shir_to_c(&prog_of(vec![
+            setarray("setArray", "a", vec![IrExpr::Int(1), IrExpr::Int(2), IrExpr::Int(3)]),
+            echo_len("a"),
+        ]));
+        let decl = out.find("char *a[").expect("no array decl:\n{out}");
+        let dn: usize = out[decl + 8..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().expect("decl size");
+        assert!(dn < 1024, "blanket cap leaked:\n{out}");
+        assert!(out.contains(&format!("_ai0 >= {dn}")), "guard disagrees with decl:\n{out}");
+        // indexed write → 1024 status quo or vec (arr_set sites are
+        // unthreaded, so never a small fixed decl).
+        let out = shir_to_c(&prog_of(vec![
+            setarray("setArray", "b", vec![IrExpr::Int(1)]),
+            index_write("b", "0"),
+            echo_len("b"),
+        ]));
+        assert!(
+            out.contains("char *b[1024]") || out.contains("char **b = NULL"),
+            "indexed write small-fixed:\n{out}"
+        );
+        // split fill (runtime-unknown count) → 1024 status quo.
+        let out = shir_to_c(&prog_of(vec![
+            setarray(
+                "setArray",
+                "c",
+                vec![IrExpr::Call {
+                    func: "split".to_string(),
+                    args: vec![IrExpr::Str("x y".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                }],
+            ),
+            echo_len("c"),
+        ]));
+        assert!(out.contains("char *c[1024]"), "split fill shrunk:\n{out}");
+    }
+
+    #[test]
     fn small_int_sum_native_no_gmp() {
         // P1 follow-up: sum() over int-domain string elements lowers to
         // a native atoll/__int128 loop (exact, no per-element GMP).
@@ -23927,7 +24410,7 @@ mod tests {
         assert!(out.contains("capacity exceeded"), "no cap check:\n{out}");
         assert!(out.contains("exit(127)"), "no fail-stop:\n{out}");
         let chk = out.find("capacity exceeded").unwrap();
-        let sto = out.find("a_len + 1 > 1024").expect("append guard shape");
+        let sto = out.find("a_len + 1 > ").expect("append guard shape");
         assert!(chk == sto || out[..chk].contains("a_len"), "check names the array");
         // the guard precedes the length bump of the same append
         let bump = out.find("++a_len").expect("append bump");
