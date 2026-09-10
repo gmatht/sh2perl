@@ -5408,7 +5408,15 @@ fn param_lift_set(prog: &IrProgram) -> HashMap<String, usize> {
 /// function, or None when the composed identifier would be invalid JS
 /// (shell function names may contain `-` etc.; those keep the fnCall
 /// dispatch).
+///
+/// The `__fn_` prefix is applied ONLY when the plain name would collide
+/// with a JS reserved word, a JS global the generated code uses, or a
+/// generated temp name — a clean, collision-free name binds as itself
+/// (`let all_factors = …`), so the output reads naturally.
 fn direct_binding_name(name: &str) -> Option<String> {
+    if is_plain_fn_name_safe(name) {
+        return Some(name.to_string());
+    }
     let n = format!("__fn_{name}");
     let mut chars = n.chars();
     let first = chars.next()?;
@@ -5419,6 +5427,52 @@ fn direct_binding_name(name: &str) -> Option<String> {
         return None;
     }
     Some(n)
+}
+
+/// Is `name` safe to bind as a plain JS identifier (no `__fn_` prefix)?
+/// True when it is a valid identifier AND not a JS reserved word, a JS
+/// global the generated code relies on, or a generated temp name.
+fn is_plain_fn_name_safe(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // JS reserved words — a bare binding would be a syntax error
+    const RESERVED: &[&str] = &[
+        "break", "case", "catch", "class", "const", "continue", "debugger",
+        "default", "delete", "do", "else", "enum", "export", "extends",
+        "false", "finally", "for", "function", "if", "import", "in",
+        "instanceof", "new", "null", "return", "super", "switch", "this",
+        "throw", "true", "try", "typeof", "var", "void", "while", "with",
+        "yield", "let", "static", "await", "async",
+    ];
+    if RESERVED.contains(&name) {
+        return false;
+    }
+    // JS globals the generated code calls directly (a bare binding would
+    // shadow them and break the emitted `String(...)`/`Number(...)`/…)
+    const GLOBALS: &[&str] = &[
+        "String", "Number", "Math", "BigInt", "Array", "Object", "Boolean",
+        "JSON", "Promise", "process", "console", "setTimeout", "setInterval",
+        "clearTimeout", "clearInterval", "parseInt", "parseFloat", "isNaN",
+        "isFinite", "Symbol", "Map", "Set", "RegExp", "Date", "Error",
+        "TypeError", "RangeError", "ReferenceError", "sh2",
+    ];
+    if GLOBALS.contains(&name) {
+        return false;
+    }
+    // generated temp names (the sorted-join IIFE, true64 slots, …)
+    if name.starts_with("__") {
+        return false;
+    }
+    true
 }
 
 /// Is `name` a positional-parameter name the runtime resolves from its
@@ -24573,19 +24627,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // direct-fn set is HashSet-backed; deterministic declaration order
     // keeps A1->ESTree output byte-stable across processes.
     let mut direct_sorted: Vec<&String> = direct_fns.iter().collect();
-    // param-lifted functions need the same module binding (their define
-    // is a bare reassignment of `__fn_<name>`)
-    let pl_names: Vec<String> = PARAM_LIFT
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|pl| pl.keys().cloned().collect())
-        .unwrap_or_default();
-    for n in &pl_names {
-        if !direct_fns.contains(n) {
-            direct_sorted.push(n);
-        }
-    }
+    // param-lifted functions are EXCLUDED from the `let = null` prologue
+    // — their define site emits `function <binding>(<params>)` directly
+    // (a hoisted declaration — no `=`/`=>`). The analysis proves
+    // top-level single definition with static calls, so hoisting only
+    // widens the callable window; the `callUndefined` fallback is
+    // preserved for non-param-lifted direct functions.
     // STORE-ONLY vars: the native binding (`let <name> = null;` — the
     // Assign writes and bare reads follow)
     let so_names: Vec<String> = STORE_ONLY_VARS
@@ -29036,6 +29083,42 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 fn_call_is_direct(name)
                     .then(|| direct_binding_name(name).expect("direct set is binding-valid"))
             };
+            // param-lifted: idiomatic `function <binding>(<params>)` at
+            // the define site (a hoisted declaration — no `=`/`=>`, no
+            // `let = null` prologue entry, which we skipped above). Safe
+            // because the arrow never binds `this`/`arguments`/`super`
+            // (the emitter never generates them), params are plain `p1..`
+            // identifiers, and the analysis proves top-level single
+            // definition with static calls (hoisting only widens the
+            // callable window vs `const`, never narrows it).
+            if lifted_arity.is_some() {
+                if let Some(b) = &binding {
+                    if let Expr::ArrowFunctionExpression {
+                        params,
+                        body,
+                        r#async,
+                        ..
+                    } = arrow
+                    {
+                        let fn_body: Stmt = match body {
+                            ArrowBody::Block(boxed) => *boxed,
+                            ArrowBody::Expr(expr) => Stmt::BlockStatement {
+                                body: vec![Stmt::ReturnStatement {
+                                    argument: Some(*expr),
+                                }],
+                            },
+                        };
+                        return Some(Stmt::FunctionDeclaration {
+                            id: Expr::Identifier { name: b.clone() },
+                            params,
+                            body: Box::new(fn_body),
+                            generator: false,
+                            expression: false,
+                            r#async,
+                        });
+                    }
+                }
+            }
             let mut items = vec![];
             if let Some(b) = &binding {
                 items.push(Expr::AssignmentExpression {
