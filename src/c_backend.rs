@@ -426,6 +426,9 @@ pub struct Render {
     /// consumed by sortedIntJoin/sortedBigintJoin): stored as
     /// `long long name[N]` + `name_len` instead of `char* name[N]`
     int_arrays: HashSet<String>,
+    /// int arrays consumed by max/min/sum — maintain `_max`/`_min`/`_sum`
+    /// aggregates incrementally so the reduction is O(1) (Optimisation 1)
+    reduce_arrays: HashSet<String>,
     /// associative-array names (`name_k`/`name_v`/`name_n` stores)
     assoc_arrays: BTreeSet<String>,
     /// `shopt -s nocasematch` → [[ == ]] globs match case-insensitively
@@ -540,6 +543,76 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
 /// integer AND the array is never read in a string context (only
 /// `sortedIntJoin`/`sortedBigintJoin` consume it). Such arrays can be
 /// stored as `long long[]` instead of `char *[]` — no string round-trip.
+/// Arrays consumed by `max`/`min`/`sum` — candidates for maintained
+/// `_max`/`_min`/`_sum` aggregates (Optimisation 1). Only int arrays that
+/// are reduced this way qualify (a bigint array's aggregate is a GMP
+/// value, not worth maintaining on the hot path).
+fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
+    let int_arrays = analyze_int_arrays(prog);
+    let mut reduce: HashSet<String> = HashSet::new();
+    fn walk(stmts: &[IrStmt], reduce: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, reduce),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, reduce),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    for b in then { walk(std::slice::from_ref(b), reduce); }
+                    for (_, b) in elsifs { walk(b, reduce); }
+                    for b in else_ { walk(std::slice::from_ref(b), reduce); }
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body, reduce),
+                IrStmt::For { body, .. } => walk(body, reduce),
+                IrStmt::Function { body, .. } => walk(body, reduce),
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    walk(body, reduce)
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages.iter().flatten() { walk(std::slice::from_ref(st), reduce); }
+                }
+                IrStmt::Ext(n) => {
+                    for c in n.children() { walk(std::slice::from_ref(c), reduce); }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, reduce: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if matches!(func.as_str(), "max" | "min" | "sum") {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        reduce.insert(name.clone());
+                    }
+                }
+                for a in args { walk_expr(a, reduce); }
+            }
+            IrExpr::Array(items) => {
+                for it in items { walk_expr(it, reduce); }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, reduce);
+                walk_expr(rhs, reduce);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p { walk_expr(x, reduce); }
+                }
+            }
+            IrExpr::Ext(n) => {
+                for c in n.children() { walk_expr(c, reduce); }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut reduce);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut reduce);
+    }
+    // only int arrays (the aggregate is a plain i64)
+    reduce.retain(|a| int_arrays.contains(a));
+    reduce
+}
+
 fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
     let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let bigint_vars = analyze_bigint_vars(prog);
@@ -953,6 +1026,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     r.int_arrays = analyze_int_arrays(&prog);
+    r.reduce_arrays = analyze_reduce_arrays(&prog);
     r.int_array_widths = int_array_widths(&prog, &ranges);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
@@ -1003,6 +1077,17 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         let shadowed = vars.contains("argc") || vars.contains("argv");
         r.pos_const = scan_pos_const(&prog.stmts, &r.lifted_fns, shadowed);
+    }
+    // Range-loop re-fold: the frontend lowers `for i in range(...)` to
+    // `i = lo; while (i < hi) { body; i++ }` (the While form keeps the
+    // estree backend's fast native-while path). The C backend folds the
+    // counting-loop shape back into a cstyleFor Call so it renders a
+    // native C `for` (goal: `for i in range(...)` → `for (i = lo; i <
+    // hi; i++)`). Runs after the analyses (they see the While form) and
+    // before program() (mark_cstyle_for_vars sees the cstyleFor Call).
+    fold_range_for(&mut prog.stmts);
+    for sub in &mut prog.subs {
+        fold_range_for(&mut sub.body);
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -3770,6 +3855,15 @@ impl Render {
         let li = format!("_i{}", self.temp_seq);
         self.temp_seq += 1;
         if self.int_arrays.contains(name) {
+            if self.reduce_arrays.contains(name) {
+                // O(1): read the maintained aggregate (Optimisation 1)
+                let agg = match func {
+                    "max" => format!("{id}_max"),
+                    "min" => format!("{id}_min"),
+                    _ => format!("{id}_sum"),
+                };
+                return self.num_temp(&agg);
+            }
             let w = self.int_array_widths.get(name).copied().unwrap_or(Width::I64);
             let ct = w.c_type();
             self.emit(&format!("{ct} {acc} = ({id}_len > 0) ? {id}[0] : 0;"));
@@ -10912,6 +11006,11 @@ impl Render {
         // (the item loop below re-sets _len per element; without this a
         // function-local array reused across calls keeps its old length).
         self.emit(&format!("{id}_len = 0;"));
+        if self.reduce_arrays.contains(var) {
+            self.emit(&format!("{id}_max = 0;"));
+            self.emit(&format!("{id}_min = 0;"));
+            self.emit(&format!("{id}_sum = 0;"));
+        }
         for (i, it) in items.iter().enumerate() {
             let _ = i;
             // `arr=("$@")` — EACH positional is its own element (a joined
@@ -10959,6 +11058,14 @@ impl Render {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
                 self.emit(&format!("{id}[{ai}] = {nv};"));
+                if self.reduce_arrays.contains(var) {
+                    // maintain the aggregates (Optimisation 1)
+                    self.emit(&format!("if ({ai} == 0) {{ {id}_max = {id}_min = {id}_sum = {nv}; }} else {{"));
+                    self.emit(&format!("    if ({nv} > {id}_max) {id}_max = {nv};"));
+                    self.emit(&format!("    if ({nv} < {id}_min) {id}_min = {nv};"));
+                    self.emit(&format!("    {id}_sum += {nv};"));
+                    self.emit("}");
+                }
             } else {
                 self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
             }
@@ -10989,6 +11096,14 @@ impl Render {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
                 self.emit(&format!("{id}[{idx}] = {nv};"));
+                if self.reduce_arrays.contains(var) {
+                    // maintain the aggregates (Optimisation 1)
+                    self.emit(&format!("if ({idx} == 0) {{ {id}_max = {id}_min = {id}_sum = {nv}; }} else {{"));
+                    self.emit(&format!("    if ({nv} > {id}_max) {id}_max = {nv};"));
+                    self.emit(&format!("    if ({nv} < {id}_min) {id}_min = {nv};"));
+                    self.emit(&format!("    {id}_sum += {nv};"));
+                    self.emit("}");
+                }
             } else {
                 let v = self.value_c(it);
                 self.emit(&format!("{id}[{idx}] = strdup((char*)({v}));"));
@@ -14176,6 +14291,12 @@ impl Render {
                 let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
                 self.emit(&format!("static {} {id}[{ARR_CAP}] = {{0}};", w.c_type()));
                 self.emit(&format!("static size_t {id}_len = 0;"));
+                if self.reduce_arrays.contains(a) {
+                    // maintained max/min/sum aggregates (Optimisation 1)
+                    self.emit(&format!("static long long {id}_max = 0;"));
+                    self.emit(&format!("static long long {id}_min = 0;"));
+                    self.emit(&format!("static long long {id}_sum = 0;"));
+                }
             } else {
                 self.emit(&format!("static char *{id}[{ARR_CAP}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_len = 0;"));
@@ -16515,6 +16636,186 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
         }
         _ => {}
     }
+}
+
+/// Render an ArithAst back to arithmetic text (for a cstyleFor header).
+/// Only the shapes the range-loop fold produces need to be exact; the
+/// rest render best-effort (the fold only fires on the simple shapes).
+fn arith_to_text(a: &ArithAst) -> String {
+    match a {
+        ArithAst::Num(n) => n.to_string(),
+        ArithAst::Var(n) | ArithAst::Ident(n) => n.clone(),
+        ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_text(key)),
+        ArithAst::Bin { op, lhs, rhs } => {
+            format!("({} {} {})", arith_to_text(lhs), op, arith_to_text(rhs))
+        }
+        ArithAst::Un { op, arg } => format!("({op}{})", arith_to_text(arg)),
+        ArithAst::Cond { test, then, else_ } => format!(
+            "({} ? {} : {})",
+            arith_to_text(test),
+            arith_to_text(then),
+            arith_to_text(else_)
+        ),
+        ArithAst::Assign { var, op, rhs } => format!("{var} {op} {}", arith_to_text(rhs)),
+        ArithAst::IncDec { var, delta, prefix } => {
+            let op = if *delta >= 0 { "++" } else { "--" };
+            if *prefix {
+                format!("{op}{var}")
+            } else {
+                format!("{var}{op}")
+            }
+        }
+        ArithAst::Sizeof(_) => "0".into(),
+        ArithAst::Cast { arg, .. } => arith_to_text(arg),
+    }
+}
+
+/// Does a statement list contain a native `continue` anywhere? (The fold
+/// below must not fire: a `continue` in the While form skips the step
+/// (the step is the body's last stmt); in the for form it runs the step
+/// (the step lives in the header) — a semantic difference.)
+fn stmts_contain_continue(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        IrStmt::Continue => true,
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            stmts_contain_continue(b)
+        }
+        IrStmt::If { then, elsifs, else_, .. } => {
+            stmts_contain_continue(then)
+                || elsifs.iter().any(|(_, b)| stmts_contain_continue(b))
+                || stmts_contain_continue(else_)
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+            stmts_contain_continue(body)
+        }
+        _ => false,
+    })
+}
+
+/// Fold the frontend's range-loop pattern (`i = lo; while (i < hi) {
+/// body; i++ }`) into a cstyleFor Call so the C backend renders a native
+/// `for` (goal: `for i in range(...)` → `for (i = lo; i < hi; i++)`).
+/// The frontend emits the While form (the estree backend's fast native
+/// while path); this pass re-folds it for the C renderer. Conservative:
+/// only the exact counting-loop shape folds, and only when the body has
+/// no native `continue` (see stmts_contain_continue).
+fn fold_range_for(stmts: &mut Vec<IrStmt>) {
+    let mut out = Vec::with_capacity(stmts.len());
+    let mut i = 0;
+    while i < stmts.len() {
+        if i + 1 < stmts.len() {
+            if let Some(repl) = fold_range_pair(&stmts[i], &stmts[i + 1]) {
+                out.push(repl);
+                i += 2;
+                continue;
+            }
+        }
+        let mut s = stmts[i].clone();
+        fold_range_stmt(&mut s);
+        out.push(s);
+        i += 1;
+    }
+    *stmts = out;
+}
+
+/// Recurse into a statement's nested statement lists (the pair-fold
+/// happens at the list level in fold_range_for).
+fn fold_range_stmt(s: &mut IrStmt) {
+    match s {
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => fold_range_for(b),
+        IrStmt::If { then, elsifs, else_, .. } => {
+            fold_range_for(then);
+            for (_, b) in elsifs {
+                fold_range_for(b);
+            }
+            fold_range_for(else_);
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+            fold_range_for(body);
+        }
+        IrStmt::ForInit { init, step, body, .. } => {
+            fold_range_for(init);
+            fold_range_for(step);
+            fold_range_for(body);
+        }
+        IrStmt::Function { body, .. } => fold_range_for(body),
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                fold_range_for(&mut c.body);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            fold_range_for(body);
+            for e in excepts {
+                fold_range_for(&mut e.body);
+            }
+            fold_range_for(else_body);
+            fold_range_for(finally_body);
+        }
+        _ => {}
+    }
+}
+
+/// The pair fold: `Assign { targets: [v], expr: Arith(a1) }` followed by
+/// `While { cond: Arith(Bin(<, Var(v), X)), body: B }` where B's last
+/// stmt is the step (`v++` or `v = v + 1`) → a cstyleFor Call.
+fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
+    let (v, a1) = match a {
+        IrStmt::Assign { targets, expr: IrExpr::Arith(a1), .. }
+            if targets.len() == 1 && targets[0].indices.is_empty() =>
+        {
+            (targets[0].var.clone(), a1)
+        }
+        _ => return None,
+    };
+    let (cond, body) = match b {
+        IrStmt::While { cond: IrExpr::Arith(c), body } => (c, body),
+        _ => return None,
+    };
+    let x = match cond.as_ref() {
+        ArithAst::Bin { op, lhs, rhs } if op == "<" => match lhs.as_ref() {
+            ArithAst::Var(n) if *n == v => rhs.as_ref().clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (step, body_rest) = body.split_last()?;
+    let step_ok = match step {
+        IrStmt::Expr(IrExpr::Arith(a)) => match a.as_ref() {
+            ArithAst::IncDec { var, delta, prefix: false } => *var == v && *delta == 1,
+            _ => false,
+        },
+        IrStmt::Assign { targets, expr: IrExpr::Arith(a), .. } => match a.as_ref() {
+            ArithAst::Bin { op, lhs, rhs } => {
+                op == "+"
+                    && targets.len() == 1
+                    && targets[0].indices.is_empty()
+                    && targets[0].var == v
+                    && matches!(lhs.as_ref(), ArithAst::Var(n) if *n == v)
+                    && matches!(rhs.as_ref(), ArithAst::Num(1))
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !step_ok || stmts_contain_continue(body_rest) {
+        return None;
+    }
+    let spec = format!(
+        "{}={}; {}<{}; {}++",
+        v,
+        arith_to_text(a1),
+        v,
+        arith_to_text(&x),
+        v
+    );
+    Some(IrStmt::Expr(IrExpr::Call {
+        func: "cstyleFor".to_string(),
+        args: vec![
+            IrExpr::Str(spec, crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Arrow(body_rest.to_vec()),
+        ],
+    }))
 }
 
 /// cstyleFor header vars: the C backend renders the header natively, so
