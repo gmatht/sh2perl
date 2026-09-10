@@ -2211,6 +2211,7 @@ impl Render {
             }
             IrStmt::Exec { .. } | IrStmt::Require(_) | IrStmt::RawText(_) => None,
             IrStmt::Label(_) | IrStmt::Goto(_) => None,
+            IrStmt::Shaderize { .. } => None,
         }
     }
 
@@ -3168,6 +3169,9 @@ impl Render {
                 } else {
                     self.mark_todo("break outside a loop");
                 }
+            }
+            IrStmt::Shaderize { .. } => {
+                self.mark_todo("shaderize (autoshaderization) not supported by the Go backend");
             }
         }
     }

@@ -106,6 +106,7 @@ pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix
 pub mod echo_return; // pure-output "echo a value and return" functions → fnValue value-returning convention (CROSS_BACKEND_RUNTIME.md §8.3)
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
+pub mod split_set; // set[int] → small ∪ big partitions (runtime routing; speed-class, SH2_SPLIT_SETS)
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -162,6 +163,10 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("loop-return-lift", loop_return_lift::transform),
         ("echo-return", echo_return::transform),
         ("unreachable-after-exit", unreachable_after_exit::transform),
+        // split-set: set[int] → small ∪ big partitions (runtime routing).
+        // Speed-class — gated by SH2_SPLIT_SETS (set at -O3/-O4 by the
+        // CLI, mirroring set_dual_loops).
+        ("split-set", split_set::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
         // GC'd languages ignore the flag — see shir_passes/split_inplace)

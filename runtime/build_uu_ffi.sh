@@ -16,7 +16,11 @@
 set -euo pipefail
 
 TOOLCHAIN="${UU_FFI_TOOLCHAIN:-1.96.1}"
-FEATURES="cat echo wc ls sort sed awk grep"
+# The dispatch set the perl/C seams rely on (ir.rs SH_RUN_EXT_PREAMBLE's
+# __SH_UU_OK + c_backend's uu list). Grown 2026-09-08: date/sha256sum/
+# uname/basename/dirname/cp — uutils supports them all; the .so feature
+# gate was the only limiter (UU-FFI.md "still open").
+FEATURES="cat wc ls sort sed awk grep date sha256sum uname basename dirname cp"
 UU_FFI_DIR="${1:-/root/src/coreutils/uu-ffi}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LIBDIR="$HERE/lib"

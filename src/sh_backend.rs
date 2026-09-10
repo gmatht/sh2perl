@@ -258,6 +258,11 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     walk(else_body, names);
                     walk(finally_body, names);
                 }
+                IrStmt::Shaderize { body, .. } => {
+                    for s in body {
+                        walk(std::slice::from_ref(s), names);
+                    }
+                }
             }
         }
     }
@@ -454,6 +459,9 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                         })
                         || walk(else_body)
                         || walk(finally_body)
+                }
+                IrStmt::Shaderize { body, .. } => {
+                    body.iter().any(|s| walk(std::slice::from_ref(s)))
                 }
             };
             if hit {
@@ -1519,6 +1527,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(()),
+        IrStmt::Shaderize { .. } => Ok(()),
     }
 }
 
@@ -5141,6 +5150,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         }
         // inline asm has no sh rendering — refuse loudly
         IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
+        IrStmt::Shaderize { .. } => Err("shaderize (autoshaderization) has no sh rendering".into()),
     }
 }
 

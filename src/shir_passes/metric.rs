@@ -298,6 +298,11 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
         }
+        IrStmt::Shaderize { body, .. } => {
+            for s in body {
+                walk_stmt(s, counts);
+            }
+        }
     }
 }
 

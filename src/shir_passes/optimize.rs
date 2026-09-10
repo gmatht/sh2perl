@@ -267,6 +267,7 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
         }
         IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::Continue | IrStmt::Break
         | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Label(_) | IrStmt::Goto(_) => false,
+        IrStmt::Shaderize { body, .. } => body.iter().any(|s| stmt_reads(name, s)),
     }
 }
 

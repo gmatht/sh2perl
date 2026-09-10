@@ -161,6 +161,8 @@ pub struct Render {
     need_ext: bool,
     /// sortedIntJoin helper (set-array sort+dedup+join) needed
     need_sorted: bool,
+    /// max/min/sum reduction helpers needed
+    need_reduce: bool,
     /// bigint (std.math.big.int.Managed) helpers needed
     need_bigint: bool,
 }
@@ -1682,6 +1684,30 @@ impl Render {
                 }
                 self.sh2_stub("sortedIntJoin", "sortedIntJoin")
             }
+            "sortedBigintJoin" => {
+                // `sorted(list(factors))` over a bigint list — sort+dedup+join
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.set_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_sorted = true;
+                        return format!("sh2SortedBigintJoin(&{m}, {m}_len)");
+                    }
+                }
+                self.sh2_stub("sortedBigintJoin", "sortedBigintJoin")
+            }
+            "max" | "min" | "sum" => {
+                // typed reduction over a list/set array
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.set_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_reduce = true;
+                        return format!("sh2{}(&{m}, {m}_len)", camel(func));
+                    }
+                }
+                self.sh2_stub(func, func)
+            }
             "arith" => {
                 if let Some(IrExpr::Str(sv, _)) = args.first() {
                     if let Some(x) = self.arith_text(sv) {
@@ -2734,16 +2760,13 @@ impl Render {
                     if matches!(func.as_str(), "setArray" | "setArrayAppend")
                         && self.set_arrays.contains(&t.var)
                     {
-                        if func == "setArray" {
-                            self.emit(&format!("{m}_len = 0;"));
-                        } else {
-                            // append each element
-                            if let Some(IrExpr::Array(items)) = args.get(1) {
-                                for it in items {
-                                    let v = self.expr_num(it);
-                                    self.emit(&format!("{m}[{m}_len] = {v};"));
-                                    self.emit(&format!("{m}_len += 1;"));
-                                }
+                        self.emit(&format!("{m}_len = 0;"));
+                        // populate/append each element
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for it in items {
+                                let v = self.expr_num(it);
+                                self.emit(&format!("{m}[{m}_len] = {v};"));
+                                self.emit(&format!("{m}_len += 1;"));
                             }
                         }
                         return;
@@ -3520,6 +3543,26 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return out.items;");
             self.emit("}");
         }
+        if self.need_reduce {
+            self.emit("");
+            self.emit("fn sh2Max(a: []const i64, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (v > best) best = v; }");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2Min(a: []const i64, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (v < best) best = v; }");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2Sum(a: []const i64, n: usize) []const u8 {");
+            self.emit("    var total: i64 = 0;");
+            self.emit("    for (a[0..n]) |v| total += v;");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{total}) catch \"\";");
+            self.emit("}");
+        }
         if self.need_run {
             self.emit("");
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
@@ -3581,7 +3624,7 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
                 pat.iter().any(|p| l.contains(p.as_str()))
             });
-            let kw = if mutated || self.bigint_vars.contains(v) {
+            let kw = if mutated || self.bigint_vars.contains(v) || self.set_arrays.contains(v) {
                 "var"
             } else {
                 "const"
@@ -3591,6 +3634,10 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                     "    {kw} {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);"
                 ));
                 decls.push(format!("    defer {m}.deinit();"));
+            } else if self.set_arrays.contains(v) {
+                // set/list → fixed i64 array + length counter
+                decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
+                decls.push(format!("    var {m}_len: usize = 0;"));
             } else if self.is_num(v) {
                 decls.push(format!("    {kw} {m}: i64 = 0;"));
             } else {

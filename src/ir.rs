@@ -802,6 +802,19 @@ pub enum IrStmt {
     Label(String),
     /// Jump to a `Label`. See `Label`.
     Goto(String),
+    /// `-O4` autoshaderization: a compute loop (a pure-arithmetic counted
+    /// loop) emitted in a shader-offloadable form via
+    /// `sh2.shaderize(start, end, step, op, (i) => { body })`. The
+    /// estree renderer emits the runtime call; other renderers refuse
+    /// loudly (REFUSE > GUESS).
+    Shaderize {
+        var: String,
+        start: i64,
+        end: i64,
+        step: i64,
+        op: String,
+        body: Vec<IrStmt>,
+    },
 }
 
 // ── Subroutine ───────────────────────────────────────────────────────
@@ -1500,6 +1513,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Goto(name) => {
             emit_indent(out, indent);
             out.push_str(&format!("goto {name};\n"));
+        }
+
+        IrStmt::Shaderize { .. } => {
+            // -O4 autoshaderization is JS-target-only; the Perl generator
+            // refuses loudly (REFUSE > GUESS).
+            emit_indent(out, indent);
+            out.push_str("die \"shaderize: not supported by the Perl backend\";\n");
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
@@ -6983,6 +7003,7 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(stmt_refers_to_main_exit),
         IrStmt::RawText(t) => t.contains("$main_exit_code") || t.contains("main_exit_code"),
         IrStmt::Label(_) | IrStmt::Goto(_) => false,
+        IrStmt::Shaderize { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrStmt::Case { .. }
         | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
@@ -7150,6 +7171,11 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrStmt::Label(_) | IrStmt::Goto(_) => {} // no variables
+        IrStmt::Shaderize { body, .. } => {
+            for s in body {
+                collect_vars_in_stmt(s, vars);
+            }
+        }
         // Neutral ESTree-path-only nodes carry no Perl variables.
         IrStmt::Case { .. }
         | IrStmt::Function { .. }

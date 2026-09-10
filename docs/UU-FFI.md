@@ -1,12 +1,37 @@
 # UU-FFI — In-Process uutils Coreutils for Backend Runtime Support
 
-Status: **IMPLEMENTING** (2026-09-06). The foundation is landed as code:
-`runtime/build_uu_ffi.sh`, the `runtime/uu_run.{h,c}` wrapper, and two
-green gates (`tests/parity_vs_bash.sh`, `tests/c_backend_uu_ffi.sh`, §9
-executed below). The C backend wiring is env-opt-in (`SH2_UU_FFI=1`),
-byte-identical by default. Still open: Python/Go/Perl adoption, the
-per-backend corpus-gate sign-off, and the toolchain/`.so`-deployment
-decisions (§7/§8). The plan (PLAN.md) remains the authority.
+Status: **C landed; PERL LANDED (2026-09-08, auto-decide shape)**. The
+foundation is `runtime/build_uu_ffi.sh`, the `runtime/uu_run.{h,c}`
+wrapper (C backend), and two green gates (`tests/parity_vs_bash.sh`,
+`tests/c_backend_uu_ffi.sh`). The C backend wiring is env-opt-in
+(`SH2_UU_FFI=1`), byte-identical by default.
+
+The PERL backend adoption (ir.rs `SH_RUN_EXT_PREAMBLE`) went further —
+the **auto-decide** design that resolves §7/§8:
+
+- The rendered program always carries BOTH arms behind a `BEGIN`
+  feature probe (env `SH2_UU_LIB` → workspace-relative `runtime/lib/`
+  walk → bare soname; FFI::Platypus attaches `uu_run` from
+  `libcoreutils_ffi.so` directly). `.so` present ⇒ in-process
+  coreutils; absent ⇒ ONE stderr warning + guarded fork/exec fallback.
+  Renders are byte-deterministic (same text on every box); the runtime
+  picks the arm.
+- Capture is a **temp-file fd-1 redirect around the in-process
+  `uu_run` call** — a temp file cannot fill, so the concurrent-drain
+  deadlock the C wrapper exists to solve never arises, and perl needs
+  no second `.so` (`uu_run.c`'s `sh2_*` helpers stay a C-backend
+  artifact).
+- check_qx strips the marker-delimited `__SH_RUN_EXT_BEGIN/END` block
+  (the bash -c inside is feature-guarded, never the unconditional wrap
+  the gate rejects); `fail` exports `SH2_UU_LIB` so the gate exercises
+  the in-process arm.
+- Dispatch set = the `.so` build FEATURES (cat wc ls sort sed awk
+  grep); other commands route through the seam too but deterministically
+  take the fallback until the feature list grows.
+
+Still open: Python/Go adoption, growing the feature list (date,
+sha256sum, uname exist in uutils but are not in `FEATURES`), the
+both-mode parity gate for the perl arm as a runtime/tests script.
 
 This doc captures the design; §10 records what is implemented and its
 green status.

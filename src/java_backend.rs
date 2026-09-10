@@ -391,6 +391,9 @@ impl JavaRender {
                 self.depth += 1;
                 Ok(())
             }
+            IrStmt::Shaderize { .. } => {
+                Err("shaderize (autoshaderization) not supported by the Java backend".into())
+            }
             IrStmt::For { var, iter, body } => {
                 let items = self.for_items(iter)?;
                 self.fields.insert(sanitize(var));

@@ -5417,7 +5417,7 @@ impl Render {
             }
             IrStmt::Die { .. } | IrStmt::Warn { .. } | IrStmt::SetChildError(_)
             | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Goto(_)
-            | IrStmt::Label(_) | IrStmt::Ext(_) => {
+            | IrStmt::Label(_) | IrStmt::Ext(_) | IrStmt::Shaderize { .. } => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
         }

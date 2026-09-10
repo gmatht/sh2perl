@@ -2768,6 +2768,7 @@ impl Render {
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
+            IrStmt::Shaderize { .. } => self.mark_todo("shaderize (autoshaderization) not supported by the Perl backend"),
         }
     }
 

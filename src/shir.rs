@@ -64,6 +64,42 @@ pub fn true64_enabled() -> bool {
     TRUE64.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `-O3` on JS: the i53/BigInt dual-loop profile. The i64 (out-of-±2^53)
+/// hot accumulator chains are homed in BigInt64Array slots (the int-array
+/// trick) even though the rest of the arithmetic stays plain JS Number
+/// (i53) — the dual-loop guard then keeps the i53 loops on the fast
+/// Number arm and the i64 loops on the slot/BigInt arm. This is the
+/// `-O3`-only refinement: full `--true64` homes EVERY out-of-range var as
+/// BigInt (no i53 fast path); the i53 profile homes only the slot-worthy
+/// i64 accumulators as BigInt and leaves the rest as Numbers.
+static SLOTS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the `-O3` i53+slots profile (default off).
+pub fn set_slots_enabled(on: bool) {
+    SLOTS_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn slots_enabled() -> bool {
+    SLOTS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `-O4` autoshaderization (JS target only): a compute loop (a pure-
+/// arithmetic counted loop) is emitted in a shader-offloadable form via
+/// the `sh2.shaderize` runtime helper — a pure function of the loop
+/// index, structured so a GPU could run the iterations in parallel. The
+/// runtime helper runs a CPU fallback (node has no GPU); the emitted
+/// form is the shader model.
+static SHADERIZE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable `-O4` autoshaderization (default off).
+pub fn set_shaderize_enabled(on: bool) {
+    SHADERIZE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn shaderize_enabled() -> bool {
+    SHADERIZE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
 /// lowering)?
 pub fn slot_var_index(name: &str) -> Option<usize> {
@@ -1386,6 +1422,9 @@ fn stmt_has_extra_observer(stmt: &IrStmt, defined: &HashMap<String, Vec<IrStmt>>
             .any(|s| stmt_has_extra_observer(s, defined)),
         // try/select/ext/asm: unknown status flow — observer (status quo).
         IrStmt::Try { .. } | IrStmt::Select { .. } | IrStmt::Ext(_) | IrStmt::Asm { .. } => true,
+        IrStmt::Shaderize { body, .. } => body
+            .iter()
+            .any(|s| stmt_has_extra_observer(s, defined)),
     }
 }
 
@@ -2019,6 +2058,12 @@ fn record_all_calls_in_stmt(
         | IrStmt::Die { .. }
         | IrStmt::Warn { .. }
         | IrStmt::Ext(_) => {}
+        IrStmt::Shaderize { body, .. } => {
+            for s in body {
+                record_all_calls_in_stmt(s, defined, out);
+            }
+        }
+
     }
 }
 
@@ -2293,6 +2338,193 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
     dead
 }
 
+/// EXIT-CODE-ZERO proof (shared shIR analysis): the program's process
+/// exit code is PROVABLY 0 — no statement reads `$?` (the status is
+/// never observed mid-program) AND every statement's status is provably
+/// 0 (prints/arith/assignments/successful builtins; a capture of a
+/// function whose body is provably-0). When it holds, the runner's
+/// exit-code read of the final status is a no-op — the final statement's
+/// `sh2.lastExit = 0` record is dead weight (t87_bignum's last sh2
+/// reference). The i32-provable pattern: a pure shIR analysis every
+/// backend can re-derive (the Perl renderer's status tracking, the C
+/// renderer's `_sh_rc`, …).
+fn exit_code_provably_zero(prog: &IrProgram) -> bool {
+    fn expr_zero(e: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
+        match e {
+            IrExpr::Arith(_) => true,
+            IrExpr::Call { func, args } => match func.as_str() {
+                // successful builtins / pure store ops / the sync
+                // function-call tiers (a param-lifted fn's status is
+                // its body's — checked below)
+                "echo" | "printf" | "true" | "setVar" | "setArray"
+                | "setArrayAppend" | "arith" | "fnCall" | "callDirect"
+                | "builtin" => true,
+                // the A1's exec("echo"/"printf"/"true", …) — the
+                // successful-builtin exec form (the prints in t86/t87
+                // are exec("echo", …)); a call of a DEFINED function
+                // whose body is provably-0 (the captureSync of a
+                // param-lifted fn — its status is its body's)
+                "exec" => match args.first() {
+                    Some(IrExpr::Str(n, _))
+                        if matches!(n.as_str(), "echo" | "printf" | "true") =>
+                    {
+                        true
+                    }
+                    Some(IrExpr::Str(n, _)) => fns
+                        .get(n)
+                        .map(|body| body.iter().all(|s| stmt_zero(s, fns)))
+                        .unwrap_or(false),
+                    _ => false,
+                },
+                "captureSync" | "capture" => {
+                    // the captured command's status: its body's — a
+                    // failing exec (grep with no match, a missing
+                    // command, …) makes the capture nonzero
+                    args.iter().all(|a| match a {
+                        IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_zero(s, fns)),
+                        _ => true,
+                    })
+                }
+                _ => false,
+            },
+            // a command-substitution capture — the captured command's
+            // status (a failing exec makes the capture nonzero)
+            IrExpr::Capture { expr, .. } => match expr.as_ref() {
+                IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_zero(s, fns)),
+                _ => false,
+            },
+            _ => true, // Var/Str/Int/Interpolate reads — no status
+        }
+    }
+    // a condition's OWN status write: an arith cond writes 0; a `test`
+    // cond writes 1 when false (not provably 0); a plain var/str cond
+    // writes nothing (the enclosing statement's status is its own)
+    fn cond_zero(c: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
+        match c {
+            IrExpr::Arith(_) => true,
+            // a `&&`/`||` chain's status is the SHORT-CIRCUIT operand's
+            // (1 when the test fails) — not provably 0
+            IrExpr::BinOp { op, .. } => !matches!(op, BinOpKind::And | BinOpKind::Or),
+            // a `[[ … ]]`/`test` condition writes 1 when false — both the
+            // Call{func:"test"} form and the exec("test", …) form
+            IrExpr::Call { func, args } => {
+                if func == "test"
+                    || (func == "exec"
+                        && matches!(
+                            args.first(),
+                            Some(IrExpr::Str(n, _)) if n == "test"
+                        ))
+                {
+                    return false;
+                }
+                // a redirect of a test (`test … 2>/dev/null`) — the
+                // redirect's status is the inner command's
+                if func == "redirect" {
+                    return args.iter().all(|a| match a {
+                        IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_zero(s, fns)),
+                        _ => true,
+                    });
+                }
+                true
+            }
+            // a capture of a test (`test … 2>/dev/null` — the redirect
+            // wraps it) — the capture's status is the test's
+            IrExpr::Capture { expr, .. } => match expr.as_ref() {
+                IrExpr::Arrow(stmts) => stmts.iter().all(|s| stmt_zero(s, fns)),
+                _ => false,
+            },
+            _ => true,
+        }
+    }
+    fn stmt_zero(st: &IrStmt, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
+        match st {
+            IrStmt::Expr(e) => expr_zero(e, fns),
+            // an ASSIGN's value can be a capture of a failing command
+            // (`x=$(grep …)` — grep exits 1/2) — the expr must be
+            // provably-0 too
+            IrStmt::Assign { expr, .. } => expr_zero(expr, fns),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                // the CONDITION's OWN status write must be provably 0 too
+                // — a `[[ … ]]` test writes 1 when false, and the if's
+                // synthesized 0-write is what overrides it; dropping the
+                // if's write would leak the test's 1 into the exit code
+                cond_zero(cond, fns)
+                    && then.iter().all(|s| stmt_zero(s, fns))
+                    && elsifs.iter().all(|(c, b)| {
+                        cond_zero(c, fns) && b.iter().all(|s| stmt_zero(s, fns))
+                    })
+                    && else_.iter().all(|s| stmt_zero(s, fns))
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                cond_zero(cond, fns) && body.iter().all(|s| stmt_zero(s, fns))
+            }
+            IrStmt::For { iter, body, .. } => {
+                cond_zero(iter, fns) && body.iter().all(|s| stmt_zero(s, fns))
+            }
+            IrStmt::Function { name, body, .. } => {
+                // a function DEFINITION has no status; its body's status
+                // matters only at call sites (checked via captureSync)
+                let _ = (name, body);
+                true
+            }
+            _ => false,
+        }
+    }
+    // collect function bodies (for the captureSync status check)
+    let mut fns: HashMap<String, &Vec<IrStmt>> = HashMap::new();
+    fn collect<'a>(stmts: &'a [IrStmt], fns: &mut HashMap<String, &'a Vec<IrStmt>>) {
+        for st in stmts {
+            if let IrStmt::Function { name, body, .. } = st {
+                fns.insert(name.clone(), body);
+            }
+        }
+    }
+    collect(&prog.stmts, &mut fns);
+    for sub in &prog.subs {
+        fns.insert(sub.name.clone(), &sub.body);
+    }
+    // no $? reads anywhere + every statement provably-0
+    fn walk(stmts: &[IrStmt], fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
+        for st in stmts {
+            if ir_stmt_reads_status(st) {
+                return false;
+            }
+            if !stmt_zero(st, fns) {
+                return false;
+            }
+            // recurse into bodies (the status reads inside matter)
+            match st {
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if !walk(then, fns)
+                        || !elsifs.iter().all(|(_, b)| walk(b, fns))
+                        || !walk(else_, fns)
+                    {
+                        return false;
+                    }
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                    if !walk(body, fns) {
+                        return false;
+                    }
+                }
+                IrStmt::For { body, .. } => {
+                    if !walk(body, fns) {
+                        return false;
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if !walk(body, fns) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+    walk(&prog.stmts, &fns)
+}
+
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
@@ -2302,7 +2534,16 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
         return dead;
     }
     let mut live: HashSet<usize> = HashSet::new();
-    walk_lastexit_liveness(&prog.stmts, true, &mut live);
+    // the exit code is PROVABLY 0 (no $? reads, every status 0): the
+    // runner's exit-code read of the final status is a no-op — walk with
+    // end_live=false so the final statement's record drops (t87_bignum's
+    // trailing `sh2.lastExit = 0`).
+    let ec_zero = exit_code_provably_zero(prog);
+    if std::env::var("SH2_DBG_ECZ").is_ok() {
+        eprintln!("DBG exit_code_provably_zero = {}", ec_zero);
+    }
+    let end_live = !ec_zero;
+    walk_lastexit_liveness(&prog.stmts, end_live, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     *TEST_COND_DEAD.lock().unwrap() = Some(compute_test_cond_deadness(&prog.stmts, &live));
     dead
@@ -2853,6 +3094,32 @@ fn dual_loops_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The split-set gate: opt-in via `SH2_SPLIT_SETS=1` (a speed-class
+/// emitter-level feature, like dual loops — the registry gates tree
+/// rewrites). The static override (-1 = consult env) exists for tests:
+/// parallel test threads mutating process env race each other. Set at
+/// `-O3`/`-O4` by the CLI (see otranspilerl/src/lib.rs).
+static SPLIT_SETS_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+pub fn set_split_sets(on: Option<bool>) {
+    let v = match on {
+        None => -1,
+        Some(true) => 1,
+        Some(false) => 0,
+    };
+    SPLIT_SETS_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn split_sets_enabled() -> bool {
+    match SPLIT_SETS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    std::env::var("SH2_SPLIT_SETS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Build the guarded dual-loop If for an eligible native while, or None
 /// (keep the single narrow loop). Eligibility: the loop's status write is
 /// dead (versioning duplicates the body — tracking vars would need
@@ -2991,6 +3258,20 @@ fn dual_version_while(
         // nothing
         return None;
     }
+    // A loop that is SPECIFICALLY i64 (every guard var is proven
+    // out-of-±2^53 — BigInt-homed or slot-homed) must not be dual-
+    // versioned: the `Number.isSafeInteger` guard would be false for
+    // every var, so the narrow i53 arm would never run and the dual
+    // loop is pure overhead. Such loops are handled by the i64
+    // machinery directly — the BigInt64Array slot (int-array) trick for
+    // hot accumulators, BigInt values otherwise. The dual loop is only
+    // a win when at least one guard var MIGHT be i53 (so the fast arm
+    // is sometimes taken).
+    if guard_vars.iter().all(|v| {
+        slot_var_index(v).is_some() || true64_int_var(v)
+    }) {
+        return None;
+    }
     // The wide arm: identical IR with arith roots wrapped. The clone is
     // rendered through the normal path; its pointers miss the deadness
     // maps (conservative → tracking kept, sound), and nested loops in the
@@ -3004,11 +3285,16 @@ fn dual_version_while(
         unreachable!()
     };
     // The forced-wrap scope: every arith render inside (cond + body,
-    // including the zero-compare div/mod fast path) goes exact-i64.
+    // including the zero-compare div/mod fast path) goes exact-i64. Mark
+    // the wide-arm render so [`arith_cast_to_estree`] keeps its casts on
+    // the bash asIntN wrap path (they are non-C-typed / non-true64 vars,
+    // which would otherwise look like py-sh-go exact-BigInt reads).
     INT64_WRAP_FORCE.store(1, std::sync::atomic::Ordering::Relaxed);
+    DUAL_WIDE_ARM.store(1, std::sync::atomic::Ordering::Relaxed);
     let wide_cond_e = cond_to_estree(&wide_cond);
     let wide_stmts: Vec<Stmt> = wide_body.iter().filter_map(stmt_to_estree).collect();
     INT64_WRAP_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
+    DUAL_WIDE_ARM.store(0, std::sync::atomic::Ordering::Relaxed);
     if wide_stmts.len() != wide_body.len() {
         return None; // a body stmt refused to lower — no partial arms
     }
@@ -3246,6 +3532,60 @@ static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 /// body lowers — `positional_read`/`native_special_var` render `$i` as
 /// the `pi` param identifier inside it.
 static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+
+/// STORE-ONLY vars (the StoreToNative pass's verdict): written only via
+/// setVar/getVar with literal names — the native binding renders bare
+/// (`let <name> = null;` + `name = v` + bare reads), no sh2.vars store.
+static STORE_ONLY_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn store_only_var(name: &str) -> bool {
+    STORE_ONLY_VARS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// VALUE-RETURNING param-lifted functions: the body's FINAL statement is
+/// a single value echo (`echo <value>` — no -n/-e, one arg) and nothing
+/// follows. The define arrow's final echo becomes a native `return
+/// <value>` and the call sites' captureSync wrappers become the bare
+/// call (the value flows directly — no stdout round-trip, no capture).
+static VALUE_RETURN_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn value_return_fn(name: &str) -> bool {
+    VALUE_RETURN_FNS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// The single value-echo of a function body's final statement, if any:
+/// `exec("echo", [<value>])` / `builtin("echo", [<value>])` with exactly
+/// one arg (no -n/-e flags, no multi-word output).
+fn final_value_echo(body: &[IrStmt]) -> Option<IrExpr> {
+    let [.., IrStmt::Expr(e)] = body else {
+        return None;
+    };
+    match e {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            let [IrExpr::Str(n, _), IrExpr::Array(items)] = args.as_slice() else {
+                return None;
+            };
+            if n != "echo" {
+                return None;
+            }
+            let [value] = items.as_slice() else {
+                return None;
+            };
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
 
 fn param_lift_arity(name: &str) -> Option<usize> {
     PARAM_LIFT
@@ -7407,6 +7747,11 @@ use std::collections::{HashMap, HashSet};
                     walk_stmt(s, acc, multi_run);
                 }
             }
+            IrStmt::Shaderize { body, .. } => {
+                for s in body {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
         }
     }
 
@@ -8136,7 +8481,9 @@ const SAFE_NUMBER: i128 = 1 << 53;
 /// assigned inside a loop, where V8's native int64 element arithmetic
 /// applies (the BinInt64 benchmarks: ~1.8 ns/op vs ~5–25 ns for BigInt
 /// values). Returns (int_vars, slot_var -> slot index).
-pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usize>) {
+pub fn analyze_true64(
+    prog: &IrProgram,
+) -> (HashSet<String>, HashMap<String, usize>, HashSet<String>) {
     fn walk_stmts(
         stmts: &[IrStmt],
         numeric: &HashSet<String>,
@@ -8144,6 +8491,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
         rmw: &mut HashSet<String>,
         in_loop: &mut HashSet<String>,
         unsafe_write: &mut HashSet<String>,
+        rmw_reads: &mut HashMap<String, HashSet<String>>,
         inside_loop: bool,
     ) {
         for s in stmts {
@@ -8162,6 +8510,20 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
                             || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == v));
                         if is_rmw {
                             rmw.insert(v.clone());
+                            // Track the RHS operands (other than `v`
+                            // itself): a slot wraps mod 2^64, so an
+                            // accumulator whose RHS can be a bigint must
+                            // NOT be slot-homed (t91_set_sum_fallback:
+                            // `total += x` over a set with a bigint
+                            // element dropped the 2^100 term).
+                            if let IrExpr::Arith(a) = expr {
+                                let reads = rmw_reads.entry(v.clone()).or_default();
+                                for r in arith_read_vars(a) {
+                                    if r != *v {
+                                        reads.insert(r);
+                                    }
+                                }
+                            }
                         }
                     } else {
                         // indexed/multi-target assigns bypass the slot
@@ -8174,20 +8536,20 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
                 IrStmt::While { body, .. }
                 | IrStmt::For { body, .. }
                 | IrStmt::DoWhile { body, .. } => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, true);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, true);
                 }
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                 }
                 IrStmt::If { then, elsifs, else_, .. } => {
-                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                     for (_, arm) in elsifs {
-                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                     }
-                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                 }
                 IrStmt::Redirect { inner, .. } => {
-                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                 }
                 IrStmt::Function { body, .. } => {
                     // function-locals get their inits baked into `let`
@@ -8243,7 +8605,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
                     for s in body {
                         mark_fn_writes(s, unsafe_write);
                     }
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
                 }
                 _ => {}
             }
@@ -8256,6 +8618,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     let mut rmw = HashSet::new();
     let mut in_loop = HashSet::new();
     let mut unsafe_write = HashSet::new();
+    let mut rmw_reads: HashMap<String, HashSet<String>> = HashMap::new();
     walk_stmts(
         &prog.stmts,
         &numeric,
@@ -8263,6 +8626,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
         &mut rmw,
         &mut in_loop,
         &mut unsafe_write,
+        &mut rmw_reads,
         false,
     );
     let mut int_vars = HashSet::new();
@@ -8290,13 +8654,42 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     for v in &int_vars {
         // slot-worthy: self-RMW accumulator written ONLY through plain
         // single-target Assigns in a loop (a string/local/declare write
-        // would desync the slot from the value's other home)
-        if rmw.contains(v) && in_loop.contains(v) && !unsafe_write.contains(v) {
+        // would desync the slot from the value's other home), AND whose
+        // RHS operands are all PROVEN within ±2^53 (a slot wraps mod
+        // 2^64 — an accumulator summed with a bigint operand would lose
+        // the value; t91_set_sum_fallback: `total += x` over a set with
+        // a bigint element dropped the 2^100 term).
+        if rmw.contains(v)
+            && in_loop.contains(v)
+            && !unsafe_write.contains(v)
+            && rmw_reads
+                .get(v)
+                .map(|reads| {
+                    // A slot wraps mod 2^64 — an accumulator summed with
+                    // an operand whose range is UNKNOWN or outside ±2^53
+                    // can be a bigint and would be lost (t91_set_sum_fallback:
+                    // `total += x` over a set with a bigint element dropped
+                    // the 2^100 term). Only home when every RHS operand is
+                    // PROVEN within ±2^53.
+                    reads.iter().all(|r| {
+                        ranges
+                            .get(r)
+                            .is_some_and(|&(lo, hi)| lo >= -SAFE_NUMBER && hi <= SAFE_NUMBER)
+                    })
+                })
+                .unwrap_or(true)
+        {
             slots.insert(v.clone(), slot_idx);
             slot_idx += 1;
         }
     }
-    (int_vars, slots)
+    // The RMW accumulators written inside a loop — the hot-accumulator
+    // set. The `-O3` profile uses this to promote the ones that were
+    // REFUSED slot-homing (e.g. because their RHS can be a bigint) to
+    // BigInt, so a for-of sum over a set with a bigint element stays
+    // exact (t91_set_sum_fallback) instead of rounding as a Number.
+    let rmw_in_loop: HashSet<String> = rmw.intersection(&in_loop).cloned().collect();
+    (int_vars, slots, rmw_in_loop)
 }
 
 /// The i53 ESCALATION analysis (Task 1 — the optimistic width rule):
@@ -9667,6 +10060,11 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         | IrStmt::Warn { .. }
         | IrStmt::Exec { .. }
         | IrStmt::Expr(_) => {}
+        IrStmt::Shaderize { body, .. } => {
+            for s in body {
+                walk_stmt_ranges(s, state);
+            }
+        }
     }
 }
 
@@ -12508,7 +12906,21 @@ fn arith_var_read(name: &str) -> Expr {
     // the lifted-num bare read: a lifted binding may hold a Number (a
     // string-init `x=5` on a typed var) — BigInt(x) is exact, and
     // idempotent when x is already a BigInt. Number would round past 2^53.
+    // A bigint-HOMED var (every write a fully-bigint arith tree — e.g. a
+    // param whose only write is `Cast(Int64, $1)`) is the same: its runtime
+    // value is a BigInt, so read it as BigInt(read) — idempotent when the
+    // binding already holds a BigInt — instead of Number(read)||0, which
+    // would round past 2^53 (t89_factor_big: Number(2^64+1) = 2^64).
     if let Some(IrType::Int64 | IrType::UInt64) = var_type_of(name) {
+        return Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "BigInt".to_string(),
+            }),
+            arguments: vec![read],
+            optional: false,
+        };
+    }
+    if bigint_homed_var(name) {
         return Expr::CallExpression {
             callee: Box::new(Expr::Identifier {
                 name: "BigInt".to_string(),
@@ -12538,6 +12950,54 @@ fn arith_var_read(name: &str) -> Expr {
             regex: None,
         }),
     }
+}
+
+/// Exact-BigInt operand read for a bigint-tainted `%`/`/` (t89_factor_big):
+/// when one side of the division carries an Int64/UInt64 cast, the operation
+/// evaluates in the BigInt domain (the sh2.imod/idiv helpers coerce via
+/// BigInt; native `%`/`/` throw on mixed arity) — so a direct `Var` operand
+/// on the other side must ALSO read exactly. The normal [`arith_var_read`]
+/// path coerces through `Number(read) || 0`, which rounds past ±2^53
+/// (Number(2^64+1) is 2^64 — the odd dividend reads even, and every small
+/// factor comes out wrong). `BigInt(read || 0)` is exact for
+/// BigInt/Number/canonical-int-string bindings, idempotent when the binding
+/// already holds a BigInt, and empty-safe (`""`/`undefined` → `0` → `0n`,
+/// the same zero the Number path yields). Scoped to direct `Var` leaves
+/// whose normal read would take the Number path (slot reads, Int64/UInt64
+/// vars and lifted numerics already read exactly — those delegate to the
+/// normal render); every other shape renders normally.
+fn arith_bigint_safe_operand(a: &ArithAst) -> Expr {
+    if let ArithAst::Var(name) = a {
+        if slot_var_index(name).is_none()
+            && !matches!(var_type_of(name), Some(IrType::Int64 | IrType::UInt64))
+        {
+            // Exact BigInt read. A lifted-num var is included too: in a
+            // bigint context (the other side carries a cast) its binding
+            // may already hold a BigInt (t91_set_sum_fallback: `total`
+            // accumulates a 2**100 element, so after the first wide add
+            // its binding is a BigInt) — BigInt(raw || 0) is exact for
+            // Number/BigInt/canonical-int-string bindings, idempotent
+            // when the binding already holds a BigInt, and empty-safe
+            // (`""`/`undefined` → `0` → `0n`).
+            let raw = arith_var_read_expr(name);
+            return Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "BigInt".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "||".to_string(),
+                    left: Box::new(raw),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            };
+        }
+    }
+    arith_to_estree(a)
 }
 
 /// The declared C type of a var (the per-compilation VAR_TYPES static),
@@ -12655,7 +13115,13 @@ fn arith_has_poison(a: &ArithAst) -> bool {
 
 /// Does the arith subtree contain a raw var read (Var/Ident)? Used for
 /// the div-lowering bigint taint: a lifted binding may hold a BigInt at
-/// runtime, where Math.trunc(BigInt) would throw.
+/// runtime, where Math.trunc(BigInt) would throw. (2026-09-09: exempting
+/// lifted-numeric non-BigInt vars was tried — `i` in t86-style loops — but
+/// every helper-site operand in both corpora still taints via its other
+/// side (store-held dividends, Casts), so the refinement fired nowhere;
+/// reverted to keep the taint conservative until a real program needs it,
+/// with a test. Full nativeness for store-held dividends needs the param
+/// lift, not a taint tweak.)
 fn arith_has_var_read(a: &ArithAst) -> bool {
     match a {
         ArithAst::Var(_) | ArithAst::Ident(_) => true,
@@ -12677,13 +13143,92 @@ fn arith_has_var_read(a: &ArithAst) -> bool {
 /// Does `a` have the shape `X == 0` / `0 == X` where X contains a
 /// zero-possible div/mod and NO other poison operator? See the
 /// zero-compare native lowering in [`arith_to_estree_wrapped`].
+/// Syntactic `/`/`%` presence: [`arith_has_div_mod`] minus the
+/// zero-divisor proof (a provably-nonzero divisor is excluded there —
+/// correct for the arithEval-wrapper decision, but the zero-compare gate
+/// below needs to know a div/mod EXISTS even when it cannot abort).
+fn arith_has_any_div_mod(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            (*op == "/" || *op == "%")
+                || arith_has_any_div_mod(lhs)
+                || arith_has_any_div_mod(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_has_any_div_mod(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => arith_has_any_div_mod(test) || arith_has_any_div_mod(then) || arith_has_any_div_mod(else_),
+        ArithAst::Index { key, .. } => arith_has_any_div_mod(key),
+        ArithAst::Assign { rhs, .. } => arith_has_any_div_mod(rhs),
+        ArithAst::IncDec { .. } => false,
+        _ => false,
+    }
+}
+
+/// Does the tree touch the BigInt domain — an Int64/UInt64 cast anywhere,
+/// or a read of a BigInt-homed/slotted/typed var? Guards the zero-compare
+/// extension below: native `%` on mixed Number/BigInt arity THROWS, so
+/// only pure-Number trees may skip the helper.
+fn arith_tree_has_bigint(a: &ArithAst) -> bool {
+    if arith_has_cast(a) {
+        return true;
+    }
+    match a {
+        ArithAst::Var(n) => {
+            true64_int_var(n)
+                || slot_var_index(n).is_some()
+                || bigint_homed_var(n)
+                || matches!(var_type_of(n), Some(IrType::Int64 | IrType::UInt64))
+        }
+        // a lifted binding of statically unknown kind — conservative
+        ArithAst::Ident(_) => true,
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_tree_has_bigint(lhs) || arith_tree_has_bigint(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_tree_has_bigint(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => arith_tree_has_bigint(test) || arith_tree_has_bigint(then) || arith_tree_has_bigint(else_),
+        ArithAst::Assign { var, rhs, .. } => {
+            arith_tree_has_bigint(rhs)
+                || true64_int_var(var)
+                || slot_var_index(var).is_some()
+                || bigint_homed_var(var)
+        }
+        ArithAst::Cast { arg, .. } => arith_tree_has_bigint(arg),
+        ArithAst::Index { key, .. } => arith_tree_has_bigint(key),
+        ArithAst::IncDec { var, .. } => {
+            true64_int_var(var)
+                || slot_var_index(var).is_some()
+                || bigint_homed_var(var)
+        }
+        _ => false,
+    }
+}
+
 fn arith_is_zero_cmp(a: &ArithAst) -> bool {
     match a {
         ArithAst::Bin { op, lhs, rhs } if op == "==" => {
             if matches!(**lhs, ArithAst::Num(0)) {
-                arith_has_div_mod(rhs) && !arith_has_poison(rhs)
+                // Mirror of the `X == 0` extension below (operand order
+                // must not change the lowering).
+                !arith_has_poison(rhs)
+                    && (arith_has_div_mod(rhs)
+                        || (arith_has_any_div_mod(rhs) && !arith_tree_has_bigint(rhs)))
             } else if matches!(**rhs, ArithAst::Num(0)) {
-                arith_has_div_mod(lhs) && !arith_has_poison(lhs)
+                // A divisor proven nonzero ([`arith_has_div_mod`] excludes
+                // it) still needs the native `%`: the `==` poison would
+                // otherwise force the per-evaluation helper for a loop that
+                // cannot abort (t86: 67M imod dispatches behind `i`-in-`1..`
+                // proven-nonzero divisors). The extension fires only for
+                // pure-Number trees (no Cast, no BigInt reads — native `%`
+                // is then op-identical to the helper's Number path, NaN
+                // `== 0` false = bash abort→false, minus dispatch; divisor
+                // nonzero-proven so the abort is unreachable anyway).
+                // BigInt-touching trees keep the exact helper (t89).
+                !arith_has_poison(lhs)
+                    && (arith_has_div_mod(lhs)
+                        || (arith_has_any_div_mod(lhs) && !arith_tree_has_bigint(lhs)))
             } else {
                 false
             }
@@ -12846,6 +13391,44 @@ fn arith_has_cast(a: &ArithAst) -> bool {
 /// program never opted into --true64. Scoped strictly around the wide
 /// arm's render in [`dual_version_while`]; zero everywhere else.
 static INT64_WRAP_FORCE: AtomicUsize = AtomicUsize::new(0);
+
+/// True while rendering the wide arm of a versioned dual loop. The bash
+/// int64 semantics of the wide arm's `Cast(Int64, …)` leaves (wrap mod
+/// 2^64 via `asIntN`) must survive the py-sh-go exact-BigInt cast change
+/// ([`exact_bigint_var_read`]): the wide arm's Int-typed loop vars are
+/// non-C-typed and non-true64 (so they would otherwise look like the
+/// py-sh-go exact-BigInt vars and skip the asIntN wrap) — this flag is
+/// what keeps them on the bash wrap path.
+static DUAL_WIDE_ARM: AtomicUsize = AtomicUsize::new(0);
+
+fn in_dual_wide_arm() -> bool {
+    DUAL_WIDE_ARM.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// A `Cast(Int64, Var/Ident)` whose arg is a py-sh-go exact-BigInt var:
+/// read it EXACTLY (`BigInt(raw || 0)`, no `asIntN` wrap). This is the
+/// right semantics for Python's unbounded ints (a >2^63 value like 2**100
+/// is a multiple of 2^64 and would otherwise fold to 0n — t91). The bash
+/// int64 wrap contexts are excluded: C-typed (`var_type_of`), --true64,
+/// slots, and the dual-loop wide arm (which must stay mod-2^64-exact).
+fn exact_bigint_var_read(n: &str) -> bool {
+    if in_dual_wide_arm() {
+        return false;
+    }
+    if bigint_homed_var(n) {
+        return true;
+    }
+    if matches!(var_type_of(n), Some(IrType::Int64 | IrType::UInt64)) {
+        return false;
+    }
+    if true64_int_var(n) {
+        return false;
+    }
+    if slot_var_index(n).is_some() {
+        return false;
+    }
+    true
+}
 
 /// Unconditional leaf-wrap for the dual-loop wide arm: every Num/Var/Ident
 /// leaf becomes `Cast(Int64, …)` (slots and length placeholders stay raw —
@@ -13164,7 +13747,24 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 // non-zero numeric literal, optionally sign-flipped — the
                 // abort can never fire), the operation is plain native
                 // JS: no idiv/imod dispatch, no zero check per evaluation.
-                let r = arith_to_estree(rhs);
+                // BigInt-taint operand reads (t89_factor_big): when one side
+                // carries an exact-BigInt cast, the operation evaluates in
+                // the BigInt domain — a direct-Var operand on the other side
+                // must read exactly (`BigInt(read || 0)`, not the rounding
+                // `Number(read) || 0`). No-cast pairs (the t88 i53 loop)
+                // render exactly as before.
+                let lhs_cast = arith_has_cast(lhs);
+                let rhs_cast = arith_has_cast(rhs);
+                let lhs_e = if rhs_cast {
+                    arith_bigint_safe_operand(lhs)
+                } else {
+                    arith_to_estree(lhs)
+                };
+                let r = if lhs_cast {
+                    arith_bigint_safe_operand(rhs)
+                } else {
+                    arith_to_estree(rhs)
+                };
                 // bigint taint: any operand carrying an Int64/UInt64 cast
                 // (exact BigInt("N") literals) or a raw var read (a lifted
                 // binding may hold a BigInt — the A1 frontends' bigint
@@ -13197,7 +13797,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 {
                     return Expr::BinaryExpression {
                         operator: "/".to_string(),
-                        left: Box::new(arith_to_estree(lhs)),
+                        left: Box::new(lhs_e),
                         right: Box::new(r),
                     };
                 }
@@ -13222,7 +13822,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                             }),
                             arguments: vec![Expr::BinaryExpression {
                                 operator: "/".to_string(),
-                                left: Box::new(arith_to_estree(lhs)),
+                                left: Box::new(lhs_e),
                                 right: Box::new(r),
                             }],
                             optional: false,
@@ -13230,7 +13830,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     } else {
                         Expr::BinaryExpression {
                             operator: "%".to_string(),
-                            left: Box::new(arith_to_estree(lhs)),
+                            left: Box::new(lhs_e),
                             right: Box::new(r),
                         }
                     }
@@ -13248,7 +13848,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     // bash aborts the whole expansion, so those keep the
                     // throwing helper. =0 restores the helper everywhere.
                     if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 || may_bigint {
-                        sh2_call("idiv", vec![arith_to_estree(lhs), r])
+                        sh2_call("idiv", vec![lhs_e, r])
                     } else {
                         Expr::CallExpression {
                             callee: Box::new(Expr::MemberExpression {
@@ -13263,7 +13863,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                             }),
                             arguments: vec![Expr::BinaryExpression {
                                 operator: "/".to_string(),
-                                left: Box::new(arith_to_estree(lhs)),
+                                left: Box::new(lhs_e),
                                 right: Box::new(r),
                             }],
                             optional: false,
@@ -13275,14 +13875,42 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     // zero divisor — same abort channels + poison
                     // suppression as the division arm above.
                     if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 {
-                        sh2_call("imod", vec![arith_to_estree(lhs), r])
+                        sh2_call("imod", vec![lhs_e, r])
                     } else {
                         Expr::BinaryExpression {
                             operator: "%".to_string(),
-                            left: Box::new(arith_to_estree(lhs)),
+                            left: Box::new(lhs_e),
                             right: Box::new(r),
                         }
                     }
+                }
+            } else if matches!(op.as_str(), "+" | "-" | "*") {
+                // Mixed-domain widening (t90 floordiv composition
+                // `n - ((n % i + i) % i)`): native `+`/`-`/`*` THROW on
+                // mixed Number/BigInt arity, so when one side renders
+                // BigInt (exact Cast present) a direct-Var Number-read on
+                // the other side widens to exact `BigInt(read || 0)` (the
+                // same helper as the div/mod arms — idempotent when the
+                // binding already holds a BigInt, empty-safe). Pure-Number
+                // pairs render exactly as before; comparisons keep loose
+                // `==` (mixed compares by value, no throw) and are
+                // untouched.
+                let lhs_cast = arith_has_cast(lhs);
+                let rhs_cast = arith_has_cast(rhs);
+                let lhs_e = if rhs_cast {
+                    arith_bigint_safe_operand(lhs)
+                } else {
+                    arith_to_estree(lhs)
+                };
+                let r = if lhs_cast {
+                    arith_bigint_safe_operand(rhs)
+                } else {
+                    arith_to_estree(rhs)
+                };
+                Expr::BinaryExpression {
+                    operator: op.to_string(),
+                    left: Box::new(lhs_e),
+                    right: Box::new(r),
                 }
             } else if *op == "&&" || *op == "||" {
                 // bash yields 0/1; JS logicals yield one of the operands
@@ -13538,6 +14166,17 @@ fn arith_cast_to_estree(ty: IrType, arg: &ArithAst) -> Expr {
         // fits; the string keeps it exact past 2^53)
         IrType::Int64 => match arg {
             ArithAst::Num(n) => bigint_lit_expr(*n),
+            // A py-sh-go "coerce to exact BigInt" cast on an EXACT-BigInt
+            // var: read it EXACTLY (BigInt(raw || 0)) with NO asIntN(64, …)
+            // wrap — the wrap would fold a >2^63 value mod 2^64
+            // (t91_set_sum_fallback: the loop var x can hold 2**100,
+            // which is a multiple of 2^64 and would wrap to 0n).
+            // [`exact_bigint_var_read`] excludes the bash int64 contexts
+            // (C-typed / --true64 / slot / dual-loop wide arm) which keep
+            // the asIntN wrap (bash int64 semantics).
+            ArithAst::Var(n) | ArithAst::Ident(n) if exact_bigint_var_read(n) => {
+                arith_bigint_safe_operand(arg)
+            }
             _ => bigint_method("asIntN", Expr::CallExpression {
                 callee: Box::new(Expr::Identifier {
                     name: "BigInt".to_string(),
@@ -13551,6 +14190,9 @@ fn arith_cast_to_estree(ty: IrType, arg: &ArithAst) -> Expr {
         // form keeps the literal exact past 2^53
         IrType::UInt64 => match arg {
             ArithAst::Num(n) => bigint_method("asUintN", bigint_lit_expr(*n)),
+            ArithAst::Var(n) | ArithAst::Ident(n) if exact_bigint_var_read(n) => {
+                arith_bigint_safe_operand(arg)
+            }
             _ => bigint_method("asUintN", Expr::CallExpression {
                 callee: Box::new(Expr::Identifier {
                     name: "BigInt".to_string(),
@@ -15383,6 +16025,43 @@ fn arith_written_vars(a: &ArithAst) -> Vec<String> {
             v
         }
         ArithAst::Index { key, .. } => arith_written_vars(key),
+        _ => Vec::new(),
+    }
+}
+
+/// All vars READ in an arith tree (Var/Ident reads, Index bases, and the
+/// written var of Assign/IncDec — a RMW accumulator's RHS reads it). Used
+/// by [`analyze_true64`] to refuse slot-homing an accumulator whose RHS
+/// can be a bigint (a slot wraps mod 2^64, losing the value).
+fn arith_read_vars(a: &ArithAst) -> Vec<String> {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => vec![n.clone()],
+        ArithAst::Index { var, key } => {
+            let mut v = vec![var.clone()];
+            v.extend(arith_read_vars(key));
+            v
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            let mut v = arith_read_vars(lhs);
+            v.extend(arith_read_vars(rhs));
+            v
+        }
+        ArithAst::Un { arg, .. } => arith_read_vars(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            let mut v = arith_read_vars(test);
+            v.extend(arith_read_vars(then));
+            v.extend(arith_read_vars(else_));
+            v
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            let mut v = vec![var.clone()];
+            v.extend(arith_read_vars(rhs));
+            v
+        }
+        ArithAst::IncDec { var, .. } => vec![var.clone()],
+        ArithAst::Cast { arg, .. } => arith_read_vars(arg),
         _ => Vec::new(),
     }
 }
@@ -17362,6 +18041,5767 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     lifted
 }
 
+/// Hoist loop-invariant param reads (t86: `Number(p1) || 0` re-parses a
+/// string param on all 67M iterations — V8 treats the coercion as opaque,
+/// ~7x on a 30M-iteration microbench vs one entry const).
+///
+/// For each function arrow `(p1, …, pk) => { body }`, a `Number(p) || 0`
+/// / `BigInt(p || 0)` read of a NEVER-WRITTEN param occurring 2+ times
+/// folds to one entry const (`const __p1n = Number(p1) || 0`) with every
+/// occurrence replaced. Soundness, each condition load-bearing:
+/// - params hold shell values (strings/numbers/BigInts): the coercions
+///   never throw on them and `|| 0` absorbs NaN/empty — the const evaluates
+///   the identical pure expression once at entry (a body that exits before
+///   first use evaluates one pure coercion more: unobservable; garbage
+///   non-numeric strings throw at entry rather than at first use —
+///   fail-fast on already-broken input). Mutable-object params (arrays)
+///   mutated through an ALIAS between reads are out of scope (the binding
+///   is never reassigned, so the write scan cannot see the mutation) —
+///   same class as the existing SH2_ASSUME_* contracts; no corpus program
+///   passes a mutated object as an arith param.
+/// - never-written is verified by walking the WHOLE arrow body including
+///   nested arrows (closures can reassign outer bindings — any bare `p =`
+///   / `p++` anywhere refuses the param).
+/// - any nested BINDING of the name (arrow/fn params, fn ids, declarators,
+///   catch params) refuses it (shadowing would desync the counts).
+/// - the const name is refused if bound anywhere (no capture).
+/// - direct `eval(...)` / `Function(...)` construction refuses everything
+///   in scope (dynamic code can touch any binding).
+/// Runs LAST in the post-emission pipeline (nothing after it disturbs the
+/// consts; earlier passes see the shapes they were designed against).
+/// Pure function of the ESTree (reads no compilation statics), inert
+/// wherever native bindings already replaced the reads.
+fn hoist_param_reads(mut program: Program) -> Program {
+    if let Some(module_bound) = hoist_module_bound(&program.body) {
+        hoist_in_stmt_list(&mut program.body, &module_bound);
+    }
+    program
+}
+
+/// Param-hoist shapes: 1 = `Number(p) || 0`, 2 = `BigInt(p || 0)`.
+/// (Bare `Number(p)` / `BigInt(p)` are rarer; the `|| 0`-normalized forms
+/// are the arith read idiom — one shape family keeps the matcher exact.)
+fn param_read_shape(e: &Expr, param: &str) -> Option<u8> {
+    let Expr::LogicalExpression {
+        operator,
+        left,
+        right,
+    } = e
+    else {
+        // `BigInt(p || 0)`: the whole call is the shape
+        if let Expr::CallExpression {
+            callee, arguments, ..
+        } = e
+        {
+            if !matches!(callee.as_ref(), Expr::Identifier { name } if name == "BigInt") {
+                return None;
+            }
+            if let [inner] = arguments.as_slice() {
+                if let Expr::LogicalExpression {
+                    operator: op2,
+                    left: l2,
+                    right: r2,
+                } = inner
+                {
+                    if op2 == "||"
+                        && matches!(l2.as_ref(), Expr::Identifier { name } if name == param)
+                        && matches!(r2.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0))
+                    {
+                        return Some(2);
+                    }
+                }
+            }
+        }
+        return None;
+    };
+    if operator != "||" {
+        return None;
+    }
+    if !matches!(right.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0)) {
+        return None;
+    }
+    // `Number(p) || 0`
+    if let Expr::CallExpression {
+        callee, arguments, ..
+    } = left.as_ref()
+    {
+        if matches!(callee.as_ref(), Expr::Identifier { name } if name == "Number")
+            && matches!(arguments.as_slice(), [Expr::Identifier { name }] if name == param)
+        {
+            return Some(1);
+        }
+    }
+    None
+}
+
+/// Bound names in a binding position (`let p`, `catch (p)`, `function p`,
+/// arrow/fn params): `Some(set)` of plain identifiers, or `None` when a
+/// non-Identifier binding occurs (cannot prove what it shadows — the
+/// caller refuses everything in scope).
+fn bound_names(e: &Expr) -> Option<HashSet<String>> {
+    match e {
+        Expr::Identifier { name } => {
+            let mut s = HashSet::new();
+            s.insert(name.clone());
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// Per-root analysis state for one arrow/function body.
+#[derive(Default)]
+struct HoistScope {
+    /// `Number(p) || 0` occurrence counts per param.
+    num_uses: HashMap<String, usize>,
+    /// `BigInt(p || 0)` occurrence counts per param.
+    big_uses: HashMap<String, usize>,
+    /// params with any bare write (`p =`, `p++`, …) — refused.
+    written: HashSet<String>,
+    /// names bound anywhere in scope (shadowing poisons the param).
+    bound: HashSet<String>,
+    /// dynamic-code / unknown-shape seen — refuse everything.
+    poisoned: bool,
+}
+
+/// Collect binding names from a binding position: `Some` with the plain
+/// identifiers, or `None` when a non-Identifier binding occurs (cannot
+/// prove what it shadows — the caller refuses everything in scope).
+fn hoist_bound_names(e: &Expr, out: &mut HashSet<String>) -> bool {
+    match e {
+        Expr::Identifier { name } => {
+            out.insert(name.clone());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Analysis walk: counts hoistable shape reads, flags writes and bindings.
+/// Fully transparent (descends everywhere including nested arrows — a
+/// missed read is a safe miss, a missed write would stale the const).
+/// Unknown/dynamic shapes set `poisoned` (fail-closed).
+fn hoist_scan_stmt(s: &Stmt, params: &HashSet<String>, scope: &mut HoistScope) {
+    match s {
+        Stmt::ExpressionStatement { expression } => hoist_scan_expr(expression, params, scope),
+        Stmt::BlockStatement { body } => hoist_scan_list(body, params, scope),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_scan_expr(test, params, scope);
+            hoist_scan_stmt(consequent, params, scope);
+            if let Some(a) = alternate {
+                hoist_scan_stmt(a, params, scope);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            hoist_scan_expr(test, params, scope);
+            hoist_scan_stmt(body, params, scope);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            hoist_scan_stmt(init, params, scope);
+            hoist_scan_expr(test, params, scope);
+            hoist_scan_expr(update, params, scope);
+            hoist_scan_stmt(body, params, scope);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            hoist_scan_stmt(left, params, scope);
+            hoist_scan_expr(right, params, scope);
+            hoist_scan_stmt(body, params, scope);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                hoist_scan_expr(e, params, scope);
+            }
+        }
+        Stmt::ThrowStatement { argument } => hoist_scan_expr(argument, params, scope),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            hoist_scan_stmt(block, params, scope);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    if !hoist_bound_names(p, &mut scope.bound) {
+                        scope.poisoned = true;
+                    }
+                }
+                hoist_scan_stmt(&h.body, params, scope);
+            }
+            if let Some(f) = finalizer {
+                hoist_scan_stmt(f, params, scope);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            hoist_scan_expr(discriminant, params, scope);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    hoist_scan_expr(t, params, scope);
+                }
+                hoist_scan_list(&c.consequent, params, scope);
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if !hoist_bound_names(&d.id, &mut scope.bound) {
+                    scope.poisoned = true;
+                }
+                if let Some(init) = &d.init {
+                    hoist_scan_expr(init, params, scope);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { id, params: fps, body, .. } => {
+            if !hoist_bound_names(id, &mut scope.bound) {
+                scope.poisoned = true;
+            }
+            for p in fps {
+                if !hoist_bound_names(p, &mut scope.bound) {
+                    scope.poisoned = true;
+                }
+            }
+            hoist_scan_stmt(body, params, scope);
+        }
+        Stmt::BreakStatement { .. }
+        | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn hoist_scan_list(stmts: &[Stmt], params: &HashSet<String>, scope: &mut HoistScope) {
+    for st in stmts {
+        hoist_scan_stmt(st, params, scope);
+    }
+}
+
+fn hoist_scan_expr(e: &Expr, params: &HashSet<String>, scope: &mut HoistScope) {
+    // Count hoistable shape reads first (a shape node also contains a
+    // param read, which must NOT double-count — the shape match consumes
+    // the whole node).
+    let mut shaped = false;
+    for p in params {
+        match param_read_shape(e, p) {
+            Some(1) => {
+                *scope.num_uses.entry(p.clone()).or_insert(0) += 1;
+                shaped = true;
+            }
+            Some(2) => {
+                *scope.big_uses.entry(p.clone()).or_insert(0) += 1;
+                shaped = true;
+            }
+            _ => {}
+        }
+    }
+    if shaped {
+        // Still recurse (a shape arg could contain a nested shape or a
+        // write — e.g. `Number(p1 = 5)` assigns AND reads).
+    }
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::CallExpression { callee, arguments, .. } => {
+            if matches!(callee.as_ref(), Expr::Identifier { name } if name == "eval" || name == "Function")
+            {
+                scope.poisoned = true;
+                return;
+            }
+            hoist_scan_expr(callee, params, scope);
+            for a in arguments {
+                hoist_scan_expr(a, params, scope);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            hoist_scan_expr(object, params, scope);
+            if *computed {
+                hoist_scan_expr(property, params, scope);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression {
+            left, right, ..
+        } => {
+            hoist_scan_expr(left, params, scope);
+            hoist_scan_expr(right, params, scope);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_scan_expr(test, params, scope);
+            hoist_scan_expr(consequent, params, scope);
+            hoist_scan_expr(alternate, params, scope);
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            if (operator == "++" || operator == "--")
+                && matches!(argument.as_ref(), Expr::Identifier { name } if params.contains(name))
+            {
+                if let Expr::Identifier { name } = argument.as_ref() {
+                    scope.written.insert(name.clone());
+                }
+            }
+            hoist_scan_expr(argument, params, scope);
+        }
+        Expr::AssignmentExpression {
+            operator: _,
+            left,
+            right,
+        } => {
+            match left.as_ref() {
+                Expr::Identifier { name } if params.contains(name) => {
+                    scope.written.insert(name.clone());
+                }
+                Expr::Identifier { .. } => {}
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed,
+                    ..
+                } => {
+                    hoist_scan_expr(object, params, scope);
+                    if *computed {
+                        hoist_scan_expr(property, params, scope);
+                    }
+                }
+                _ => {
+                    // destructuring assignment — cannot prove which names
+                    // it writes.
+                    scope.poisoned = true;
+                }
+            }
+            hoist_scan_expr(right, params, scope);
+        }
+        Expr::ArrowFunctionExpression { params: fps, body, .. } => {
+            for p in fps {
+                if !hoist_bound_names(p, &mut scope.bound) {
+                    scope.poisoned = true;
+                }
+            }
+            match body {
+                ArrowBody::Block(b) => hoist_scan_stmt(b, params, scope),
+                ArrowBody::Expr(x) => hoist_scan_expr(x, params, scope),
+            }
+        }
+        Expr::FunctionExpression {
+            id,
+            params: fps,
+            body,
+            ..
+        } => {
+            if !hoist_bound_names(id, &mut scope.bound) {
+                scope.poisoned = true;
+            }
+            for p in fps {
+                if !hoist_bound_names(p, &mut scope.bound) {
+                    scope.poisoned = true;
+                }
+            }
+            hoist_scan_stmt(body, params, scope);
+        }
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    hoist_scan_expr(&prop.key, params, scope);
+                }
+                hoist_scan_expr(&prop.value, params, scope);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter().flatten() {
+                hoist_scan_expr(el, params, scope);
+            }
+        }
+        Expr::SpreadElement { argument } => hoist_scan_expr(argument, params, scope),
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                hoist_scan_expr(x, params, scope);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                hoist_scan_expr(x, params, scope);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            if matches!(callee.as_ref(), Expr::Identifier { name } if name == "Function") {
+                scope.poisoned = true;
+                return;
+            }
+            hoist_scan_expr(callee, params, scope);
+            for a in arguments {
+                hoist_scan_expr(a, params, scope);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => hoist_scan_expr(argument, params, scope),
+    }
+}
+
+/// Process one function scope as a hoisting root: analyze its body for
+/// the params, and rewrite qualified reads to entry consts. Nested arrows
+/// and function declarations are processed independently by the driver
+/// recursion ([`hoist_in_stmt`] / [`hoist_in_expr`]); this scope's scan
+/// sees through them (a missed read is a safe miss, a missed write would
+/// stale the const — so writes and bindings are collected transparently
+/// everywhere, reads only where unambiguous).
+fn hoist_fn(params: &[Expr], body: &mut Vec<Stmt>, module_bound: &HashSet<String>) {
+    let mut names: HashSet<String> = HashSet::new();
+    for p in params {
+        match p {
+            Expr::Identifier { name } => {
+                names.insert(name.clone());
+            }
+            // Non-identifier params (destructuring) may shadow anything —
+            // refuse everything in this scope.
+            _ => return,
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let mut scope = HoistScope::default();
+    hoist_scan_list(body, &names, &mut scope);
+    if std::env::var("SH2_DBG_HOIST").is_ok() {
+        eprintln!("DBG hoist names={:?} num={:?} big={:?} written={:?} bound={:?} poisoned={}", names, scope.num_uses, scope.big_uses, scope.written, scope.bound, scope.poisoned);
+    }
+    if scope.poisoned {
+        return;
+    }
+    // Decide per (param, shape): 2+ occurrences, never written, never
+    // bound in scope, const name free (params, scope bindings, module
+    // bindings, and previously-chosen consts in this scope).
+    let mut hoists: Vec<(String, u8, String)> = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for p in &names {
+        if scope.written.contains(p) || scope.bound.contains(p) {
+            continue;
+        }
+        for (kind, uses) in [(1u8, &scope.num_uses), (2u8, &scope.big_uses)] {
+            if uses.get(p).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            let cnst = if kind == 1 {
+                format!("__p{n}n", n = p.strip_prefix('p').unwrap_or(p))
+            } else {
+                format!("__p{n}b", n = p.strip_prefix('p').unwrap_or(p))
+            };
+            if names.contains(&cnst)
+                || scope.bound.contains(&cnst)
+                || module_bound.contains(&cnst)
+                || !used.insert(cnst.clone())
+            {
+                continue;
+            }
+            hoists.push((p.clone(), kind, cnst));
+        }
+    }
+    if hoists.is_empty() {
+        return;
+    }
+    // Rewrite occurrences, then prepend the consts (in param order for
+    // byte-stable output).
+    hoists.sort();
+    {
+        let map: HashMap<(String, u8), String> = hoists
+            .iter()
+            .map(|(p, k, c)| ((p.clone(), *k), c.clone()))
+            .collect();
+        hoist_rewrite_list(body, &map);
+    }
+    let mut decls = Vec::new();
+    for (p, kind, cnst) in &hoists {
+        let init = if *kind == 1 {
+            Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "Number".to_string(),
+                    }),
+                    arguments: vec![Expr::Identifier { name: p.clone() }],
+                    optional: false,
+                }),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            }
+        } else {
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "BigInt".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "||".to_string(),
+                    left: Box::new(Expr::Identifier { name: p.clone() }),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            }
+        };
+        decls.push(VariableDeclarator {
+            type_: "VariableDeclarator",
+            id: Expr::Identifier { name: cnst.clone() },
+            init: Some(init),
+        });
+    }
+    body.insert(
+        0,
+        Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: decls,
+        },
+    );
+}
+
+/// Rewrite walk: replaces qualified shape occurrences with their const
+/// identifier. Mirrors the [`hoist_scan_stmt`] / [`hoist_scan_expr`]
+/// coverage (same regions visited) — keep the two in sync. Missed
+/// occurrences are safe (they recompute the identical value); the
+/// analysis above guarantees no writes, so every replacement is exact.
+fn hoist_rewrite_list(stmts: &mut Vec<Stmt>, map: &HashMap<(String, u8), String>) {
+    for st in stmts.iter_mut() {
+        hoist_rewrite_stmt(st, map);
+    }
+}
+
+fn hoist_rewrite_stmt(st: &mut Stmt, map: &HashMap<(String, u8), String>) {
+    match st {
+        Stmt::ExpressionStatement { expression } => hoist_rewrite_expr(expression, map),
+        Stmt::BlockStatement { body } => hoist_rewrite_list(body, map),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_rewrite_expr(test, map);
+            hoist_rewrite_stmt(consequent, map);
+            if let Some(a) = alternate {
+                hoist_rewrite_stmt(a, map);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            hoist_rewrite_expr(test, map);
+            hoist_rewrite_stmt(body, map);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            hoist_rewrite_stmt(init, map);
+            hoist_rewrite_expr(test, map);
+            hoist_rewrite_expr(update, map);
+            hoist_rewrite_stmt(body, map);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            hoist_rewrite_stmt(left, map);
+            hoist_rewrite_expr(right, map);
+            hoist_rewrite_stmt(body, map);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                hoist_rewrite_expr(e, map);
+            }
+        }
+        Stmt::ThrowStatement { argument } => hoist_rewrite_expr(argument, map),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            hoist_rewrite_stmt(block, map);
+            if let Some(h) = handler {
+                hoist_rewrite_stmt(&mut h.body, map);
+            }
+            if let Some(f) = finalizer {
+                hoist_rewrite_stmt(f, map);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            hoist_rewrite_expr(discriminant, map);
+            for c in cases {
+                if let Some(t) = &mut c.test {
+                    hoist_rewrite_expr(t, map);
+                }
+                hoist_rewrite_list(&mut c.consequent, map);
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if let Some(init) = &mut d.init {
+                    hoist_rewrite_expr(init, map);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { body, .. } => {
+            hoist_rewrite_stmt(body, map);
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn hoist_rewrite_expr(e: &mut Expr, map: &HashMap<(String, u8), String>) {
+    // Replace whole-shape matches first (a shape node contains a param
+    // read that must not match separately).
+    for ((p, kind), cnst) in map.iter() {
+        let matches = match param_read_shape(e, p) {
+            Some(k) => k == *kind,
+            None => false,
+        };
+        if matches {
+            *e = Expr::Identifier { name: cnst.clone() };
+            return;
+        }
+    }
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::CallExpression { callee, arguments, .. } => {
+            hoist_rewrite_expr(callee, map);
+            for a in arguments.iter_mut() {
+                hoist_rewrite_expr(a, map);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            hoist_rewrite_expr(object, map);
+            if *computed {
+                hoist_rewrite_expr(property, map);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            hoist_rewrite_expr(left, map);
+            hoist_rewrite_expr(right, map);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_rewrite_expr(test, map);
+            hoist_rewrite_expr(consequent, map);
+            hoist_rewrite_expr(alternate, map);
+        }
+        Expr::UnaryExpression { argument, .. } => hoist_rewrite_expr(argument, map),
+        Expr::AssignmentExpression { left, right, .. } => {
+            hoist_rewrite_expr(left, map);
+            hoist_rewrite_expr(right, map);
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Block(b) => hoist_rewrite_stmt(b, map),
+            ArrowBody::Expr(x) => hoist_rewrite_expr(x, map),
+        },
+        Expr::FunctionExpression { body, .. } => {
+            hoist_rewrite_stmt(body, map);
+        }
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    hoist_rewrite_expr(&mut prop.key, map);
+                }
+                hoist_rewrite_expr(&mut prop.value, map);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter_mut().flatten() {
+                hoist_rewrite_expr(el, map);
+            }
+        }
+        Expr::SpreadElement { argument } => hoist_rewrite_expr(argument, map),
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                hoist_rewrite_expr(x, map);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions.iter_mut() {
+                hoist_rewrite_expr(x, map);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            hoist_rewrite_expr(callee, map);
+            for a in arguments.iter_mut() {
+                hoist_rewrite_expr(a, map);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => hoist_rewrite_expr(argument, map),
+    }
+}
+
+/// Driver recursion: find every function scope in the tree and process
+/// each as an independent hoisting root (pre-order — outer consts exist
+/// before nested analysis, which simply sees them as bindings).
+fn hoist_in_stmt_list(stmts: &mut Vec<Stmt>, module_bound: &HashSet<String>) {
+    for st in stmts.iter_mut() {
+        hoist_in_stmt(st, module_bound);
+    }
+}
+
+fn hoist_in_stmt(st: &mut Stmt, module_bound: &HashSet<String>) {
+    match st {
+        Stmt::ExpressionStatement { expression } => hoist_in_expr(expression, module_bound),
+        Stmt::BlockStatement { body } => hoist_in_stmt_list(body, module_bound),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_in_expr(test, module_bound);
+            hoist_in_stmt(consequent, module_bound);
+            if let Some(a) = alternate {
+                hoist_in_stmt(a, module_bound);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            hoist_in_expr(test, module_bound);
+            hoist_in_stmt(body, module_bound);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            hoist_in_stmt(init, module_bound);
+            hoist_in_expr(test, module_bound);
+            hoist_in_expr(update, module_bound);
+            hoist_in_stmt(body, module_bound);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            hoist_in_stmt(left, module_bound);
+            hoist_in_expr(right, module_bound);
+            hoist_in_stmt(body, module_bound);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                hoist_in_expr(e, module_bound);
+            }
+        }
+        Stmt::ThrowStatement { argument } => hoist_in_expr(argument, module_bound),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            hoist_in_stmt(block, module_bound);
+            if let Some(h) = handler {
+                hoist_in_stmt(&mut h.body, module_bound);
+            }
+            if let Some(f) = finalizer {
+                hoist_in_stmt(f, module_bound);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            hoist_in_expr(discriminant, module_bound);
+            for c in cases {
+                if let Some(t) = &mut c.test {
+                    hoist_in_expr(t, module_bound);
+                }
+                hoist_in_stmt_list(&mut c.consequent, module_bound);
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if let Some(init) = &mut d.init {
+                    hoist_in_expr(init, module_bound);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            hoist_fn_in_expr(params, body, module_bound);
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Process a function-like node as an independent hoisting root: hoist
+/// for its own params when the body is a block, then descend for deeper
+/// nesting regardless.
+fn hoist_fn_in_expr(params: &[Expr], body: &mut Stmt, module_bound: &HashSet<String>) {
+    if let Stmt::BlockStatement { body: vec } = body {
+        hoist_fn(params, vec, module_bound);
+    }
+    hoist_in_stmt(body, module_bound);
+}
+
+fn hoist_in_expr(e: &mut Expr, module_bound: &HashSet<String>) {
+    match e {
+        Expr::ArrowFunctionExpression { params, body, .. } => match body {
+            ArrowBody::Block(b) => hoist_fn_in_expr(params, b, module_bound),
+            ArrowBody::Expr(x) => hoist_in_expr(x, module_bound),
+        },
+        Expr::FunctionExpression { params, body, .. } => {
+            hoist_fn_in_expr(params, body, module_bound);
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            hoist_in_expr(callee, module_bound);
+            for a in arguments.iter_mut() {
+                hoist_in_expr(a, module_bound);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            hoist_in_expr(object, module_bound);
+            if *computed {
+                hoist_in_expr(property, module_bound);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            hoist_in_expr(left, module_bound);
+            hoist_in_expr(right, module_bound);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_in_expr(test, module_bound);
+            hoist_in_expr(consequent, module_bound);
+            hoist_in_expr(alternate, module_bound);
+        }
+        Expr::UnaryExpression { argument, .. } => hoist_in_expr(argument, module_bound),
+        Expr::AssignmentExpression { left, right, .. } => {
+            hoist_in_expr(left, module_bound);
+            hoist_in_expr(right, module_bound);
+        }
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    hoist_in_expr(&mut prop.key, module_bound);
+                }
+                hoist_in_expr(&mut prop.value, module_bound);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter_mut().flatten() {
+                hoist_in_expr(el, module_bound);
+            }
+        }
+        Expr::SpreadElement { argument } => hoist_in_expr(argument, module_bound),
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                hoist_in_expr(x, module_bound);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions.iter_mut() {
+                hoist_in_expr(x, module_bound);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            hoist_in_expr(callee, module_bound);
+            for a in arguments.iter_mut() {
+                hoist_in_expr(a, module_bound);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => hoist_in_expr(argument, module_bound),
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+    }
+}
+
+/// Module-level binding names (top-level `let`/`const` declarators and
+/// function ids): hoisted consts must not capture these. A non-Identifier
+/// binding anywhere at top level disables the pass (cannot prove no
+/// capture — fail-closed; machine headers only declare plain idents).
+fn hoist_module_bound(body: &[Stmt]) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    for st in body {
+        match st {
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    match &d.id {
+                        Expr::Identifier { name } => {
+                            out.insert(name.clone());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { id, .. } => match id {
+                Expr::Identifier { name } => {
+                    out.insert(name.clone());
+                }
+                _ => return None,
+            },
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// Native-array migration (t86 `factors`): `setArray`/`setArrayAppend`/
+/// `sortedIntJoin` on an append-only array become `const`/`push`/inline
+/// join — the store roundtrip disappears. Soundness (each condition
+/// load-bearing, fail-closed throughout):
+/// - ALL static refs to the name program-wide lie in ONE function scope
+///   (or top); anything elsewhere (other functions, driver, dynamic
+///   names) refuses. Shared store state across scopes cannot be proven
+///   disjoint — a single missed reader would strand on an empty store
+///   (demonstrated: push-only migration yields `[]`).
+/// - every ref in scope is whitelisted (init/append/joins/scalar-get/
+///   items-spread); indexed writes/deletes/assoc/dynamic/unlisted
+///   shapes refuse (holes/aliasing/assoc dispatch change the game).
+/// - elements are expansion-inert (the runtime `expandWord`s every
+///   appended scalar — `$`, backticks, command subst would execute):
+///   Num literals, inert-Str (no `$`/backtick/`\`), Number-producing
+///   calls (`Number`/`Math.*` sans random/`idiv`/`imod`/`parseInt`… —
+///   canonical numerics never contain live syntax), loop counters
+///   (single Num init + IncDec/compound-only), and runtimes-proven
+///   recursion thereof. Store reads (`getVar`), params, and arbitrary
+///   strings refuse (may hold live syntax).
+/// - assoc excluded (`assocSet`/`assocNames` refs, `declare -A` in
+///   program, `isAssoc` arg): same call shapes hit a different store.
+/// - no direct recursion or opaque calls in scope (reentrancy shares
+///   store state across invocations; native consts are per-invocation).
+/// - the const name is free (no lifted/param/binding collision).
+/// Runs after [`hoist_param_reads`] in the pipeline (its consts are
+/// valid immutable element sources); inert where native bindings already
+/// replaced the calls. Pure ESTree transform, no compilation statics.
+/// Extract `V` from a `sh2.vars.V` / `sh2.vars["V"]` store read (the
+/// loop-counter element shape the frontend emits — never a bare
+/// binding). Anything else (computed dynamics, other roots) is not a
+/// plain slot read.
+fn sh2_vars_read(e: &Expr) -> Option<&str> {
+    if let Expr::MemberExpression {
+        object,
+        property,
+        computed,
+        ..
+    } = e
+    {
+        if let Expr::MemberExpression {
+            object: inner,
+            property: mid,
+            computed: mid_computed,
+            ..
+        } = object.as_ref()
+        {
+            if !mid_computed
+                && matches!(inner.as_ref(), Expr::Identifier { name } if name == "sh2")
+                && matches!(mid.as_ref(), Expr::Identifier { name } if name == "vars")
+            {
+                if !computed {
+                    if let Expr::Identifier { name } = property.as_ref() {
+                        return Some(name);
+                    }
+                } else if let Expr::Literal { value, .. } = property.as_ref() {
+                    return value.as_str();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Timing-purity for top-placed init elements: the const evaluates
+/// EARLIER than the original setArray position, so elements must not
+/// execute effects (calls — even pure-looking ones take args that may
+/// run code — assignments, updates, awaits, constructions). Reads
+/// (idents, members, literals) and pure operators are fine. Value
+/// inertness is checked separately ([`array_elem_inert`]); both must
+/// hold (pure-but-live like `getVar(x)` is refused by inertness).
+fn array_elem_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. } | Expr::Identifier { .. } => true,
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            array_elem_pure(object) && (!computed || array_elem_pure(property))
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            array_elem_pure(left) && array_elem_pure(right)
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_elem_pure(test)
+                && array_elem_pure(consequent)
+                && array_elem_pure(alternate)
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            // IncDec/delete are writes — impure. The rest recompute.
+            if operator == "++" || operator == "--" || operator == "delete" {
+                return false;
+            }
+            array_elem_pure(argument)
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            elements.iter().flatten().all(array_elem_pure)
+        }
+        Expr::TemplateLiteral { expressions, .. }
+        | Expr::SequenceExpression { expressions } => {
+            expressions.iter().all(array_elem_pure)
+        }
+        // Calls (any callee — args may run code), assignments,
+        // updates, arrows/functions (deferred code), spreads (call
+        //-adjacent), news, awaits, objects (getters): impure.
+        _ => false,
+    }
+}
+
+fn array_elem_inert(
+    e: &Expr,
+    counters: &HashMap<String, bool>,
+    b_dead: &HashSet<String>,
+) -> bool {
+    match e {
+        Expr::Literal { value, .. } => {
+            if let Some(n) = value.as_i64() {
+                let _ = n;
+                return true;
+            }
+            if let Some(s) = value.as_str() {
+                return !s.contains('$') && !s.contains('`') && !s.contains('\\');
+            }
+            // bool/null/other literals: fixed inert text (`true`, `null`)
+            // — EXCEPT strings are covered above; fall through refuse for
+            // anything else literal-shaped we cannot vouch for.
+            false
+        }
+        Expr::Identifier { name } => counters.get(name).copied().unwrap_or(false),
+        Expr::CallExpression { callee, arguments, .. } => {
+            let pure_result = match callee.as_ref() {
+                Expr::Identifier { name }
+                    if matches!(
+                        name.as_str(),
+                        "Number" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
+                    ) =>
+                {
+                    true
+                }
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed,
+                    ..
+                } => {
+                    !computed
+                        && matches!(object.as_ref(), Expr::Identifier { name } if name == "Math")
+                        && !matches!(property.as_ref(), Expr::Identifier { name } if name == "random")
+                }
+                _ => false,
+            };
+            // `idiv`/`imod`/`String()`-of-inert stay canonical-numeric;
+            // anything else called is opaque (may yield live strings).
+            if pure_result {
+                return true;
+            }
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } = callee.as_ref()
+            {
+                if !computed
+                    && matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name } if name == "idiv" || name == "imod")
+                {
+                    return true;
+                }
+                // `arithEval(f)` sanitizes to an inert string (digits
+                // for BigInt/finite-Number, `''` otherwise — including
+                // on throw, which it catches) and never throws itself.
+                // Side effects inside `f` execute at the same position
+                // either way (transparently scanned by the caller).
+                if !computed
+                    && matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name } if name == "arithEval")
+                {
+                    return true;
+                }
+            }
+            if let Expr::Identifier { name } = callee.as_ref() {
+                if name == "String" {
+                    return arguments.iter().all(|a| array_elem_inert(a, counters, b_dead));
+                }
+            }
+            false
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            // `-x`/`+x`/`!x`/`~x`/`typeof x` yield numbers/booleans/fixed
+            // strings — never live syntax. (`++`/`--` cannot appear here:
+            // they are writes, handled by the counter analysis, and any
+            // other occurrence refuses via the unknown-shape rule below
+            // — actually `++`/`--` ARE UnaryExpression in this dialect;
+            // an IncDec of a counter is fine (stays numeric), anything
+            // else: the operand must itself be inert.
+            if operator == "++" || operator == "--" || operator == "delete" {
+                return match argument.as_ref() {
+                    Expr::Identifier { name } => counters.get(name).copied().unwrap_or(false),
+                    _ => false,
+                };
+            }
+            array_elem_inert(argument, counters, b_dead)
+        }
+        Expr::BinaryExpression { left, right, .. } => {
+            // `+` concatenates (could forge live syntax from inert parts:
+            // `"$" + "(x)"`); all other arithmetic ops on inert
+            // operands stay numeric-or-NaN (inert text). Comparisons yield
+            // booleans (inert). `&&`/`||`/`??` yield an operand — recurse.
+            // NOTE: operator string checked by caller context; be
+            // conservative here and require both sides inert for every
+            // binary op (a live side anywhere refuses the element).
+            array_elem_inert(left, counters, b_dead) && array_elem_inert(right, counters, b_dead)
+        }
+        Expr::LogicalExpression { left, right, operator } => {
+            // `sh2.vars.V ?? FALLBACK` with V provably always set
+            // (top/fn-top numeric init — the fallback is dead): the
+            // store slot alone, counter-proven. (`||`/`&&` get no
+            // shortcut — falsy (0/"") still takes the fallback.)
+            if operator == "??" {
+                if let Some(v) = sh2_vars_read(left) {
+                    if b_dead.contains(v) {
+                        return counters.get(v).copied().unwrap_or(false);
+                    }
+                }
+            }
+            array_elem_inert(left, counters, b_dead) && array_elem_inert(right, counters, b_dead)
+        }
+        Expr::MemberExpression { .. } => {
+            // Bare `sh2.vars.V` slot reads (no fallback): inert iff V
+            // is counter-proven (undefined pre-init stringifies
+            // inertly — no deadness proof needed). Every other member
+            // shape refuses (native reads, method results, dynamics).
+            match sh2_vars_read(e) {
+                Some(v) => counters.get(v).copied().unwrap_or(false),
+                None => false,
+            }
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_elem_inert(test, counters, b_dead)
+                && array_elem_inert(consequent, counters, b_dead)
+                && array_elem_inert(alternate, counters, b_dead)
+        }
+        Expr::ArrayExpression { elements, .. } => elements
+            .iter()
+            .flatten()
+            .all(|el| array_elem_inert(el, counters, b_dead)),
+        _ => false,
+    }
+}
+
+/// A statically-known arrayIndex key: integer (Num literal or clean
+/// decimal Str — no leading zeros (`"08"` would be octal in arith)),
+/// or `@`/`*` (whole-array copy, same as arrayItems).
+#[derive(Clone, PartialEq)]
+enum ArrayIndexKey {
+    Num(i64),
+    AtStar,
+}
+
+/// Per-array analysis state for native-array migration: one transparent
+/// walk collects every static reference to the name; decisions happen
+/// after (a later node can disqualify — e.g. a dynamic read after the
+/// appends). Anything not explicitly whitelisted refuses the array.
+#[derive(Default)]
+struct ArrayScope {
+    /// setArray sites: (elements-clone, top ancestor idx). Only
+    /// direct-child inits migrate (empty or all-inert-and-pure).
+    inits: Vec<(Vec<Expr>, usize)>,
+    /// setArrayAppend sites: (elements-clone, top ancestor idx).
+    appends: Vec<(Vec<Expr>, usize)>,
+    /// sorted join reads: (bigint?, top ancestor idx). Positions only
+    /// used to verify all-uses-after-init ordering.
+    joins: Vec<(bool, usize)>,
+    /// `sortedJoinMerge(NAME, PARTNER)` reads: (partner name, top idx).
+    /// A two-array merge — both arrays must migrate together.
+    join_merges: Vec<(String, usize)>,
+    /// literal-key indexed reads: (key, top ancestor idx). Dynamic
+    /// keys are unlisted (evalArith abort channel) and refuse.
+    index_reads: Vec<(ArrayIndexKey, usize)>,
+    /// arrayLen reads (top ancestor idx) — dense-only, so `.length`.
+    lens: Vec<usize>,
+    /// arrayItems spreads and `@`/`*` index reads (top ancestor idx).
+    items: Vec<usize>,
+    /// Str-literal occurrences equal to the name (name args AND literal
+    /// text — over-approximate, safe).
+    str_refs: usize,
+    /// bare-Ident reads/writes of the name (dual-homed scalar confusion).
+    ident_refs: usize,
+    /// writes that are not setArray/setArrayAppend (assign, memStore,
+    /// direct member writes, `x op=` …): indexed writes create holes.
+    other_writes: bool,
+    /// assoc machinery touching the name (assocSet/assocNames with it,
+    /// `declare -A` program-wide handled at driver level).
+    assoc_touch: bool,
+    /// direct array-store access (`sh2.arrays…` at any depth — method
+    /// calls with dynamic keys bypass every helper shape). The function
+    /// table (`sh2.functions`) is array-independent (registrations are
+    /// transparent arrows; retrievals are covered by the ref counts +
+    /// program-wide dynamic pre-scan) and never sets this.
+    store_violation: bool,
+    /// invocation hazards (fnCall/callDirect/bare user calls — possible
+    /// self-recursion with store reset-wipe semantics). Top-level code
+    /// is not re-enterable, so the driver excuses these at top scope.
+    call_hazard: bool,
+    /// cstyle-loop headers (raw strings + top ancestor idx) for
+    /// fallback-deadness (`sh2.vars.V ?? …` needs V provably set — a
+    /// numeric header init dominating the use qualifies).
+    cstyle_headers: Vec<(String, usize)>,
+    /// cstyle-loop headers (raw strings + top ancestor idx) for
+    /// fallback-deadness (`sh2.vars.V ?? …` needs V provably set — a
+    /// numeric header init dominating the use qualifies).
+    /// dynamic-name call, eval/await-class, opaque call, recursion-call,
+    /// non-Identifier binding of the name, or unknown shape seen.
+    poisoned: bool,
+}
+
+/// Does this call read or write a store name we cannot statically pin?
+/// `true` for name-taking callees with a non-Str-literal first arg, and
+/// for the opaque/dynamic set unconditionally.
+fn array_call_is_dynamic(func: &str, args: &[Expr]) -> bool {
+    const NAME_TAKING: &[&str] = &[
+        "getVar",
+        "setVar",
+        "setArray",
+        "setArrayAppend",
+        "arrayIndex",
+        "arrayLen",
+        "listVar",
+        "arrayItems",
+        "arrayValues",
+        "arrayKeys",
+        "assocValues",
+        "assocKeys",
+        "param",
+        "assign",
+        "assocSet",
+        "assocSet2",
+        "assocGet",
+        "memStore",
+        "memLoad",
+        "addrOf",
+        "sortedIntJoin",
+        "sortedBigintJoin",
+    ];
+    // Unconditional poison: dynamic code (eval/Function) and
+    // fork-hazard wrappers (subshell/redirect bodies may run against a
+    // copied store while native consts stay shared — unverified,
+    // refuse). Dynamic dispatch (fnCall/callDirect) and bare user
+    // calls are CALL hazards (possible self-recursion), recorded
+    // separately — top-level code is not re-enterable. Loops/captures/
+    // pipelines/background with inline bodies are TRANSPARENT (walked;
+    // deferred execution is sound — operation order is preserved, only
+    // homes change). `exec`/`builtin` with a static command are
+    // external/pure enough (their Str args are counted by the name
+    // scan); a dynamic first arg poisons (could be `eval`/`source` or
+    // an in-process function).
+    const OPAQUE: &[&str] = &["eval", "Function", "subshell", "subshellSync", "redirect"];
+    if OPAQUE.contains(&func) {
+        return true;
+    }
+    if NAME_TAKING.contains(&func) {
+        return !matches!(args.first(), Some(Expr::Literal { value, .. }) if value.is_string());
+    }
+    false
+}
+
+/// Dynamic dispatch (fnCall/callDirect — possible self-recursion with
+/// reset-wipe semantics). Recorded as a call hazard, not poison:
+/// top-level code is not re-enterable.
+fn array_call_is_call_hazard(func: &str) -> bool {
+    matches!(func, "fnCall" | "callDirect")
+}
+
+/// Parse a clean decimal arrayIndex key: optional `-`, digits, at most
+/// 18 chars, no leading zeros (`"08"` is octal-or-error in arith but
+/// 8 via `Number()` — refuse the divergence). Returns the integer.
+fn array_index_key(s: &str) -> Option<i64> {
+    if s.is_empty() || s.len() > 19 {
+        return None;
+    }
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+/// Transparent reference walk for one array name in one scope: every
+/// static touch is classified; unknown shapes poison (fail-closed).
+/// `top_idx` is the index of the enclosing direct-child statement
+/// (ordering: appends must come after the init; joins may precede —
+/// empty reads are identical on a missing store array and `[]`).
+#[allow(clippy::too_many_arguments)]
+fn array_scan_expr(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize) {
+    match e {
+        Expr::CallExpression { callee, arguments, .. } => {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } = callee.as_ref()
+            {
+                if !computed
+                    && matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                {
+                    if let Expr::Identifier { name: func } = property.as_ref() {
+                        match func.as_str() {
+                            "setArray" => {
+                                // Empty or all-inert-and-pure inits
+                                // (`setArray(NAME, [es])`); the const is
+                                // top-placed, so non-empty elements must
+                                // not execute effects (purity) and must
+                                // survive expansion verbatim (inertness,
+                                // checked at decision). Holes refuse.
+                                if let [Expr::Literal { value: nm, .. }, Expr::ArrayExpression {
+                                    elements,
+                                    ..
+                                }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        let els: Vec<Expr> =
+                                            elements.iter().flatten().cloned().collect();
+                                        if els.len() == elements.len()
+                                            && els.iter().all(array_elem_pure)
+                                        {
+                                            scope.str_refs += 1;
+                                            // (Elements are NOT scanned:
+                                            // purity proves no store ops
+                                            // inside; inertness at decision
+                                            // catches self-references.)
+                                            scope.inits.push((els, top_idx));
+                                            return;
+                                        }
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                }
+                                // `setArray(NAME, [es], falsyIsAssoc)` — the
+                                // indexed path; truthy/dynamic isAssoc is
+                                // the assoc store (refuse).
+                                if let [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { elements, .. }, Expr::Literal { value: assoc, .. }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        let falsy = assoc.as_bool() == Some(false)
+                                            || assoc.as_i64() == Some(0)
+                                            || assoc.as_str() == Some("")
+                                            || assoc.is_null();
+                                        if falsy {
+                                            let els: Vec<Expr> = elements
+                                                .iter()
+                                                .flatten()
+                                                .cloned()
+                                                .collect();
+                                            if els.len() == elements.len()
+                                                && els.iter().all(array_elem_pure)
+                                            {
+                                                scope.str_refs += 1;
+                                                scope.inits.push((els, top_idx));
+                                                return;
+                                            }
+                                        }
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                }
+                                // Any other setArray shape mentioning the
+                                // name (non-empty init, dynamic isAssoc)
+                                // refuses; unrelated names just flow on.
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "setArrayAppend" => {
+                                if let [Expr::Literal { value: nm, .. }, Expr::ArrayExpression {
+                                    elements,
+                                    ..
+                                }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        let els: Vec<Expr> =
+                                            elements.iter().flatten().cloned().collect();
+                                        if els.len() == elements.len() {
+                                            scope.str_refs += 1;
+                                            // (Elements NOT scanned —
+                                            // purity + inertness cover.)
+                                            scope.appends.push((els, top_idx));
+                                            return;
+                                        }
+                                        // holes (`[,]`) — sparse store
+                                        // layout we do not replicate.
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "sortedIntJoin" | "sortedBigintJoin" => {
+                                if let [Expr::Literal { value: nm, .. }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        scope.joins.push((func == "sortedBigintJoin", top_idx));
+                                        scope.str_refs += 1;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "sortedJoinMerge" => {
+                                // Two-array merge: `sortedJoinMerge(NAME, PARTNER)`
+                                // reads NAME (and PARTNER, recorded when
+                                // scanning that array). Both must migrate
+                                // together (handled by the pair pass).
+                                if let [Expr::Literal { value: nm, .. }, Expr::Literal { value: partner, .. }] =
+                                    arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        if let Some(p) = partner.as_str() {
+                                            scope.join_merges.push((p.to_string(), top_idx));
+                                            scope.str_refs += 1;
+                                            return;
+                                        }
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                    if partner.as_str() == Some(name) {
+                                        if let Some(p) = nm.as_str() {
+                                            scope.join_merges.push((p.to_string(), top_idx));
+                                            scope.str_refs += 1;
+                                            return;
+                                        }
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "arrayIndex" => {
+                                // Literal keys only: Num, clean-decimal
+                                // Str (no leading zeros — octal hazard),
+                                // or `@`/`*` (whole copy, like items).
+                                // Dynamic keys need evalArith (abort
+                                // channel) — unlisted, refuse via budget.
+                                if let [Expr::Literal { value: nm, .. }, Expr::Literal { value: key, .. }] =
+                                    arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        if let Some(k) = key.as_i64() {
+                                            scope.index_reads.push((ArrayIndexKey::Num(k), top_idx));
+                                            scope.str_refs += 1;
+                                            return;
+                                        }
+                                        if let Some(s) = key.as_str() {
+                                            if s == "@" || s == "*" {
+                                                scope.items.push(top_idx);
+                                                scope.str_refs += 1;
+                                                return;
+                                            }
+                                            if let Some(k) = array_index_key(s) {
+                                                scope.index_reads.push((ArrayIndexKey::Num(k), top_idx));
+                                                scope.str_refs += 1;
+                                                return;
+                                            }
+                                        }
+                                        // Non-integer/leading-zero key
+                                        // — evalArith-shaped, refuse.
+                                        scope.poisoned = true;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "arrayLen" => {
+                                if let [Expr::Literal { value: nm, .. }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        scope.lens.push(top_idx);
+                                        scope.str_refs += 1;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            "arrayItems" => {
+                                if let [Expr::Literal { value: nm, .. }] = arguments.as_slice()
+                                {
+                                    if nm.as_str() == Some(name) {
+                                        scope.items.push(top_idx);
+                                        scope.str_refs += 1;
+                                        return;
+                                    }
+                                }
+                                for a in arguments {
+                                    array_scan_expr(a, name, scope, top_idx);
+                                }
+                                if arguments.iter().any(|a| matches!(a, Expr::Literal { value, .. } if value.as_str() == Some(name)))
+                                {
+                                    scope.poisoned = true;
+                                }
+                                return;
+                            }
+                            _ => {
+                                // A dynamic-name or opaque call can touch
+                                // the array invisibly — refuse.
+                                // Static-name calls flow on (their Str
+                                // args are counted below). Dynamic
+                                // dispatch is a call hazard (possible
+                                // self-recursion), excused at top scope.
+                                if array_call_is_dynamic(func, arguments) {
+                                    scope.poisoned = true;
+                                }
+                                if array_call_is_call_hazard(func) {
+                                    scope.call_hazard = true;
+                                }
+                                // `exec`/`builtin` with a dynamic command:
+                                // could be eval/source or an in-process
+                                // function — refuse.
+                                if (func == "exec" || func == "builtin")
+                                    && !matches!(arguments.first(), Some(Expr::Literal { value, .. }) if value.is_string())
+                                {
+                                    scope.poisoned = true;
+                                }
+                                // assoc writes/reads of the name: different
+                                // store (Maps), never the indexed array.
+                                if (func == "assocSet"
+                                    || func == "assocSet2"
+                                    || func == "assocGet")
+                                    && matches!(arguments.first(), Some(Expr::Literal { value, .. }) if value.as_str() == Some(name))
+                                {
+                                    scope.assoc_touch = true;
+                                }
+                                // cstyle headers for fallback-deadness
+                                // (counter `V` set-ness per use position).
+                                if func == "cstyleForSync" || func == "cstyleFor" {
+                                    if let Some(Expr::Literal { value, .. }) =
+                                        arguments.first()
+                                    {
+                                        if let Some(h) = value.as_str() {
+                                            scope.cstyle_headers.push((h.to_string(), top_idx));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            array_scan_expr(callee, name, scope, top_idx);
+            for a in arguments {
+                array_scan_expr(a, name, scope, top_idx);
+            }
+            // Bare-identifier calls are user/private functions (or
+            // constructors): possible self-recursion — a call hazard
+            // (excused at top scope), except the pure value
+            // constructors (no store access, no calls).
+            if let Expr::Identifier { name: f } = callee.as_ref() {
+                if !matches!(
+                    f.as_str(),
+                    "Number" | "String" | "BigInt" | "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Boolean"
+                ) {
+                    scope.call_hazard = true;
+                }
+            }
+        }
+        Expr::Literal { value, .. } => {
+            // Mention-matching (not exact): baked `NAME[i]` writes,
+            // `ref=NAME` nameref decls, and literal text all refuse.
+            if let Some(s) = value.as_str() {
+                if array_str_mentions(s, name) {
+                    scope.str_refs += 1;
+                }
+            }
+        }
+        Expr::Identifier { name: n } => {
+            if n == name {
+                scope.ident_refs += 1;
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            // Direct array-store access at any depth (`sh2.arrays…`,
+            // incl. method calls with dynamic keys like
+            // `sh2.arrays.get(x)`) bypasses every helper shape —
+            // refuse. (`sh2.vars.x` / `process.env.x` are harmless:
+            // array ops never touch the vars-slot, and the Str
+            // backstop catches any dual use via setVar/getVar/param.
+            // The function table is array-independent — ignored.)
+            fn chain_roots_at_sh2(e: &Expr) -> bool {
+                match e {
+                    Expr::Identifier { name } => name == "sh2",
+                    Expr::MemberExpression { object, .. } => chain_roots_at_sh2(object),
+                    _ => false,
+                }
+            }
+            fn roots_at_store(e: &Expr) -> bool {
+                match e {
+                    Expr::MemberExpression {
+                        object, property, ..
+                    } => {
+                        let prop_is_store = match property.as_ref() {
+                            Expr::Identifier { name: p } => matches!(
+                                p.as_str(),
+                                "arrays" | "assocNames" | "assocStore"
+                            ),
+                            Expr::Literal { value, .. } => matches!(
+                                value.as_str(),
+                                Some("arrays" | "assocNames" | "assocStore")
+                            ),
+                            _ => false,
+                        };
+                        if prop_is_store && chain_roots_at_sh2(object) {
+                            return true;
+                        }
+                        roots_at_store(object)
+                    }
+                    _ => false,
+                }
+            }
+            if roots_at_store(e) {
+                scope.store_violation = true;
+            }
+            // `sh2[<dynamic>]` could resolve to the arrays map —
+            // refuse unless the key is a static literal (checked by
+            // `roots_at_store` above). Deeper harmless slots like
+            // `sh2.vars[x]` flow on (dynamics there cannot reach
+            // array storage).
+            if *computed
+                && matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                && !matches!(property.as_ref(), Expr::Literal { .. })
+            {
+                scope.store_violation = true;
+            }
+            array_scan_expr(object, name, scope, top_idx);
+            if *computed {
+                array_scan_expr(property, name, scope, top_idx);
+            }
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            // Any write to the name outside setArray/setArrayAppend
+            // (scalar dual-homing, indexed writes with holes, `op=`…)
+            // refuses; the runtime's other write channels (`memStore`,
+            // baked `setArray("n[i]")`, `unset`) surface as Str refs
+            // or dynamic calls and hit the backstops below.
+            if matches!(left.as_ref(), Expr::Identifier { name: n } if n == name) {
+                scope.other_writes = true;
+            }
+            array_scan_expr(left, name, scope, top_idx);
+            array_scan_expr(right, name, scope, top_idx);
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            if (operator == "++" || operator == "--" || operator == "delete")
+                && matches!(argument.as_ref(), Expr::Identifier { name: n } if n == name)
+            {
+                scope.other_writes = true;
+            }
+            array_scan_expr(argument, name, scope, top_idx);
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            array_scan_expr(left, name, scope, top_idx);
+            array_scan_expr(right, name, scope, top_idx);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_scan_expr(test, name, scope, top_idx);
+            array_scan_expr(consequent, name, scope, top_idx);
+            array_scan_expr(alternate, name, scope, top_idx);
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Block(b) => array_scan_stmt(b, name, scope, top_idx),
+            ArrowBody::Expr(x) => array_scan_expr(x, name, scope, top_idx),
+        },
+        Expr::FunctionExpression { body, .. } => {
+            array_scan_stmt(body, name, scope, top_idx);
+        }
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    array_scan_expr(&prop.key, name, scope, top_idx);
+                }
+                array_scan_expr(&prop.value, name, scope, top_idx);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter().flatten() {
+                array_scan_expr(el, name, scope, top_idx);
+            }
+        }
+        Expr::SpreadElement { argument } => {
+            array_scan_expr(argument, name, scope, top_idx);
+        }
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                array_scan_expr(x, name, scope, top_idx);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                array_scan_expr(x, name, scope, top_idx);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            array_scan_expr(callee, name, scope, top_idx);
+            for a in arguments {
+                array_scan_expr(a, name, scope, top_idx);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => {
+            array_scan_expr(argument, name, scope, top_idx);
+        }
+    }
+}
+
+/// Statement half of the array reference walk (transparent everywhere;
+/// bindings of the name poison — a shadowing `let`/param/catch would
+/// reroute the bare-identifier reads the rewrite introduces).
+fn array_scan_stmt(s: &Stmt, name: &str, scope: &mut ArrayScope, top_idx: usize) {
+    match s {
+        Stmt::ExpressionStatement { expression } => {
+            array_scan_expr(expression, name, scope, top_idx)
+        }
+        Stmt::BlockStatement { body } => {
+            for b in body {
+                array_scan_stmt(b, name, scope, top_idx);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_scan_expr(test, name, scope, top_idx);
+            array_scan_stmt(consequent, name, scope, top_idx);
+            if let Some(a) = alternate {
+                array_scan_stmt(a, name, scope, top_idx);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            array_scan_expr(test, name, scope, top_idx);
+            array_scan_stmt(body, name, scope, top_idx);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            array_scan_stmt(init, name, scope, top_idx);
+            array_scan_expr(test, name, scope, top_idx);
+            array_scan_expr(update, name, scope, top_idx);
+            array_scan_stmt(body, name, scope, top_idx);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            array_scan_stmt(left, name, scope, top_idx);
+            array_scan_expr(right, name, scope, top_idx);
+            array_scan_stmt(body, name, scope, top_idx);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                array_scan_expr(e, name, scope, top_idx);
+            }
+        }
+        Stmt::ThrowStatement { argument } => {
+            array_scan_expr(argument, name, scope, top_idx);
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            array_scan_stmt(block, name, scope, top_idx);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    if matches!(p.as_ref(), Expr::Identifier { name: n } if n.as_str() == name) {
+                        scope.poisoned = true;
+                    }
+                    array_scan_expr(p, name, scope, top_idx);
+                }
+                array_scan_stmt(&h.body, name, scope, top_idx);
+            }
+            if let Some(f) = finalizer {
+                array_scan_stmt(f, name, scope, top_idx);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            array_scan_expr(discriminant, name, scope, top_idx);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    array_scan_expr(t, name, scope, top_idx);
+                }
+                for b in &c.consequent {
+                    array_scan_stmt(b, name, scope, top_idx);
+                }
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if matches!(&d.id, Expr::Identifier { name: n } if n.as_str() == name) {
+                    scope.poisoned = true;
+                }
+                array_scan_expr(&d.id, name, scope, top_idx);
+                if let Some(init) = &d.init {
+                    array_scan_expr(init, name, scope, top_idx);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { id, params, body, .. } => {
+            if matches!(id, Expr::Identifier { name: n } if n.as_str() == name) {
+                scope.poisoned = true;
+            }
+            for p in params {
+                if matches!(p, Expr::Identifier { name: n } if n.as_str() == name) {
+                    scope.poisoned = true;
+                }
+                array_scan_expr(p, name, scope, top_idx);
+            }
+            array_scan_stmt(body, name, scope, top_idx);
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Classify a `V`-write inside an arith-evaluated string (`arith`,
+/// cstyle headers, `let`/`declare` builtins…): NumInit (numeric
+/// literal), IncDec, or disqualifying (live/computed/compound).
+/// Returns (saw_write, ok). No match → (false, true).
+fn array_str_write(s: &str, name: &str) -> (bool, bool) {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut saw = false;
+    let mut ok = true;
+    let mut i = 0usize;
+    while i < s.len() {
+        // Find `name` as a word.
+        let Some(rel) = s[i..].find(name) else { break };
+        let j = i + rel;
+        let before_ok = j == 0 || !is_word(s[..j].chars().next_back().unwrap());
+        let after = &s[j + name.len()..];
+        let after_ok = after.is_empty() || !is_word(after.chars().next().unwrap());
+        i = j + 1;
+        if !(before_ok && after_ok) {
+            continue;
+        }
+        // Classify what follows: `++`/`--` (IncDec), `=` (check RHS),
+        // compound-assign (disqualify), comparisons (not writes).
+        let rest = after.trim_start();
+        if rest.starts_with("++") || rest.starts_with("--") {
+            saw = true;
+            continue;
+        }
+        // Strip comparison ops (==, !=, <=, >=) — not writes.
+        let mut r = rest;
+        if r.starts_with("==") || r.starts_with("!=") || r.starts_with("<=") || r.starts_with(">=") {
+            continue;
+        }
+        // Compound assigns (`+=`, `<<=`, …) — disqualify (may concat
+        // live text onto a numeric base).
+        let compound = ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="]
+            .iter()
+            .any(|op| r.starts_with(op));
+        if compound {
+            saw = true;
+            ok = false;
+            continue;
+        }
+        if let Some(eq_rest) = r.strip_prefix('=') {
+            if eq_rest.starts_with('=') {
+                continue; // `==` (missed above) — comparison.
+            }
+            saw = true;
+            // Plain integer-literal RHS (`i=1`, `i = -5`) — NumInit.
+            // Anything else (expressions, hex/floats, strings,
+            // command subst — all live-or-computed) disqualifies.
+            let rhs = eq_rest.trim_start();
+            let digits_start = if rhs.starts_with('-') { 1 } else { 0 };
+            let digit_len: usize = rhs[digits_start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .map(|c| c.len_utf8())
+                .sum();
+            let after_digits = &rhs[digits_start + digit_len..];
+            let is_num = digit_len > 0
+                && (after_digits.is_empty()
+                    || after_digits.starts_with([';', ',', ')', ' ', '\t', '\n']));
+            if !is_num {
+                ok = false;
+            }
+            continue;
+        }
+        // `<`/`>` alone are comparisons — not writes. Anything else
+        // after a bare `V` (e.g. `,`, `)`, `;`, end) is a read.
+    }
+    (saw, ok)
+}
+
+/// Inspect a `sh2.*` call's string args for writes to counter `name`
+/// (arith-evaluated strings actually assign; echo/test words do not).
+/// Merges into (`saw`, `ok`). Unattributable dynamics disqualify.
+fn array_counter_sh2call(func: &str, args: &[Expr], name: &str, saw: &mut bool, ok: &mut bool) {
+    // Arith-evaluated strings (headers, expressions): full write
+    // classification via the string inspector.
+    if matches!(
+        func,
+        "arith"
+            | "evalArith"
+            | "cstyleForSync"
+            | "cstyleFor"
+            | "forLoop"
+            | "forLoopSync"
+            | "whileLoop"
+            | "whileLoopSync"
+            | "whileLoopBatch"
+    ) {
+        for a in args {
+            if let Expr::Literal { value, .. } = a {
+                if let Some(s) = value.as_str() {
+                    let (saw_w, ok_w) = array_str_write(s, name);
+                    *saw |= saw_w;
+                    *ok &= ok_w;
+                } else {
+                    // Non-string literal arg — no arith text.
+                }
+            }
+            // (Non-literal args are values/arrows — transparently
+            // walked by the caller; only strings evaluate as code.)
+        }
+        return;
+    }
+    if func != "builtin" && func != "exec" {
+        return;
+    }
+    let Some(Expr::Literal { value: cmd, .. }) = args.first() else {
+        // Dynamic command — for `builtin` could be eval/let/declare
+        // (in-process writes); for `exec` always external (harmless).
+        // (The caller distinguishes; here disqualify defensively —
+        // exec-dynamic is actually harmless but vanishingly rare.)
+        *saw = true;
+        *ok = false;
+        return;
+    };
+    let Some(cmd_str) = cmd.as_str() else { return };
+    if func == "exec" {
+        return; // external processes cannot write parent vars.
+    }
+    // `builtin` with a static command: only write-capable builtins
+    // matter; their name args are precise Str literals.
+    let str_args: Vec<&str> = args
+        .iter()
+        .skip(1)
+        .filter_map(|a| {
+            if let Expr::Literal { value, .. } = a {
+                value.as_str()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let has_dynamic = args.iter().skip(1).any(|a| !matches!(a, Expr::Literal { .. }));
+    // (Array args (`builtin("echo", [...])`) hold the words in
+    // element position — scan those too.)
+    let mut words: Vec<&str> = str_args;
+    for a in args.iter().skip(1) {
+        if let Expr::ArrayExpression { elements, .. } = a {
+            for el in elements.iter().flatten() {
+                if let Expr::Literal { value, .. } = el {
+                    if let Some(s) = value.as_str() {
+                        words.push(s);
+                    }
+                }
+            }
+        }
+    }
+    match cmd_str {
+        "let" => {
+            // Arith strings — same inspector as `arith`.
+            for w in words {
+                let (saw_w, ok_w) = array_str_write(w, name);
+                *saw |= saw_w;
+                *ok &= ok_w;
+            }
+            if has_dynamic {
+                *saw = true;
+                *ok = false;
+            }
+        }
+        "declare" | "local" | "typeset" | "export" | "readonly" => {
+            // `V=value` assignments (strings unless live). Flags
+            // (`-A`, `-i`, …) are not writes.
+            for w in words {
+                if w.starts_with('-') || w.starts_with('+') {
+                    continue;
+                }
+                // Bare `V` (no `=`) in declare args — `declare V`
+                // (no value — harmless, already unset-or-empty).
+                if w == name {
+                    continue;
+                }
+                if w.starts_with(name)
+                    && w[name.len()..].starts_with(['=', '+', '-', '*', '/', '%'])
+                {
+                    let (saw_w, ok_w) = array_str_write(w, name);
+                    *saw |= saw_w;
+                    *ok &= ok_w;
+                }
+            }
+            if has_dynamic {
+                *saw = true;
+                *ok = false;
+            }
+        }
+        "read" | "mapfile" | "readarray" => {
+            // Args are var NAMES receiving user/file input (live).
+            if words.iter().any(|w| *w == name) {
+                *saw = true;
+                *ok = false;
+            }
+            if has_dynamic {
+                *saw = true;
+                *ok = false;
+            }
+        }
+        "unset" => {
+            // Deletion nullifies (breaks counters + fallback-dead).
+            if words.iter().any(|w| *w == name) {
+                *saw = true;
+                *ok = false;
+            }
+            if has_dynamic {
+                *saw = true;
+                *ok = false;
+            }
+        }
+        "printf" => {
+            // Only `printf -v V` writes (formatted output — live).
+            if words.iter().any(|w| *w == "-v")
+                && (words.iter().any(|w| *w == name) || has_dynamic)
+            {
+                *saw = true;
+                *ok = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect bare-identifier writes to `name` in scope: every value must
+/// be expansion-inert (Num literal, inert-Str literal, IncDec result,
+/// or uninit `let` — all stringify without live syntax). Anything else
+/// (`= x`, `+=`, calls…) disqualifies. Returns (saw_write, all_ok).
+fn array_counter_writes(stmts: &[Stmt], name: &str, saw: &mut bool, ok: &mut bool) {
+    fn expr(e: &Expr, name: &str, saw: &mut bool, ok: &mut bool) {
+        match e {
+            Expr::AssignmentExpression { left, right, .. } => {
+                if matches!(left.as_ref(), Expr::Identifier { name: n } if n.as_str() == name)
+                {
+                    *saw = true;
+                    let good = match right.as_ref() {
+                        Expr::Literal { value, .. } => {
+                            value.as_i64().is_some()
+                                || matches!(value.as_str(), Some(s) if !s.contains('$') && !s.contains('`') && !s.contains('\\'))
+                        }
+                        _ => false,
+                    };
+                    if !good {
+                        *ok = false;
+                    }
+                }
+                expr(left, name, saw, ok);
+                expr(right, name, saw, ok);
+            }
+            Expr::UnaryExpression { argument, .. } => {
+                // `i++`/`i--` always yield Numbers (inert) — but still
+                // count as a write (proves the name is a live binding,
+                // not an unbound global that could hold live text).
+                if matches!(argument.as_ref(), Expr::Identifier { name: n } if n.as_str() == name)
+                {
+                    *saw = true;
+                }
+                expr(argument, name, saw, ok);
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                // Arith-evaluated / write-capable string args assign
+                // through text — inspect for `name` writes.
+                if let Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    ..
+                } = callee.as_ref()
+                {
+                    if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2") {
+                        if let Expr::Identifier { name: func } = property.as_ref() {
+                            array_counter_sh2call(func, arguments, name, saw, ok);
+                        }
+                    }
+                }
+                expr(callee, name, saw, ok);
+                for a in arguments {
+                    expr(a, name, saw, ok);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                expr(object, name, saw, ok);
+                if *computed {
+                    expr(property, name, saw, ok);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. } => {
+                expr(left, name, saw, ok);
+                expr(right, name, saw, ok);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, name, saw, ok);
+                expr(consequent, name, saw, ok);
+                expr(alternate, name, saw, ok);
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                // Shadowed writes (own params/locals binding `name`)
+                // touch the shadow, not the outer slot — skip.
+                if params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                {
+                    return;
+                }
+                match body {
+                    ArrowBody::Block(b) => {
+                        if array_scope_binds(std::slice::from_ref(b.as_ref()), name) {
+                            return;
+                        }
+                        stmt(b, name, saw, ok)
+                    }
+                    ArrowBody::Expr(x) => expr(x, name, saw, ok),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                if params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                    || array_scope_binds(std::slice::from_ref(body.as_ref()), name)
+                {
+                    return;
+                }
+                stmt(body, name, saw, ok)
+            }
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties {
+                    if prop.computed {
+                        expr(&prop.key, name, saw, ok);
+                    }
+                    expr(&prop.value, name, saw, ok);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter().flatten() {
+                    expr(el, name, saw, ok);
+                }
+            }
+            Expr::SpreadElement { argument } => expr(argument, name, saw, ok),
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions {
+                    expr(x, name, saw, ok);
+                }
+            }
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions {
+                    expr(x, name, saw, ok);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, name, saw, ok);
+                for a in arguments {
+                    expr(a, name, saw, ok);
+                }
+            }
+            Expr::AwaitExpression { argument, .. } => expr(argument, name, saw, ok),
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn stmt(s: &Stmt, name: &str, saw: &mut bool, ok: &mut bool) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, name, saw, ok),
+            Stmt::BlockStatement { body } => {
+                for b in body {
+                    stmt(b, name, saw, ok);
+                }
+            }
+            Stmt::IfStatement {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, name, saw, ok);
+                stmt(consequent, name, saw, ok);
+                if let Some(a) = alternate {
+                    stmt(a, name, saw, ok);
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                expr(test, name, saw, ok);
+                stmt(body, name, saw, ok);
+            }
+            Stmt::ForStatement {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                stmt(init, name, saw, ok);
+                expr(test, name, saw, ok);
+                expr(update, name, saw, ok);
+                stmt(body, name, saw, ok);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, name, saw, ok);
+                expr(right, name, saw, ok);
+                stmt(body, name, saw, ok);
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(e) = argument {
+                    expr(e, name, saw, ok);
+                }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, name, saw, ok),
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt(block, name, saw, ok);
+                if let Some(h) = handler {
+                    stmt(&h.body, name, saw, ok);
+                }
+                if let Some(f) = finalizer {
+                    stmt(f, name, saw, ok);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, name, saw, ok);
+                for c in cases {
+                    if let Some(t) = &c.test {
+                        expr(t, name, saw, ok);
+                    }
+                    for b in &c.consequent {
+                        stmt(b, name, saw, ok);
+                    }
+                }
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if matches!(&d.id, Expr::Identifier { name: n } if n.as_str() == name) {
+                        *saw = true;
+                        let good = match &d.init {
+                            None => true,
+                            Some(Expr::Literal { value, .. }) => {
+                                value.as_i64().is_some()
+                                    || matches!(value.as_str(), Some(s) if !s.contains('$') && !s.contains('`') && !s.contains('\\'))
+                            }
+                            _ => false,
+                        };
+                        if !good {
+                            *ok = false;
+                        }
+                    }
+                    if let Some(init) = &d.init {
+                        expr(init, name, saw, ok);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { id, params, body, .. } => {
+                if matches!(id, Expr::Identifier { name: n } if n.as_str() == name)
+                    || params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                    || array_scope_binds(std::slice::from_ref(body.as_ref()), name)
+                {
+                    return;
+                }
+                stmt(body, name, saw, ok)
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts {
+        stmt(s, name, saw, ok);
+    }
+}
+
+/// Does `name` bind anywhere in these statements (declarator, param is
+/// checked by the caller, function id, catch param)? A function-local
+/// binding shadows the module top — the counter analysis then ignores
+/// module-level writes.
+fn array_scope_binds(stmts: &[Stmt], name: &str) -> bool {
+    fn expr_binds(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                    || match body {
+                        ArrowBody::Block(b) => stmt_binds(b, name),
+                        ArrowBody::Expr(x) => expr_binds(x, name),
+                    }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                    || stmt_binds(body, name)
+            }
+            _ => false,
+        }
+    }
+    fn stmt_binds(s: &Stmt, name: &str) -> bool {
+        match s {
+            Stmt::VariableDeclaration { declarations, .. } => declarations
+                .iter()
+                .any(|d| matches!(&d.id, Expr::Identifier { name: n } if n.as_str() == name)),
+            Stmt::FunctionDeclaration { id, params, body, .. } => {
+                matches!(id, Expr::Identifier { name: n } if n.as_str() == name)
+                    || params.iter().any(|p| matches!(p, Expr::Identifier { name: n } if n.as_str() == name))
+                    || stmt_binds(body, name)
+            }
+            Stmt::BlockStatement { body } => body.iter().any(|b| stmt_binds(b, name)),
+            Stmt::IfStatement {
+                consequent,
+                alternate,
+                ..
+            } => {
+                stmt_binds(consequent, name)
+                    || alternate.as_ref().is_some_and(|a| stmt_binds(a, name))
+            }
+            Stmt::WhileStatement { body, .. } | Stmt::DoWhileStatement { body, .. } => {
+                stmt_binds(body, name)
+            }
+            Stmt::ForStatement { init, body, .. } => {
+                stmt_binds(init, name) || stmt_binds(body, name)
+            }
+            Stmt::ForOfStatement { left, body, .. } => {
+                stmt_binds(left, name) || stmt_binds(body, name)
+            }
+            Stmt::TryStatement { block, handler, finalizer, .. } => {
+                stmt_binds(block, name)
+                    || handler.as_ref().is_some_and(|h| stmt_binds(&h.body, name))
+                    || finalizer.as_ref().is_some_and(|f| stmt_binds(f, name))
+            }
+            Stmt::SwitchStatement { cases, .. } => cases
+                .iter()
+                .any(|c| c.consequent.iter().any(|b| stmt_binds(b, name))),
+            Stmt::ExpressionStatement { expression } => expr_binds(expression, name),
+            Stmt::ReturnStatement { argument } => argument
+                .as_ref()
+                .is_some_and(|e| expr_binds(e, name)),
+            Stmt::ThrowStatement { .. }
+            | Stmt::BreakStatement { .. }
+            | Stmt::ContinueStatement { .. } => false,
+        }
+    }
+    stmts.iter().any(|s| stmt_binds(s, name))
+}
+
+/// Does string `s` mention array `name`? Exact match, bracket form
+/// (`NAME[i]` — baked element writes like `setArray("n[i]")`), or word
+/// boundary (`ref=NAME` nameref decls, literal text). Over-approximate
+/// by design (safe miss on data text resembling a reference).
+fn array_str_mentions(s: &str, name: &str) -> bool {
+    if s == name {
+        return true;
+    }
+    if s.starts_with(name)
+        && s[name.len()..].starts_with('[')
+    {
+        return true;
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut start = 0usize;
+    while let Some(pos) = s[start..].find(name) {
+        let i = start + pos;
+        let before_ok = i == 0 || !is_word(s[..i].chars().next_back().unwrap());
+        let after = &s[i + name.len()..];
+        let after_ok = after.is_empty() || !is_word(after.chars().next().unwrap());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + 1;
+    }
+    false
+}
+
+/// Can `name` be a `const` binding? Valid JS identifier, not reserved,
+/// not shadowing a global the analysis assumes (`Number`, `Math`… —
+/// the element-inertness allowlists would resolve to the array).
+fn array_valid_const_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return false;
+    }
+    const RESERVED: &[&str] = &[
+        "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+        "delete", "do", "else", "export", "extends", "false", "finally", "for",
+        "function", "if", "import", "in", "instanceof", "new", "null", "return",
+        "super", "switch", "this", "throw", "true", "try", "typeof", "var",
+        "void", "while", "with", "yield", "let", "static", "enum", "await",
+        "implements", "package", "protected", "interface", "private", "public",
+    ];
+    const GLOBALS: &[&str] = &[
+        "sh2", "Number", "String", "BigInt", "Boolean", "Math", "Object", "Array",
+        "JSON", "Map", "Set", "WeakMap", "WeakSet", "Date", "RegExp", "Error",
+        "Promise", "Symbol", "Function", "Reflect", "Proxy", "parseInt",
+        "parseFloat", "isNaN", "isFinite", "undefined", "NaN", "Infinity",
+        "console", "process", "globalThis", "arguments",
+    ];
+    !RESERVED.contains(&name) && !GLOBALS.contains(&name)
+}
+
+/// Inline transliteration of `sh2.sortedIntJoin(NAME)` /
+/// `sh2.sortedBigintJoin(NAME)` over the native binding — op-for-op
+/// identical to the runtime helpers (same maps, same comparator
+/// (stable sort, index tiebreak), same dedup domain (items for int,
+/// vals for bigint — `"5"` vs `"05"` differ!), same `', '` join).
+/// Emitted as an IIFE (valid in any expression position).
+/// Native read for a literal `arrayIndex(NAME, k)`: negative wraps
+/// (`k<0 → length+k`), out-of-range yields `""`, in-range
+/// `String()`s — the runtime's exact decision (dense arrays have no
+/// holes, so no `??` needed — and none in the original either).
+fn array_index_read(arr: &str, k: i64) -> Expr {
+    fn ident(n: &str) -> Expr {
+        Expr::Identifier { name: n.to_string() }
+    }
+    fn num(n: i64) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::Number(n.into()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn str_(s: &str) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::String(s.to_string()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn at(arr: &str, idx: Expr) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(ident(arr)),
+            property: Box::new(idx),
+            computed: true,
+            optional: false,
+        }
+    }
+    fn len(arr: &str) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(ident(arr)),
+            property: Box::new(ident("length")),
+            computed: false,
+            optional: false,
+        }
+    }
+    // In-range read: `String(N[i])` (bounds-checked by callers).
+    // Concrete per-sign shapes (literals rebuilt per side — tiny).
+    if k >= 0 {
+        // `(k < N.length ? String(N[k]) : "")`.
+        Expr::ConditionalExpression {
+            test: Box::new(Expr::BinaryExpression {
+                left: Box::new(num(k)),
+                operator: "<".to_string(),
+                right: Box::new(len(arr)),
+            }),
+            consequent: Box::new(Expr::CallExpression {
+                callee: Box::new(ident("String")),
+                arguments: vec![at(arr, num(k))],
+                optional: false,
+            }),
+            alternate: Box::new(str_("")),
+        }
+    } else {
+        // `(N.length+k >= 0 && N.length+k < N.length
+        //   ? String(N[N.length+k]) : "")`.
+        let wrapped = Expr::BinaryExpression {
+            left: Box::new(len(arr)),
+            operator: "+".to_string(),
+            right: Box::new(num(k)),
+        };
+        let wrapped2 = Expr::BinaryExpression {
+            left: Box::new(len(arr)),
+            operator: "+".to_string(),
+            right: Box::new(num(k)),
+        };
+        let wrapped3 = Expr::BinaryExpression {
+            left: Box::new(len(arr)),
+            operator: "+".to_string(),
+            right: Box::new(num(k)),
+        };
+        Expr::ConditionalExpression {
+            test: Box::new(Expr::LogicalExpression {
+                left: Box::new(Expr::BinaryExpression {
+                    left: Box::new(wrapped),
+                    operator: ">=".to_string(),
+                    right: Box::new(num(0)),
+                }),
+                operator: "&&".to_string(),
+                right: Box::new(Expr::BinaryExpression {
+                    left: Box::new(wrapped2),
+                    operator: "<".to_string(),
+                    right: Box::new(len(arr)),
+                }),
+            }),
+            consequent: Box::new(Expr::CallExpression {
+                callee: Box::new(ident("String")),
+                arguments: vec![at(arr, wrapped3)],
+                optional: false,
+            }),
+            alternate: Box::new(str_("")),
+        }
+    }
+}
+
+fn array_join_iife(arr: Expr, bigint: bool) -> Expr {
+    fn ident(n: &str) -> Expr {
+        Expr::Identifier { name: n.to_string() }
+    }
+    fn str_lit(s: &str) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::String(s.to_string()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn num_lit(n: i64) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::Number(n.into()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn call(callee: Expr, args: Vec<Expr>) -> Expr {
+        Expr::CallExpression {
+            callee: Box::new(callee),
+            arguments: args,
+            optional: false,
+        }
+    }
+    fn member(obj: Expr, prop: &str) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(ident(prop)),
+            computed: false,
+            optional: false,
+        }
+    }
+    fn arrow1(param: &str, body: Expr) -> Expr {
+        Expr::ArrowFunctionExpression {
+            params: vec![ident(param)],
+            body: ArrowBody::Expr(Box::new(body)),
+            expression: true,
+            r#async: false,
+        }
+    }
+    fn const_decl(n: &str, init: Expr) -> Stmt {
+        Stmt::VariableDeclaration {
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: ident(n),
+                init: Some(init),
+            }],
+            kind: "const",
+        }
+    }
+    // `NAME.map((v) => String(v ?? ''))` — the runtime's items line.
+    let items = call(
+        member(arr, "map"),
+        vec![arrow1(
+            "v",
+            call(
+                ident("String"),
+                vec![Expr::LogicalExpression {
+                    left: Box::new(ident("v")),
+                    operator: "??".to_string(),
+                    right: Box::new(str_lit("")),
+                }],
+            ),
+        )],
+    );
+    // vals: `Number(s)` / `try BigInt(s) catch 0n`. BigInt has no
+    // literal form in this dialect — `BigInt("0")` is value-equal.
+    let vals = if bigint {
+        Expr::CallExpression {
+            callee: Box::new(member(ident("__items"), "map")),
+            arguments: vec![Expr::ArrowFunctionExpression {
+                params: vec![ident("s")],
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                    body: vec![Stmt::TryStatement {
+                        block: Box::new(Stmt::BlockStatement {
+                            body: vec![Stmt::ReturnStatement {
+                                argument: Some(call(ident("BigInt"), vec![ident("s")])),
+                            }],
+                        }),
+                        handler: Some(CatchClause {
+                            type_: "CatchClause",
+                            param: None,
+                            body: Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ReturnStatement {
+                                    argument: Some(call(ident("BigInt"), vec![str_lit("0")])),
+                                }],
+                            }),
+                        }),
+                        finalizer: None,
+                    }],
+                })),
+                expression: false,
+                r#async: false,
+            }],
+            optional: false,
+        }
+    } else {
+        call(
+            member(ident("__items"), "map"),
+            vec![arrow1("s", call(ident("Number"), vec![ident("s")]))],
+        )
+    };
+    // order: indices sorted by (val, index) — the runtime comparator.
+    let order = call(
+        member(
+            call(
+                member(ident("__items"), "map"),
+                vec![Expr::ArrowFunctionExpression {
+                    params: vec![ident("_"), ident("i")],
+                    body: ArrowBody::Expr(Box::new(ident("i"))),
+                    expression: true,
+                    r#async: false,
+                }],
+            ),
+            "sort",
+        ),
+        vec![Expr::ArrowFunctionExpression {
+            params: vec![ident("a"), ident("b")],
+            body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
+                test: Box::new(Expr::BinaryExpression {
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(ident("__vals")),
+                        property: Box::new(ident("a")),
+                        computed: true,
+                        optional: false,
+                    }),
+                    operator: "<".to_string(),
+                    right: Box::new(Expr::MemberExpression {
+                        object: Box::new(ident("__vals")),
+                        property: Box::new(ident("b")),
+                        computed: true,
+                        optional: false,
+                    }),
+                }),
+                consequent: Box::new(num_lit(-1)),
+                alternate: Box::new(Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression {
+                        left: Box::new(Expr::MemberExpression {
+                            object: Box::new(ident("__vals")),
+                            property: Box::new(ident("a")),
+                            computed: true,
+                            optional: false,
+                        }),
+                        operator: ">".to_string(),
+                        right: Box::new(Expr::MemberExpression {
+                            object: Box::new(ident("__vals")),
+                            property: Box::new(ident("b")),
+                            computed: true,
+                            optional: false,
+                        }),
+                    }),
+                    consequent: Box::new(num_lit(1)),
+                    alternate: Box::new(Expr::BinaryExpression {
+                        left: Box::new(ident("a")),
+                        operator: "-".to_string(),
+                        right: Box::new(ident("b")),
+                    }),
+                }),
+            })),
+            expression: true,
+            r#async: false,
+        }],
+    );
+    // Dedup + collect: int compares ITEMS (strings), bigint compares
+    // VALS (BigInts) — the two helpers differ, replicated exactly.
+    let (dedup_lhs, push_arg) = if bigint {
+        (
+            Expr::MemberExpression {
+                object: Box::new(ident("__vals")),
+                property: Box::new(ident("__i")),
+                computed: true,
+                optional: false,
+            },
+            ident("__i"),
+        )
+    } else {
+        (
+            Expr::MemberExpression {
+                object: Box::new(ident("__items")),
+                property: Box::new(ident("__i")),
+                computed: true,
+                optional: false,
+            },
+            Expr::MemberExpression {
+                object: Box::new(ident("__items")),
+                property: Box::new(ident("__i")),
+                computed: true,
+                optional: false,
+            },
+        )
+    };
+    let dedup_rhs = if bigint {
+        Expr::MemberExpression {
+            object: Box::new(ident("__vals")),
+            property: Box::new(Expr::MemberExpression {
+                object: Box::new(ident("__out")),
+                property: Box::new(Expr::BinaryExpression {
+                    left: Box::new(member(ident("__out"), "length")),
+                    operator: "-".to_string(),
+                    right: Box::new(num_lit(1)),
+                }),
+                computed: true,
+                optional: false,
+            }),
+            computed: true,
+            optional: false,
+        }
+    } else {
+        Expr::MemberExpression {
+            object: Box::new(ident("__out")),
+            property: Box::new(Expr::BinaryExpression {
+                left: Box::new(member(ident("__out"), "length")),
+                operator: "-".to_string(),
+                right: Box::new(num_lit(1)),
+            }),
+            computed: true,
+            optional: false,
+        }
+    };
+    let collect_loop = Stmt::ForOfStatement {
+        left: Box::new(Stmt::VariableDeclaration {
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: ident("__i"),
+                init: None,
+            }],
+            kind: "const",
+        }),
+        right: ident("__order"),
+        body: Box::new(Stmt::BlockStatement {
+            body: vec![Stmt::IfStatement {
+                test: Expr::LogicalExpression {
+                    left: Box::new(Expr::BinaryExpression {
+                        left: Box::new(member(ident("__out"), "length")),
+                        operator: "===".to_string(),
+                        right: Box::new(num_lit(0)),
+                    }),
+                    operator: "||".to_string(),
+                    right: Box::new(Expr::BinaryExpression {
+                        left: Box::new(dedup_lhs),
+                        operator: "!==".to_string(),
+                        right: Box::new(dedup_rhs),
+                    }),
+                },
+                consequent: Box::new(Stmt::BlockStatement {
+                    body: vec![Stmt::ExpressionStatement {
+                        expression: call(member(ident("__out"), "push"), vec![push_arg]),
+                    }],
+                }),
+                alternate: None,
+            }],
+        }),
+    };
+    // `out.map((i) => items[i]).join(', ')` (int) vs
+    // `out.map((i) => items[i]).join(', ')` — both map INDICES through
+    // items (bigint pushes indices, int pushes item strings directly;
+    // the final projection differs — replicate exactly).
+    let result = if bigint {
+        call(
+            member(
+                call(
+                    member(ident("__out"), "map"),
+                    vec![arrow1(
+                        "i",
+                        Expr::MemberExpression {
+                            object: Box::new(ident("__items")),
+                            property: Box::new(ident("i")),
+                            computed: true,
+                            optional: false,
+                        },
+                    )],
+                ),
+                "join",
+            ),
+            vec![str_lit(", ")],
+        )
+    } else {
+        // int pushes item strings — `__out` already holds strings.
+        call(member(ident("__out"), "join"), vec![str_lit(", ")])
+    };
+    let iife_body = Stmt::BlockStatement {
+        body: vec![
+            const_decl("__items", items),
+            const_decl("__vals", vals),
+            const_decl("__order", order),
+            const_decl("__out", Expr::ArrayExpression {
+                elements: vec![],
+            }),
+            collect_loop,
+            Stmt::ReturnStatement {
+                argument: Some(result),
+            },
+        ],
+    };
+    Expr::CallExpression {
+        callee: Box::new(Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Block(Box::new(iife_body)),
+            expression: false,
+            r#async: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    }
+}
+
+/// Inline transliteration of `sh2.sortedJoinMerge(small, big)` over two
+/// native bindings — op-for-op identical to the runtime helper: sort the
+/// small partition as Numbers, the big as BigInts, then a linear merge
+/// of the two sorted runs, deduping by value. Emitted as an IIFE.
+fn array_join_merge_iife(small: Expr, big: Expr) -> Expr {
+    fn ident(n: &str) -> Expr {
+        Expr::Identifier { name: n.to_string() }
+    }
+    fn str_lit(s: &str) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::String(s.to_string()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn num_lit(n: i64) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::Number(n.into()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn call(callee: Expr, args: Vec<Expr>) -> Expr {
+        Expr::CallExpression {
+            callee: Box::new(callee),
+            arguments: args,
+            optional: false,
+        }
+    }
+    fn member(obj: Expr, prop: &str) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(ident(prop)),
+            computed: false,
+            optional: false,
+        }
+    }
+    fn index(obj: Expr, idx: Expr) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(idx),
+            computed: true,
+            optional: false,
+        }
+    }
+    fn arrow1(param: &str, body: Expr) -> Expr {
+        Expr::ArrowFunctionExpression {
+            params: vec![ident(param)],
+            body: ArrowBody::Expr(Box::new(body)),
+            expression: true,
+            r#async: false,
+        }
+    }
+    fn arrow2(p1: &str, p2: &str, body: Expr) -> Expr {
+        Expr::ArrowFunctionExpression {
+            params: vec![ident(p1), ident(p2)],
+            body: ArrowBody::Expr(Box::new(body)),
+            expression: true,
+            r#async: false,
+        }
+    }
+    fn const_decl(n: &str, init: Expr) -> Stmt {
+        Stmt::VariableDeclaration {
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: ident(n),
+                init: Some(init),
+            }],
+            kind: "const",
+        }
+    }
+    fn let_decl(n: &str, init: Expr) -> Stmt {
+        Stmt::VariableDeclaration {
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: ident(n),
+                init: Some(init),
+            }],
+            kind: "let",
+        }
+    }
+    fn expr_stmt(e: Expr) -> Stmt {
+        Stmt::ExpressionStatement { expression: e }
+    }
+    fn block(stmts: Vec<Stmt>) -> Stmt {
+        Stmt::BlockStatement { body: stmts }
+    }
+    fn return_stmt(e: Expr) -> Stmt {
+        Stmt::ReturnStatement { argument: Some(e) }
+    }
+    fn inc(n: &str) -> Expr {
+        Expr::UnaryExpression {
+            operator: "++".to_string(),
+            argument: Box::new(ident(n)),
+            prefix: false,
+        }
+    }
+    // `X.map((v) => String(v ?? ""))` — the runtime's items line.
+    let items_of = |arr: Expr| {
+        call(
+            member(arr, "map"),
+            vec![arrow1(
+                "v",
+                call(
+                    ident("String"),
+                    vec![Expr::LogicalExpression {
+                        left: Box::new(ident("v")),
+                        operator: "??".to_string(),
+                        right: Box::new(str_lit("")),
+                    }],
+                ),
+            )],
+        )
+    };
+    // `X.map((s) => Number(s))` — small vals.
+    let s_vals = |arr: Expr| {
+        call(member(arr, "map"), vec![arrow1("s", call(ident("Number"), vec![ident("s")]))])
+    };
+    // `X.map((s) => { try { return BigInt(s); } catch { return BigInt("0"); } })`
+    // — big vals (BigInt, 0n on parse failure).
+    let b_vals = |arr: Expr| {
+        call(
+            member(arr, "map"),
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![ident("s")],
+                body: ArrowBody::Block(Box::new(block(vec![Stmt::TryStatement {
+                    block: Box::new(block(vec![Stmt::ReturnStatement {
+                        argument: Some(call(ident("BigInt"), vec![ident("s")])),
+                    }])),
+                    handler: Some(CatchClause {
+                        type_: "CatchClause",
+                        param: None,
+                        body: Box::new(block(vec![Stmt::ReturnStatement {
+                            argument: Some(call(ident("BigInt"), vec![str_lit("0")])),
+                        }])),
+                    }),
+                    finalizer: None,
+                }]))),
+                expression: false,
+                r#async: false,
+            }],
+        )
+    };
+    // `X.map((_, i) => i).sort((a, b) => V[a] < V[b] ? -1 : V[a] > V[b] ? 1 : a - b)`
+    // — the runtime's index sort (stable, index tiebreak).
+    let order_of = |arr: Expr, vals: &str| {
+        call(
+            member(
+                call(
+                    member(arr, "map"),
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![ident("_"), ident("i")],
+                        body: ArrowBody::Expr(Box::new(ident("i"))),
+                        expression: true,
+                        r#async: false,
+                    }],
+                ),
+                "sort",
+            ),
+            vec![arrow2(
+                "a",
+                "b",
+                Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression {
+                        left: Box::new(index(ident(vals), ident("a"))),
+                        operator: "<".to_string(),
+                        right: Box::new(index(ident(vals), ident("b"))),
+                    }),
+                    consequent: Box::new(num_lit(-1)),
+                    alternate: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(Expr::BinaryExpression {
+                            left: Box::new(index(ident(vals), ident("a"))),
+                            operator: ">".to_string(),
+                            right: Box::new(index(ident(vals), ident("b"))),
+                        }),
+                        consequent: Box::new(num_lit(1)),
+                        alternate: Box::new(Expr::BinaryExpression {
+                            left: Box::new(ident("a")),
+                            operator: "-".to_string(),
+                            right: Box::new(ident("b")),
+                        }),
+                    }),
+                },
+            )],
+        )
+    };
+    // `const __push = (item) => { if (out.length === 0 || item !== out[out.length-1]) out.push(item); }`
+    let push_cond = Expr::LogicalExpression {
+        left: Box::new(Expr::BinaryExpression {
+            left: Box::new(member(ident("__out"), "length")),
+            operator: "===".to_string(),
+            right: Box::new(num_lit(0)),
+        }),
+        operator: "||".to_string(),
+        right: Box::new(Expr::BinaryExpression {
+            left: Box::new(ident("item")),
+            operator: "!==".to_string(),
+            right: Box::new(index(
+                ident("__out"),
+                Expr::BinaryExpression {
+                    left: Box::new(member(ident("__out"), "length")),
+                    operator: "-".to_string(),
+                    right: Box::new(num_lit(1)),
+                },
+            )),
+        }),
+    };
+    let push_call = call(member(ident("__out"), "push"), vec![ident("item")]);
+    let push_if = Stmt::IfStatement {
+        test: push_cond,
+        consequent: Box::new(block(vec![expr_stmt(push_call)])),
+        alternate: None,
+    };
+    let push_fn = Expr::ArrowFunctionExpression {
+        params: vec![ident("item")],
+        body: ArrowBody::Block(Box::new(block(vec![push_if]))),
+        expression: false,
+        r#async: false,
+    };
+    // The linear merge loop body (one iteration).
+    let merge_iter = block(vec![
+        const_decl(
+            "__si",
+            index(ident("__sOrder"), ident("__i")),
+        ),
+        const_decl(
+            "__bi",
+            index(ident("__bOrder"), ident("__j")),
+        ),
+        Stmt::IfStatement {
+            test: Expr::BinaryExpression {
+                left: Box::new(index(ident("__sVals"), ident("__si"))),
+                operator: "<".to_string(),
+                right: Box::new(index(ident("__bVals"), ident("__bi"))),
+            },
+            consequent: Box::new(block(vec![
+                expr_stmt(call(ident("__push"), vec![index(ident("__sItems"), ident("__si"))])),
+                expr_stmt(inc("__i")),
+            ])),
+            alternate: Some(Box::new(Stmt::IfStatement {
+                test: Expr::BinaryExpression {
+                    left: Box::new(index(ident("__sVals"), ident("__si"))),
+                    operator: ">".to_string(),
+                    right: Box::new(index(ident("__bVals"), ident("__bi"))),
+                },
+                consequent: Box::new(block(vec![
+                    expr_stmt(call(ident("__push"), vec![index(ident("__bItems"), ident("__bi"))])),
+                    expr_stmt(inc("__j")),
+                ])),
+                alternate: Some(Box::new(block(vec![
+                    expr_stmt(call(ident("__push"), vec![index(ident("__sItems"), ident("__si"))])),
+                    expr_stmt(inc("__i")),
+                    expr_stmt(inc("__j")),
+                ]))),
+            })),
+        },
+    ]);
+    let drain_s = Stmt::WhileStatement {
+        test: Expr::BinaryExpression {
+            left: Box::new(ident("__i")),
+            operator: "<".to_string(),
+            right: Box::new(member(ident("__sOrder"), "length")),
+        },
+        body: Box::new(block(vec![
+            expr_stmt(call(
+                ident("__push"),
+                vec![index(ident("__sItems"), index(ident("__sOrder"), ident("__i")))],
+            )),
+            expr_stmt(inc("__i")),
+        ])),
+    };
+    let drain_b = Stmt::WhileStatement {
+        test: Expr::BinaryExpression {
+            left: Box::new(ident("__j")),
+            operator: "<".to_string(),
+            right: Box::new(member(ident("__bOrder"), "length")),
+        },
+        body: Box::new(block(vec![
+            expr_stmt(call(
+                ident("__push"),
+                vec![index(ident("__bItems"), index(ident("__bOrder"), ident("__j")))],
+            )),
+            expr_stmt(inc("__j")),
+        ])),
+    };
+    let merge_loop = Stmt::WhileStatement {
+        test: Expr::LogicalExpression {
+            left: Box::new(Expr::BinaryExpression {
+                left: Box::new(ident("__i")),
+                operator: "<".to_string(),
+                right: Box::new(member(ident("__sOrder"), "length")),
+            }),
+            operator: "&&".to_string(),
+            right: Box::new(Expr::BinaryExpression {
+                left: Box::new(ident("__j")),
+                operator: "<".to_string(),
+                right: Box::new(member(ident("__bOrder"), "length")),
+            }),
+        },
+        body: Box::new(merge_iter),
+    };
+    let iife_body = block(vec![
+        const_decl("__sItems", items_of(small)),
+        const_decl("__bItems", items_of(big)),
+        const_decl("__sVals", s_vals(ident("__sItems"))),
+        const_decl("__bVals", b_vals(ident("__bItems"))),
+        const_decl("__sOrder", order_of(ident("__sItems"), "__sVals")),
+        const_decl("__bOrder", order_of(ident("__bItems"), "__bVals")),
+        const_decl("__out", Expr::ArrayExpression { elements: vec![] }),
+        const_decl("__push", push_fn),
+        let_decl("__i", num_lit(0)),
+        let_decl("__j", num_lit(0)),
+        merge_loop,
+        drain_s,
+        drain_b,
+        return_stmt(call(member(ident("__out"), "join"), vec![str_lit(", ")])),
+    ]);
+    Expr::CallExpression {
+        callee: Box::new(Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Block(Box::new(iife_body)),
+            expression: false,
+            r#async: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    }
+}
+
+/// Rewrite walk: `setArrayAppend(NAME, els)` → `NAME.push(...els)`
+/// (in place, order preserved) and `sorted*Join(NAME)` → inline IIFE
+/// (any expression position). The init is removed by the driver (top
+/// const); this walk never touches `setArray` itself.
+fn array_rewrite_expr(e: &mut Expr, name: &str) {    // Post-order: rewrite the call node itself first (it cannot nest
+    // another whitelisted call of the SAME array — nested reads would
+    // have refused the array — then recurse into the replacement).
+    if let Expr::CallExpression { callee, arguments, .. } = e {
+        if let Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } = callee.as_ref()
+        {
+            if !computed
+                && matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+            {
+                if let Expr::Identifier { name: func } = property.as_ref() {
+                    if (func == "sortedIntJoin" || func == "sortedBigintJoin")
+                        && matches!(arguments.as_slice(), [Expr::Literal { value, .. }] if value.as_str() == Some(name))
+                    {
+                        let bigint = func == "sortedBigintJoin";
+                        *e = array_join_iife(
+                            Expr::Identifier { name: name.to_string() },
+                            bigint,
+                        );
+                        array_rewrite_expr(e, name);
+                        return;
+                    }
+                    // `sortedJoinMerge(NAME, PARTNER)` → inline merge IIFE
+                    // over the two native bindings (both migrated).
+                    if func == "sortedJoinMerge"
+                        && matches!(arguments.as_slice(), [Expr::Literal { value: nm, .. }, Expr::Literal { value: partner, .. }]
+                            if nm.as_str() == Some(name))
+                    {
+                        if let [_, Expr::Literal { value: partner, .. }] = arguments.as_slice() {
+                            if let Some(p) = partner.as_str() {
+                                *e = array_join_merge_iife(
+                                    Expr::Identifier { name: name.to_string() },
+                                    Expr::Identifier { name: p.to_string() },
+                                );
+                                array_rewrite_expr(e, name);
+                                return;
+                            }
+                        }
+                    }
+                    // `arrayIndex(NAME, lit)` → bounds-checked native
+                    // read (validated at decision; re-match defensively).
+                    if func == "arrayIndex"
+                        && matches!(arguments.as_slice(), [Expr::Literal { value: nm, .. }, Expr::Literal { value: key, .. }]
+                            if nm.as_str() == Some(name)
+                            && (key.as_i64().is_some() || matches!(key.as_str(), Some("@" | "*")) || array_index_key(key.as_str().unwrap_or("")).is_some()))
+                    {
+                        if let [_, Expr::Literal { value: key, .. }] = arguments.as_slice() {
+                            if let Some(k) = key.as_i64() {
+                                *e = array_index_read(name, k);
+                                array_rewrite_expr(e, name);
+                                return;
+                            }
+                            if let Some(s) = key.as_str() {
+                                if s == "@" || s == "*" {
+                                    *e = Expr::ArrayExpression {
+                                        elements: vec![Some(Expr::SpreadElement {
+                                            argument: Box::new(Expr::Identifier {
+                                                name: name.to_string(),
+                                            }),
+                                        })],
+                                    };
+                                    array_rewrite_expr(e, name);
+                                    return;
+                                }
+                                if let Some(k) = array_index_key(s) {
+                                    *e = array_index_read(name, k);
+                                    array_rewrite_expr(e, name);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // `arrayLen(NAME)` → `NAME.length`.
+                    if func == "arrayLen"
+                        && matches!(arguments.as_slice(), [Expr::Literal { value, .. }] if value.as_str() == Some(name))
+                    {
+                        *e = Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: name.to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "length".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        };
+                        array_rewrite_expr(e, name);
+                        return;
+                    }
+                    // `arrayItems(NAME)` → `[...NAME]` (snapshot copy).
+                    if func == "arrayItems"
+                        && matches!(arguments.as_slice(), [Expr::Literal { value, .. }] if value.as_str() == Some(name))
+                    {
+                        *e = Expr::ArrayExpression {
+                            elements: vec![Some(Expr::SpreadElement {
+                                argument: Box::new(Expr::Identifier {
+                                    name: name.to_string(),
+                                }),
+                            })],
+                        };
+                        array_rewrite_expr(e, name);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    match e {
+        Expr::CallExpression { callee, arguments, .. } => {
+            array_rewrite_expr(callee, name);
+            for a in arguments.iter_mut() {
+                array_rewrite_expr(a, name);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            array_rewrite_expr(object, name);
+            if *computed {
+                array_rewrite_expr(property, name);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            array_rewrite_expr(left, name);
+            array_rewrite_expr(right, name);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_rewrite_expr(test, name);
+            array_rewrite_expr(consequent, name);
+            array_rewrite_expr(alternate, name);
+        }
+        Expr::UnaryExpression { argument, .. }
+        | Expr::SpreadElement { argument }
+        | Expr::AwaitExpression { argument, .. } => {
+            array_rewrite_expr(argument, name);
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Block(b) => array_rewrite_stmt(b, name),
+            ArrowBody::Expr(x) => array_rewrite_expr(x, name),
+        },
+        Expr::FunctionExpression { body, .. } => array_rewrite_stmt(body, name),
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties.iter_mut() {
+                if prop.computed {
+                    array_rewrite_expr(&mut prop.key, name);
+                }
+                array_rewrite_expr(&mut prop.value, name);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter_mut().flatten() {
+                array_rewrite_expr(el, name);
+            }
+        }
+        Expr::TemplateLiteral { expressions, .. }
+        | Expr::SequenceExpression { expressions } => {
+            for x in expressions.iter_mut() {
+                array_rewrite_expr(x, name);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            array_rewrite_expr(callee, name);
+            for a in arguments.iter_mut() {
+                array_rewrite_expr(a, name);
+            }
+        }
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+    }
+}
+
+/// Statement rewrite: appends become `push` in place (nested too —
+/// closure capture keeps the same object); joins via the expr walk.
+fn array_rewrite_stmt(s: &mut Stmt, name: &str) {
+    match s {
+        Stmt::ExpressionStatement { expression } => {
+            // `sh2.setArrayAppend(NAME, [els])` → `NAME.push(...els)`.
+            let is_append = matches!(expression, Expr::CallExpression { callee, arguments, .. }
+                if matches!(callee.as_ref(), Expr::MemberExpression { object, property, computed: false, .. }
+                    if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setArrayAppend"))
+                && matches!(arguments.as_slice(), [Expr::Literal { value, .. }, Expr::ArrayExpression { .. }]
+                    if value.as_str() == Some(name)));
+            if is_append {
+                if let Expr::CallExpression { arguments, .. } = expression {
+                    let mut taken = std::mem::take(arguments);
+                    // args verified as [name, array] above — extract
+                    // the array (last); anything unexpected restores
+                    // the node untouched for the generic walk.
+                    let mut extracted: Option<Vec<Expr>> = None;
+                    if taken.len() == 2 {
+                        match taken.pop() {
+                            Some(Expr::ArrayExpression { elements, .. }) => {
+                                extracted =
+                                    Some(elements.into_iter().flatten().collect());
+                            }
+                            Some(other) => taken.push(other),
+                            None => {}
+                        }
+                    }
+                    if let Some(els) = extracted {
+                        *expression = Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier {
+                                    name: name.to_string(),
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "push".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: els,
+                            optional: false,
+                        };
+                        return;
+                    }
+                    // Unreachable given is_append — never leave the
+                    // node emptied: restore the args for the walk.
+                    if let Expr::CallExpression { arguments, .. } = expression {
+                        *arguments = taken;
+                    }
+                }
+            }
+            array_rewrite_expr(expression, name);
+        }
+        Stmt::BlockStatement { body } => {
+            for b in body.iter_mut() {
+                array_rewrite_stmt(b, name);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_rewrite_expr(test, name);
+            array_rewrite_stmt(consequent, name);
+            if let Some(a) = alternate {
+                array_rewrite_stmt(a, name);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            array_rewrite_expr(test, name);
+            array_rewrite_stmt(body, name);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            array_rewrite_stmt(init, name);
+            array_rewrite_expr(test, name);
+            array_rewrite_expr(update, name);
+            array_rewrite_stmt(body, name);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            array_rewrite_stmt(left, name);
+            array_rewrite_expr(right, name);
+            array_rewrite_stmt(body, name);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                array_rewrite_expr(e, name);
+            }
+        }
+        Stmt::ThrowStatement { argument } => array_rewrite_expr(argument, name),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            array_rewrite_stmt(block, name);
+            if let Some(h) = handler {
+                array_rewrite_stmt(&mut h.body, name);
+            }
+            if let Some(f) = finalizer {
+                array_rewrite_stmt(f, name);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            array_rewrite_expr(discriminant, name);
+            for c in cases.iter_mut() {
+                if let Some(t) = &mut c.test {
+                    array_rewrite_expr(t, name);
+                }
+                for b in c.consequent.iter_mut() {
+                    array_rewrite_stmt(b, name);
+                }
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations.iter_mut() {
+                if let Some(init) = &mut d.init {
+                    array_rewrite_expr(init, name);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { body, .. } => array_rewrite_stmt(body, name),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Program-wide pre-scan: dynamic-name calls (invisible array access
+/// from any scope) and `declare -A` (assoc-store membership) refuse
+/// or disqualify arrays they cannot attribute.
+#[derive(Default)]
+struct ArrayPreScan {
+    dynamic_anywhere: bool,
+    declare_a_names: HashSet<String>,
+    declare_a_dynamic: bool,
+    /// Names with a dominating non-nullish init: leading module-top
+    /// declarators (`let i = 0`) in the pure prefix (only literal-init
+    /// declarators and function definitions before them — they execute
+    /// before any call, so `sh2.vars.V ?? FALLBACK` never reaches the
+    /// fallback for these `V`).
+    leading_inits: HashSet<String>,
+}
+
+fn array_pre_scan_expr(e: &Expr, pre: &mut ArrayPreScan) {
+    match e {
+        Expr::CallExpression { callee, arguments, .. } => {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } = callee.as_ref()
+            {
+                if !computed
+                    && matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                {
+                    if let Expr::Identifier { name: func } = property.as_ref() {
+                        // Dynamic-name reads/writes anywhere can touch
+                        // any array invisibly — refuse all migration.
+                        if array_call_is_dynamic(func, arguments) {
+                            pre.dynamic_anywhere = true;
+                        }
+                        // Dynamic code anywhere refuses all (invisible
+                        // access). Static-target dynamic dispatch
+                        // (fnCall("name", …)) merely re-enters a
+                        // visible scope (fresh native consts per call)
+                        // — harmless; dynamic targets refuse.
+                        if matches!(func.as_str(), "eval" | "Function") {
+                            pre.dynamic_anywhere = true;
+                        }
+                        if matches!(func.as_str(), "fnCall" | "callDirect") {
+                            if !matches!(arguments.first(), Some(Expr::Literal { value, .. }) if value.is_string())
+                            {
+                                pre.dynamic_anywhere = true;
+                            }
+                        }
+                        // `declare -A NAME` (also typeset/local): assoc
+                        // membership is per-name — collect static names;
+                        // unattributable forms refuse all arrays.
+                        if matches!(func.as_str(), "exec" | "builtin") {
+                            if let [Expr::Literal { value: cmd, .. }, Expr::ArrayExpression { elements, .. }, ..] =
+                                arguments.as_slice()
+                            {
+                                if matches!(cmd.as_str(), Some("declare" | "typeset" | "local")) {
+                                    let mut saw_a = false;
+                                    let mut names = vec![];
+                                    let mut dynamic = false;
+                                    for el in elements.iter().flatten() {
+                                        match el {
+                                            Expr::Literal { value, .. } => {
+                                                if let Some(s) = value.as_str() {
+                                                    if s == "-A"
+                                                        || (s.starts_with('-')
+                                                            && s.contains('A'))
+                                                    {
+                                                        saw_a = true;
+                                                    } else if s.starts_with('-') || s.starts_with('+') {
+                                                        // other flags — ignore
+                                                    } else if let Some(eq) =
+                                                        s.find('=')
+                                                    {
+                                                        let base = &s[..eq];
+                                                        if !base.is_empty() {
+                                                            names.push(base.to_string());
+                                                        }
+                                                    } else {
+                                                        names.push(s.to_string());
+                                                    }
+                                                } else {
+                                                    dynamic = true;
+                                                }
+                                            }
+                                            _ => dynamic = true,
+                                        }
+                                    }
+                                    if saw_a {
+                                        for n in names {
+                                            pre.declare_a_names.insert(n);
+                                        }
+                                        if dynamic {
+                                            pre.declare_a_dynamic = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // `declare` can also arrive as a bare call in some
+            // lowerings — same treatment via the generic walk below
+            // (Str args counted, dynamics flagged on shape).
+            array_pre_scan_expr(callee, pre);
+            for a in arguments {
+                array_pre_scan_expr(a, pre);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            array_pre_scan_expr(object, pre);
+            if *computed {
+                array_pre_scan_expr(property, pre);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            array_pre_scan_expr(left, pre);
+            array_pre_scan_expr(right, pre);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_pre_scan_expr(test, pre);
+            array_pre_scan_expr(consequent, pre);
+            array_pre_scan_expr(alternate, pre);
+        }
+        Expr::UnaryExpression { argument, .. }
+        | Expr::SpreadElement { argument }
+        | Expr::AwaitExpression { argument, .. } => {
+            array_pre_scan_expr(argument, pre);
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Block(b) => array_pre_scan_stmt(b, pre),
+            ArrowBody::Expr(x) => array_pre_scan_expr(x, pre),
+        },
+        Expr::FunctionExpression { body, .. } => array_pre_scan_stmt(body, pre),
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties.iter() {
+                if prop.computed {
+                    array_pre_scan_expr(&prop.key, pre);
+                }
+                array_pre_scan_expr(&prop.value, pre);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter().flatten() {
+                array_pre_scan_expr(el, pre);
+            }
+        }
+        Expr::TemplateLiteral { expressions, .. }
+        | Expr::SequenceExpression { expressions } => {
+            for x in expressions.iter() {
+                array_pre_scan_expr(x, pre);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            if matches!(callee.as_ref(), Expr::Identifier { name: f } if f == "Function") {
+                pre.dynamic_anywhere = true;
+            }
+            array_pre_scan_expr(callee, pre);
+            for a in arguments {
+                array_pre_scan_expr(a, pre);
+            }
+        }
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+    }
+}
+
+fn array_pre_scan_stmt(s: &Stmt, pre: &mut ArrayPreScan) {
+    match s {
+        Stmt::ExpressionStatement { expression } => array_pre_scan_expr(expression, pre),
+        Stmt::BlockStatement { body } => {
+            for b in body {
+                array_pre_scan_stmt(b, pre);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            array_pre_scan_expr(test, pre);
+            array_pre_scan_stmt(consequent, pre);
+            if let Some(a) = alternate {
+                array_pre_scan_stmt(a, pre);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            array_pre_scan_expr(test, pre);
+            array_pre_scan_stmt(body, pre);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            array_pre_scan_stmt(init, pre);
+            array_pre_scan_expr(test, pre);
+            array_pre_scan_expr(update, pre);
+            array_pre_scan_stmt(body, pre);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            array_pre_scan_stmt(left, pre);
+            array_pre_scan_expr(right, pre);
+            array_pre_scan_stmt(body, pre);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                array_pre_scan_expr(e, pre);
+            }
+        }
+        Stmt::ThrowStatement { argument } => array_pre_scan_expr(argument, pre),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            array_pre_scan_stmt(block, pre);
+            if let Some(h) = handler {
+                array_pre_scan_stmt(&h.body, pre);
+            }
+            if let Some(f) = finalizer {
+                array_pre_scan_stmt(f, pre);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            array_pre_scan_expr(discriminant, pre);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    array_pre_scan_expr(t, pre);
+                }
+                for b in &c.consequent {
+                    array_pre_scan_stmt(b, pre);
+                }
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if let Some(init) = &d.init {
+                    array_pre_scan_expr(init, pre);
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { body, .. } => array_pre_scan_stmt(body, pre),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Full migration decision for one array in one scope. Every condition
+/// is load-bearing (see the module docs on [`array_elem_inert`]); any
+/// failure refuses (safe miss — the store path stays).
+#[allow(clippy::too_many_arguments)]
+fn array_decide(
+    name: &str,
+    scope: &ArrayScope,
+    body: &[Stmt],
+    prog_top: &[Stmt],
+    module_bound: &HashSet<String>,
+    params: &[String],
+    pre: &ArrayPreScan,
+    init_idx: usize,
+    isolated: bool,
+    is_top: bool,
+) -> bool {
+    if scope.poisoned
+        || scope.other_writes
+        || scope.assoc_touch
+        || scope.store_violation
+    {
+        return false;
+    }
+    // Invocation hazards (possible self-recursion) — top-level code
+    // is not re-enterable, so these are excused at top scope.
+    if scope.call_hazard && !is_top {
+        return false;
+    }
+    // Exactly one init, and it is the direct-child candidate.
+    if scope.inits.len() != 1 || scope.inits[0].1 != init_idx {
+        return false;
+    }
+    // No bare-identifier traffic (dual-homed scalar confusion).
+    if scope.ident_refs != 0 {
+        return false;
+    }
+    // Str budget: init + appends + joins + index reads + lens +
+    // items consume their name args; anything else mentioning the
+    // name refuses.
+    let expected = 1
+        + scope.appends.len()
+        + scope.joins.len()
+        + scope.join_merges.len()
+        + scope.index_reads.len()
+        + scope.lens.len()
+        + scope.items.len();
+    if scope.str_refs != expected {
+        return false;
+    }
+    // Appends must execute after the init (pre-init appends are wiped
+    // by the original `setArray` reset but would accumulate natively).
+    // Empty-init reads (joins/index/len/items) may precede (identical
+    // on missing/`[]`); non-empty-init uses must all follow (a
+    // pre-init read would see full content natively vs missing-empty).
+    if scope.appends.iter().any(|(_, idx)| *idx <= init_idx) {
+        return false;
+    }
+    if !scope.inits[0].0.is_empty() {
+        let after = |idx: &usize| *idx > init_idx;
+        if !scope.joins.iter().all(|(_, idx)| after(idx))
+            || !scope.index_reads.iter().all(|(_, idx)| after(idx))
+            || !scope.lens.iter().all(after)
+            || !scope.items.iter().all(after)
+        {
+            return false;
+        }
+    }
+    // Program-wide hazards.
+    if pre.dynamic_anywhere {
+        return false;
+    }
+    if pre.declare_a_names.contains(name) || pre.declare_a_dynamic {
+        return false;
+    }
+    if !isolated {
+        return false;
+    }
+    // Name must be declarable and collision-free.
+    if !array_valid_const_name(name) || name == "PIPESTATUS" {
+        return false;
+    }
+    if module_bound.contains(name) {
+        return false;
+    }
+    if params.iter().any(|p| p == name) {
+        return false;
+    }
+    // Every append element must be expansion-inert. Loop counters get
+    // a per-name value proof (Num/inert-Str/IncDec-only writes here
+    // and — if unshadowed — at module top).
+    let mut counters: HashMap<String, bool> = HashMap::new();
+    // `??`-fallback deadness: names with a dominating non-nullish init
+    // (module-top leading declarators — the fallback is dead): the
+    // store slot alone, counter-proven. (`||`/`&&` get no
+    // shortcut — falsy (0/"") still takes the fallback.)
+    // (Computed in the pre-scan (`leading_inits`); top-scope arrays
+    // get no shortcut (their uses share the top ordering).)
+    let mut b_dead: HashSet<String> = HashSet::new();
+    if !is_top {
+        for n in &pre.leading_inits {
+            b_dead.insert(n.clone());
+        }
+    }
+    fn collect_idents(e: &Expr, out: &mut Vec<String>) {
+        // `sh2.vars.V` slot reads need V counter-proven — collect V
+        // alongside bare identifiers (property position is not a
+        // value, so the generic member walk would miss it).
+        if let Some(v) = sh2_vars_read(e) {
+            out.push(v.to_string());
+        }
+        match e {
+            Expr::Identifier { name } => out.push(name.clone()),
+            Expr::CallExpression { callee, arguments, .. } => {
+                collect_idents(callee, out);
+                for a in arguments {
+                    collect_idents(a, out);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                collect_idents(object, out);
+                if *computed {
+                    collect_idents(property, out);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                collect_idents(left, out);
+                collect_idents(right, out);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                collect_idents(test, out);
+                collect_idents(consequent, out);
+                collect_idents(alternate, out);
+            }
+            Expr::UnaryExpression { argument, .. }
+            | Expr::SpreadElement { argument }
+            | Expr::AwaitExpression { argument, .. } => collect_idents(argument, out),
+            Expr::ArrowFunctionExpression { .. } | Expr::FunctionExpression { .. } => {}
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties.iter() {
+                    collect_idents(&prop.value, out);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter().flatten() {
+                    collect_idents(el, out);
+                }
+            }
+            Expr::TemplateLiteral { expressions, .. }
+            | Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter() {
+                    collect_idents(x, out);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                collect_idents(callee, out);
+                for a in arguments {
+                    collect_idents(a, out);
+                }
+            }
+            Expr::Literal { .. } => {}
+        }
+    }
+    for (els, append_idx) in &scope.appends {
+        let mut idents = vec![];
+        for el in els {
+            collect_idents(el, &mut idents);
+        }
+        for id in idents {
+            if !counters.contains_key(&id) {
+                // Shadowed in-fn → module writes are invisible;
+                // params bind (no writes → not a counter → refuse).
+                let bound =
+                    array_scope_binds(body, &id) || params.iter().any(|p| p == &id);
+                let mut saw = false;
+                let mut ok = true;
+                array_counter_writes(body, &id, &mut saw, &mut ok);
+                if !bound {
+                    array_counter_writes(prog_top, &id, &mut saw, &mut ok);
+                }
+                counters.insert(id, saw && ok);
+            }
+        }
+        // Fallback-deadness for THIS append: leading inits (load
+        // order) plus cstyle headers dominating it (a numeric set
+        // event at or before its position — same top statement
+        // (nested body) or earlier). Headers must look well-formed
+        // (`;`-separated) to credit; malformed headers still
+        // disqualify via the counter write scan.
+        let mut use_dead = b_dead.clone();
+        for id in counters.keys() {
+            for (header, h_idx) in &scope.cstyle_headers {
+                if *h_idx <= *append_idx
+                    && header.contains(';')
+                    && array_str_write(header, id).0
+                {
+                    use_dead.insert(id.clone());
+                }
+            }
+        }
+        for el in els {
+            if !array_elem_inert(el, &counters, &use_dead) {
+                return false;
+            }
+        }
+    }
+    // Init elements (non-empty): inert with load-order deadness (the
+    // top-placed const evaluates before any cstyle header — only
+    // `b_dead`, never per-append headers). Purity was verified at
+    // scan (no effects to shift earlier).
+    {
+        let mut idents = vec![];
+        for el in &scope.inits[0].0 {
+            collect_idents(el, &mut idents);
+        }
+        for id in idents {
+            if !counters.contains_key(&id) {
+                let bound =
+                    array_scope_binds(body, &id) || params.iter().any(|p| p == &id);
+                let mut saw = false;
+                let mut ok = true;
+                array_counter_writes(body, &id, &mut saw, &mut ok);
+                if !bound {
+                    array_counter_writes(prog_top, &id, &mut saw, &mut ok);
+                }
+                counters.insert(id, saw && ok);
+            }
+        }
+        for el in &scope.inits[0].0 {
+            if !array_elem_inert(el, &counters, &b_dead) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Direct-child `setArray(NAME, [...])` candidates (2-arg with array,
+/// or 3-arg falsy-isAssoc with array): (name, child index). Element
+/// purity/inertness and emptiness are validated by the full scan +
+/// decision (non-Array second args never match here).
+fn array_direct_inits(body: &[Stmt]) -> Vec<(String, usize)> {
+    let mut out = vec![];
+    for (idx, st) in body.iter().enumerate() {
+        if let Stmt::ExpressionStatement { expression } = st {
+            if let Expr::CallExpression { callee, arguments, .. } = expression {
+                if let Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    ..
+                } = callee.as_ref()
+                {
+                    if !matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                        || !matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setArray")
+                    {
+                        continue;
+                    }
+                    let array_init = |args: &[Expr]| -> Option<String> {
+                        match args {
+                            [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }] => {
+                                nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+                            }
+                            [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }, Expr::Literal { value: assoc, .. }] =>
+                            {
+                                let falsy = assoc.as_bool() == Some(false)
+                                    || assoc.as_i64() == Some(0)
+                                    || assoc.as_str() == Some("")
+                                    || assoc.is_null();
+                                if falsy {
+                                    nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(nm) = array_init(arguments) {
+                        out.push((nm, idx));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Migrate a `sortedJoinMerge(A, B)` pair: remove both setArray inits,
+/// insert both consts, then rewrite appends + inline the merge. Both
+/// arrays must be native BEFORE the merge is inlined (the IIFE
+/// references both as identifiers) — so both setArrays are removed and
+/// both consts inserted first, then the per-array rewrite runs (A's
+/// rewrite inlines the merge, now correct; B's is a no-op on it).
+fn migrate_join_merge_pair(live_body: &mut Vec<Stmt>, a: &str, b: &str) -> bool {
+    // Find the setArray inits for A and B.
+    let mut a_idx = None;
+    let mut b_idx = None;
+    for (idx, st) in live_body.iter().enumerate() {
+        if let Stmt::ExpressionStatement { expression } = st {
+            if let Expr::CallExpression { callee, arguments, .. } = expression {
+                if let Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    ..
+                } = callee.as_ref()
+                {
+                    if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                        && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setArray")
+                    {
+                        if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                            if value.as_str() == Some(a) {
+                                a_idx = Some(idx);
+                            } else if value.as_str() == Some(b) {
+                                b_idx = Some(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (Some(ai), Some(bi)) = (a_idx, b_idx) else { return false };
+    // Extract init elements for both.
+    let init_of = |idx: usize| -> Vec<Option<Expr>> {
+        match live_body.get(idx) {
+            Some(Stmt::ExpressionStatement { expression }) => {
+                if let Expr::CallExpression { arguments, .. } = expression {
+                    arguments
+                        .get(1)
+                        .and_then(|a| match a {
+                            Expr::ArrayExpression { elements, .. } => Some(elements.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        }
+    };
+    let a_els = init_of(ai);
+    let b_els = init_of(bi);
+    // Remove both (descending index to avoid shifting).
+    let (hi, lo) = if ai > bi { (ai, bi) } else { (bi, ai) };
+    live_body.remove(hi);
+    live_body.remove(lo);
+    // Insert both consts at top (after directives).
+    let mut insert_at = 0usize;
+    while insert_at < live_body.len() {
+        if let Stmt::ExpressionStatement { expression } = &live_body[insert_at] {
+            if matches!(expression, Expr::Literal { value, .. } if value.is_string()) {
+                insert_at += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    let const_of = |name: &str, els: Vec<Option<Expr>>| Stmt::VariableDeclaration {
+        declarations: vec![VariableDeclarator {
+            type_: "VariableDeclarator",
+            id: Expr::Identifier { name: name.to_string() },
+            init: Some(Expr::ArrayExpression { elements: els }),
+        }],
+        kind: "const",
+    };
+    live_body.insert(insert_at, const_of(a, a_els));
+    live_body.insert(insert_at + 1, const_of(b, b_els));
+    // Rewrite appends + inline the merge (A's rewrite inlines it; both
+    // arrays are native now).
+    for st in live_body.iter_mut() {
+        array_rewrite_stmt(st, a);
+    }
+    for st in live_body.iter_mut() {
+        array_rewrite_stmt(st, b);
+    }
+    true
+}
+
+/// Analyze and decide one array in a scope: scan refs, compute
+/// isolation, find the init, run [`array_decide`]. Returns the init
+/// index and the in-scope analysis if migratable.
+fn array_analyze_decide(
+    name: &str,
+    snapshot_body: &[Stmt],
+    snapshot_top: &[Stmt],
+    module_bound: &HashSet<String>,
+    params: &[String],
+    pre: &ArrayPreScan,
+    is_top: bool,
+) -> Option<(usize, ArrayScope)> {
+    let mut scope = ArrayScope::default();
+    for (idx, st) in snapshot_body.iter().enumerate() {
+        array_scan_stmt(st, name, &mut scope, idx);
+    }
+    let mut total = ArrayScope::default();
+    for (idx, st) in snapshot_top.iter().enumerate() {
+        array_scan_stmt(st, name, &mut total, idx);
+    }
+    let isolated = total.inits.len() == scope.inits.len()
+        && total.appends.len() == scope.appends.len()
+        && total.joins.len() == scope.joins.len()
+        && total.join_merges.len() == scope.join_merges.len()
+        && total.index_reads.len() == scope.index_reads.len()
+        && total.lens.len() == scope.lens.len()
+        && total.items.len() == scope.items.len()
+        && total.str_refs == scope.str_refs
+        && total.ident_refs == scope.ident_refs
+        && !total.store_violation
+        && !total.assoc_touch;
+    let init_idx = array_direct_inits(snapshot_body)
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, i)| *i)?;
+    if array_decide(
+        name,
+        &scope,
+        snapshot_body,
+        snapshot_top,
+        module_bound,
+        params,
+        pre,
+        init_idx,
+        isolated,
+        is_top,
+    ) {
+        Some((init_idx, scope))
+    } else {
+        if std::env::var("SH2_ARRAY_DEBUG").is_ok() {
+            eprintln!(
+                "array_analyze_decide({name}): REFUSE inits={} appends={} joins={} jm={} str={} ident={} poison={} other={} assoc={} store={} call={}",
+                scope.inits.len(),
+                scope.appends.len(),
+                scope.joins.len(),
+                scope.join_merges.len(),
+                scope.str_refs,
+                scope.ident_refs,
+                scope.poisoned,
+                scope.other_writes,
+                scope.assoc_touch,
+                scope.store_violation,
+                scope.call_hazard,
+            );
+        }
+        None
+    }
+}
+
+/// Migrate at most ONE array in this scope body, returning whether one
+/// migrated (the driver re-scans after each — indices stay fresh, so a
+/// second array's snapshot positions are never stale). All analysis
+/// runs on owned snapshots; the rewrite applies after a passing
+/// decision. Callers pass Identifier params only (scopes with
+/// destructuring params are skipped — they can bind anything).
+fn array_migrate_scope(
+    live_body: &mut Vec<Stmt>,
+    snapshot_body: &[Stmt],
+    snapshot_top: &[Stmt],
+    params: &[String],
+    module_bound: &HashSet<String>,
+    pre: &ArrayPreScan,
+    is_top: bool,
+) -> bool {
+    for (nm, _) in array_direct_inits(snapshot_body) {
+        let Some((init_idx, scope)) = array_analyze_decide(
+            &nm,
+            snapshot_body,
+            snapshot_top,
+            module_bound,
+            params,
+            pre,
+            is_top,
+        ) else {
+            continue;
+        };
+        // A `sortedJoinMerge(NAME, PARTNER)` pair: both arrays must
+        // migrate together (the merge IIFE references both natively).
+        if let Some((partner, _)) = scope.join_merges.first() {
+            if array_analyze_decide(
+                partner,
+                snapshot_body,
+                snapshot_top,
+                module_bound,
+                params,
+                pre,
+                is_top,
+            )
+            .is_some()
+            {
+                if migrate_join_merge_pair(live_body, &nm, partner) {
+                    return true;
+                }
+            }
+        }
+        // Rewrite: remove the init, insert `const NAME = [es]` at top
+        // (after directives; elements move verbatim — purity verified
+        // at scan, inertness at decision), rewrite appends/reads.
+        let init_elements: Vec<Option<Expr>> = match live_body.get(init_idx) {
+            Some(Stmt::ExpressionStatement { expression }) => {
+                if let Expr::CallExpression { arguments, .. } = expression {
+                    // Second arg is the array (2-arg, or 3-arg with
+                    // falsy isAssoc — validated at decision).
+                    arguments
+                        .get(1)
+                        .and_then(|a| match a {
+                            Expr::ArrayExpression { elements, .. } => {
+                                Some(elements.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        live_body.remove(init_idx);
+        let mut insert_at = 0usize;
+        while insert_at < live_body.len() {
+            if let Stmt::ExpressionStatement { expression } = &live_body[insert_at] {
+                if matches!(expression, Expr::Literal { value, .. } if value.is_string()) {
+                    insert_at += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        live_body.insert(
+            insert_at,
+            Stmt::VariableDeclaration {
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier { name: nm.clone() },
+                    init: Some(Expr::ArrayExpression {
+                        elements: init_elements,
+                    }),
+                }],
+                kind: "const",
+            },
+        );
+        for st in live_body.iter_mut() {
+            array_rewrite_stmt(st, &nm);
+        }
+        return true;
+    }
+    false
+}
+
+/// Collect Identifier param names; `None` on any non-Identifier param
+/// (destructuring binds opaquely — the scope is skipped).
+fn array_ident_params(params: &[Expr]) -> Option<Vec<String>> {
+    let mut out = vec![];
+    for p in params {
+        if let Expr::Identifier { name } = p {
+            out.push(name.clone());
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Recurse `&mut` through statements, migrating arrays in every function
+/// body (Block-bodied arrows/functions; expression bodies cannot hold
+/// the statement shapes). Whole-program scans use the iteration
+/// snapshot (pre-mutation); scope scans clone the live body (untouched
+/// by other scopes' rewrites).
+fn array_migrate_bodies(
+    stmts: &mut Vec<Stmt>,
+    snap_top: &[Stmt],
+    module_bound: &HashSet<String>,
+    pre: &ArrayPreScan,
+    migrated: &mut bool,
+) {
+    fn expr(
+        e: &mut Expr,
+        snap_top: &[Stmt],
+        module_bound: &HashSet<String>,
+        pre: &ArrayPreScan,
+        migrated: &mut bool,
+    ) {
+        match e {
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                if let ArrowBody::Block(b) = body {
+                    if let Some(pnames) = array_ident_params(params) {
+                        if let Stmt::BlockStatement { body: live } = b.as_mut() {
+                            for _ in 0..64 {
+                                let s = live.clone();
+                                if !array_migrate_scope(
+                                    live, &s, snap_top, &pnames, module_bound, pre, false,
+                                ) {
+                                    break;
+                                }
+                                *migrated = true;
+                            }
+                        }
+                    }
+                }
+                // Recurse into nested bodies regardless.
+                match body {
+                    ArrowBody::Block(b) => stmt(b, snap_top, module_bound, pre, migrated),
+                    ArrowBody::Expr(x) => expr(x, snap_top, module_bound, pre, migrated),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                if let Some(pnames) = array_ident_params(params) {
+                    if let Stmt::BlockStatement { body: live } = body.as_mut() {
+                        for _ in 0..64 {
+                            let s = live.clone();
+                            if !array_migrate_scope(
+                                live, &s, snap_top, &pnames, module_bound, pre, false,
+                            ) {
+                                break;
+                            }
+                            *migrated = true;
+                        }
+                    }
+                }
+                stmt(body, snap_top, module_bound, pre, migrated);
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, snap_top, module_bound, pre, migrated);
+                for a in arguments.iter_mut() {
+                    expr(a, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                expr(object, snap_top, module_bound, pre, migrated);
+                if *computed {
+                    expr(property, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, snap_top, module_bound, pre, migrated);
+                expr(right, snap_top, module_bound, pre, migrated);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, snap_top, module_bound, pre, migrated);
+                expr(consequent, snap_top, module_bound, pre, migrated);
+                expr(alternate, snap_top, module_bound, pre, migrated);
+            }
+            Expr::UnaryExpression { argument, .. }
+            | Expr::SpreadElement { argument }
+            | Expr::AwaitExpression { argument, .. } => {
+                expr(argument, snap_top, module_bound, pre, migrated);
+            }
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties.iter_mut() {
+                    if prop.computed {
+                        expr(&mut prop.key, snap_top, module_bound, pre, migrated);
+                    }
+                    expr(&mut prop.value, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter_mut().flatten() {
+                    expr(el, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::TemplateLiteral { expressions, .. }
+            | Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() {
+                    expr(x, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, snap_top, module_bound, pre, migrated);
+                for a in arguments.iter_mut() {
+                    expr(a, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn stmt(
+        s: &mut Stmt,
+        snap_top: &[Stmt],
+        module_bound: &HashSet<String>,
+        pre: &ArrayPreScan,
+        migrated: &mut bool,
+    ) {
+        match s {
+            Stmt::ExpressionStatement { expression } => {
+                expr(expression, snap_top, module_bound, pre, migrated)
+            }
+            Stmt::BlockStatement { body } => {
+                for b in body.iter_mut() {
+                    stmt(b, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Stmt::IfStatement {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, snap_top, module_bound, pre, migrated);
+                stmt(consequent, snap_top, module_bound, pre, migrated);
+                if let Some(a) = alternate {
+                    stmt(a, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                expr(test, snap_top, module_bound, pre, migrated);
+                stmt(body, snap_top, module_bound, pre, migrated);
+            }
+            Stmt::ForStatement {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                stmt(init, snap_top, module_bound, pre, migrated);
+                expr(test, snap_top, module_bound, pre, migrated);
+                expr(update, snap_top, module_bound, pre, migrated);
+                stmt(body, snap_top, module_bound, pre, migrated);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, snap_top, module_bound, pre, migrated);
+                expr(right, snap_top, module_bound, pre, migrated);
+                stmt(body, snap_top, module_bound, pre, migrated);
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(e) = argument {
+                    expr(e, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Stmt::ThrowStatement { argument } => {
+                expr(argument, snap_top, module_bound, pre, migrated)
+            }
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt(block, snap_top, module_bound, pre, migrated);
+                if let Some(h) = handler {
+                    stmt(&mut h.body, snap_top, module_bound, pre, migrated);
+                }
+                if let Some(f) = finalizer {
+                    stmt(f, snap_top, module_bound, pre, migrated);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, snap_top, module_bound, pre, migrated);
+                for c in cases.iter_mut() {
+                    if let Some(t) = &mut c.test {
+                        expr(t, snap_top, module_bound, pre, migrated);
+                    }
+                    for b in c.consequent.iter_mut() {
+                        stmt(b, snap_top, module_bound, pre, migrated);
+                    }
+                }
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations.iter_mut() {
+                    if let Some(init) = &mut d.init {
+                        expr(init, snap_top, module_bound, pre, migrated);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                if let Some(pnames) = array_ident_params(params) {
+                    if let Stmt::BlockStatement { body: live } = body.as_mut() {
+                        for _ in 0..64 {
+                            let s = live.clone();
+                            if !array_migrate_scope(
+                                live, &s, snap_top, &pnames, module_bound, pre, false,
+                            ) {
+                                break;
+                            }
+                            *migrated = true;
+                        }
+                    }
+                }
+                stmt(body, snap_top, module_bound, pre, migrated);
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts.iter_mut() {
+        stmt(s, snap_top, module_bound, pre, migrated);
+    }
+}
+
+/// Recognize a store-temp read `sh2.vars.T ?? (process.env.T ?? "")`
+/// (optionally wrapped in `Number(...) || 0` and/or `+ 0`) and return
+/// the temp name `T`. Used by the temp-roundtrip fold: a temp written
+/// once via `setVar("T", E)` and read once via this shape can skip the
+/// store entirely.
+fn temp_read_name(e: &Expr) -> Option<&str> {
+    // Unwrap `(X) + 0` (the trailing no-op Number coercion).
+    let mut e = e;
+    if let Expr::BinaryExpression {
+        operator, left, right, ..
+    } = e
+    {
+        if operator == "+"
+            && matches!(right.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0))
+        {
+            e = left;
+        }
+    }
+    // Unwrap `X || 0` (the NaN/0 fallback).
+    if let Expr::LogicalExpression {
+        operator, left, right, ..
+    } = e
+    {
+        if operator == "||"
+            && matches!(right.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0))
+        {
+            e = left;
+        }
+    }
+    // Unwrap `Number(X)` (the string→Number coercion).
+    if let Expr::CallExpression { callee, arguments, .. } = e {
+        if matches!(callee.as_ref(), Expr::Identifier { name } if name == "Number")
+            && arguments.len() == 1
+        {
+            e = &arguments[0];
+        }
+    }
+    // Now expect `sh2.vars.T ?? (process.env.T ?? "")`.
+    if let Expr::LogicalExpression {
+        operator, left, right, ..
+    } = e
+    {
+        if operator != "??" {
+            return None;
+        }
+        let t = sh2_vars_read(left)?;
+        // Right side must be `process.env.T ?? ""` (or just `""`).
+        let env_ok = match right.as_ref() {
+            Expr::Literal { value, .. } => value.as_str() == Some(""),
+            Expr::LogicalExpression {
+                operator: op,
+                left: env,
+                right: fallback,
+                ..
+            } if op == "??" => {
+                matches!(env.as_ref(), Expr::MemberExpression { object, property, computed: false, .. }
+                    if matches!(object.as_ref(), Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                        if matches!(o.as_ref(), Expr::Identifier { name } if name == "process")
+                        && matches!(p.as_ref(), Expr::Identifier { name } if name == "env"))
+                    && matches!(property.as_ref(), Expr::Identifier { name } if name == t)
+                    && matches!(fallback.as_ref(), Expr::Literal { value, .. } if value.as_str() == Some("")))
+            }
+            _ => false,
+        };
+        if env_ok {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Purity for a temp-fold value: no observable side effects, so
+/// evaluating it at the read position (adjacent) instead of the setVar
+/// position is unobservable. Allows pure builtin calls (`Math.*`,
+/// `Number`/`String`/`BigInt`, `parseInt`/`parseFloat`/`isNaN`/
+/// `isFinite`) and pure operators; refuses assignments, updates,
+/// user/`sh2.*` calls, awaits, constructions, object literals.
+fn temp_eval_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. } | Expr::Identifier { .. } => true,
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => array_elem_pure(e),
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            temp_eval_pure(left) && temp_eval_pure(right)
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            temp_eval_pure(test)
+                && temp_eval_pure(consequent)
+                && temp_eval_pure(alternate)
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            if operator == "++" || operator == "--" || operator == "delete" {
+                return false;
+            }
+            temp_eval_pure(argument)
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            // Pure builtin callees only.
+            let pure_callee = match callee.as_ref() {
+                Expr::Identifier { name } => matches!(
+                    name.as_str(),
+                    "Number" | "String" | "BigInt" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
+                ),
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    ..
+                } => {
+                    matches!(object.as_ref(), Expr::Identifier { name } if name == "Math")
+                        && !matches!(property.as_ref(), Expr::Identifier { name } if name == "random")
+                }
+                _ => false,
+            };
+            pure_callee && arguments.iter().all(temp_eval_pure)
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            elements.iter().flatten().all(temp_eval_pure)
+        }
+        Expr::TemplateLiteral { expressions, .. }
+        | Expr::SequenceExpression { expressions } => {
+            expressions.iter().all(temp_eval_pure)
+        }
+        _ => false,
+    }
+}
+
+/// Fold a store-temp roundtrip: `sh2.setVar("T", E)` immediately
+/// followed by `Tv = (Number(sh2.vars.T ?? (process.env.T ?? "")) || 0) + 0`
+/// → remove the setVar and set `Tv = (Number(E) || 0) + 0` directly.
+/// Sound when T is written once and read once (the store is invisible
+/// elsewhere) and E is pure (evaluating it at the read position instead
+/// of the setVar position is unobservable). Fail-closed: any other
+/// reference to T, any impure E, or a non-adjacent read refuses.
+fn fold_temp_roundtrips(stmts: &mut Vec<Stmt>) {
+    // Count references to each temp name (setVar writes + reads).
+    fn count_refs(stmts: &[Stmt], name: &str) -> (usize, usize) {
+        // (writes, reads) — only setVar writes and temp_read_name reads.
+        let mut writes = 0usize;
+        let mut reads = 0usize;
+        fn expr(e: &Expr, name: &str, writes: &mut usize, reads: &mut usize) {
+            if let Some(t) = temp_read_name(e) {
+                if t == name {
+                    *reads += 1;
+                    // The whole subtree is one read — don't recurse
+                    // (temp_read_name matches at every nesting level).
+                    return;
+                }
+            }
+            match e {
+                Expr::CallExpression { callee, arguments, .. } => {
+                    if let Expr::MemberExpression {
+                        object,
+                        property,
+                        computed: false,
+                        ..
+                    } = callee.as_ref()
+                    {
+                        if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                            && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setVar")
+                        {
+                            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                                if value.as_str() == Some(name) {
+                                    *writes += 1;
+                                }
+                            }
+                        }
+                    }
+                    expr(callee, name, writes, reads);
+                    for a in arguments {
+                        expr(a, name, writes, reads);
+                    }
+                }
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed,
+                    ..
+                } => {
+                    expr(object, name, writes, reads);
+                    if *computed {
+                        expr(property, name, writes, reads);
+                    }
+                }
+                Expr::BinaryExpression { left, right, .. }
+                | Expr::LogicalExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    expr(left, name, writes, reads);
+                    expr(right, name, writes, reads);
+                }
+                Expr::ConditionalExpression {
+                    test,
+                    consequent,
+                    alternate,
+                } => {
+                    expr(test, name, writes, reads);
+                    expr(consequent, name, writes, reads);
+                    expr(alternate, name, writes, reads);
+                }
+                Expr::UnaryExpression { argument, .. }
+                | Expr::SpreadElement { argument }
+                | Expr::AwaitExpression { argument, .. } => {
+                    expr(argument, name, writes, reads);
+                }
+                Expr::ArrowFunctionExpression { body, .. } => match body {
+                    ArrowBody::Block(b) => stmt(b, name, writes, reads),
+                    ArrowBody::Expr(x) => expr(x, name, writes, reads),
+                },
+                Expr::FunctionExpression { body, .. } => stmt(body, name, writes, reads),
+                Expr::ObjectExpression { properties, .. } => {
+                    for prop in properties.iter() {
+                        if prop.computed {
+                            expr(&prop.key, name, writes, reads);
+                        }
+                        expr(&prop.value, name, writes, reads);
+                    }
+                }
+                Expr::ArrayExpression { elements, .. } => {
+                    for el in elements.iter().flatten() {
+                        expr(el, name, writes, reads);
+                    }
+                }
+                Expr::TemplateLiteral { expressions, .. }
+                | Expr::SequenceExpression { expressions } => {
+                    for x in expressions.iter() {
+                        expr(x, name, writes, reads);
+                    }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    expr(callee, name, writes, reads);
+                    for a in arguments {
+                        expr(a, name, writes, reads);
+                    }
+                }
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            }
+        }
+        fn stmt(s: &Stmt, name: &str, writes: &mut usize, reads: &mut usize) {
+            match s {
+                Stmt::ExpressionStatement { expression } => expr(expression, name, writes, reads),
+                Stmt::BlockStatement { body } => {
+                    for b in body {
+                        stmt(b, name, writes, reads);
+                    }
+                }
+                Stmt::IfStatement {
+                    test,
+                    consequent,
+                    alternate,
+                } => {
+                    expr(test, name, writes, reads);
+                    stmt(consequent, name, writes, reads);
+                    if let Some(a) = alternate {
+                        stmt(a, name, writes, reads);
+                    }
+                }
+                Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                    expr(test, name, writes, reads);
+                    stmt(body, name, writes, reads);
+                }
+                Stmt::ForStatement {
+                    init,
+                    test,
+                    update,
+                    body,
+                } => {
+                    stmt(init, name, writes, reads);
+                    expr(test, name, writes, reads);
+                    expr(update, name, writes, reads);
+                    stmt(body, name, writes, reads);
+                }
+                Stmt::ForOfStatement { left, right, body } => {
+                    stmt(left, name, writes, reads);
+                    expr(right, name, writes, reads);
+                    stmt(body, name, writes, reads);
+                }
+                Stmt::ReturnStatement { argument } => {
+                    if let Some(e) = argument {
+                        expr(e, name, writes, reads);
+                    }
+                }
+                Stmt::ThrowStatement { argument } => expr(argument, name, writes, reads),
+                Stmt::TryStatement {
+                    block,
+                    handler,
+                    finalizer,
+                } => {
+                    stmt(block, name, writes, reads);
+                    if let Some(h) = handler {
+                        stmt(&h.body, name, writes, reads);
+                    }
+                    if let Some(f) = finalizer {
+                        stmt(f, name, writes, reads);
+                    }
+                }
+                Stmt::SwitchStatement { discriminant, cases } => {
+                    expr(discriminant, name, writes, reads);
+                    for c in cases {
+                        if let Some(t) = &c.test {
+                            expr(t, name, writes, reads);
+                        }
+                        for b in &c.consequent {
+                            stmt(b, name, writes, reads);
+                        }
+                    }
+                }
+                Stmt::VariableDeclaration { declarations, .. } => {
+                    for d in declarations {
+                        if let Some(init) = &d.init {
+                            expr(init, name, writes, reads);
+                        }
+                    }
+                }
+                Stmt::FunctionDeclaration { body, .. } => stmt(body, name, writes, reads),
+                Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            }
+        }
+        for s in stmts {
+            stmt(s, name, &mut writes, &mut reads);
+        }
+        (writes, reads)
+    }
+
+    // Walk the statement list; fold adjacent setVar→read pairs.
+    let mut i = 0usize;
+    while i < stmts.len() {
+        // Look for `sh2.setVar("T", E)`.
+        let (tname, eval) = match &stmts[i] {
+            Stmt::ExpressionStatement { expression } => {
+                if let Expr::CallExpression { callee, arguments, .. } = expression {
+                    if let Expr::MemberExpression {
+                        object,
+                        property,
+                        computed: false,
+                        ..
+                    } = callee.as_ref()
+                    {
+                        if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                            && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setVar")
+                        {
+                            if let [Expr::Literal { value: nm, .. }, eval] = arguments.as_slice() {
+                                if let Some(t) = nm.as_str() {
+                                    (t.to_string(), eval.clone())
+                                } else {
+                                    i += 1;
+                                    continue;
+                                }
+                            } else {
+                                i += 1;
+                                continue;
+                            }
+                        } else {
+                            i += 1;
+                            continue;
+                        }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // The next statement must be `Tv = <read of T>`.
+        let Some(next) = stmts.get(i + 1) else {
+            i += 1;
+            continue;
+        };
+        let (tv, read) = match next {
+            Stmt::ExpressionStatement { expression } => {
+                if let Expr::AssignmentExpression {
+                    operator,
+                    left,
+                    right,
+                    ..
+                } = expression
+                {
+                    if operator == "="
+                        && matches!(left.as_ref(), Expr::Identifier { .. })
+                        && temp_read_name(right) == Some(tname.as_str())
+                    {
+                        if let Expr::Identifier { name } = left.as_ref() {
+                            (name.clone(), right.clone())
+                        } else {
+                            i += 1;
+                            continue;
+                        }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Soundness: T written once, read once, E pure.
+        let (writes, reads) = count_refs(stmts, &tname);
+        if std::env::var("SH2_TEMP_DEBUG").is_ok() {
+            eprintln!(
+                "temp_fold({tname}): writes={writes} reads={reads} pure={} read_ok={}",
+                temp_eval_pure(&eval),
+                temp_read_name(&read).is_some(),
+            );
+        }
+        if writes != 1 || reads != 1 || !temp_eval_pure(&eval) {
+            i += 1;
+            continue;
+        }
+        // Fold: remove the setVar, replace the read's store access with
+        // E (the read keeps its Number/||0/+0 coercion — correct for
+        // any E, and sh2-free).
+        let folded = fold_read_with_value(&read, &eval);
+        stmts.remove(i);
+        if let Stmt::ExpressionStatement { expression } = &mut stmts[i] {
+            if let Expr::AssignmentExpression { right, .. } = expression {
+                *right = Box::new(folded);
+            }
+        }
+        if std::env::var("SH2_TEMP_DEBUG").is_ok() {
+            eprintln!("temp_fold({tname}): FOLDED -> {}", serde_json::to_string(&stmts[i]).unwrap());
+        }
+        // Re-scan from the same index (the next pair may also fold).
+    }
+}
+
+/// Replace the store-access subtree inside a temp read with `value`
+/// (the setVar value), keeping the surrounding Number/||0/+0 coercion.
+fn fold_read_with_value(read: &Expr, value: &Expr) -> Expr {
+    // Rebuild the read with the store access replaced by `value`.
+    // The read is `(Number(sh2.vars.T ?? (process.env.T ?? "")) || 0) + 0`
+    // — replace the innermost `sh2.vars.T ?? (process.env.T ?? "")` with
+    // `value`, preserving the wrapper structure.
+    fn replace(e: &Expr, value: &Expr) -> Expr {
+        if temp_read_name(e).is_some() {
+            return value.clone();
+        }
+        match e {
+            Expr::BinaryExpression {
+                operator,
+                left,
+                right,
+                ..
+            } => Expr::BinaryExpression {
+                operator: operator.clone(),
+                left: Box::new(replace(left, value)),
+                right: Box::new(replace(right, value)),
+            },
+            Expr::LogicalExpression {
+                operator,
+                left,
+                right,
+                ..
+            } => Expr::LogicalExpression {
+                operator: operator.clone(),
+                left: Box::new(replace(left, value)),
+                right: Box::new(replace(right, value)),
+            },
+            Expr::CallExpression {
+                callee,
+                arguments,
+                optional,
+            } => Expr::CallExpression {
+                callee: Box::new(replace(callee, value)),
+                arguments: arguments.iter().map(|a| replace(a, value)).collect(),
+                optional: *optional,
+            },
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                optional,
+            } => Expr::MemberExpression {
+                object: Box::new(replace(object, value)),
+                property: Box::new(replace(property, value)),
+                computed: *computed,
+                optional: *optional,
+            },
+            _ => e.clone(),
+        }
+    }
+    replace(read, value)
+}
+
+/// Collect bindings provably holding Numbers (and, separately, those
+/// provably non-zero) in a statement list: `X = Number(...) || 0`,
+/// `X = <Num literal>`, `X = <arith on Numbers>`; a binding assigned a
+/// positive literal and only IncDec'd is non-zero (loop counter).
+/// Used by the `idiv` peephole (both operands must be Numbers, the
+/// divisor non-zero, to replace `sh2.idiv` with `Math.trunc`).
+fn collect_number_bindings(stmts: &[Stmt]) -> (HashSet<String>, HashSet<String>) {
+    let mut nums: HashSet<String> = HashSet::new();
+    let mut nonzero: HashSet<String> = HashSet::new();
+    fn is_num_lit(v: &serde_json::Value) -> bool {
+        v.as_i64().is_some() || v.as_f64().is_some()
+    }
+    fn is_positive_lit(v: &serde_json::Value) -> bool {
+        v.as_i64().map(|n| n > 0).unwrap_or(false)
+    }
+    fn expr_is_num(e: &Expr, nums: &HashSet<String>) -> bool {
+        match e {
+            Expr::Literal { value, .. } => is_num_lit(value),
+            Expr::Identifier { name } => nums.contains(name),
+            Expr::CallExpression { callee, arguments, .. } => {
+                // `Number`/`parseInt`/`parseFloat` coerce ANY argument
+                // to a Number (or NaN) — always Number-producing.
+                // `Math.*` (except random) returns a Number. `isNaN`/
+                // `isFinite` return booleans — NOT Numbers.
+                let always_num = match callee.as_ref() {
+                    Expr::Identifier { name } => matches!(
+                        name.as_str(),
+                        "Number" | "parseInt" | "parseFloat"
+                    ),
+                    Expr::MemberExpression {
+                        object,
+                        property,
+                        computed: false,
+                        ..
+                    } => {
+                        matches!(object.as_ref(), Expr::Identifier { name } if name == "Math")
+                            && !matches!(property.as_ref(), Expr::Identifier { name } if name == "random")
+                    }
+                    _ => false,
+                };
+                if always_num {
+                    true
+                } else {
+                    false
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. } => {
+                expr_is_num(left, nums) && expr_is_num(right, nums)
+            }
+            Expr::UnaryExpression { argument, .. } => expr_is_num(argument, nums),
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr_is_num(test, nums)
+                    && expr_is_num(consequent, nums)
+                    && expr_is_num(alternate, nums)
+            }
+            _ => false,
+        }
+    }
+    // Walk statements; record declarator/assignment inits.
+    fn walk_stmt(s: &Stmt, nums: &mut HashSet<String>, nonzero: &mut HashSet<String>) {
+        match s {
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Expr::Identifier { name } = &d.id {
+                        if let Some(init) = &d.init {
+                            if expr_is_num(init, nums) {
+                                nums.insert(name.clone());
+                            }
+                            if matches!(init, Expr::Literal { value, .. } if is_positive_lit(value)) {
+                                nonzero.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::ExpressionStatement { expression } => {
+                if let Expr::AssignmentExpression { left, right, .. } = expression {
+                    if let Expr::Identifier { name } = left.as_ref() {
+                        if expr_is_num(right, nums) {
+                            nums.insert(name.clone());
+                        }
+                        if matches!(right.as_ref(), Expr::Literal { value, .. } if is_positive_lit(value)) {
+                            nonzero.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            Stmt::BlockStatement { body } => {
+                for b in body {
+                    walk_stmt(b, nums, nonzero);
+                }
+            }
+            Stmt::IfStatement {
+                consequent,
+                alternate,
+                ..
+            } => {
+                walk_stmt(consequent, nums, nonzero);
+                if let Some(a) = alternate {
+                    walk_stmt(a, nums, nonzero);
+                }
+            }
+            Stmt::WhileStatement { body, .. } | Stmt::DoWhileStatement { body, .. } => {
+                walk_stmt(body, nums, nonzero);
+            }
+            Stmt::ForStatement { init, body, .. } => {
+                walk_stmt(init, nums, nonzero);
+                walk_stmt(body, nums, nonzero);
+            }
+            Stmt::ForOfStatement { left, body, .. } => {
+                walk_stmt(left, nums, nonzero);
+                walk_stmt(body, nums, nonzero);
+            }
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                walk_stmt(block, nums, nonzero);
+                if let Some(h) = handler {
+                    walk_stmt(&h.body, nums, nonzero);
+                }
+                if let Some(f) = finalizer {
+                    walk_stmt(f, nums, nonzero);
+                }
+            }
+            Stmt::SwitchStatement { cases, .. } => {
+                for c in cases {
+                    for b in &c.consequent {
+                        walk_stmt(b, nums, nonzero);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { body, .. } => walk_stmt(body, nums, nonzero),
+            Stmt::ExpressionStatement { .. }
+            | Stmt::ReturnStatement { .. }
+            | Stmt::ThrowStatement { .. }
+            | Stmt::BreakStatement { .. }
+            | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts {
+        walk_stmt(s, &mut nums, &mut nonzero);
+    }
+    (nums, nonzero)
+}
+
+/// `idiv` peephole: `sh2.idiv(A, B)` → `Math.trunc(A / B)` when both
+/// operands are provably Numbers and B is provably non-zero (the helper
+/// throws on zero divisor; `Math.trunc` would yield NaN/Infinity — only
+/// safe when B cannot be 0). Post-emission ESTree transform.
+fn peephole_idiv(stmts: &mut Vec<Stmt>) {
+    let (nums, nonzero) = collect_number_bindings(stmts);
+    fn is_num(e: &Expr, nums: &HashSet<String>) -> bool {
+        match e {
+            Expr::Literal { value, .. } => value.as_i64().is_some() || value.as_f64().is_some(),
+            Expr::Identifier { name } => nums.contains(name),
+            Expr::CallExpression { callee, arguments, .. } => {
+                // `Number`/`parseInt`/`parseFloat` coerce ANY argument
+                // to a Number (or NaN) — always Number-producing.
+                // `Math.*` (except random) returns a Number. `isNaN`/
+                // `isFinite` return booleans — NOT Numbers.
+                let always_num = match callee.as_ref() {
+                    Expr::Identifier { name } => matches!(
+                        name.as_str(),
+                        "Number" | "parseInt" | "parseFloat"
+                    ),
+                    Expr::MemberExpression {
+                        object,
+                        property,
+                        computed: false,
+                        ..
+                    } => {
+                        matches!(object.as_ref(), Expr::Identifier { name } if name == "Math")
+                            && !matches!(property.as_ref(), Expr::Identifier { name } if name == "random")
+                    }
+                    _ => false,
+                };
+                if always_num {
+                    true
+                } else {
+                    false
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. } => {
+                is_num(left, nums) && is_num(right, nums)
+            }
+            Expr::UnaryExpression { argument, .. } => is_num(argument, nums),
+            _ => false,
+        }
+    }
+    fn is_nonzero(e: &Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
+        match e {
+            Expr::Literal { value, .. } => value.as_i64().map(|n| n != 0).unwrap_or(false),
+            Expr::Identifier { name } => nonzero.contains(name),
+            _ => false,
+        }
+    }
+    fn expr(e: &mut Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "idiv")
+                {
+                    if let [a, b] = arguments.as_slice() {
+                        if is_num(a, nums) && is_num(b, nums) && is_nonzero(b, nums, nonzero) {
+                            *e = Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::Identifier {
+                                        name: "Math".to_string(),
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "trunc".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![Expr::BinaryExpression {
+                                    operator: "/".to_string(),
+                                    left: Box::new(a.clone()),
+                                    right: Box::new(b.clone()),
+                                }],
+                                optional: false,
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        match e {
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, nums, nonzero);
+                for a in arguments.iter_mut() {
+                    expr(a, nums, nonzero);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                expr(object, nums, nonzero);
+                if *computed {
+                    expr(property, nums, nonzero);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, nums, nonzero);
+                expr(right, nums, nonzero);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, nums, nonzero);
+                expr(consequent, nums, nonzero);
+                expr(alternate, nums, nonzero);
+            }
+            Expr::UnaryExpression { argument, .. }
+            | Expr::SpreadElement { argument }
+            | Expr::AwaitExpression { argument, .. } => expr(argument, nums, nonzero),
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => stmt(b, nums, nonzero),
+                ArrowBody::Expr(x) => expr(x, nums, nonzero),
+            },
+            Expr::FunctionExpression { body, .. } => stmt(body, nums, nonzero),
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties.iter_mut() {
+                    if prop.computed {
+                        expr(&mut prop.key, nums, nonzero);
+                    }
+                    expr(&mut prop.value, nums, nonzero);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter_mut().flatten() {
+                    expr(el, nums, nonzero);
+                }
+            }
+            Expr::TemplateLiteral { expressions, .. }
+            | Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() {
+                    expr(x, nums, nonzero);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, nums, nonzero);
+                for a in arguments.iter_mut() {
+                    expr(a, nums, nonzero);
+                }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn stmt(s: &mut Stmt, nums: &HashSet<String>, nonzero: &HashSet<String>) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, nums, nonzero),
+            Stmt::BlockStatement { body } => {
+                for b in body.iter_mut() {
+                    stmt(b, nums, nonzero);
+                }
+            }
+            Stmt::IfStatement {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, nums, nonzero);
+                stmt(consequent, nums, nonzero);
+                if let Some(a) = alternate {
+                    stmt(a, nums, nonzero);
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                expr(test, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ForStatement {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                stmt(init, nums, nonzero);
+                expr(test, nums, nonzero);
+                expr(update, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, nums, nonzero);
+                expr(right, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(e) = argument {
+                    expr(e, nums, nonzero);
+                }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, nums, nonzero),
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt(block, nums, nonzero);
+                if let Some(h) = handler {
+                    stmt(&mut h.body, nums, nonzero);
+                }
+                if let Some(f) = finalizer {
+                    stmt(f, nums, nonzero);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, nums, nonzero);
+                for c in cases.iter_mut() {
+                    if let Some(t) = &mut c.test {
+                        expr(t, nums, nonzero);
+                    }
+                    for b in c.consequent.iter_mut() {
+                        stmt(b, nums, nonzero);
+                    }
+                }
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations.iter_mut() {
+                    if let Some(init) = &mut d.init {
+                        expr(init, nums, nonzero);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { body, .. } => stmt(body, nums, nonzero),
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts.iter_mut() {
+        stmt(s, &nums, &nonzero);
+    }
+}
+
+/// Temp-roundtrip fold driver: walk every function body (and the top
+/// scope) and fold `setVar("T", E)` + `Tv = read(T)` pairs. Runs after
+/// the array migration (both are post-emission ESTree transforms).
+fn fold_temp_roundtrips_program(program: &mut Program) {
+    fn expr(e: &mut Expr) {
+        match e {
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => stmt(b),
+                ArrowBody::Expr(x) => expr(x),
+            },
+            Expr::FunctionExpression { body, .. } => stmt(body),
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee);
+                for a in arguments.iter_mut() {
+                    expr(a);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                expr(object);
+                if *computed {
+                    expr(property);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left);
+                expr(right);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test);
+                expr(consequent);
+                expr(alternate);
+            }
+            Expr::UnaryExpression { argument, .. }
+            | Expr::SpreadElement { argument }
+            | Expr::AwaitExpression { argument, .. } => expr(argument),
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties.iter_mut() {
+                    if prop.computed {
+                        expr(&mut prop.key);
+                    }
+                    expr(&mut prop.value);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter_mut().flatten() {
+                    expr(el);
+                }
+            }
+            Expr::TemplateLiteral { expressions, .. }
+            | Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() {
+                    expr(x);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee);
+                for a in arguments.iter_mut() {
+                    expr(a);
+                }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn stmt(s: &mut Stmt) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression),
+            Stmt::BlockStatement { body } => {
+                fold_temp_roundtrips(body);
+                peephole_idiv(body);
+                for b in body.iter_mut() {
+                    stmt(b);
+                }
+            }
+            Stmt::IfStatement {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test);
+                stmt(consequent);
+                if let Some(a) = alternate {
+                    stmt(a);
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                expr(test);
+                stmt(body);
+            }
+            Stmt::ForStatement {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                stmt(init);
+                expr(test);
+                expr(update);
+                stmt(body);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left);
+                expr(right);
+                stmt(body);
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(e) = argument {
+                    expr(e);
+                }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument),
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt(block);
+                if let Some(h) = handler {
+                    stmt(&mut h.body);
+                }
+                if let Some(f) = finalizer {
+                    stmt(f);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant);
+                for c in cases.iter_mut() {
+                    if let Some(t) = &mut c.test {
+                        expr(t);
+                    }
+                    for b in c.consequent.iter_mut() {
+                        stmt(b);
+                    }
+                }
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations.iter_mut() {
+                    if let Some(init) = &mut d.init {
+                        expr(init);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { body, .. } => stmt(body),
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    fold_temp_roundtrips(&mut program.body);
+    peephole_idiv(&mut program.body);
+    for s in program.body.iter_mut() {
+        stmt(s);
+    }
+}
+
+/// Native-array migration driver: fixpoint over the top scope and all
+/// function bodies (one array per pass — indices stay fresh). Pure
+/// ESTree transform; reads no compilation statics (all state from the
+/// AST + [`hoist_module_bound`], like [`hoist_param_reads`]).
+/// Kill-switch `SH2_NO_ARRAY_MIGRATE=1` restores the store path
+/// (bisection + opt-out; default migrates where proven sound).
+fn array_migrate_program(program: &mut Program, module_bound: &HashSet<String>) {
+    if std::env::var("SH2_NO_ARRAY_MIGRATE").is_ok() {
+        return;
+    }
+    let mut pre = ArrayPreScan::default();
+    {
+        let snap = program.body.clone();
+        for s in &snap {
+            array_pre_scan_stmt(s, &mut pre);
+        }
+        // Leading pure prefix: literal-init declarators (and function
+        // definitions) before any executable statement — they run
+        // before every call, so their names are always set (non-null).
+        // A call-init declarator, destructuring id, or any other
+        // statement ends the prefix (unverifiable execution).
+        'prefix: for s in &snap {
+            match s {
+                Stmt::VariableDeclaration { declarations, .. } => {
+                    for d in declarations {
+                        let Expr::Identifier { name } = &d.id else {
+                            break 'prefix;
+                        };
+                        match &d.init {
+                            None => {}
+                            Some(Expr::Literal { value, .. }) => {
+                                let inert = value.as_i64().is_some()
+                                    || matches!(value.as_str(), Some(t) if !t.contains('$') && !t.contains('`') && !t.contains('\\'));
+                                if inert {
+                                    pre.leading_inits.insert(name.clone());
+                                }
+                            }
+                            _ => break 'prefix,
+                        }
+                    }
+                }
+                Stmt::FunctionDeclaration { .. } => {}
+                _ => break 'prefix,
+            }
+        }
+    }
+    for _ in 0..64 {
+        let snap = program.body.clone();
+        let mut migrated = false;
+        // Top scope (empty params; destructuring impossible at top
+        // level… top-level patterns would have failed module_bound).
+        if array_migrate_scope(
+            &mut program.body, &snap, &snap, &[], module_bound, &pre, true,
+        )
+        {
+            migrated = true;
+            continue;
+        }
+        array_migrate_bodies(&mut program.body, &snap, module_bound, &pre, &mut migrated);
+        if !migrated {
+            break;
+        }
+    }
+}
+
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
     // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
@@ -17397,7 +23837,17 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // the ORIGINAL arith shapes (the RMW detection needs the unwrapped
     // trees); the wrap below then rewrites the leaves on the clone.
     let (mut true64_int, true64_slots) = if true64_enabled() {
-        analyze_true64(prog)
+        let (iv, sl, _) = analyze_true64(prog);
+        (iv, sl)
+    } else if slots_enabled() {
+        // `-O3` i53+slots profile: run the true64 analysis for its
+        // BigInt64Array SLOT homes (the int-array trick for i64 hot
+        // accumulator chains) but keep ONLY the slot vars as BigInt —
+        // the non-slot out-of-range vars stay plain Number (i53) and
+        // are covered by the i53 escalation below (proven-big → BigInt)
+        // or the dual-loop guard (unproven → Number fast arm).
+        let (int_vars, slots, _) = analyze_true64(prog);
+        (slots.keys().cloned().collect(), slots)
     } else {
         (HashSet::new(), HashMap::new())
     };
@@ -17441,6 +23891,17 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             &crate::shir_passes::PassContext::default(),
         );
     }
+    // the store-only verdict (the pass's analysis, on the ORIGINAL prog
+    // — the converted clone's setVars are already Assigns): the
+    // native-binding rendering for these vars (bare `let` + reads, no
+    // sh2.vars)
+    let (store_only, unsafe_v) = crate::shir_passes::transform::analyze_store_only(prog);
+    if std::env::var("SH2_DBG_SO").is_ok() {
+        eprintln!("DBG store_only: {:?}", store_only);
+        eprintln!("DBG unsafe: {:?}", unsafe_v);
+        eprintln!("DBG store_only_var(__fl0) = {}", store_only_var("__fl0"));
+    }
+    *STORE_ONLY_VARS.lock().unwrap() = Some(store_only);
     // Int64 leaf wrapping (the `--true64` machinery, now also the i53
     // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
     // non-slot Var leaves -> Cast(Int64, Var); slot reads stay RAW (the
@@ -17731,7 +24192,29 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         eprintln!("DBG sync: {:?}", SYNC_FN_CALLS.lock().unwrap().as_ref());
         eprintln!("DBG direct: {:?}", DIRECT_FN_CALLS.lock().unwrap().as_ref());
     }
-    *PARAM_LIFT.lock().unwrap() = Some(pl);
+    *PARAM_LIFT.lock().unwrap() = Some(pl.clone());
+    // VALUE-RETURN: a param-lifted function whose body's final statement
+    // is a single value echo — the define arrow returns the value and the
+    // call sites use it directly (no captureSync, no echo).
+    let mut fn_bodies: HashMap<String, Vec<&[IrStmt]>> = HashMap::new();
+    collect_fn_bodies(&prog.stmts, &mut fn_bodies);
+    for sub in &prog.subs {
+        fn_bodies.entry(sub.name.clone()).or_default().push(&sub.body);
+    }
+    let vr: HashSet<String> = pl
+        .keys()
+        .filter(|name| {
+            fn_bodies
+                .get(*name)
+                .map(|fns| fns.iter().any(|b| final_value_echo(b).is_some()))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if std::env::var("SH2_DBG_VR").is_ok() {
+        eprintln!("DBG value_return: {:?}", vr);
+    }
+    *VALUE_RETURN_FNS.lock().unwrap() = Some(vr);
     // Native-echo-in-function analysis (see [`native_echo_fn_set`]): the
     // define arrows of eligible functions lower WITHOUT the sink-depth
     // bump, so their echo/printf statements go native. Must run after the
@@ -17899,6 +24382,19 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             direct_sorted.push(n);
         }
     }
+    // STORE-ONLY vars: the native binding (`let <name> = null;` — the
+    // Assign writes and bare reads follow)
+    let so_names: Vec<String> = STORE_ONLY_VARS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|so| so.iter().cloned().collect())
+        .unwrap_or_default();
+    for n in &so_names {
+        if !direct_fns.contains(n) {
+            direct_sorted.push(n);
+        }
+    }
     direct_sorted.sort();
     for name in direct_sorted {
         let binding = direct_binding_name(name).expect("direct set is binding-valid");
@@ -17927,9 +24423,28 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     });
     // then the dead top-level declaration elimination (a for-loop's own
     // `let i` shadows the hoisted `let i = 0`, which is then dead)
-    crate::estree::drop_dead_top_decls(crate::estree::drop_dead_flags(
-        crate::estree::hoist_last_exit(program),
-    ))
+    //
+    // Finally, loop-invariant param-read hoisting (see `hoist_param_reads`
+    // — `Number(p)||0` entry consts): runs last so every earlier pass
+    // sees the shapes it was designed against, and nothing after it can
+    // disturb the consts.
+    let mut program =
+        crate::estree::drop_dead_top_decls(crate::estree::drop_dead_flags(
+            crate::estree::hoist_last_exit(program),
+        ));
+    if let Some(module_bound) = hoist_module_bound(&program.body) {
+        hoist_in_stmt_list(&mut program.body, &module_bound);
+        // Native-array migration (setArray/setArrayAppend/sortedJoins
+        // → const/push/inline join): after hoisting so the entry consts
+        // it must respect are in place; last, so nothing disturbs the
+        // native bindings. Fail-closed per array — unlisted shapes stay.
+        array_migrate_program(&mut program, &module_bound);
+        // Store-temp roundtrip fold (setVar("T",E) + read → direct):
+        // after the array migration (both post-emission ESTree
+        // transforms; the fold is independent of arrays).
+        fold_temp_roundtrips_program(&mut program);
+    }
+    program
 }
 
 /// Top-level statement lowering: additionally wraps statement-position calls
@@ -18128,6 +24643,136 @@ enum CasePat {
     /// translation mirrors the runtime's parseGlob/classMatch grammar
     /// exactly.
     Glob(String),
+}
+
+/// Native single-pattern `sh2.caseMatch(value, [pat])` (t68 py
+/// `s.startswith("h")` → `caseMatch(getVar("s"), ["h*"])`): the glob needs
+/// no engine for the four string-op shapes — prefix/suffix/contains/exact
+/// lower to `String(v).startsWith/endsWith/includes/===` (plain-string
+/// methods: no regex-escaping hazards at all), bare `*` to `true`.
+/// Reuses [`classify_case_pat`] (same quote-unwrap, same meta strictness);
+/// `Glob` (regex) shapes refuse — a per-evaluation regex rebuild would cost
+/// what the native avoids, and the runtime keeps them exactly. Empty
+/// cores/patterns refuse (an empty match's falsy runtime return would
+/// invert under a boolean native). Multi-pattern arrays and dynamic
+/// elements refuse. `nocase` mirrors [`try_native_case`] (statically-on
+/// and untoggled → lowercase the value only; dynamic → refuse).
+/// Status: the runtime call records lastExit, so the native records it
+/// too — the single-record `(_g = t, lastExit = _g ? 0 : 1, _g)` protocol
+/// (the shape the sibling `in`-operator operands use; the hoist passes
+/// strip it under the same rules as any other record). A `|` inside a
+/// single pattern element is NOT an alternation here (the Case-statement
+/// path splits those upstream; the runtime matches `a|b` literally) —
+/// `classify_case_pat` yields `Exact`, and `===` is runtime-identical.
+fn try_native_case_match(args: &[IrExpr]) -> Option<Expr> {
+    let [disc, pats] = args else {
+        return None;
+    };
+    let IrExpr::Array(items) = pats else {
+        return None;
+    };
+    let [IrExpr::Str(pat, _)] = items.as_slice() else {
+        return None;
+    };
+    let classified = classify_case_pat(pat)?;
+    // `String($disc)` — the runtime's caseMatch coercion. `nocase`
+    // mirrors `try_native_case`: statically-on-and-untoggled lowercases
+    // the VALUE side only (not the pattern); anything dynamic refuses
+    // (the runtime consults shoptState live).
+    let case_sensitive = !CASE_NOCASE.lock().unwrap().unwrap_or(false);
+    let case_dynamic = CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false);
+    if !case_sensitive && case_dynamic {
+        // toggled at runtime: the live shoptState decides — refuse.
+        return None;
+    }
+    let nocase = !case_sensitive && !case_dynamic;
+    let mut value = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        // `(disc ?? "")` — the runtime's `String(value ?? '')`
+        // coercion: an undefined/null discriminant (an uninitialized
+        // binding) matches as "", never as the text "undefined".
+        arguments: vec![Expr::LogicalExpression {
+            operator: "??".to_string(),
+            left: Box::new(expr_to_estree(disc)),
+            right: Box::new(str_lit("")),
+        }],
+        optional: false,
+    };
+    if nocase {
+        value = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(value),
+                property: Box::new(Expr::Identifier {
+                    name: "toLowerCase".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![],
+            optional: false,
+        };
+    }
+    let method_call = |method: &str, lit: &str| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(value.clone()),
+            property: Box::new(Expr::Identifier {
+                name: method.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit(lit)],
+        optional: false,
+    };
+    let test = match classified {
+        CasePat::Any => Expr::Literal {
+            value: serde_json::Value::Bool(true),
+            raw: None,
+            regex: None,
+        },
+        CasePat::Substr(s) => method_call("includes", &s),
+        CasePat::Prefix(s) => method_call("startsWith", &s),
+        CasePat::Suffix(s) => method_call("endsWith", &s),
+        CasePat::Exact(s) => {
+            if s.is_empty() {
+                return None;
+            }
+            Expr::BinaryExpression {
+                operator: "===".to_string(),
+                left: Box::new(value.clone()),
+                right: Box::new(str_lit(&s)),
+            }
+        }
+        CasePat::Glob(_) => return None,
+    };
+    let tmp = sh2_member("_g");
+    Some(seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(tmp.clone()),
+            right: Box::new(test),
+        },
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::ConditionalExpression {
+                test: Box::new(tmp.clone()),
+                consequent: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(1),
+                    raw: None,
+                    regex: None,
+                }),
+            }),
+        },
+        tmp,
+    ]))
 }
 
 fn classify_case_pat(pat: &str) -> Option<CasePat> {
@@ -19008,6 +25653,8 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
                     || c.ch.as_ref().is_some_and(scan_expr)
                     || c.value.as_ref().is_some_and(scan_expr)
             }),
+            IrStmt::Shaderize { body, .. } => scan_stmts(body),
+
         }
     }
     scan_stmts(&prog.stmts)
@@ -19214,6 +25861,12 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
                     }
                 }
             }
+            IrStmt::Shaderize { body, .. } => {
+                for s in body {
+                    scan_stmt(s, mask);
+                }
+            }
+
         }
     }
     let mut mask = 0u8;
@@ -19958,6 +26611,29 @@ fn flatten_for_iter(iter: &IrExpr) -> Expr {
 /// is NaN (falsy — the exact abort semantics), Number("0") is 0 (falsy),
 /// a value string is truthy. Div/mod-free arith lowers to a BARE numeric
 /// expression (no wrapper — the arm's fast path) and needs no coercion.
+/// Test-position boolean unwrap: `if/while (E ? 1 : 0)` → `if/while (E)`.
+/// The arith comparison/logical lowerings normalize bash 0/1 results via
+/// `? 1 : 0` (bash yields 0/1, JS yields booleans) — but in a BOOLEAN test
+/// position the normalization is redundant: `(E ? 1 : 0)` is truthy exactly
+/// when E is truthy, with E evaluated exactly once either way (no
+/// double-evaluation; NaN/0/""/undefined are falsy on both sides).
+/// Applied ONLY at If/While statement tests, never in value positions
+/// (where the 0/1 digits are observed: `x = (c ? 1 : 0)`, call args).
+fn unwrap_test_bool(e: Expr) -> Expr {
+    match e {
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } if matches!(consequent.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(1))
+            && matches!(alternate.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0)) =>
+        {
+            *test
+        }
+        other => other,
+    }
+}
+
 fn cond_to_estree(cond: &IrExpr) -> Expr {
     let c = expr_to_estree(cond);
     if let IrExpr::Arith(a) = cond {
@@ -19974,6 +26650,119 @@ fn cond_to_estree(cond: &IrExpr) -> Expr {
         }
     }
     c
+}
+
+/// `-O4` autoshaderization: detect a compute loop (a `ForInit` counted
+/// loop with a pure-arithmetic body) and emit it in a shader-offloadable
+/// form via `sh2.shaderize(start, end, step, (i) => { body })`. Returns
+/// None when the loop is not a shaderizable compute loop (or `-O4` is
+/// off), so the caller falls back to the native ForStatement.
+fn try_shaderize_forinit(
+    init: &[IrStmt],
+    cond: &IrExpr,
+    step: &[IrStmt],
+    body: &[IrStmt],
+) -> Option<Expr> {
+    if !shaderize_enabled() {
+        return None;
+    }
+    // init: a single `i = start` (start a constant).
+    let (var, start) = match init {
+        [IrStmt::Assign { targets, expr, .. }] => {
+            let target = targets.first()?.var.clone();
+            let IrExpr::Arith(a) = expr else { return None };
+            let ArithAst::Assign { var, op, rhs } = &**a else { return None };
+            if *op != "=" || *var != target {
+                return None;
+            }
+            (var.clone(), arith_const(rhs)?)
+        }
+        _ => return None,
+    };
+    // cond: `builtin("let", ["i<op>bound"])`.
+    let (op, bound) = match cond {
+        IrExpr::Call { func, args } if func == "builtin" => {
+            let IrExpr::Str(s, _) = args.first()? else { return None };
+            if s != "let" {
+                return None;
+            }
+            let IrExpr::Array(items) = args.get(1)? else { return None };
+            let IrExpr::Str(expr_str, _) = items.first()? else { return None };
+            parse_cond(expr_str, &var)?
+        }
+        _ => return None,
+    };
+    // step: a single `i++` / `i += step` (constant step).
+    let step_val = match step {
+        [IrStmt::Assign { targets, expr, .. }] => {
+            let target = targets.first()?.var.clone();
+            if target != var {
+                return None;
+            }
+            let IrExpr::Arith(a) = expr else { return None };
+            match &**a {
+                ArithAst::IncDec { var: v, delta, .. } if *v == var => *delta,
+                ArithAst::Assign { var: v, op, rhs } if *v == var && *op == "+=" => {
+                    arith_const(rhs)? as i64
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    // body: pure arithmetic (no side-effect calls).
+    if !body_is_pure_arith(body) {
+        return None;
+    }
+    // Emit sh2.shaderize(start, end, step, (var) => { body }).
+    let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+    if body_stmts.len() != body.len() {
+        return None;
+    }
+    let arrow = Expr::ArrowFunctionExpression {
+        params: vec![Expr::Identifier {
+            name: var.clone(),
+        }],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+            body: body_stmts,
+        })),
+        expression: false,
+        r#async: false,
+    };
+    Some(sh2_call(
+        "shaderize",
+        vec![
+            int_lit_expr(start as i64),
+            int_lit_expr(bound),
+            int_lit_expr(step_val),
+            str_lit(&op),
+            arrow,
+        ],
+    ))
+}
+
+/// Parse a `let`-builtin condition string `"i<10"` into `(op, bound)`,
+/// requiring the loop var on the left and a constant bound on the right.
+fn parse_cond(s: &str, var: &str) -> Option<(String, i64)> {
+    for op in ["<=", ">=", "<", ">"] {
+        if let Some((l, r)) = s.split_once(op) {
+            if l.trim() == var {
+                let b = r.trim().parse::<i64>().ok()?;
+                return Some((op.to_string(), b));
+            }
+        }
+    }
+    None
+}
+
+/// A compute-loop body is pure arithmetic: every statement is an
+/// `Assign` whose expression is an `Arith` (no echo/printf/exec/redirect/
+/// capture side effects).
+fn body_is_pure_arith(body: &[IrStmt]) -> bool {
+    body.iter().all(|s| match s {
+        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(_)),
+        _ => false,
+    })
 }
 
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
@@ -20393,9 +27182,44 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     },
                 });
             }
+            // NOTE (2026-09-09, t78/t93 regressions): a concurrent worker's
+            // in-flight `|| store_only_var(&target.var)` disjunct routed
+            // store-only writes to native bindings (`x = "3"`) with no
+            // `let x` declared (their decl work emits `__fn_`-style names)
+            // — every such write is a strict-mode ReferenceError, and reads
+            // disagree about the home (binding vs store). Restored to the
+            // committed `is_lifted` gate (store writes + store reads, always
+            // consistent) until the bindings land. The setArray early
+            // return above stays correct regardless (the general path
+            // below emits those calls bare too).
             if is_lifted(&target.var) && target.indices.is_empty() {
+                // arr=(...) / arr+=(...) / x op= v on a lifted/store-only
+                // target (t89 list-append: `out.append(i)` on store-only
+                // `out`): the helper already sets the variable itself
+                // (the array lives in the runtime store, read back by
+                // name) — emit the call bare, exactly like the general
+                // path below. Falling through would wrap it as
+                // `out = sh2.setArrayAppend(...)`, assigning the helper's
+                // return into the native binding (desync), and the
+                // source match below has no array arm (`unreachable!`).
+                if let IrExpr::Call { func, .. } = expr {
+                    if func == "setArray" || func == "setArrayAppend" || func == "assign" {
+                        return Some(Stmt::ExpressionStatement {
+                            expression: expr_to_estree(expr),
+                        });
+                    }
+                }
                 // native JS write — the analysis guarantees the source kind
-                let right = match expr {
+                // for the fast-path arms below. Anything else (Ext nodes
+                // like the go-sh TypeAssert, unknown calls) yields None and
+                // falls through to the general store path underneath (the
+                // store is authoritative there; a native-binding write of
+                // an untyped value would desync reads). The fallback arm
+                // previously panicked (`unreachable!`) — fall-through only
+                // ever fires for programs that crashed, so passing tests
+                // cannot regress (they never reach it).
+                let right: Option<Expr> = (|| -> Option<Expr> {
+                    Some(match expr {
                     // numeric-lifted source; a `--true64` Int64 var wraps
                     // at 2^64 (bash's int64 semantics)
                     IrExpr::Arith(a) => {
@@ -20563,17 +27387,20 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // store mark for param name args on this assumption)
                     // and returns the computed string into the binding.
                     IrExpr::Call { func, .. } if func == "param" => expr_to_estree(expr),
-                    _ => unreachable!("lifted var assigned an unanalysed source"),
-                };
-                return Some(Stmt::ExpressionStatement {
-                    expression: Expr::AssignmentExpression {
-                        operator: "=".to_string(),
-                        left: Box::new(Expr::Identifier {
-                            name: target.var.clone(),
-                        }),
-                        right: Box::new(right),
-                    },
-                });
+                    _ => return None,
+                    })
+                })();
+                if let Some(right) = right {
+                    return Some(Stmt::ExpressionStatement {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(Expr::Identifier {
+                                name: target.var.clone(),
+                            }),
+                            right: Box::new(right),
+                        },
+                    });
+                }
             }
             match expr {
                 // arr=(...) / arr+=(...) / x op= v → the helper already sets
@@ -20724,13 +27551,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // (the `$?` protocol is byte-identical where a reader
                     // exists — the analysis only drops unobserved
                     // writes).
+                    // Test-position `? 1 : 0` unwrap (see
+                    // [`unwrap_test_bool`]): the guard is evaluated for
+                    // truthiness only.
                     if test_cond_write_is_dead(stmt) {
                         *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
                         let c = cond_to_estree(cond);
                         *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
-                        c
+                        unwrap_test_bool(c)
                     } else {
-                        cond_to_estree(cond)
+                        unwrap_test_bool(cond_to_estree(cond))
                     }
                 },
                 consequent,
@@ -21045,6 +27875,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     cond_to_estree(cond)
                 }
             };
+            // Test-position `? 1 : 0` unwrap (t86 hot loop): the guard is
+            // evaluated for truthiness only — see [`unwrap_test_bool`].
+            let cond_e = unwrap_test_bool(cond_e);
             let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
             if !expr_has_await(&cond_e) && !stmts_have_await(&body_stmts) {
                 // Native loop (the ladder's top rung): a plain JS `while`
@@ -21908,7 +28741,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // body emission (`fn_call_sync_set`) skips too (its clones
             // are dropped after the scan — no marked pointers may outlive
             // their objects).
-            let cloned_body = body.clone();
+            let mut cloned_body = body.clone();
+            // VALUE-RETURN: the body's final single value echo becomes a
+            // native `return <value>` (the call sites use the value
+            // directly — no stdout round-trip, no captureSync).
+            if value_return_fn(name) {
+                if let Some(value) = final_value_echo(&cloned_body) {
+                    let n = cloned_body.len();
+                    cloned_body[n - 1] = IrStmt::Return(Some(value));
+                }
+            }
             let saved_body_dead = ARROW_BODY_DEAD.lock().unwrap().take();
             let saved_cond_dead = ARROW_BODY_COND_DEAD.lock().unwrap().take();
             let saved_loop_dead = ARROW_BODY_LOOP_DEAD.lock().unwrap().take();
@@ -22784,6 +29626,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
 
         IrStmt::ForInit { init, cond, step, body } => {
+            // `-O4` autoshaderization: a compute loop (pure-arithmetic
+            // counted loop) is emitted in a shader-offloadable form via
+            // `sh2.shaderize(...)` instead of the native ForStatement.
+            if let Some(shaderized) = try_shaderize_forinit(init, cond, step, body) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: shaderized,
+                });
+            }
             // Native JS for loop: `for (init; cond; step) body`.
             // The ESTree renderer handles ForInit natively, so the
             // `strip_cfor` pass can be skipped/blacklisted for the
@@ -31283,6 +38133,73 @@ fn native_test_statused(t: Expr) -> Expr {
     ])
 }
 
+/// Is `e` a `sh2.<prop>` member read?
+fn is_sh2_member(e: &Expr, prop: &str) -> bool {
+    matches!(e,
+        Expr::MemberExpression { object, property, computed: false, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+        && matches!(&**property, Expr::Identifier { name } if name == prop))
+}
+
+/// Is `e` already a status-record sequence — exactly the
+/// [`native_test_statused`] shape `(_g = t, lastExit = _g ? 0 : 1, _g)`?
+/// The `&&`/`||` chain-link lowering re-records the status its operand
+/// already recorded (t28: every chain link pays 2 assignments + a branch
+/// for the identical lastExit value). Skipping the outer wrap when the
+/// operand IS the protocol shape is sound: the chain links read precisely
+/// the lastExit this sequence sets, from precisely the `_g` value it
+/// yields — the re-record recomputes the same status from the same value.
+/// The match is the full 3-element protocol (not merely "ends with _g")
+/// so a coincidentally `_g`-tailed sequence never skips.
+fn is_status_record_seq(e: &Expr) -> bool {
+    let Expr::SequenceExpression { expressions } = e else {
+        return false;
+    };
+    let [store, record, tail] = expressions.as_slice() else {
+        return false;
+    };
+    if !is_sh2_member(tail, "_g") {
+        return false;
+    }
+    let Expr::AssignmentExpression {
+        operator: op1,
+        left: l1,
+        ..
+    } = store
+    else {
+        return false;
+    };
+    if op1 != "=" || !is_sh2_member(l1, "_g") {
+        return false;
+    }
+    let Expr::AssignmentExpression {
+        operator: op2,
+        left: l2,
+        right: r2,
+    } = record
+    else {
+        return false;
+    };
+    if op2 != "=" || !is_sh2_member(l2, "lastExit") {
+        return false;
+    }
+    let Expr::ConditionalExpression {
+        test,
+        consequent,
+        alternate,
+    } = &**r2
+    else {
+        return false;
+    };
+    if !is_sh2_member(test, "_g") {
+        return false;
+    }
+    let is_zero = matches!(consequent.as_ref(),
+        Expr::Literal { value, .. } if value.as_i64() == Some(0));
+    let is_one = matches!(alternate.as_ref(),
+        Expr::Literal { value, .. } if value.as_i64() == Some(1));
+    is_zero && is_one
+}
 /// True when the test string contains a GROUPING paren OUTSIDE quotes
 /// (single or double). Quoted paren literals (`[[ "$c" == '(' ]]`) are
 /// operands — the runtime's tokenizer would mis-parse them, so the
@@ -37013,6 +43930,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if is_lifted(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
+                    // NOTE (2026-09-09, t89 list-append): a concurrent
+                    // worker's in-flight `|| store_only_var(name)`
+                    // disjunct rendered store-only reads as bare
+                    // identifiers, but no `let <name>` is declared for
+                    // non-lifted store-only vars (their decl work emits
+                    // `__fn_`-style bindings) — every such read was a
+                    // ReferenceError (e.g. `return out` for an appended
+                    // array). Restored to committed store-read semantics
+                    // until the bindings land; then the disjunct can
+                    // come back with them.
                     if let Some(native) = native_special_var(name) {
                         return native;
                     }
@@ -37601,6 +44528,19 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if expr_sh2_call_count(&native) <= 1
                             && (!expr_has_await(&native) || awaited_ok)
                         {
+                            // Status-record dedup: `try_native_test` above
+                            // already wrapped the comparison in the
+                            // `(_g = t, lastExit = _g ? 0 : 1, _g)` protocol
+                            // ([`is_status_record_seq`]) — and the chain
+                            // links read exactly the lastExit it sets — so
+                            // the outer re-record below would recompute the
+                            // identical status from the identical value.
+                            // Use the recorded sequence directly (one fewer
+                            // `_g` store, one fewer lastExit store, one fewer
+                            // branch per evaluation).
+                            if is_status_record_seq(&native) {
+                                return native;
+                            }
                             let tmp = sh2_member("_g");
                             return seq(vec![
                                 Expr::AssignmentExpression {
@@ -37634,6 +44574,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // runtime test (a bare template is always truthy)
                         return sh2_call("test", vec![tpl]);
                     }
+                }
+            }
+            // `sh2.caseMatch(value, [pat])` with a single static simple
+            // pattern — the native string-op form ([`try_native_case_match`]:
+            // no glob engine, no per-pattern parse). Anything else keeps
+            // the runtime call (exact).
+            if func == "caseMatch" {
+                if let Some(native) = try_native_case_match(args) {
+                    return native;
                 }
             }
             // `sh2.param` on a LIFTED variable: the runtime reads the value
@@ -37953,6 +44902,28 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // the transformed line content (echo's own trailing newline
             // would be stripped anyway).
             if func == "capture" {
+                // `$(f args)` of a VALUE-RETURNING param-lifted function:
+                // the call returns the value directly — no captureSync, no
+                // stdout round-trip (the define arrow's final echo became
+                // a native `return`).
+                if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                    if let [IrStmt::Expr(IrExpr::Call { func: cf, args: cargs })] =
+                        stmts.as_slice()
+                    {
+                        if cf == "exec" {
+                            if let Some(IrExpr::Str(fname, _)) = cargs.first() {
+                                if value_return_fn(fname) {
+                                    // the exec args: [name, Array(args)]
+                                    if let Some(IrExpr::Array(elems)) = cargs.get(1) {
+                                        if let Some(call) = try_native_fn_call(fname, elems) {
+                                            return call;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if !program_defines_function("echo") && !program_defines_function("tr") {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
@@ -41194,6 +48165,858 @@ fn safe_ident(name: &str) -> String {
     }
 }
 
+/// Regression guards for the 2026-09-09 lowering work (all order-proof:
+/// pure-tree assertions, or globals saved/restored — never dependent on
+/// another test's compilation state).
+mod lowering_shape_tests {
+    use super::*;
+
+    fn var(name: &str) -> ArithAst {
+        ArithAst::Var(name.to_string())
+    }
+    fn num(n: i64) -> ArithAst {
+        ArithAst::Num(n)
+    }
+    fn pct(lhs: ArithAst, rhs: ArithAst) -> ArithAst {
+        ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+    fn eq0(lhs: ArithAst) -> ArithAst {
+        ArithAst::Bin {
+            op: "==".to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(num(0)),
+        }
+    }
+    fn cast64(arg: ArithAst) -> ArithAst {
+        ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(arg),
+        }
+    }
+
+    #[test]
+    fn any_div_mod_sees_proven_nonzero_divisors() {
+        // [`arith_has_div_mod`] excludes nonzero literals (no abort
+        // possible — correct for the wrapper decision); the syntactic
+        // detector must still see the operation (the zero-cmp gate).
+        assert!(arith_has_div_mod(&pct(var("n"), var("i"))));
+        assert!(!arith_has_div_mod(&pct(var("n"), num(2))));
+        assert!(arith_has_any_div_mod(&pct(var("n"), var("i"))));
+        assert!(arith_has_any_div_mod(&pct(var("n"), num(2))));
+        assert!(!arith_has_any_div_mod(&var("n")));
+    }
+
+    #[test]
+    fn zero_cmp_abort_channel_unchanged() {
+        // The classic abort-capable shape still gates exactly as before
+        // (no globals set: the divisor var is unproven, so both detectors
+        // agree — this pins the main path the extension builds on).
+        let t = eq0(pct(var("n"), var("i")));
+        assert!(arith_is_zero_cmp(&t));
+        assert!(!arith_is_zero_cmp(&var("n")));
+    }
+
+    #[test]
+    fn tree_bigint_needs_cast_or_homed_read() {
+        // Pure shapes only (no var reads — those consult compilation
+        // statics): Cast is BigInt, plain numbers never are.
+        assert!(arith_tree_has_bigint(&cast64(num(5))));
+        assert!(!arith_tree_has_bigint(&num(5)));
+        assert!(!arith_tree_has_bigint(&pct(num(10), num(3))));
+        assert!(arith_tree_has_bigint(&pct(cast64(num(10)), num(3))));
+    }
+
+    #[test]
+    fn status_record_shape_matches() {
+        // [`is_status_record_seq`] accepts exactly the
+        // [`native_test_statused`] protocol shape (and nothing looser:
+        // a coincidentally `_g`-tailed sequence must not skip).
+        let rec = native_test_statused(Expr::Identifier {
+            name: "t".to_string(),
+        });
+        assert!(is_status_record_seq(&rec));
+        assert!(!is_status_record_seq(&Expr::Identifier {
+            name: "t".to_string()
+        }));
+        assert!(!is_status_record_seq(&seq(vec![sh2_member("_g")])));
+    }
+
+    #[test]
+    fn case_match_single_patterns_lower_natively() {
+        // Globals saved/restored: other tests' compilations leave the
+        // nocase statics populated.
+        let old_case = CASE_NOCASE.lock().unwrap().clone();
+        let old_dyn = CASE_NOCASE_DYNAMIC.lock().unwrap().clone();
+        *CASE_NOCASE.lock().unwrap() = Some(false);
+        *CASE_NOCASE_DYNAMIC.lock().unwrap() = Some(false);
+        let run = |pat: &str| {
+            try_native_case_match(&[
+                IrExpr::Str("v".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str(
+                    pat.to_string(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )]),
+            ])
+        };
+        let s = serde_json::to_string;
+        // prefix / suffix / contains / exact / any
+        assert!(s(&run("h*").unwrap()).unwrap().contains("startsWith"));
+        assert!(s(&run("*lo").unwrap()).unwrap().contains("endsWith"));
+        assert!(s(&run("*ell*").unwrap()).unwrap().contains("includes"));
+        let exact = s(&run("hello").unwrap()).unwrap();
+        assert!(exact.contains("===") && !exact.contains("caseMatch"));
+        assert!(s(&run("*").unwrap()).is_ok());
+        // refusals keep the runtime call
+        assert!(run("h*x").is_none());
+        assert!(run("[ab]c").is_none());
+        assert!(run("").is_none());
+        // `a|b` is literal-Exact (the runtime matches it literally too),
+        // so `===` is runtime-identical — NOT a refusal.
+        let alt = s(&run("a|b").unwrap()).unwrap();
+        assert!(alt.contains("==="));
+        *CASE_NOCASE.lock().unwrap() = old_case;
+        *CASE_NOCASE_DYNAMIC.lock().unwrap() = old_dyn;
+    }
+    #[test]
+    fn test_bool_unwrap_strips_1_0_normalization() {
+        // `if/while (E ? 1 : 0)` → `E`: truthiness-preserving, E evaluated
+        // once either way. Anything else passes through untouched.
+        let norm = |e: Expr| Expr::ConditionalExpression {
+            test: Box::new(e),
+            consequent: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+            alternate: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        };
+        let cmp = Expr::BinaryExpression {
+            operator: "<".to_string(),
+            left: Box::new(Expr::Identifier {
+                name: "i".to_string(),
+            }),
+            right: Box::new(Expr::Identifier {
+                name: "l".to_string(),
+            }),
+        };
+        // strips to the bare comparison
+        assert!(matches!(
+            unwrap_test_bool(norm(cmp.clone())),
+            Expr::BinaryExpression { .. }
+        ));
+        // non-normalizations pass through: inverted branches, other lits,
+        // bare expressions
+        let inv = Expr::ConditionalExpression {
+            test: Box::new(cmp.clone()),
+            consequent: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+            alternate: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        };
+        assert!(matches!(unwrap_test_bool(inv), Expr::ConditionalExpression { .. }));
+        assert!(matches!(
+            unwrap_test_bool(cmp.clone()),
+            Expr::BinaryExpression { .. }
+        ));
+    }
+    #[test]
+    fn mixed_domain_plus_minus_widens_number_side() {
+        // t90 floordiv composition: `Var - (… Cast …)` must render the
+        // Number side as `BigInt(read || 0)` (native mixed-arity `-`
+        // throws). Implausible var names keep this independent of any
+        // other test's compilation state.
+        let lhs = ArithAst::Var("__tqw_n_1".to_string());
+        let rhs = cast64(num(7));
+        let sub = ArithAst::Bin {
+            op: "-".to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+        let s = serde_json::to_string(&arith_to_estree(&sub)).unwrap();
+        assert!(
+            s.contains("BigInt"),
+            "number side widened to BigInt: {s}"
+        );
+        // pure-Number pairs are untouched (no BigInt anywhere).
+        let plain = ArithAst::Bin {
+            op: "-".to_string(),
+            lhs: Box::new(num(9)),
+            rhs: Box::new(num(4)),
+        };
+        let sp = serde_json::to_string(&arith_to_estree(&plain)).unwrap();
+        assert!(!sp.contains("BigInt"), "pure numbers stay native: {sp}");
+    }
+
+    // Param-read hoisting redemption tests (pure ESTree transform — reads
+    // no compilation statics, so fully order-proof). Builders below.
+    fn num_read(p: &str) -> Expr {
+        Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![Expr::Identifier { name: p.to_string() }],
+                optional: false,
+            }),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        }
+    }
+    fn big_read(p: &str) -> Expr {
+        Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "BigInt".to_string(),
+            }),
+            arguments: vec![Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(Expr::Identifier { name: p.to_string() }),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            }],
+            optional: false,
+        }
+    }
+    fn expr_stmt(e: Expr) -> Stmt {
+        Stmt::ExpressionStatement { expression: e }
+    }
+    fn arrow_of(params: &[&str], body: Vec<Stmt>) -> Stmt {
+        Stmt::ExpressionStatement {
+            expression: Expr::ArrowFunctionExpression {
+                params: params
+                    .iter()
+                    .map(|p| Expr::Identifier { name: p.to_string() })
+                    .collect(),
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body })),
+                expression: false,
+                r#async: false,
+            },
+        }
+    }
+    fn run_hoist(stmts: Vec<Stmt>) -> crate::estree::Program {
+        hoist_param_reads(crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body: stmts,
+        })
+    }
+
+    #[test]
+    fn hoist_repeated_number_read_to_entry_const() {
+        let prog = run_hoist(vec![arrow_of(
+            &["p1"],
+            vec![expr_stmt(num_read("p1")), expr_stmt(num_read("p1"))],
+        )]);
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("__p1n"), "entry const declared: {s}");
+        assert!(!s.contains("Number(p1)"), "reads replaced: {s}");
+    }
+
+    #[test]
+    fn hoist_bigint_read_to_entry_const() {
+        let prog = run_hoist(vec![arrow_of(
+            &["p1"],
+            vec![expr_stmt(big_read("p1")), expr_stmt(big_read("p1"))],
+        )]);
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("__p1b"), "bigint const declared: {s}");
+    }
+
+    #[test]
+    fn hoist_refuses_writes_single_use_and_shadow() {
+        // write to p1 → no hoist (would stale the const)
+        let prog = run_hoist(vec![arrow_of(
+            &["p1"],
+            vec![
+                expr_stmt(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(Expr::Identifier {
+                        name: "p1".to_string(),
+                    }),
+                    right: Box::new(num_read("p1")),
+                }),
+                expr_stmt(num_read("p1")),
+            ],
+        )]);
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(!s.contains("__p1n"), "write refuses hoist: {s}");
+        // single occurrence → no hoist (not worth a const)
+        let prog = run_hoist(vec![arrow_of(&["p1"], vec![expr_stmt(num_read("p1"))])]);
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(!s.contains("__p1n"), "single use keeps inline form: {s}");
+        // nested shadowing binding → no hoist for that param
+        let prog = run_hoist(vec![arrow_of(
+            &["p1"],
+            vec![
+                expr_stmt(num_read("p1")),
+                Stmt::VariableDeclaration {
+                    kind: "let",
+                    declarations: vec![VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier {
+                            name: "p1".to_string(),
+                        },
+                        init: Some(Expr::Literal {
+                            value: serde_json::Value::from(0),
+                            raw: None,
+                            regex: None,
+                        }),
+                    }],
+                },
+                expr_stmt(num_read("p1")),
+            ],
+        )]);
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(!s.contains("__p1n"), "shadowing refuses hoist: {s}");
+    }
+
+    // ── native-array migration ──
+    fn s_lit(s: &str) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::String(s.to_string()),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn n_lit(n: i64) -> Expr {
+        Expr::Literal {
+            value: serde_json::Value::from(n),
+            raw: None,
+            regex: None,
+        }
+    }
+    fn sh2_call(func: &str, args: Vec<Expr>) -> Expr {
+        Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: func.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: args,
+            optional: false,
+        }
+    }
+    fn arr_init(name: &str) -> Stmt {
+        expr_stmt(sh2_call(
+            "setArray",
+            vec![s_lit(name), Expr::ArrayExpression { elements: vec![] }],
+        ))
+    }
+    fn arr_append(name: &str, els: Vec<Expr>) -> Stmt {
+        expr_stmt(sh2_call(
+            "setArrayAppend",
+            vec![
+                s_lit(name),
+                Expr::ArrayExpression {
+                    elements: els.into_iter().map(Some).collect(),
+                },
+            ],
+        ))
+    }
+    fn arr_join(name: &str) -> Expr {
+        sh2_call("sortedIntJoin", vec![s_lit(name)])
+    }
+    fn migrate_top(body: Vec<Stmt>) -> String {
+        let mut prog = crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body,
+        };
+        let bound = hoist_module_bound(&prog.body).unwrap_or_default();
+        array_migrate_program(&mut prog, &bound);
+        serde_json::to_string(&prog).unwrap()
+    }
+
+    #[test]
+    fn array_str_mentions_shapes() {
+        assert!(array_str_mentions("factors", "factors"));
+        assert!(array_str_mentions("factors[0]", "factors"));
+        assert!(array_str_mentions("ref=factors", "factors"));
+        assert!(array_str_mentions("my factors list", "factors"));
+        assert!(!array_str_mentions("factors2", "factors"));
+        assert!(!array_str_mentions("myfactors", "factors"));
+        assert!(!array_str_mentions("other", "factors"));
+        assert!(!array_str_mentions("", "factors"));
+    }
+
+    #[test]
+    fn array_valid_const_name_shapes() {
+        assert!(array_valid_const_name("factors"));
+        assert!(array_valid_const_name("_i"));
+        assert!(!array_valid_const_name("if"));
+        assert!(!array_valid_const_name("this"));
+        assert!(!array_valid_const_name("sh2"));
+        assert!(!array_valid_const_name("Number"));
+        assert!(!array_valid_const_name("Math"));
+        assert!(!array_valid_const_name("a-b"));
+        assert!(!array_valid_const_name(""));
+        assert!(!array_valid_const_name("0abc"));
+    }
+
+    #[test]
+    fn array_str_write_classifies() {
+        assert_eq!(array_str_write("i=1", "i"), (true, true));
+        assert_eq!(array_str_write("i = -5", "i"), (true, true));
+        assert_eq!(array_str_write("i++", "i"), (true, true));
+        assert_eq!(array_str_write("i--", "i"), (true, true));
+        assert_eq!(array_str_write("i=1; i<n; i++", "i"), (true, true));
+        assert_eq!(array_str_write("i=$(cmd)", "i").1, false);
+        assert_eq!(array_str_write("i=x", "i").1, false);
+        assert_eq!(array_str_write("i+=1", "i").1, false);
+        assert_eq!(array_str_write("i=1+2", "i").1, false);
+        assert_eq!(array_str_write("i<n", "i"), (false, true));
+        assert_eq!(array_str_write("i==1", "i"), (false, true));
+        assert_eq!(array_str_write("j=1", "i"), (false, true));
+        assert_eq!(array_str_write("int(x)", "i"), (false, true));
+    }
+
+    #[test]
+    fn array_elem_inert_shapes() {
+        let counters: HashMap<String, bool> =
+            [("i".to_string(), true)].into_iter().collect();
+        let dead: HashSet<String> = HashSet::new();
+        assert!(array_elem_inert(&n_lit(5), &counters, &dead));
+        assert!(array_elem_inert(&s_lit("abc"), &counters, &dead));
+        assert!(!array_elem_inert(&s_lit("a$b"), &counters, &dead));
+        assert!(!array_elem_inert(&s_lit("a`b"), &counters, &dead));
+        assert!(array_elem_inert(
+            &Expr::Identifier { name: "i".to_string() },
+            &counters,
+            &dead
+        ));
+        assert!(!array_elem_inert(
+            &Expr::Identifier { name: "x".to_string() },
+            &counters,
+            &dead
+        ));
+        assert!(array_elem_inert(
+            &Expr::CallExpression {
+                callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                arguments: vec![Expr::Identifier { name: "x".to_string() }],
+                optional: false,
+            },
+            &counters,
+            &dead
+        ));
+        assert!(!array_elem_inert(
+            &sh2_call("getVar", vec![s_lit("x")]),
+            &counters,
+            &dead
+        ));
+    }
+
+    #[test]
+    fn array_migrates_closed_append_join() {
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(s.contains("\"const\""), "const inserted: {s}");
+        assert!(s.contains("\"factors\""), "binding named: {s}");
+        assert!(s.contains("\"push\""), "push rewritten: {s}");
+        assert!(!s.contains("setArray"), "store init gone: {s}");
+        assert!(!s.contains("setArrayAppend"), "store append gone: {s}");
+        assert!(!s.contains("sortedIntJoin"), "store join gone: {s}");
+        assert!(s.contains("__items"), "join inlined: {s}");
+        assert!(s.contains("__vals"), "join inlined: {s}");
+        assert!(s.contains("__order"), "join inlined: {s}");
+        assert!(s.contains("__out"), "join inlined: {s}");
+    }
+
+    #[test]
+    fn array_refuses_assoc() {
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            expr_stmt(sh2_call("assocSet", vec![s_lit("factors"), s_lit("k")])),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(s.contains("setArray"), "assoc touch refuses: {s}");
+    }
+
+    #[test]
+    fn array_refuses_dynamic() {
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            expr_stmt(sh2_call(
+                "getVar",
+                vec![Expr::Identifier { name: "x".to_string() }]
+            )),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(s.contains("setArray"), "dynamic read refuses: {s}");
+    }
+
+    #[test]
+    fn array_refuses_indexed_write() {
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            expr_stmt(sh2_call("setArray", vec![s_lit("factors[0]"), n_lit(9)])),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(
+            s.contains("setArrayAppend"),
+            "bracket-name write refuses: {s}"
+        );
+    }
+
+    #[test]
+    fn array_refuses_live_element() {
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append(
+                "factors",
+                vec![sh2_call("getVar", vec![s_lit("x")])],
+            ),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(s.contains("setArray"), "live element refuses: {s}");
+    }
+
+    #[test]
+    fn array_migrates_nonempty_inert_init() {
+        // v2: non-empty inits migrate when every element is pure AND
+        // inert (Str literals are pushed values, not store names).
+        let s = migrate_top(vec![
+            expr_stmt(sh2_call(
+                "setArray",
+                vec![
+                    s_lit("factors"),
+                    Expr::ArrayExpression {
+                        elements: vec![Some(s_lit("a")), Some(s_lit("b"))],
+                    },
+                ],
+            )),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(!s.contains("setArray"), "inert init migrates: {s}");
+        assert!(s.contains("\"a\""), "element preserved: {s}");
+    }
+
+    #[test]
+    fn array_refuses_live_init_element() {
+        // A store read as an init element (may hold live syntax) is
+        // impure AND non-inert — refuses.
+        let s = migrate_top(vec![
+            expr_stmt(sh2_call(
+                "setArray",
+                vec![
+                    s_lit("factors"),
+                    Expr::ArrayExpression {
+                        elements: vec![Some(sh2_call("getVar", vec![s_lit("x")]))],
+                    },
+                ],
+            )),
+            Stmt::ReturnStatement {
+                argument: Some(arr_join("factors")),
+            },
+        ]);
+        assert!(s.contains("setArray"), "live init element refuses: {s}");
+    }
+
+    #[test]
+    fn array_migrates_literal_index_reads() {
+        // init + literal-key arrayIndex reads → native bounds-checked
+        // reads; arrayLen → .length; arrayItems → [...N].
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            expr_stmt(sh2_call("arrayIndex", vec![s_lit("factors"), s_lit("0")])),
+            expr_stmt(sh2_call("arrayLen", vec![s_lit("factors")])),
+            expr_stmt(sh2_call("arrayItems", vec![s_lit("factors")])),
+        ]);
+        assert!(!s.contains("arrayIndex"), "index read migrated: {s}");
+        assert!(!s.contains("arrayLen"), "len migrated: {s}");
+        assert!(!s.contains("arrayItems"), "items migrated: {s}");
+        assert!(s.contains("\"length\""), "native length: {s}");
+        assert!(s.contains("SpreadElement"), "native items: {s}");
+    }
+
+    #[test]
+    fn array_refuses_dynamic_index_read() {
+        // A dynamic arrayIndex key needs evalArith (abort channel) —
+        // refuses.
+        let s = migrate_top(vec![
+            arr_init("factors"),
+            arr_append("factors", vec![n_lit(1)]),
+            expr_stmt(sh2_call(
+                "arrayIndex",
+                vec![s_lit("factors"), Expr::Identifier { name: "i".to_string() }],
+            )),
+        ]);
+        assert!(s.contains("arrayIndex"), "dynamic key refuses: {s}");
+    }
+
+    // ── temp-roundtrip fold + idiv peephole ──
+    fn setvar_stmt(name: &str, value: Expr) -> Stmt {
+        expr_stmt(sh2_call("setVar", vec![s_lit(name), value]))
+    }
+    fn temp_read(name: &str) -> Expr {
+        // `(Number(sh2.vars.T ?? (process.env.T ?? "")) || 0) + 0`
+        let vars_read = Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                property: Box::new(Expr::Identifier { name: "vars".to_string() }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier { name: name.to_string() }),
+            computed: false,
+            optional: false,
+        };
+        let env_read = Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "process".to_string() }),
+                property: Box::new(Expr::Identifier { name: "env".to_string() }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier { name: name.to_string() }),
+            computed: false,
+            optional: false,
+        };
+        let fallback = Expr::LogicalExpression {
+            operator: "??".to_string(),
+            left: Box::new(vars_read),
+            right: Box::new(Expr::LogicalExpression {
+                operator: "??".to_string(),
+                left: Box::new(env_read),
+                right: Box::new(s_lit("")),
+            }),
+        };
+        let num = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+            arguments: vec![fallback],
+            optional: false,
+        };
+        let or0 = Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(num),
+            right: Box::new(n_lit(0)),
+        };
+        Expr::BinaryExpression {
+            operator: "+".to_string(),
+            left: Box::new(or0),
+            right: Box::new(n_lit(0)),
+        }
+    }
+    fn assign_stmt(lhs: &str, rhs: Expr) -> Stmt {
+        expr_stmt(Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(Expr::Identifier { name: lhs.to_string() }),
+            right: Box::new(rhs),
+        })
+    }
+    fn fold_top(body: Vec<Stmt>) -> String {
+        let mut prog = crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body,
+        };
+        fold_temp_roundtrips_program(&mut prog);
+        serde_json::to_string(&prog).unwrap()
+    }
+    fn idiv_top(body: Vec<Stmt>) -> String {
+        let mut prog = crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body,
+        };
+        peephole_idiv(&mut prog.body);
+        serde_json::to_string(&prog).unwrap()
+    }
+
+    #[test]
+    fn temp_fold_roundtrip() {
+        // setVar("T", E) + Tv = read(T) → Tv = (Number(E)||0)+0, setVar gone.
+        let s = fold_top(vec![
+            setvar_stmt("T", Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "Math".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "trunc".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![Expr::Identifier { name: "x".to_string() }],
+                    optional: false,
+                }),
+                right: Box::new(n_lit(1)),
+            }),
+            assign_stmt("Tv", temp_read("T")),
+        ]);
+        assert!(!s.contains("setVar"), "setVar folded: {s}");
+        assert!(!s.contains("\"vars\""), "store read folded: {s}");
+        assert!(s.contains("\"trunc\""), "value preserved: {s}");
+    }
+
+    #[test]
+    fn temp_fold_refuses_multi_read() {
+        // Two reads of T → not a single-read temp → refuse.
+        let s = fold_top(vec![
+            setvar_stmt("T", n_lit(5)),
+            assign_stmt("Tv", temp_read("T")),
+            assign_stmt("Tv2", temp_read("T")),
+        ]);
+        assert!(s.contains("setVar"), "multi-read refuses: {s}");
+    }
+
+    #[test]
+    fn temp_fold_refuses_impure_value() {
+        // A user call as the value (may have side effects) refuses.
+        let s = fold_top(vec![
+            setvar_stmt("T", sh2_call("getVar", vec![s_lit("x")])),
+            assign_stmt("Tv", temp_read("T")),
+        ]);
+        assert!(s.contains("setVar"), "impure value refuses: {s}");
+    }
+
+    #[test]
+    fn idiv_peephole_number_operands() {
+        // sh2.idiv(Number(p)||0, i) with i a positive counter → Math.trunc.
+        let s = idiv_top(vec![
+            Stmt::VariableDeclaration {
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier { name: "p1n".to_string() },
+                    init: Some(Expr::LogicalExpression {
+                        operator: "||".to_string(),
+                        left: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                            arguments: vec![Expr::Identifier { name: "p".to_string() }],
+                            optional: false,
+                        }),
+                        right: Box::new(n_lit(0)),
+                    }),
+                }],
+                kind: "const",
+            },
+            assign_stmt("i", n_lit(1)),
+            expr_stmt(sh2_call("idiv", vec![Expr::Identifier { name: "p1n".to_string() }, Expr::Identifier { name: "i".to_string() }])),
+        ]);
+        assert!(!s.contains("\"idiv\""), "idiv peepholed: {s}");
+        assert!(s.contains("\"trunc\""), "Math.trunc emitted: {s}");
+    }
+
+    #[test]
+    fn idiv_refuses_unknown_divisor() {
+        // Divisor not provably non-zero → keep the helper.
+        let s = idiv_top(vec![
+            expr_stmt(sh2_call(
+                "idiv",
+                vec![n_lit(10), Expr::Identifier { name: "d".to_string() }],
+            )),
+        ]);
+        assert!(s.contains("\"idiv\""), "unknown divisor keeps helper: {s}");
+    }
+
+    // ── sortedJoinMerge pair migration ──
+    fn arr_merge_stmt(a: &str, b: &str) -> Expr {
+        sh2_call("sortedJoinMerge", vec![s_lit(a), s_lit(b)])
+    }
+    fn migrate_merge_top(body: Vec<Stmt>) -> String {
+        let mut prog = crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body,
+        };
+        let bound = hoist_module_bound(&prog.body).unwrap_or_default();
+        array_migrate_program(&mut prog, &bound);
+        serde_json::to_string(&prog).unwrap()
+    }
+
+    #[test]
+    fn array_migrates_join_merge_pair() {
+        // setArray A + setArray B + appends + sortedJoinMerge → both
+        // consts + push + inline merge IIFE (no sh2 calls).
+        let s = migrate_merge_top(vec![
+            arr_init("factors"),
+            arr_init("factors__big"),
+            arr_append("factors", vec![n_lit(1)]),
+            arr_append("factors", vec![n_lit(2)]),
+            Stmt::ReturnStatement {
+                argument: Some(arr_merge_stmt("factors", "factors__big")),
+            },
+        ]);
+        assert!(!s.contains("setArray"), "both inits migrated: {s}");
+        assert!(!s.contains("setArrayAppend"), "appends migrated: {s}");
+        assert!(!s.contains("sortedJoinMerge"), "merge inlined: {s}");
+        assert!(s.contains("\"push\""), "native push: {s}");
+        assert!(s.contains("__sItems"), "merge IIFE small: {s}");
+        assert!(s.contains("__bItems"), "merge IIFE big: {s}");
+        assert!(s.contains("__sVals"), "merge IIFE sVals: {s}");
+        assert!(s.contains("__bVals"), "merge IIFE bVals: {s}");
+        assert!(s.contains("__sOrder"), "merge IIFE sOrder: {s}");
+        assert!(s.contains("__bOrder"), "merge IIFE bOrder: {s}");
+    }
+
+    #[test]
+    fn array_refuses_join_merge_partner_not_migratable() {
+        // A partner with a live element (impure) refuses the pair.
+        let s = migrate_merge_top(vec![
+            arr_init("factors"),
+            expr_stmt(sh2_call(
+                "setArray",
+                vec![
+                    s_lit("factors__big"),
+                    Expr::ArrayExpression {
+                        elements: vec![Some(sh2_call("getVar", vec![s_lit("x")]))],
+                    },
+                ],
+            )),
+            arr_append("factors", vec![n_lit(1)]),
+            Stmt::ReturnStatement {
+                argument: Some(arr_merge_stmt("factors", "factors__big")),
+            },
+        ]);
+        assert!(
+            s.contains("setArray"),
+            "non-migratable partner refuses pair: {s}"
+        );
+    }
+}
+
 mod const_analysis_tests {
     use super::*;
 
@@ -41534,7 +49357,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let src = "x=1\nwhile [ $x -lt 10000000000000000 ]; do x=$((x * 2)); done";
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
-        let (int_vars, slots) = analyze_true64(&prog);
+        let (int_vars, slots, _) = analyze_true64(&prog);
         assert!(int_vars.contains("x"), "x must be out-of-±2^53 (int_vars)");
         assert_eq!(slots.get("x"), Some(&0), "x must be slot 0");
         // a function-local accumulator is excluded from slots (the `let
@@ -41542,7 +49365,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let src2 = "f() { local i=3; while [ $i -lt 10 ]; do i=$((i + 2)); done; }";
         let cmds2 = crate::Parser::new(src2).parse().expect("parse");
         let prog2 = ast_to_ir(&cmds2);
-        let (_iv2, slots2) = analyze_true64(&prog2);
+        let (_iv2, slots2, _) = analyze_true64(&prog2);
         assert!(!slots2.contains_key("i"), "function-local i must not be slotted");
     }
 

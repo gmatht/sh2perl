@@ -37,7 +37,14 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             if func == "pipeline" {
                 if let Some(text) = recognize_pipeline_wc_l(args) {
                     if let Some(ir) = planner::build_wc_l(text, &cap) {
-                        *stmt = IrStmt::Expr(ir);
+                        // `wc -l` PRINTS the count — wrap the value in an
+                        // Output statement (newline-terminated), not a bare
+                        // Expr (which would discard it).
+                        *stmt = IrStmt::Output {
+                            value: ir,
+                            newline: true,
+                            target: None,
+                        };
                         changed = true;
                     }
                 }
