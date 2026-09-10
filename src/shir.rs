@@ -10477,8 +10477,7 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
 /// may read a var an inner write changes, but the common shapes are
 /// sequential). The expression's own VALUE is arith_range's job; this is
 /// the var's post-statement state.
-fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {
-    match a {
+fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    match a {
         ArithAst::Assign { var, op, rhs } => {
             let r = arith_range(rhs, state);
             let next: Range = match op.as_str() {
@@ -20727,6 +20726,29 @@ fn array_join_iife(arr: Expr, bigint: bool) -> Expr {
             r#async: false,
         }
     }
+    fn arrow2(p1: &str, p2: &str, body: Expr) -> Expr {
+        Expr::ArrowFunctionExpression {
+            params: vec![ident(p1), ident(p2)],
+            body: ArrowBody::Expr(Box::new(body)),
+            expression: true,
+            r#async: false,
+        }
+    }
+    fn bin(op: &str, l: Expr, r: Expr) -> Expr {
+        Expr::BinaryExpression {
+            left: Box::new(l),
+            operator: op.to_string(),
+            right: Box::new(r),
+        }
+    }
+    fn cmember(obj: Expr, prop: Expr) -> Expr {
+        Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(prop),
+            computed: true,
+            optional: false,
+        }
+    }
     fn const_decl(n: &str, init: Expr) -> Stmt {
         Stmt::VariableDeclaration {
             declarations: vec![VariableDeclarator {
@@ -20850,132 +20872,47 @@ fn array_join_iife(arr: Expr, bigint: bool) -> Expr {
             r#async: false,
         }],
     );
-    // Dedup + collect: int compares ITEMS (strings), bigint compares
-    // VALS (BigInts) — the two helpers differ, replicated exactly.
-    let (dedup_lhs, push_arg) = if bigint {
-        (
-            Expr::MemberExpression {
-                object: Box::new(ident("__vals")),
-                property: Box::new(ident("__i")),
-                computed: true,
-                optional: false,
-            },
-            ident("__i"),
-        )
+    // Dedup + collect via a single filter+map+join over the sorted index
+    // order (the runtime's loop, expressed functionally): keep the first
+    // index, or any index whose value differs from the previous in sorted
+    // order. int compares ITEMS (strings), bigint compares VALS (BigInts)
+    // — the two helpers differ, replicated exactly.
+    let dedup_lhs = if bigint {
+        cmember(ident("__vals"), ident("__i"))
     } else {
-        (
-            Expr::MemberExpression {
-                object: Box::new(ident("__items")),
-                property: Box::new(ident("__i")),
-                computed: true,
-                optional: false,
-            },
-            Expr::MemberExpression {
-                object: Box::new(ident("__items")),
-                property: Box::new(ident("__i")),
-                computed: true,
-                optional: false,
-            },
-        )
+        cmember(ident("__items"), ident("__i"))
     };
     let dedup_rhs = if bigint {
-        Expr::MemberExpression {
-            object: Box::new(ident("__vals")),
-            property: Box::new(Expr::MemberExpression {
-                object: Box::new(ident("__out")),
-                property: Box::new(Expr::BinaryExpression {
-                    left: Box::new(member(ident("__out"), "length")),
-                    operator: "-".to_string(),
-                    right: Box::new(num_lit(1)),
-                }),
-                computed: true,
-                optional: false,
-            }),
-            computed: true,
-            optional: false,
-        }
-    } else {
-        Expr::MemberExpression {
-            object: Box::new(ident("__out")),
-            property: Box::new(Expr::BinaryExpression {
-                left: Box::new(member(ident("__out"), "length")),
-                operator: "-".to_string(),
-                right: Box::new(num_lit(1)),
-            }),
-            computed: true,
-            optional: false,
-        }
-    };
-    let collect_loop = Stmt::ForOfStatement {
-        left: Box::new(Stmt::VariableDeclaration {
-            declarations: vec![VariableDeclarator {
-                type_: "VariableDeclarator",
-                id: ident("__i"),
-                init: None,
-            }],
-            kind: "const",
-        }),
-        right: ident("__order"),
-        body: Box::new(Stmt::BlockStatement {
-            body: vec![Stmt::IfStatement {
-                test: Expr::LogicalExpression {
-                    left: Box::new(Expr::BinaryExpression {
-                        left: Box::new(member(ident("__out"), "length")),
-                        operator: "===".to_string(),
-                        right: Box::new(num_lit(0)),
-                    }),
-                    operator: "||".to_string(),
-                    right: Box::new(Expr::BinaryExpression {
-                        left: Box::new(dedup_lhs),
-                        operator: "!==".to_string(),
-                        right: Box::new(dedup_rhs),
-                    }),
-                },
-                consequent: Box::new(Stmt::BlockStatement {
-                    body: vec![Stmt::ExpressionStatement {
-                        expression: call(member(ident("__out"), "push"), vec![push_arg]),
-                    }],
-                }),
-                alternate: None,
-            }],
-        }),
-    };
-    // `out.map((i) => items[i]).join(', ')` (int) vs
-    // `out.map((i) => items[i]).join(', ')` — both map INDICES through
-    // items (bigint pushes indices, int pushes item strings directly;
-    // the final projection differs — replicate exactly).
-    let result = if bigint {
-        call(
-            member(
-                call(
-                    member(ident("__out"), "map"),
-                    vec![arrow1(
-                        "i",
-                        Expr::MemberExpression {
-                            object: Box::new(ident("__items")),
-                            property: Box::new(ident("i")),
-                            computed: true,
-                            optional: false,
-                        },
-                    )],
-                ),
-                "join",
-            ),
-            vec![str_lit(", ")],
+        cmember(
+            ident("__vals"),
+            cmember(ident("__order"), bin("-", ident("__k"), num_lit(1))),
         )
     } else {
-        // int pushes item strings — `__out` already holds strings.
-        call(member(ident("__out"), "join"), vec![str_lit(", ")])
+        cmember(
+            ident("__items"),
+            cmember(ident("__order"), bin("-", ident("__k"), num_lit(1))),
+        )
     };
+    let keep = bin(
+        "||",
+        bin("===", ident("__k"), num_lit(0)),
+        bin("!==", dedup_lhs, dedup_rhs),
+    );
+    let result = call(
+        member(
+            call(
+                member(call(member(ident("__order"), "filter"), vec![arrow2("__i", "__k", keep)]), "map"),
+                vec![arrow1("__i", cmember(ident("__items"), ident("__i")))],
+            ),
+            "join",
+        ),
+        vec![str_lit(", ")],
+    );
     let iife_body = Stmt::BlockStatement {
         body: vec![
             const_decl("__items", items),
             const_decl("__vals", vals),
             const_decl("__order", order),
-            const_decl("__out", Expr::ArrayExpression {
-                elements: vec![],
-            }),
-            collect_loop,
             Stmt::ReturnStatement {
                 argument: Some(result),
             },
@@ -23612,6 +23549,233 @@ fn peephole_idiv(stmts: &mut Vec<Stmt>) {
     }
 }
 
+/// `arithEval` wrapper removal: `sh2.arithEval(() => E)` → `E` when E is
+/// provably non-aborting (no division/modulo by a possibly-zero divisor).
+/// The wrapper exists to catch the zero-divisor abort; when every divisor
+/// is provably non-zero (Number literal, positive-literal loop counter),
+/// the wrapper is redundant and its string coercion is a no-op for the
+/// finite result. Post-emission ESTree transform.
+fn peephole_arith_eval(stmts: &mut Vec<Stmt>) {
+    let (nums, nonzero) = collect_number_bindings(stmts);
+    fn is_nonzero(e: &Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
+        match e {
+            Expr::Literal { value, .. } => value.as_i64().map(|n| n != 0).unwrap_or(false),
+            Expr::Identifier { name } => nonzero.contains(name),
+            _ => false,
+        }
+    }
+    fn non_aborting(e: &Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
+        match e {
+            Expr::BinaryExpression {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                if operator == "/" || operator == "%" {
+                    if !is_nonzero(right, nums, nonzero) {
+                        return false;
+                    }
+                }
+                non_aborting(left, nums, nonzero) && non_aborting(right, nums, nonzero)
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                non_aborting(callee, nums, nonzero)
+                    && arguments.iter().all(|a| non_aborting(a, nums, nonzero))
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                non_aborting(object, nums, nonzero)
+                    && (!computed || non_aborting(property, nums, nonzero))
+            }
+            Expr::UnaryExpression { argument, .. } => non_aborting(argument, nums, nonzero),
+            Expr::Identifier { .. } | Expr::Literal { .. } => true,
+            _ => false,
+        }
+    }
+    fn expr(e: &mut Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) {
+        // `sh2.arithEval(() => E)` → `E` when E is provably non-aborting.
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "arithEval")
+                {
+                    if let [Expr::ArrowFunctionExpression { body, .. }] = arguments.as_slice() {
+                        if let ArrowBody::Expr(inner) = body {
+                            if non_aborting(inner, nums, nonzero) {
+                                *e = inner.as_ref().clone();
+                                expr(e, nums, nonzero);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match e {
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, nums, nonzero);
+                for a in arguments.iter_mut() {
+                    expr(a, nums, nonzero);
+                }
+            }
+            Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } => {
+                expr(object, nums, nonzero);
+                if *computed {
+                    expr(property, nums, nonzero);
+                }
+            }
+            Expr::BinaryExpression { left, right, .. }
+            | Expr::LogicalExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, nums, nonzero);
+                expr(right, nums, nonzero);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, nums, nonzero);
+                expr(consequent, nums, nonzero);
+                expr(alternate, nums, nonzero);
+            }
+            Expr::UnaryExpression { argument, .. }
+            | Expr::SpreadElement { argument }
+            | Expr::AwaitExpression { argument, .. } => expr(argument, nums, nonzero),
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => stmt(b, nums, nonzero),
+                ArrowBody::Expr(x) => expr(x, nums, nonzero),
+            },
+            Expr::FunctionExpression { body, .. } => stmt(body, nums, nonzero),
+            Expr::ObjectExpression { properties, .. } => {
+                for prop in properties.iter_mut() {
+                    if prop.computed {
+                        expr(&mut prop.key, nums, nonzero);
+                    }
+                    expr(&mut prop.value, nums, nonzero);
+                }
+            }
+            Expr::ArrayExpression { elements, .. } => {
+                for el in elements.iter_mut().flatten() {
+                    expr(el, nums, nonzero);
+                }
+            }
+            Expr::TemplateLiteral { expressions, .. }
+            | Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() {
+                    expr(x, nums, nonzero);
+                }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, nums, nonzero);
+                for a in arguments.iter_mut() {
+                    expr(a, nums, nonzero);
+                }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn stmt(s: &mut Stmt, nums: &HashSet<String>, nonzero: &HashSet<String>) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, nums, nonzero),
+            Stmt::BlockStatement { body } => {
+                for b in body.iter_mut() {
+                    stmt(b, nums, nonzero);
+                }
+            }
+            Stmt::IfStatement {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr(test, nums, nonzero);
+                stmt(consequent, nums, nonzero);
+                if let Some(a) = alternate {
+                    stmt(a, nums, nonzero);
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                expr(test, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ForStatement {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                stmt(init, nums, nonzero);
+                expr(test, nums, nonzero);
+                expr(update, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, nums, nonzero);
+                expr(right, nums, nonzero);
+                stmt(body, nums, nonzero);
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(e) = argument {
+                    expr(e, nums, nonzero);
+                }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, nums, nonzero),
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt(block, nums, nonzero);
+                if let Some(h) = handler {
+                    stmt(&mut h.body, nums, nonzero);
+                }
+                if let Some(f) = finalizer {
+                    stmt(f, nums, nonzero);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, nums, nonzero);
+                for c in cases.iter_mut() {
+                    if let Some(t) = &mut c.test {
+                        expr(t, nums, nonzero);
+                    }
+                    for b in c.consequent.iter_mut() {
+                        stmt(b, nums, nonzero);
+                    }
+                }
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations.iter_mut() {
+                    if let Some(init) = &mut d.init {
+                        expr(init, nums, nonzero);
+                    }
+                }
+            }
+            Stmt::FunctionDeclaration { body, .. } => stmt(body, nums, nonzero),
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts.iter_mut() {
+        stmt(s, &nums, &nonzero);
+    }
+}
+
 /// Temp-roundtrip fold driver: walk every function body (and the top
 /// scope) and fold `setVar("T", E)` + `Tv = read(T)` pairs. Runs after
 /// the array migration (both are post-emission ESTree transforms).
@@ -23692,6 +23856,7 @@ fn fold_temp_roundtrips_program(program: &mut Program) {
             Stmt::BlockStatement { body } => {
                 fold_temp_roundtrips(body);
                 peephole_idiv(body);
+                peephole_arith_eval(body);
                 for b in body.iter_mut() {
                     stmt(b);
                 }
@@ -23770,6 +23935,7 @@ fn fold_temp_roundtrips_program(program: &mut Program) {
     }
     fold_temp_roundtrips(&mut program.body);
     peephole_idiv(&mut program.body);
+    peephole_arith_eval(&mut program.body);
     for s in program.body.iter_mut() {
         stmt(s);
     }
@@ -48686,7 +48852,7 @@ mod lowering_shape_tests {
         assert!(s.contains("__items"), "join inlined: {s}");
         assert!(s.contains("__vals"), "join inlined: {s}");
         assert!(s.contains("__order"), "join inlined: {s}");
-        assert!(s.contains("__out"), "join inlined: {s}");
+        assert!(s.contains("filter"), "join inlined (filter+map+join): {s}");
     }
 
     #[test]
@@ -49052,6 +49218,82 @@ mod lowering_shape_tests {
             s.contains("setArray"),
             "non-migratable partner refuses pair: {s}"
         );
+    }
+
+    // ── arithEval wrapper removal ──
+    fn arith_eval_expr(inner: Expr) -> Expr {
+        sh2_call(
+            "arithEval",
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Expr(Box::new(inner)),
+                expression: true,
+                r#async: false,
+            }],
+        )
+    }
+    fn peephole_arith_top(body: Vec<Stmt>) -> String {
+        let mut prog = crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body,
+        };
+        peephole_arith_eval(&mut prog.body);
+        serde_json::to_string(&prog).unwrap()
+    }
+
+    #[test]
+    fn arith_eval_removed_for_nonzero_divisor() {
+        // `sh2.arithEval(() => Math.trunc(p1n / i))` with i a positive
+        // counter → `Math.trunc(p1n / i)` (wrapper gone).
+        let s = peephole_arith_top(vec![
+            Stmt::VariableDeclaration {
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier { name: "p1n".to_string() },
+                    init: Some(Expr::LogicalExpression {
+                        operator: "||".to_string(),
+                        left: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                            arguments: vec![Expr::Identifier { name: "p".to_string() }],
+                            optional: false,
+                        }),
+                        right: Box::new(n_lit(0)),
+                    }),
+                }],
+                kind: "const",
+            },
+            assign_stmt("i", n_lit(1)),
+            expr_stmt(arith_eval_expr(Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "Math".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "trunc".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![Expr::BinaryExpression {
+                    operator: "/".to_string(),
+                    left: Box::new(Expr::Identifier { name: "p1n".to_string() }),
+                    right: Box::new(Expr::Identifier { name: "i".to_string() }),
+                }],
+                optional: false,
+            })),
+        ]);
+        assert!(!s.contains("arithEval"), "wrapper removed: {s}");
+        assert!(s.contains("\"trunc\""), "inner preserved: {s}");
+    }
+
+    #[test]
+    fn arith_eval_kept_for_unknown_divisor() {
+        // Divisor not provably non-zero → keep the wrapper.
+        let s = peephole_arith_top(vec![expr_stmt(arith_eval_expr(
+            Expr::BinaryExpression {
+                operator: "/".to_string(),
+                left: Box::new(n_lit(10)),
+                right: Box::new(Expr::Identifier { name: "d".to_string() }),
+            },
+        ))]);
+        assert!(s.contains("arithEval"), "unknown divisor keeps wrapper: {s}");
     }
 }
 
