@@ -1115,6 +1115,32 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             *line = format!("{}{};", indent, &t[1..t.len() - 2]);
         }
     }
+    // P1 OOM policy: redirect every strdup through the checking
+    // _sh_xstrdup (fail-stop on allocation failure — never a NULL that
+    // flows to a print guard as empty output). Inserted here, after
+    // render and before trim_includes, and only when a call site
+    // exists: the helper is present iff used (no unused-function
+    // warning), the include trim sees the final text, and the #define
+    // lands after every #include (no header is emitted later) but
+    // before every use. The helper body calls (strdup) — parenthesized
+    // to exempt it from its own macro.
+    {
+        let full = r.out.join("\n");
+        if full.contains("strdup(") {
+            let pos = r.out.iter().rposition(|l| l.trim_start().starts_with("#include ")).map(|i| i + 1).unwrap_or(0);
+            let helper = vec![
+                "/* checked strdup (P1 OOM policy): fail-stop, never NULL-on-OOM */".to_string(),
+                "static char *_sh_xstrdup(const char *s) {".to_string(),
+                "  char *p = (strdup)(s);".to_string(),
+                "  if (s && !p) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }".to_string(),
+                "  return p;".to_string(),
+                "}".to_string(),
+                "#define strdup _sh_xstrdup".to_string(),
+                "".to_string(),
+            ];
+            r.out.splice(pos..pos, helper);
+        }
+    }
     // Only keep `#include`s whose symbols actually appear in the
     // emitted program (after the runtime trim removed helpers).
     r.trim_includes();
@@ -1883,7 +1909,8 @@ impl Render {
             self.emit("  _sh_badd(b, cap, \")\");");
             self.emit("}");
             self.emit("static void _sh_arr_set(char **a, size_t *len, size_t cap, long long i, const char *v) {");
-            self.emit("  if (i < 0 || i >= (long long)cap || !v) return;");
+            self.emit("  if (i < 0 || !v) return;");
+            self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             // strdup: the source may be a stack temp that dies when its
             // block closes (a capture/arith string in a loop body)
             self.emit("  a[i] = (char*)strdup(v);");
@@ -1898,6 +1925,7 @@ impl Render {
             self.emit("  for (size_t i = 0; i < *n; i++)");
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)strdup(val ? val : \"\"); return; }");
             self.emit("  if (*n < cap) { k[*n] = (char*)strdup(key); v[*n] = (char*)strdup(val ? val : \"\"); (*n)++; }");
+            self.emit("  else { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             self.emit("}");
             self.emit("static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {");
             self.emit("  if (!key) return \"\";");
@@ -11029,6 +11057,9 @@ impl Render {
             self.depth += 1;
         }
         let ev = self.value_c(elem);
+        // P1: the loop appends into a fixed [ARR_CAP] array — refuse
+        // past the cap instead of overflowing.
+        self.emit(&format!("if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
         self.emit(&format!("{id}[{id}_len++] = strdup((char*)({ev}));"));
         if cond.is_some() {
             self.depth -= 1;
@@ -11141,6 +11172,11 @@ impl Render {
                 if (func == "listVar" || func == "arrayItems")
                     && matches!(Self::str_arg(args, 0).as_deref(), Some("@"))
                 {
+                    // P1: the loop below writes {ai} + (argc-1) elements
+                    // into a fixed [ARR_CAP] array — refuse upfront.
+                    self.emit(&format!(
+                        "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                    ));
                     self.emit(&format!(
                         "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = strdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
                     ));
@@ -11167,6 +11203,11 @@ impl Render {
                         "static _sh_vbuf {t} = {{0, 0}}; static char **{t}_w = 0; static size_t {t}_wc = 0; _sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"
                     ));
                     self.emit(&format!("size_t _sn{t} = _sh_split({t}.p, &{t}_w, &{t}_wc);"));
+                    // P1: the loop below writes {ai} + _sn elements into
+                    // a fixed [ARR_CAP] array — refuse upfront.
+                    self.emit(&format!(
+                        "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                    ));
                     self.emit(&format!(
                         "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = strdup({t}_w[_sk{t}]);"
                     ));
@@ -11176,6 +11217,9 @@ impl Render {
                 }
             }
             let v = self.value_c(it);
+            // P1: {ai} is the running index into a fixed [ARR_CAP]
+            // array — refuse past the cap instead of overflowing.
+            self.emit(&format!("if ({ai} >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
             if self.int_arrays.contains(var) {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
@@ -11203,6 +11247,13 @@ impl Render {
             Some(IrExpr::Array(items)) => items.clone(),
             _ => vec![],
         };
+        // P1 OOM policy: the stores below write {id}[{id}_len ..] into a
+        // fixed [ARR_CAP] array with no per-store guard — one upfront
+        // check covers every arm (mpz/int/string) instead of silent
+        // overflow past the cap.
+        if !items.is_empty() {
+            self.emit(&format!("if ({id}_len + {} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
+        }
         for (i, it) in items.iter().enumerate() {
             // `arr[len + 0]` -> `arr[len]` (drop the +0 for the first)
             let idx = if i == 0 {
@@ -12416,7 +12467,7 @@ impl Render {
                         let t = self.value_c(target);
                         let strip = if striptail { "1" } else { "0" };
                         self.emit(&format!(
-                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len < {ARR_CAP}) {id}[{id}_len++] = strdup(_mfl.p); }} fclose(_mf); }} }}"
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[{id}_len++] = strdup(_mfl.p); }} fclose(_mf); }} }}"
                         ));
                         return;
                     }
@@ -13843,6 +13894,15 @@ impl Render {
             IrStmt::DeclareArray { var, elements, .. } => {
                 self.arrays.insert(var.clone());
                 let id = self.c_ident(var);
+                // P1: the literal indices are compile-time constants — a
+                // literal longer than the fixed [ARR_CAP] decl is a
+                // statically-known overflow, so refuse without emitting
+                // the stores.
+                if elements.len() > ARR_CAP {
+                    self.emit(&format!("{{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+                    self.emit(&format!("{id}_len = 0;"));
+                    return;
+                }
                 for (i, e) in elements.iter().enumerate() {
                     let v = self.value_c(e);
                     self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
@@ -20849,6 +20909,84 @@ mod tests {
         assert!(r.mathfunc_arith_c("arr[1]").is_none(), "subscript refused");
         assert!(r.mathfunc_arith_c("$?").is_none(), "$? refused");
         assert!(r.mathfunc_arith_c("unknownfn(2)").is_none(), "unknown call refused");
+    }
+
+    #[test]
+    fn p1_strdup_redirected_through_xstrdup() {
+        // P1 OOM policy: every strdup in the output must route through
+        // the checking _sh_xstrdup (fail-stop, never NULL-on-OOM that
+        // flows to a print guard as empty output). A capture+echo
+        // program has strdup sites; pure arithmetic has none.
+        let src = "x=$(echo hi); echo \"$x\"";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = shir_to_c(&prog);
+        assert!(out.contains("static char *_sh_xstrdup(const char *s) {"), "helper missing:\n{out}");
+        assert!(out.contains("#define strdup _sh_xstrdup"), "macro missing:\n{out}");
+        assert!(out.contains("(strdup)(s)"), "helper must call the real strdup:\n{out}");
+        assert!(out.contains("sh2c: out of memory"), "diagnostic missing:\n{out}");
+        let inc = out.find("#include <string.h>").expect("string.h kept");
+        let def = out.find("#define strdup _sh_xstrdup").unwrap();
+        let use_ = out.find("strdup((char*)").expect("a call site exists");
+        assert!(inc < def, "macro must follow the header");
+        assert!(def < use_, "macro must precede every use");
+        // no strdup sites → no helper, no macro (no dead code, and no
+        // risk to the include trim).
+        let src2 = "echo $((1+2))";
+        let cmds2 = crate::Parser::new(src2).parse().expect("parse");
+        let prog2 = crate::shir::ast_to_ir(&cmds2);
+        let out2 = shir_to_c(&prog2);
+        assert!(!out2.contains("_sh_xstrdup"), "helper emitted without a site:\n{out2}");
+        assert!(!out2.contains("#define strdup"), "macro emitted without a site:\n{out2}");
+    }
+
+    #[test]
+    fn p1_array_append_capacity_checked() {
+        // P1 OOM policy: an append into a fixed [ARR_CAP] array must
+        // refuse past the cap (fail-stop) instead of overflowing like
+        // the old factors[factors_len] store. The check must precede
+        // the store.
+        let src = "a=(1); a+=(2); echo \"${a[@]}\"";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = shir_to_c(&prog);
+        assert!(out.contains("capacity exceeded"), "no cap check:\n{out}");
+        assert!(out.contains("exit(127)"), "no fail-stop:\n{out}");
+        let chk = out.find("capacity exceeded").unwrap();
+        let sto = out.find("a_len + 1 > 1024").expect("append guard shape");
+        assert!(chk == sto || out[..chk].contains("a_len"), "check names the array");
+        // the guard precedes the length bump of the same append
+        let bump = out.find("++a_len").expect("append bump");
+        assert!(sto < bump, "guard must precede the store");
+    }
+
+    #[test]
+    fn p1_declare_array_over_cap_refuses() {
+        // P1 OOM policy: a literal longer than the fixed [ARR_CAP] decl
+        // is a statically-known overflow — refuse without emitting the
+        // stores.
+        let mut elems = Vec::new();
+        for i in 0..1025 {
+            elems.push(IrExpr::Str(i.to_string(), crate::ir::StrStyle::DoubleQuoted));
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::DeclareArray { var: "big".to_string(), sigil: None, elements: elems }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("capacity exceeded: big"), "no cap refusal:\n{out}");
+        assert!(out.contains("exit(127)"), "no fail-stop:\n{out}");
+        assert!(!out.contains("big[1024]"), "over-cap store emitted:\n{out}");
     }
 
     fn phase3_numeric_var_declares_numeric() {
