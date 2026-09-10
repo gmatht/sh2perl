@@ -24647,8 +24647,37 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         }
     }
     direct_sorted.sort();
+    // Track names already declared by the LIFTED loops above, so a
+    // store-only var that is ALSO lifted (e.g. loop counter `i`) does
+    // not get a DUPLICATE `let` (the duplicate's `null` init would
+    // shadow the numeric init and poison downstream value proofs).
+    // Store-only vars use their PLAIN names (they are variables, not
+    // functions — function-binding naming via direct_binding_name must
+    // not apply, or a plain-named var collides with its lifted decl).
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // LIFTED_NUMERIC and LIFTED_STRING loops above declare these; collect
+    // them by re-reading the emitted body (the loops push VariableDeclaration).
+    for st in &body {
+        if let Stmt::VariableDeclaration { declarations, .. } = st {
+            for d in declarations {
+                if let Expr::Identifier { name } = &d.id {
+                    declared.insert(name.clone());
+                }
+            }
+        }
+    }
     for name in direct_sorted {
-        let binding = direct_binding_name(name).expect("direct set is binding-valid");
+        // functions use binding names; store-only vars use plain names
+        let is_fn = direct_fns.contains(name);
+        let binding = if is_fn {
+            direct_binding_name(name).expect("direct set is binding-valid")
+        } else {
+            name.clone()
+        };
+        if declared.contains(&binding) {
+            continue;
+        }
+        declared.insert(binding.clone());
         body.push(Stmt::VariableDeclaration {
             kind: "let",
             declarations: vec![VariableDeclarator {
