@@ -3212,7 +3212,7 @@ impl Render {
                             Self::cstr(name)
                         )
                     };
-                    format!("(long long)atoll({v})")
+                    format!("atoll({v})")
                 }
             }
             ArithAst::Index { var, key } => {
@@ -3221,7 +3221,7 @@ impl Render {
                 self.need_sh = true;
                 let id = self.c_ident(var);
                 let k = self.arith(key);
-                format!("(long long)atoll(_sh_arr_get({id}, {id}_len, {k}))")
+                format!("atoll(_sh_arr_get({id}, {id}_len, {k}))")
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 // bash arithmetic is intmax_t (64-bit): a constant subtree
@@ -3287,7 +3287,7 @@ impl Render {
                 } else {
                     // a Str var: read the value, compute, write back —
                     // `atoll(y) += 2` would be an lvalue error
-                    let l = format!("(long long)atoll({})", self.store_read(var));
+                    let l = format!("atoll({})", self.store_read(var));
                     let r = self.arith(rhs);
                     let base = op.trim_end_matches('=');
                     let t = self.num_temp(&format!("({l} {base} {r})"));
@@ -4704,7 +4704,7 @@ impl Render {
                 if self.is_num(name) {
                     self.c_ident(name)
                 } else {
-                    format!("(long long)atoll({})", self.store_ref(name))
+                    format!("atoll({})", self.store_ref(name))
                 }
             }
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -4712,7 +4712,7 @@ impl Render {
                     if self.is_num(&name) {
                         self.c_ident(&name)
                     } else {
-                        format!("(long long)atoll({})", self.store_ref(&name))
+                        format!("atoll({})", self.store_ref(&name))
                     }
                 } else {
                     "0".into()
@@ -4720,9 +4720,9 @@ impl Render {
             }
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
-                Err(_) => format!("(long long)atoll({})", Self::cstr(s)),
+                Err(_) => format!("atoll({})", Self::cstr(s)),
             },
-            _ => format!("(long long)atoll((char*)({}))", self.value_c(e)),
+            _ => format!("atoll((char*)({}))", self.value_c(e)),
         }
     }
 
@@ -4786,7 +4786,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "param" => {
                 if self.param_is_len(args) {
                     let v = self.call(func, args);
-                    return format!("(long long)atoll({v})");
+                    return format!("atoll({v})");
                 }
                 format!("(int)atoll({})", self.value_c(e))
             }
