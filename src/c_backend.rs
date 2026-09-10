@@ -1825,6 +1825,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     for sub in &prog.subs {
         seed_isqrt_bounds(&sub.body, &mut ranges);
     }
+    // range-loop counters with proven u32-or-narrower bounds and
+    // exactly init+step writes (see seed_range_loop_vars). Runs after
+    // the bound-temp seeding above so loop bounds resolve.
+    seed_range_loop_vars(&prog, &mut ranges);
     // Effective widths: a var's width must cover every arith-expr result
     // mentioning it (e.g. i in [1, 70000] is u32, but i*i needs i64), so
     // narrow only when the var AND all its arithmetic stay in width.
@@ -17743,6 +17747,282 @@ fn nonnull_written_arith(a: &ArithAst, out: &mut HashSet<String>) {
     }
 }
 
+/// Count static writes to `var` across stmts (for loop-var range
+/// seeding: narrowing is sound only when the loop's init+step are the
+/// ONLY writes). Mirrors `nonnull_written_*` coverage (Assign/For /
+/// IncDec-nested/setVar/read/unset/declare/printf-v/Ext/Asm/loops/
+/// branches — missing one would be unsound, extra counting only
+/// misses opts). Text paths cannot write C vars (established), so
+/// only native shapes matter; site builders use fresh Render state.
+fn count_writes_stmts(stmts: &[IrStmt], var: &str, count: &mut usize) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    if t.var == var {
+                        *count += 1;
+                    }
+                }
+                count_writes_expr(expr, var, count);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                // only an initialized declare writes a value (bare
+                // `local i` merely reserves storage — decl-init 0 is
+                // already covered by seeds including 0).
+                if init.is_some() {
+                    for v in vars {
+                        if v.name == var {
+                            *count += 1;
+                        }
+                    }
+                }
+                if let Some(e) = init {
+                    count_writes_expr(e, var, count);
+                }
+            }
+            IrStmt::DeclareArray { var: _, elements, .. } => {
+                for e in elements {
+                    count_writes_expr(e, var, count);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                count_writes_expr(cond, var, count);
+                count_writes_stmts(then, var, count);
+                for (_, b) in elsifs {
+                    count_writes_stmts(b, var, count);
+                }
+                count_writes_stmts(else_, var, count);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                count_writes_expr(cond, var, count);
+                count_writes_stmts(body, var, count);
+            }
+            IrStmt::For { var: lv, body, .. } => {
+                if lv == var {
+                    *count += 1;
+                }
+                count_writes_stmts(body, var, count);
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                count_writes_stmts(init, var, count);
+                count_writes_expr(cond, var, count);
+                count_writes_stmts(step, var, count);
+                count_writes_stmts(body, var, count);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                count_writes_stmts(body, var, count);
+                for e in excepts {
+                    count_writes_stmts(&e.body, var, count);
+                }
+                count_writes_stmts(else_body, var, count);
+                count_writes_stmts(finally_body, var, count);
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                count_writes_expr(discriminant, var, count);
+                for c in clauses {
+                    count_writes_stmts(&c.body, var, count);
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    count_writes_stmts(&c.body, var, count);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => count_writes_stmts(inner, var, count),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    count_writes_stmts(st, var, count);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                count_writes_stmts(body, var, count);
+                for (_, b) in named_blocks {
+                    count_writes_stmts(b, var, count);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                count_writes_stmts(b, var, count)
+            }
+            IrStmt::Output { value, .. } | IrStmt::WriteFile { content: value, .. } => {
+                count_writes_expr(value, var, count);
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    count_writes_expr(x, var, count);
+                }
+            }
+            IrStmt::Die { expr: e, .. } => {
+                count_writes_expr(e, var, count);
+            }
+            IrStmt::Ext(n) => {
+                // ForEachLine assigns its loop var per iteration (plus
+                // body writes below); unknown tags rely on the global
+                // opaque-poison backstop.
+                if let Some(fl) = n.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>() {
+                    if fl.var == var {
+                        *count += 1;
+                    }
+                }
+                for c in n.children() {
+                    count_writes_stmts(std::slice::from_ref(c), var, count);
+                }
+            }
+            IrStmt::Shaderize { var: lv, body, .. } => {
+                if lv == var {
+                    *count += 1;
+                }
+                count_writes_stmts(body, var, count);
+            }
+            IrStmt::Asm { outputs, .. } => {
+                for (v, e) in outputs {
+                    if v == var {
+                        *count += 1;
+                    }
+                    count_writes_expr(e, var, count);
+                }
+            }
+            IrStmt::Expr(e) => count_writes_expr(e, var, count),
+            _ => {}
+        }
+    }
+}
+
+/// Nested writes inside an expression (mirror of nonnull_written_expr,
+/// counting matches instead of collecting).
+fn count_writes_expr(e: &IrExpr, var: &str, count: &mut usize) {
+    match e {
+        IrExpr::Arith(a) => count_writes_arith(a, var, count),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            count_writes_expr(lhs, var, count);
+            count_writes_expr(rhs, var, count);
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            count_writes_expr(cond, var, count);
+            count_writes_expr(then, var, count);
+            count_writes_expr(else_, var, count);
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            count_writes_expr(expr, var, count);
+            count_writes_expr(default, var, count);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    count_writes_expr(x, var, count);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for x in items {
+                count_writes_expr(x, var, count);
+            }
+        }
+        IrExpr::Index { key, .. } => count_writes_expr(key, var, count),
+        IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
+            if let Some(IrExpr::Str(n, _)) = args.first() {
+                if n == var {
+                    *count += 1;
+                }
+            }
+            for a in args.iter().skip(1) {
+                count_writes_expr(a, var, count);
+            }
+        }
+        IrExpr::Call { func, args }
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if matches!(c.as_str(), "local" | "declare" | "typeset" | "export" | "readonly" | "unset" | "read" | "readarray" | "mapfile")) =>
+        {
+            for a in args.iter().skip(1) {
+                match a {
+                    IrExpr::Array(items) => {
+                        for w in items {
+                            if let IrExpr::Str(ws, _) = w {
+                                let n = ws.split('=').next().unwrap_or("");
+                                let n = n.trim_start_matches(|c: char| c == '$' || c == '"' || c == '\'');
+                                if n == var {
+                                    *count += 1;
+                                }
+                            } else {
+                                count_writes_expr(w, var, count);
+                            }
+                        }
+                    }
+                    IrExpr::Str(ws, _) => {
+                        let n = ws.split('=').next().unwrap_or("");
+                        let n = n.trim_start_matches(|c: char| c == '$' || c == '"' || c == '\'');
+                        if n == var {
+                            *count += 1;
+                        }
+                    }
+                    other => count_writes_expr(other, var, count),
+                }
+            }
+        }
+        IrExpr::Call { func: _, args } => {
+            for a in args {
+                count_writes_expr(a, var, count);
+            }
+        }
+        IrExpr::ArrayComp { var: lv, iter, elem, cond } => {
+            if lv == var {
+                *count += 1;
+            }
+            count_writes_expr(iter, var, count);
+            count_writes_expr(elem, var, count);
+            if let Some(c) = cond {
+                count_writes_expr(c, var, count);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
+            count_writes_stmts(body, var, count);
+        }
+        IrExpr::Arrow(body) => {
+            count_writes_stmts(body, var, count);
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                count_writes_expr(v, var, count);
+            }
+        }
+        IrExpr::Splice(x) => count_writes_expr(x, var, count),
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                count_writes_expr(c, var, count);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Nested arith writes at any depth.
+fn count_writes_arith(a: &ArithAst, var: &str, count: &mut usize) {
+    match a {
+        ArithAst::Assign { var: v, rhs, .. } => {
+            if v == var {
+                *count += 1;
+            }
+            count_writes_arith(rhs, var, count);
+        }
+        ArithAst::IncDec { var: v, .. } => {
+            if v == var {
+                *count += 1;
+            }
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            count_writes_arith(lhs, var, count);
+            count_writes_arith(rhs, var, count);
+        }
+        ArithAst::Un { arg, .. } => count_writes_arith(arg, var, count),
+        ArithAst::Cond { test, then, else_, .. } => {
+            count_writes_arith(test, var, count);
+            count_writes_arith(then, var, count);
+            count_writes_arith(else_, var, count);
+        }
+        ArithAst::Cast { arg, .. } => count_writes_arith(arg, var, count),
+        ArithAst::Index { key, .. } => count_writes_arith(key, var, count),
+        _ => {}
+    }
+}
 /// Collect Function definitions at any depth (names + bodies).
 fn collect_fn_defs(
     stmts: &[IrStmt],
@@ -20561,6 +20841,264 @@ fn isqrt_derive_range(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> O
 /// Merges (widens) into existing proofs — never narrows one. Loop vars
 /// are deliberately NOT seeded here: their bound is proven but their
 /// arithmetic needs promotion analysis before narrowing is sound.
+/// Seed proven loop-var ranges for int-domain range loops (range-proof
+/// wiring, part 2): `v = lo; while (v < b) { …; v++ }` where `b` has a
+/// proven u32-or-narrower range and `v` is written NOWHERE else
+/// program-wide (init + step only, counted — so every value v takes
+/// comes from this loop). Overwrites the fixpoint range (sound: with
+/// exactly two writes, all values are loop values in [lo, hi], plus
+/// decl-init 0 which fits every int type). Skipped (left wide) when
+/// the bound is unknown/wide, the shape differs, or the counter is
+/// shared. Loop vars are deliberately NOT seeded from unproven bounds;
+/// `effective_widths` + promotion analysis (arith_op_wide) handle the
+/// rest.
+/// True if any OPAQUE `Ext` node exists (any depth) — anything but the
+/// audited ForEachLine shape below. Its writes are unknowable, so
+/// loop-var narrowing is disabled program-wide (fail-closed — missed
+/// opts only, never unsound).
+fn count_opaque_ext(stmts: &[IrStmt], opaque: &mut bool) {
+    if *opaque {
+        return;
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Ext(n)
+                if n.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>().is_none() =>
+            {
+                *opaque = true;
+                return;
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                count_opaque_ext(b, opaque)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                count_opaque_ext(then, opaque);
+                for (_, b) in elsifs {
+                    count_opaque_ext(b, opaque);
+                }
+                count_opaque_ext(else_, opaque);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                count_opaque_ext(body, opaque)
+            }
+            IrStmt::For { body, .. } => count_opaque_ext(body, opaque),
+            IrStmt::ForInit { init, body, .. } => {
+                count_opaque_ext(init, opaque);
+                count_opaque_ext(body, opaque);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                count_opaque_ext(body, opaque);
+                for (_, b) in named_blocks {
+                    count_opaque_ext(b, opaque);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                count_opaque_ext(body, opaque);
+                for e in excepts {
+                    count_opaque_ext(&e.body, opaque);
+                }
+                count_opaque_ext(else_body, opaque);
+                count_opaque_ext(finally_body, opaque);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    count_opaque_ext(&c.body, opaque);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => count_opaque_ext(inner, opaque),
+            _ => {}
+        }
+        if *opaque {
+            return;
+        }
+    }
+}
+
+fn seed_range_loop_vars(
+    prog: &IrProgram,
+    ranges: &mut HashMap<String, (i128, i128)>,
+) {
+    // opaque Ext nodes with unknowable writes poison counting globally
+    // (fail-closed: skip all loop seeding below).
+    let mut opaque = false;
+    count_opaque_ext(&prog.stmts, &mut opaque);
+    for sub in &prog.subs {
+        count_opaque_ext(&sub.body, &mut opaque);
+    }
+    if opaque {
+        return;
+    }
+    seed_loops_in_list(&prog.stmts, prog, ranges);
+    for sub in &prog.subs {
+        seed_loops_in_list(&sub.body, prog, ranges);
+    }
+}
+
+/// Total static writes to `var` program-wide (stmts + subs). The loop's
+/// own init+step count too — callers require exactly 2 (so those are
+/// the only writes, and every value comes from this loop).
+fn count_writes_to(prog: &IrProgram, var: &str) -> usize {
+    let mut n = 0;
+    count_writes_stmts(&prog.stmts, var, &mut n);
+    for sub in &prog.subs {
+        count_writes_stmts(&sub.body, var, &mut n);
+    }
+    n
+}
+
+/// Match `Assign(v, Num(lo))` immediately followed by a While range loop
+/// in one stmt list; recurse into nested bodies. Seeds `v` on match.
+fn seed_loops_in_list(
+    stmts: &[IrStmt],
+    prog: &IrProgram,
+    ranges: &mut HashMap<String, (i128, i128)>,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        if i + 1 < stmts.len() {
+            if let (
+                IrStmt::Assign { targets, expr, .. },
+                IrStmt::While { cond, body },
+            ) = (&stmts[i], &stmts[i + 1])
+            {
+                if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                    if t.indices.is_empty() {
+                        if let ArithAst::Num(lo) = a.as_ref() {
+                            seed_while_loop_var(&t.var, *lo, cond, body, prog, ranges);
+                        }
+                    }
+                }
+            }
+        }
+        // recurse into nested scopes for further loops
+        match &stmts[i] {
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                seed_loops_in_list(b, prog, ranges)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                seed_loops_in_list(then, prog, ranges);
+                for (_, b) in elsifs {
+                    seed_loops_in_list(b, prog, ranges);
+                }
+                seed_loops_in_list(else_, prog, ranges);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                seed_loops_in_list(body, prog, ranges)
+            }
+            IrStmt::For { body, .. } => seed_loops_in_list(body, prog, ranges),
+            IrStmt::ForInit { init, body, .. } => {
+                seed_loops_in_list(init, prog, ranges);
+                seed_loops_in_list(body, prog, ranges);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                seed_loops_in_list(body, prog, ranges);
+                for (_, b) in named_blocks {
+                    seed_loops_in_list(b, prog, ranges);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                seed_loops_in_list(body, prog, ranges);
+                for e in excepts {
+                    seed_loops_in_list(&e.body, prog, ranges);
+                }
+                seed_loops_in_list(else_body, prog, ranges);
+                seed_loops_in_list(finally_body, prog, ranges);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    seed_loops_in_list(&c.body, prog, ranges);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => seed_loops_in_list(inner, prog, ranges),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Try to seed one While range loop: `v` from `lo`, `v < b` (or `<=`),
+/// step `v++`/`++v`/`v+=1` as the last body stmt, bound `b` proven
+/// u32-or-narrower, exactly 2 program-wide writes to `v` (the init +
+/// step verified here). Overwrites ranges[v] (sound: decl-init 0 fits
+/// every int type, and all other values come from this loop).
+fn seed_while_loop_var(
+    v: &str,
+    lo: i64,
+    cond: &IrExpr,
+    body: &[IrStmt],
+    prog: &IrProgram,
+    ranges: &mut HashMap<String, (i128, i128)>,
+) {
+    // cond `v < b` / `v <= b` with ident bound
+    let (cmp_lt, b) = match cond {
+        IrExpr::Arith(a) => match a.as_ref() {
+            ArithAst::Bin { op, lhs, rhs } => {
+                let vl = match lhs.as_ref() {
+                    ArithAst::Var(n) | ArithAst::Ident(n) if n == v => true,
+                    _ => false,
+                };
+                let bound = match rhs.as_ref() {
+                    ArithAst::Var(n) | ArithAst::Ident(n) => Some(n.clone()),
+                    _ => None,
+                };
+                match (vl, bound, op.as_str()) {
+                    (true, Some(b), "<") => (true, b),
+                    (true, Some(b), "<=") => (false, b),
+                    _ => return,
+                }
+            }
+            _ => return,
+        },
+        _ => return,
+    };
+    // step `v++` / `++v` / `v += 1` as the last body stmt
+    let step_ok = match body.last() {
+        Some(IrStmt::Expr(IrExpr::Arith(a))) => match a.as_ref() {
+            ArithAst::IncDec { var, delta, .. } => var == v && *delta == 1,
+            ArithAst::Assign { var, op, rhs } => {
+                var == v
+                    && op == "+="
+                    && matches!(rhs.as_ref(), ArithAst::Num(1))
+            }
+            _ => false,
+        },
+        Some(IrStmt::Assign { targets, expr, .. }) => {
+            if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                t.var == v
+                    && t.indices.is_empty()
+                    && matches!(a.as_ref(), ArithAst::Bin { op, lhs, rhs }
+                        if op == "+"
+                        && matches!(lhs.as_ref(), ArithAst::Var(n) | ArithAst::Ident(n) if n == v)
+                        && matches!(rhs.as_ref(), ArithAst::Num(1)))
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if !step_ok {
+        return;
+    }
+    // bound proven u32-or-narrower (isqrt temps, constant bounds, ...).
+    let (_, bhi) = match ranges.get(&b) {
+        Some((_, hi)) if *hi <= u32::MAX as i128 => (0, *hi),
+        _ => return,
+    };
+    // exactly the init + step write v program-wide (else leave wide).
+    if count_writes_to(prog, v) != 2 {
+        return;
+    }
+    let lo128 = lo as i128;
+    // `<` exits with v == B; `<=` with v == B+1 (guarded u32-contained).
+    let hi = if cmp_lt { bhi } else { bhi + 1 };
+    if hi > u32::MAX as i128 {
+        return;
+    }
+    // include decl-init 0 (fits every int type — width-neutral) so
+    // use-before-assign stays covered for divisor-guard elision.
+    ranges.insert(v.to_string(), (lo128.min(0), hi));
+}
+
 fn seed_isqrt_bounds(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i128)>) {
     // pass 1: direct isqrt assigns (any depth)
     collect_isqrt_assigns(stmts, ranges);
@@ -20760,6 +21298,36 @@ fn walk_widths_stmts(
     }
 }
 
+/// Does this arith expression provably compute at 64+ bits (so narrow
+/// operands promote safely and need no widening)? True if any direct
+/// operand is proven wide: a positional `$N` (renders `long long` in
+/// every param ABI — native, atoll, or mpz_get_si), an out-of-i32
+/// literal (renders `…LL`), or a var whose RANGE exceeds 32 bits
+/// (`hi > u32::MAX` or `lo < i32::MIN` — decls only ever widen from
+/// ranges, so a wide range means a wide decl). Unknown/unranged
+/// operands never count (fail-closed: claiming wide there would miss
+/// real narrowing needs). Nested exprs recurse structurally; anything
+/// else (calls, index, cond, casts, side-effect forms) does not prove
+/// (conservative miss, never unsound).
+fn arith_op_wide(a: &ArithAst, state: &HashMap<String, Option<(i128, i128)>>) -> bool {
+    match a {
+        ArithAst::Num(n) => *n > i32::MAX as i64 || *n < i32::MIN as i64,
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+            match state.get(name).copied().flatten() {
+                Some((lo, hi)) => hi > u32::MAX as i128 || lo < i32::MIN as i128,
+                None => false,
+            }
+        }
+        ArithAst::Bin { lhs, rhs, .. } => arith_op_wide(lhs, state) || arith_op_wide(rhs, state),
+        ArithAst::Un { arg, .. } => arith_op_wide(arg, state),
+        _ => false,
+    }
+}
+
+
 fn walk_widths_expr(
     e: &IrExpr,
     state: &HashMap<String, Option<(i128, i128)>>,
@@ -20772,7 +21340,13 @@ fn walk_widths_expr(
             // widths — skip them. Forcing I64 here kept every compared
             // var wide, defeating range-narrowing for loop bounds like
             // `i < _i_sqrt_nv` (and could even narrow a u64 to i64).
-            if matches!(a.as_ref(), ArithAst::Bin { op, .. } if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!=")) {
+            // Side-effect roots (`i++`, `x = ...` as a statement value)
+            // are likewise skipped: their width impact is nil (the
+            // written var's RANGE governs, via the range analysis),
+            // and forcing on them kept every mutated counter wide.
+            if matches!(a.as_ref(), ArithAst::Bin { op, .. } if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!="))
+                || matches!(a.as_ref(), ArithAst::Assign { .. } | ArithAst::IncDec { .. })
+            {
                 return;
             }
             let rng = arith_range_local(a, state);
@@ -20786,8 +21360,14 @@ fn walk_widths_expr(
                         widths.insert(v, cur.widen(w));
                     }
                     None => {
-                        // no proof the expr stays in width → no narrowing
-                        widths.insert(v, Width::I64);
+                        // no proof the expr stays in width — narrow only
+                        // if the op provably computes wide (some operand
+                        // is proven i64-or-wider, so narrow operands
+                        // promote safely via C usual conversions); else
+                        // force i64 (a narrow op could wrap).
+                        if !arith_op_wide(a, state) {
+                            widths.insert(v, Width::I64);
+                        }
                     }
                 }
             }
@@ -22779,6 +23359,107 @@ mod tests {
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("uint32_t _hv"), "bound temp not narrowed:\n{out}");
+    }
+
+    #[test]
+    fn range_loop_counter_narrows_to_u32() {
+        // range-proof wiring end to end for loop vars: `i = 1;
+        // while (i < isqrt-bound) { …; i++ }` with exactly init+step
+        // writes narrows `i` to uint32_t (bound proven via the isqrt
+        // chain above).
+        fn assign_num(v: &str, n: i64) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: v.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Num(n))),
+                asm: None,
+            }
+        }
+        fn assign_isqrt_bound(s: &str, v: &str) -> Vec<IrStmt> {
+            vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: s.to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "arith".to_string(),
+                        args: vec![IrExpr::Str(
+                            "(int(sqrt($1)) + 1)".to_string(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )],
+                    },
+                    asm: None,
+                },
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: v.to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "+".to_string(),
+                        lhs: Box::new(ArithAst::Var(s.to_string())),
+                        rhs: Box::new(ArithAst::Num(0)),
+                    })),
+                    asm: None,
+                },
+            ]
+        }
+        fn range_while(v: &str, bound: &str) -> IrStmt {
+            IrStmt::While {
+                cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "<".to_string(),
+                    lhs: Box::new(ArithAst::Var(v.to_string())),
+                    rhs: Box::new(ArithAst::Var(bound.to_string())),
+                })),
+                body: vec![IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
+                    var: v.to_string(),
+                    delta: 1,
+                    prefix: false,
+                })))],
+            }
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        // positive: isqrt bound + init/step only → uint32_t i.
+        let mut stmts = assign_isqrt_bound("_h", "_hv");
+        stmts.push(assign_num("i", 1));
+        stmts.push(range_while("i", "_hv"));
+        let out = shir_to_c(&prog_of(stmts));
+        assert!(out.contains("uint32_t i"), "loop var not narrowed:\n{out}");
+        assert!(out.contains("uint32_t _hv"), "bound temp not narrowed:\n{out}");
+        // negative: a third write (out-of-u32 value) disables narrowing.
+        let mut stmts = assign_isqrt_bound("_h", "_hv");
+        stmts.push(assign_num("i", 1));
+        stmts.push(range_while("i", "_hv"));
+        stmts.push(assign_num("i", 5000000000));
+        let out = shir_to_c(&prog_of(stmts));
+        assert!(out.contains("long long i"), "shared counter wrongly narrowed:\n{out}");
+        assert!(!out.contains("uint32_t i"), "shared counter narrowed:\n{out}");
+        // negative: unknown (positional) bound → stays wide.
+        let mut stmts = vec![assign_num("i", 1)];
+        stmts.push(range_while("i", "1"));
+        let out = shir_to_c(&prog_of(stmts));
+        assert!(out.contains("long long i"), "unknown bound narrowed:\n{out}");
     }
 
     #[test]
