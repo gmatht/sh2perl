@@ -10082,6 +10082,16 @@ fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
                 out.insert(name.clone());
             }
         }
+        // `((i++))` / `((x+=2))` — a BARE arith statement: the
+        // IncDec/Assign writes are assignments too. Without this arm the
+        // loop fixpoint's carried set misses the counter, so its growth
+        // is invisible to the join/widen and a var assigned from it
+        // (`last = i`) reads the stale pre-loop range (last looked like
+        // [0,1] forever → wrongly narrowed to u8). Mirrors the
+        // walk_stmt_ranges Expr(Arith) arm.
+        IrStmt::Expr(IrExpr::Arith(a)) => {
+            arith_write_names(a, out);
+        }
         IrStmt::Block(stmts) | IrStmt::Subshell(stmts) => {
             for s in stmts {
                 collect_assigned(s, out);
@@ -10519,6 +10529,34 @@ fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {
         }
         ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state),
         ArithAst::Index { key, .. } => arith_stmt_writes(key, state),
+        _ => {}
+    }
+}
+
+/// The var names a bare-arith statement writes (the IncDec/Assign
+/// targets) — the `collect_assigned` counterpart of
+/// `arith_stmt_writes`.
+fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            arith_write_names(rhs, out);
+        }
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_write_names(lhs, out);
+            arith_write_names(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => arith_write_names(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_write_names(test, out);
+            arith_write_names(then, out);
+            arith_write_names(else_, out);
+        }
+        ArithAst::Cast { arg, .. } => arith_write_names(arg, out),
+        ArithAst::Index { key, .. } => arith_write_names(key, out),
         _ => {}
     }
 }
@@ -49335,8 +49373,8 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert_eq!(r.get("y"), Some(&(2, 2)));
         assert!(!r.contains_key("z"), "cmdsub provenance must be Any");
         assert_eq!(r.get("w"), Some(&(-5, -5)));
-        assert_eq!(range_width_name(1, 1), "u32");
-        assert_eq!(range_width_name(-5, -5), "i32");
+        assert_eq!(range_width_name(1, 1), "u8");
+        assert_eq!(range_width_name(-5, -5), "i8");
         assert_eq!(range_width_name(0, 4_000_000_000), "u32");
         // fits signed-64 but not u32 → i64 (bash/C-signed domain)
         assert_eq!(range_width_name(0, 10_000_000_000), "i64");
@@ -49407,8 +49445,8 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let r = ranges_of(src);
         assert_eq!(r.get("__n"), Some(&(0, 1000)));
         assert_eq!(r.get("i"), Some(&(1, 1002)));
-        assert_eq!(range_width_name(0, 1000), "u32");
-        assert_eq!(range_width_name(1, 1002), "u32");
+        assert_eq!(range_width_name(0, 1000), "u16");
+        assert_eq!(range_width_name(1, 1002), "u16");
         // `until` flips the comparison: until i >= 100 ⇔ while i < 100
         let r2 = ranges_of("i=0\nuntil [ $i -ge 100 ]; do i=$((i+1)); done");
         assert_eq!(r2.get("i"), Some(&(0, 100)));
@@ -49574,6 +49612,10 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
     #[test]
     fn corpus_var_width_tally() {
         let mut widths: HashMap<&'static str, usize> = HashMap::new();
+        widths.insert("u8", 0);
+        widths.insert("i8", 0);
+        widths.insert("u16", 0);
+        widths.insert("i16", 0);
         widths.insert("u32", 0);
         widths.insert("i32", 0);
         widths.insert("u64", 0);

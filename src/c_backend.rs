@@ -331,6 +331,11 @@ pub struct Render {
     need_time: bool,
     /// integer pow helper (cc has no -lm on the gate)
     need_pow: bool,
+    /// integer floor-sqrt helper (`int(x**0.5)` on an int operand): the
+    /// float sqrt loses precision above 2^53 (the int→double conversion
+    /// rounds), so the loop bound would be off by 1 for huge n — the
+    /// Newton isqrt is exact for every long long.
+    need_isqrt: bool,
     /// GMP bigint runtime (the py-sh-go proven-big regime): set when
     /// any Cast(Int64) arith is rendered — <gmp.h> + _sh_mpz_* helpers.
     /// The gate links -lgmp (libgmp-dev installed); programs without
@@ -2694,6 +2699,19 @@ impl Render {
             self.emit("}");
             self.emit("");
         }
+        if self.need_isqrt {
+            // integer floor sqrt (Newton): exact for every long long,
+            // where the float sqrt's int→double conversion rounds above
+            // 2^53 and the bound `int(n**0.5)` would be off by 1.
+            self.emit("/* integer floor sqrt (exact; the float sqrt rounds above 2^53) */");
+            self.emit("static long long _sh_isqrt(long long n) {");
+            self.emit("  if (n <= 0) return 0;");
+            self.emit("  long long x = n, y = (n + 1) / 2;");
+            self.emit("  while (y < x) { x = y; y = (x + n / x) / 2; }");
+            self.emit("  return x;");
+            self.emit("}");
+            self.emit("");
+        }
         if self.need_time {
             // `sleep` — nanosleep (time.h is included above)
             self.emit("static int _sh_sleep(const char *s) {");
@@ -3140,8 +3158,22 @@ impl Render {
                     self.c_ident(name)
                 } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
                     // `$1` in `$(( ))` — a lifted fn's real C param, else
-                    // the caller's _sh_argv (fnValue swaps it per call)
-                    format!("(long long){}", self.positional_read_l(name))
+                    // the caller's _sh_argv (fnValue swaps it per call).
+                    // A native numeric param is ALREADY long long — the
+                    // `(long long)` wrap would be a no-op cast. A bigint
+                    // param truncates via mpz_get_si (the documented i64
+                    // context behavior — the raw mpz_t would not compile).
+                    if self.cur_bigint_param {
+                        if let Some(p) = self.lifted_param(name) {
+                            return format!("mpz_get_si({})", p);
+                        }
+                    }
+                    let p = self.positional_read_l(name);
+                    if self.cur_native_num && self.lifted_param(name).is_some() {
+                        p
+                    } else {
+                        format!("(long long){}", p)
+                    }
                 } else {
                     // a Str-typed var in arithmetic: coerce its value
                     // (`$((x * y))` with x="5" — bash parses at runtime)
@@ -3808,8 +3840,9 @@ impl Render {
                 return format!("({p})");
             }
             if self.cur_bigint_param {
-                // native bigint param: `_pN` is the mpz_t
-                return format!("({p})");
+                // native bigint param in an i64 arith context: truncate
+                // (the raw mpz_t would not compile in C arithmetic)
+                return format!("mpz_get_si({p})");
             }
             return format!("(atoll((({p}) ? ({p}) : \"\")))");
         }
@@ -8160,7 +8193,49 @@ impl Render {
                 _ => return None,
             }
         }
+        if name == "int" && args.len() == 1 {
+            // int(sqrt(X)) with an int-typed X → integer isqrt: the
+            // float sqrt's int→double conversion rounds above 2^53, so
+            // the bound `int(n**0.5)` would be off by 1 for huge n. The
+            // Newton isqrt is exact for every long long (and equals the
+            // float sqrt for n ≤ 2^53, so the gate corpus is
+            // unaffected). A float-typed X (a `(double)` cast or a
+            // float literal in the operand) keeps the libm sqrt.
+            if let Some(inner) = Self::strip_sqrt(&args[0]) {
+                if !inner.contains("(double)") && !inner.contains('.') {
+                    self.need_isqrt = true;
+                    return Some(format!("_sh_isqrt({inner})"));
+                }
+            }
+        }
         self.mf_call(&name, args)
+    }
+
+    /// If `s` is the sqrt rendering `sqrt((double)(X))`, return X (the
+    /// operand text, paren-balanced).
+    fn strip_sqrt(s: &str) -> Option<String> {
+        let p = "sqrt((double)(";
+        if !s.starts_with(p) {
+            return None;
+        }
+        let rest = &s[p.len()..];
+        let mut depth = 1usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if rest[i..].starts_with("))") {
+                            return Some(rest[..i].to_string());
+                        }
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// One mathfunc call → the libm C form. `int()` truncates toward
@@ -20745,14 +20820,26 @@ mod tests {
         // The zsh-mathfunc subset lowers NATIVELY — no child-bash capture
         // (real bash cannot even RUN `int(sqrt($1))`: it is a bash arith
         // syntax error). int() = C cast, sqrt() = libm, $N reads argv.
+        // An INT-typed sqrt operand lowers to the integer isqrt (the
+        // float sqrt's int→double conversion rounds above 2^53, so the
+        // bound `int(n**0.5)` would be off by 1 for huge n); a FLOAT
+        // operand keeps the libm sqrt.
         let mut r = Render::default();
         let out = r
             .mathfunc_arith_c("(int(sqrt($1)) + 1)")
             .expect("lowers");
-        assert!(out.contains("sqrt((double)("), "{out}");
+        assert!(out.contains("_sh_isqrt("), "no integer isqrt: {out}");
+        assert!(!out.contains("sqrt((double)("), "float sqrt kept: {out}");
         assert!(out.contains("_sh_argv[1]"), "{out}");
-        assert!(out.contains("(long long)("), "{out}");
         assert!(out.contains("1LL"), "{out}");
+        // a float operand keeps the libm sqrt (int(2.5**0.5) is a
+        // genuine double computation)
+        let mut r2 = Render::default();
+        let out2 = r2
+            .mathfunc_arith_c("(int(sqrt(2.5)) + 1)")
+            .expect("lowers");
+        assert!(out2.contains("sqrt((double)(2.5))"), "{out2}");
+        assert!(!out2.contains("_sh_isqrt"), "isqrt on a float: {out2}");
         // refuse > guess: the ops whose runtime semantics diverge
         assert!(r.mathfunc_arith_c("a % 2").is_none(), "fmod refused");
         assert!(r.mathfunc_arith_c("a && b").is_none(), "&& refused");
