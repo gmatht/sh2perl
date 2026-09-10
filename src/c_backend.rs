@@ -279,13 +279,25 @@ pub struct Render {
     /// without flow tracking. Cleared on function entry (temp names
     /// reuse across functions, each with its own storage).
     nonnull: HashSet<String>,
+    /// shIR vars proven non-NULL at the current render point — same
+    /// consult as `nonnull`, but flow-tracked (assigns / branches /
+    /// loops) since named vars span statements. Entries are C idents,
+    /// like `nonnull`. Cleared only on function entry (never per
+    /// statement — the proof must survive across the statements
+    /// between assign and use).
+    nonnull_var: HashSet<String>,
     /// Generated function names proven to never return NULL: every
     /// return goes through `_sh_xstrdup` (aborts on OOM instead of
     /// returning NULL), with no early bare `return`. Computed by a
     /// pre-pass (render order is caller-first, so render-time recording
     /// would always arrive too late). Consulted when a fresh call temp
-    /// is created.
+    /// is created, and for cross-statement shIR-var moves (see below).
     nonnull_returns: HashSet<String>,
+    /// shIR vars assigned in ANY function body (precomputed): a call
+    /// might observe them mid-flight, so they are never eligible for
+    /// proof (belt-and-suspenders over save/restore). Fresh C temps
+    /// never appear here (backend inventions, not shIR assigns).
+    fn_written: HashSet<String>,
     /// int-array name -> narrowest element width (from the element ranges).
     int_array_widths: std::collections::HashMap<String, Width>,
     todo: usize,
@@ -4389,6 +4401,7 @@ impl Render {
         // with its own storage), so proofs never cross the boundary —
         // save/restore around the body (nested defs included).
         let saved_nonnull = std::mem::take(&mut self.nonnull);
+        let saved_nonnull_var = std::mem::take(&mut self.nonnull_var);
         let site_mark = self.site_bodies.len();
         let cap_mark = self.cap_bodies.len();
         self.decl_line_idx.clear();
@@ -4500,6 +4513,7 @@ impl Render {
         self.in_function = prev_fn;
         self.current_fn = prev_current;
         self.nonnull = saved_nonnull;
+        self.nonnull_var = saved_nonnull_var;
         for n in &fvars {
             let id = self.c_ident(n);
             if body_out.iter().any(|l| text_contains_ident(l, &id)) {
@@ -6543,6 +6557,9 @@ impl Render {
                                     let cap = self.capture_call(args);
                                     let id = self.c_ident(&t.var);
                                     self.store.insert(t.var.clone());
+                                    // P1 follow-up: capture output is
+                                    // unproven (may be empty/failure).
+                                    self.nonnull_var.remove(&id);
                                     self.emit(&format!("{id} = {cap};"));
                                     self.emit(&format!(
                                         "_sh_addraw({});",
@@ -7775,6 +7792,8 @@ impl Render {
                 if matches!(words.first(), Some(IrExpr::Str(s, _)) if s == "-v") {
                     if let (Some(v), Some(fmtw)) = (words.get(1), words.get(2)) {
                         if let Some(name) = Self::str_arg(&[(*v).clone()], 0) {
+                            // P1 follow-up: printf -v writes the var.
+                            self.nonnull_forget(&name);
                             let rest: Vec<&IrExpr> = words.iter().skip(2).copied().collect();
                             if let Some(p) = self.try_native_printf_into(&rest, Some(&self.c_ident(&name))) {
                                 self.store.insert(name.clone());
@@ -7831,6 +7850,9 @@ impl Render {
                 self.need_sh = true;
                 for w in &words {
                     if let Some(name) = Self::str_arg(&[(*w).clone()], 0) {
+                        // P1 follow-up: unset clears the var (over-removal
+                        // if an exotic path preserves it — sound).
+                        self.nonnull_forget(&name);
                         if let Some(open) = name.find('[') {
                             if name.ends_with(']') {
                                 // `unset arr[i]` — clear the element
@@ -7967,6 +7989,8 @@ impl Render {
                 }
                 let id = self.c_ident(&target);
                 self.store.insert(target.clone());
+                // P1 follow-up: read assigns (possibly NULL on EOF).
+                self.nonnull_var.remove(&id);
                 self.emit(&format!("{id} = _sh_readline();"));
                 format!(
                     "({{ int _r = ({id}[0] ? 0 : 1); _sh_rc = _r; _r == 0; }})"
@@ -8174,6 +8198,10 @@ impl Render {
                     {
                         self.store.insert(name.to_string());
                         let id = self.c_ident(name);
+                        // P1 follow-up: declare writes the C var —
+                        // invalidate proofs (over-removal if this word
+                        // turns out read-only is sound).
+                        self.nonnull_var.remove(&id);
                         // `local x=$1` — the core splits `x=` and the
                         // VALUE EXPR into separate word args
                         let value_expr: Option<&IrExpr> = if val.is_empty()
@@ -10939,6 +10967,8 @@ impl Render {
                     return "0".into();
                 };
                 self.store.insert(name.clone());
+                // P1 follow-up: inline store write invalidates proofs.
+                self.nonnull_forget(&name);
                 format!("({} = {})", self.c_ident(&name), self.value_c(value))
             }
             "assign" => {
@@ -10948,6 +10978,8 @@ impl Render {
                 };
                 self.store.insert(name.clone());
                 let id = self.c_ident(&name);
+                // P1 follow-up: inline store write invalidates proofs.
+                self.nonnull_var.remove(&id);
                 let Some(value) = args.get(2) else {
                     return "0".into();
                 };
@@ -12250,6 +12282,28 @@ impl Render {
         format!("{t}.p")
     }
 
+    /// Drop a shIR var from the non-NULL proof set (it was just written
+    /// with an unproven value). C-ident mapping included. Over-removal
+    /// is always sound (missed opts only); under-removal would be fatal,
+    /// so every C-var write path calls this unless it proves (see the
+    /// native Assign inserts).
+    fn nonnull_forget(&mut self, name: &str) {
+        let id = self.c_ident(name);
+        self.nonnull_var.remove(&id);
+    }
+
+    /// Drop proofs for every var a statement list might write (loop
+    /// bodies and the like). Over-removal is always sound (missed opts
+    /// only); the thorough collector misses nothing writable.
+    fn nonnull_clear_written(&mut self, stmts: &[IrStmt]) {
+        let mut w = HashSet::new();
+        nonnull_written_stmts(stmts, &mut w);
+        for v in &w {
+            let id = self.c_ident(v);
+            self.nonnull_var.remove(&id);
+        }
+    }
+
     /// Split an expression into printf parts: Lit(text) | Arg(cexpr, is_num).
     fn parts_of(&mut self, e: &IrExpr) -> Vec<Part> {
         match e {
@@ -12455,7 +12509,7 @@ impl Render {
                         // prints "" — guard every %s arg UNLESS proven
                         // non-NULL (P1 follow-up: OOM aborts, so a proven
                         // fresh call temp can never be NULL here).
-                        if self.nonnull.contains(&v) {
+                        if self.nonnull.contains(&v) || self.nonnull_var.contains(&v) {
                             cargs.push(format!("(char*)({v})"));
                         } else {
                             cargs.push(format!(
@@ -12980,6 +13034,8 @@ impl Render {
                         for v in &vars_c {
                             self.store.insert(v.clone());
                             self.var_types.insert(v.clone(), IrType::Str);
+                            // P1 follow-up: the loop assigns these vars.
+                            self.nonnull_forget(v);
                         }
 
                         if is_pipe {
@@ -13130,6 +13186,8 @@ impl Render {
                         for v in &vars_c {
                             self.store.insert(v.clone());
                             self.var_types.insert(v.clone(), IrType::Str);
+                            // P1 follow-up: the loop assigns these vars.
+                            self.nonnull_forget(v);
                         }
 
                         if is_pipe {
@@ -13344,6 +13402,8 @@ impl Render {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if matches!(items.first(), Some(IrExpr::Str(sv, _)) if sv == "-v") {
                         if let Some(IrExpr::Str(name, _)) = items.get(1) {
+                            // P1 follow-up: printf -v writes the var.
+                            self.nonnull_forget(name);
                             let rest: Vec<&IrExpr> =
                                 items.iter().skip(2).collect();
                             if let Some(p) = self.try_native_printf_into(
@@ -13671,8 +13731,12 @@ impl Render {
                 // const-markup lift: the declaration already carries the
                 // literal initializer (emit_var_decl) — the assignment
                 // statement is redundant (the verdict guarantees this is
-                // the var's only write).
+                // the var's only write). The const value is a literal —
+                // non-NULL by construction (plus fn-written gate).
                 if self.const_lifted.contains(&t.var) {
+                    if !self.fn_written.contains(&t.var) {
+                        self.nonnull_var.insert(self.c_ident(&t.var));
+                    }
                     return;
                 }
                 // bash `((expr))` arith STATEMENT (the core spells the
@@ -13687,6 +13751,19 @@ impl Render {
                         a.as_ref(),
                         ArithAst::Assign { .. } | ArithAst::IncDec { .. }
                     ) {
+                        // P1 follow-up: side-effect writes (target +
+                        // nested IncDec/Assign vars) invalidate proofs.
+                        // (This arm returns early, bypassing the
+                        // top-remove below.)
+                        {
+                            let mut w = HashSet::new();
+                            nonnull_written_arith(a, &mut w);
+                            for v in w {
+                                let id = self.c_ident(&v);
+                                self.nonnull_var.remove(&id);
+                            }
+                            self.nonnull_forget(&t.var);
+                        }
                         if self.is_bigint_arith(a) {
                             // bigint side-effect statement (`((x++))`
                             // with bigint x): the eval writes a temp;
@@ -13725,6 +13802,10 @@ impl Render {
                     }
                 }
                 let name = self.c_ident(&t.var);
+                // P1 follow-up: any scalar write invalidates a non-NULL
+                // proof (the proven sub-arms below re-establish it).
+                // Default-deny: every path that does not prove removes.
+                self.nonnull_var.remove(&name);
                 if let Some(b) = self.buf_bound(&t.var) {
                     // a bounded string var: the debug-only length assert
                     // fires BEFORE the write that would overflow the
@@ -13739,6 +13820,11 @@ impl Render {
                         rhs
                     };
                     self.emit_guarded_copy(&name, b, &rhs);
+                    // P1 follow-up: a fixed buffer address is never NULL
+                    // (plus fn-written gate: calls might observe it).
+                    if !self.fn_written.contains(&t.var) {
+                        self.nonnull_var.insert(name.clone());
+                    }
                     return;
                 }
                 let is_num = self.is_num(&t.var);
@@ -13829,6 +13915,13 @@ impl Render {
                         // and it is no longer pending a free.
                         self.emit(&format!("{name} = {rhs};"));
                         self.pending_frees.retain(|x| x != &rhs);
+                        // P1 follow-up: moved from a proven temp/var →
+                        // proven (plus fn-written gate).
+                        if (self.nonnull.contains(&rhs) || self.nonnull_var.contains(&rhs))
+                            && !self.fn_written.contains(&t.var)
+                        {
+                            self.nonnull_var.insert(name.clone());
+                        }
                     } else {
                         // free-before-reassign: a FILE-SCOPE heap store
                         // var (hoisted to file scope because a function
@@ -13844,12 +13937,22 @@ impl Render {
                             self.emit(&format!("free({name});"));
                         }
                         self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
+                        // P1 follow-up: _sh_xstrdup aborts on OOM, so the
+                        // fresh copy is non-NULL by construction (plus
+                        // fn-written gate).
+                        if !self.fn_written.contains(&t.var) {
+                            self.nonnull_var.insert(name.clone());
+                        }
                     }
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
+                // P1 follow-up: (re)definition writes the vars.
+                for v in vars {
+                    self.nonnull_forget(&v.name);
+                }
                 // `local n=$1` — the core keeps the SOURCE text as the
                 // init: expand `$1`/`$name` into the live values
                 let dollar = init.as_ref().and_then(|e| match e {
@@ -13949,13 +14052,20 @@ impl Render {
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 let c = self.expr(cond);
+                // P1 follow-up: intersect proofs across branches — a
+                // var proven on every path stays proven; a reassign on
+                // any path drops it. (Each branch starts from the
+                // pre-branch state.)
+                let pre_if = self.nonnull_var.clone();
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
                 for s in then {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                let mut post_if = std::mem::take(&mut self.nonnull_var);
                 for (ec, body) in elsifs {
+                    self.nonnull_var = pre_if.clone();
                     let ec = self.expr(ec);
                     self.emit(&format!("}} else if ({ec}) {{"));
                     self.depth += 1;
@@ -13963,7 +14073,10 @@ impl Render {
                         self.stmt(s);
                     }
                     self.depth -= 1;
+                    let cur = std::mem::take(&mut self.nonnull_var);
+                    post_if.retain(|v| cur.contains(v));
                 }
+                self.nonnull_var = pre_if.clone();
                 if !else_.is_empty() {
                     self.emit("} else {");
                     self.depth += 1;
@@ -13972,6 +14085,11 @@ impl Render {
                     }
                     self.depth -= 1;
                 }
+                // (empty else preserves the pre-branch state, already
+                // in place above)
+                let cur = std::mem::take(&mut self.nonnull_var);
+                post_if.retain(|v| cur.contains(v));
+                self.nonnull_var = post_if;
                 self.emit("}");
             }
             IrStmt::Exit(e) => {
@@ -13979,6 +14097,9 @@ impl Render {
                 self.emit(&format!("return {code};"));
             }
             IrStmt::For { var, iter, body } => {
+                // P1 follow-up: the loop var is (re)assigned per
+                // iteration, plus body writes (see While).
+                self.nonnull_clear_written(std::slice::from_ref(s));
                 // seq-range lift: `for x in $(seq a b)` (captureWords →
                 // arrow → exec "seq") OR a core-lowered IrExpr::Range →
                 // traditional numeric C loop. The A2 verdict for the loop
@@ -14336,6 +14457,11 @@ impl Render {
                 }
             }
             IrStmt::While { cond, body } => {
+                // P1 follow-up: loop-body writes invalidate proofs
+                // (cleared before the cond/body render, so uses inside
+                // see the conservative state; re-established by Assign
+                // hooks as the body renders).
+                self.nonnull_clear_written(std::slice::from_ref(s));
                 // the cond is an IrExpr (the ShIR's `[ ... ]` is a
                 // Call("test") -> test_render, `while true` -> "1").
                 // Wrapped in a site helper: any numeric temps the cond
@@ -14357,6 +14483,8 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
+                // P1 follow-up: see While.
+                self.nonnull_clear_written(std::slice::from_ref(s));
                 let c = self.cond_site(cond);
                 self.emit("do {");
                 self.depth += 1;
@@ -14485,6 +14613,8 @@ impl Render {
                     // pipeline stdout captured into $var
                     self.store.insert(var.clone());
                     let id = self.c_ident(&var);
+                    // P1 follow-up: capture output is unproven.
+                    self.nonnull_var.remove(&id);
                     let args = vec![IrExpr::Array(
                         stages
                             .iter()
@@ -14636,6 +14766,9 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::Case { discriminant, clauses } => {
+                // P1 follow-up: branches may reassign — drop proofs
+                // (precision follow-up: intersect like If).
+                self.nonnull_var.clear();
                 let d = self.value_c(discriminant);
                 self.need_fnmatch = true;
                 let mut first = true;
@@ -14843,6 +14976,8 @@ impl Render {
                 step,
                 body,
             } => {
+                // P1 follow-up: init/step/body all write (see While).
+                self.nonnull_clear_written(std::slice::from_ref(s));
                 // c-style for as a real node: `init; while (cond) {
                 // body; step; }`. The init/step render as STATEMENTS (not
                 // for-header exprs) so their arith temps land inside the
@@ -14866,6 +15001,9 @@ impl Render {
             // a file (O(1) memory; the node doc pins "C getline"). The
             // loop var is STRING-typed by construction.
             IrStmt::Ext(ref node) if node.tag() == "ForEachLine" => {
+                // P1 follow-up: the loop assigns its var (body assigns
+                // are tracked by the Assign hooks as the body renders).
+                // (The counter is a fresh C temp, never tracked.)
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static FL_N: AtomicUsize = AtomicUsize::new(0);
                 let k = FL_N.fetch_add(1, Ordering::Relaxed);
@@ -14874,6 +15012,7 @@ impl Render {
                     .expect("tag/type agree");
                 self.store.insert(fl.var.clone());
                 self.var_types.insert(fl.var.clone(), IrType::Str);
+                self.nonnull_forget(&fl.var);
                 // body self-increment assigns ('cat -n F' counter) are
                 // NUMERIC — typed here before the body renders or the
                 // counter hoists as char* and prints pointer garbage
@@ -14936,6 +15075,9 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::Try { body, excepts, else_body, finally_body } => {
+                // P1 follow-up: exceptional paths may reassign — drop
+                // proofs (see Case).
+                self.nonnull_var.clear();
                 // Python-style exceptions via setjmp/longjmp: the try body
                 // (and the else body — Python's no-exception branch) run
                 // in the setjmp==0 arm; a raise longjmps to the else arm,
@@ -15144,6 +15286,15 @@ impl Render {
         // call temp is created (a pre-pass because render order is
         // caller-first). See analyze_nonnull_returns.
         self.nonnull_returns = analyze_nonnull_returns(&self.fn_defs, &self.lifted_fns);
+        // vars assigned in any function body: calls might observe them
+        // mid-flight, so they never enter the proof set (see fn_written).
+        // Thorough (over-approximate): missing one would be unsound,
+        // extra ones only miss opts.
+        let mut fw = HashSet::new();
+        for (_, body) in &self.fn_defs {
+            nonnull_written_stmts(body, &mut fw);
+        }
+        self.fn_written = fw;
         // vars that appear ONLY inside function bodies (var_types covers
         // them too, but they must NOT be hoisted into main — the
         // function declares its own copy).
@@ -15341,6 +15492,13 @@ impl Render {
             // free heap-return temps (native-call results) not moved
             // into a store var, at each logical-statement boundary.
             self.flush_pending_frees();
+            // non-NULL proofs do not cross top-level statements either:
+            // temps are freed here, and shIR-var proofs are re-established
+            // per statement by the Assign hooks (a stale entry would
+            // claim a value assigned before intervening control flow).
+            // (Function bodies manage their own scope via emit_function
+            // save/restore; this covers main and straight-line runs.)
+            self.nonnull.clear();
         }
         // EXIT trap: run the registered cleanup body before returning
         if let Some(body) = &self.exit_trap_body {
@@ -17300,6 +17458,272 @@ fn nonnull_has_early_return(stmts: &[IrStmt]) -> bool {
         }
     }
     false
+}
+
+/// Every shIR var name this statement list might write (thorough
+/// over-approximation for `fn_written` exclusion and loop-clearing:
+/// missing one would be unsound, extra ones only miss opts). Covers
+/// Assign targets, loop vars, nested arith writes (any depth), setVar /
+/// runtime-assign / exec-declare / printf -v / unset / read targets,
+/// and recurses through every inline scope (nested Function defs
+/// included — their assigns happen when called). Opaque Ext/Asm nodes
+/// contribute their structural children/names (see below); anything
+/// truly opaque would need a veto flag — none remain (Ext exposes
+/// children(), Shaderize has body+var, Asm has output names).
+fn nonnull_written_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    out.insert(t.var.clone());
+                }
+                nonnull_written_expr(expr, out);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for v in vars {
+                    out.insert(v.name.clone());
+                }
+                if let Some(e) = init {
+                    nonnull_written_expr(e, out);
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                out.insert(var.clone());
+                for e in elements {
+                    nonnull_written_expr(e, out);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                nonnull_written_expr(cond, out);
+                nonnull_written_stmts(then, out);
+                for (_, b) in elsifs {
+                    nonnull_written_stmts(b, out);
+                }
+                nonnull_written_stmts(else_, out);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                nonnull_written_expr(cond, out);
+                nonnull_written_stmts(body, out);
+            }
+            IrStmt::For { var, iter: _, body } => {
+                out.insert(var.clone());
+                nonnull_written_stmts(body, out);
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                nonnull_written_stmts(init, out);
+                nonnull_written_expr(cond, out);
+                nonnull_written_stmts(step, out);
+                nonnull_written_stmts(body, out);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                nonnull_written_stmts(body, out);
+                for e in excepts {
+                    nonnull_written_stmts(&e.body, out);
+                }
+                nonnull_written_stmts(else_body, out);
+                nonnull_written_stmts(finally_body, out);
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                nonnull_written_expr(discriminant, out);
+                for c in clauses {
+                    nonnull_written_stmts(&c.body, out);
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    nonnull_written_stmts(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => nonnull_written_stmts(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    nonnull_written_stmts(st, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                // nested definitions execute when called — their writes
+                // count (over-approximate).
+                nonnull_written_stmts(body, out);
+                for (_, b) in named_blocks {
+                    nonnull_written_stmts(b, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                nonnull_written_stmts(b, out)
+            }
+            IrStmt::Output { value, .. } | IrStmt::WriteFile { content: value, .. } => {
+                nonnull_written_expr(value, out);
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    nonnull_written_expr(x, out);
+                }
+            }
+            IrStmt::Die { expr: e, .. } => {
+                nonnull_written_expr(e, out);
+            }
+            IrStmt::Ext(n) => {
+                for c in n.children() {
+                    nonnull_written_stmts(std::slice::from_ref(c), out);
+                }
+            }
+            IrStmt::Shaderize { var, body, .. } => {
+                out.insert(var.clone());
+                nonnull_written_stmts(body, out);
+            }
+            IrStmt::Asm { outputs, .. } => {
+                for (v, e) in outputs {
+                    out.insert(v.clone());
+                    nonnull_written_expr(e, out);
+                }
+            }
+            IrStmt::Expr(e) => nonnull_written_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+/// A `k=v` (or bare `k`) word of a store-writing builtin (local /
+/// declare / export / readonly / unset / read / …): `k` is written
+/// (bare words declare, possibly unset — still a write). Anything else
+/// is not a name.
+fn nonnull_written_word(ws: &str, out: &mut HashSet<String>) {
+    let n = ws.split('=').next().unwrap_or("");
+    let n = n.trim_start_matches(|c: char| c == '$' || c == '"' || c == '\'');
+    if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        out.insert(n.to_string());
+    }
+}
+
+/// Side-effecting writes hidden inside an expression (for the thorough
+/// collector above): nested arith Assign/IncDec at any depth, and the
+/// store-writing calls (setVar / runtime assign / exec-declare /
+/// printf -v / unset / read). Anything else is value-only.
+fn nonnull_written_expr(e: &IrExpr, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Arith(a) => nonnull_written_arith(a, out),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            nonnull_written_expr(lhs, out);
+            nonnull_written_expr(rhs, out);
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            nonnull_written_expr(cond, out);
+            nonnull_written_expr(then, out);
+            nonnull_written_expr(else_, out);
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            nonnull_written_expr(expr, out);
+            nonnull_written_expr(default, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    nonnull_written_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for x in items {
+                nonnull_written_expr(x, out);
+            }
+        }
+        IrExpr::Index { key, .. } => nonnull_written_expr(key, out),
+        IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
+            if let Some(IrExpr::Str(n, _)) = args.first() {
+                out.insert(n.clone());
+            }
+            for a in args.iter().skip(1) {
+                nonnull_written_expr(a, out);
+            }
+        }
+        IrExpr::Call { func, args }
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if matches!(c.as_str(), "local" | "declare" | "typeset" | "export" | "readonly" | "unset" | "read" | "readarray" | "mapfile")) =>
+        {
+            for a in args.iter().skip(1) {
+                match a {
+                    IrExpr::Array(items) => {
+                        for w in items {
+                            if let IrExpr::Str(ws, _) = w {
+                                nonnull_written_word(ws, out);
+                            } else {
+                                nonnull_written_expr(w, out);
+                            }
+                        }
+                    }
+                    IrExpr::Str(ws, _) => nonnull_written_word(ws, out),
+                    other => nonnull_written_expr(other, out),
+                }
+            }
+        }
+        IrExpr::Call { func: _, args } => {
+            for a in args {
+                nonnull_written_expr(a, out);
+            }
+        }
+        IrExpr::ArrayComp { var, iter, elem, cond } => {
+            // comprehension loop var is written per iteration.
+            out.insert(var.clone());
+            nonnull_written_expr(iter, out);
+            nonnull_written_expr(elem, out);
+            if let Some(c) = cond {
+                nonnull_written_expr(c, out);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
+            // closure body runs when called — its writes count
+            // (over-approximate).
+            nonnull_written_stmts(body, out);
+        }
+        IrExpr::Arrow(body) => {
+            nonnull_written_stmts(body, out);
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                nonnull_written_expr(v, out);
+            }
+        }
+        IrExpr::Splice(x) => nonnull_written_expr(x, out),
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                nonnull_written_expr(c, out);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            nonnull_written_expr(obj, out);
+            for a in args {
+                nonnull_written_expr(a, out);
+            }
+        }
+        IrExpr::Capture { expr, .. } => nonnull_written_expr(expr, out),
+        _ => {}
+    }
+}
+
+/// Nested arith writes at any depth (`j = i++ + ++i` writes j AND i).
+fn nonnull_written_arith(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            nonnull_written_arith(rhs, out);
+        }
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            nonnull_written_arith(lhs, out);
+            nonnull_written_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => nonnull_written_arith(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            nonnull_written_arith(test, out);
+            nonnull_written_arith(then, out);
+            nonnull_written_arith(else_, out);
+        }
+        ArithAst::Cast { arg, .. } => nonnull_written_arith(arg, out),
+        ArithAst::Index { key, .. } => nonnull_written_arith(key, out),
+        _ => {}
+    }
 }
 
 /// Collect Function definitions at any depth (names + bodies).
@@ -22211,6 +22635,90 @@ mod tests {
             asm: None,
         }];
         assert!(!analyze_nonnull_returns(&[("f".to_string(), assign_tail)], &lifted).contains("f"));
+    }
+
+    #[test]
+    fn nonnull_flow_assign_branch_loop() {
+        // P1 follow-up flow: straight-line proven assigns drop the
+        // guard; reassigns/branches/loops invalidate soundly.
+        fn assign(v: &str, e: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: v.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: e,
+                asm: None,
+            }
+        }
+        fn echo_var(v: &str) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    str_lit("echo"),
+                    IrExpr::Array(vec![IrExpr::Var(v.to_string(), None)]),
+                ],
+            })
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        // proven literal assign → guard dropped.
+        let out = shir_to_c(&prog_of(vec![
+            assign("x", str_lit("hi")),
+            echo_var("x"),
+        ]));
+        assert!(out.contains("(char*)(x)"), "no guard expected:\n{out}");
+        assert!(!out.contains("? (char*)(x)"), "guard kept:\n{out}");
+        // move chain through proven var → guard dropped.
+        let out = shir_to_c(&prog_of(vec![
+            assign("x", str_lit("hi")),
+            assign("y", IrExpr::Var("x".to_string(), None)),
+            echo_var("y"),
+        ]));
+        assert!(!out.contains("? (char*)(y)"), "move guard kept:\n{out}");
+        // reassign from unproven source kills the proof... via a path
+        // that bypasses xstrdup-copy: an arith side-effect statement
+        // writes without proving (plus the reassign itself removes).
+        // (Plain `x = $y` re-proves via xstrdup-copy — crash-or-proven.)
+        // untracked-then-proven: assign after a clobbering branch keeps
+        // the guard only on the unproven path — intersect preserves
+        // when BOTH branches prove.
+        let out = shir_to_c(&prog_of(vec![
+            assign("x", str_lit("hi")),
+            IrStmt::If {
+                cond: str_lit("c"),
+                then: vec![assign("x", str_lit("bye"))],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            echo_var("x"),
+        ]));
+        assert!(!out.contains("? (char*)(x)"), "intersect dropped proven:\n{out}");
+        // loop that never touches x preserves the proof.
+        let out = shir_to_c(&prog_of(vec![
+            assign("x", str_lit("hi")),
+            IrStmt::While {
+                cond: str_lit("c"),
+                body: vec![assign("y", str_lit("bye"))],
+            },
+            echo_var("x"),
+        ]));
+        assert!(!out.contains("? (char*)(x)"), "loop killed unrelated:\n{out}");
     }
 
     #[test]
