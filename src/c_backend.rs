@@ -783,6 +783,770 @@ fn walk_int_array_expr(
     }
 }
 
+/// Hoist-pair fold (t86 `_i_sqrt_n`/`_i_sqrt_nv`): the py-sh-go frontend
+/// evaluates a float-path bound ONCE into a temp pair — the arith-string
+/// result `s = arith(text)`, then the numeric coercion `n = s + 0` — so
+/// the per-iteration condition reads a plain binding instead of
+/// re-parsing a store string. The core types `s` Str and `n` Int, so the
+/// render homes `s` as `char*` (snprintf + strdup) and `n` via
+/// `atoll(s)` — a heap string round-trip of a value that is only ever
+/// read numerically.
+///
+/// When the pair is adjacent in one statement list and `s` occurs
+/// NOWHERE else in the program (the single static def plus the single
+/// coercion read — counted by `count_name_occurrences`, whose matches
+/// are exhaustive so the compiler rejects an unhandled variant), the
+/// arith call is retargeted onto `n` directly and the coercion dropped.
+/// `n` keeps the Int verdict the core derived from the arith source (the
+/// fold runs after `analyze_var_types` and drops only `s` from it), so
+/// the `is_num` + `arith` arm renders it numerically — the string home,
+/// the strdup, the atoll and the free all vanish. Anything not matching
+/// (extra defs/reads, non-`+0` coercions, the big-dom `Cast` shape, `asm`
+/// labels, Ext nodes, a non-Int `n`) is left untouched. Evaluation count
+/// is unchanged (the text evaluates once before and once after), and the
+/// fast-path cast is exactly the old snprintf+atoll value (see the arm).
+///
+/// C-backend-local: no other backend is affected, and the JS/estree path
+/// (which already folds the pair downstream) never sees the rewrite.
+fn fold_hoist_pairs(prog: &mut IrProgram) {
+    let frozen = prog.clone();
+    let mut dropped: HashSet<String> = HashSet::new();
+    fold_hoist_list(&mut prog.stmts, &frozen, &prog.var_types, &mut dropped);
+    for sub in &mut prog.subs {
+        fold_hoist_list(&mut sub.body, &frozen, &prog.var_types, &mut dropped);
+    }
+    if !dropped.is_empty() {
+        prog.var_types.retain(|(n, _)| !dropped.contains(n));
+    }
+}
+
+/// Numeric verdict of the coercion target: the fold only fires when `n`
+/// is already homed numeric, so the retargeted arith call renders through
+/// the `is_num` + `arith` arm. (A Str-typed `n` would keep the strdup and
+/// read it back per loop iteration — strictly worse than the pair.)
+/// Mirrors `is_num`'s last-wins construction over the verdict vec.
+fn hoist_target_is_int(var_types: &[(String, IrType)], name: &str) -> bool {
+    var_types
+        .iter()
+        .rev()
+        .find(|(n, _)| n == name)
+        .is_some_and(|(_, t)| *t == IrType::Int)
+}
+
+fn fold_hoist_list(
+    stmts: &mut Vec<IrStmt>,
+    frozen: &IrProgram,
+    var_types: &[(String, IrType)],
+    dropped: &mut HashSet<String>,
+) {
+    let mut i = 0usize;
+    while i + 1 < stmts.len() {
+        if let Some((s, n_target, arith_expr)) = hoist_pair_at(&stmts[i], &stmts[i + 1]) {
+            if hoist_target_is_int(var_types, &n_target.var)
+                && count_name_occurrences(frozen, &s) == 2
+            {
+                stmts[i] = IrStmt::Assign {
+                    targets: vec![n_target],
+                    expr: arith_expr,
+                    asm: None,
+                };
+                stmts.remove(i + 1);
+                dropped.insert(s);
+                // re-examine (i, i+1): the retargeted def may itself be
+                // the string half of a chained pair
+                continue;
+            }
+        }
+        i += 1;
+    }
+    for st in stmts.iter_mut() {
+        fold_hoist_nested(st, frozen, var_types, dropped);
+    }
+}
+
+/// Match the adjacent hoist pair `s = arith(text)` / `n = s + 0` (or the
+/// post-`arith_identity` bare-`Var`/`Ident` shape). Returns the temp name,
+/// the numeric target (identity preserved from the coercion statement)
+/// and the arith call. Refuses `asm` labels (dropping a
+/// declaration-site label would rename the object symbol),
+/// multi-targets, indexed targets and the big-dom `Cast` shape.
+fn hoist_pair_at(
+    a: &IrStmt,
+    b: &IrStmt,
+) -> Option<(String, crate::ir::AssignTarget, IrExpr)> {
+    let (s, arith_expr) = match a {
+        IrStmt::Assign { targets, expr, asm } if targets.len() == 1 && asm.is_none() => {
+            let t = &targets[0];
+            if !t.indices.is_empty() || t.var.contains('[') {
+                return None;
+            }
+            match expr {
+                IrExpr::Call { func, args }
+                    if func == "arith" && matches!(args.as_slice(), [IrExpr::Str(_, _)]) =>
+                {
+                    (t.var.clone(), expr.clone())
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    match b {
+        IrStmt::Assign { targets, expr, asm } if targets.len() == 1 && asm.is_none() => {
+            let u = &targets[0];
+            if u.var == s || !u.indices.is_empty() || u.var.contains('[') {
+                return None;
+            }
+            let is_coercion = match expr {
+                IrExpr::Arith(ast) => match ast.as_ref() {
+                    ArithAst::Bin { op, lhs, rhs } if op == "+" => {
+                        matches!((&**lhs, &**rhs), (ArithAst::Var(v), ArithAst::Num(0)) if v == &s)
+                            || matches!((&**lhs, &**rhs), (ArithAst::Num(0), ArithAst::Var(v)) if v == &s)
+                    }
+                    ArithAst::Var(v) | ArithAst::Ident(v) => v == &s,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !is_coercion {
+                return None;
+            }
+            Some((s, u.clone(), arith_expr))
+        }
+        _ => None,
+    }
+}
+
+/// Recurse the fold into nested statement lists. Arrow/Lambda bodies are
+/// deliberately NOT folded (a hoist pair cannot originate inside a
+/// deferred closure from any current frontend — the pre-statements hoist
+/// to statement level; leaving one is over-refusal, always sound). The
+/// occurrence counter DOES descend into them, so a hidden read there
+/// still refuses the fold.
+fn fold_hoist_nested(
+    st: &mut IrStmt,
+    frozen: &IrProgram,
+    var_types: &[(String, IrType)],
+    dropped: &mut HashSet<String>,
+) {
+    match st {
+        IrStmt::If { then, elsifs, else_, .. } => {
+            fold_hoist_list(then, frozen, var_types, dropped);
+            for (_, b) in elsifs {
+                fold_hoist_list(b, frozen, var_types, dropped);
+            }
+            fold_hoist_list(else_, frozen, var_types, dropped);
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            fold_hoist_list(body, frozen, var_types, dropped);
+            for e in excepts {
+                fold_hoist_list(&mut e.body, frozen, var_types, dropped);
+            }
+            fold_hoist_list(else_body, frozen, var_types, dropped);
+            fold_hoist_list(finally_body, frozen, var_types, dropped);
+        }
+        IrStmt::For { body, .. } => fold_hoist_list(body, frozen, var_types, dropped),
+        IrStmt::ForInit { init, step, body, .. } => {
+            fold_hoist_list(init, frozen, var_types, dropped);
+            fold_hoist_list(step, frozen, var_types, dropped);
+            fold_hoist_list(body, frozen, var_types, dropped);
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+            fold_hoist_list(body, frozen, var_types, dropped);
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            fold_hoist_list(body, frozen, var_types, dropped);
+            for (_, b) in named_blocks {
+                fold_hoist_list(b, frozen, var_types, dropped);
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            fold_hoist_list(body, frozen, var_types, dropped);
+        }
+        IrStmt::Redirect { inner, .. } => fold_hoist_list(inner, frozen, var_types, dropped),
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                fold_hoist_list(&mut c.body, frozen, var_types, dropped);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                fold_hoist_list(stage, frozen, var_types, dropped);
+            }
+        }
+        IrStmt::Shaderize { body, .. } => fold_hoist_list(body, frozen, var_types, dropped),
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                fold_hoist_list(&mut c.body, frozen, var_types, dropped);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Occurrences of `name` anywhere in the program: defs, reads, name-arg
+/// positions, `$`-refs inside texts. The fold requires exactly 2 (the
+/// pair's def plus its single coercion read) — any other mention refuses
+/// it. Every match is exhaustive (no wildcard arm) so adding an IR
+/// variant breaks compilation instead of silently under-counting.
+///
+/// String positions count three ways (all conservative — a literal value
+/// that merely looks like a mention over-refuses, never miscompiles):
+/// exact equality (a `getVar("s")`-style name argument), a `name=value`
+/// head (a `local s=…` write word), and `$` references (`$s`, `${s}`,
+/// `${s…}`).
+fn count_name_occurrences(prog: &IrProgram, name: &str) -> usize {
+    let mut n = 0usize;
+    for st in &prog.stmts {
+        count_stmt(st, name, &mut n);
+    }
+    for sub in &prog.subs {
+        if sub.name == name {
+            n += 1;
+        }
+        for p in &sub.params {
+            if p == name {
+                n += 1;
+            }
+        }
+        for st in &sub.body {
+            count_stmt(st, name, &mut n);
+        }
+    }
+    n
+}
+
+fn count_stmt(st: &IrStmt, name: &str, n: &mut usize) {
+    match st {
+        IrStmt::Ext(_) => {
+            // Opaque transform node: assume a mention (a read hidden in
+            // an uninspectable payload must refuse the fold).
+            // Over-refusal is always sound; t86-class programs carry no
+            // Ext nodes on the C path (split_set is -O3-gated,
+            // process_subst only rewrites <()).
+            *n += 1;
+        }
+        IrStmt::Output { value, target, .. } => {
+            count_expr(value, name, n);
+            if target.as_deref() == Some(name) {
+                *n += 1;
+            }
+        }
+        IrStmt::WriteFile { path, content, .. } => {
+            count_expr(path, name, n);
+            count_expr(content, name, n);
+        }
+        IrStmt::Assign { targets, expr, asm } => {
+            for t in targets {
+                if t.var == name {
+                    *n += 1;
+                } else {
+                    // baked subscript (`arr[$i]`) or array-element write
+                    *n += str_mentions(&t.var, name);
+                    for ix in &t.indices {
+                        count_expr(ix, name, n);
+                    }
+                }
+            }
+            count_expr(expr, name, n);
+            if let Some(a) = asm {
+                count_asm_spec(a, name, n);
+            }
+        }
+        IrStmt::Declare { vars, init, .. } => {
+            for d in vars {
+                if d.name == name {
+                    *n += 1;
+                }
+            }
+            if let Some(e) = init {
+                count_expr(e, name, n);
+            }
+        }
+        IrStmt::DeclareArray { var, elements, .. } => {
+            if var == name {
+                *n += 1;
+            }
+            for e in elements {
+                count_expr(e, name, n);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            count_expr(cond, name, n);
+            for b in then.iter().chain(else_) {
+                count_stmt(b, name, n);
+            }
+            for (c, b) in elsifs {
+                count_expr(c, name, n);
+                for stm in b {
+                    count_stmt(stm, name, n);
+                }
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for b in body.iter().chain(else_body).chain(finally_body) {
+                count_stmt(b, name, n);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    count_expr(m, name, n);
+                }
+                if e.as_name.as_deref() == Some(name) {
+                    *n += 1;
+                }
+                for b in &e.body {
+                    count_stmt(b, name, n);
+                }
+            }
+        }
+        IrStmt::For { var, iter, body } => {
+            if var == name {
+                *n += 1;
+            }
+            count_expr(iter, name, n);
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for b in init.iter().chain(step).chain(body) {
+                count_stmt(b, name, n);
+            }
+            count_expr(cond, name, n);
+        }
+        IrStmt::Continue => {}
+        IrStmt::Break => {}
+        IrStmt::While { cond, body } => {
+            count_expr(cond, name, n);
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for b in body {
+                count_stmt(b, name, n);
+            }
+            count_expr(cond, name, n);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+            count_expr(expr, name, n);
+        }
+        IrStmt::Exec { cmd, args, capture, redirects, env } => {
+            count_expr(cmd, name, n);
+            for a in args {
+                count_expr(a, name, n);
+            }
+            if capture.as_deref() == Some(name) {
+                *n += 1;
+            }
+            for r in redirects {
+                count_expr(r, name, n);
+            }
+            for (v, e) in env {
+                if v == name {
+                    *n += 1;
+                }
+                count_expr(e, name, n);
+            }
+        }
+        IrStmt::Pipeline { stages, last_output, capture, cmd_str } => {
+            for stage in stages {
+                for b in stage {
+                    count_stmt(b, name, n);
+                }
+            }
+            if last_output.as_deref() == Some(name) {
+                *n += 1;
+            }
+            if capture.as_deref() == Some(name) {
+                *n += 1;
+            }
+            if let Some(s) = cmd_str {
+                *n += str_mentions(s, name);
+            }
+        }
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                count_expr(x, name, n);
+            }
+        }
+        IrStmt::SetChildError(e) => count_expr(e, name, n),
+        IrStmt::Require(s) => {
+            *n += str_mentions(s, name);
+        }
+        IrStmt::RawText(s) => {
+            *n += str_mentions(s, name);
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            count_expr(discriminant, name, n);
+            for c in clauses {
+                for p in &c.patterns {
+                    // patterns are globs (no expansion), but scanning
+                    // them is the conservative direction
+                    *n += str_mentions(p, name);
+                }
+                for b in &c.body {
+                    count_stmt(b, name, n);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                count_stmt(b, name, n);
+            }
+            for r in redirects {
+                count_expr(&r.target, name, n);
+            }
+        }
+        IrStmt::Function { name: fname, body, named_blocks } => {
+            if fname == name {
+                *n += 1;
+            }
+            for b in body {
+                count_stmt(b, name, n);
+            }
+            for (bn, b) in named_blocks {
+                if bn == name {
+                    *n += 1;
+                }
+                for st in b {
+                    count_stmt(st, name, n);
+                }
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if c.comm == *name {
+                    *n += 1;
+                }
+                if c.target.as_deref() == Some(name) {
+                    *n += 1;
+                }
+                if let Some(ch) = &c.ch {
+                    count_expr(ch, name, n);
+                }
+                if let Some(v) = &c.value {
+                    count_expr(v, name, n);
+                }
+                for b in &c.body {
+                    count_stmt(b, name, n);
+                }
+            }
+        }
+        IrStmt::Asm { template, outputs, inputs, clobbers, .. } => {
+            *n += str_mentions(template, name);
+            for (c, e) in outputs.iter().chain(inputs) {
+                if c == name {
+                    *n += 1;
+                }
+                count_expr(e, name, n);
+            }
+            for c in clobbers {
+                *n += str_mentions(c, name);
+            }
+        }
+        IrStmt::Expr(e) => count_expr(e, name, n),
+        IrStmt::Label(s) | IrStmt::Goto(s) => {
+            if s == name {
+                *n += 1;
+            }
+        }
+        IrStmt::Shaderize { var, body, .. } => {
+            if var == name {
+                *n += 1;
+            }
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+    }
+}
+
+fn count_asm_spec(a: &crate::ir::AsmSpec, name: &str, n: &mut usize) {
+    *n += str_mentions(&a.template, name);
+    for (c, e) in a.outputs.iter().chain(&a.inputs) {
+        if c == name {
+            *n += 1;
+        }
+        count_expr(e, name, n);
+    }
+    for c in &a.clobbers {
+        *n += str_mentions(c, name);
+    }
+}
+
+fn count_expr(e: &IrExpr, name: &str, n: &mut usize) {
+    match e {
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Range { .. } => {}
+        IrExpr::Str(s, _) => {
+            *n += str_mentions(s, name);
+        }
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+            if v == name {
+                *n += 1;
+            }
+        }
+        IrExpr::Index { var, key } => {
+            if var == name {
+                *n += 1;
+            }
+            count_expr(key, name, n);
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            count_expr(lhs, name, n);
+            count_expr(rhs, name, n);
+        }
+        IrExpr::Call { func, args } => {
+            if func == name {
+                *n += 1;
+            }
+            for a in args {
+                count_expr(a, name, n);
+            }
+        }
+        IrExpr::MethodCall { obj, method, args } => {
+            if method == name {
+                *n += 1;
+            }
+            count_expr(obj, name, n);
+            for a in args {
+                count_expr(a, name, n);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            count_expr(cond, name, n);
+            count_expr(then, name, n);
+            count_expr(else_, name, n);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            count_expr(expr, name, n);
+            count_expr(default, name, n);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => {
+                        *n += str_mentions(s, name);
+                    }
+                    InterpPart::Expr(x) => count_expr(x, name, n),
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => count_expr(expr, name, n),
+        IrExpr::Regex { pattern, flags } => {
+            *n += str_mentions(pattern, name);
+            *n += str_mentions(flags, name);
+        }
+        IrExpr::RawExpr(s) => {
+            *n += str_mentions(s, name);
+        }
+        IrExpr::Arrow(body) => {
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+        IrExpr::Array(items) => {
+            for it in items {
+                count_expr(it, name, n);
+            }
+        }
+        IrExpr::ArrayComp { var, iter, elem, cond } => {
+            if var == name {
+                *n += 1;
+            }
+            count_expr(iter, name, n);
+            count_expr(elem, name, n);
+            if let Some(c) = cond {
+                count_expr(c, name, n);
+            }
+        }
+        IrExpr::Lambda { params, body } => {
+            for p in params {
+                if p == name {
+                    *n += 1;
+                }
+            }
+            for b in body {
+                count_stmt(b, name, n);
+            }
+        }
+        IrExpr::Arith(a) => count_arith(a, name, n),
+        IrExpr::Json(v) => count_json(v, name, n),
+        IrExpr::Object(props) => {
+            for (k, v) in props {
+                if k == name {
+                    *n += 1;
+                }
+                count_expr(v, name, n);
+            }
+        }
+        IrExpr::Splice(x) => count_expr(x, name, n),
+        IrExpr::Ext(_) => {
+            // see the IrStmt::Ext arm: assume a mention
+            *n += 1;
+        }
+    }
+}
+
+fn count_arith(a: &ArithAst, name: &str, n: &mut usize) {
+    match a {
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        ArithAst::Var(v) | ArithAst::Ident(v) => {
+            if v == name {
+                *n += 1;
+            }
+        }
+        ArithAst::Index { var, key } => {
+            if var == name {
+                *n += 1;
+            }
+            count_arith(key, name, n);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            count_arith(lhs, name, n);
+            count_arith(rhs, name, n);
+        }
+        ArithAst::Un { arg, .. } => count_arith(arg, name, n),
+        ArithAst::Cond { test, then, else_ } => {
+            count_arith(test, name, n);
+            count_arith(then, name, n);
+            count_arith(else_, name, n);
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            if var == name {
+                *n += 1;
+            }
+            count_arith(rhs, name, n);
+        }
+        ArithAst::IncDec { var, .. } => {
+            if var == name {
+                *n += 1;
+            }
+        }
+        ArithAst::Cast { arg, .. } => count_arith(arg, name, n),
+    }
+}
+
+fn count_json(v: &serde_json::Value, name: &str, n: &mut usize) {
+    match v {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        serde_json::Value::String(s) => {
+            *n += str_mentions(s, name);
+        }
+        serde_json::Value::Array(items) => {
+            for it in items {
+                count_json(it, name, n);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k == name {
+                    *n += 1;
+                }
+                count_json(v, name, n);
+            }
+        }
+    }
+}
+
+/// String-position mentions of `name`: exact equality (a bare name
+/// argument), a `name=value` head (a builtin write word), and `$`
+/// references (see `dollar_refs`).
+fn str_mentions(text: &str, name: &str) -> usize {
+    let mut c = 0usize;
+    if text == name {
+        c += 1;
+    } else if let Some((head, _)) = text.split_once('=') {
+        if head == name {
+            c += 1;
+        }
+    }
+    c + dollar_refs(text, name)
+}
+
+/// `$`-reference mentions of `name` in a text: `$name`, `${name}`,
+/// `${#name}`/`${!name}` (length/indirect — both read the var) and
+/// `${name…}` (defaults/slices/patterns keep scanning inside the
+/// braces). `$$`/`$?`/`$#`/`$!`/`$-` are non-var specials (skipped);
+/// `$@`/`$*`/`${@…}`/`${*…}` read every positional, so they count only
+/// for numeric (positional) names — a `_i_*` temp is never positional.
+/// `$(…)` is transparent: inner refs scan normally.
+fn dollar_refs(text: &str, name: &str) -> usize {
+    let positional = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let mut c = 0usize;
+    // byte indexing is safe: every slice boundary below sits on an
+    // ASCII byte (single-byte in UTF-8), and 0x24 never appears inside
+    // a multibyte sequence
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            break;
+        }
+        match b[i] {
+            b'{' => {
+                i += 1;
+                if i < b.len() && (b[i] == b'@' || b[i] == b'*') {
+                    if positional {
+                        c += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if i < b.len() && (b[i] == b'#' || b[i] == b'!') {
+                    i += 1;
+                }
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if start < i && &text[start..i] == name {
+                    c += 1;
+                }
+                // fall through: keep scanning inside the braces
+            }
+            b'@' | b'*' => {
+                if positional {
+                    c += 1;
+                }
+                i += 1;
+            }
+            ch if ch.is_ascii_alphabetic() || ch == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if &text[start..i] == name {
+                    c += 1;
+                }
+            }
+            ch if ch.is_ascii_digit() => {
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if &text[start..i] == name {
+                    c += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    c
+}
+
 /// Is `e` a provable 64-bit integer expression (a non-bigint literal,
 /// native arith, or an int-typed non-bigint var read)? Bigint arith and
 /// bigint-typed vars are excluded — they cannot fit a `long long[]` slot.
@@ -1006,6 +1770,12 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // A2 + var_lengths: the analyses run at serialization time in the
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
+    // Hoist-pair fold (t86 `_i_sqrt_n`/`_i_sqrt_nv` — see fold_hoist_pairs):
+    // runs after the A2 verdicts (which must see the pair to type the
+    // numeric half Int) and before every downstream analysis, so they all
+    // observe the folded program. C-backend-local: other backends never
+    // see the rewrite.
+    fold_hoist_pairs(&mut prog);
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
     prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     prog.var_storage = crate::shir::select_storage_classes(&prog);
@@ -12937,11 +13707,35 @@ impl Render {
                 }
                 let is_num = self.is_num(&t.var);
                 let rhs = if is_num {
-                    if let IrExpr::Call { func, .. } = expr {
+                    if let IrExpr::Call { func, args } = expr {
                         if func == "arith" {
                             // `n=$(( dyn ))` — the arith VALUE (the
-                            // site arm returns only the truthiness)
-                            format!("(long long)atoll({})", self.value_c(expr))
+                            // site arm returns only the truthiness).
+                            // A mathfunc-lowerable float-path text
+                            // (py-sh-go's hoisted `int(n**0.5)+1` bound)
+                            // renders as the numeric C expression
+                            // directly — no snprintf/atoll round-trip.
+                            // `(long long)(v)` is exactly what the
+                            // num_temp+atoll path computes (the same cast
+                            // around the same v: snprintf "%lld" of a
+                            // long long value round-trips exactly, and
+                            // NaN/Inf/overflow behave identically since
+                            // both paths cast first), so values are
+                            // identical; anything else keeps the
+                            // capture+atoll path.
+                            let direct = match args.as_slice() {
+                                [IrExpr::Str(text, _)] => {
+                                    self.mathfunc_arith_c(text)
+                                }
+                                _ => None,
+                            };
+                            match direct {
+                                Some(v) => format!("(long long)({v})"),
+                                None => format!(
+                                    "(long long)atoll({})",
+                                    self.value_c(expr)
+                                ),
+                            }
                         } else {
                             self.expr_as_num(expr)
                         }
@@ -20474,6 +21268,170 @@ mod tests {
             !out.contains("TODO(unsupported)"),
             "Index read fell to TODO:\n{out}"
         );
+    }
+
+    #[test]
+    fn hoist_pair_folds_to_direct_numeric_assign() {
+        // t86 `_i_sqrt_n`/`_i_sqrt_nv`: the float-bound temp pair must
+        // fold to one numeric assign — no string home, no strdup, no
+        // snprintf temp, no atoll of the temp (the `$1` read keeps its
+        // own atoll — only the temp's round-trip must vanish).
+        use crate::ir::StrStyle;
+        fn assign(var: &str, expr: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr,
+                asm: None,
+            }
+        }
+        let pair = vec![
+            assign(
+                "s",
+                IrExpr::Call {
+                    func: "arith".to_string(),
+                    args: vec![IrExpr::Str(
+                        "(int(sqrt($1)) + 1)".to_string(),
+                        StrStyle::DoubleQuoted,
+                    )],
+                },
+            ),
+            assign(
+                "n",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("s".to_string())),
+                    rhs: Box::new(ArithAst::Num(0)),
+                })),
+            ),
+            assign("i", IrExpr::Arith(Box::new(ArithAst::Num(1)))),
+            IrStmt::While {
+                cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "<".to_string(),
+                    lhs: Box::new(ArithAst::Var("i".to_string())),
+                    rhs: Box::new(ArithAst::Var("n".to_string())),
+                })),
+                body: vec![],
+            },
+        ];
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: pair,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("long long n"), "n not homed numeric:\n{out}");
+        assert!(
+            out.contains("n = (long long)("),
+            "bound not assigned directly:\n{out}"
+        );
+        assert!(
+            !out.contains("char* s = NULL"),
+            "string home survives:\n{out}"
+        );
+        assert!(!out.contains("= strdup"), "strdup survives:\n{out}");
+        assert!(!out.contains("_s0"), "snprintf temp survives:\n{out}");
+        assert!(!out.contains("atoll((s"), "atoll-of-temp survives:\n{out}");
+        assert!(!out.contains("free(s)"), "dead free survives:\n{out}");
+    }
+
+    #[test]
+    fn hoist_pair_refuses_extra_string_read() {
+        // an additional `$s` read anywhere keeps the pair untouched
+        // (and keeps `s` in the verdicts)
+        use crate::ir::StrStyle;
+        fn assign(var: &str, expr: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr,
+                asm: None,
+            }
+        }
+        let mut prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                assign(
+                    "s",
+                    IrExpr::Call {
+                        func: "arith".to_string(),
+                        args: vec![IrExpr::Str(
+                            "(int(sqrt($1)) + 1)".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )],
+                    },
+                ),
+                assign(
+                    "n",
+                    IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "+".to_string(),
+                        lhs: Box::new(ArithAst::Var("s".to_string())),
+                        rhs: Box::new(ArithAst::Num(0)),
+                    })),
+                ),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "$s".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![
+                ("s".to_string(), IrType::Str),
+                ("n".to_string(), IrType::Int),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        fold_hoist_pairs(&mut prog);
+        assert_eq!(prog.stmts.len(), 3, "pair folded despite extra read");
+        assert!(
+            prog.var_types.iter().any(|(v, _)| v == "s"),
+            "s dropped despite extra read"
+        );
+    }
+
+    #[test]
+    fn dollar_refs_rejects_name_prefix() {
+        // `_i_sqrt_n` is a strict prefix of `_i_sqrt_nv`: only full
+        // identifier matches count (a prefix hit would refuse every
+        // real hoist pair, since `n`'s own name contains `s`)
+        assert_eq!(dollar_refs("$_i_sqrt_nv", "_i_sqrt_n"), 0);
+        assert_eq!(dollar_refs("$_i_sqrt_n", "_i_sqrt_n"), 1);
+        assert_eq!(dollar_refs("${_i_sqrt_n}", "_i_sqrt_n"), 1);
+        assert_eq!(dollar_refs("${_i_sqrt_n:-1}", "_i_sqrt_n"), 1);
+        assert_eq!(dollar_refs("$_i_sqrt_nv + ${_i_sqrt_n}", "_i_sqrt_n"), 1);
+        assert_eq!(dollar_refs("$@", "_i_sqrt_n"), 0);
+        assert_eq!(dollar_refs("$@", "1"), 1);
+        assert_eq!(str_mentions("s", "s"), 1);
+        assert_eq!(str_mentions("s=1", "s"), 1);
+        assert_eq!(str_mentions("echo", "s"), 0);
     }
 
     #[test]
