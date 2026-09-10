@@ -150,6 +150,9 @@ pub struct Render {
     /// set-typed arrays (`factors = set(); factors.add(x)`) — lowered to
     /// a fixed i64 array + length counter (the C backend's model)
     set_arrays: BTreeSet<String>,
+    /// set/list arrays with bigint elements — lowered to a fixed
+    /// std.math.big.int.Managed array + length counter
+    bigint_arrays: BTreeSet<String>,
     /// bigint vars (arith beyond i64) — lowered to std.math.big.int.Managed
     bigint_vars: BTreeSet<String>,
     /// user functions whose body uses `try` (bigint/file IO) — they
@@ -1687,7 +1690,7 @@ impl Render {
             "sortedBigintJoin" => {
                 // `sorted(list(factors))` over a bigint list — sort+dedup+join
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.set_arrays.contains(name) {
+                    if self.bigint_arrays.contains(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
                         self.need_sorted = true;
@@ -1699,6 +1702,12 @@ impl Render {
             "max" | "min" | "sum" => {
                 // typed reduction over a list/set array
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.bigint_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_reduce = true;
+                        return format!("sh2{}Bigint(&{m}, {m}_len)", camel(func));
+                    }
                     if self.set_arrays.contains(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
@@ -2758,14 +2767,28 @@ impl Render {
                 // `factors.add(x)` appends (dedup happens at sortedIntJoin)
                 if let IrExpr::Call { func, args } = expr {
                     if matches!(func.as_str(), "setArray" | "setArrayAppend")
-                        && self.set_arrays.contains(&t.var)
+                        && (self.set_arrays.contains(&t.var) || self.bigint_arrays.contains(&t.var))
                     {
-                        self.emit(&format!("{m}_len = 0;"));
+                        if func == "setArray" {
+                            self.emit(&format!("{m}_len = 0;"));
+                        }
                         // populate/append each element
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             for it in items {
-                                let v = self.expr_num(it);
-                                self.emit(&format!("{m}[{m}_len] = {v};"));
+                                if self.bigint_arrays.contains(&t.var) {
+                                    // bigint element: init a Managed slot
+                                    self.emit(&format!("{m}[{m}_len] = try std.math.big.int.Managed.init(std.heap.page_allocator);"));
+                                    match it {
+                                        IrExpr::Arith(a) => self.bigint_into(a, &format!("{m}[{m}_len]")),
+                                        _ => {
+                                            let v = self.expr_str(it);
+                                            self.emit(&format!("try {m}[{m}_len].setString(10, {v});"));
+                                        }
+                                    }
+                                } else {
+                                    let v = self.expr_num(it);
+                                    self.emit(&format!("{m}[{m}_len] = {v};"));
+                                }
                                 self.emit(&format!("{m}_len += 1;"));
                             }
                         }
@@ -3212,7 +3235,11 @@ impl Render {
                 }
                 for v in &locals {
                     let m = self.zig_ident(v);
-                    if self.set_arrays.contains(v) {
+                    if self.bigint_arrays.contains(v) {
+                        // bigint list → fixed Managed array + length counter
+                        fntext.push_str(&format!("    var {m}: [1024]std.math.big.int.Managed = undefined;\n"));
+                        fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
+                    } else if self.set_arrays.contains(v) {
                         // set → fixed i64 array + length counter
                         fntext.push_str(&format!("    var {m}: [1024]i64 = undefined;\n"));
                         fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
@@ -3281,6 +3308,14 @@ impl Render {
         let mut set_arrays = BTreeSet::new();
         collect_set_arrays(&prog.stmts, &mut set_arrays);
         self.set_arrays = set_arrays;
+
+        // bigint-element arrays — lowered to a Managed array
+        let mut bigint_arrays = BTreeSet::new();
+        collect_bigint_arrays(&prog.stmts, &self.bigint_vars, &mut bigint_arrays);
+        for sub in &prog.subs {
+            collect_bigint_arrays(&sub.body, &self.bigint_vars, &mut bigint_arrays);
+        }
+        self.bigint_arrays = bigint_arrays;
 
         // bigint vars (arith beyond i64) — lowered to Managed
         self.bigint_vars = analyze_bigint_vars(prog);
@@ -3542,6 +3577,25 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    }");
             self.emit("    return out.items;");
             self.emit("}");
+            self.emit("fn sh2SortedBigintJoin(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
+            self.emit("    for (0..n) |i| ix[i] = i;");
+            self.emit("    std.mem.sort(usize, ix, a, struct {");
+            self.emit("        fn lt(ctx: []const std.math.big.int.Managed, x: usize, y: usize) bool {");
+            self.emit("            return std.math.big.int.Managed.order(ctx[x], ctx[y]) == .lt;");
+            self.emit("        }");
+            self.emit("    }.lt);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var prev: ?std.math.big.int.Managed = null;");
+            self.emit("    for (ix) |j| {");
+            self.emit("        if (prev != null and std.math.big.int.Managed.order(prev.?, a[j]) == .eq) continue;");
+            self.emit("        if (out.items.len != 0) out.appendSlice(std.heap.page_allocator, \", \") catch return \"\";");
+            self.emit("        const num = a[j].toString(std.heap.page_allocator, 10, .lower) catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, num) catch return \"\";");
+            self.emit("        prev = a[j];");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
         }
         if self.need_reduce {
             self.emit("");
@@ -3561,6 +3615,29 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    var total: i64 = 0;");
             self.emit("    for (a[0..n]) |v| total += v;");
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{total}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2MaxBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .gt) best = v; }");
+            self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2MinBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .lt) best = v; }");
+            self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2SumBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    var total = std.math.big.int.Managed.initSet(std.heap.page_allocator, 0) catch return \"\";");
+            self.emit("    defer total.deinit();");
+            self.emit("    for (a[0..n]) |v| {");
+            self.emit("        var t = std.math.big.int.Managed.init(std.heap.page_allocator) catch return \"\";");
+            self.emit("        defer t.deinit();");
+            self.emit("        t.add(&total, &v) catch return \"\";");
+            self.emit("        total.copy(t.toConst()) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return total.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
             self.emit("}");
         }
         if self.need_run {
@@ -3634,6 +3711,10 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                     "    {kw} {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);"
                 ));
                 decls.push(format!("    defer {m}.deinit();"));
+            } else if self.bigint_arrays.contains(v) {
+                // bigint list → fixed Managed array + length counter
+                decls.push(format!("    var {m}: [1024]std.math.big.int.Managed = undefined;"));
+                decls.push(format!("    var {m}_len: usize = 0;"));
             } else if self.set_arrays.contains(v) {
                 // set/list → fixed i64 array + length counter
                 decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
@@ -3808,6 +3889,51 @@ fn analyze_bigint_vars(prog: &IrProgram) -> BTreeSet<String> {
         }
     }
     vars
+}
+
+/// Arrays whose setArray/setArrayAppend elements are bigint-tainted —
+/// lowered to a std.math.big.int.Managed array (an i64 array would
+/// truncate the bigint elements).
+fn collect_bigint_arrays(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+    fn walk(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    if let IrExpr::Call { func, args } = expr {
+                        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                            if let Some(IrExpr::Str(name, _)) = args.first() {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if items.iter().any(|it| {
+                                        matches!(it, IrExpr::Arith(a) if arith_is_bigint(a, big))
+                                    }) {
+                                        out.insert(name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for t in targets {
+                        if big.contains(&t.var) {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, big, out);
+                    for (_, b) in elsifs { walk(b, big, out); }
+                    walk(else_, big, out);
+                }
+                IrStmt::For { body, .. } => walk(body, big, out),
+                IrStmt::ForInit { body, .. } => walk(body, big, out),
+                IrStmt::While { body, .. } => walk(body, big, out),
+                IrStmt::Function { body, .. } => walk(body, big, out),
+                IrStmt::Subshell(body) => walk(body, big, out),
+                IrStmt::Background(body) => walk(body, big, out),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, big, out);
 }
 
 fn collect_set_arrays(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
