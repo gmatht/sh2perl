@@ -1363,7 +1363,7 @@ fn classify_array_call(
 ) {
     let Some(first) = args.first() else { return };
     let name = match fn_name {
-        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" => match lit_str(first) {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" | "max" | "min" | "sum" => match lit_str(first) {
             Some(n) => n,
             None => return,
         },
@@ -1474,6 +1474,7 @@ fn classify_array_call(
             _ => entry.index_bad = true,
         },
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
+        "max" | "min" | "sum" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let _target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1969,6 +1970,17 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                         }
                     }
                 }
+                "max" | "min" | "sum" => {
+                    // native array: reduce via the maxArr/minArr/sumArr twin
+                    if let Some((name, _)) = array_len_join(fn_name, arguments) {
+                        if natives.contains(name) {
+                            return sh2_call(
+                                &format!("{fn_name}Arr"),
+                                vec![Expr::Identifier { name: name.to_string() }],
+                            );
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2131,7 +2143,7 @@ fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Opt
 fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
     match fn_name {
         "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
-        "arrayItems" | "arrayValues" => lit_str(args.first()?).map(|n| (n, false)),
+        "arrayItems" | "arrayValues" | "max" | "min" | "sum" => lit_str(args.first()?).map(|n| (n, false)),
         "param" => {
             let op = lit_str(args.first()?)?;
             let mode = args.get(2).and_then(lit_str)?;
