@@ -978,6 +978,60 @@ fn fold_hoist_list(
                 continue;
             }
         }
+        // `tmp = Y + 1` ... `while (V < tmp)` → `while (V <= Y)` (item 9):
+        // bash arithmetic is integers, so `V < Y+1` ⟺ `V <= Y`; the temp
+        // (and its decl) vanishes. Only effect-free stmts mentioning
+        // neither tmp nor Y may stand between (checked by lookahead);
+        // Y re-evaluates per iteration, so it must be a cheap Var/Num
+        // and unwritten in the loop body.
+        if let Some((tmp, y)) = bound_plus1_def(&stmts[i]) {
+            let yname: Option<String> = match &y {
+                crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => {
+                    Some(v.clone())
+                }
+                _ => None,
+            };
+            let mut j = i + 1;
+            let mut found: Option<(crate::ir::ArithAst)> = None;
+            while j < stmts.len() {
+                // the loop itself? check the cond shape first
+                if let Some(lhs) = bound_plus1_cond(&stmts[j], &tmp) {
+                    found = Some(lhs);
+                    break;
+                }
+                // otherwise the stmt must not mention tmp or Y at all
+                let mut n = 0;
+                count_stmt(&stmts[j], &tmp, &mut n);
+                if n > 0 {
+                    break;
+                }
+                if let Some(yn) = &yname {
+                    let mut m = 0;
+                    count_stmt(&stmts[j], yn, &mut m);
+                    if m > 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if let Some(lhs) = found {
+                if hoist_target_is_int(var_types, &tmp)
+                    && count_name_occurrences(frozen, &tmp) == 2
+                    && bound_y_stable(&y, &stmts[j])
+                {
+                    if let IrStmt::While { cond, .. } = &mut stmts[j] {
+                        *cond = IrExpr::Arith(Box::new(crate::ir::ArithAst::Bin {
+                            op: "<=".to_string(),
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(y),
+                        }));
+                    }
+                    stmts.remove(i);
+                    dropped.insert(tmp);
+                    continue;
+                }
+            }
+        }
         i += 1;
     }
     for st in stmts.iter_mut() {
@@ -991,6 +1045,77 @@ fn fold_hoist_list(
 /// and the arith call. Refuses `asm` labels (dropping a
 /// declaration-site label would rename the object symbol),
 /// multi-targets, indexed targets and the big-dom `Cast` shape.
+/// Match `tmp = Y + 1` for the bound fold (item 9). Y must be a cheap
+/// re-evaluatable Var/Ident/Num; the caller checks occurrence counts,
+/// the cond shape, and body stability.
+fn bound_plus1_def(a: &IrStmt) -> Option<(String, crate::ir::ArithAst)> {
+    match a {
+        IrStmt::Assign { targets, expr, asm } if targets.len() == 1 && asm.is_none() => {
+            let t = &targets[0];
+            if !t.indices.is_empty() || t.var.contains('[') {
+                return None;
+            }
+            match expr {
+                IrExpr::Arith(x) => match x.as_ref() {
+                    crate::ir::ArithAst::Bin { op, lhs, rhs } if op == "+" => {
+                        if !matches!(rhs.as_ref(), crate::ir::ArithAst::Num(1)) {
+                            return None;
+                        }
+                        match lhs.as_ref() {
+                            crate::ir::ArithAst::Var(_)
+                            | crate::ir::ArithAst::Ident(_)
+                            | crate::ir::ArithAst::Num(_) => {
+                                Some((t.var.clone(), lhs.as_ref().clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Match `while (V < tmp)` for the bound fold — returns V.
+fn bound_plus1_cond(b: &IrStmt, tmp: &str) -> Option<crate::ir::ArithAst> {
+    match b {
+        IrStmt::While { cond, .. } => match cond {
+            IrExpr::Arith(x) => match x.as_ref() {
+                crate::ir::ArithAst::Bin { op, lhs, rhs } if op == "<" => {
+                    match rhs.as_ref() {
+                        crate::ir::ArithAst::Var(v) if v == tmp => Some(lhs.as_ref().clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Is the bound base Y stable across the loop — a Num, or a Var/Ident
+/// the body never assigns? (Moving Y into the per-iteration cond would
+/// otherwise read a value the original frozen temp never saw.)
+fn bound_y_stable(y: &crate::ir::ArithAst, loop_stmt: &IrStmt) -> bool {
+    let name = match y {
+        crate::ir::ArithAst::Num(_) => return true,
+        crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => v,
+        _ => return false,
+    };
+    let body = match loop_stmt {
+        IrStmt::While { body, .. } => body,
+        _ => return false,
+    };
+    let mut written = BTreeSet::new();
+    collect_assigned_vars(body, &mut written);
+    !written.contains(name)
+}
+
 fn hoist_pair_at(
     a: &IrStmt,
     b: &IrStmt,
@@ -22008,9 +22133,9 @@ fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
         IrStmt::While { cond: IrExpr::Arith(c), body } => (c, body),
         _ => return None,
     };
-    let x = match cond.as_ref() {
-        ArithAst::Bin { op, lhs, rhs } if op == "<" => match lhs.as_ref() {
-            ArithAst::Var(n) if *n == v => rhs.as_ref().clone(),
+    let (x, cmp) = match cond.as_ref() {
+        ArithAst::Bin { op, lhs, rhs } if op == "<" || op == "<=" => match lhs.as_ref() {
+            ArithAst::Var(n) if *n == v => (rhs.as_ref().clone(), op.clone()),
             _ => return None,
         },
         _ => return None,
@@ -22038,10 +22163,11 @@ fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
         return None;
     }
     let spec = format!(
-        "{}={}; {}<{}; {}++",
+        "{}={}; {}{}{}; {}++",
         v,
         arith_to_text(a1),
         v,
+        cmp,
         arith_to_text(&x),
         v
     );
