@@ -2665,6 +2665,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // constant on the straight-line path (runs after strip_dead_rc so
     // dead `$?` stores are gone before the between-scan reads lines).
     r.fold_init_store();
+    // drop `1;`-style constant statements (strip_dead_rc residue)
+    r.drop_const_stmts();
     // the discarded-value echo collapsed to `(printf(...));` /
     // `(fputs(...));` — drop OUR comma-expr wrapper parens (safe: these
     // prefixes are never a cast/declaration at statement position).
@@ -4609,6 +4611,46 @@ impl Render {
         for sj in drop_lines.iter().rev() {
             self.out.remove(*sj);
         }
+    }
+
+    /// Drop no-op constant expression statements (`1;`, `(0);`, `"x";`)
+    /// left behind by strip_dead_rc's comma peel (`(_sh_rc = 0, 1);` →
+    /// `1;`). A bare literal has no side effects; `gcc -Wall` flags
+    /// these (`-Wunused-value`), so they are noise, not code.
+    fn drop_const_stmts(&mut self) {
+        self.out.retain(|line| {
+            let t = line.trim();
+            if !t.ends_with(';') {
+                return true;
+            }
+            let mut inner = t[..t.len() - 1].trim();
+            // peel one layer of balanced outer parens
+            while inner.starts_with('(') && inner.ends_with(')') {
+                let b = inner.as_bytes();
+                let mut depth = 0usize;
+                let mut balanced = true;
+                let mut closed_early = false;
+                for (k, &ch) in b.iter().enumerate() {
+                    if ch == b'(' {
+                        depth += 1;
+                    } else if ch == b')' {
+                        depth -= 1;
+                        if depth == 0 && k != b.len() - 1 {
+                            closed_early = true;
+                            break;
+                        }
+                    }
+                }
+                if depth != 0 || closed_early {
+                    balanced = false;
+                }
+                if !balanced {
+                    break;
+                }
+                inner = inner[1..inner.len() - 1].trim();
+            }
+            !is_const_rhs(inner)
+        });
     }
 
     /// Drop `#include` lines nothing in the final program uses. stdio.h
@@ -10950,7 +10992,8 @@ fn param_copy_alias(
     fn echo_native_ok(&self, w: &IrExpr) -> bool {
         match w {
             IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_)
-            | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_) => true,
+            | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_)
+            | IrExpr::Index { .. } => true,
             IrExpr::Call { func, args, .. } if func == "capture" => {
                 // an in-process-lowered capture is a plain value; anything
                 // else goes through the deferred _cap_N() site call
@@ -15239,6 +15282,13 @@ fn param_copy_alias(
                 vec![Part::Arg(self.call(func, &args), spec)]
             }
             other => {
+                // assoc/array element read — a single value by construction
+                // (split-wrapped forms arrive as split/arrayIndex CALLS, never
+                // bare Index). array_index_read renders null-safe C strings
+                // (assoc miss → "", int-homed → decimal text), so %s.
+                if let IrExpr::Index { .. } = other {
+                    return vec![Part::Arg(self.expr(other), NumSpec::Str)];
+                }
                 self.mark_todo(&format!("echo arg {:?}", other));
                 vec![Part::Arg("0".into(), NumSpec::Num("%lld", true))]
             }
@@ -15289,7 +15339,14 @@ fn param_copy_alias(
                         // non-NULL (P1 follow-up: OOM aborts, so a proven
                         // fresh call temp can never be NULL here). A
                         // proven `char*` needs neither guard nor cast.
-                        if self.nonnull.contains(&v) || self.nonnull_var.contains(&v) {
+                        // The assoc/arr getters are proven non-NULL by
+                        // construction (every miss path returns "" — see
+                        // their emitted bodies); skipping the guard also
+                        // single-evaluates the call (the guard ran it twice).
+                        if self.nonnull.contains(&v)
+                            || self.nonnull_var.contains(&v)
+                            || is_nonnull_helper_call(&v)
+                        {
                             cargs.push(v);
                         } else {
                             cargs.push(format!(
@@ -20507,6 +20564,59 @@ fn has_call(s: &str) -> bool {
             }
         }
         i += 1;
+    }
+    false
+}
+
+/// A call expression provably never returning NULL: `_sh_assoc_get` /
+/// `_sh_arr_get` return `""` on every miss path (see their emitted
+/// bodies). Lets printf_from_parts skip the `%s` null-guard (which
+/// also double-evaluated the call).
+fn is_nonnull_helper_call(v: &str) -> bool {
+    let mut s = v.trim();
+    loop {
+        if let Some(rest) = s
+            .strip_prefix("(char*)")
+            .or_else(|| s.strip_prefix("(const char*)"))
+        {
+            s = rest.trim_start();
+        } else {
+            break;
+        }
+    }
+    for h in ["_sh_assoc_get(", "_sh_arr_get("] {
+        if let Some(rest) = s.strip_prefix(h) {
+            // exactly the call: parens balance with the final `)`
+            // closing the helper's own paren — anything trailing
+            // (`, more`, `? :`) means a bigger expression, refuse
+            let mut depth = 1usize;
+            let b = rest.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return i == b.len() - 1;
+                        }
+                    }
+                    b'"' => {
+                        // skip string literals (parens inside quotes)
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            if b[i] == b'\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            return false;
+        }
     }
     false
 }
