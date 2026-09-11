@@ -782,13 +782,21 @@ fn walk_int_array_expr(
                 // the array may appear in the argv (a string context)
                 for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
-            "arrayIndex" | "arrayItems" | "arrayLen" => {
-                // reading the array as a value — if it's used in a string
-                // context this is a string read; conservatively mark it
+            "arrayIndex" | "arrayItems" => {
+                // reading elements as values — if used in a string
+                // context this is a string read; conservatively mark it.
+                // (arrayLen is NOT here: `${#xs[@]}` reads only the
+                // count, never the elements, so it can't force string
+                // storage.)
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     all.insert(name.clone());
                     str_read.insert(name.clone());
                 }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "arrayLen" => {
+                // `${#xs[@]}` — the element count only; never reads
+                // (and never stringifies) elements.
                 for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
             "getVar" => {
@@ -4674,7 +4682,16 @@ impl Render {
                 self.need_sh = true;
                 let id = self.c_ident(var);
                 let k = self.arith(key);
-                format!("atoll(_sh_arr_get({id}, {id}_len, {k}))")
+                if self.int_arrays.contains(var) {
+                    // int-homed elements: read the native value (unset
+                    // index → 0, bash arithmetic semantics). `_sh_arr_get`
+                    // would not even compile against a uint8/16/… array.
+                    // (k is a pure arith expression — double evaluation
+                    // matches the sibling `(long long){id}[{k}]` shape.)
+                    format!("(({k} >= 0 && {k} < (long long){id}_len) ? (long long){id}[{k}] : 0)")
+                } else {
+                    format!("atoll(_sh_arr_get({id}, {id}_len, {k}))")
+                }
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 // bash arithmetic is intmax_t (64-bit): a constant subtree
@@ -12894,6 +12911,15 @@ impl Render {
             return format!("(char*)_sh_assoc_get({id}_k, {id}_v, {id}_n, {k})");
         }
         if let Ok(i) = key.trim().parse::<i64>() {
+            if self.int_arrays.contains(var) {
+                // int-homed (uint8/16/…): every index < len holds a
+                // VALUE, never a NULL pointer — render its decimal text
+                // (num_temp). Guard is the length bound ALONE: a 0
+                // element must print "0" (Python/bash parity), which
+                // the pointer-truthiness test would treat as unset.
+                let el = self.num_temp(&format!("{id}[{i}]"));
+                return format!("(({i} >= 0 && {i} < (long long){id}_len) ? {el} : \"\")");
+            }
             return format!("(({i} < {id}_len && {id}[{i}]) ? {id}[{i}] : \"\")");
         }
         let k = if let Some(rest) = key.strip_prefix('$') {
@@ -12922,7 +12948,18 @@ impl Render {
         } else {
             format!("(long long)atoll({})", Self::cstr(key))
         };
-        format!("(char*)_sh_arr_get({id}, {id}_len, {k})")
+        // int-homed array with a dynamic key: read the native element.
+        // The key is pure (bounds/arith reads only) but evaluated here
+        // into a temp so it drives both the guard and the index once.
+        if self.int_arrays.contains(var) {
+            let kt = format!("_ak{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit(&format!("long long {kt} = {k};"));
+            let el = self.num_temp(&format!("{id}[{kt}]"));
+            format!("(({kt} >= 0 && {kt} < (long long){id}_len) ? {el} : \"\")")
+        } else {
+            format!("(char*)_sh_arr_get({id}, {id}_len, {k})")
+        }
     }
 
     /// `${#arr[@]}` — the element count
@@ -24140,6 +24177,142 @@ mod tests {
         stmts.push(range_while("i", "1"));
         let out = shir_to_c(&prog_of(stmts));
         assert!(out.contains("long long i"), "unknown bound narrowed:\n{out}");
+    }
+
+    #[test]
+    fn array_len_does_not_force_string_storage() {
+        // `${#xs[@]}` reads only the count, never the elements: an
+        // int-element array consumed by sum+len must stay narrow-int
+        // homed (this shape silently came out char*[] before).
+        fn call(func: &str, arr: &str) -> IrExpr {
+            IrExpr::Call {
+                func: func.to_string(),
+                args: vec![IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            }
+        }
+        fn echo_it(e: IrExpr) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![e]),
+                ],
+            })
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "xs".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "setArray".to_string(),
+                        args: vec![
+                            IrExpr::Str("xs".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Int(1000), IrExpr::Int(2000)]),
+                        ],
+                    },
+                    asm: None,
+                },
+                echo_it(call("sum", "xs")),
+                echo_it(call("arrayLen", "xs")),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("uint16_t xs["), "len() forced string storage:\n{out}");
+        assert!(!out.contains("char *xs["), "string decl leaked:\n{out}");
+    }
+
+    #[test]
+    fn int_homed_element_read_stringifies_zero() {
+        // an int-homed array element read in a STRING context (echo):
+        // the pre-fix ternary `(len && xs[i]) ? xs[i] : ""` treated a
+        // 0 element as unset (silently printing "" — C-DIFF vs
+        // Python's "0") and passed an integer as const char* (warning;
+        // nonzero elements pointed at garbage). Now: length-bound-only
+        // guard + exact decimal text via num_temp.
+        fn call(func: &str, args: Vec<IrExpr>) -> IrExpr {
+            IrExpr::Call {
+                func: func.to_string(),
+                args,
+            }
+        }
+        fn word(arr: &str) -> IrExpr {
+            call("exec", vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Index {
+                    var: arr.to_string(),
+                    key: Box::new(IrExpr::Str("0".to_string(), crate::ir::StrStyle::DoubleQuoted)),
+                }]),
+            ])
+        }
+        fn setarr(arr: &str, items: Vec<IrExpr>) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: arr.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: call("setArray", vec![
+                    IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(items),
+                ]),
+                asm: None,
+            }
+        }
+        fn exec_word(e: IrExpr) -> IrStmt {
+            IrStmt::Expr(call("exec", vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![e]),
+            ]))
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        let out = shir_to_c(&prog_of(vec![
+            setarr("xs", vec![IrExpr::Int(1000), IrExpr::Int(0)]),
+            exec_word(call("sum", vec![IrExpr::Str("xs".to_string(), crate::ir::StrStyle::DoubleQuoted)])),
+            exec_word(word("xs")),
+        ]));
+        assert!(out.contains("static uint16_t xs["), "element read forced char*:\n{out}");
+        assert!(
+            out.contains("0 < (long long)xs_len)"),
+            "no length-only guard (0-element would read as unset):\n{out}"
+        );
+        assert!(
+            !out.contains("xs[0] ? xs[0]"),
+            "falsy element ternary survived:\n{out}"
+        );
+        assert!(
+            out.contains("? _s"),
+            "no decimal-text temp for the element:\n{out}"
+        );
     }
 
     #[test]
