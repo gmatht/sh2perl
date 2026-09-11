@@ -2408,7 +2408,29 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     }
     // A2 + var_lengths: the analyses run at serialization time in the
     // JSON path; the library path must run the same ones.
+    let frontend_int: HashMap<String, IrType> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == IrType::Int)
+        .cloned()
+        .collect();
     prog.var_types = crate::shir::analyze_var_types(&prog);
+    // The frontend's Int verdicts are authoritative where the
+    // bash-source heuristic (numeric_lift_vars, which lifts only
+    // arith-assigned vars) cannot see the type: a var assigned from a
+    // typed reduction (`_min_xs = min(xs)`) computes an int, but comes
+    // back Str here — restoring Int keeps it on the native numeric
+    // path (no snprintf/strdup/atoll round-trip). Str verdicts stay
+    // exactly as analyzed.
+    for (n, t) in &frontend_int {
+        if !prog.var_types.contains(&(n.clone(), IrType::Int)) {
+            prog.var_types.retain(|(k, _)| k != n);
+            prog.var_types.push((n.clone(), t.clone()));
+        }
+    }
+    // sort for deterministic serialization (the C backend reads it as a
+    // map, but the sort keeps output stable across runs)
+    prog.var_types.sort_by(|a, b| a.0.cmp(&b.0));
     // Hoist-pair fold (t86 `_i_sqrt_n`/`_i_sqrt_nv` — see fold_hoist_pairs):
     // runs after the A2 verdicts (which must see the pair to type the
     // numeric half Int) and before every downstream analysis, so they all
@@ -15987,6 +16009,33 @@ impl Render {
                 }
             }
             IrExpr::Int(i) => i.to_string(),
+            IrExpr::Call { func, args } if matches!(func.as_str(), "max" | "min" | "sum") => {
+                // numeric-context reduction: an int-homed array with the
+                // maintained aggregate reads it natively (`_min_xs =
+                // (long long)xs_min` — no snprintf/atoll round-trip via
+                // reduce_array's num_temp string). Everything else falls
+                // through to the string form, exact for every
+                // i64-parseable element (atoll of exact decimal text).
+                // Mirrors reduce_array's fast-path conditions so the
+                // emitted value always matches what a string context
+                // would render.
+                let Some(name) = Self::str_arg(args, 0) else {
+                    return "0".into();
+                };
+                if self.arrays.contains(&name)
+                    && self.int_arrays.contains(&name)
+                    && self.reduce_arrays.contains(&name)
+                {
+                    let id = self.c_ident(&name);
+                    let agg = match func.as_str() {
+                        "max" => format!("{id}_max"),
+                        "min" => format!("{id}_min"),
+                        _ => format!("{id}_sum"),
+                    };
+                    return format!("(long long)({agg})");
+                }
+                format!("(long long)atoll({})", self.expr(e))
+            }
             _ => self.expr(e),
         }
     }
@@ -24312,6 +24361,99 @@ mod tests {
         assert!(
             out.contains("? _s"),
             "no decimal-text temp for the element:\n{out}"
+        );
+    }
+
+    #[test]
+    fn numeric_reduction_assign_reads_aggregate_natively() {
+        // ``_min_xs = min(xs)`` (int-homed xs, maintained aggregate):
+        // the numeric assign must read `(long long)(xs_min)` directly —
+        // before the expr_as_num reduction arm, reduce_array's num_temp
+        // string was stored into the long long (char*→int garbage;
+        // t97's accumulator printed a heap address).
+        fn redcall(func: &str, arr: &str) -> IrExpr {
+            IrExpr::Call {
+                func: func.to_string(),
+                args: vec![IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            }
+        }
+        fn setarr(arr: &str, items: Vec<IrExpr>) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: arr.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: "setArray".to_string(),
+                    args: vec![
+                        IrExpr::Str(arr.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(items),
+                    ],
+                },
+                asm: None,
+            }
+        }
+        fn assign_num(target: &str, e: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: target.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: e,
+                asm: None,
+            }
+        }
+        fn echo_expr(e: IrExpr) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![e]),
+                ],
+            })
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                setarr("xs", vec![IrExpr::Int(5), IrExpr::Int(3), IrExpr::Int(9)]),
+                assign_num("_min_xs", redcall("min", "xs")),
+                assign_num("_max_xs", redcall("max", "xs")),
+                assign_num("_sum_xs", redcall("sum", "xs")),
+                echo_expr(redcall("min", "xs")),
+            ],
+            subs: vec![],
+            var_types: vec![
+                ("_min_xs".to_string(), crate::ir::IrType::Int),
+                ("_max_xs".to_string(), crate::ir::IrType::Int),
+                ("_sum_xs".to_string(), crate::ir::IrType::Int),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("_min_xs = (long long)(xs_min);"),
+            "min assign not native:\n{out}"
+        );
+        assert!(
+            out.contains("_max_xs = (long long)(xs_max);"),
+            "max assign not native:\n{out}"
+        );
+        assert!(
+            out.contains("_sum_xs = (long long)(xs_sum);"),
+            "sum assign not native:\n{out}"
+        );
+        assert!(
+            !out.contains("= _s"),
+            "string temp stored into long long:\n{out}"
         );
     }
 
