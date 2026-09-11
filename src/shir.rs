@@ -32078,7 +32078,22 @@ fn native_capture_cat(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Optio
     } else {
         let mut out = Vec::new();
         for a in cmd_args {
-            let _ = is_plain_path_arg(a)?;
+            // static paths AND dynamic ones (interpolated `$var`
+            // segments, getVar reads): read_file_value evaluates any
+            // expression at runtime via async readFile, so only refuse
+            // shapes that are never paths (empty, flags, glob magic)
+            match a {
+                IrExpr::Str(sv, _) => {
+                    if sv.is_empty()
+                        || sv.starts_with('-')
+                        || sv.starts_with(GLOB_MAGIC)
+                        || sv.starts_with(PS_MAGIC)
+                    {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
             out.push(read_file_value(expr_to_estree(a), Some("utf8"), 0, 1));
         }
         if out.is_empty() {
