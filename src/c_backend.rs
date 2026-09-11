@@ -221,6 +221,16 @@ pub struct Render {
     /// forward declarations for the hoisted functions (emitted before
     /// their definitions so call order never matters)
     fn_fwd_decls: Vec<String>,
+    /// top-level-private vars (mentioned nowhere outside the top
+    /// level's own direct subtree): safe for main() locals instead of
+    /// file-scope globals. Lifecycle + helper references are decided
+    /// post-render in program(), where the sets and the completed
+    /// helper bodies are final.
+    main_private: HashSet<String>,
+    /// file-scope declaration line texts per var (recorded as emitted
+    /// in the preamble `vars` loop): the main-localization pass moves
+    /// a main-private var's lines into main() (removing them here).
+    file_decl_text: HashMap<String, Vec<String>>,
     /// per-function PRIVATE vars (fn name → vars mentioned nowhere
     /// outside that fn's own direct subtree): safe to declare as fn
     /// locals instead of file-scope globals. Computed in program()
@@ -5960,7 +5970,7 @@ fn param_copy_alias(
         fns: &[(String, Vec<IrStmt>)],
         vt: &HashMap<String, IrType>,
         no_local: &HashSet<String>,
-    ) -> HashMap<String, HashSet<String>> {
+    ) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
         fn str_hits(s: &str, x: &str) -> bool {
             // `$x`/`${x}` refs plus bare idents in opaque texts
             // (arith/cstyleFor/test strings evaluate bare names).
@@ -6537,7 +6547,7 @@ fn param_copy_alias(
             false
         }
         if has_ext(stmts) || fns.iter().any(|(_, b)| has_ext(b)) {
-            return out;
+            return (out, HashSet::new());
         }
         for (fname, fbody) in fns {
             // candidates: every name bound or read in the body (nested
@@ -6601,7 +6611,130 @@ fn param_copy_alias(
                 out.insert(fname.clone(), privs);
             }
         }
-        out
+        // main-private candidates (t86 `old_factors` → a main() local):
+        // top-level-assigned names mentioned nowhere outside the top
+        // level's own direct subtree (no fn/subs/nested-def mentions).
+        // Lifecycle (Int vs heap-manageable) and helper references are
+        // decided post-render in program(), where the sets and the
+        // completed helper bodies are final.
+        fn top_assigns(stmts: &[IrStmt], out: &mut HashSet<String>) {
+            for s in stmts {
+                match s {
+                    // nested defs are separate scopes (their assigns
+                    // write globals at call time) — mentions inside
+                    // disqualify via nested_hits, but they contribute
+                    // no candidates.
+                    IrStmt::Function { .. } => {}
+                    IrStmt::Assign { targets, .. } => {
+                        for t in targets {
+                            out.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                        }
+                    }
+                    IrStmt::Declare { vars, .. } => {
+                        for d in vars {
+                            out.insert(d.name.clone());
+                        }
+                    }
+                    IrStmt::DeclareArray { var, .. } => {
+                        out.insert(var.clone());
+                    }
+                    IrStmt::For { var, body, .. } => {
+                        // for-loop vars are declared inside the loop
+                        // itself (never a file decl) — nothing to move.
+                        top_assigns(body, out);
+                        let _ = var;
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        top_assigns(then, out);
+                        for (_, b) in elsifs {
+                            top_assigns(b, out);
+                        }
+                        top_assigns(else_, out);
+                    }
+                    IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                        top_assigns(body, out);
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        top_assigns(init, out);
+                        top_assigns(step, out);
+                        top_assigns(body, out);
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        top_assigns(body, out);
+                        for e in excepts {
+                            top_assigns(&e.body, out);
+                        }
+                        top_assigns(else_body, out);
+                        top_assigns(finally_body, out);
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            top_assigns(&c.body, out);
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            top_assigns(st, out);
+                        }
+                    }
+                    IrStmt::Select { clauses, .. } => {
+                        for c in clauses {
+                            top_assigns(&c.body, out);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => top_assigns(inner, out),
+                    IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                        top_assigns(b, out)
+                    }
+                    IrStmt::Expr(e) => {
+                        // `printf -v x …` writes x at top level.
+                        if let IrExpr::Call { func: _, args } = e {
+                            if is_printf_v_call(args) {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if let Some(IrExpr::Str(sv, _)) = items.get(1) {
+                                        out.insert(sv.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut main_cands = HashSet::new();
+        top_assigns(stmts, &mut main_cands);
+        let mut main_priv = HashSet::new();
+        // NOTE: no has_ext bail-out needed beyond the one above (an Ext
+        // anywhere already emptied `out` and returns early below) — the
+        // main set shares the same bail.
+        for x in &main_cands {
+            if x.is_empty() || x.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // nested defs inside top level observe globals at call time.
+            let mut outside = nested_hits(stmts, x);
+            if !outside {
+                for sub in subs {
+                    if stmts_hit(&sub.body, x) {
+                        outside = true;
+                        break;
+                    }
+                }
+            }
+            if !outside {
+                for (_, b) in fns {
+                    if stmts_hit(b, x) {
+                        outside = true;
+                        break;
+                    }
+                }
+            }
+            if !outside {
+                main_priv.insert(x.clone());
+            }
+        }
+        (out, main_priv)
     }
 
     fn emit_function(&mut self, name: &str, body: &[IrStmt], main_vars: &BTreeSet<String>) {
@@ -17913,13 +18046,15 @@ fn param_copy_alias(
         // Int gate above already excludes them).
         let no_local: HashSet<String> =
             self.bigint_vars.iter().cloned().collect();
-        self.fn_private = Self::fn_private_vars(
+        let (fn_priv, main_priv) = Self::fn_private_vars(
             &prog.stmts,
             &prog.subs,
             &self.fn_defs,
             &self.var_types,
             &no_local,
         );
+        self.fn_private = fn_priv;
+        self.main_private = main_priv;
         // never-NULL return proofs (P1 follow-up): which generated
         // functions provably never return NULL — consulted when a fresh
         // call temp is created (a pre-pass because render order is
@@ -18154,7 +18289,15 @@ fn param_copy_alias(
             eprintln!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
         }
         for v in &vars {
+            // record the emitted file-decl lines per var: the
+            // main-localization pass below may move a main-private
+            // var's declaration into main() (removing these lines).
+            let before = self.out.len();
             self.emit_var_decl(v);
+            self.file_decl_text.insert(
+                v.clone(),
+                self.out[before..].iter().cloned().collect(),
+            );
         }
         std::mem::swap(&mut self.out, &mut decl_out);
         let mut body_out = Vec::new();
@@ -18285,6 +18428,91 @@ fn param_copy_alias(
         self.in_runtime = true;
         self.emit_runtime();
         self.in_runtime = false;
+        // main-private vars → main() locals (t86 `old_factors`): the
+        // file-decl lines recorded above move into the buffered main
+        // body. Decided NOW (not earlier) so three post-render facts
+        // are final: the lifecycle sets (store/const/buf fill during
+        // render), the completed helper bodies (a helper referencing
+        // the var forces file scope — helpers can't see main locals),
+        // and var_types (cstyleFor/seq marks land pre-render, but the
+        // moved text is byte-identical either way). Anything unproven
+        // keeps its file decl (status quo ante).
+        {
+            let mut cands: Vec<String> = self.main_private.iter().cloned().collect();
+            cands.sort();
+            let mut local: Vec<String> = Vec::new();
+            for x in &cands {
+                // lifecycle: plain Int always; heap strings iff
+                // manageable post-render (explicit + scope-exit frees
+                // key on unchanged name sets); never bigint (main-top
+                // mpz_init), arrays/assoc (separate machinery),
+                // const-lifted, fixed buffers, fn names (shared C
+                // namespace), or argc/argv (prologue shadows).
+                if self.bigint_vars.contains(x)
+                    || self.arrays.contains(x)
+                    || self.assoc_arrays.contains(x)
+                    || self.const_lifted.contains(x)
+                    || self.buf_bound(x).is_some()
+                    || self.functions.contains(x)
+                    || x == "argc"
+                    || x == "argv"
+                {
+                    continue;
+                }
+                let ok_type = self.var_types.get(x) == Some(&IrType::Int)
+                    || self.is_heap_store_var(x);
+                if !ok_type {
+                    continue;
+                }
+                // helper references (exact, final bodies): a file-scope
+                // helper cannot observe a main local.
+                let id = self.c_ident(x);
+                let refd = self
+                    .site_bodies
+                    .iter()
+                    .chain(self.cap_bodies.iter())
+                    .any(|b| text_contains_ident(b, &id));
+                if refd {
+                    continue;
+                }
+                local.push(x.clone());
+            }
+            // move their file-decl lines (recorded text, matched by
+            // value — all-or-nothing per var so a drifted decl keeps
+            // file scope instead of half-moving).
+            let mut moved: Vec<String> = Vec::new();
+            for x in &local {
+                let empty: Vec<String> = Vec::new();
+                let texts = self.file_decl_text.get(x).unwrap_or(&empty).clone();
+                if texts.is_empty() {
+                    continue;
+                }
+                let mut idxs = Vec::new();
+                let mut ok = true;
+                for t in &texts {
+                    match decl_out.iter().position(|l| l == t) {
+                        Some(i) => idxs.push(i),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                idxs.sort_unstable();
+                for i in idxs.iter().rev() {
+                    decl_out.remove(*i);
+                }
+                for t in &texts {
+                    moved.push(format!("    {t}"));
+                }
+            }
+            if !moved.is_empty() {
+                body_out.splice(0..0, moved);
+            }
+        }
         self.out.extend(decl_out.iter().cloned());
         self.emit("");
         // forward declarations: a capture body may call a site and a
@@ -27137,7 +27365,7 @@ mod tests {
                 IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string()))),
             ),
         ])];
-        let m = Render::fn_private_vars(&top, &[], &fns, &vt, &HashSet::new());
+        let (m, _) = Render::fn_private_vars(&top, &[], &fns, &vt, &HashSet::new());
         let f = m.get("f").cloned().unwrap_or_default();
         assert!(f.contains("_t"), "fn-only temp not private: {f:?}");
         assert!(!f.contains("shared"), "top-level-read var privatized: {f:?}");
@@ -27155,7 +27383,7 @@ mod tests {
             assign("_t", IrExpr::Int(3)),
             nested[0].clone(),
         ])];
-        let m2 = Render::fn_private_vars(&top2, &[], &fns2, &vt, &HashSet::new());
+        let (m2, _) = Render::fn_private_vars(&top2, &[], &fns2, &vt, &HashSet::new());
         assert!(
             !m2.get("f").is_some_and(|s| s.contains("_t")),
             "nested-callee temp privatized: {:?}",
@@ -27164,12 +27392,102 @@ mod tests {
         // non-Int vars never privatize (lifecycle lives at file scope).
         let mut vt3 = HashMap::new();
         vt3.insert("_t".to_string(), IrType::Str);
-        let m3 = Render::fn_private_vars(&top, &[], &fns, &vt3, &HashSet::new());
+        let (m3, _) = Render::fn_private_vars(&top, &[], &fns, &vt3, &HashSet::new());
         assert!(
             !m3.get("f").is_some_and(|s| s.contains("_t")),
             "Str temp privatized: {:?}",
             m3.get("f")
         );
+    }
+
+    #[test]
+    fn main_private_vars_become_main_locals() {
+        // t86 `old_factors`: top-level-only vars (Int or heap-string)
+        // move from file scope into main(); shared vars (read in a
+        // function) stay global. File decls are col-0, locals indented.
+        use std::collections::{HashMap, HashSet};
+        use crate::ir::{ArithAst, IrType};
+        fn assign(var: &str, e: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: e,
+                asm: None,
+            }
+        }
+        fn echo_var(var: &str) -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Call {
+                        func: "getVar".to_string(),
+                        args: vec![IrExpr::Str(var.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                    }]),
+                ],
+            })
+        }
+        fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+            let mut vt = HashMap::new();
+            vt.insert("_t".to_string(), IrType::Int);
+            vt.insert("g".to_string(), IrType::Int);
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vt.into_iter().collect(),
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        // _t assigned+read only at top level → main local. (Two
+        // assigns: a single literal assign would const-lift instead.)
+        let out = shir_to_c(&prog_of(vec![
+            assign("_t", IrExpr::Int(7)),
+            assign(
+                "_t",
+                IrExpr::Arith(Box::new(crate::ir::ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(crate::ir::ArithAst::Var("_t".to_string())),
+                    rhs: Box::new(crate::ir::ArithAst::Num(1)),
+                })),
+            ),
+            echo_var("_t"),
+        ]));
+        assert!(
+            out.contains("\n    uint8_t _t = 0;\n"),
+            "no main-local decl:\n{out}"
+        );
+        assert!(
+            !out.contains("\nuint8_t _t = 0;\n"),
+            "file-global decl survived:\n{out}"
+        );
+        // g read inside a nested fn → stays file-global.
+        let out = shir_to_c(&prog_of(vec![
+            assign("_t", IrExpr::Int(7)),
+            IrStmt::Function {
+                name: "f".to_string(),
+                body: vec![echo_var("g")],
+                named_blocks: vec![],
+            },
+            assign("g", IrExpr::Int(1)),
+            echo_var("_t"),
+            echo_var("g"),
+        ]));
+        assert!(
+            out.contains("\nconst uint8_t g = 1;"),
+            "shared var left main:\n{out}"
+        );
+        let _ = HashSet::<usize>::new();
     }
 
     #[test]
