@@ -14577,6 +14577,9 @@ fn param_copy_alias(
     fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
+        // exact assoc capacity from proofs (not blanket 1024) — decl
+        // and every set-call guard agree via array_cap
+        let acap = self.array_cap(var);
         let v = self.value_c(val);
         if let IrExpr::Interpolate(parts) = key {
             // an Interpolate KEY (e.g. `m["${flags:j:1}"]=v` arrives as
@@ -14586,7 +14589,7 @@ fn param_copy_alias(
             let kv = self.value_c(key);
             let id2 = self.c_ident(var);
             self.emit(&format!(
-                "_sh_assoc_set({id2}_k, {id2}_v, &{id2}_n, {ARR_CAP}, {kv}, {v});"
+                "_sh_assoc_set({id2}_k, {id2}_v, &{id2}_n, {acap}, {kv}, {v});"
             ));
             return;
         }
@@ -14603,7 +14606,7 @@ fn param_copy_alias(
                 self.assoc_arrays.insert(var.to_string());
                 let kv = self.heredoc_body_c(key);
                 self.emit(&format!(
-                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {kv}, {v});"
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {kv}, {v});"
                 ));
                 return;
             }
@@ -14642,7 +14645,7 @@ fn param_copy_alias(
                 // stores key `os` (the raw shIR text keeps them)
                 let kc = k.trim().trim_matches(|c| c == '"' || c == '\'');
                 self.emit(&format!(
-                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {v});",
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {}, {v});",
                     Self::cstr(kc)
                 ));
             }
@@ -14816,6 +14819,7 @@ fn param_copy_alias(
     fn emit_set_array(&mut self, var: &str, args: &[IrExpr]) {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
+        let acap = self.array_cap(var);
         // ArrayComp: `x = [elem for var in iter if cond]` — a Python
         // list comprehension. Render a loop that appends elem for each
         // iter item passing cond.
@@ -14859,7 +14863,7 @@ fn param_copy_alias(
                             let k = inner[..eq].trim().trim_matches('"').trim_matches('\'');
                             let v = inner[eq + 2..].trim();
                             self.emit(&format!(
-                                "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {});",
+                                "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {}, {});",
                                 Self::cstr(k),
                                 Self::cstr(v)
                             ));
@@ -14881,7 +14885,7 @@ fn param_copy_alias(
                 };
                 let v = self.value_c(&items[i + 1]);
                 self.emit(&format!(
-                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {k}, {v});"
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {k}, {v});"
                 ));
                 i += 2;
             }
@@ -18532,8 +18536,9 @@ fn param_copy_alias(
             let id = self.c_ident(a);
             if self.assoc_arrays.contains(a) {
                 if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} assoc"); }
-                self.emit(&format!("static char *{id}_k[{ARR_CAP}] = {{0}};"));
-                self.emit(&format!("static char *{id}_v[{ARR_CAP}] = {{0}};"));
+                let acap = self.array_cap(a);
+                self.emit(&format!("static char *{id}_k[{acap}] = {{0}};"));
+                self.emit(&format!("static char *{id}_v[{acap}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_n = 0;"));
             } else if self.array_return_arrays.values().any(|ra| ra == a) {
                 if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} arr_ret"); }
