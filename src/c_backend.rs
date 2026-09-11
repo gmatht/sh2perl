@@ -373,8 +373,11 @@ pub struct Render {
     runtime_start: usize,
     runtime_end: usize,
     runtime_known: bool,
-    /// sys/stat.h file tests (test_render -f/-d/...)
-    need_stat: bool,
+    /// sys/stat.h file tests (test_render -f/-d/...): the operator
+    /// letters actually used ("f", "d", ...; "mtime" for -ot/-nt/-ef).
+    /// Each helper emits iff its key is present (BASHC_OPT item 1 — no
+    /// more all-or-nothing 20-helper block for a single `-f`).
+    need_stat_ops: BTreeSet<String>,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
     need_fnmatch: bool,
     /// string-var ++/-- helpers (sequence-point-safe inc/dec)
@@ -2792,6 +2795,13 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.fold_init_store();
     // drop `1;`-style constant statements (strip_dead_rc residue)
     r.drop_const_stmts();
+    // drop orphaned num temps: `static char _sN[32]; snprintf(_sN,
+    // ...)` pairs whose temp is never read afterwards (a consumer took
+    // a different path after the temp was emitted — e.g. a test cond
+    // rendered numerically, then routed through a shell-out site that
+    // converts itself). Only when the snprintf value is call-free
+    // (dropping must not lose a side effect).
+    r.drop_dead_num_temps();
     // the discarded-value echo collapsed to `(printf(...));` /
     // `(fputs(...));` — drop OUR comma-expr wrapper parens (safe: these
     // prefixes are never a cast/declaration at statement position).
@@ -3235,7 +3245,7 @@ impl Render {
                 self.emit("");
             }
         }
-        if self.need_stat {
+        if !self.need_stat_ops.is_empty() {
             self.emit("#include <sys/stat.h>");
         }
         if self.need_exc {
@@ -3287,7 +3297,7 @@ impl Render {
             self.emit("}");
             self.emit("");
         }
-        if self.need_time || self.need_stat {
+        if self.need_time || !self.need_stat_ops.is_empty() {
             self.emit("#include <time.h>");
         }
         self.emit("#include <math.h>");
@@ -4422,29 +4432,37 @@ impl Render {
             self.emit("}");
             self.emit("");
         }
-        if self.need_stat {
-            self.emit("/* [ -f/-d/-e/-s/... ] file tests */");
-            self.emit("static long long _sh_mtime(const char *p) { struct stat st; return stat(p, &st) == 0 ? (long long)st.st_mtime : -1; }");
-            self.emit("static int _sh_is_f(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISREG(st.st_mode); }");
-            self.emit("static int _sh_is_d(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }");
-            self.emit("static int _sh_is_e(const char *p) { struct stat st; return stat(p, &st) == 0; }");
-            self.emit("static int _sh_is_s(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_size > 0; }");
-            self.emit("static int _sh_is_l(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
-            self.emit("static int _sh_is_h(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
-            self.emit("static int _sh_is_S(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISSOCK(st.st_mode); }");
-            self.emit("static int _sh_is_p(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISFIFO(st.st_mode); }");
-            self.emit("static int _sh_is_b(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISBLK(st.st_mode); }");
-            self.emit("static int _sh_is_c(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISCHR(st.st_mode); }");
-            self.emit("static int _sh_is_g(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISGID); }");
-            self.emit("static int _sh_is_k(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISVTX); }");
-            self.emit("static int _sh_is_u(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISUID); }");
-            self.emit("static int _sh_is_t(const char *p) { return isatty(atoi(p)); }");
-            self.emit("static int _sh_is_G(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_gid == getgid(); }");
-            self.emit("static int _sh_is_O(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_uid == getuid(); }");
-            self.emit("static int _sh_is_N(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_mtime > time(0); }");
-            self.emit("static int _sh_is_r(const char *p) { return access(p, R_OK) == 0; }");
-            self.emit("static int _sh_is_w(const char *p) { return access(p, W_OK) == 0; }");
-            self.emit("static int _sh_is_x(const char *p) { return access(p, X_OK) == 0; }");
+        if !self.need_stat_ops.is_empty() {
+            self.emit("/* [ -f/-d/-e/-s/... ] file tests (only used ops) */");
+            // (op, helper body) table — each emits iff used (BASHC_OPT 1).
+            const STAT_HELPERS: &[(&str, &str)] = &[
+                ("mtime", "static long long _sh_mtime(const char *p) { struct stat st; return stat(p, &st) == 0 ? (long long)st.st_mtime : -1; }"),
+                ("f", "static int _sh_is_f(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISREG(st.st_mode); }"),
+                ("d", "static int _sh_is_d(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }"),
+                ("e", "static int _sh_is_e(const char *p) { struct stat st; return stat(p, &st) == 0; }"),
+                ("s", "static int _sh_is_s(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_size > 0; }"),
+                ("l", "static int _sh_is_l(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }"),
+                ("h", "static int _sh_is_h(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }"),
+                ("S", "static int _sh_is_S(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISSOCK(st.st_mode); }"),
+                ("p", "static int _sh_is_p(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISFIFO(st.st_mode); }"),
+                ("b", "static int _sh_is_b(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISBLK(st.st_mode); }"),
+                ("c", "static int _sh_is_c(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISCHR(st.st_mode); }"),
+                ("g", "static int _sh_is_g(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISGID); }"),
+                ("k", "static int _sh_is_k(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISVTX); }"),
+                ("u", "static int _sh_is_u(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISUID); }"),
+                ("t", "static int _sh_is_t(const char *p) { return isatty(atoi(p)); }"),
+                ("G", "static int _sh_is_G(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_gid == getgid(); }"),
+                ("O", "static int _sh_is_O(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_uid == getuid(); }"),
+                ("N", "static int _sh_is_N(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_mtime > time(0); }"),
+                ("r", "static int _sh_is_r(const char *p) { return access(p, R_OK) == 0; }"),
+                ("w", "static int _sh_is_w(const char *p) { return access(p, W_OK) == 0; }"),
+                ("x", "static int _sh_is_x(const char *p) { return access(p, X_OK) == 0; }"),
+            ];
+            for (op, body) in STAT_HELPERS {
+                if self.need_stat_ops.contains(*op) {
+                    self.emit(body);
+                }
+            }
         }
         if self.need_pow {
             self.emit("/* integer power (no libm on the gate's cc) */");
@@ -4680,6 +4698,112 @@ impl Render {
             }
         }
         self.out = out;
+        // BASHC_OPT item 10: the while-status idiom leaves a dead
+        // scaffold once the rc store is stripped — `{ int _went = 0;`
+        // … `_went = 1;` … `if (!_went) { }` + block close. The flag is
+        // written once, tested once, read nowhere else by construction
+        // (the emitter's only _went shapes), so when the test is empty
+        // the whole scaffold goes (the while loop and body stay).
+        // Runs only under dead-rc (a live `$?` keeps the test non-empty
+        // and this pass never fires).
+        let mut drop: Vec<bool> = vec![false; self.out.len()];
+        let mut i = 0;
+        while i < self.out.len() {
+            let is_test = self.out[i].trim_start() == "if (!_went) { }"
+                || (self.out[i].trim_start() == "if (!_went) {"
+                    && self.out.get(i + 1).is_some_and(|n| n.trim_start() == "}"));
+            if !is_test {
+                i += 1;
+                continue;
+            }
+            let indent_len = self.out[i].len() - self.out[i].trim_start().len();
+            // enclosing block open `{ int _went = 0;` at the same indent,
+            // searching back (a nested loop's own block is deeper).
+            let mut open = None;
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let lj = &self.out[j];
+                let ij = lj.len() - lj.trim_start().len();
+                if ij == indent_len && lj.trim_start() == "{ int _went = 0;" {
+                    open = Some(j);
+                    break;
+                }
+                // do not cross a less-indented boundary (a different
+                // block owns anything outside it).
+                if ij < indent_len && !lj.trim().is_empty() {
+                    break;
+                }
+            }
+            let Some(o) = open else {
+                i += 1;
+                continue;
+            };
+            // matching block close: first same-indent `}` after the test.
+            let test_end = if self.out[i].trim_start() == "if (!_went) { }" {
+                i
+            } else {
+                i + 1
+            };
+            let mut close = None;
+            for k in (test_end + 1)..self.out.len() {
+                let lk = &self.out[k];
+                if lk.len() - lk.trim_start().len() == indent_len && lk.trim_start() == "}" {
+                    close = Some(k);
+                    break;
+                }
+                if !lk.trim().is_empty()
+                    && lk.len() - lk.trim_start().len() < indent_len
+                {
+                    break;
+                }
+            }
+            let Some(c) = close else {
+                i += 1;
+                continue;
+            };
+            // the only _went mentions in (open..=close) must be the
+            // decl, the single set, and the test itself.
+            let mut mentions = 0;
+            for l in &self.out[o..=c] {
+                mentions += l.matches("_went").count();
+            }
+            // decl + set + test = 3 mentions (two-line test form's
+            // brace line adds none).
+            if mentions != 3 {
+                i += 1;
+                continue;
+            }
+            // the set must be the loop-body shape `_went = 1;`.
+            let has_set = self.out[o..=c]
+                .iter()
+                .any(|l| l.trim_start() == "_went = 1;");
+            if !has_set {
+                i += 1;
+                continue;
+            }
+            drop[o] = true;
+            for k in o..=c {
+                if self.out[k].trim_start() == "_went = 1;"
+                    || k == test_end
+                    || (test_end != i && k == i)
+                    || k == c
+                {
+                    drop[k] = true;
+                }
+            }
+            i = c + 1;
+            continue;
+        }
+        if drop.iter().any(|&d| d) {
+            let mut kept = Vec::with_capacity(self.out.len());
+            for (k, line) in self.out.iter().enumerate() {
+                if !drop[k] {
+                    kept.push(line.clone());
+                }
+            }
+            self.out = kept;
+        }
     }
 
     /// Fold a zero/bare declaration into the first constant store:
@@ -4755,6 +4879,130 @@ impl Render {
     /// left behind by strip_dead_rc's comma peel (`(_sh_rc = 0, 1);` →
     /// `1;`). A bare literal has no side effects; `gcc -Wall` flags
     /// these (`-Wunused-value`), so they are noise, not code.
+    /// Drop orphaned `num_temp` statics: `static char _sN[32];` +
+    /// `snprintf(_sN, sizeof _sN, ...);` where `_sN` never appears in any
+    /// later line. The snprintf value must be call-free (a dropped temp
+    /// must not lose a side effect): strip the known no-op casts
+    /// (`(long long)`, `(size_t)`, `(char*)`, `(int)`, `(unsigned)`)
+    /// and require no remaining `(`. Static temps are write-once by
+    /// construction (fresh `_sN` per site), so def-use is unambiguous.
+    fn drop_dead_num_temps(&mut self) {
+        fn snprintf_value_call_free(line: &str) -> bool {
+            // extract the value expression: text between the format
+            // string's closing `", ` and the final `));`.
+            let Some(start) = line.find("\", ") else {
+                return false;
+            };
+            let Some(end) = line.rfind("));") else {
+                return false;
+            };
+            if end <= start {
+                return false;
+            }
+            let mut v = line[start + 3..end].to_string();
+            for cast in ["(long long)", "(size_t)", "(char*)", "(const char*)", "(int)", "(unsigned)"] {
+                v = v.replace(cast, "");
+            }
+            // true call syntax only: ident/`)`/`]` followed by `(`
+            // (a bare `(i)` grouping is pure). C keywords excluded
+            // defensively though they never appear in a value.
+            let b = v.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'(' {
+                    let mut j = i;
+                    while j > 0 && b[j - 1] == b' ' {
+                        j -= 1;
+                    }
+                    if j > 0 {
+                        let c = b[j - 1] as char;
+                        if c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']' {
+                            let mut k = j;
+                            while k > 0
+                                && ((b[k - 1] as char).is_ascii_alphanumeric() || b[k - 1] == b'_')
+                            {
+                                k -= 1;
+                            }
+                            let word = &v[k..j];
+                            if !matches!(
+                                word,
+                                "if" | "while" | "for" | "switch" | "return" | "sizeof"
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            true
+        }
+        let mut drop = vec![false; self.out.len()];
+        let mut i = 0;
+        while i + 1 < self.out.len() {
+            let decl = self.out[i].trim_start();
+            // `static char _sN[32];` (any indent) followed by its snprintf.
+            let name = if decl.starts_with("static char _s") && decl.ends_with("[32];") {
+                let inner = decl["static char ".len()..decl.len() - "[32];".len()].trim();
+                if !inner.is_empty()
+                    && inner.chars().all(|c| c == '_' || c == 's' || c.is_ascii_digit())
+                {
+                    Some(inner.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(nm) = name else {
+                i += 1;
+                continue;
+            };
+            let snp = self.out[i + 1].trim_start();
+            if !snp.starts_with(&format!("snprintf({nm}, sizeof {nm}, ")) {
+                i += 1;
+                continue;
+            }
+            if !snprintf_value_call_free(&self.out[i + 1]) {
+                i += 1;
+                continue;
+            }
+            // used later? (def itself excluded by starting after i+1;
+            // the snprintf line's own mentions don't count.)
+            let used = self.out[i + 2..].iter().any(|l| {
+                // word-boundary match so `_s1` doesn't match `_s10`.
+                let mut k = 0;
+                let b = l.as_bytes();
+                let nb = nm.as_bytes();
+                while k + nb.len() <= b.len() {
+                    if &b[k..k + nb.len()] == nb
+                        && (k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_'))
+                        && (k + nb.len() == b.len()
+                            || !(b[k + nb.len()].is_ascii_alphanumeric() || b[k + nb.len()] == b'_'))
+                    {
+                        return true;
+                    }
+                    k += 1;
+                }
+                false
+            });
+            if !used {
+                drop[i] = true;
+                drop[i + 1] = true;
+            }
+            i += 1;
+        }
+        if drop.iter().any(|&d| d) {
+            let mut kept = Vec::with_capacity(self.out.len());
+            for (k, line) in self.out.iter().enumerate() {
+                if !drop[k] {
+                    kept.push(line.clone());
+                }
+            }
+            self.out = kept;
+        }
+    }
+
     fn drop_const_stmts(&mut self) {
         self.out.retain(|line| {
             let t = line.trim();
@@ -8158,8 +8406,21 @@ fn param_copy_alias(
             }
             IrExpr::Interpolate(parts) => {
                 // value context: snprintf the flattened parts into a temp
-                // (NOT the shared word buffer — callers may be mid-assembly)
+                // (NOT the shared word buffer — callers may be mid-assembly).
+                // All-literal (no Expr parts): plain C string literal — no
+                // vbuf, no snprintf loop (BASHC_OPT item 14). The fmt
+                // below carries %% escapes for snprintf, so rebuild from
+                // the raw Lit parts instead.
                 let parts = flatten_parts(parts);
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) {
+                    let mut s = String::new();
+                    for p in &parts {
+                        if let InterpPart::Lit(lit) = p {
+                            s.push_str(lit);
+                        }
+                    }
+                    return Self::cstr(&s);
+                }
                 let mut fmt = String::new();
                 let mut cargs: Vec<String> = Vec::new();
                 for p in &parts {
@@ -12920,11 +13181,14 @@ fn param_copy_alias(
                     "-z" => format!("(!({v}) || !({v})[0])"),
                     "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-S" | "-p"
                     | "-b" | "-c" | "-g" | "-k" | "-u" | "-G" | "-O" | "-N" | "-h" => {
-                        self.need_stat = true;
-                        format!("_sh_is_{}({v})", &flag[1..])
+                        // `-L` is spelling for `-l` (lstat symlink test) —
+                        // the helper is emitted lowercase-only.
+                        let op = if &flag[1..] == "L" { "l".to_string() } else { flag[1..].to_string() };
+                        self.need_stat_ops.insert(op.clone());
+                        format!("_sh_is_{op}({v})")
                     }
                     "-a" => {
-                        self.need_stat = true;
+                        self.need_stat_ops.insert("e".to_string());
                         format!("_sh_is_e({v})")
                     }
                     _ => {
@@ -12937,8 +13201,9 @@ fn param_copy_alias(
                                     | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-u"
                                     | "-G" | "-O" | "-N" | "-h"
                             ) {
-                                self.need_stat = true;
-                                return format!("(!_sh_is_{}({v}))", &flag[1..]);
+                                let op = if &flag[1..] == "L" { "l".to_string() } else { flag[1..].to_string() };
+                                self.need_stat_ops.insert(op.clone());
+                                return format!("(!_sh_is_{op}({v}))");
                             }
                         }
                         self.mark_todo(&format!("test flag {flag}"));
@@ -12961,6 +13226,23 @@ fn param_copy_alias(
     }
 
     fn test_compare(&mut self, op: &str, l: &str, r: &str, raw_l: &str, raw_r: &str) -> String {
+        // BASHC_OPT item 4: both sides proven-int (Int var or int
+        // literal) → native comparison, no atoll round-trip. Sound
+        // because an Int-homed var can never hold non-numeric text
+        // (bash's "integer expression expected" error is unreachable).
+        if matches!(op, "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
+            if let (Some(ln), Some(rn)) = (self.test_num_operand(raw_l), self.test_num_operand(raw_r)) {
+                let cop = match op {
+                    "-gt" => ">",
+                    "-lt" => "<",
+                    "-ge" => ">=",
+                    "-le" => "<=",
+                    "-eq" => "==",
+                    _ => "!=",
+                };
+                return format!("({ln} {cop} {rn})");
+            }
+        }
         match op {
             "-gt" => format!("(atoll({l}) > atoll({r}))"),
             "-lt" => format!("(atoll({l}) < atoll({r}))"),
@@ -13071,7 +13353,7 @@ fn param_copy_alias(
             }
             "-ot" | "-nt" | "-ef" => {
                 // file mtime/newer/exists compares (bash 0 if either missing)
-                self.need_stat = true;
+                self.need_stat_ops.insert("mtime".to_string());
                 match op {
                     "-ot" => format!("(_sh_mtime({l}) < _sh_mtime({r}))"),
                     "-nt" => format!("(_sh_mtime({l}) > _sh_mtime({r}))"),
@@ -13095,6 +13377,51 @@ fn param_copy_alias(
     }
 
     /// A test operand → char* C expression (numeric vars via num_temp).
+    /// A test operand proven integer-valued: int literal, or `$name` /
+    /// `${name}` of an Int-homed var (renders as the native ident).
+    /// None otherwise (atoll path stays exact). Used by test_compare
+    /// for native integer comparisons (BASHC_OPT item 4).
+    fn test_num_operand(&self, raw: &str) -> Option<String> {
+        let mut t = raw.trim();
+        // strip one layer of matching quotes
+        if t.len() >= 2
+            && ((t.starts_with('"') && t.ends_with('"'))
+                || (t.starts_with('\'') && t.ends_with('\'')))
+        {
+            t = t[1..t.len() - 1].trim();
+        }
+        if t.parse::<i64>().is_ok() {
+            return Some(t.to_string());
+        }
+        // `$name` / `${name}` / `${name:-...}`? Only the bare forms
+        // prove the VALUE is the var's (defaults/complex expansions
+        // can inject arbitrary text).
+        let name = if let Some(rest) = t.strip_prefix('$') {
+            if let Some(inner) = rest
+                .strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+            {
+                inner.to_string()
+            } else {
+                rest.to_string()
+            }
+        } else {
+            return None;
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        if self.is_num(&name) {
+            Some(self.c_ident(&name))
+        } else {
+            None
+        }
+    }
+
     fn test_value(&mut self, t: &str) -> String {
         let raw = t.trim();
         // `~` / `~/Documents` — home expansion (also `~user` is out of
@@ -13308,6 +13635,44 @@ fn param_copy_alias(
 
     // ── parameter expansion ──────────────────────────────────────────
 
+    /// True call syntax in a rendered C value expression: an
+    /// identifier (or `)`/`]`) directly followed by `(`. Bare `(i)`
+    /// groupings don't count; C keywords excluded defensively.
+    /// Callers use it to decide single-evaluation hoisting (BASHC_OPT
+    /// item 13) — a pure value needs no temp.
+    fn expr_has_call(v: &str) -> bool {
+        let b = v.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'(' {
+                let mut j = i;
+                while j > 0 && b[j - 1] == b' ' {
+                    j -= 1;
+                }
+                if j > 0 {
+                    let c = b[j - 1] as char;
+                    if c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']' {
+                        let mut k = j;
+                        while k > 0
+                            && ((b[k - 1] as char).is_ascii_alphanumeric() || b[k - 1] == b'_')
+                        {
+                            k -= 1;
+                        }
+                        let word = &v[k..j];
+                        if !matches!(
+                            word,
+                            "if" | "while" | "for" | "switch" | "return" | "sizeof"
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn param_call(&mut self, args: &[IrExpr]) -> String {
         let Some(op) = Self::str_arg(args, 0) else {
             return "0".into();
@@ -13471,6 +13836,21 @@ fn param_copy_alias(
             .get(2)
             .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
+        // BASHC_OPT item 13: the -/:-/:?/=/:= arms below evaluate
+        // var_expr up to 5x -- hoist call-containing expressions into a
+        // const temp (single evaluation; also fixes multi-run of
+        // side-effecting capture defaults like ${x:-$(cmd)}). Bare
+        // ident/member forms stay inline (no temp, no statement).
+        let var_expr = if matches!(op.as_str(), "-" | ":-" | ":?" | "=" | ":=")
+            && Self::expr_has_call(&var_expr)
+        {
+            let dt = format!("_d{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit(&format!("const char *{dt} = ({var_expr});"));
+            dt
+        } else {
+            var_expr
+        };
         let repl = args
             .get(3)
             .map(|x| self.default_word(x))
@@ -15499,8 +15879,20 @@ fn param_copy_alias(
                         // construction (every miss path returns "" — see
                         // their emitted bodies); skipping the guard also
                         // single-evaluates the call (the guard ran it twice).
+                        // Word-renderer parens (`(a)`) are transparent to
+                        // the proof: strip outer layers for the lookup
+                        // only (emission keeps them).
+                        let mut stripped = v.trim();
+                        while stripped.starts_with('(')
+                            && stripped.ends_with(')')
+                            && stripped.len() > 2
+                        {
+                            stripped = stripped[1..stripped.len() - 1].trim();
+                        }
                         if self.nonnull.contains(&v)
                             || self.nonnull_var.contains(&v)
+                            || self.nonnull.contains(stripped)
+                            || self.nonnull_var.contains(stripped)
                             || is_nonnull_helper_call(&v)
                         {
                             cargs.push(v);
@@ -17124,9 +17516,58 @@ fn param_copy_alias(
                 // it afterwards.
                 if let Some((first, last, step)) = seq_iter_range(iter) {
                     let name = self.c_ident(var);
+                    let was_num = self.is_num(var);
                     let prev_type = self.var_types.get(var).copied();
                     self.var_types.insert(var.clone(), IrType::Int);
                     let cmp = if step > 0 { "<=" } else { ">=" };
+                    // BASHC_OPT item 7b: a brace-int-seq (`{1..5}`) with an
+                    // Int-homed loop var runs on a HIDDEN counter with a
+                    // per-iteration assign — never directly on the var. A
+                    // direct `for (i = 1; i <= 5; i++)` leaves i past the
+                    // end (6) where bash leaves the LAST element (5), so
+                    // any post-loop read (or break) would be off by one
+                    // (002: missing first Counter line). The hidden
+                    // counter preserves exact bash end-value/break
+                    // semantics while dropping the materialized table.
+                    // (Range iters keep the direct form — pre-existing
+                    // behavior, known latent end-value gap, untouched.)
+                    // Non-Int vars keep the string-table path below.
+                    let is_brace_seq = matches!(iter,
+                        IrExpr::Array(items)
+                            if items.len() == 1
+                                && matches!(items.first(),
+                                    Some(IrExpr::Call { func, .. }) if func == "brace"));
+                    if is_brace_seq && was_num {
+                        let k = format!("_sk{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let kupd = match step {
+                            1 => format!("{k}++"),
+                            -1 => format!("{k}--"),
+                            s => format!("{k} += {s}"),
+                        };
+                        // NOTE: no prof_loop trip instrumentation here
+                        // (the direct-var path above has it) — prof_loop is
+                        // worker-owned WIP; wire this path when it lands.
+                        self.emit(&format!(
+                            "for (long long {k} = {first}; {k} {cmp} {last}; {kupd}) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!("{name} = {k};"));
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        match prev_type {
+                            Some(t) => {
+                                self.var_types.insert(var.clone(), t);
+                            }
+                            None => {
+                                self.var_types.remove(var);
+                            }
+                        }
+                        return;
+                    }
                     let upd = match step {
                         1 => format!("{name}++"),
                         -1 => format!("{name}--"),
@@ -17264,6 +17705,15 @@ fn param_copy_alias(
                             self.emit(&format!(
                                 "{var_name} = _sh_argv[_ai_{var_name}];"
                             ));
+                            // argv[1..argc) entries are non-NULL by exec
+                            // convention and the index is bounds-checked:
+                            // the loop var is proven non-NULL until
+                            // reassigned (BASHC_OPT item 12 — drops the
+                            // `%s` guard on `echo "Arg: $a"`-shaped uses).
+                            // Per-statement clearing removes it after the
+                            // loop, so a zero-trip loop can't leak a stale
+                            // proof to later reads.
+                            self.nonnull_var.insert(var_name.clone());
                             for s in body {
                                 self.stmt(s);
                             }
@@ -24107,11 +24557,52 @@ fn seq_iter_range(iter: &IrExpr) -> Option<(i128, i128, i128)> {
         IrExpr::Range { start, end } => Some((*start as i128, *end as i128, 1i128)),
         IrExpr::Array(items) if items.len() == 1 => match items.first() {
             Some(IrExpr::Range { start, end }) => Some((*start as i128, *end as i128, 1i128)),
+            // BASHC_OPT item 7: a constant brace-int-seq (`{1..5}`)
+            // folds to a native C for — no materialized table + index
+            // loop. Strictly canonical decimal items only: "01" parses
+            // as 1 but is a different string downstream (padding would
+            // be lost), so anything non-canonical falls back.
+            Some(IrExpr::Call { func, args }) if func == "brace" => {
+                seq_of_ints(&brace_expand(args))
+            }
             Some(cap) => seq_capture_words(cap),
             None => None,
         },
         _ => None,
     }
+}
+
+/// A constant integer sequence (all canonical decimal, constant nonzero
+/// step) as (first, last, step) for a native C for loop. None → the
+/// materialized-table path stays.
+fn seq_of_ints(strs: &[String]) -> Option<(i128, i128, i128)> {
+    if strs.is_empty() {
+        return None;
+    }
+    let mut vals = Vec::with_capacity(strs.len());
+    for s in strs {
+        let t = s.trim();
+        let Ok(n) = t.parse::<i64>() else {
+            return None;
+        };
+        // canonical form only: re-render must round-trip exactly
+        // (rejects "01", "+5", " 7 ", ...).
+        if n.to_string() != t {
+            return None;
+        }
+        vals.push(n as i128);
+    }
+    if vals.len() == 1 {
+        return Some((vals[0], vals[0], 1));
+    }
+    let step = vals[1] - vals[0];
+    if step == 0 {
+        return None;
+    }
+    if !vals.windows(2).all(|w| w[1] - w[0] == step) {
+        return None;
+    }
+    Some((vals[0], vals[vals.len() - 1], step))
 }
 
 /// Parse the pre-lift `captureWords → arrow → exec "seq"` iterable
@@ -28009,6 +28500,183 @@ mod tests {
             "shared var left main:\n{out}"
         );
         let _ = HashSet::<usize>::new();
+    }
+
+    #[test]
+    fn bashc_opt_item1_stat_helpers_per_op() {
+        // BASHC_OPT item 1: only used file-test helpers emit (was an
+        // all-or-nothing 20-helper block). A bare `[ -f x ]` test gets
+        // `_sh_is_f` and nothing else.
+        fn test_call(text: &str) -> IrExpr {
+            IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![IrExpr::Str(text.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            }
+        }
+        fn prog_of(e: IrExpr) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Expr(e)],
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        let out = shir_to_c(&prog_of(test_call("-f somefile")));
+        assert!(out.contains("_sh_is_f("), "-f helper missing:\n{out}");
+        assert!(!out.contains("_sh_is_d("), "unused -d helper leaked:\n{out}");
+        assert!(!out.contains("_sh_is_x("), "unused -x helper leaked:\n{out}");
+        // `-L` is spelling for `-l`: used to emit a call to the
+        // never-defined `_sh_is_L` (compile break).
+        let out = shir_to_c(&prog_of(test_call("-L somelink")));
+        assert!(out.contains("_sh_is_l("), "-L not lowered to _sh_is_l:\n{out}");
+        assert!(!out.contains("_sh_is_L("), "undefined _sh_is_L call:\n{out}");
+    }
+
+    #[test]
+    fn bashc_opt_item9_dead_num_temp_dropped() {
+        // BASHC_OPT item 9: an emitted num temp never read afterwards
+        // is dropped (def + snprintf), but only when the value is
+        // call-free (dropping must not lose a side effect).
+        let mut r = Render::default();
+        r.out = vec![
+            "    static char _s0[32];".to_string(),
+            "    snprintf(_s0, sizeof _s0, \"%lld\", (long long)(i));".to_string(),
+            "    printf(\"%s\\n\", _s0);".to_string(),
+        ];
+        r.drop_dead_num_temps();
+        assert_eq!(r.out.len(), 3, "used temp dropped");
+        let mut r = Render::default();
+        r.out = vec![
+            "    static char _s0[32];".to_string(),
+            "    snprintf(_s0, sizeof _s0, \"%lld\", (long long)(i));".to_string(),
+            "    printf(\"%s\\n\", other);".to_string(),
+        ];
+        r.drop_dead_num_temps();
+        assert_eq!(r.out.len(), 1, "orphan temp kept: {:?}", r.out);
+        // call in the value: keep (side effect).
+        let mut r = Render::default();
+        r.out = vec![
+            "    static char _s0[32];".to_string(),
+            "    snprintf(_s0, sizeof _s0, \"%lld\", (long long)(_sh_site_0()));".to_string(),
+            "    printf(\"%s\\n\", other);".to_string(),
+        ];
+        r.drop_dead_num_temps();
+        assert_eq!(r.out.len(), 3, "side-effect temp dropped");
+    }
+
+    #[test]
+    fn bashc_opt_item10_went_scaffold_dropped() {
+        // BASHC_OPT item 10: the while-status scaffold goes once the rc
+        // store is stripped (decl + set + empty test + block close),
+        // keeping the loop itself.
+        let mut r = Render::default();
+        r.out = vec![
+            "    { int _went = 0;".to_string(),
+            "    while (cond) {".to_string(),
+            "        _went = 1;".to_string(),
+            "        body();".to_string(),
+            "    }".to_string(),
+            "    if (!_went) { }".to_string(),
+            "    }".to_string(),
+            "    after();".to_string(),
+        ];
+        r.strip_dead_rc();
+        let out = r.out.join("\n");
+        assert!(!out.contains("_went"), "scaffold survived:\n{out}");
+        assert!(out.contains("while (cond)"), "loop dropped:\n{out}");
+        assert!(out.contains("body();"), "body dropped:\n{out}");
+        assert!(out.contains("after();"), "tail dropped:\n{out}");
+    }
+
+    #[test]
+    fn bashc_opt_item12_argv_guard_dropped() {
+        // BASHC_OPT item 12: argv[1..argc) entries are non-NULL by exec
+        // convention — the for-argv loop var proves nonnull, and the
+        // printf guard lookup tolerates the word-renderer's parens.
+        let mut r = Render::default();
+        r.nonnull_var.insert("a".to_string());
+        let out = r.printf_from_parts(vec![Part::Arg(
+            "(a)".to_string(),
+            NumSpec::Str,
+        )]);
+        assert!(!out.contains('?'), "guard kept on proven arg: {out}");
+        assert!(out.contains("(a)"), "arg lost: {out}");
+    }
+
+    #[test]
+    fn bashc_opt_item14_const_interpolate_folds() {
+        // BASHC_OPT item 14: all-literal interpolation renders as a
+        // plain C string — no vbuf, no snprintf loop (%% unescaped
+        // back to % since no format evaluation happens).
+        let mut r = Render::default();
+        let out = r.value_c(&IrExpr::Interpolate(vec![
+            crate::ir::InterpPart::Lit("100%".to_string()),
+        ]));
+        assert_eq!(out, "\"100%\"", "const fold wrong: {out}");
+        assert!(!r.out.iter().any(|l| l.contains("snprintf")), "snprintf emitted");
+    }
+
+    #[test]
+    fn bashc_opt_item4_native_int_compare() {
+        // BASHC_OPT item 4: `[ $i -lt 10 ]` with Int-homed i renders
+        // `(i < 10)` — no atoll round-trip. Untyped vars keep atoll.
+        fn test_call(text: &str) -> IrExpr {
+            IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![IrExpr::Str(text.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            }
+        }
+        fn prog_of(e: IrExpr, vt: Vec<(String, crate::ir::IrType)>) -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Expr(e)],
+                subs: vec![],
+                var_types: vt,
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        let out = shir_to_c(&prog_of(
+            test_call("$i -lt 10"),
+            vec![("i".to_string(), crate::ir::IrType::Int)],
+        ));
+        assert!(out.contains("(i < 10)"), "no native compare:\n{out}");
+        assert!(!out.contains("atoll"), "atoll survived:\n{out}");
+        // untyped var keeps the exact atoll path.
+        let out = shir_to_c(&prog_of(test_call("$j -lt 10"), vec![]));
+        assert!(out.contains("atoll"), "atoll dropped for untyped:\n{out}");
+    }
+
+    #[test]
+    fn bashc_opt_item7_brace_seq_folds() {
+        // BASHC_OPT item 7: const brace-int-seq shapes (unit level).
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(seq_of_ints(&v(&["1", "2", "3"])), Some((1, 3, 1)));
+        assert_eq!(seq_of_ints(&v(&["5", "4", "3"])), Some((5, 3, -1)));
+        assert_eq!(seq_of_ints(&v(&["1", "3", "5"])), Some((1, 5, 2)));
+        assert_eq!(seq_of_ints(&v(&["7"])), Some((7, 7, 1)));
+        // non-canonical decimals keep the table path (padding lost).
+        assert_eq!(seq_of_ints(&v(&["01", "02"])), None);
+        assert_eq!(seq_of_ints(&v(&["+5", "+6"])), None);
+        // letters, mixed, zero-step, empty: no fold.
+        assert_eq!(seq_of_ints(&v(&["a", "b"])), None);
+        assert_eq!(seq_of_ints(&v(&["1", "x"])), None);
+        assert_eq!(seq_of_ints(&v(&["5", "5"])), None);
+        assert_eq!(seq_of_ints(&Vec::new()), None);
     }
 
     #[test]
