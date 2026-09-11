@@ -29,6 +29,7 @@
 //! covered by the range analysis; the string side stays open).
 
 use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart, VarKind};
+use crate::shir_passes::list_profile::Structure;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 enum Part {
@@ -471,6 +472,22 @@ pub struct Render {
     /// consumed by sortedIntJoin/sortedBigintJoin): stored as
     /// `long long name[N]` + `name_len` instead of `char* name[N]`
     int_arrays: HashSet<String>,
+    /// int-homed arrays with a growable-vec verdict (list-profile):
+    /// `T *name` + `name_len` + `name_cap` instead of `T name[1024]`.
+    /// Subset of `int_arrays`; every `{id}[k]`/`{id}_len` use site works
+    /// unchanged — only decl/append/indexed-write/free differ.
+    vec_arrays: HashSet<String>,
+    /// vec arrays owned by one function (single safe scope): declared
+    /// as function locals at the owner's top instead of file-scope
+    /// statics, freed at every function exit. Computed in program().
+    vec_local: HashMap<String, String>,
+    /// grow-helper widths needed (`_sh_grow_{suffix}` emitters in the
+    /// runtime prelude), by width suffix
+    need_grow: BTreeSet<String>,
+    /// list-profile verdicts (structure + append bound + escape),
+    /// computed in shir_to_c; consumed when finalizing `vec_arrays`
+    /// in program() (after assoc discovery so decl/append/free agree)
+    list_verdicts: BTreeMap<String, crate::shir_passes::list_profile::ListVerdict>,
     /// int arrays consumed by max/min/sum — maintain `_max`/`_min`/`_sum`
     /// aggregates incrementally so the reduction is O(1) (Optimisation 1)
     reduce_arrays: HashSet<String>,
@@ -656,6 +673,45 @@ fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
     // only int arrays (the aggregate is a plain i64)
     reduce.retain(|a| int_arrays.contains(a));
     reduce
+}
+
+/// Growable-vec selection (docs/LISTS.MD §4.4, C-backend hook): arrays
+/// whose list-profile verdict demands growth — tracked, unescaped, and
+/// unbounded-or-overflowing. `Fixed`-verdict, escaped, assoc, fn-return
+/// (mpz), bigint-homed, and untracked arrays keep status-quo storage
+/// (byte-identical output). SmallVec/Chunked/Gap/Rope verdicts lower as
+/// Vec until their own lowerings land (all correct on Vec; slower only).
+/// `SH2_LIST_VEC=0` disables the upgrade entirely (validation kill-switch).
+fn select_vec_arrays(
+    verdicts: &BTreeMap<String, crate::shir_passes::list_profile::ListVerdict>,
+    exclude: &HashSet<String>,
+) -> HashSet<String> {
+    if std::env::var("SH2_LIST_VEC").as_deref() == Ok("0") {
+        return HashSet::new();
+    }
+    // NOTE: keyed on verdict names, not the render-discovered array
+    // set (unknown until program()). String-homed (char*) lists hit
+    // the same cap exit and grow the same way. Excluded: assoc /
+    // fn-return / bigint-homed stores (fixed k/v stores or mpz slots).
+    verdicts
+        .iter()
+        .filter(|(a, v)| {
+            if exclude.contains(*a) {
+                return false;
+            }
+            !v.escaped
+                && matches!(
+                    v.structure,
+                    Structure::Vec
+                        | Structure::SmallVec
+                        | Structure::Chunked
+                        | Structure::Gap
+                        | Structure::Rope
+                )
+                && (v.append_hi.is_none() || v.append_hi.unwrap() > ARR_CAP as u64)
+        })
+        .map(|(a, _)| a.clone())
+        .collect()
 }
 
 fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
@@ -2500,6 +2556,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.bigint_param_fns = analyze_bigint_param_fns(&prog);
     r.array_return_arrays = analyze_array_return_fns(&prog);
     r.array_return_fns = r.array_return_arrays.keys().cloned().collect();
+    // list-container profiles (advisory verdicts; vec selection below)
+    r.list_verdicts = crate::shir_passes::list_profile::verdicts(&prog);
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
         r.need_sh = true;
@@ -2510,6 +2568,26 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.bigint_vars = analyze_bigint_vars(&prog);
     if !r.bigint_vars.is_empty() {
         r.need_gmp = true;
+    }
+    // growable-vec selection (after bigint_vars: mpz-homed arrays stay
+    // fixed). See select_vec_arrays. Function-local owners are resolved
+    // here too (pre fold_range_for — see program()).
+    {
+        let mut exclude: HashSet<String> =
+            r.array_return_fns.iter().cloned().collect();
+        exclude.extend(r.bigint_vars.iter().cloned());
+        r.vec_arrays = select_vec_arrays(&r.list_verdicts, &exclude);
+        let r_uses = crate::shir_passes::list_profile::scopes::use_scopes(&prog);
+        let mut locals = HashMap::new();
+        for a in &r.vec_arrays {
+            if let Some(us) = r_uses.get(a) {
+                if let Some(f) = crate::shir_passes::list_profile::scopes::local_owner(us)
+                {
+                    locals.insert(a.clone(), f);
+                }
+            }
+        }
+        r.vec_local = locals;
     }
     // compile-time-constant bigints become GLOBAL mpz_t constants
     // (shared across functions, init once in main).
@@ -3380,6 +3458,38 @@ impl Render {
             self.emit("  if (i < 0 || i >= (long long)len || !a[i]) return \"\";");
             self.emit("  return a[i];");
             self.emit("}");
+            // growable-vec helpers per element width (list-profile Vec
+            // verdicts): doubling realloc, P1 fail-stop OOM policy.
+            // Deterministic order (BTreeSet) for byte-identical output.
+            let grows: Vec<String> = self.need_grow.iter().cloned().collect();
+            for sfx in &grows {
+                if sfx == "str" {
+                    // string-vec grower: the array itself is char**
+                    self.emit("static void _sh_grow_str(char ***p, size_t *cap) {");
+                    self.emit("  size_t ncap = *cap ? *cap * 2 : 16;");
+                    self.emit("  char **np = (char**)realloc(*p, ncap * sizeof *np);");
+                    self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                    self.emit("  *p = np; *cap = ncap;");
+                    self.emit("}");
+                    continue;
+                }
+                let t = match sfx.as_str() {
+                    "i8" => "int8_t",
+                    "u8" => "uint8_t",
+                    "i16" => "int16_t",
+                    "u16" => "uint16_t",
+                    "u32" => "uint32_t",
+                    "i32" => "int32_t",
+                    "u64" => "unsigned long long",
+                    _ => "long long",
+                };
+                self.emit(&format!("static void _sh_grow_{sfx}({t} **p, size_t *cap) {{"));
+                self.emit("  size_t ncap = *cap ? *cap * 2 : 16;");
+                self.emit(&format!("  {t} *np = ({t}*)realloc(*p, ncap * sizeof *np);"));
+                self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                self.emit("  *p = np; *cap = ncap;");
+                self.emit("}");
+            }
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
@@ -5143,6 +5253,7 @@ impl Render {
                 // caller). The array itself is not a store var, so it is
                 // not freed.
                 self.emit_fn_frees(&fvars);
+                self.emit_vec_local_frees();
                 self.emit(&format!("return {aid};"));
             } else {
                 // the trailing echo's single element — its VALUE is the
@@ -5171,6 +5282,7 @@ impl Render {
                         if let Some(moved_name) = moved_name {
                             self.emit_fn_frees_excluding(&fvars, &[&moved_name]);
                             self.flush_pending_frees();
+                            self.emit_vec_local_frees();
                             self.emit(&format!("return {};", self.c_ident(&moved_name)));
                         } else {
                             // otherwise the return value is a
@@ -5192,6 +5304,7 @@ impl Render {
                             }
                             self.emit_fn_frees(&fvars);
                             self.flush_pending_frees();
+                            self.emit_vec_local_frees();
                             self.emit(&format!("return {ret};"));
                         }
                     }
@@ -5209,6 +5322,39 @@ impl Render {
             .cloned()
             .collect();
         self.fn_file_vars.insert(name.to_string(), fn_file_vars);
+        // vec-local soundness guard: no file-scope helper registered by
+        // this body may reference an owned array (the IR rule forbids
+        // helper-triggering positions — reaching here means the rule
+        // missed one, a real soundness bug: fail loud, never silently
+        // read a stale global). Check the array ident plus its _len /
+        // _cap (and reduce aggregates): any of them read from a helper
+        // observes the global while the body writes the local.
+        {
+            let owned: Vec<String> = self
+                .vec_local
+                .iter()
+                .filter(|(_, o)| o.as_str() == name)
+                .map(|(a, _)| a.clone())
+                .collect();
+            for a in &owned {
+                let id = self.c_ident(a);
+                let mut idents = vec![id.clone(), format!("{id}_len"), format!("{id}_cap")];
+                if self.reduce_arrays.contains(a) {
+                    idents.push(format!("{id}_max"));
+                    idents.push(format!("{id}_min"));
+                    idents.push(format!("{id}_sum"));
+                }
+                let hit = idents.iter().any(|id| {
+                    self.site_bodies[site_mark..].iter().any(|b| code_contains_ident(b, id))
+                        || self.cap_bodies[cap_mark..].iter().any(|b| code_contains_ident(b, id))
+                });
+                if hit {
+                    unreachable!(
+                        "vec-local array `{a}` referenced by a file-scope helper — locality proof unsound"
+                    );
+                }
+            }
+        }
         let mut body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         self.in_function = prev_fn;
@@ -5297,6 +5443,35 @@ impl Render {
         for line in &local_lines {
             self.out.push((*line).clone());
         }
+        // vec arrays owned by this function: function-local storage
+        // (same names as the file-scope form, so every use site renders
+        // identically — no body surgery). Plain (non-static) locals:
+        // recursion-safe, freed at every exit below.
+        let mut owned: Vec<String> = self
+            .vec_local
+            .iter()
+            .filter(|(_, o)| o.as_str() == name)
+            .map(|(a, _)| a.clone())
+            .collect();
+        owned.sort();
+        for a in &owned {
+            let id = self.c_ident(a);
+            if self.int_arrays.contains(a) {
+                let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
+                self.emit(&format!("{} *{} = NULL;", w.c_type(), id));
+            } else {
+                self.emit(&format!("char **{} = NULL;", id));
+            }
+            self.emit(&format!("size_t {}_len = 0, {}_cap = 0;", id, id));
+            if self.reduce_arrays.contains(a) {
+                self.emit(&format!("long long {}_max = 0;", id));
+                self.emit(&format!("long long {}_min = 0;", id));
+                self.emit(&format!("long long {}_sum = 0;", id));
+            }
+        }
+        if !owned.is_empty() {
+            self.emit("");
+        }
         if !local_lines.is_empty() {
             self.emit("");
             let local_vars: BTreeSet<String> = fvars
@@ -5311,11 +5486,57 @@ impl Render {
         // non-lifted functions have no trailing echo->return, so free
         // their non-escaping heap store vars at the end of the body
         // (lifted functions already freed them before the return).
+        // Same for owned vec-locals (`current_fn` is already restored
+        // here, so pass the name explicitly).
         if lifted_arity.is_none() {
             self.emit_fn_frees(&fvars);
+            self.emit_vec_local_frees_in(name);
         }
         self.depth -= 1;
         self.emit("}");
+    }
+
+    /// Free one function's owned vec-locals (element loop for string
+    /// vecs, then the buffer).
+    fn emit_vec_local_frees_in(&mut self, fname: &str) {
+        let mut owned: Vec<String> = self
+            .vec_local
+            .iter()
+            .filter(|(_, o)| o.as_str() == fname)
+            .map(|(a, _)| a.clone())
+            .collect();
+        owned.sort();
+        for a in &owned {
+            let id = self.c_ident(a);
+            if !self.int_arrays.contains(a) {
+                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+            }
+            self.emit(&format!("free({id});"));
+        }
+    }
+
+    /// Free the current function's owned vec-locals (in-body sites:
+    /// returns — `current_fn` is set during body render). No-op outside
+    /// functions or when none owned.
+    fn emit_vec_local_frees(&mut self) {
+        let f = match &self.current_fn {
+            Some(f) => f.clone(),
+            None => return,
+        };
+        let mut owned: Vec<String> = self
+            .vec_local
+            .iter()
+            .filter(|(_, o)| o.as_str() == f)
+            .map(|(a, _)| a.clone())
+            .collect();
+        owned.sort();
+        for a in &owned {
+            let id = self.c_ident(a);
+            if !self.int_arrays.contains(a) {
+                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+            }
+            self.emit(&format!("free({id});"));
+        }
     }
 
     fn str_arg(args: &[IrExpr], i: usize) -> Option<String> {
@@ -12431,6 +12652,24 @@ impl Render {
         Some(format!("{t}.p"))
     }
 
+    /// Indexed write into a growable vec: hoist value+key into temps
+    /// (single evaluation; null value or negative index stores nothing
+    /// — exactly `_sh_arr_set`'s `i < 0 || !v` guard), grow past the
+    /// index, store, extend len. Int vecs store `atoll` (the value is
+    /// always a `char*` — see `value_c`); string vecs strdup.
+    fn emit_vec_index_write(&mut self, var: &str, key: &str, val: &str) {
+        let id = self.c_ident(var);
+        let sfx = self.vec_grow_suffix(var);
+        let seq = self.temp_seq;
+        self.temp_seq += 1;
+        let store = if self.int_arrays.contains(var) {
+            format!("{id}[_kk{seq}] = (long long)atoll(_vv{seq});")
+        } else {
+            format!("{id}[_kk{seq}] = _sh_xstrdup(_vv{seq});")
+        };
+        self.emit(&format!("{{ const char *_vv{seq} = ({val}); long long _kk{seq} = (long long)({key}); if (_vv{seq} && _kk{seq} >= 0) {{ while ((size_t)(_kk{seq} + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {store} if ((size_t)(_kk{seq} + 1) > {id}_len) {id}_len = _kk{seq} + 1; }} }}"));
+    }
+
     /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
     fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
         self.arrays.insert(var.to_string());
@@ -12469,6 +12708,10 @@ impl Render {
         if let IrExpr::Str(k, _) = key {
             // a literal key: numeric for indexed arrays, string for assoc
             if let Ok(i) = k.trim().parse::<i64>() {
+                if self.vec_arrays.contains(var) {
+                    self.emit_vec_index_write(var, &i.to_string(), &v);
+                    return;
+                }
                 self.emit(&format!(
                     "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {i}, {v});"
                 ));
@@ -12483,6 +12726,10 @@ impl Render {
                 } else {
                     format!("(long long)atoll({})", self.store_read(k.trim()))
                 };
+                if self.vec_arrays.contains(var) {
+                    self.emit_vec_index_write(var, &kv, &v);
+                    return;
+                }
                 self.emit(&format!(
                     "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {kv}, {v});"
                 ));
@@ -12499,6 +12746,10 @@ impl Render {
         } else {
             // dynamic key: `arr[$i]=x` — the key is an index value
             let k = self.value_num(key);
+            if self.vec_arrays.contains(var) {
+                self.emit_vec_index_write(var, &k, &v);
+                return;
+            }
             self.emit(&format!(
                 "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {k}, {v});"
             ));
@@ -12573,6 +12824,11 @@ impl Render {
             }
         };
         let n = items.len();
+        // redefine clears: free orphaned string elements for vecs (see
+        // emit_set_array)
+        if self.vec_arrays.contains(arr) && !self.int_arrays.contains(arr) {
+            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+        }
         self.emit(&format!("{id}_len = 0;"));
         if n == 0 {
             return;
@@ -12629,9 +12885,14 @@ impl Render {
         }
         let ev = self.value_c(elem);
         // P1: the loop appends into a fixed [ARR_CAP] array — refuse
-        // past the cap instead of overflowing.
-        let cap = self.array_cap(arr);
-        self.emit(&format!("if ({id}_len >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+        // past the cap instead of overflowing. Vec arrays grow instead.
+        if self.vec_arrays.contains(arr) {
+            let sfx = self.vec_grow_suffix(arr);
+            self.emit(&format!("while ({id}_len + 1 > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"));
+        } else {
+            let cap = self.array_cap(arr);
+            self.emit(&format!("if ({id}_len >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+        }
         self.emit(&format!("{id}[{id}_len++] = _sh_xstrdup((char*)({ev}));"));
         if cond.is_some() {
             self.depth -= 1;
@@ -12730,6 +12991,12 @@ impl Render {
         // empty literal (`arr=()`) clears a previously-populated array
         // (the item loop below re-sets _len per element; without this a
         // function-local array reused across calls keeps its old length).
+        // A string vec frees its orphaned elements first (fixed arrays
+        // leak them — pre-existing; a vec redefine in a loop would leak
+        // unboundedly and trip LSan).
+        if self.vec_arrays.contains(var) && !self.int_arrays.contains(var) {
+            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+        }
         self.emit(&format!("{id}_len = 0;"));
         if self.reduce_arrays.contains(var) {
             self.emit(&format!("{id}_max = 0;"));
@@ -12746,9 +13013,17 @@ impl Render {
                 {
                     // P1: the loop below writes {ai} + (argc-1) elements
                     // into a fixed [ARR_CAP] array — refuse upfront.
-                    self.emit(&format!(
-                        "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
-                    ));
+                    // Vec arrays grow instead (same stores either way).
+                    if self.vec_arrays.contains(var) {
+                        let sfx = self.vec_grow_suffix(var);
+                        self.emit(&format!(
+                            "while ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
+                        ));
+                    } else {
+                        self.emit(&format!(
+                            "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                        ));
+                    }
                     self.emit(&format!(
                         "for (int _av{ai} = 1; _av{ai} < (int)_sh_argc; _av{ai}++) {{ {id}[{ai} + (_av{ai} - 1)] = _sh_xstrdup(_sh_argv[_av{ai}] ? _sh_argv[_av{ai}] : \"\"); }}"
                     ));
@@ -12777,9 +13052,17 @@ impl Render {
                     self.emit(&format!("size_t _sn{t} = _sh_split({t}.p, &{t}_w, &{t}_wc);"));
                     // P1: the loop below writes {ai} + _sn elements into
                     // a fixed [ARR_CAP] array — refuse upfront.
-                    self.emit(&format!(
-                        "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
-                    ));
+                    // Vec arrays grow instead (same stores either way).
+                    if self.vec_arrays.contains(var) {
+                        let sfx = self.vec_grow_suffix(var);
+                        self.emit(&format!(
+                            "while ({ai} + _sn{t} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
+                        ));
+                    } else {
+                        self.emit(&format!(
+                            "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                        ));
+                    }
                     self.emit(&format!(
                         "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = _sh_xstrdup({t}_w[_sk{t}]);"
                     ));
@@ -12791,8 +13074,16 @@ impl Render {
             let v = self.value_c(it);
             // P1: {ai} is the running index into a fixed [ARR_CAP]
             // array — refuse past the cap instead of overflowing.
+            // Vec arrays grow instead (same stores either way).
+            if self.vec_arrays.contains(var) {
+                let sfx = self.vec_grow_suffix(var);
+                self.emit(&format!(
+                    "while ({ai} + 1 > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
+                ));
+            } else {
                 let cap = self.array_cap(var);
                 self.emit(&format!("if ({ai} >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
+            }
             if self.int_arrays.contains(var) {
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
@@ -12812,6 +13103,16 @@ impl Render {
         }
     }
 
+    /// Element-width suffix for a vec array's grow helper (int homing);
+    /// string-homed (char*) vecs share one `_sh_grow_str` helper.
+    fn vec_grow_suffix(&self, var: &str) -> &'static str {
+        if self.int_arrays.contains(var) {
+            return self.int_array_widths.get(var).copied().unwrap_or(Width::I64).suffix();
+        }
+        "str"
+    }
+
+
     /// `arr+=(x y)` — append elements
     fn emit_set_array_append(&mut self, var: &str, args: &[IrExpr]) {
         self.arrays.insert(var.to_string());
@@ -12823,10 +13124,15 @@ impl Render {
         // P1 OOM policy: the stores below write {id}[{id}_len ..] into a
         // fixed [ARR_CAP] array with no per-store guard — one upfront
         // check covers every arm (mpz/int/string) instead of silent
-        // overflow past the cap.
+        // overflow past the cap. Vec arrays grow instead.
         if !items.is_empty() {
+            if self.vec_arrays.contains(var) {
+                let sfx = self.vec_grow_suffix(var);
+                self.emit(&format!("while ({id}_len + {} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);", items.len()));
+            } else {
                 let cap = self.array_cap(var);
                 self.emit(&format!("if ({id}_len + {} > {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
+            }
         }
         for (i, it) in items.iter().enumerate() {
             // `arr[len + 0]` -> `arr[len]` (drop the +0 for the first)
@@ -14480,6 +14786,13 @@ impl Render {
                         }
                         _ => self.value_c(expr),
                     };
+                    if self.vec_arrays.contains(&t.var) {
+                        // growable vec: store at len (= append). The
+                        // helper hoists value+key (single evaluation,
+                        // null-safe) and extends len itself.
+                        self.emit_vec_index_write(&t.var, &format!("{id}_len"), &v);
+                        return;
+                    }
                     self.emit(&format!(
                         "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {id}_len, {v});"
                     ));
@@ -15621,6 +15934,8 @@ impl Render {
                     } else {
                         self.emit("_sh_rc = 0;");
                     }
+                    // function-local vecs die here (value already computed)
+                    self.emit_vec_local_frees();
                     self.emit("return;");
                 } else {
                     let v = e
@@ -16234,6 +16549,24 @@ impl Render {
         // the IR (setArray/arrayIndex/param/index-assign/DeclareArray)
         collect_array_names(&prog.stmts, &mut self.arrays);
         collect_assoc_names(&prog.stmts, &mut self.assoc_arrays);
+        // finalize the vec set now that IR-visible assocs are known:
+        // an assoc-discovered name keeps fixed storage (its _sh_assoc_*
+        // helpers address fixed k/v stores). Later runtime discoveries
+        // are a pre-existing decl-mismatch edge either way (documented
+        // in select_vec_arrays). Also register grow helpers per width.
+        self.vec_arrays.retain(|a| !self.assoc_arrays.contains(a));
+        let vecs: Vec<String> = self.vec_arrays.iter().cloned().collect();
+        for a in &vecs {
+            let sfx = self.vec_grow_suffix(a);
+            self.need_grow.insert(sfx.to_string());
+        }
+        // function-local owners were resolved in shir_to_c (pre
+        // fold_range_for — post-fold While-turned-Arrow bodies would
+        // wrongly globalize the loop-append shape); drop any the assoc
+        // discovery disqualifies so decl/append/free agree.
+        let assoc_now: BTreeSet<String> = self.assoc_arrays.iter().cloned().collect();
+        let vec_now: HashSet<String> = self.vec_arrays.iter().cloned().collect();
+        self.vec_local.retain(|a, _| !assoc_now.contains(a) && vec_now.contains(a));
         for a in &self.arrays {
             vars.remove(a);
             self.store.remove(a);
@@ -16259,16 +16592,36 @@ impl Render {
                 // integer, only consumed by sortedIntJoin — store as the
                 // narrowest width that fits all elements, no string
                 // round-trip.
-                let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
-                let cap = self.array_cap(a);
-                self.emit(&format!("static {} {id}[{cap}] = {{0}};", w.c_type()));
-                self.emit(&format!("static size_t {id}_len = 0;"));
-                if self.reduce_arrays.contains(a) {
-                    // maintained max/min/sum aggregates (Optimisation 1)
-                    self.emit(&format!("static long long {id}_max = 0;"));
-                    self.emit(&format!("static long long {id}_min = 0;"));
-                    self.emit(&format!("static long long {id}_sum = 0;"));
+                // Function-local vecs skip the file-scope decl entirely
+                // (declared at the owner's top, aggregates included).
+                if !self.vec_local.contains_key(a) {
+                    let w = self.int_array_widths.get(a).copied().unwrap_or(Width::I64);
+                    let cap = self.array_cap(a);
+                    if self.vec_arrays.contains(a) {
+                        // growable vec (list-profile verdict): pointer + len
+                        // + cap. Every {id}[k]/{id}_len use site renders
+                        // identically for fixed and vec storage.
+                        self.emit(&format!("static {} *{id} = NULL;", w.c_type()));
+                        self.emit(&format!("static size_t {id}_len = 0, {id}_cap = 0;"));
+                    } else {
+                        self.emit(&format!("static {} {id}[{cap}] = {{0}};", w.c_type()));
+                        self.emit(&format!("static size_t {id}_len = 0;"));
+                    }
+                    if self.reduce_arrays.contains(a) {
+                        // maintained max/min/sum aggregates (Optimisation 1)
+                        self.emit(&format!("static long long {id}_max = 0;"));
+                        self.emit(&format!("static long long {id}_min = 0;"));
+                        self.emit(&format!("static long long {id}_sum = 0;"));
+                    }
                 }
+            } else if self.vec_local.contains_key(a) {
+                // function-local vec: declared at the owner's top
+            } else if self.vec_arrays.contains(a) {
+                // growable string vec (list-profile verdict): heap
+                // pointer + len + cap; every {id}[k]/{id}_len use site
+                // renders identically for fixed and vec storage.
+                self.emit(&format!("static char **{id} = NULL;"));
+                self.emit(&format!("static size_t {id}_len = 0, {id}_cap = 0;"));
             } else {
                 // exact proven capacity (sizing from proofs) or ARR_CAP
                 let cap = self.array_cap(a);
@@ -16326,6 +16679,26 @@ impl Render {
             if !lt.escapes && self.top_vars.contains(name) && self.is_heap_store_var(name) {
                 self.emit(&format!("free({});", self.c_ident(name)));
             }
+        }
+        // growable vec arrays: free the heap buffer. Int elements are
+        // inline values (no per-element free); string elements are
+        // strdup-owned — free each, then the buffer (else LSan flags
+        // the orphaned elements once the buffer is gone). Function-local
+        // vecs are freed at their owner's exits instead — skipping them
+        // here avoids a double free.
+        let mut vecs: Vec<String> = self.vec_arrays.iter().cloned().collect();
+        vecs.sort();
+        for a in &vecs {
+            if self.vec_local.contains_key(a) {
+                continue;
+            }
+            let id = self.c_ident(a);
+            if !self.int_arrays.contains(a) {
+                self.emit(&format!(
+                    "for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"
+                ));
+            }
+            self.emit(&format!("free({id});"));
         }
         // GMP bigint slots: mpz_clear (not free) at the end of main so
         // the heap limbs don't leak (LSan/valgrind flag them). Both the
@@ -19738,6 +20111,32 @@ fn looks_like_arith(k: &str) -> bool {
 
 /// Whole-word identifier search in rendered C text (the fn-local hoist
 /// uses it to find vars a site/capture helper body references).
+/// C-identifier scan ignoring double-quoted spans: a `"name"` string
+/// literal (e.g. an `_sh_idx_init` array-name argument) is not a read.
+/// Used by the vec-local soundness guard below.
+fn code_contains_ident(text: &str, id: &str) -> bool {
+    let mut code = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else {
+            code.push(b as char);
+        }
+        i += 1;
+    }
+    text_contains_ident(&code, id)
+}
+
 fn text_contains_ident(text: &str, id: &str) -> bool {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -24001,6 +24400,304 @@ mod tests {
         assert_eq!(str_mentions("s", "s"), 1);
         assert_eq!(str_mentions("s=1", "s"), 1);
         assert_eq!(str_mentions("echo", "s"), 0);
+    }
+
+    /// Build the vec-test program: `xs = [1, 2]` then `body` (appends),
+    /// consumed by `sortedIntJoin` under `echo` (the int_arrays admission
+    /// shape: all-int elements, numeric-only consumption).
+    fn vec_test_prog(body: Vec<IrStmt>) -> IrProgram {
+        use crate::ir::StrStyle;
+        let word = |s: &str| IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted);
+        let mut stmts = vec![IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "xs".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    word("xs"),
+                    IrExpr::Array(vec![IrExpr::Int(1), IrExpr::Int(2)]),
+                ],
+            },
+            asm: None,
+        }];
+        stmts.extend(body);
+        stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                word("echo"),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "sortedIntJoin".to_string(),
+                    args: vec![word("xs")],
+                }]),
+            ],
+        }));
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn vec_append_xs() -> IrStmt {
+        use crate::ir::StrStyle;
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "xs".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArrayAppend".to_string(),
+                args: vec![
+                    IrExpr::Str("xs".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Int(3)]),
+                ],
+            },
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn vec_array_grows_past_cap() {
+        // unbounded append loop over an int-consumed array: pointer +
+        // len + cap decl, grow helper + call, heap free — and no fixed
+        // decl, no capacity exit for this array.
+        let body = vec![IrStmt::While {
+            // unranged counter bounds: trip unprovable → unbounded
+            cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "<".to_string(),
+                lhs: Box::new(ArithAst::Var("u".to_string())),
+                rhs: Box::new(ArithAst::Var("v".to_string())),
+            })),
+            body: vec![vec_append_xs()],
+        }];
+        let out = shir_to_c(&vec_test_prog(body));
+        // elements 1..3 narrow to u8: the vec is width-narrowed too
+        assert!(out.contains("uint8_t *xs = NULL"), "vec decl missing:\n{out}");
+        assert!(out.contains("xs_len = 0, xs_cap = 0"), "len/cap missing:\n{out}");
+        assert!(
+            out.contains("static void _sh_grow_u8(uint8_t **p, size_t *cap)"),
+            "grow helper missing:\n{out}"
+        );
+        assert!(
+            out.contains("_sh_grow_u8(&xs, &xs_cap)"),
+            "grow call missing:\n{out}"
+        );
+        assert!(out.contains("free(xs);"), "heap free missing:\n{out}");
+        assert!(!out.contains("xs[1024]"), "fixed decl survives:\n{out}");
+        assert!(
+            !out.contains("capacity exceeded: xs"),
+            "capacity exit survives:\n{out}"
+        );
+    }
+
+    #[test]
+    fn vec_array_bounded_stays_fixed() {
+        // straight-line appends (bound 4 ≤ cap): fixed storage (exact
+        // proven size, not the blanket 1024), no vec machinery at all.
+        let out = shir_to_c(&vec_test_prog(vec![vec_append_xs(), vec_append_xs()]));
+        assert!(out.contains("xs["), "fixed decl missing:\n{out}");
+        assert!(!out.contains("*xs = NULL"), "vec decl leaked:\n{out}");
+        assert!(!out.contains("_sh_grow_"), "grow helper leaked:\n{out}");
+        assert!(!out.contains("free(xs);"), "vec free leaked:\n{out}");
+    }
+
+    #[test]
+    fn vec_array_escaped_stays_fixed() {
+        // passed to an unknown callee: escape keeps fixed storage
+        // (unknown code may do anything), exactly sized.
+        use crate::ir::StrStyle;
+        let prog = vec_test_prog(vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("mystery".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Var("xs".to_string(), None)]),
+            ],
+        })]);
+        let out = shir_to_c(&prog);
+        assert!(out.contains("xs["), "fixed decl missing:\n{out}");
+        assert!(!out.contains("*xs = NULL"), "vec decl leaked:\n{out}");
+    }
+
+    /// Big-int-literal elements (force I64 width so decl shapes are
+    /// predictable) for the locality tests below.
+    fn big_ints() -> Vec<IrExpr> {
+        vec![IrExpr::Int(5_000_000_000), IrExpr::Int(6_000_000_000)]
+    }
+
+    fn set_array_xs(items: Vec<IrExpr>) -> IrStmt {
+        use crate::ir::StrStyle;
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "xs".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    IrExpr::Str("xs".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(items),
+                ],
+            },
+            asm: None,
+        }
+    }
+
+    fn append_xs_big() -> IrStmt {
+        use crate::ir::StrStyle;
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "xs".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArrayAppend".to_string(),
+                args: vec![
+                    IrExpr::Str("xs".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Int(7_000_000_000)]),
+                ],
+            },
+            asm: None,
+        }
+    }
+
+    fn echo_sorted_xs() -> IrStmt {
+        use crate::ir::StrStyle;
+        let word = |s: &str| IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted);
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                word("echo"),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "sortedIntJoin".to_string(),
+                    args: vec![word("xs")],
+                }]),
+            ],
+        })
+    }
+
+    fn unbounded_while(body: Vec<IrStmt>) -> IrStmt {
+        IrStmt::While {
+            cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "<".to_string(),
+                lhs: Box::new(ArithAst::Var("u".to_string())),
+                rhs: Box::new(ArithAst::Var("v".to_string())),
+            })),
+            body,
+        }
+    }
+
+    fn fn_prog(name: &str, body: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Function {
+                name: name.to_string(),
+                body,
+                named_blocks: vec![],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn vec_array_single_scope_is_fn_local() {
+        // every use inside one function, none risky: pointer + len +
+        // cap declare as plain (non-static) fn-top locals with a heap
+        // free — no file-scope global for this array.
+        let body = vec![
+            set_array_xs(big_ints()),
+            unbounded_while(vec![append_xs_big()]),
+            echo_sorted_xs(),
+        ];
+        let out = shir_to_c(&fn_prog("f", body));
+        assert!(
+            out.contains("\n    long long *xs = NULL;"),
+            "fn-local decl missing:\n{out}"
+        );
+        assert!(
+            !out.contains("static long long *xs"),
+            "file-scope decl survives:\n{out}"
+        );
+        assert!(out.contains("free(xs);"), "local free missing:\n{out}");
+    }
+
+    #[test]
+    fn vec_array_capture_use_stays_global() {
+        // a use inside a capture (file-scope helper territory) forces
+        // global storage: static decl, no fn-local shadow.
+        let body = vec![
+            set_array_xs(big_ints()),
+            unbounded_while(vec![append_xs_big()]),
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "out".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Capture {
+                    expr: Box::new(IrExpr::Call {
+                        func: "getVar".to_string(),
+                        args: vec![{
+                            use crate::ir::StrStyle;
+                            IrExpr::Str("xs".to_string(), StrStyle::DoubleQuoted)
+                        }],
+                    }),
+                    native: false,
+                },
+                asm: None,
+            },
+            echo_sorted_xs(),
+        ];
+        let out = shir_to_c(&fn_prog("f", body));
+        assert!(
+            out.contains("static long long *xs"),
+            "global decl missing:\n{out}"
+        );
+        assert!(
+            !out.contains("\n    long long *xs = NULL;"),
+            "fn-local shadow leaked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn vec_array_main_scope_stays_global() {
+        // top-level-only uses: file-scope static is correct (main runs
+        // once) and stays.
+        let prog = vec_test_prog(vec![unbounded_while(vec![vec_append_xs()])]);
+        let out = shir_to_c(&prog);
+        // small ints narrow; either way the decl is file-scope static
+        assert!(
+            out.contains("static ") && out.contains("*xs = NULL;"),
+            "global decl missing:\n{out}"
+        );
+        assert!(
+            !out.contains("\n    long long *xs = NULL;")
+                && !out.contains("\n    uint8_t *xs = NULL;"),
+            "fn-local shadow leaked:\n{out}"
+        );
     }
 
     #[test]

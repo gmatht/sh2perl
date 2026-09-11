@@ -46,6 +46,11 @@
 pub mod analysis;
 pub mod context;
 pub mod lifetime;
+/// List-container profiling (docs/LISTS.MD §4): census, frequency
+/// bounds, structure selection, use scopes. Consumed by the C backend
+/// (growable-vec selection + function-local vecs); nothing else
+/// consumes the verdicts yet.
+pub mod list_profile;
 pub mod loop_opt; // LICM-lite (estree-20260813-182436/201235): hoist loop-invariant runs into loop prologues
 pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
