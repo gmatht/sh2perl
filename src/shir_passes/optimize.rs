@@ -88,6 +88,29 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
                         return true;
                     }
                 }
+            } else if matches!(func.as_str(), "memLoad" | "memAdvance" | "memStore" | "memFree" | "arrayStore") {
+                // the mem seam + element stores resolve their first arg
+                // (a var name or handle) through the store at runtime —
+                // a literal name here is a READ of that variable (a
+                // memStore also writes through it, which likewise keeps
+                // the name alive)
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == name {
+                        return true;
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — a literal arg matching name is a READ
+                // (the Array elements carry the actual words)
+                if args.iter().any(|a| match a {
+                    IrExpr::Str(n, _) => n == name,
+                    IrExpr::Array(items) => items.iter().any(|it| matches!(it, IrExpr::Str(n, _) if n == name)),
+                    _ => false,
+                }) {
+                    return true;
+                }
             }
             // $name references inside ANY string argument are reads — the
             // `test` operands (`[ "$x" -eq 5 ]`) AND the slice start of
@@ -469,6 +492,29 @@ fn expr_reads_name(name: &str, e: &IrExpr) -> bool {
                     if n == name {
                         return true;
                     }
+                }
+            } else if matches!(func.as_str(), "memLoad" | "memAdvance" | "memStore" | "memFree" | "arrayStore") {
+                // the mem seam + element stores resolve their first arg
+                // (a var name or handle) through the store at runtime —
+                // a literal name here is a READ of that variable (a
+                // memStore also writes through it, which likewise keeps
+                // the name alive)
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == name {
+                        return true;
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — a literal arg matching name is a READ
+                // (the Array elements carry the actual words)
+                if args.iter().any(|a| match a {
+                    IrExpr::Str(n, _) => n == name,
+                    IrExpr::Array(items) => items.iter().any(|it| matches!(it, IrExpr::Str(n, _) if n == name)),
+                    _ => false,
+                }) {
+                    return true;
                 }
             } else if func == "test" {
                 for a in args {
@@ -1667,6 +1713,11 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 || func == "addrVar"
                 || func == "derefGet"
                 || func == "derefSet"
+                || func == "memLoad"
+                || func == "memAdvance"
+                || func == "memStore"
+                || func == "memFree"
+                || func == "arrayStore"
             {
                 // pointer indirection (&x / *x): the named slot is BOTH
                 // read and written through the reference
@@ -1676,6 +1727,24 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 if func == "derefSet" {
                     if let Some(IrExpr::Str(n, _)) = args.get(1) {
                         out.push(n.clone());
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — every Str arg, including nested Array
+                // elements, is a potential read
+                for a in args {
+                    match a {
+                        IrExpr::Str(n, _) => out.push(n.clone()),
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(n, _) = it {
+                                    out.push(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             } else if matches!(

@@ -43096,6 +43096,14 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
                             mark_word(n, written);
                         }
                     }
+                    // getLine("b") writes b (the c frontend's getline
+                    // bridge) — without this, a var only ever written
+                    // through getLine folds to "" at every read
+                    "getLine" | "getLineD" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, written);
+                        }
+                    }
                     "assign" => {
                         if let Some(IrExpr::Str(n, _)) = args.first() {
                             mark_word(n, written);
