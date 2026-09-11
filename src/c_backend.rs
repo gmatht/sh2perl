@@ -221,6 +221,13 @@ pub struct Render {
     /// forward declarations for the hoisted functions (emitted before
     /// their definitions so call order never matters)
     fn_fwd_decls: Vec<String>,
+    /// per-function PRIVATE vars (fn name → vars mentioned nowhere
+    /// outside that fn's own direct subtree): safe to declare as fn
+    /// locals instead of file-scope globals. Computed in program()
+    /// once function bodies are collected; consulted by emit_function
+    /// when deciding local vs file scope (the site/capture-helper
+    /// backstop still applies afterwards).
+    fn_private: HashMap<String, HashSet<String>>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -5442,7 +5449,7 @@ fn param_copy_alias(
                     }
                     IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
                         InterpPart::Expr(xe) => expr_reads(xe, x, digit),
-                        _ => false,
+                        InterpPart::Lit(s) => str_mentions(s, x) > 0 || text_contains_ident(s, x),
                     }),
                     IrExpr::Arith(a) => arith_reads(a, x, digit),
                     IrExpr::Object(props) => props.iter().any(|(_, v)| expr_reads(v, x, digit)),
@@ -5654,7 +5661,7 @@ fn param_copy_alias(
                     IrExpr::BinOp { lhs, rhs, .. } => expr_hit(lhs, x) || expr_hit(rhs, x),
                     IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
                         InterpPart::Expr(xe) => expr_hit(xe, x),
-                        _ => false,
+                        InterpPart::Lit(s) => str_mentions(s, x) > 0 || text_contains_ident(s, x),
                     }),
                     IrExpr::Arith(a) => arith_hit(a, x),
                     IrExpr::Object(props) => props.iter().any(|(_, v)| expr_hit(v, x)),
@@ -5933,6 +5940,670 @@ fn param_copy_alias(
         (alias, skip2)
     }
 
+    /// Per-function private vars (t86 `_i_sqrt_n[v]` → fn locals, not
+    /// globals): a var mentioned NOWHERE outside fn F's own direct
+    /// subtree — not top-level, not other functions/subs, not nested
+    /// defs inside F (a nested callee observes the GLOBAL at call time,
+    /// so sharing keeps it global). Bash dynamic scope makes any outside
+    /// mention force file scope (post-call/top-level reads see the
+    /// global); privacy is what makes a fn-local sound. The mention
+    /// scan is deliberately over-approximate (every `$x`/`${x}` ref,
+    /// bare idents in opaque strings, all scopes): a missed mention
+    /// would wrongly localize (unsound), an extra one only keeps the
+    /// global (status quo). No wildcards on the Stmt/Expr/Arith matches
+    /// — a future variant breaks compilation here, forcing an explicit
+    /// (fail-closed) decision. Opaque nodes (Ext, Shaderize) and any
+    /// program-level Ext bail the whole map.
+    fn fn_private_vars(
+        stmts: &[IrStmt],
+        subs: &[crate::ir::IrSub],
+        fns: &[(String, Vec<IrStmt>)],
+        vt: &HashMap<String, IrType>,
+        no_local: &HashSet<String>,
+    ) -> HashMap<String, HashSet<String>> {
+        fn str_hits(s: &str, x: &str) -> bool {
+            // `$x`/`${x}` refs plus bare idents in opaque texts
+            // (arith/cstyleFor/test strings evaluate bare names).
+            str_mentions(s, x) > 0 || text_contains_ident(s, x)
+        }
+        fn arith_hits(a: &ArithAst, x: &str) -> bool {
+            match a {
+                ArithAst::Num(_) => false,
+                ArithAst::Var(v) | ArithAst::Ident(v) => v == x,
+                ArithAst::Index { var, key } => var == x || arith_hits(key, x),
+                ArithAst::Bin { lhs, rhs, .. } => arith_hits(lhs, x) || arith_hits(rhs, x),
+                ArithAst::Un { arg, .. } => arith_hits(arg, x),
+                ArithAst::Cond { test, then, else_, .. } => {
+                    arith_hits(test, x) || arith_hits(then, x) || arith_hits(else_, x)
+                }
+                ArithAst::Cast { arg, .. } => arith_hits(arg, x),
+                ArithAst::Assign { var, rhs, .. } => var == x || arith_hits(rhs, x),
+                ArithAst::IncDec { var, .. } => var == x,
+                ArithAst::Sizeof(_) => false,
+            }
+        }
+        fn expr_hits(e: &IrExpr, x: &str) -> bool {
+            match e {
+                IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Range { .. } => false,
+                IrExpr::Str(s, _) => str_hits(s, x),
+                IrExpr::Var(v, _) | IrExpr::Ident(v) => v == x,
+                IrExpr::Index { var, key } => var == x || expr_hits(key, x),
+                IrExpr::BinOp { lhs, rhs, .. } => expr_hits(lhs, x) || expr_hits(rhs, x),
+                IrExpr::Call { func, args } => {
+                    func == x || args.iter().any(|a| expr_hits(a, x))
+                }
+                IrExpr::MethodCall { obj, method, args } => {
+                    text_contains_ident(method, x)
+                        || expr_hits(obj, x)
+                        || args.iter().any(|a| expr_hits(a, x))
+                }
+                IrExpr::Ternary { cond, then, else_, .. } => {
+                    expr_hits(cond, x) || expr_hits(then, x) || expr_hits(else_, x)
+                }
+                IrExpr::DefinedOr { expr, default, .. } => {
+                    expr_hits(expr, x) || expr_hits(default, x)
+                }
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    InterpPart::Expr(xe) => expr_hits(xe, x),
+                    InterpPart::Lit(s) => str_hits(s, x),
+                }),
+                IrExpr::Capture { expr, .. } => expr_hits(expr, x),
+                IrExpr::Regex { pattern, flags } => {
+                    // match patterns are literal text, never var reads.
+                    let _ = flags;
+                    let _ = pattern;
+                    false
+                }
+                IrExpr::RawExpr(s) => text_contains_ident(s, x),
+                IrExpr::Arrow(b) => stmts_hit(b, x),
+                IrExpr::Array(items) => items.iter().any(|i| expr_hits(i, x)),
+                IrExpr::ArrayComp { var, iter, elem, cond, .. } => {
+                    // the comp var shadows inside elem/cond (each item
+                    // binds it) — mentions there observe the binding.
+                    expr_hits(iter, x)
+                        || ((var != x)
+                            && (expr_hits(elem, x)
+                                || cond.as_ref().is_some_and(|c| expr_hits(c, x))))
+                }
+                IrExpr::Lambda { params, body } => {
+                    // closure params shadow like nested scopes.
+                    if params.iter().any(|p| p == x) {
+                        return false;
+                    }
+                    stmts_hit(body, x)
+                }
+                IrExpr::Arith(a) => arith_hits(a, x),
+                IrExpr::Json(v) => {
+                    // data literal, not code — but scan its text anyway
+                    // (fail-closed is cheaper than auditing the shapes).
+                    text_contains_ident(&format!("{v:?}"), x)
+                }
+                IrExpr::Object(props) => props.iter().any(|(k, v)| {
+                    text_contains_ident(k, x) || expr_hits(v, x)
+                }),
+                IrExpr::Splice(inner) => expr_hits(inner, x),
+                IrExpr::Ext(_) => true,
+            }
+        }
+        fn stmts_hit(stmts: &[IrStmt], x: &str) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, expr, .. } => {
+                        for t in targets {
+                            if t.var == x
+                                || t.var.split('[').next() == Some(x)
+                            {
+                                return true;
+                            }
+                            for ix in &t.indices {
+                                if expr_hits(ix, x) {
+                                    return true;
+                                }
+                            }
+                        }
+                        if expr_hits(expr, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Declare { vars, init, .. } => {
+                        // a top-level declare names the var (sharing
+                        // signal); inits may read it.
+                        if vars.iter().any(|d| d.name == x) {
+                            return true;
+                        }
+                        if init.as_ref().is_some_and(|e| expr_hits(e, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::DeclareArray { var, elements, .. } => {
+                        if var == x {
+                            return true;
+                        }
+                        if elements.iter().any(|e| expr_hits(e, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Expr(e) => {
+                        if expr_hits(e, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Output { value, .. } => {
+                        if expr_hits(value, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::WriteFile { path, content, .. } => {
+                        if expr_hits(path, x) || expr_hits(content, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Return(e) | IrStmt::Exit(e) => {
+                        if e.as_ref().is_some_and(|v| expr_hits(v, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        if expr_hits(cond, x)
+                            || stmts_hit(then, x)
+                            || stmts_hit(else_, x)
+                            || elsifs
+                                .iter()
+                                .any(|(c, b)| expr_hits(c, x) || stmts_hit(b, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                        if expr_hits(cond, x) || stmts_hit(body, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { var, iter, body } => {
+                        // `for x in …` writes the (global) counter.
+                        if var == x || expr_hits(iter, x) || stmts_hit(body, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { init, cond, step, body } => {
+                        if stmts_hit(init, x)
+                            || expr_hits(cond, x)
+                            || stmts_hit(step, x)
+                            || stmts_hit(body, x)
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        if stmts_hit(body, x)
+                            || stmts_hit(else_body, x)
+                            || stmts_hit(finally_body, x)
+                            || excepts.iter().any(|e| {
+                                e.match_expr.as_ref().is_some_and(|m| expr_hits(m, x))
+                                    || stmts_hit(&e.body, x)
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Case { discriminant, clauses, .. } => {
+                        if expr_hits(discriminant, x)
+                            || clauses.iter().any(|c| stmts_hit(&c.body, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        if stmts_hit(body, x)
+                            || named_blocks.iter().any(|(_, b)| stmts_hit(b, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        if stages.iter().any(|st| stmts_hit(st, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Select { clauses, .. } => {
+                        if clauses.iter().any(|c| stmts_hit(&c.body, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Redirect { inner, redirects, .. } => {
+                        if stmts_hit(inner, x) {
+                            return true;
+                        }
+                        if redirects.iter().any(|r| expr_hits(&r.target, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                        if stmts_hit(b, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Exec { cmd, args, redirects, .. } => {
+                        if expr_hits(cmd, x)
+                            || args.iter().any(|a| expr_hits(a, x))
+                            || redirects.iter().any(|r| expr_hits(r, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                        if expr_hits(expr, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::SetChildError(e) => {
+                        if expr_hits(e, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Continue | IrStmt::Break => {}
+                    IrStmt::Goto(l) => {
+                        if text_contains_ident(l, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Label(l) => {
+                        if text_contains_ident(l, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Require(p) => {
+                        if text_contains_ident(p, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::RawText(t) => {
+                        if str_hits(t, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Asm { template, outputs, inputs, clobbers, .. } => {
+                        if text_contains_ident(template, x)
+                            || outputs.iter().any(|(o, _)| text_contains_ident(o, x))
+                            || inputs.iter().any(|(i, _)| text_contains_ident(i, x))
+                            || clobbers.iter().any(|c| text_contains_ident(c, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Ext(_) | IrStmt::Shaderize { .. } => return true,
+                }
+            }
+            false
+        }
+        // mentions strictly inside nested defs of `body` (a nested
+        // callee observes the global at call time).
+        fn nested_hits(stmts: &[IrStmt], x: &str) -> bool {
+            // a nested scope mentioning x observes the GLOBAL at call
+            // time — including defs hidden inside expression closures
+            // (Arrow/Lambda bodies via expr_fn_hits below).
+            fn expr_fn_hits(e: &IrExpr, x: &str) -> bool {
+                match e {
+                    IrExpr::Arrow(b) => nested_hits(b, x),
+                    IrExpr::Lambda { body, .. } => nested_hits(body, x),
+                    IrExpr::Call { args, .. } => args.iter().any(|a| expr_fn_hits(a, x)),
+                    IrExpr::MethodCall { obj, args, .. } => {
+                        expr_fn_hits(obj, x) || args.iter().any(|a| expr_fn_hits(a, x))
+                    }
+                    IrExpr::Ternary { cond, then, else_, .. } => {
+                        expr_fn_hits(cond, x)
+                            || expr_fn_hits(then, x)
+                            || expr_fn_hits(else_, x)
+                    }
+                    IrExpr::DefinedOr { expr, default, .. } => {
+                        expr_fn_hits(expr, x) || expr_fn_hits(default, x)
+                    }
+                    IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                        InterpPart::Expr(xe) => expr_fn_hits(xe, x),
+                        InterpPart::Lit(_) => false,
+                    }),
+                    IrExpr::Capture { expr, .. } => expr_fn_hits(expr, x),
+                    IrExpr::Array(items) => items.iter().any(|i| expr_fn_hits(i, x)),
+                    IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                        expr_fn_hits(iter, x)
+                            || expr_fn_hits(elem, x)
+                            || cond.as_ref().is_some_and(|c| expr_fn_hits(c, x))
+                    }
+                    IrExpr::BinOp { lhs, rhs, .. } => {
+                        expr_fn_hits(lhs, x) || expr_fn_hits(rhs, x)
+                    }
+                    IrExpr::Object(props) => props.iter().any(|(_, v)| expr_fn_hits(v, x)),
+                    IrExpr::Splice(inner) => expr_fn_hits(inner, x),
+                    IrExpr::Index { key, .. } => expr_fn_hits(key, x),
+                    IrExpr::Ext(_) => true,
+                    _ => false,
+                }
+            }
+            for s in stmts {
+                match s {
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        if stmts_hit(body, x)
+                            || named_blocks.iter().any(|(_, b)| stmts_hit(b, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        if nested_hits(then, x)
+                            || nested_hits(else_, x)
+                            || elsifs.iter().any(|(_, b)| nested_hits(b, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                        if nested_hits(body, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { body, .. } => {
+                        if nested_hits(body, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        if nested_hits(init, x) || nested_hits(step, x) || nested_hits(body, x)
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        if nested_hits(body, x)
+                            || nested_hits(else_body, x)
+                            || nested_hits(finally_body, x)
+                            || excepts.iter().any(|e| nested_hits(&e.body, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        if clauses.iter().any(|c| nested_hits(&c.body, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        if stages.iter().any(|st| nested_hits(st, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Select { clauses, .. } => {
+                        if clauses.iter().any(|c| nested_hits(&c.body, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Redirect { inner, redirects, .. } => {
+                        if nested_hits(inner, x) {
+                            return true;
+                        }
+                        for r in redirects {
+                            if expr_fn_hits(&r.target, x) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                        if nested_hits(b, x) {
+                            return true;
+                        }
+                    }
+                    // expression positions: a nested def can hide inside
+                    // an Arrow/Lambda body here (e.g. `x = $(def g …)`).
+                    IrStmt::Assign { expr, .. } => {
+                        if expr_fn_hits(expr, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Declare { init, .. } => {
+                        if init.as_ref().is_some_and(|e| expr_fn_hits(e, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::DeclareArray { elements, .. } => {
+                        if elements.iter().any(|e| expr_fn_hits(e, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Expr(e)
+                    | IrStmt::Output { value: e, .. }
+                    | IrStmt::SetChildError(e) => {
+                        if expr_fn_hits(e, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::WriteFile { path, content, .. } => {
+                        if expr_fn_hits(path, x) || expr_fn_hits(content, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Return(e) | IrStmt::Exit(e) => {
+                        if e.as_ref().is_some_and(|v| expr_fn_hits(v, x)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Exec { cmd, args, redirects, .. } => {
+                        if expr_fn_hits(cmd, x)
+                            || args.iter().any(|a| expr_fn_hits(a, x))
+                            || redirects.iter().any(|r| expr_fn_hits(r, x))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                        if expr_fn_hits(expr, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Case { discriminant, .. } => {
+                        if expr_fn_hits(discriminant, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { iter, .. } => {
+                        if expr_fn_hits(iter, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { cond, .. } => {
+                        if expr_fn_hits(cond, x) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Try { excepts, .. } => {
+                        if excepts.iter().any(|e| {
+                            e.match_expr.as_ref().is_some_and(|m| expr_fn_hits(m, x))
+                        }) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Select { clauses, .. } => {
+                        if clauses.iter().any(|c| {
+                            c.ch.as_ref().is_some_and(|e| expr_fn_hits(e, x))
+                                || c.value.as_ref().is_some_and(|e| expr_fn_hits(e, x))
+                        }) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        // candidates: every name ASSIGNED in the body (only assigned
+        // vars need declarations; reads-only names keep using the
+        // global). Nested defs excluded — separate scope (their mentions
+        // still disqualify via nested_hits below).
+        fn body_names(stmts: &[IrStmt], out: &mut HashSet<String>) {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, .. } => {
+                        for t in targets {
+                            out.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                        }
+                    }
+                    IrStmt::Declare { vars, .. } => {
+                        for d in vars {
+                            out.insert(d.name.clone());
+                        }
+                    }
+                    IrStmt::DeclareArray { var, .. } => {
+                        out.insert(var.clone());
+                    }
+                    IrStmt::For { var, .. } => {
+                        out.insert(var.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        // any program-level Ext bails the whole map (opaque payloads
+        // could hide mentions anywhere).
+        fn has_ext(stmts: &[IrStmt]) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Ext(_) => return true,
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        if has_ext(then)
+                            || has_ext(else_)
+                            || elsifs.iter().any(|(_, b)| has_ext(b))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                        if has_ext(body) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { body, .. } => {
+                        if has_ext(body) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        if has_ext(init) || has_ext(step) || has_ext(body) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        if has_ext(body)
+                            || has_ext(else_body)
+                            || has_ext(finally_body)
+                            || excepts.iter().any(|e| has_ext(&e.body))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        if clauses.iter().any(|c| has_ext(&c.body)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        if has_ext(body)
+                            || named_blocks.iter().any(|(_, b)| has_ext(b))
+                        {
+                            return true;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        if stages.iter().any(|st| has_ext(st)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Select { clauses, .. } => {
+                        if clauses.iter().any(|c| has_ext(&c.body)) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => {
+                        if has_ext(inner) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                        if has_ext(b) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        if has_ext(stmts) || fns.iter().any(|(_, b)| has_ext(b)) {
+            return out;
+        }
+        for (fname, fbody) in fns {
+            // candidates: every name bound or read in the body (nested
+            // defs excluded — their scope is separate, but their
+            // mentions still disqualify via nested_hits below).
+            let mut cands = HashSet::new();
+            body_names(fbody, &mut cands);
+            let mut privs = HashSet::new();
+            for x in &cands {
+                // positional/special names are scope-fluid — never private.
+                if x.is_empty() || x.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                // mentioned anywhere outside F's own direct subtree?
+                let mut outside = false;
+                for st in stmts {
+                    if let IrStmt::Function { name, body, named_blocks } = st {
+                        if name == fname {
+                            if nested_hits(body, x)
+                                || named_blocks.iter().any(|(_, b)| nested_hits(b, x))
+                            {
+                                outside = true;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    if stmts_hit(std::slice::from_ref(st), x) {
+                        outside = true;
+                        break;
+                    }
+                }
+                if !outside {
+                    for sub in subs {
+                        if stmts_hit(&sub.body, x) {
+                            outside = true;
+                            break;
+                        }
+                    }
+                }
+                if !outside {
+                    for (n, b) in fns {
+                        if n != fname && stmts_hit(b, x) {
+                            outside = true;
+                            break;
+                        }
+                    }
+                }
+                // lifecycle gate: only plain Int scalars localize (no
+                // init/free/clear machinery may assume file scope — mpz_t
+                // needs main-top mpz_init, heap strings need scope-exit
+                // frees, consts have their own storage).
+                if !outside
+                    && vt.get(x) == Some(&IrType::Int)
+                    && !no_local.contains(x)
+                {
+                    privs.insert(x.clone());
+                }
+            }
+            if !privs.is_empty() {
+                out.insert(fname.clone(), privs);
+            }
+        }
+        out
+    }
+
     fn emit_function(&mut self, name: &str, body: &[IrStmt], main_vars: &BTreeSet<String>) {
         let fname = self.c_ident(name);
         // param-copy aliasing (t86 `n = (_p1)` → the C parameter is
@@ -6176,7 +6847,24 @@ fn param_copy_alias(
         self.nonnull_var = saved_nonnull_var;
         for n in &fvars {
             let id = self.c_ident(n);
-            if body_out.iter().any(|l| text_contains_ident(l, &id)) {
+            // file scope only when SHARED: a file-scope helper reads it
+            // (helpers can't see fn locals), or another scope mentions
+            // it (bash dynamic scope: post-call/top-level reads observe
+            // the global). A var mentioned only by its own body stays a
+            // fn local. (Checking the fn's own body text here — as before
+            // — would globalize everything, since every assigned local
+            // is textually mentioned where it is written.)
+            let helper_refd = self.site_bodies[site_mark..]
+                .iter()
+                .any(|b| text_contains_ident(b, &id))
+                || self.cap_bodies[cap_mark..]
+                    .iter()
+                    .any(|b| text_contains_ident(b, &id));
+            let private = self
+                .fn_private
+                .get(name)
+                .is_some_and(|s| s.contains(n));
+            if helper_refd || !private {
                 self.site_file_vars.insert(n.clone());
             }
         }
@@ -17215,6 +17903,23 @@ fn param_copy_alias(
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        // per-function private vars (mentioned nowhere outside the fn's
+        // own direct subtree): safe for fn-local declarations. Needs the
+        // collected bodies; consulted by emit_function (site/capture
+        // helpers referencing one still force it file-scope afterwards).
+        // bigint vars need main-top mpz_init (emitted, not IR-visible)
+        // — nothing else here has file-scope lifecycle (plain Ints need
+        // no init/free; heap/const/buffer shapes are Str-typed and the
+        // Int gate above already excludes them).
+        let no_local: HashSet<String> =
+            self.bigint_vars.iter().cloned().collect();
+        self.fn_private = Self::fn_private_vars(
+            &prog.stmts,
+            &prog.subs,
+            &self.fn_defs,
+            &self.var_types,
+            &no_local,
+        );
         // never-NULL return proofs (P1 follow-up): which generated
         // functions provably never return NULL — consulted when a fresh
         // call temp is created (a pre-pass because render order is
@@ -26377,6 +27082,94 @@ mod tests {
         let (alias, _) = Render::param_copy_alias(&vt, &body, 1);
         assert!(alias.is_empty(), "pre-copy read aliased: {alias:?}");
         let _ = HashSet::<usize>::new();
+    }
+
+    #[test]
+    fn fn_private_vars_localizes_fn_only_temps() {
+        // t86 `_i_sqrt_n[v]`: mentioned nowhere outside the fn's own
+        // direct subtree → private → fn-local, not file-global. Shared
+        // vars (top-level use, cross-fn use, nested-callee use) stay out.
+        use std::collections::{HashMap, HashSet};
+        use crate::ir::{ArithAst, IrType};
+        fn assign(var: &str, e: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: e,
+                asm: None,
+            }
+        }
+        fn def(name: &str, body: Vec<IrStmt>) -> IrStmt {
+            IrStmt::Function {
+                name: name.to_string(),
+                body,
+                named_blocks: vec![],
+            }
+        }
+        // fn f: _t assigned + read only inside; shared read at top.
+        let body = vec![
+            assign("_t", IrExpr::Int(3)),
+            assign(
+                "shared",
+                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string()))),
+            ),
+        ];
+        let top = vec![
+            def("f", body),
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Var("shared".to_string(), None)]),
+                ],
+            }),
+        ];
+        let mut vt = HashMap::new();
+        vt.insert("_t".to_string(), IrType::Int);
+        vt.insert("shared".to_string(), IrType::Int);
+        let fns = vec![("f".to_string(), vec![
+            assign("_t", IrExpr::Int(3)),
+            assign(
+                "shared",
+                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string()))),
+            ),
+        ])];
+        let m = Render::fn_private_vars(&top, &[], &fns, &vt, &HashSet::new());
+        let f = m.get("f").cloned().unwrap_or_default();
+        assert!(f.contains("_t"), "fn-only temp not private: {f:?}");
+        assert!(!f.contains("shared"), "top-level-read var privatized: {f:?}");
+        // nested callee mentioning it disqualifies (observes the global).
+        let nested = vec![IrStmt::Function {
+            name: "g".to_string(),
+            body: vec![IrStmt::Expr(IrExpr::Var("_t".to_string(), None))],
+            named_blocks: vec![],
+        }];
+        let top2 = vec![def("f", vec![
+            assign("_t", IrExpr::Int(3)),
+            nested[0].clone(),
+        ])];
+        let fns2 = vec![("f".to_string(), vec![
+            assign("_t", IrExpr::Int(3)),
+            nested[0].clone(),
+        ])];
+        let m2 = Render::fn_private_vars(&top2, &[], &fns2, &vt, &HashSet::new());
+        assert!(
+            !m2.get("f").is_some_and(|s| s.contains("_t")),
+            "nested-callee temp privatized: {:?}",
+            m2.get("f")
+        );
+        // non-Int vars never privatize (lifecycle lives at file scope).
+        let mut vt3 = HashMap::new();
+        vt3.insert("_t".to_string(), IrType::Str);
+        let m3 = Render::fn_private_vars(&top, &[], &fns, &vt3, &HashSet::new());
+        assert!(
+            !m3.get("f").is_some_and(|s| s.contains("_t")),
+            "Str temp privatized: {:?}",
+            m3.get("f")
+        );
     }
 
     #[test]
