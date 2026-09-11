@@ -2660,6 +2660,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // helper, no fn-call status), the stores are unobservable dead
     // code — strip them and the definition.
     r.strip_dead_rc();
+    // fold `T v = 0; ... v = K;` (K constant) into `T v = K;` — the
+    // zero-init is dead when the first store is an unconditional
+    // constant on the straight-line path (runs after strip_dead_rc so
+    // dead `$?` stores are gone before the between-scan reads lines).
+    r.fold_init_store();
     // the discarded-value echo collapsed to `(printf(...));` /
     // `(fputs(...));` — drop OUR comma-expr wrapper parens (safe: these
     // prefixes are never a cast/declaration at statement position).
@@ -4535,6 +4540,75 @@ impl Render {
             }
         }
         self.out = out;
+    }
+
+    /// Fold a zero/bare declaration into the first constant store:
+    /// `long long i = 0; ... i = 0;` → `long long i = 0;` (store dropped),
+    /// `uint8_t x = 0; ... x = 1;` → `uint8_t x = 1;` (init updated).
+    /// Sound only when (a) the stored RHS is a constant (no ordering risk),
+    /// (b) no line between mentions the var (no read could see the old
+    /// init, no earlier store), (c) decl and store share indent with no
+    /// braces between (straight-line, unconditional — a conditional store
+    /// must keep the zero init), and (d) the decl is not `static` (a
+    /// static init runs once, a store runs per call — folding those
+    /// together changes repeated-call behavior) nor const/array/pointer.
+    fn fold_init_store(&mut self) {
+        let mut drop_lines: Vec<usize> = Vec::new();
+        let mut reinit: Vec<(usize, String)> = Vec::new();
+        let mut i = 0;
+        while i < self.out.len() {
+            let parsed = parse_zero_decl(&self.out[i]);
+            let Some((indent, ty, name, has_init)) = parsed else {
+                i += 1;
+                continue;
+            };
+            // find the first simple `name = RHS;` store at the same indent
+            let mut j = i + 1;
+            let mut hit: Option<(usize, String)> = None;
+            let mut blocked = false;
+            while j < self.out.len() {
+                let line = &self.out[j];
+                let t = line.trim_start();
+                let li = line.len() - t.len();
+                if li == indent {
+                    if let Some(rhs) = parse_simple_store(t, &name) {
+                        if is_const_rhs(&rhs) {
+                            hit = Some((j, rhs));
+                            break;
+                        }
+                    }
+                }
+                // any mention of the var (read or other store) refuses;
+                // any brace refuses (block structure changed)
+                if has_ident(line, &name) || line.contains('{') || line.contains('}')
+                {
+                    blocked = true;
+                    break;
+                }
+                j += 1;
+            }
+            if blocked {
+                i += 1;
+                continue;
+            }
+            let Some((sj, rhs)) = hit else {
+                i += 1;
+                continue;
+            };
+            // fold: decl carries the constant, store line dies (unless
+            // it repeats the existing init — then just drop the store)
+            if !(has_init && rhs == "0") {
+                reinit.push((i, format!("{}{} {} = {};", " ".repeat(indent), ty, name, rhs)));
+            }
+            drop_lines.push(sj);
+            i += 1;
+        }
+        for (idx, line) in reinit {
+            self.out[idx] = line;
+        }
+        for sj in drop_lines.iter().rev() {
+            self.out.remove(*sj);
+        }
     }
 
     /// Drop `#include` lines nothing in the final program uses. stdio.h
@@ -16301,7 +16375,10 @@ fn param_copy_alias(
                             self.emit("}");
                             // bash: a while whose condition failed BEFORE
                             // the first body run exits 0 (the last cond
-                            // rc must not leak into $?)
+                            // rc must not leak into $?). The flag is LOAD-
+                            // BEARING here: the site tail runs _sh_system_rc()
+                            // per evaluation, so a pre-set _sh_rc = 0 would be
+                            // overwritten by the failing cond itself.
                             self.emit("if (!_went) _sh_rc = 0;");
                             self.emit("}");
                         }
@@ -17194,19 +17271,33 @@ fn param_copy_alias(
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
                 let c = self.cond_site(cond);
-                self.emit("{ int _went = 0;");
+                // bash: a while whose condition failed BEFORE the first
+                // body run exits 0 — pre-set _sh_rc, but ONLY when the cond
+                // is call-free (no _sh_site_/_cap_/helper call can stash a
+                // failing rc into _sh_rc; a site tail runs _sh_system_rc()
+                // per evaluation and would overwrite the pre-set). With a
+                // call in the cond, keep the load-bearing _went flag.
+                // strip_dead_rc removes the pre-set when nothing reads $?.
+                let cond_pure = !has_call(&c);
+                if cond_pure {
+                    self.emit("_sh_rc = 0;");
+                } else {
+                    self.emit("{ int _went = 0;");
+                }
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
-                self.emit("_went = 1;");
+                if !cond_pure {
+                    self.emit("_went = 1;");
+                }
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
                 self.emit("}");
-                // bash: a while whose condition failed BEFORE the first
-                // body run exits 0 (the cond rc must not leak into $?)
-                self.emit("if (!_went) { _sh_rc = 0; }");
-                self.emit("}");
+                if !cond_pure {
+                    self.emit("if (!_went) { _sh_rc = 0; }");
+                    self.emit("}");
+                }
             }
             IrStmt::DoWhile { body, cond, until } => {
                 // P1 follow-up: see While.
@@ -20299,6 +20390,125 @@ fn strip_rc_line(line: &str) -> Option<String> {
         i += 1;
     }
     Some(out)
+}
+
+/// Parse `T name;` / `T name = 0;` scalar declarations for fold_init_store.
+/// Returns (indent_width, type_text, name, has_zero_init). Only plain
+/// integer scalar types; rejects const/static/pointers/arrays/structs
+/// (anything with `*[](),` or an initializer other than `= 0`).
+fn parse_zero_decl(line: &str) -> Option<(usize, String, String, bool)> {
+    let t = line.trim_start();
+    let indent = line.len() - t.len();
+    if t.starts_with("static ") || t.starts_with("const ") || t.starts_with("volatile ") {
+        return None;
+    }
+    if t.contains(['*', '[', ']', '(', ')', ',', '{', '}']) {
+        return None;
+    }
+    let body = t.strip_suffix(';')?;
+    let (ty_part, init_part) = match body.split_once('=') {
+        Some((ty, init)) => (ty.trim_end(), Some(init.trim())),
+        None => (body, None),
+    };
+    if let Some(init) = init_part {
+        if init != "0" {
+            return None;
+        }
+    }
+    let mut words: Vec<&str> = ty_part.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let name = words.pop().unwrap().to_string();
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let ty = words.join(" ");
+    if !matches!(
+        ty.as_str(),
+        "char" | "short" | "int" | "long" | "long long" | "size_t" | "ssize_t"
+            | "unsigned" | "unsigned char" | "unsigned short" | "unsigned int"
+            | "unsigned long" | "unsigned long long" | "uint8_t" | "uint16_t"
+            | "uint32_t" | "uint64_t" | "int8_t" | "int16_t" | "int32_t"
+            | "int64_t" | "double" | "float"
+    ) {
+        return None;
+    }
+    Some((indent, ty, name, init_part.is_some()))
+}
+
+/// Parse a simple `name = RHS;` store line (already trimmed). Returns RHS.
+fn parse_simple_store(trimmed: &str, name: &str) -> Option<String> {
+    // require `name = rhs` spacing (the renderer's store shape)
+    if !trimmed.starts_with(name) || !trimmed[name.len()..].starts_with(" = ") {
+        return None;
+    }
+    let rhs = trimmed[name.len() + 3..].strip_suffix(';')?;
+    if rhs.is_empty() {
+        return None;
+    }
+    Some(rhs.to_string())
+}
+
+/// Is an RHS a compile-time constant safe to hoist into a declaration?
+/// Integer literals, string literals (no interior quotes), NULL.
+fn is_const_rhs(rhs: &str) -> bool {
+    if rhs == "NULL" {
+        return true;
+    }
+    if rhs.strip_prefix('-').unwrap_or(rhs).chars().all(|c| c.is_ascii_digit())
+        && !rhs.is_empty()
+        && rhs != "-"
+    {
+        return true;
+    }
+    if rhs.len() >= 2 && rhs.starts_with('"') && rhs.ends_with('"') {
+        let inner = &rhs[1..rhs.len() - 1];
+        return !inner.contains('"');
+    }
+    false
+}
+
+/// Does `line` mention `name` as a whole identifier?
+fn has_ident(line: &str, name: &str) -> bool {
+    let b = line.as_bytes();
+    let n = name.as_bytes();
+    let mut i = 0;
+    while i + n.len() <= b.len() {
+        if &b[i..i + n.len()] == n {
+            let before = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let after = i + n.len() == b.len()
+                || !(b[i + n.len()].is_ascii_alphanumeric() || b[i + n.len()] == b'_');
+            if before && after {
+                return true;
+            }
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Does `s` contain a call expression — an identifier char (or `]`)
+/// immediately followed by `(`? Casts (`(long long)(x)`) don't match
+/// (the `(` follows `)`); every real call does. Conservative: keeping
+/// the _went flag on any call is always sound (a callee may stash rc).
+fn has_call(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 1;
+    while i < b.len() {
+        if b[i] == b'(' {
+            let p = b[i - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' || p == b']' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// main() prologue line? (see trim_main_prologue)
@@ -27464,8 +27674,8 @@ mod tests {
             echo_var("_t"),
         ]));
         assert!(
-            out.contains("\n    uint8_t _t = 0;\n"),
-            "no main-local decl:\n{out}"
+            out.contains("\n    uint8_t _t = 7;\n"),
+            "no main-local decl (fold_init_store folds the first constant store into it):\n{out}"
         );
         assert!(
             !out.contains("\nuint8_t _t = 0;\n"),
