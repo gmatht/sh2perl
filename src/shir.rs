@@ -18118,6 +18118,10 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 IrExpr::Call { func, args } if func == "getVar" => {
                     matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
                 }
+                // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                // node): always int-valued (exact Newton in C,
+                // trunc-sqrt in doubles elsewhere — both integral).
+                IrExpr::Call { func, .. } if func == "isqrt" => true,
                 _ => false,
             }) && for_iters
                 .get(name)
@@ -18164,6 +18168,780 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 /// consts; earlier passes see the shapes they were designed against).
 /// Pure function of the ESTree (reads no compilation statics), inert
 /// wherever native bindings already replaced the reads.
+/// Nonzero-number-literal proof for the interprocedural param-range
+/// analysis (`strip_proven_nonzero_guard`): true when `Number(e)` is
+/// provably a nonzero finite number. Literals only (fail-closed):
+/// numeric literals ≠ 0, `+`/`-` on a numeric literal with result ≠ 0,
+/// and narrow digit-string literals (`"10"`, `"-3"`, `"4.5"`) whose
+/// f64 value is finite and ≠ 0. Anything else (identifiers, calls,
+/// templates, hex/exponent strings, whitespace-padded strings) refuses —
+/// sound but incomplete is fine (one refusal only keeps the `|| 0`).
+fn hoist_nonzero_number_literal(e: &Expr) -> bool {
+    fn num_nonzero(v: &serde_json::Value) -> bool {
+        if let Some(n) = v.as_i64() {
+            return n != 0;
+        }
+        if let Some(f) = v.as_f64() {
+            return f != 0.0 && f.is_finite();
+        }
+        false
+    }
+    match e {
+        Expr::Literal { value, .. } => {
+            if num_nonzero(value) {
+                return true;
+            }
+            if let Some(s) = value.as_str() {
+                let t = s.trim();
+                if t.len() != s.len() || t.is_empty() {
+                    return false;
+                }
+                let b = t.as_bytes();
+                let mut i = 0;
+                if b[0] == b'+' || b[0] == b'-' {
+                    if t.len() == 1 {
+                        return false;
+                    }
+                    i = 1;
+                }
+                let mut digits = 0;
+                let mut dots = 0;
+                while i < b.len() {
+                    if b[i].is_ascii_digit() {
+                        digits += 1;
+                    } else if b[i] == b'.' {
+                        dots += 1;
+                        if dots > 1 {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                    i += 1;
+                }
+                if digits == 0 {
+                    return false;
+                }
+                if let Ok(f) = t.parse::<f64>() {
+                    return f != 0.0 && f.is_finite();
+                }
+            }
+            false
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } if operator == "-" || operator == "+" => {
+            if let Expr::Literal { value, .. } = argument.as_ref() {
+                return num_nonzero(value);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Interprocedural call-site facts for `strip_proven_nonzero_guard`.
+#[derive(Default)]
+struct HoistCalls {
+    /// fn name → param names (only all-Identifier param lists recorded).
+    fns: HashMap<String, Vec<String>>,
+    /// fn name → arg-lists of every static direct call.
+    calls: HashMap<String, Vec<Vec<Expr>>>,
+    /// fn names seen in any non-callee value position (possible escape /
+    /// dynamic dispatch — unprovable).
+    escaped: HashSet<String>,
+    /// every identifier bound anywhere (params, fn ids, declarator ids,
+    /// catch params): a shadowing binding makes call attribution
+    /// uncertain — any fn name found here escapes after the walk.
+    bound: HashSet<String>,
+    /// every string literal (and template cooked text): a fn name
+    /// appearing as a string may be dispatched dynamically (`fnCall`).
+    strings: HashSet<String>,
+    /// an opaque binding (destructuring) was seen: attribution is
+    /// uncertain for every fn regardless of walk order.
+    opaque_binding_seen: bool,
+}
+
+/// All-Identifier param lists; `None` on destructuring (opaque binding).
+fn hoist_params_named(params: &[Expr]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for p in params {
+        match p {
+            Expr::Identifier { name } => out.push(name.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Record an arrow/function body under `name`; a redefinition with
+/// different params, or non-Identifier params, escapes the name
+/// (cannot attribute calls to positions — fail-closed).
+fn hoist_record_fn(fx: &mut HoistCalls, name: &str, params: &[Expr]) {
+    match hoist_params_named(params) {
+        Some(ps) => {
+            if let Some(prev) = fx.fns.get(name) {
+                if prev != &ps {
+                    fx.escaped.insert(name.to_string());
+                }
+            } else {
+                fx.fns.insert(name.to_string(), ps);
+            }
+        }
+        None => {
+            fx.escaped.insert(name.to_string());
+        }
+    }
+}
+
+/// Read-only call-site collection (mirrors the `hoist_in_stmt` /
+/// `hoist_in_expr` coverage — every region the hoist can rewrite a
+/// guard in must be scanned for calls/escapes, else a missed caller
+/// voids the proof).
+fn hoist_collect_stmt(s: &Stmt, fx: &mut HoistCalls) {
+    match s {
+        Stmt::ExpressionStatement { expression } => hoist_collect_expr(expression, fx),
+        Stmt::BlockStatement { body } => {
+            for b in body {
+                hoist_collect_stmt(b, fx);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_collect_expr(test, fx);
+            hoist_collect_stmt(consequent, fx);
+            if let Some(a) = alternate {
+                hoist_collect_stmt(a, fx);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            hoist_collect_expr(test, fx);
+            hoist_collect_stmt(body, fx);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            hoist_collect_stmt(init, fx);
+            hoist_collect_expr(test, fx);
+            hoist_collect_expr(update, fx);
+            hoist_collect_stmt(body, fx);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            hoist_collect_stmt(left, fx);
+            hoist_collect_expr(right, fx);
+            hoist_collect_stmt(body, fx);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                hoist_collect_expr(e, fx);
+            }
+        }
+        Stmt::ThrowStatement { argument } => hoist_collect_expr(argument, fx),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            hoist_collect_stmt(block, fx);
+            if let Some(h) = handler {
+                if let Some(p) = h.param.as_ref() {
+                    hoist_collect_bound(p, fx);
+                }
+                hoist_collect_stmt(&h.body, fx);
+            }
+            if let Some(f) = finalizer {
+                hoist_collect_stmt(f, fx);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            hoist_collect_expr(discriminant, fx);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    hoist_collect_expr(t, fx);
+                }
+                for b in &c.consequent {
+                    hoist_collect_stmt(b, fx);
+                }
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                let named = match &d.id {
+                    Expr::Identifier { name } => Some(name.clone()),
+                    _ => {
+                        hoist_collect_bound(&d.id, fx);
+                        None
+                    }
+                };
+                if let Some(init) = &d.init {
+                    match init {
+                        Expr::ArrowFunctionExpression { params, .. } => {
+                            if let Some(n) = &named {
+                                hoist_record_fn(fx, n, params);
+                            }
+                        }
+                        Expr::FunctionExpression { id, params, .. } => {
+                            if let Expr::Identifier { name } = id.as_ref() {
+                                hoist_record_fn(fx, name, params);
+                            } else if let Some(n) = &named {
+                                hoist_record_fn(fx, n, params);
+                            }
+                        }
+                        _ => {
+                            // A plain value binding shadows any fn of the
+                            // same name from here on — EXCEPT `let N;` /
+                            // `let N = null`, which is declaration noise
+                            // (the module prologue preamble binds every
+                            // name to null before its define): null carries
+                            // no value into any call, and every syntactic
+                            // call is still recorded, so attribution stands.
+                            let is_null_decl = matches!(
+                                init,
+                                Expr::Literal { value, .. } if value.is_null()
+                            );
+                            if !is_null_decl {
+                                if let Some(n) = &named {
+                                    fx.bound.insert(n.clone());
+                                }
+                            }
+                        }
+                    }
+                    hoist_collect_expr(init, fx);
+                }
+                // No init (`let N;`): declaration noise, nothing to walk.
+            }
+        }
+        Stmt::FunctionDeclaration { id, params, body, .. } => {
+            if let Expr::Identifier { name } = id {
+                hoist_record_fn(fx, name, params);
+            } else {
+                hoist_collect_bound(id, fx);
+            }
+            for p in params {
+                hoist_collect_bound(p, fx);
+            }
+            hoist_collect_stmt(body, fx);
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Identifiers in a binding position: params, patterns, catch params.
+/// Plain identifiers land in `bound` (shadowing check); anything else
+/// is opaque — every fn recorded so far escapes (fail-closed).
+fn hoist_collect_bound(e: &Expr, fx: &mut HoistCalls) {
+    match e {
+        Expr::Identifier { name } => {
+            fx.bound.insert(name.clone());
+        }
+        _ => {
+            // Opaque binding (destructuring): cannot prove what it
+            // shadows — every attribution is uncertain (flagged for
+            // after the walk so definition order cannot hide a fn).
+            fx.opaque_binding_seen = true;
+        }
+    }
+}
+
+fn hoist_collect_expr(e: &Expr, fx: &mut HoistCalls) {
+    match e {
+        Expr::CallExpression { callee, arguments, .. } => {
+            if let Expr::Identifier { name } = callee.as_ref() {
+                // Direct static call: record (the callee position itself
+                // is not an escape); args may nest calls/escapes.
+                fx.calls
+                    .entry(name.clone())
+                    .or_default()
+                    .push(arguments.clone());
+                for a in arguments {
+                    hoist_collect_expr(a, fx);
+                }
+                return;
+            }
+            hoist_collect_expr(callee, fx);
+            for a in arguments {
+                hoist_collect_expr(a, fx);
+            }
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            if let Expr::Identifier { name } = left.as_ref() {
+                match right.as_ref() {
+                    Expr::ArrowFunctionExpression { params, .. } => {
+                        hoist_record_fn(fx, name, params);
+                    }
+                    Expr::FunctionExpression { id, params, .. } => {
+                        if let Expr::Identifier { name: inner } = id.as_ref() {
+                            hoist_record_fn(fx, inner, params);
+                        } else {
+                            hoist_record_fn(fx, name, params);
+                        }
+                    }
+                    _ => {
+                        // `N = <non-function>` rebinds N: unprovable.
+                        fx.escaped.insert(name.clone());
+                    }
+                }
+                hoist_collect_expr(right, fx);
+                return;
+            }
+            hoist_collect_expr(left, fx);
+            hoist_collect_expr(right, fx);
+        }
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            for p in params {
+                hoist_collect_bound(p, fx);
+            }
+            match body {
+                ArrowBody::Block(b) => hoist_collect_stmt(b, fx),
+                ArrowBody::Expr(x) => hoist_collect_expr(x, fx),
+            }
+        }
+        Expr::FunctionExpression { id, params, body, .. } => {
+            if let Expr::Identifier { name } = id.as_ref() {
+                hoist_record_fn(fx, name, params);
+            } else {
+                hoist_collect_bound(id, fx);
+            }
+            for p in params {
+                hoist_collect_bound(p, fx);
+            }
+            hoist_collect_stmt(body, fx);
+        }
+        Expr::Identifier { name } => {
+            fx.escaped.insert(name.clone());
+        }
+        Expr::Literal { value, .. } => {
+            if let Some(s) = value.as_str() {
+                fx.strings.insert(s.to_string());
+            }
+        }
+        Expr::TemplateLiteral { quasis, expressions } => {
+            for q in quasis {
+                if let Some(c) = &q.value.cooked {
+                    fx.strings.insert(c.clone());
+                }
+            }
+            for x in expressions {
+                hoist_collect_expr(x, fx);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            hoist_collect_expr(object, fx);
+            if *computed {
+                hoist_collect_expr(property, fx);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            hoist_collect_expr(left, fx);
+            hoist_collect_expr(right, fx);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_collect_expr(test, fx);
+            hoist_collect_expr(consequent, fx);
+            hoist_collect_expr(alternate, fx);
+        }
+        Expr::UnaryExpression { argument, .. } => hoist_collect_expr(argument, fx),
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    hoist_collect_expr(&prop.key, fx);
+                }
+                hoist_collect_expr(&prop.value, fx);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter().flatten() {
+                hoist_collect_expr(el, fx);
+            }
+        }
+        Expr::SpreadElement { argument } => hoist_collect_expr(argument, fx),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                hoist_collect_expr(x, fx);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            hoist_collect_expr(callee, fx);
+            for a in arguments {
+                hoist_collect_expr(a, fx);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => hoist_collect_expr(argument, fx),
+    }
+}
+
+/// Pure proof computation (no env): fn name → params proven nonzero —
+/// every static direct call passes a nonzero-number literal at that
+/// position, the fn never escapes, and no binding shadows it.
+fn hoist_proven_nonzero_params(body: &[Stmt]) -> HashMap<String, HashSet<String>> {
+    let mut fx = HoistCalls::default();
+    for s in body {
+        hoist_collect_stmt(s, &mut fx);
+    }
+    let extra: Vec<String> = fx
+        .strings
+        .iter()
+        .filter(|s| fx.fns.contains_key(*s))
+        .cloned()
+        .collect();
+    for n in extra {
+        fx.escaped.insert(n);
+    }
+    let shadowed: Vec<String> = fx
+        .bound
+        .iter()
+        .filter(|b| fx.fns.contains_key(*b))
+        .cloned()
+        .collect();
+    for n in shadowed {
+        fx.escaped.insert(n);
+    }
+    if fx.opaque_binding_seen {
+        let names: Vec<String> = fx.fns.keys().cloned().collect();
+        for n in names {
+            fx.escaped.insert(n);
+        }
+    }
+    // The definition site itself binds the name — that binding is the
+    // fn, not a shadow. (Any OTHER binding already escaped it above.)
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, params) in &fx.fns {
+        if fx.escaped.contains(name) {
+            continue;
+        }
+        let calls = match fx.calls.get(name) {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        let mut set = HashSet::new();
+        for (i, p) in params.iter().enumerate() {
+            let mut ok = true;
+            for args in calls.iter() {
+                match args.get(i) {
+                    Some(a) if hoist_nonzero_number_literal(a) => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                set.insert(p.clone());
+            }
+        }
+        if !set.is_empty() {
+            out.insert(name.clone(), set);
+        }
+    }
+    out
+}
+
+/// Drop the `|| 0` from the hoisted `const __pNn = Number(p) || 0` when
+/// the param is proven nonzero at every static call site: a nonzero
+/// number is truthy, so `Number(p) || 0` ≡ `Number(p)` exactly. Runs
+/// right after the hoist (the shapes it rewrites only exist then).
+/// Disabled for `--library` (`SH2_LIBRARY`): exported functions accept
+/// external callers, so no call-site range is provable. `BigInt(p||0)`
+/// guards are out of scope (empty-string throws vs coerces — kept).
+fn strip_proven_nonzero_guard(mut program: Program) -> Program {
+    strip_proven_nonzero_guard_inner(program, std::env::var("SH2_LIBRARY").is_ok())
+}
+
+fn strip_proven_nonzero_guard_inner(mut program: Program, is_library: bool) -> Program {
+    if is_library {
+        return program;
+    }
+    let proven = hoist_proven_nonzero_params(&program.body);
+    if proven.is_empty() {
+        return program;
+    }
+    hoist_strip_in_list(&mut program.body, None, &proven);
+    program
+}
+
+/// Rewrite walk: replaces the hoisted `Number(p) || 0` init with
+/// `Number(p)` inside functions whose param is proven. Mirrors the
+/// `hoist_in_stmt` / `hoist_in_expr` coverage with an explicit current-
+/// function context (nested functions push their own).
+fn hoist_strip_in_list(
+    stmts: &mut Vec<Stmt>,
+    cur: Option<&str>,
+    proven: &HashMap<String, HashSet<String>>,
+) {
+    for st in stmts.iter_mut() {
+        hoist_strip_in_stmt(st, cur, proven);
+    }
+}
+
+fn hoist_strip_in_stmt(
+    st: &mut Stmt,
+    cur: Option<&str>,
+    proven: &HashMap<String, HashSet<String>>,
+) {
+    match st {
+        Stmt::ExpressionStatement { expression } => hoist_strip_in_expr(expression, cur, proven),
+        Stmt::BlockStatement { body } => hoist_strip_in_list(body, cur, proven),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_strip_in_expr(test, cur, proven);
+            hoist_strip_in_stmt(consequent, cur, proven);
+            if let Some(a) = alternate {
+                hoist_strip_in_stmt(a, cur, proven);
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            hoist_strip_in_expr(test, cur, proven);
+            hoist_strip_in_stmt(body, cur, proven);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            hoist_strip_in_stmt(init, cur, proven);
+            hoist_strip_in_expr(test, cur, proven);
+            hoist_strip_in_expr(update, cur, proven);
+            hoist_strip_in_stmt(body, cur, proven);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            hoist_strip_in_stmt(left, cur, proven);
+            hoist_strip_in_expr(right, cur, proven);
+            hoist_strip_in_stmt(body, cur, proven);
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(e) = argument {
+                hoist_strip_in_expr(e, cur, proven);
+            }
+        }
+        Stmt::ThrowStatement { argument } => hoist_strip_in_expr(argument, cur, proven),
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            hoist_strip_in_stmt(block, cur, proven);
+            if let Some(h) = handler {
+                hoist_strip_in_stmt(&mut h.body, cur, proven);
+            }
+            if let Some(f) = finalizer {
+                hoist_strip_in_stmt(f, cur, proven);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            hoist_strip_in_expr(discriminant, cur, proven);
+            for c in cases {
+                if let Some(t) = &mut c.test {
+                    hoist_strip_in_expr(t, cur, proven);
+                }
+                hoist_strip_in_list(&mut c.consequent, cur, proven);
+            }
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations.iter_mut() {
+                if let Some(init) = &mut d.init {
+                    // Definition site: the arrow body runs under the
+                    // declarator name.
+                    let inner = match &d.id {
+                        Expr::Identifier { name } => match init {
+                            Expr::ArrowFunctionExpression { body: ArrowBody::Block(_), .. }
+                            | Expr::FunctionExpression { .. } => Some(name.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(n) = inner {
+                        hoist_strip_in_expr(init, Some(&n), proven);
+                    } else {
+                        hoist_strip_in_expr(init, cur, proven);
+                    }
+                }
+            }
+            // The hoisted guard const itself lives in a list this walk
+            // visits under the owning function's context.
+            if let Some(f) = cur {
+                if let Some(pset) = proven.get(f) {
+                    for d in declarations.iter_mut() {
+                        hoist_strip_guard(d, pset);
+                    }
+                }
+            }
+        }
+        Stmt::FunctionDeclaration { id, body, .. } => {
+            match id {
+                Expr::Identifier { name } => {
+                    hoist_strip_in_stmt(body, Some(name.as_str()), proven)
+                }
+                _ => hoist_strip_in_stmt(body, cur, proven),
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Replace one hoisted `const __pNn = Number(p) || 0` init with
+/// `Number(p)` when `p` is proven nonzero for this function.
+fn hoist_strip_guard(d: &mut VariableDeclarator, pset: &HashSet<String>) {
+    let init = match &mut d.init {
+        Some(e) => e,
+        None => return,
+    };
+    let cn = match &d.id {
+        Expr::Identifier { name } => name.clone(),
+        _ => return,
+    };
+    if let Expr::LogicalExpression {
+        operator,
+        left,
+        right,
+    } = init
+    {
+        if operator != "||" {
+            return;
+        }
+        if !matches!(right.as_ref(), Expr::Literal { value, .. } if value.as_i64() == Some(0))
+        {
+            return;
+        }
+        if let Expr::CallExpression { callee, arguments, .. } = left.as_ref() {
+            if !matches!(callee.as_ref(), Expr::Identifier { name } if name == "Number") {
+                return;
+            }
+            if let [Expr::Identifier { name: p }] = arguments.as_slice() {
+                let expect =
+                    format!("__p{n}n", n = p.strip_prefix('p').unwrap_or(p));
+                if cn == expect && pset.contains(p) {
+                    *init = (**left).clone();
+                }
+            }
+        }
+    }
+}
+
+fn hoist_strip_in_expr(
+    e: &mut Expr,
+    cur: Option<&str>,
+    proven: &HashMap<String, HashSet<String>>,
+) {
+    match e {
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            // A bare arrow keeps the ambient context; the named
+            // definition sites (assignment / declarator) set it.
+            ArrowBody::Block(b) => hoist_strip_in_stmt(b, cur, proven),
+            ArrowBody::Expr(x) => hoist_strip_in_expr(x, cur, proven),
+        },
+        Expr::FunctionExpression { id, body, .. } => {
+            match &**id {
+                Expr::Identifier { name } => {
+                    hoist_strip_in_stmt(body, Some(name.as_str()), proven)
+                }
+                _ => hoist_strip_in_stmt(body, cur, proven),
+            }
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            if let Expr::Identifier { name } = left.as_ref() {
+                match right.as_ref() {
+                    Expr::ArrowFunctionExpression {
+                        body: ArrowBody::Block(_),
+                        ..
+                    }
+                    | Expr::FunctionExpression { .. } => {
+                        hoist_strip_in_expr(right, Some(name.as_str()), proven);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            hoist_strip_in_expr(left, cur, proven);
+            hoist_strip_in_expr(right, cur, proven);
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            hoist_strip_in_expr(callee, cur, proven);
+            for a in arguments.iter_mut() {
+                hoist_strip_in_expr(a, cur, proven);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            hoist_strip_in_expr(object, cur, proven);
+            if *computed {
+                hoist_strip_in_expr(property, cur, proven);
+            }
+        }
+        Expr::BinaryExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. } => {
+            hoist_strip_in_expr(left, cur, proven);
+            hoist_strip_in_expr(right, cur, proven);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            hoist_strip_in_expr(test, cur, proven);
+            hoist_strip_in_expr(consequent, cur, proven);
+            hoist_strip_in_expr(alternate, cur, proven);
+        }
+        Expr::UnaryExpression { argument, .. } => hoist_strip_in_expr(argument, cur, proven),
+        Expr::ObjectExpression { properties, .. } => {
+            for prop in properties {
+                if prop.computed {
+                    hoist_strip_in_expr(&mut prop.key, cur, proven);
+                }
+                hoist_strip_in_expr(&mut prop.value, cur, proven);
+            }
+        }
+        Expr::ArrayExpression { elements, .. } => {
+            for el in elements.iter_mut().flatten() {
+                hoist_strip_in_expr(el, cur, proven);
+            }
+        }
+        Expr::SpreadElement { argument } => hoist_strip_in_expr(argument, cur, proven),
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                hoist_strip_in_expr(x, cur, proven);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions.iter_mut() {
+                hoist_strip_in_expr(x, cur, proven);
+            }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            hoist_strip_in_expr(callee, cur, proven);
+            for a in arguments.iter_mut() {
+                hoist_strip_in_expr(a, cur, proven);
+            }
+        }
+        Expr::AwaitExpression { argument, .. } => hoist_strip_in_expr(argument, cur, proven),
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+
+    }
+}
+
 fn hoist_param_reads(mut program: Program) -> Program {
     if let Some(module_bound) = hoist_module_bound(&program.body) {
         hoist_in_stmt_list(&mut program.body, &module_bound);
@@ -24716,6 +25494,11 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         ));
     if let Some(module_bound) = hoist_module_bound(&program.body) {
         hoist_in_stmt_list(&mut program.body, &module_bound);
+        // Interprocedural param-range proof (drop the `|| 0` NaN/zero
+        // normalizer where every static call site passes nonzero): right
+        // after the hoist that emits the guards, before migration sees
+        // the element shapes. Disabled for `--library` inside.
+        program = strip_proven_nonzero_guard(program);
         // Native-array migration (setArray/setArrayAppend/sortedJoins
         // → const/push/inline join): after hoisting so the entry consts
         // it must respect are in place; last, so nothing disturbs the
@@ -27529,6 +28312,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         } else {
                             inner
                         }
+                    }
+                    IrExpr::Call { func, .. } if func == "isqrt" => {
+                        // structured integer sqrt into a lifted binding:
+                        // native Math.trunc(sqrt) (see the expr_to_estree
+                        // isqrt arm) — int-domain only, always a Number.
+                        expr_to_estree(expr)
                     }
                     IrExpr::Int(i) => {
                         // i53 escalation / `--true64`: an Int64 target
@@ -42602,6 +43391,14 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
                     if let Some(m) = &e.match_expr {
                         walk_expr(m, written, blocked);
                     }
+                    // the `as` binding is written by the runtime's catch
+                    // preamble (`setVar(as, e)` heads every arm) — reads
+                    // of it must never take the never-written "" fold
+                    // (the go-sh panic-recovery idiom `r := recover()`
+                    // reads the caught value).
+                    if let Some(n) = &e.as_name {
+                        mark_word(n, written);
+                    }
                     for st in &e.body {
                         walk_stmt(st, written, blocked);
                     }
@@ -44303,6 +45100,42 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             };
                         }
                     }
+                }
+            }
+            // structured integer sqrt (py-sh-go `int(Y**0.5)` node —
+            // no arith-string detour). CPython parity by construction:
+            // trunc(sqrt(x)) in doubles, exactly CPython's int(n**0.5).
+            if func == "isqrt" {
+                if let [IrExpr::Arith(a)] = args.as_slice() {
+                    let inner = arith_to_estree(a);
+                    let sqrt = Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Math".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "sqrt".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![inner],
+                        optional: false,
+                    };
+                    return Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Math".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "trunc".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![sqrt],
+                        optional: false,
+                    };
                 }
             }
             // `sh2.arith("$j*$i")` — the runtime-evaluated arith STRING
@@ -48808,6 +49641,252 @@ mod lowering_shape_tests {
         assert!(!s.contains("__p1n"), "shadowing refuses hoist: {s}");
     }
 
+    // ── interprocedural param-range proof (strip the hoisted `|| 0`) ──
+    fn named_arrow(name: &str, params: &[&str], body: Vec<Stmt>) -> Stmt {
+        expr_stmt(Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            right: Box::new(Expr::ArrowFunctionExpression {
+                params: params
+                    .iter()
+                    .map(|p| Expr::Identifier { name: p.to_string() })
+                    .collect(),
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body })),
+                expression: false,
+                r#async: false,
+            }),
+        })
+    }
+    fn direct_call(name: &str, args: Vec<Expr>) -> Stmt {
+        expr_stmt(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            arguments: args,
+            optional: false,
+        })
+    }
+    fn guard_const() -> Stmt {
+        Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: "__p1n".to_string(),
+                },
+                init: Some(num_read("p1")),
+            }],
+        }
+    }
+    fn run_strip(stmts: Vec<Stmt>, is_library: bool) -> crate::estree::Program {
+        strip_proven_nonzero_guard_inner(
+            crate::estree::Program {
+                type_: "Program",
+                source_type: "module",
+                body: stmts,
+            },
+            is_library,
+        )
+    }
+
+    #[test]
+    fn nonzero_literal_shapes() {
+        assert!(hoist_nonzero_number_literal(&n_lit(42)));
+        assert!(hoist_nonzero_number_literal(&s_lit("10")));
+        assert!(hoist_nonzero_number_literal(&s_lit("-3")));
+        assert!(hoist_nonzero_number_literal(&s_lit("4.5")));
+        assert!(!hoist_nonzero_number_literal(&n_lit(0)));
+        assert!(!hoist_nonzero_number_literal(&s_lit("0")));
+        assert!(!hoist_nonzero_number_literal(&s_lit("")));
+        assert!(!hoist_nonzero_number_literal(&s_lit("12a")));
+        assert!(!hoist_nonzero_number_literal(&s_lit(" 10")));
+        // narrow on purpose: exponent/hex strings stay guarded (sound,
+        // merely incomplete — one refusal only keeps the `|| 0`).
+        assert!(!hoist_nonzero_number_literal(&s_lit("1e3")));
+        assert!(!hoist_nonzero_number_literal(&Expr::Identifier {
+            name: "p1".to_string()
+        }));
+    }
+
+    #[test]
+    fn strip_drops_guard_all_nonzero_calls() {
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call("f", vec![s_lit("10")]),
+                direct_call("f", vec![n_lit(42)]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("__p1n"), "const kept: {s}");
+        assert!(!s.contains("\"||\""), "guard dropped: {s}");
+    }
+
+    #[test]
+    fn strip_drops_guard_function_declaration() {
+        // param-lift emits `function f(p1)` declarations — same proof.
+        let prog = run_strip(
+            vec![
+                Stmt::FunctionDeclaration {
+                    id: Expr::Identifier {
+                        name: "f".to_string(),
+                    },
+                    params: vec![Expr::Identifier {
+                        name: "p1".to_string(),
+                    }],
+                    body: Box::new(Stmt::BlockStatement {
+                        body: vec![guard_const()],
+                    }),
+                    generator: false,
+                    expression: false,
+                    r#async: false,
+                },
+                direct_call("f", vec![s_lit("10")]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(!s.contains("\"||\""), "guard dropped: {s}");
+    }
+
+    #[test]
+    fn strip_drops_guard_null_prologue() {
+        // the module prologue (`let f = null`) is declaration noise —
+        // it must not shadow-escape the later define.
+        let prog = run_strip(
+            vec![
+                Stmt::VariableDeclaration {
+                    kind: "let",
+                    declarations: vec![VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier {
+                            name: "f".to_string(),
+                        },
+                        init: Some(Expr::Literal {
+                            value: serde_json::Value::Null,
+                            raw: None,
+                            regex: None,
+                        }),
+                    }],
+                },
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call("f", vec![s_lit("10")]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(!s.contains("\"||\""), "guard dropped: {s}");
+    }
+
+    #[test]
+    fn strip_keeps_guard_zero_call() {
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call("f", vec![s_lit("10")]),
+                direct_call("f", vec![s_lit("0")]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "zero call keeps guard: {s}");
+    }
+
+    #[test]
+    fn strip_keeps_guard_missing_arg() {
+        // short call leaves p1 undefined → Number(undefined) is NaN.
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call("f", vec![]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "short call keeps guard: {s}");
+    }
+
+    #[test]
+    fn strip_keeps_guard_library() {
+        // exported: external callers can pass anything.
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call("f", vec![s_lit("10")]),
+            ],
+            true,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "library keeps guard: {s}");
+    }
+
+    #[test]
+    fn strip_keeps_guard_escaped_or_rebound() {
+        // passed as a value → may be invoked with unknown args.
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                direct_call(
+                    "g",
+                    vec![Expr::Identifier {
+                        name: "f".to_string(),
+                    }],
+                ),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "escape keeps guard: {s}");
+        // rebound to a non-function → unprovable.
+        let prog = run_strip(
+            vec![
+                named_arrow("f", &["p1"], vec![guard_const()]),
+                expr_stmt(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(Expr::Identifier {
+                        name: "f".to_string(),
+                    }),
+                    right: Box::new(n_lit(5)),
+                }),
+                direct_call("f", vec![s_lit("10")]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "rebind keeps guard: {s}");
+    }
+
+    #[test]
+    fn strip_leaves_bigint_guard() {
+        // `BigInt(p || 0)` is out of scope (empty-string throws vs
+        // coerces) — kept even when the param is proven nonzero.
+        let prog = run_strip(
+            vec![
+                named_arrow(
+                    "f",
+                    &["p1"],
+                    vec![Stmt::VariableDeclaration {
+                        kind: "const",
+                        declarations: vec![VariableDeclarator {
+                            type_: "VariableDeclarator",
+                            id: Expr::Identifier {
+                                name: "__p1b".to_string(),
+                            },
+                            init: Some(big_read("p1")),
+                        }],
+                    }],
+                ),
+                direct_call("f", vec![s_lit("10")]),
+            ],
+            false,
+        );
+        let s = serde_json::to_string(&prog).unwrap();
+        assert!(s.contains("\"||\""), "bigint guard kept: {s}");
+    }
+
     // ── native-array migration ──
     fn s_lit(s: &str) -> Expr {
         Expr::Literal {
@@ -49719,6 +50798,62 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         // inner try); the inner try has no finalizer
         assert!(json.contains("\"handler\":null,\"finalizer\":{\"type\":\"BlockStatement\""), "{json}");
         assert!(json.contains("\"finalizer\":null},{\"type\":\"IfStatement\""), "{json}");
+    }
+
+    #[test]
+    fn try_except_as_binding_read_not_folded() {
+        // The `as` binding is written by the runtime's catch preamble
+        // (`setVar(as, e)` heads every arm): a body read of it must
+        // survive the never-written "" fold (go-sh `r := recover()`).
+        use crate::ir::{AssignTarget, IrExpr, IrProgram, IrStmt, StrStyle, TryExcept};
+        let prog = IrProgram {
+            var_storage: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Try {
+                body: vec![IrStmt::Expr(IrExpr::Ident("guard".to_string()))],
+                excepts: vec![TryExcept {
+                    match_expr: None,
+                    as_name: Some("mye".to_string()),
+                    body: vec![IrStmt::Assign {
+                        targets: vec![AssignTarget {
+                            var: "r".to_string(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        asm: None,
+                        expr: IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![IrExpr::Str(
+                                "mye".to_string(),
+                                StrStyle::DoubleQuoted,
+                            )],
+                        },
+                    }],
+                }],
+                else_body: vec![],
+                finally_body: vec![],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(json.contains("\"name\":\"mye\""), "as-binding read kept: {json}");
+        // the folded form (`r = ""`) must not appear: find the r
+        // assignment and require a non-empty RHS
+        let i = json.find("\"name\": \"r\"").or_else(|| json.find("\"name\":\"r\""))
+            .expect("r assign");
+        let rhs = &json[i..(i + 600).min(json.len())];
+        assert!(
+            !rhs.contains("\"value\": \"\"") && !rhs.contains("\"value\":\"\""),
+            "as-binding read folded to empty: {rhs}"
+        );
     }
 
     #[test]

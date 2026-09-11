@@ -1140,6 +1140,16 @@ impl Render {
                     "0".into()
                 }
             },
+            "isqrt" => match args.first() {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                // node — no arith-string detour). CPython parity:
+                // int(sqrt(x)) in doubles.
+                Some(IrExpr::Arith(a)) => format!("int(sqrt({}))", self.arith(a)),
+                _ => {
+                    self.mark_todo("isqrt arg");
+                    "0".into()
+                }
+            },
             "test" => match Self::str_arg(args, 0) {
                 Some(s) => self.test(&s),
                 None => {

@@ -1827,6 +1827,15 @@ impl Render {
                 }
                 self.sh2_stub("arith", args, "arith")
             }
+            "isqrt" => {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                // node — no arith-string detour). CPython parity by
+                // construction: int(x ** 0.5) in doubles, no import.
+                match args.first() {
+                    Some(IrExpr::Arith(a)) => format!("int(({}) ** 0.5)", self.arith(a)),
+                    _ => self.sh2_stub("isqrt", args, "isqrt"),
+                }
+            }
             // the C memory model (malloc/pointer arithmetic): the arena
             // runtime (subset of sh2-namespace.mjs slice 2).
             "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree"

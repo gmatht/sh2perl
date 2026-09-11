@@ -740,6 +740,17 @@ impl Render {
                     "0".to_string()
                 }
             }
+            IrExpr::Call { func, args } if func == "isqrt" => {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                // node — no arith-string detour). CPython parity:
+                // trunc(sqrt(x)) in doubles.
+                match args.first() {
+                    Some(IrExpr::Arith(a)) => {
+                        format!("({} as f64).sqrt() as i64", self.arith(a))
+                    }
+                    _ => "0".to_string(),
+                }
+            }
             IrExpr::Call { func, args } if func == "assign" => self.assign_call_num(args),
             other => format!("{}.trim().parse::<i64>().unwrap_or(0)", self.expr_str(other)),
         }

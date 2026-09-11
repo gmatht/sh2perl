@@ -1744,6 +1744,16 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 "sh2ArithStub()".to_string()
             }
+            "isqrt" => {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)` node
+                // — no arith-string detour). CPython parity by
+                // construction: trunc(sqrt(x)) in doubles.
+                if let Some(IrExpr::Arith(a)) = args.first() {
+                    let x = self.arith(a);
+                    return format!("@as(i64, @intFromFloat(@sqrt(@as(f64, @floatFromInt({x})))))" );
+                }
+                "0".to_string()
+            }
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
                 self.need_toint = true;

@@ -1886,86 +1886,6 @@ fn small_int_arrays(
     out
 }
 
-/// Collect every setArray/setArrayAppend element expression per array.
-fn collect_array_elements(stmts: &[IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
-    for s in stmts {
-        match s {
-            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => collect_array_elements_expr(e, out),
-            IrStmt::Assign { expr, .. } => collect_array_elements_expr(expr, out),
-            IrStmt::If { cond, then, elsifs, else_ } => {
-                collect_array_elements_expr(cond, out);
-                collect_array_elements(then, out);
-                for (c, b) in elsifs {
-                    collect_array_elements_expr(c, out);
-                    collect_array_elements(b, out);
-                }
-                collect_array_elements(else_, out);
-            }
-            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                collect_array_elements_expr(cond, out);
-                collect_array_elements(body, out);
-            }
-            IrStmt::For { iter, body, .. } => {
-                collect_array_elements_expr(iter, out);
-                collect_array_elements(body, out);
-            }
-            IrStmt::Function { body, .. } => collect_array_elements(body, out),
-            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
-                collect_array_elements(b, out)
-            }
-            IrStmt::ForInit { init, cond, step, body, .. } => {
-                collect_array_elements(init, out);
-                collect_array_elements_expr(cond, out);
-                collect_array_elements(step, out);
-                collect_array_elements(body, out);
-            }
-            IrStmt::Case { discriminant, clauses, .. } => {
-                collect_array_elements_expr(discriminant, out);
-                for c in clauses {
-                    collect_array_elements(&c.body, out);
-                }
-            }
-            IrStmt::Redirect { inner, redirects } => {
-                collect_array_elements(inner, out);
-                for r in redirects {
-                    collect_array_elements_expr(&r.target, out);
-                }
-            }
-            IrStmt::Pipeline { stages, .. } => {
-                for st in stages.iter().flatten() {
-                    collect_array_elements(std::slice::from_ref(st), out);
-                }
-            }
-            IrStmt::Return(Some(e))
-            | IrStmt::Exit(Some(e))
-            | IrStmt::Die { expr: e, .. }
-            | IrStmt::Warn { expr: e, .. } => collect_array_elements_expr(e, out),
-            IrStmt::Declare { init, .. } => {
-                if let Some(e) = init {
-                    collect_array_elements_expr(e, out);
-                }
-            }
-            IrStmt::DeclareArray { elements, .. } => {
-                for e in elements {
-                    collect_array_elements_expr(e, out);
-                }
-            }
-            IrStmt::WriteFile { path, content, .. } => {
-                collect_array_elements_expr(path, out);
-                collect_array_elements_expr(content, out);
-            }
-            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                collect_array_elements(body, out);
-                for e in excepts {
-                    collect_array_elements(&e.body, out);
-                }
-                collect_array_elements(else_body, out);
-                collect_array_elements(finally_body, out);
-            }
-            _ => {}
-        }
-    }
-}
 /// Exact fixed capacity per array (sizing from proofs, not the blanket
 /// ARR_CAP): max literal reset bulk + bounded appends (straight-line
 /// appends plus const-trip loop appends). Only arrays with fully bounded
@@ -2326,6 +2246,87 @@ fn array_fixed_caps(
     out
 }
 
+/// Collect every setArray/setArrayAppend element expression per array.
+fn collect_array_elements(stmts: &[IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => collect_array_elements_expr(e, out),
+            IrStmt::Assign { expr, .. } => collect_array_elements_expr(expr, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(then, out);
+                for (c, b) in elsifs {
+                    collect_array_elements_expr(c, out);
+                    collect_array_elements(b, out);
+                }
+                collect_array_elements(else_, out);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_array_elements_expr(iter, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::Function { body, .. } => collect_array_elements(body, out),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_array_elements(b, out)
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                collect_array_elements(init, out);
+                collect_array_elements_expr(cond, out);
+                collect_array_elements(step, out);
+                collect_array_elements(body, out);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                collect_array_elements_expr(discriminant, out);
+                for c in clauses {
+                    collect_array_elements(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_array_elements(inner, out);
+                for r in redirects {
+                    collect_array_elements_expr(&r.target, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages.iter().flatten() {
+                    collect_array_elements(std::slice::from_ref(st), out);
+                }
+            }
+            IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. } => collect_array_elements_expr(e, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    collect_array_elements_expr(e, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    collect_array_elements_expr(e, out);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                collect_array_elements_expr(path, out);
+                collect_array_elements_expr(content, out);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_array_elements(body, out);
+                for e in excepts {
+                    collect_array_elements(&e.body, out);
+                }
+                collect_array_elements(else_body, out);
+                collect_array_elements(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_array_elements_expr(e: &IrExpr, out: &mut HashMap<String, Vec<IrExpr>>) {
     match e {
         IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
@@ -2547,7 +2548,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         r.small_int_arrays = small_int_arrays(&prog, &vt, &r.bigint_vars);
     }
     // exact fixed capacities (sizing from proofs, not blanket 1024).
-    // Same point: final layout, all verdicts/sets ready. Array-return
+    // Same point: final layout, all sets ready. Array-return
     // and bigint-homed arrays never consult the map (separate
     // decls/paths), so excluding them is hygiene.
     {
@@ -4214,9 +4215,14 @@ impl Render {
             self.emit("/* integer floor sqrt (exact; the float sqrt rounds above 2^53) */");
             self.emit("static long long _sh_isqrt(long long n) {");
             self.emit("  if (n <= 0) return 0;");
-            self.emit("  long long x = n, y = (n + 1) / 2;");
-            self.emit("  while (y < x) { x = y; y = (x + n / x) / 2; }");
-            self.emit("  return x;");
+            // unsigned arithmetic: (n + 1) overflows signed long long
+            // at i64max (UB/garbage) — unsigned wraps definedly and all
+            // values stay < 2^63, so results are bit-identical for every
+            // input the signed form handled.
+            self.emit("  unsigned long long ux = (unsigned long long)n;");
+            self.emit("  unsigned long long x = ux, y = (x + 1) / 2;");
+            self.emit("  while (y < x) { x = y; y = (x + ux / x) / 2; }");
+            self.emit("  return (long long)x;");
             self.emit("}");
             self.emit("");
         }
@@ -6148,6 +6154,16 @@ impl Render {
                         return "0".into();
                     };
                     self.reduce_array(func, &name)
+                }
+                "isqrt" => {
+                    // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                    // node — no arith-string detour). Exact Newton
+                    // helper; CPython-parity for int-domain (≤2^53).
+                    let Some(IrExpr::Arith(a)) = args.first() else {
+                        return "0".into();
+                    };
+                    self.need_isqrt = true;
+                    format!("_sh_isqrt({})", self.arith(a))
                 }
                 "arith" => {
                     if std::env::var("SH2_DBG_VARS").is_ok() {
@@ -14608,6 +14624,19 @@ impl Render {
                                     self.value_c(expr)
                                 ),
                             }
+                        } else if func == "isqrt" {
+                            // structured integer sqrt (py-sh-go node) —
+                            // direct native helper, no arith-string.
+                            self.need_isqrt = true;
+                            match args.as_slice() {
+                                [IrExpr::Arith(a)] => {
+                                    format!("(long long)(_sh_isqrt({}))", self.arith(a))
+                                }
+                                _ => format!(
+                                    "(long long)atoll({})",
+                                    self.value_c(expr)
+                                ),
+                            }
                         } else {
                             self.expr_as_num(expr)
                         }
@@ -16326,20 +16355,13 @@ impl Render {
             self.emit_function(name, body, &vars);
         }
         fn_out = std::mem::replace(&mut self.out, saved_out);
-        // forward declarations head the function block (calls may occur
-        // in any definition order). The fn_fwd_decls are ALSO emitted in
-        // the preamble's forward-decl section (before the capture/site
-        // helpers, which the in-process capture dispatch calls) — so
-        // here they are only prepended to the definitions, not consumed.
-        if !self.fn_fwd_decls.is_empty() {
-            let mut with_fwd: Vec<String> = Vec::new();
-            for d in self.fn_fwd_decls.iter() {
-                with_fwd.push(d.clone());
-            }
-            with_fwd.push(String::new());
-            with_fwd.extend(fn_out.iter().cloned());
-            fn_out = with_fwd;
-        }
+        // No forward declarations head the function block: the preamble's
+        // forward-decl section below emits the referenced subset (see the
+        // conditional emission there), and it precedes both the capture/site
+        // helpers and the function definitions in output order — so it
+        // already covers calls in any definition order (and mutual
+        // recursion). Prepending a second copy here only duplicated every
+        // prototype.
         // fn-locals referenced by site/capture helpers hoist to FILE
         // scope (the helpers are file-scope functions; emit_function
         // already excluded them from the fn's local block)
@@ -16403,7 +16425,72 @@ impl Render {
         // in-process capture dispatch inside a capture helper calls them
         // BEFORE the definitions (the fn block is emitted after the
         // helpers).
-        let fn_fwd: Vec<String> = self.fn_fwd_decls.iter().cloned().collect();
+        // Forward declarations, but only for functions referenced BEFORE
+        // their definitions: capture/site/stage-thunk bodies (emitted above
+        // the function block) and earlier sibling definitions (mutual
+        // recursion, later callees). main() follows everything and needs
+        // none. A reference is any word-level mention of the C identifier
+        // — direct calls, address-takes, pointer passing, and name strings
+        // for dynamic dispatch all spell it (verified: this emitter builds
+        // no references via token-pasting). Sibling bodies are scanned in
+        // Debug form so every identifier and string is visible whatever IR
+        // variant carries it (future-proof: new variants are included
+        // automatically). Anything unparseable keeps its prototype
+        // (fail-closed).
+        fn fwd_decl_name(decl: &str) -> Option<&str> {
+            let head = decl.split('(').next()?;
+            head.split(|c: char| c.is_whitespace() || c == '*')
+                .filter(|s| !s.is_empty())
+                .last()
+        }
+        fn c_ref_mentioned(haystack: &str, needle: &str) -> bool {
+            if needle.is_empty() {
+                return true;
+            }
+            let (hb, nb) = (haystack.as_bytes(), needle.as_bytes());
+            if nb.len() > hb.len() {
+                return false;
+            }
+            let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+            for i in 0..=(hb.len() - nb.len()) {
+                if &hb[i..i + nb.len()] != nb {
+                    continue;
+                }
+                let before_ok = i == 0 || !is_word(hb[i - 1]);
+                let after_ok = i + nb.len() == hb.len() || !is_word(hb[i + nb.len()]);
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            false
+        }
+        let pre_text = self.out.join("\n");
+        let mut earlier = String::new();
+        let mut fn_fwd: Vec<String> = Vec::new();
+        let defs_aligned = fn_defs.len() == self.fn_fwd_decls.len();
+        for (i, d) in self.fn_fwd_decls.iter().enumerate() {
+            let keep = match fwd_decl_name(d) {
+                // Unparseable declaration: keep (fail-closed).
+                None => true,
+                Some(nm) => {
+                    if !defs_aligned {
+                        true
+                    } else {
+                        c_ref_mentioned(&pre_text, nm) || c_ref_mentioned(&earlier, nm)
+                    }
+                }
+            };
+            if keep {
+                fn_fwd.push(d.clone());
+            }
+            // This definition now precedes everything below it.
+            if defs_aligned {
+                if let Some((_, b)) = fn_defs.get(i) {
+                    earlier.push_str(&format!("{b:?}"));
+                    earlier.push('\n');
+                }
+            }
+        }
         for d in &fn_fwd {
             self.emit(d);
         }
@@ -22846,6 +22933,265 @@ mod tests {
         }
         assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
         assert!(!out.contains("_sh_"), "_sh_ runtime leaked into pure-bigint output:\n{out}");
+    }
+
+    #[test]
+    fn shell_fn_prototype_omitted_when_unreferenced() {
+        // No caller before the definitions: no prototypes, just defines.
+        // (The preamble copy they replaced was unconditional.)
+        fn fn_stmt(name: &str) -> IrStmt {
+            IrStmt::Function {
+                name: name.to_string(),
+                body: vec![],
+                named_blocks: vec![],
+            }
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![fn_stmt("tfn_a"), fn_stmt("tfn_b")],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        for name in ["tfn_a", "tfn_b"] {
+            let needle = format!("{name}(");
+            let protos = out
+                .lines()
+                .filter(|l| {
+                    l.trim_start().starts_with("static")
+                        && l.contains(&needle)
+                        && l.trim_end().ends_with(");")
+                })
+                .count();
+            assert_eq!(protos, 0, "no prototype for unreferenced {name}:\n{out}");
+            let defs = out
+                .lines()
+                .filter(|l| {
+                    l.trim_start().starts_with("static")
+                        && l.contains(&needle)
+                        && l.trim_end().ends_with('{')
+                })
+                .count();
+            assert_eq!(defs, 1, "one definition for {name}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn shell_fn_prototype_kept_when_referenced_early() {
+        // g's body mentions tfn_a (even as a mere string): the prototype
+        // stays — calls, address-takes, and dispatch strings all spell it.
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "tfn_a".to_string(),
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+                IrStmt::Function {
+                    name: "tfn_g".to_string(),
+                    body: vec![IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: vec![
+                            IrExpr::Str(
+                                "echo".to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            ),
+                            IrExpr::Array(vec![IrExpr::Str(
+                                "x tfn_a y".to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )]),
+                        ],
+                    })],
+                    named_blocks: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        // tfn_a is defined FIRST here, so even the mention needs no
+        // prototype — flip the order to force a forward reference.
+        let prog2 = IrProgram {
+            stmts: vec![
+                IrStmt::Function {
+                    name: "tfn_g".to_string(),
+                    body: vec![IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: vec![
+                            IrExpr::Str(
+                                "echo".to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            ),
+                            IrExpr::Array(vec![IrExpr::Str(
+                                "x tfn_a y".to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )]),
+                        ],
+                    })],
+                    named_blocks: vec![],
+                },
+                IrStmt::Function {
+                    name: "tfn_a".to_string(),
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+            ],
+            ..prog
+        };
+        let out2 = shir_to_c(&prog2);
+        let protos = out2
+            .lines()
+            .filter(|l| {
+                l.trim_start().starts_with("static")
+                    && l.contains("tfn_a(")
+                    && l.trim_end().ends_with(");")
+            })
+            .count();
+        assert_eq!(protos, 1, "forward reference keeps one prototype:\n{out2}");
+        let _ = out;
+    }
+
+    // Prototype-gating counters: static decl (`...);`) vs definition
+    // (`... {`) lines mentioning NAME(. Exact counts everywhere — any
+    // duplicate (or any dropped-needed) prototype fails loudly.
+    fn proto_lines(out: &str, name: &str) -> usize {
+        let needle = format!("{name}(");
+        out.lines()
+            .filter(|l| {
+                l.trim_start().starts_with("static")
+                    && l.contains(&needle)
+                    && l.trim_end().ends_with(");")
+            })
+            .count()
+    }
+    fn def_lines(out: &str, name: &str) -> usize {
+        let needle = format!("{name}(");
+        out.lines()
+            .filter(|l| {
+                l.trim_start().starts_with("static")
+                    && l.contains(&needle)
+                    && l.trim_end().ends_with('{')
+            })
+            .count()
+    }
+    fn proto_pos(out: &str, name: &str) -> Option<usize> {
+        let needle = format!("{name}(");
+        out.lines().position(|l| {
+            l.trim_start().starts_with("static")
+                && l.contains(&needle)
+                && l.trim_end().ends_with(");")
+        })
+    }
+    fn def_pos(out: &str, name: &str) -> Option<usize> {
+        let needle = format!("{name}(");
+        out.lines().position(|l| {
+            l.trim_start().starts_with("static")
+                && l.contains(&needle)
+                && l.trim_end().ends_with('{')
+        })
+    }
+    fn fn_named(name: &str, body: Vec<IrStmt>) -> IrStmt {
+        IrStmt::Function {
+            name: name.to_string(),
+            body,
+            named_blocks: vec![],
+        }
+    }
+    /// A body statement mentioning TARGET (as a string): exercises the
+    /// reference detector through the same channel as dynamic dispatch.
+    fn mention_caller(target: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str(
+                    format!("x {target} y"),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )]),
+            ],
+        })
+    }
+    fn empty_prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn shell_fn_prototype_chain_orders_minimally() {
+        // f→g→h in emission order: g and h each need exactly one (used
+        // before defined); f needs none (nothing calls f at all here).
+        let out = shir_to_c(&empty_prog(vec![
+            fn_named("tfn_f", vec![mention_caller("tfn_g")]),
+            fn_named("tfn_g", vec![mention_caller("tfn_h")]),
+            fn_named("tfn_h", vec![]),
+        ]));
+        for (name, want) in [("tfn_f", 0), ("tfn_g", 1), ("tfn_h", 1)] {
+            assert_eq!(proto_lines(&out, name), want, "protos for {name}:\n{out}");
+            assert_eq!(def_lines(&out, name), 1, "one def for {name}:\n{out}");
+        }
+        // kept prototypes precede their definitions
+        assert!(
+            proto_pos(&out, "tfn_g") < def_pos(&out, "tfn_g"),
+            "proto before def:\n{out}"
+        );
+    }
+
+    #[test]
+    fn shell_fn_prototype_reverse_chain_needs_none() {
+        // callees defined first: every use follows its definition.
+        let out = shir_to_c(&empty_prog(vec![
+            fn_named("tfn_h", vec![]),
+            fn_named("tfn_g", vec![]),
+            fn_named("tfn_f", vec![mention_caller("tfn_g")]),
+        ]));
+        for name in ["tfn_f", "tfn_g", "tfn_h"] {
+            assert_eq!(proto_lines(&out, name), 0, "no proto for {name}:\n{out}");
+            assert_eq!(def_lines(&out, name), 1, "one def for {name}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn shell_fn_prototype_mutual_recursion_needs_exactly_one() {
+        // No order avoids a forward edge in a cycle: exactly one
+        // prototype total (for the later-defined half), never two.
+        let out = shir_to_c(&empty_prog(vec![
+            fn_named("tfn_f", vec![mention_caller("tfn_g")]),
+            fn_named("tfn_g", vec![mention_caller("tfn_f")]),
+        ]));
+        assert_eq!(proto_lines(&out, "tfn_g"), 1, "cycle forward edge:\n{out}");
+        assert_eq!(proto_lines(&out, "tfn_f"), 0, "defined-first half:\n{out}");
+        for name in ["tfn_f", "tfn_g"] {
+            assert_eq!(def_lines(&out, name), 1, "one def for {name}:\n{out}");
+        }
     }
 
     #[test]
