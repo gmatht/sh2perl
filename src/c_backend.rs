@@ -4733,7 +4733,12 @@ impl Render {
                 return true;
             }
             match HEADERS.iter().find(|(h, _)| *h == hdr) {
-                Some((_, trigs)) => trigs.iter().any(|tr| full.contains(tr)),
+                // boundary-aware: a trigger must not be preceded by an
+                // identifier char (`sqrt(` must not match `_sh_isqrt(`;
+                // `stat(` must not match `fstat(` — those have their own
+                // entries). Plain substring matching kept headers alive
+                // on helper-nameocurrences alone.
+                Some((_, trigs)) => trigs.iter().any(|tr| trigger_used(&full, tr)),
                 None => true, // unknown header — keep
             }
         });
@@ -20616,6 +20621,28 @@ fn is_nonnull_helper_call(v: &str) -> bool {
                 i += 1;
             }
             return false;
+        }
+    }
+    false
+}
+
+/// Is `tr` used in `full` as its own symbol — an occurrence NOT preceded
+/// by an identifier char? (See trim_includes.)
+fn trigger_used(full: &str, tr: &str) -> bool {
+    let b = full.as_bytes();
+    let t = tr.as_bytes();
+    if t.is_empty() || t.len() > b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + t.len() <= b.len() {
+        if &b[i..i + t.len()] == t {
+            if i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+                return true;
+            }
+            i += t.len();
+        } else {
+            i += 1;
         }
     }
     false
