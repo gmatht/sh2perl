@@ -5107,7 +5107,13 @@ impl Render {
     /// definition would make the call an undefined symbol.
     /// The C signature for a shell function: lifted fns return their
     /// value and take real C params; everything else stays void(void).
-    fn fn_c_sig(&self, name: &str, fname: &str) -> String {
+    fn fn_c_sig(&self, name: &str, fname: &str, alias: &HashMap<usize, String>) -> String {
+        let pname = |i: usize| -> String {
+            alias
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| format!("_p{i}"))
+        };
         match self.lifted_fns.get(name) {
             None => format!("static void {fname}(void)"),
             Some(&0) => format!("static char *{fname}(void)"),
@@ -5117,7 +5123,7 @@ impl Render {
                     let params = (1..=n)
                         .map(|i| {
                             if self.native_num_fns.contains(name) {
-                                format!("long long _p{i}")
+                                format!("long long {}", pname(i))
                             } else {
                                 format!("mpz_t _p{i}")
                             }
@@ -5133,7 +5139,7 @@ impl Render {
                         (1..=n)
                             .map(|i| {
                                 if native {
-                                    format!("long long _p{i}")
+                                    format!("long long {}", pname(i))
                                 } else if big {
                                     format!("mpz_t _p{i}")
                                 } else {
@@ -5148,8 +5154,800 @@ impl Render {
         }
     }
 
+    /// Param-copy aliasing (t86 `n = (_p1)` → `all_factors(long long n)`):
+    /// for a lifted native-numeric fn, a positional param copied into a
+    /// same-typed local can lend the C parameter its name — iff the copy
+    /// is the local's ONLY static write, nothing mentions the local or
+    /// the param before the copy, and the local is Int-typed (numeric
+    /// reads renamed onto a Str-typed var would break). Returns the
+    /// alias map (1-based param idx → local) plus top-level body stmt
+    /// indices to drop (self-copies `X = (X)` and the local's single
+    /// Declare). Fail-closed: anything unproven keeps `_p{i}`.
+fn param_copy_alias(
+    vt: &HashMap<String, IrType>,
+    body: &[IrStmt],
+    arity: usize,
+) -> (HashMap<usize, String>, HashSet<usize>) {
+        // read-only array consumers (join/reduce/len/index/getVar)
+        // never write — mirror of the exotic-write lists elsewhere.
+        fn is_reader(func: &str) -> bool {
+            matches!(
+                func,
+                "sortedIntJoin"
+                    | "sortedBigintJoin"
+                    | "max"
+                    | "min"
+                    | "sum"
+                    | "arrayIndex"
+                    | "arrayItems"
+                    | "arrayLen"
+                    | "getVar"
+            )
+        }
+        // a bare positional read: `Var("3")` or `Arith(Var("3"))`.
+        fn copy_digit(expr: &IrExpr, arity: usize) -> Option<usize> {
+            let v = match expr {
+                IrExpr::Var(d, _) => d.clone(),
+                IrExpr::Arith(a) => match &**a {
+                    ArithAst::Var(d) => d.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let i: usize = v.parse().ok()?;
+            if i == 0 || i > arity {
+                return None;
+            }
+            Some(i)
+        }
+        // static writes of `x` anywhere in the body (fail-closed
+        // over-count: loops, nested functions, Decl-inits, for-vars,
+        // printf-v and unknown name-first calls all count).
+        fn count_writes(stmts: &[IrStmt], x: &str) -> usize {
+            fn expr_flags(e: &IrExpr, x: &str, n: &mut usize) {
+                match e {
+                    IrExpr::Call { func, args } => {
+                        if !is_reader(func) {
+                            if let Some(IrExpr::Str(s, _)) = args.first() {
+                                if s == x {
+                                    *n += 1;
+                                }
+                            }
+                        }
+                        for a in args {
+                            expr_flags(a, x, n);
+                        }
+                    }
+                    IrExpr::Array(items) => {
+                        for it in items {
+                            expr_flags(it, x, n);
+                        }
+                    }
+                    IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                        expr_flags(iter, x, n);
+                        expr_flags(elem, x, n);
+                        if let Some(c) = cond {
+                            expr_flags(c, x, n);
+                        }
+                    }
+                    IrExpr::BinOp { lhs, rhs, .. } => {
+                        expr_flags(lhs, x, n);
+                        expr_flags(rhs, x, n);
+                    }
+                    IrExpr::Interpolate(parts) => {
+                        for p in parts {
+                            if let InterpPart::Expr(xe) = p {
+                                expr_flags(xe, x, n);
+                            }
+                        }
+                    }
+                    IrExpr::Arith(a) => arith_flags(a, x, n),
+                    IrExpr::Object(props) => {
+                        for (_, v) in props {
+                            expr_flags(v, x, n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn arith_flags(a: &ArithAst, x: &str, n: &mut usize) {
+                match a {
+                    ArithAst::Bin { lhs, rhs, .. } => {
+                        arith_flags(lhs, x, n);
+                        arith_flags(rhs, x, n);
+                    }
+                    ArithAst::Un { arg, .. } => arith_flags(arg, x, n),
+                    ArithAst::Cond { test, then, else_, .. } => {
+                        arith_flags(test, x, n);
+                        arith_flags(then, x, n);
+                        arith_flags(else_, x, n);
+                    }
+                    ArithAst::Cast { arg, .. } => arith_flags(arg, x, n),
+                    ArithAst::Assign { var, rhs, .. } => {
+                        if var == x {
+                            *n += 1;
+                        }
+                        arith_flags(rhs, x, n);
+                    }
+                    ArithAst::IncDec { var, .. } => {
+                        if var == x {
+                            *n += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn stmts_flag(stmts: &[IrStmt], x: &str, n: &mut usize) {
+                for s in stmts {
+                    match s {
+                        IrStmt::Assign { targets, expr, .. } => {
+                            for t in targets {
+                                if t.var == x || t.var.split('[').next() == Some(x) {
+                                    *n += 1;
+                                }
+                                for ix in &t.indices {
+                                    expr_flags(ix, x, n);
+                                }
+                            }
+                            expr_flags(expr, x, n);
+                        }
+                        IrStmt::Declare { vars, init, .. } => {
+                            // a bare `local x` declares without writing;
+                            // an init writes.
+                            if init.is_some() && vars.iter().any(|d| d.name == x) {
+                                *n += 1;
+                            }
+                        }
+                        IrStmt::DeclareArray { var, elements, .. } => {
+                            if var == x {
+                                *n += 1;
+                            }
+                            for e in elements {
+                                expr_flags(e, x, n);
+                            }
+                        }
+                        IrStmt::Expr(e) => {
+                            // `printf -v x …` writes x.
+                            if let IrExpr::Call { func: _, args } = e {
+                                if is_printf_v_call(args) {
+                                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                                        if let Some(IrExpr::Str(sv, _)) = items.get(1) {
+                                            if sv == x {
+                                                *n += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            expr_flags(e, x, n);
+                        }
+                        IrStmt::Output { value, .. } => expr_flags(value, x, n),
+                        IrStmt::WriteFile { path, content, .. } => {
+                            expr_flags(path, x, n);
+                            expr_flags(content, x, n);
+                        }
+                        IrStmt::Return(e) | IrStmt::Exit(e) => {
+                            if let Some(v) = e {
+                                expr_flags(v, x, n);
+                            }
+                        }
+                        IrStmt::If { cond, then, elsifs, else_, .. } => {
+                            expr_flags(cond, x, n);
+                            stmts_flag(then, x, n);
+                            for (c, b) in elsifs {
+                                expr_flags(c, x, n);
+                                stmts_flag(b, x, n);
+                            }
+                            stmts_flag(else_, x, n);
+                        }
+                        IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                            expr_flags(cond, x, n);
+                            stmts_flag(body, x, n);
+                        }
+                        IrStmt::For { var, body, .. } => {
+                            if var == x {
+                                *n += 1;
+                            }
+                            stmts_flag(body, x, n);
+                        }
+                        IrStmt::ForInit { init, cond, step, body } => {
+                            stmts_flag(init, x, n);
+                            expr_flags(cond, x, n);
+                            stmts_flag(step, x, n);
+                            stmts_flag(body, x, n);
+                        }
+                        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                            stmts_flag(body, x, n);
+                            for e in excepts {
+                                stmts_flag(&e.body, x, n);
+                            }
+                            stmts_flag(else_body, x, n);
+                            stmts_flag(finally_body, x, n);
+                        }
+                        IrStmt::Case { discriminant, clauses, .. } => {
+                            expr_flags(discriminant, x, n);
+                            for c in clauses {
+                                stmts_flag(&c.body, x, n);
+                            }
+                        }
+                        IrStmt::Function { body, named_blocks, .. } => {
+                            // nested scope: its assigns still count
+                            // (fail-closed over-count).
+                            stmts_flag(body, x, n);
+                            for (_, b) in named_blocks {
+                                stmts_flag(b, x, n);
+                            }
+                        }
+                        IrStmt::Pipeline { stages, .. } => {
+                            for st in stages {
+                                stmts_flag(st, x, n);
+                            }
+                        }
+                        IrStmt::Select { clauses, .. } => {
+                            for c in clauses {
+                                stmts_flag(&c.body, x, n);
+                            }
+                        }
+                        IrStmt::Redirect { inner, .. } => stmts_flag(inner, x, n),
+                        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                            stmts_flag(b, x, n)
+                        }
+                        IrStmt::Exec { cmd, args, redirects, .. } => {
+                            expr_flags(cmd, x, n);
+                            for a in args {
+                                expr_flags(a, x, n);
+                            }
+                            for r in redirects {
+                                expr_flags(r, x, n);
+                            }
+                        }
+                        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                            expr_flags(expr, x, n);
+                        }
+                        IrStmt::SetChildError(e) => expr_flags(e, x, n),
+                        IrStmt::Ext(_) => {
+                            // opaque: assume the worst.
+                            *n += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut n = 0;
+            stmts_flag(stmts, x, &mut n);
+            n
+        }
+        // any MENTION (read or write) of `x` or the digit-param in the
+        // prefix — nested Function bodies are opaque scopes (their `$1`
+        // is their own), so whole subtrees are skipped there.
+        fn prefix_mentions(stmts: &[IrStmt], x: &str, digit: &str) -> bool {
+            fn expr_reads(e: &IrExpr, x: &str, digit: &str) -> bool {
+                match e {
+                    IrExpr::Var(v, _) | IrExpr::Ident(v) => v == x || v == digit,
+                    IrExpr::Str(s, _) => str_mentions(s, x) > 0,
+                    IrExpr::Call { func: _, args } => {
+                        args.iter().any(|a| expr_reads(a, x, digit))
+                    }
+                    IrExpr::Array(items) => items.iter().any(|i| expr_reads(i, x, digit)),
+                    IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                        expr_reads(iter, x, digit)
+                            || expr_reads(elem, x, digit)
+                            || cond.as_ref().is_some_and(|c| expr_reads(c, x, digit))
+                    }
+                    IrExpr::BinOp { lhs, rhs, .. } => {
+                        expr_reads(lhs, x, digit) || expr_reads(rhs, x, digit)
+                    }
+                    IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                        InterpPart::Expr(xe) => expr_reads(xe, x, digit),
+                        _ => false,
+                    }),
+                    IrExpr::Arith(a) => arith_reads(a, x, digit),
+                    IrExpr::Object(props) => props.iter().any(|(_, v)| expr_reads(v, x, digit)),
+                    _ => false,
+                }
+            }
+            fn arith_reads(a: &ArithAst, x: &str, digit: &str) -> bool {
+                match a {
+                    ArithAst::Var(v) | ArithAst::Ident(v) => v == x || v == digit,
+                    ArithAst::Bin { lhs, rhs, .. } => {
+                        arith_reads(lhs, x, digit) || arith_reads(rhs, x, digit)
+                    }
+                    ArithAst::Un { arg, .. } => arith_reads(arg, x, digit),
+                    ArithAst::Cond { test, then, else_, .. } => {
+                        arith_reads(test, x, digit)
+                            || arith_reads(then, x, digit)
+                            || arith_reads(else_, x, digit)
+                    }
+                    ArithAst::Cast { arg, .. } => arith_reads(arg, x, digit),
+                    ArithAst::Assign { var, rhs, .. } => {
+                        var == x || arith_reads(rhs, x, digit)
+                    }
+                    ArithAst::IncDec { var, .. } => var == x,
+                    ArithAst::Index { var, key } => {
+                        var == x || arith_reads(key, x, digit)
+                    }
+                    _ => false,
+                }
+            }
+            fn stmts_read(stmts: &[IrStmt], x: &str, digit: &str) -> bool {
+                for s in stmts {
+                    match s {
+                        IrStmt::Assign { targets, expr, .. } => {
+                            // a bare `local x` declares without reading.
+                            for t in targets {
+                                if t.var == x || t.var.contains('[') && t.var.split('[').next() == Some(x) {
+                                    return true;
+                                }
+                                for ix in &t.indices {
+                                    if expr_reads(ix, x, digit) {
+                                        return true;
+                                    }
+                                }
+                            }
+                            if expr_reads(expr, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Declare { vars, init, .. } => {
+                            // bare declares don't read; inits might.
+                            if let Some(e) = init {
+                                if expr_reads(e, x, digit) {
+                                    return true;
+                                }
+                            }
+                            let _ = vars;
+                        }
+                        IrStmt::DeclareArray { var, elements, .. } => {
+                            if var == x {
+                                return true;
+                            }
+                            if elements.iter().any(|e| expr_reads(e, x, digit)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Expr(e) => {
+                            if expr_reads(e, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Output { value, .. } => {
+                            if expr_reads(value, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::WriteFile { path, content, .. } => {
+                            if expr_reads(path, x, digit) || expr_reads(content, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Return(e) | IrStmt::Exit(e) => {
+                            if e.as_ref().is_some_and(|v| expr_reads(v, x, digit)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::If { cond, then, elsifs, else_, .. } => {
+                            if expr_reads(cond, x, digit)
+                                || stmts_read(then, x, digit)
+                                || stmts_read(else_, x, digit)
+                                || elsifs.iter().any(|(c, b)| {
+                                    expr_reads(c, x, digit) || stmts_read(b, x, digit)
+                                })
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                            if expr_reads(cond, x, digit) || stmts_read(body, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::For { var, body, .. } => {
+                            if var == x || stmts_read(body, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::ForInit { init, cond, step, body } => {
+                            if stmts_read(init, x, digit)
+                                || expr_reads(cond, x, digit)
+                                || stmts_read(step, x, digit)
+                                || stmts_read(body, x, digit)
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                            if stmts_read(body, x, digit)
+                                || stmts_read(else_body, x, digit)
+                                || stmts_read(finally_body, x, digit)
+                                || excepts.iter().any(|e| stmts_read(&e.body, x, digit))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Case { discriminant, clauses, .. } => {
+                            if expr_reads(discriminant, x, digit)
+                                || clauses.iter().any(|c| stmts_read(&c.body, x, digit))
+                            {
+                                return true;
+                            }
+                        }
+                        // nested scope: opaque (its `$1` is its own).
+                        IrStmt::Function { .. } => {}
+                        IrStmt::Pipeline { stages, .. } => {
+                            if stages.iter().any(|st| stmts_read(st, x, digit)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Select { clauses, .. } => {
+                            if clauses.iter().any(|c| stmts_read(&c.body, x, digit)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Redirect { inner, .. } => {
+                            if stmts_read(inner, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                            if stmts_read(b, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Exec { cmd, args, redirects, .. } => {
+                            if expr_reads(cmd, x, digit)
+                                || args.iter().any(|a| expr_reads(a, x, digit))
+                                || redirects.iter().any(|r| expr_reads(r, x, digit))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                            if expr_reads(expr, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::SetChildError(e) => {
+                            if expr_reads(e, x, digit) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Ext(_) => return true,
+                        _ => {}
+                    }
+                }
+                false
+            }
+            stmts_read(stmts, x, digit)
+        }
+        // array-ish refs of `x` anywhere (setArray/index/DeclareArray
+        // name it) disqualify — the local must be a plain scalar.
+        fn array_named(stmts: &[IrStmt], x: &str) -> bool {
+            fn expr_hit(e: &IrExpr, x: &str) -> bool {
+                match e {
+                    IrExpr::Call { func, args }
+                        if matches!(
+                            func.as_str(),
+                            "setArray"
+                                | "setArrayAppend"
+                                | "arrayIndex"
+                                | "arrayLen"
+                                | "arrayItems"
+                                | "sortedIntJoin"
+                                | "sortedBigintJoin"
+                                | "max"
+                                | "min"
+                                | "sum"
+                        ) =>
+                    {
+                        args.first().is_some_and(|a| matches!(a, IrExpr::Str(s, _) if s == x))
+                    }
+                    IrExpr::Call { func: _, args } => args.iter().any(|a| expr_hit(a, x)),
+                    IrExpr::Array(items) => items.iter().any(|i| expr_hit(i, x)),
+                    IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                        expr_hit(iter, x)
+                            || expr_hit(elem, x)
+                            || cond.as_ref().is_some_and(|c| expr_hit(c, x))
+                    }
+                    IrExpr::BinOp { lhs, rhs, .. } => expr_hit(lhs, x) || expr_hit(rhs, x),
+                    IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                        InterpPart::Expr(xe) => expr_hit(xe, x),
+                        _ => false,
+                    }),
+                    IrExpr::Arith(a) => arith_hit(a, x),
+                    IrExpr::Object(props) => props.iter().any(|(_, v)| expr_hit(v, x)),
+                    _ => false,
+                }
+            }
+            fn arith_hit(a: &ArithAst, x: &str) -> bool {
+                match a {
+                    ArithAst::Index { var, .. } => var == x,
+                    ArithAst::Bin { lhs, rhs, .. } => arith_hit(lhs, x) || arith_hit(rhs, x),
+                    ArithAst::Un { arg, .. } => arith_hit(arg, x),
+                    ArithAst::Cond { test, then, else_, .. } => {
+                        arith_hit(test, x) || arith_hit(then, x) || arith_hit(else_, x)
+                    }
+                    ArithAst::Cast { arg, .. } => arith_hit(arg, x),
+                    ArithAst::Assign { rhs, .. } => arith_hit(rhs, x),
+                    _ => false,
+                }
+            }
+            fn stmts_hit(stmts: &[IrStmt], x: &str) -> bool {
+                for s in stmts {
+                    match s {
+                        IrStmt::DeclareArray { var, .. } if var == x => return true,
+                        IrStmt::DeclareArray { elements, .. } => {
+                            if elements.iter().any(|e| expr_hit(e, x)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Assign { targets, expr, .. } => {
+                            for t in targets {
+                                if t.var.contains('[')
+                                    && t.var.split('[').next() == Some(x)
+                                {
+                                    return true;
+                                }
+                            }
+                            if expr_hit(expr, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Declare { init, .. } => {
+                            if init.as_ref().is_some_and(|e| expr_hit(e, x)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Expr(e)
+                        | IrStmt::Output { value: e, .. }
+                        | IrStmt::SetChildError(e) => {
+                            if expr_hit(e, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::WriteFile { path, content, .. } => {
+                            if expr_hit(path, x) || expr_hit(content, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Return(e) | IrStmt::Exit(e) => {
+                            if e.as_ref().is_some_and(|v| expr_hit(v, x)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::If { cond, then, elsifs, else_, .. } => {
+                            if expr_hit(cond, x)
+                                || stmts_hit(then, x)
+                                || stmts_hit(else_, x)
+                                || elsifs.iter().any(|(c, b)| expr_hit(c, x) || stmts_hit(b, x))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                            if expr_hit(cond, x) || stmts_hit(body, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::For { body, .. } => {
+                            if stmts_hit(body, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::ForInit { init, cond, step, body } => {
+                            if stmts_hit(init, x)
+                                || expr_hit(cond, x)
+                                || stmts_hit(step, x)
+                                || stmts_hit(body, x)
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                            if stmts_hit(body, x)
+                                || stmts_hit(else_body, x)
+                                || stmts_hit(finally_body, x)
+                                || excepts.iter().any(|e| stmts_hit(&e.body, x))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Case { discriminant, clauses, .. } => {
+                            if expr_hit(discriminant, x)
+                                || clauses.iter().any(|c| stmts_hit(&c.body, x))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Function { body, named_blocks, .. } => {
+                            if stmts_hit(body, x)
+                                || named_blocks.iter().any(|(_, b)| stmts_hit(b, x))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Pipeline { stages, .. } => {
+                            if stages.iter().any(|st| stmts_hit(st, x)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Select { clauses, .. } => {
+                            if clauses.iter().any(|c| stmts_hit(&c.body, x)) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Redirect { inner, .. } => {
+                            if stmts_hit(inner, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                            if stmts_hit(b, x) {
+                                return true;
+                            }
+                        }
+                        IrStmt::Exec { cmd, args, redirects, .. } => {
+                            if expr_hit(cmd, x)
+                                || args.iter().any(|a| expr_hit(a, x))
+                                || redirects.iter().any(|r| expr_hit(r, x))
+                            {
+                                return true;
+                            }
+                        }
+                        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                            if expr_hit(expr, x) {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            stmts_hit(stmts, x)
+        }
+        let mut alias: HashMap<usize, String> = HashMap::new();
+        let mut skip: HashSet<usize> = HashSet::new();
+        // first pass: the FIRST top-level copy per param wins the alias.
+        for (bi, st) in body.iter().enumerate() {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                if targets.len() != 1 {
+                    continue;
+                }
+                let t = &targets[0];
+                if !t.indices.is_empty() || t.var.contains('[') {
+                    continue;
+                }
+                if t.var.is_empty()
+                    || t.var.chars().all(|c| c.is_ascii_digit())
+                {
+                    continue;
+                }
+                if let Some(d) = copy_digit(expr, arity) {
+                    if !alias.contains_key(&d) {
+                        alias.insert(d, t.var.clone());
+                    }
+                }
+            }
+        }
+        // second pass: verify each alias, collecting skips.
+        let mut bad: HashSet<usize> = HashSet::new();
+        for (d, x) in &alias {
+            // Int-typed only: numeric reads renamed onto a Str var break.
+            if vt.get(x) != Some(&IrType::Int) {
+                bad.insert(*d);
+                continue;
+            }
+            // the copy is the ONLY static write (fail-closed over-count).
+            if count_writes(body, x) != 1 {
+                bad.insert(*d);
+                continue;
+            }
+            // array-ish refs disqualify (plain scalar only).
+            if array_named(body, x) {
+                bad.insert(*d);
+                continue;
+            }
+            // find the alias-defining copy (first top-level one).
+            let mut copy_idx: Option<usize> = None;
+            for (bi, st) in body.iter().enumerate() {
+                if let IrStmt::Assign { targets, expr, .. } = st {
+                    if targets.len() == 1
+                        && targets[0].var == *x
+                        && copy_digit(expr, arity) == Some(*d)
+                    {
+                        copy_idx = Some(bi);
+                        break;
+                    }
+                }
+            }
+            let Some(k) = copy_idx else {
+                bad.insert(*d);
+                continue;
+            };
+            // nothing may mention x or the param before the copy
+            // (bare declares excepted — declare-before-copy is the idiom).
+            let mut prefix_ok = true;
+            for st in &body[..k] {
+                if let IrStmt::Declare { vars, init: None, .. } = st {
+                    if vars.iter().any(|v| v.name == *x) {
+                        continue;
+                    }
+                }
+                if prefix_mentions(std::slice::from_ref(st), x, &d.to_string()) {
+                    prefix_ok = false;
+                    break;
+                }
+            }
+            if !prefix_ok {
+                bad.insert(*d);
+                continue;
+            }
+            // drop self-copies (`X = (X)` renders a no-op) and the
+            // local's single Declare (the parameter IS the declaration).
+            for (bi, st) in body.iter().enumerate() {
+                if let IrStmt::Assign { targets, expr, .. } = st {
+                    if targets.len() == 1
+                        && targets[0].var == *x
+                        && copy_digit(expr, arity) == Some(*d)
+                    {
+                        skip.insert(bi);
+                    }
+                }
+                if let IrStmt::Declare { vars, init: None, .. } = st {
+                    if vars.len() == 1 && vars[0].name == *x {
+                        skip.insert(bi);
+                    } else if vars.iter().any(|v| v.name == *x) {
+                        // multi-declare: can't drop partially.
+                        bad.insert(*d);
+                        break;
+                    }
+                }
+            }
+        }
+        for d in bad {
+            alias.remove(&d);
+        }
+        // drop skips of disqualified aliases.
+        let mut skip2: HashSet<usize> = HashSet::new();
+        for (bi, st) in body.iter().enumerate() {
+            if !skip.contains(&bi) {
+                continue;
+            }
+            match st {
+                IrStmt::Assign { targets, .. } => {
+                    if targets.first().is_some_and(|t| alias.values().any(|x| x == &t.var)) {
+                        skip2.insert(bi);
+                    }
+                }
+                IrStmt::Declare { vars, .. } => {
+                    if vars.len() == 1 && alias.values().any(|x| x == &vars[0].name) {
+                        skip2.insert(bi);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (alias, skip2)
+    }
+
     fn emit_function(&mut self, name: &str, body: &[IrStmt], main_vars: &BTreeSet<String>) {
         let fname = self.c_ident(name);
+        // param-copy aliasing (t86 `n = (_p1)` → the C parameter is
+        // named `n` directly): lifted native-numeric fns only. The
+        // alias targets are excluded from the hoisted locals below
+        // (the parameter IS their declaration) and their self-copies
+        // + single Declares are skipped during the body render.
+        let lifted_arity_top = self.lifted_fns.get(name).copied();
+        let (param_alias, param_skip) = if lifted_arity_top.is_some()
+            && self.native_num_fns.contains(name)
+        {
+            Self::param_copy_alias(&self.var_types, body, lifted_arity_top.unwrap_or(0))
+        } else {
+            (HashMap::new(), HashSet::new())
+        };
         // per-function temp namespace: reset the used-name set and the
         // `_cn` collision counter so names are stable across functions
         // (adding a variable in one function does not renumber another's).
@@ -5176,7 +5974,12 @@ impl Render {
             .filter(|v| {
                 // arrays hoist at file scope (the fn's += appends the
                 // GLOBAL — bash array semantics)
-                !main_vars.contains(*v) && !declared.contains(*v) && !self.arrays.contains(*v)
+                !main_vars.contains(*v)
+                    && !declared.contains(*v)
+                    && !self.arrays.contains(*v)
+                    // param-copy alias targets: the C parameter declares
+                    // them (a hoisted local would redeclare the param)
+                    && !param_alias.values().any(|x| x == *v)
             })
             .cloned()
             .collect();
@@ -5229,11 +6032,21 @@ impl Render {
         self.cur_bigint_param = lifted_arity.is_some() && self.bigint_param_fns.contains(name);
         self.cur_array_return_arr = self.array_return_arrays.get(name).cloned();
         if let Some(arity) = lifted_arity {
-            self.cur_params = (1..=arity).map(|i| format!("_p{i}")).collect();
+            self.cur_params = (1..=arity)
+                .map(|i| {
+                    param_alias
+                        .get(&i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("_p{i}"))
+                })
+                .collect();
         }
         let lifted = lifted_arity.is_some();
         let n_body = body.len();
         for (bi, st) in body.iter().enumerate() {
+            if param_skip.contains(&bi) {
+                continue; // param-copy self-copy or absorbed Declare
+            }
             if lifted && bi == n_body - 1 {
                 continue; // the echo → return, emitted below
             }
@@ -5429,7 +6242,7 @@ impl Render {
         }
         // forward declaration: a function may CALL another defined later
         // (nested defs are hoisted in collection order — 081 inner/outer)
-        let sig = self.fn_c_sig(name, &fname);
+        let sig = self.fn_c_sig(name, &fname, &param_alias);
         if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG sig {name}: {sig:?}"); }
         self.fn_fwd_decls.push(format!("{sig};"));
         self.emit(&format!("{sig} {{"));
@@ -25498,6 +26311,72 @@ mod tests {
             !out.contains("= _s"),
             "string temp stored into long long:\n{out}"
         );
+    }
+
+    #[test]
+    fn param_copy_alias_names_numeric_param() {
+        // t86 `n = (_p1)` → the C parameter is `long long n` directly:
+        // the copy is n's only write, nothing precedes it, n is Int.
+        use std::collections::{HashMap, HashSet};
+        use crate::ir::{ArithAst, IrType};
+        fn copy_body() -> Vec<IrStmt> {
+            vec![
+                IrStmt::Declare {
+                    vars: vec![crate::ir::Decl {
+                        name: "n".to_string(),
+                        sigil: None,
+                    }],
+                    init: None,
+                    local: true,
+                },
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "n".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Var("1".to_string()))),
+                    asm: None,
+                },
+                IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "%".to_string(),
+                    lhs: Box::new(ArithAst::Var("1".to_string())),
+                    rhs: Box::new(ArithAst::Var("i".to_string())),
+                }))),
+            ]
+        }
+        let mut vt = HashMap::new();
+        vt.insert("n".to_string(), IrType::Int);
+        let (alias, skip) = Render::param_copy_alias(&vt, &copy_body(), 1);
+        assert_eq!(alias.get(&1), Some(&"n".to_string()));
+        assert!(skip.contains(&0) && skip.contains(&1), "skip={skip:?}");
+        // reassigned later → no alias (renaming would read the new value).
+        let mut body = copy_body();
+        body.push(IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "n".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Int(5),
+            asm: None,
+        });
+        let (alias, _) = Render::param_copy_alias(&vt, &body, 1);
+        assert!(alias.is_empty(), "reassigned local aliased: {alias:?}");
+        // Str-typed local → no alias (numeric reads must not bind char*).
+        let mut vt2 = HashMap::new();
+        vt2.insert("n".to_string(), IrType::Str);
+        let (alias, _) = Render::param_copy_alias(&vt2, &copy_body(), 1);
+        assert!(alias.is_empty(), "Str local aliased: {alias:?}");
+        // param read before the copy → no alias (would read garbage).
+        let mut body = copy_body();
+        body.insert(
+            0,
+            IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::Var("1".to_string())))),
+        );
+        let (alias, _) = Render::param_copy_alias(&vt, &body, 1);
+        assert!(alias.is_empty(), "pre-copy read aliased: {alias:?}");
+        let _ = HashSet::<usize>::new();
     }
 
     #[test]
