@@ -2950,6 +2950,8 @@ impl Render {
     /// pointer would itself be UB.
     fn emit_guarded_copy(&mut self, name: &str, b: u64, rhs: &str) {
         let rhs_c = format!("(char*)({rhs})");
+        // the capacity number is known at emit time — fold `b + 1`
+        let cap = b + 1;
         // a vbuf member read (`_v12.p`) is a string too — the `.p`
         // breaks is_ident, and without this the bounded store drops
         // the value (emits `name[0] = 0`). Like a capture site, a vbuf
@@ -2964,6 +2966,17 @@ impl Render {
             || is_vbuf
             || is_ident(rhs);
         if stringy {
+            // A fitting string LITERAL needs neither the assert (strlen
+            // is known at emit time and within bound — provably true)
+            // nor the NUL store (strncpy pads short sources with NULs,
+            // so dst[b] is already 0). Only unescaped literals qualify
+            // (an escape's source length is not its strlen).
+            if let Some(lit) = unescaped_literal(rhs) {
+                if (lit.len() as u64) <= b {
+                    self.emit(&format!("strncpy({name}, {rhs_c}, {cap});"));
+                    return;
+                }
+            }
             // The DEBUG assert is a tripwire for bounded SOURCES (string
             // literals, other fixed buffers). A capture site's output is
             // NOT reliably bounded by the length analysis (sha256sum
@@ -2973,7 +2986,7 @@ impl Render {
             if !rhs.starts_with("_cap_") && !rhs.starts_with("sh2_") && !is_vbuf {
                 self.emit(&format!("assert(strlen({rhs_c}) <= {b});"));
             }
-            self.emit(&format!("strncpy({name}, {rhs_c}, {b} + 1);"));
+            self.emit(&format!("strncpy({name}, {rhs_c}, {cap});"));
             self.emit(&format!("{name}[{b}] = '\\0';"));
         } else {
             self.emit(&format!("{name}[0] = '\\0';"));
@@ -5228,9 +5241,16 @@ impl Render {
     }
 
     /// Emit the DEBUG-ONLY length invariants (assert, NDEBUG-out) for the
-    /// bounded vars among `vars` — at function boundaries.
+    /// bounded vars among `vars` — at function boundaries. Const-lifted
+    /// vars (`const char v[N] = "lit"`) are skipped: their contents can
+    /// never change (any write is a compile error, and the Assign path
+    /// returns early for them), and an over-long literal wouldn't have
+    /// compiled — the invariant is true by construction.
     fn emit_bound_asserts(&mut self, vars: &BTreeSet<String>) {
         for v in vars {
+            if self.const_lifted.contains(v) {
+                continue;
+            }
             if let Some(b) = self.buf_bound(v) {
                 let name = self.c_ident(v);
                 self.emit(&format!("if ({name}) assert(strlen({name}) <= {b});"));
@@ -10758,14 +10778,6 @@ fn param_copy_alias(
                 // positionals — the swap is unobservable, omitted.
                 self.need_sh = true;
                 let n = words.len() + 1;
-                let av = format!("_sh_av{}", self.temp_seq);
-                self.temp_seq += 1;
-                self.emit(&format!("char *{av}[{}];", n.max(2)));
-                self.emit(&format!("{av}[0] = {};", Self::cstr(&cmd)));
-                for (i, w) in words.iter().enumerate() {
-                    let v = self.value_c(w);
-                    self.emit(&format!("{av}[{}] = {v};", i + 1));
-                }
                 if let Some(&arity) = self.lifted_fns.get(&cmd) {
                     // LIFTED fn: plain C call with the args as params
                     let native = self.native_num_fns.contains(&cmd);
@@ -10787,6 +10799,16 @@ fn param_copy_alias(
                 } else if self.pos_const {
                     format!("({}(), _sh_rc == 0)", self.c_ident(&cmd))
                 } else {
+                    // only the argv-swapping call needs the array (lifted
+                    // and pos_const calls never read it — item PYC_OPT/4)
+                    let av = format!("_sh_av{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    self.emit(&format!("char *{av}[{}];", n.max(2)));
+                    self.emit(&format!("{av}[0] = {};", Self::cstr(&cmd)));
+                    for (i, w) in words.iter().enumerate() {
+                        let v = self.value_c(w);
+                        self.emit(&format!("{av}[{}] = {v};", i + 1));
+                    }
                     let sv = format!("_sh_sv{}", self.temp_seq);
                     self.temp_seq += 1;
                     self.emit(&format!("char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;", self.temp_seq));
@@ -20646,6 +20668,27 @@ fn trigger_used(full: &str, tr: &str) -> bool {
         }
     }
     false
+}
+
+/// A `"..."` literal with no escapes (source length − 2 == strlen)?
+/// Strips `(char*)` casts first (`(char*)("yes")`). Returns the inner
+/// text for length checks. Used by emit_guarded_copy.
+fn unescaped_literal(rhs: &str) -> Option<String> {
+    let mut s = rhs.trim();
+    loop {
+        if let Some(rest) = s.strip_prefix("(char*)") {
+            s = rest.trim_start();
+        } else {
+            break;
+        }
+    }
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner = &s[1..s.len() - 1];
+        if !inner.contains(['\\', '"']) {
+            return Some(inner.to_string());
+        }
+    }
+    None
 }
 
 /// main() prologue line? (see trim_main_prologue)
