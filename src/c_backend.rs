@@ -6437,6 +6437,10 @@ impl Render {
                 ],
             ),
             (
+                "<fcntl.h>",
+                &["open(", "O_WRONLY", "O_RDONLY", "O_CREAT"],
+            ),
+            (
                 "<unistd.h>",
                 &[
                     "chdir(", "getcwd(", "access(", "unlink(", "rmdir(", "getpid(",
@@ -19032,7 +19036,88 @@ fn param_copy_alias(
         out
     }
 
+    /// NATIVE `exec` fd-redirection (`exec 3>&1`, `exec 2>file`):
+    /// a shell-out child would set fds only for itself (lost on exit).
+    /// dup2/open in-process so later children inherit them (BASHC_FIX
+    /// parse-invalid-redirect). Bare `exec` (no command args) only;
+    /// `exec cmd ...` (replace) falls through. Returns true if handled.
+    fn try_native_exec_dup(&mut self, s: &IrStmt) -> bool {
+        let IrStmt::Redirect { inner, redirects } = s else {
+            return false;
+        };
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else {
+            return false;
+        };
+        if !(func == "exec" || func == "builtin") {
+            return false;
+        }
+        // bare exec: first arg "exec", array empty or absent
+        let is_bare = match (Self::str_arg(args, 0).as_deref(), args.get(1)) {
+            (Some("exec"), None) => true,
+            (Some("exec"), Some(IrExpr::Array(items))) if items.is_empty() => true,
+            _ => false,
+        };
+        if !is_bare || redirects.is_empty() {
+            return false;
+        }
+        // every redirect must be a fd-dup or file (no heredoc/procsub)
+        for rd in redirects {
+            let fd = rd.fd.unwrap_or(1);
+            match rd.mode.as_str() {
+                "w" | "a" | "r" => {}
+                _ => return false,
+            }
+            // fd-dup target `&N`/`&-`, else a file path (Str only)
+            match &rd.target {
+                IrExpr::Str(t, _) => {
+                    if !(t.starts_with('&') || !t.is_empty()) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            if !(0..=9).contains(&fd) {
+                return false;
+            }
+        }
+        self.need_sh = true;
+        for rd in redirects {
+            let fd = rd.fd.unwrap_or(1);
+            let target = match &rd.target {
+                IrExpr::Str(t, _) => t.clone(),
+                _ => continue,
+            };
+            if let Some(dup) = target.strip_prefix('&') {
+                if dup == "-" {
+                    self.emit(&format!("close({fd}); _sh_rc = 0;"));
+                } else if let Ok(n) = dup.parse::<i32>() {
+                    self.emit(&format!(
+                        "dup2({n}, {fd}); _sh_rc = 0;"
+                    ));
+                } else {
+                    return false;
+                }
+            } else {
+                // file target: value_c for expansions (usually literal)
+                let t = self.value_c(&rd.target);
+                let (flags, mode) = match rd.mode.as_str() {
+                    "a" => ("O_WRONLY | O_CREAT | O_APPEND", "0600"),
+                    "r" => ("O_RDONLY", "0"),
+                    _ => ("O_WRONLY | O_CREAT | O_TRUNC", "0600"),
+                };
+                self.emit(&format!(
+                    "{{ int _efd = open({t}, {flags}, {mode}); if (_efd >= 0) {{ dup2(_efd, {fd}); close(_efd); _sh_rc = 0; }} else _sh_rc = 1; }}"
+                ));
+            }
+        }
+        true
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
+        // bare-`exec` fd setup runs in-process (dup2), never a child.
+        if self.try_native_exec_dup(s) {
+            return;
+        }
         // `while IFS= read -r line && [ -n "$line" ] && (( … )); do … done
         //   < F | < <(producer)` — NATIVE streaming read loop. The child-
         // text form loses every variable the body assigns (shell state
