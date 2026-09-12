@@ -2930,6 +2930,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // `(_sh_rc = N, CONST);` with live rc → `_sh_rc = N;`
     // (BASHC_OPT item 58; dead-rc whole drops are item 19's)
     r.drop_live_comma_tail();
+    // pipeline-result double-eval bind (BASHC_OPT item 65)
+    r.bind_pipeline_once();
     // `} else {` + `}` (empty else) → `}` (BASHC_OPT item 46;
     // runs after the rc strip, which empties dead-rc-only elses)
     r.drop_empty_else();
@@ -5354,12 +5356,22 @@ impl Render {
                     break;
                 };
                 let inner = cur[inner_start..close].trim();
-                let unfolded = if inner.starts_with('"') {
+                // Quoted C literals unfold (escapes resolved); bare
+                // idents/vars pass through (a digitless NAME like `x`
+                // is a variable, not a zero — item 64 fires on quoted
+                // literals only).
+                let quoted = inner.starts_with('"');
+                let unfolded = if quoted {
                     Self::unescape_cstr(inner)
                 } else {
                     inner.to_string()
                 };
                 let folded = if unfolded.is_empty() {
+                    Some("0".to_string())
+                } else if quoted && !unfolded.bytes().any(|c| c.is_ascii_digit()) {
+                    // BASHC_OPT item 64: no ASCII digit anywhere ⟹ C
+                    // performs no conversion ⟹ atoll returns 0
+                    // (leading space/sign can't conjure digits).
                     Some("0".to_string())
                 } else {
                     unfolded.parse::<i64>().ok().map(|n| n.to_string())
@@ -5823,6 +5835,198 @@ impl Render {
             *line = format!("{indent}{head};");
         }
     }
+
+    /// BASHC_OPT item 65: `_sh_vgrow(&D, strlen(E) + 1);`
+    /// `strcpy(D.p, E);` with E containing a `_sh_pipeline(` call
+    /// evaluates the pipeline TWICE (two forks; nondeterministic
+    /// bodies double side effects). Bind once (`const char *_ppN`)
+    /// — the pointer is stable across the two adjacent uses (no
+    /// intervening pipeline call), and E runs before the vgrow in
+    /// both shapes. Gate: adjacent same-indent pair, identical E,
+    /// E free of D (no self-materialize).
+    fn bind_pipeline_once(&mut self) {
+        // Split a line into `;`-separated statements (depth- and
+        // quote-aware; None if a `;` hides in a string — bail).
+        // Returns (segments, trailing-semi?) so the line rebuilds
+        // exactly when no pair fires.
+        fn split_stmts(line: &str) -> Option<(Vec<String>, bool)> {
+            let b = line.as_bytes();
+            let mut depth = 0usize;
+            let mut instr = false;
+            let mut inch = false;
+            let mut cur = String::new();
+            let mut segs = Vec::new();
+            let mut i = 0;
+            while i < b.len() {
+                let ch = b[i] as char;
+                if instr {
+                    if ch == '\\' {
+                        cur.push(ch);
+                        i += 1;
+                        if i < b.len() {
+                            cur.push(b[i] as char);
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if ch == '"' {
+                        instr = false;
+                    }
+                    cur.push(ch);
+                } else if inch {
+                    if ch == '\'' {
+                        inch = false;
+                    }
+                    cur.push(ch);
+                } else if ch == '"' {
+                    instr = true;
+                    cur.push(ch);
+                } else if ch == '\'' {
+                    inch = true;
+                    cur.push(ch);
+                } else if ch == '(' {
+                    depth += 1;
+                    cur.push(ch);
+                } else if ch == ')' {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    cur.push(ch);
+                } else if ch == ';' && depth == 0 {
+                    segs.push(cur);
+                    cur = String::new();
+                } else {
+                    cur.push(ch);
+                }
+                i += 1;
+            }
+            if depth != 0 || instr || inch {
+                return None;
+            }
+            let trailing = line.trim_end().ends_with(';');
+            segs.push(cur);
+            Some((segs, trailing))
+        }
+        // Try to fuse one vgrow+strcpy pair; returns the rewritten
+        // line pair (or single line) on success.
+        // Shared pair check: `vgrowseg` = `_sh_vgrow(&D,
+        // strlen(E) + 1)` and `cpyseg` = `strcpy(D.p, E)` (no trailing
+        // `;`) fuse to a `_ppN` bind + rebound pair. Returns the three
+        // replacement segments.
+        fn fuse_pair(vgrowseg: &str, cpyseg: &str, seq: &mut usize) -> Option<(String, String, String)> {
+            let rest = vgrowseg.strip_prefix("_sh_vgrow(&")?;
+            let (dst, r2) = rest.split_once(", strlen(")?;
+            let dst = dst.strip_prefix('&').unwrap_or(dst);
+            // E runs to the `)` balancing strlen's open (depth starts
+            // at 1 — a suffix-strip breaks when E itself ends in `)`,
+            // e.g. a `_sh_pipeline(...)` call).
+            let bb = r2.as_bytes();
+            let mut dd = 1usize;
+            let mut instr = false;
+            let mut k = 0;
+            let mut e_end = None;
+            while k < bb.len() {
+                let ch = bb[k] as char;
+                if instr {
+                    if ch == '\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if ch == '"' {
+                        instr = false;
+                    }
+                } else if ch == '"' {
+                    instr = true;
+                } else if ch == '(' {
+                    dd += 1;
+                } else if ch == ')' {
+                    dd -= 1;
+                    if dd == 0 {
+                        e_end = Some(k);
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            let e_end = e_end?;
+            let e = &r2[..e_end];
+            if r2[e_end..].trim_start() != ") + 1)" && r2[e_end..].trim_start() != ") + 1);" {
+                return None;
+            }
+            if !e.contains("_sh_pipeline(") || e.contains(dst) {
+                return None;
+            }
+            if cpyseg.trim_end_matches(';').trim() != format!("strcpy({dst}.p, {e})") {
+                return None;
+            }
+            let t = format!("_pp{}", *seq);
+            *seq += 1;
+            Some((
+                format!("const char *{t} = {e}"),
+                format!("_sh_vgrow(&{dst}, strlen({t}) + 1)"),
+                format!("strcpy({dst}.p, {t})"),
+            ))
+        }
+        let mut i = 0;
+        while i < self.out.len() {
+            // owned copies: the rewrite below needs &mut self.out.
+            let line = self.out[i].clone();
+            let ind = line[..line.len() - line.trim_start().len()].to_string();
+            let mut fired = false;
+            let mut consumed_two = false;
+            // (1) same-line adjacent segments (`;`-separated).
+            if let Some((segs, trailing)) = split_stmts(&line) {
+                let mut out_segs: Vec<String> = Vec::with_capacity(segs.len());
+                let mut j = 0;
+                let mut changed = false;
+                while j < segs.len() {
+                    if j + 1 < segs.len() {
+                        if let Some((d, g, c)) =
+                            fuse_pair(segs[j].trim(), segs[j + 1].trim(), &mut self.temp_seq)
+                        {
+                            let lead = segs[j][..segs[j].len() - segs[j].trim_start().len()].to_string();
+                            out_segs.push(format!("{lead}{d}"));
+                            out_segs.push(format!("{lead}{g}; {c}"));
+                            changed = true;
+                            j += 2;
+                            continue;
+                        }
+                    }
+                    out_segs.push(segs[j].clone());
+                    j += 1;
+                }
+                if changed {
+                    let mut joined = out_segs.join("; ");
+                    if trailing {
+                        joined.push(';');
+                    }
+                    self.out[i] = format!("{ind}{}", joined.trim_start());
+                    fired = true;
+                }
+            }
+            // (2) two-line pair (same indent, adjacent lines).
+            if !fired && i + 1 < self.out.len() {
+                let a = self.out[i].trim().to_string();
+                let b = self.out[i + 1].trim().to_string();
+                let ind_b = self.out[i + 1][..self.out[i + 1].len() - self.out[i + 1].trim_start().len()]
+                    .to_string();
+                if ind == ind_b {
+                    if let Some((d, g, c)) = fuse_pair(
+                        a.strip_suffix(';').unwrap_or(&a),
+                        b.strip_suffix(';').unwrap_or(&b),
+                        &mut self.temp_seq,
+                    ) {
+                        self.out[i] = format!("{ind}{d};");
+                        self.out[i + 1] = format!("{ind}{g}; {c};");
+                        consumed_two = true;
+                        fired = true;
+                    }
+                }
+            }
+            i += if fired { if consumed_two { 2 } else { 1 } } else { 1 };
+        }
+        }
 
     fn drop_exit_comma(&mut self) {
         for line in self.out.iter_mut() {
@@ -12242,7 +12446,7 @@ fn param_copy_alias(
                             // the guard would have run it twice).
                             // (Negated single test: the hoist arm below
                             // keeps every other shape.)
-                            if !(n_fx == 1 && is_bare_cap_call(v))
+                            if !(n_fx == 1 && is_nonnull_helper_call(v))
                                 && (v.contains("_cap_")
                                 || v.contains("_sh_pipeline(")
                                 || v.contains("_sh_call_fn(")
@@ -15865,15 +16069,29 @@ fn param_copy_alias(
         if std::env::var("SH2_DBG_PARAMS").is_ok() {
             eprintln!("DBG pre-match op={op:?} vexpr_arrget={}", var_expr.contains("_sh_arr_get"));
         }
+        // BASHC_OPT item 63: `(V && V[0])` with V a proven-nonnull
+        // bare ident → `(V[0])` (the && only guards NULL via
+        // short-circuit; the emptiness test stays). `_dN` hoists
+        // land in `nonnull` via item 24's chain registration.
+        let vt = var_expr.trim();
+        let nonempty_test = if !vt.is_empty()
+            && vt.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            && !vt.bytes().next().is_some_and(|c| c.is_ascii_digit())
+            && (self.nonnull.contains(vt) || self.nonnull_var.contains(vt))
+        {
+            format!("(({vt})[0])")
+        } else {
+            format!("(({var_expr}) && ({var_expr})[0])")
+        };
         match op.as_str() {
             "" => var_expr,
             "-" => format!("(({var_expr}) ? ({var_expr}) : ({val}))"),
-            ":-" => format!("((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : ({val}))"),
+            ":-" => format!("({nonempty_test} ? ({var_expr}) : ({val}))"),
             ":?" => format!(
-                "((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : (fprintf(stderr, \"%s\\n\", {val}), exit(1), (char*)0))"
+                "({nonempty_test} ? ({var_expr}) : (fprintf(stderr, \"%s\\n\", {val}), exit(1), (char*)0))"
             ),
             "=" | ":=" => {
-                let v = format!("((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : ({val}))");
+                let v = format!("({nonempty_test} ? ({var_expr}) : ({val}))");
                 if self.is_num(&name) || name.is_empty() {
                     v
                 } else if let Some(_b) = self.buf_bound(&name) {
@@ -23542,7 +23760,10 @@ fn is_nonnull_helper_call(v: &str) -> bool {
     if is_bare_cap_call(s) {
         return true;
     }
-    for h in ["_sh_assoc_get(", "_sh_arr_get("] {
+    // BASHC_OPT item 66: `_sh_call_fn(...)` returns post-vgrow
+    // `vb->p` (same proof as `_cap_N`) — exact-balance check via
+    // the shared loop below.
+    for h in ["_sh_assoc_get(", "_sh_arr_get(", "_sh_call_fn("] {
         if let Some(rest) = s.strip_prefix(h) {
         // exactly the call: parens balance with the final `)`
         // closing the helper's own paren — anything trailing
@@ -32708,6 +32929,37 @@ mod tests {
         assert!(!is_bare_cap_call("_cap_0(x)"));
         assert!(is_nonnull_helper_call("_cap_3()"));
         assert!(!is_nonnull_helper_call("_cap_3() , x"));
+    }
+
+    #[test]
+    fn bashc_opt_round8_post_passes() {
+        // Item 64: digitless atoll literals fold to 0 (via the
+        // atoll post-pass); digit-ful non-Rust shapes keep the call.
+        let mut r = Render::default();
+        r.out = vec![
+            "    x = (long long)atoll(\"index\");".to_string(),
+            "    y = (long long)atoll(\"10x\");".to_string(),
+        ];
+        r.fold_atoll_consts();
+        assert!(r.out[0].ends_with("(long long)0;"), "digitless kept: {}", r.out[0]);
+        assert!(r.out[1].contains("atoll"), "prefix-digits folded: {}", r.out[1]);
+        // Item 65: adjacent vgrow+strcpy over one pipeline call
+        // binds once; mismatched pairs keep the shape.
+        let mut r = Render::default();
+        r.out = vec![
+            "    _sh_vgrow(&_sp3, strlen(_sh_pipeline(_sp1, 2, &_pipe1)) + 1);".to_string(),
+            "    strcpy(_sp3.p, _sh_pipeline(_sp1, 2, &_pipe1));".to_string(),
+            "    _sh_vgrow(&_a, strlen(_sh_pipeline(_sp1, 2, &_pipe1)) + 1);".to_string(),
+            "    strcpy(_b.p, _sh_pipeline(_sp1, 2, &_pipe1));".to_string(),
+        ];
+        r.bind_pipeline_once();
+        assert!(r.out[0].contains("_pp0 = _sh_pipeline"), "not bound: {}", r.out[0]);
+        assert!(r.out[1].contains("_pp0"), "use not rebound: {}", r.out[1]);
+        assert!(r.out[2].contains("strlen(_sh_pipeline"), "mismatch bound: {}", r.out[2]);
+        // Item 66: `_sh_call_fn(...)` exact-balance calls prove
+        // non-NULL; trailing content refuses.
+        assert!(is_nonnull_helper_call("_sh_call_fn(f, av, 2, &vb)"));
+        assert!(!is_nonnull_helper_call("_sh_call_fn(f, av, 2, &vb) , x"));
     }
 
     #[test]
