@@ -1030,6 +1030,31 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
         .retain(|(n, t)| *t != crate::ir::IrType::Int || int_set.contains(n));
 }
 
+/// Collect every `/`/`%` divisor subexpression in an ArithAst
+/// (for div-zero assign skip — BASHC_FIX extra-paren).
+fn arith_divisors(a: &crate::ir::ArithAst, out: &mut Vec<crate::ir::ArithAst>) {
+    use crate::ir::ArithAst as A;
+    match a {
+        A::Bin { op, lhs, rhs } => {
+            if op == "/" || op == "%" {
+                out.push((**rhs).clone());
+            }
+            arith_divisors(lhs, out);
+            arith_divisors(rhs, out);
+        }
+        A::Un { arg, .. } => arith_divisors(arg, out),
+        A::Cond { test, then, else_, .. } => {
+            arith_divisors(test, out);
+            arith_divisors(then, out);
+            arith_divisors(else_, out);
+        }
+        A::Index { key, .. } => arith_divisors(key, out),
+        A::Assign { rhs, .. } => arith_divisors(rhs, out),
+        A::IncDec { .. } | A::Num(_) | A::Var(_) | A::Ident(_) => {}
+        _ => {}
+    }
+}
+
 fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
     let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let bigint_vars = analyze_bigint_vars(prog);
@@ -20269,6 +20294,26 @@ fn param_copy_alias(
                         rhs
                     };
                     let rhs = self.apply_case_fold(&t.var, rhs);
+                    // DIV-ZERO SKIP (BASHC_FIX extra-paren): Arith RHS
+                    // trapping on div/mod-by-zero skips the assign (var
+                    // keeps old value, rc nonzero) — guarded-0 + store
+                    // corrupts (`x=[0]` vs `x=[]`).
+                    let mut div_else = false;
+                    if let IrExpr::Arith(a) = expr {
+                        let mut divs = Vec::new();
+                        arith_divisors(a, &mut divs);
+                        if !divs.is_empty() {
+                            let mut cs = Vec::new();
+                            for d in &divs {
+                                cs.push(format!("({}) == 0", self.arith(d)));
+                            }
+                            self.emit(&format!(
+                                "if ({}) {{ _sh_rc = 1; }} else {{",
+                                cs.join(" || ")
+                            ));
+                            div_else = true;
+                        }
+                    }
                     self.emit_guarded_copy(&name, b, &rhs);
                     // P1 follow-up: a fixed buffer address is never NULL
                     // (plus fn-written gate: calls might observe it).
@@ -20276,6 +20321,9 @@ fn param_copy_alias(
                         self.nonnull_var.insert(name.clone());
                     }
                     self.emit_export_var(&t.var);
+                    if div_else {
+                        self.emit("}");
+                    }
                     return;
                 }
                 let is_num = self.is_num(&t.var);
