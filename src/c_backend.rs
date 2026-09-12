@@ -495,6 +495,16 @@ pub struct Render {
     cur_param_args: Vec<IrExpr>,
     /// array names (indexed arrays: `char* name[N]` + `name_len`)
     arrays: BTreeSet<String>,
+    /// arrays with emitted file-scope storage, snapshotted when the
+    /// decl block runs (pre-main-render). Reads first seen AFTER that
+    /// point (backend text-parsed refs like `${arr[@]:0:2}` in defaults)
+    /// are provably never assigned — assignments pre-register via the
+    /// analyses — so they read as empty instead of referencing
+    /// undeclared storage (BASHC_FIX discovery-order hole). The bool
+    /// distinguishes "decls ran" (enforce) from direct-call unit
+    /// flows (decls never run — old path).
+    array_declared: BTreeSet<String>,
+    array_decls_done: bool,
     /// int-typed arrays (every element provably a 64-bit integer, only
     /// consumed by sortedIntJoin/sortedBigintJoin): stored as
     /// `long long name[N]` + `name_len` instead of `char* name[N]`
@@ -3412,6 +3422,12 @@ impl Render {
             self.runtime_start = self.out.len();
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
+            // return-echo gate (BASHC_FIX §2.2): statement/condition
+            // callers bump this around the call so `return N` sets
+            // status without printing; capture/fnValue leaves it zero
+            // and reads the echo as the value. Trimmed with the
+            // runtime when unreferenced.
+            self.emit("static int _sh_noecho = 0;");
         if !self.pos_const {
             self.emit("static int _sh_argc = 0;");
             self.emit("static char **_sh_argv = 0;");
@@ -5536,8 +5552,20 @@ impl Render {
                 if *b { "1".into() } else { "0".into() }
             }
             IrExpr::BinOp { lhs, op, rhs } => {
+                // `&&`/`||` consume operand TRUTHINESS: render them as
+                // values (BASHC_FIX §2.4 — a discarded-form echo operand
+                // evaluates to 0/falsy). Other families ignore the flag.
+                let chain = matches!(
+                    op,
+                    crate::ir::BinOpKind::And | crate::ir::BinOpKind::Or
+                );
+                let was_discarded = self.value_discarded;
+                if chain {
+                    self.value_discarded = false;
+                }
                 let l = self.expr(lhs);
                 let r = self.expr(rhs);
+                self.value_discarded = was_discarded;
                 let c_op = match op {
                     crate::ir::BinOpKind::Add => "+",
                     crate::ir::BinOpKind::Sub => "-",
@@ -9934,6 +9962,130 @@ fn param_copy_alias(
         }
     }
 
+    /// Infinite-producer heuristic for process substitution
+    /// (BASHC_FIX §2.7): any `while`/`until` loop at any depth, or a
+    /// bare `yes` command. Over-detection is safe (FIFO+background is
+    /// correct for finite producers too); under-detection hangs the
+    /// synchronous tempfile write.
+    fn ps_producer_infinite(stmts: &[IrStmt]) -> bool {
+        for s in stmts {
+            match s {
+                IrStmt::While { .. } | IrStmt::DoWhile { .. } => return true,
+                // `until` without a body check: model like while (any
+                // loop may not terminate — background stays correct).
+                _ if matches!(s, IrStmt::ForInit { .. }) => return true,
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if Self::ps_producer_infinite(then)
+                        || Self::ps_producer_infinite(else_)
+                    {
+                        return true;
+                    }
+                    for (_, b) in elsifs {
+                        if Self::ps_producer_infinite(b) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::For { body, .. } => {
+                    if Self::ps_producer_infinite(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    if Self::ps_producer_infinite(inner) {
+                        return true;
+                    }
+                }
+                IrStmt::Block(inner) => {
+                    if Self::ps_producer_infinite(inner) {
+                        return true;
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if func == "exec" || func == "builtin" =>
+                {
+                    if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                        if cmd == "yes" {
+                            return true;
+                        }
+                    }
+                    // captures may hide loops (`$(while true …)`)
+                    for a in args {
+                        if let IrExpr::Arrow(body) = a {
+                            if Self::ps_producer_infinite(body) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                IrStmt::Expr(e) => {
+                    // arrows nested in other exprs (defaults, and/or)
+                    let mut stack = vec![e];
+                    while let Some(x) = stack.pop() {
+                        match x {
+                            IrExpr::Call { args, .. } => {
+                                for a in args {
+                                    if let IrExpr::Arrow(body) = a {
+                                        if Self::ps_producer_infinite(body) {
+                                            return true;
+                                        }
+                                    } else {
+                                        stack.push(a);
+                                    }
+                                }
+                            }
+                            IrExpr::Array(items) => {
+                                for i in items {
+                                    stack.push(i);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Tmp names for a procsub-cleanup `rm` (BASHC_FIX §2.7): Some(list)
+    /// iff every non-flag word is a `__ps_tmp*` ref (Var/Ident, or exact
+    /// Str text). Anything else → None (ordinary rm keeps old path).
+    /// Takes Exec-args words directly (no cmd element).
+    fn ps_cleanup_tmps(words: &[&IrExpr]) -> Option<Vec<String>> {
+        let mut tmps = Vec::new();
+        for w in words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') => {}
+                IrExpr::Str(s, _) if s.contains("__ps_tmp") => {
+                    // literal text mentioning the tmp — take the whole
+                    // word only if it IS the tmp (no other content)
+                    if s.starts_with("__ps_tmp")
+                        && s["__ps_tmp".len()..]
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        tmps.push(s.clone());
+                    } else {
+                        return None;
+                    }
+                }
+                IrExpr::Var(n, _) if n.starts_with("__ps_tmp") => {
+                    tmps.push(n.clone());
+                }
+                IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+                    tmps.push(n.clone());
+                }
+                _ => return None,
+            }
+        }
+        if tmps.is_empty() {
+            return None;
+        }
+        Some(tmps)
+    }
+
     fn sh_stage(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
         // track what THIS stage assigns (child-owned vars — see the
         // field docs); nested sh_stage calls scope their own set
@@ -10193,13 +10345,17 @@ fn param_copy_alias(
                 }
                 IrStmt::Redirect { inner, redirects } => {
                     // process-substitution temp: the producer's redirect
-                    // target is a `__ps_` var. For FINITE producers
-                    // (no yes/while-true), write to a TEMP FILE
-                    // synchronously — simpler than FIFOs and correct.
-                    // Only fall back to FIFO+background for infinite ones.
-                    // FINITE producers write SYNCHRONOUSLY to temp files —
-                    // simpler than FIFOs and correct for any downstream
-                    // consumer including head/tail early-exit
+                    // target is a `__ps_` var. For FINITE producers,
+                    // write to a TEMP FILE synchronously — simpler than
+                    // FIFOs and correct for any downstream consumer
+                    // including head/tail early-exit. INFINITE producers
+                    // (any `while`/`until` at any depth, or bare `yes`)
+                    // would never finish the synchronous write and hang:
+                    // mkfifo over the path, background the producer,
+                    // record its pid — the consumer reads concurrently
+                    // and the rm site kills by pidfile (BASHC_FIX §2.7).
+                    // Over-detection is safe (background is correct for
+                    // finite producers too); under-detection hangs.
                     let ps_target = redirects.iter().find_map(|rd| {
                         match (&rd.mode, &rd.target) {
                             (m, IrExpr::Var(n, _))
@@ -10212,14 +10368,38 @@ fn param_copy_alias(
                     });
                     if let Some(target) = ps_target {
                         let tv = IrExpr::Var(target.clone(), None);
-                        self.sh_raw(buf, "{");
-                        self.sh_raw(buf, "(");
-                        self.sh_stage(buf, inner);
-                        self.sh_raw(buf, ")");
-                        self.sh_raw(buf, ">");
-                        self.sh_word(buf, &tv);
-                        self.sh_raw(buf, ";");
-                        self.sh_raw(buf, "}");
+                        if Self::ps_producer_infinite(inner) {
+                            self.sh_raw(buf, "{");
+                            self.sh_raw(buf, "rm");
+                            self.sh_raw(buf, "-f");
+                            self.sh_word(buf, &tv);
+                            self.sh_raw(buf, ";");
+                            self.sh_raw(buf, "mkfifo");
+                            self.sh_word(buf, &tv);
+                            self.sh_raw(buf, ";");
+                            self.sh_raw(buf, "(");
+                            self.sh_stage(buf, inner);
+                            self.sh_raw(buf, ")");
+                            self.sh_raw(buf, ">");
+                            self.sh_word(buf, &tv);
+                            self.sh_raw(buf, "&");
+                            self.sh_raw(buf, "echo");
+                            self.sh_raw(buf, "$!");
+                            self.sh_raw(buf, ">");
+                            // braced: `.pid` must not join the name
+                            self.sh_raw(buf, &format!("${{{}}}.pid", target));
+                            self.sh_raw(buf, ";");
+                            self.sh_raw(buf, "}");
+                        } else {
+                            self.sh_raw(buf, "{");
+                            self.sh_raw(buf, "(");
+                            self.sh_stage(buf, inner);
+                            self.sh_raw(buf, ")");
+                            self.sh_raw(buf, ">");
+                            self.sh_word(buf, &tv);
+                            self.sh_raw(buf, ";");
+                            self.sh_raw(buf, "}");
+                        }
                     } else {
                         self.sh_stage(buf, inner);
                         self.sh_redirect_text(buf, redirects);
@@ -10350,6 +10530,36 @@ fn param_copy_alias(
                     self.sh_raw(buf, "esac");
                 }
                 IrStmt::Exec { cmd, args, capture, redirects, env } => {
+                    // procsub cleanup for infinite producers (BASHC_FIX
+                    // §2.7): `rm -f $tmp` for a __ps_tmp fifo must also
+                    // kill the background producer (pid in $tmp.pid).
+                    // Finite producers have no pidfile (kill no-ops on
+                    // the missing file; rm drops both paths harmlessly),
+                    // so this shape is safe for every procsub rm. Only
+                    // fires when ALL non-flag args are __ps_tmp refs.
+                    if matches!(cmd, IrExpr::Str(s, _) if s == "rm") {
+                        let words: Vec<&IrExpr> = args.iter().collect();
+                        if let Some(tmps) = Self::ps_cleanup_tmps(&words) {
+                            self.sh_raw(buf, "{");
+                            for t in &tmps {
+                                self.sh_raw(buf, "kill");
+                                self.sh_raw(
+                                    buf,
+                                    &format!("$(cat ${{{}}}.pid)", t),
+                                );
+                                self.sh_raw(buf, "2>/dev/null;");
+                            }
+                            self.sh_raw(buf, "rm");
+                            self.sh_raw(buf, "-f");
+                            for t in &tmps {
+                                self.sh_raw(buf, &format!("${{{}}}", t));
+                                self.sh_raw(buf, &format!("${{{}}}.pid", t));
+                            }
+                            self.sh_raw(buf, ";");
+                            self.sh_raw(buf, "}");
+                            return;
+                        }
+                    }
                     // the REAL Exec stmt node (the Call form is above):
                     // env prefix, cmd word, args, then the redirects
                     for (k, v) in env {
@@ -11620,7 +11830,7 @@ fn param_copy_alias(
                     }
                     format!("({}({}), _sh_rc == 0)", self.c_ident(&cmd), a.join(", "))
                 } else if self.pos_const {
-                    format!("({}(), _sh_rc == 0)", self.c_ident(&cmd))
+                    format!("(_sh_noecho++, {}(), _sh_noecho--, _sh_rc == 0)", self.c_ident(&cmd))
                 } else {
                     // only the argv-swapping call needs the array (lifted
                     // and pos_const calls never read it — item PYC_OPT/4)
@@ -11638,7 +11848,7 @@ fn param_copy_alias(
                     self.temp_seq += 1;
                     self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
                     format!(
-                        "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
+                        "(_sh_noecho++, {}(), _sh_noecho--, _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
                         self.c_ident(&cmd),
                         self.temp_seq - 1
                     )
@@ -11703,6 +11913,32 @@ fn param_copy_alias(
     }
 
     /// `export X=1` / `declare x=...` — apply the assignments to the store.
+    /// Owned store assign for `declare`-family words (BASHC_FIX §2.x:
+    /// `local x=$1` aliased argv, then `free(x)` segfaulted). Mirrors
+    /// the Assign arm: MOVE a pending heap temp (no strdup, unpend it),
+    /// else free-before-reassign for file-scope vars (self-ref guard)
+    /// and strdup into owned storage. Only for heap-store vars (num /
+    /// buf / mstr / const have their own mechanisms — callers check).
+    /// Plain `x = v` without this owns nothing (borrowed argv, env,
+    /// literals, aliases) and a later free is a crash or double-free.
+    fn emit_owned_store(&mut self, name: &str, id: &str, v: String) {
+        // only heap-store vars (the freed set) take ownership here;
+        // num/buf/mstr/const/bigint have their own mechanisms.
+        if !self.is_heap_store_var(name) {
+            self.emit(&format!("{id} = {v};"));
+            return;
+        }
+        if self.pending_frees.contains(&v) {
+            self.emit(&format!("{id} = {v};"));
+            self.pending_frees.retain(|x| x != &v);
+            return;
+        }
+        if self.top_vars.contains(name) && !text_contains_ident(&v, id) {
+            self.emit(&format!("free({id});"));
+        }
+        self.emit(&format!("{id} = _sh_xstrdup((char*)({v}));"));
+    }
+
     fn declare_words(&mut self, words: &[&IrExpr]) {
         let mut i = 0;
         while i < words.len() {
@@ -11787,7 +12023,7 @@ fn param_copy_alias(
                             } else if let Some(b) = self.buf_bound(name) {
                                 self.emit_guarded_copy(&id, b, &v);
                             } else {
-                                self.emit(&format!("{id} = {v};"));
+                                self.emit_owned_store(name, &id, v);
                             }
                         } else if self.is_num(name) {
                             match val.trim().parse::<i64>() {
@@ -11801,13 +12037,13 @@ fn param_copy_alias(
                             if let Some(b) = self.buf_bound(name) {
                                 self.emit_guarded_copy(&id, b, &v);
                             } else {
-                                self.emit(&format!("{id} = {v};"));
+                                self.emit_owned_store(name, &id, v);
                             }
                         } else if let Some(b) = self.buf_bound(name) {
                             let v = Self::cstr(val);
                             self.emit_guarded_copy(&id, b, &v);
                         } else {
-                            self.emit(&format!("{id} = {};", Self::cstr(val)));
+                            self.emit_owned_store(name, &id, Self::cstr(val));
                         }
                     }
                 }
@@ -14212,9 +14448,14 @@ fn param_copy_alias(
         if std::env::var("SH2_DBG_PARAMS").is_ok() {
             eprintln!("DBG param_call op={op:?} name={:?} nargs={}", Self::str_arg(args, 1), args.len());
         }
-        let Some(name) = Self::str_arg(args, 1) else {
+        let Some(mut name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
+        // `${arr[i]<op>}` element reads with a REAL operator feed here
+        // with name = "arr[i]" text; param_array's element arm returns
+        // the bare read and drops op. Divert those through the scalar
+        // machinery below via a stabilized temp (set below).
+        let mut var_expr_override: Option<String> = None;
         // ${PIPESTATUS[N]} — per-stage statuses of the last pipeline
         // (exported by the pipeline site's state-import suffix)
         if let Some(rest) = name
@@ -14339,6 +14580,32 @@ fn param_copy_alias(
         // `${arr[1]}` / `${#arr[@]}` — the array machinery (bare
         // `@`/`*` are the positional params — the var_expr chain below
         // handles them with the default/value ops)
+        // `${arr[i]<op>}` (`#`, `:-`, …): read the element once into
+        // a temp and run the scalar op below on it (BASHC_FIX §2.x —
+        // `key=${args[i]#--}` kept the dashes). Slice keeps the old
+        // path (its arm is name-based); `len` folds directly; [@]/[*]
+        // and indirect (`!`) names keep their arms. `:=`/`=` won't
+        // store back to the element (was fully dropped before).
+        if !op.is_empty() && op != "slice" {
+            if let Some(open) = name.find('[') {
+                if name.ends_with(']') && !name.starts_with('!') {
+                    let var = &name[..open];
+                    let key = &name[open + 1..name.len() - 1];
+                    if !var.is_empty() && !key.contains('@') && !key.contains('*') {
+                        let elem = self.array_index_read(var, key);
+                        let t = format!("_pe{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        if op == "len" {
+                            self.emit(&format!("char *{t} = ({elem});"));
+                            return self.num_temp(&format!("(long long)strlen({t})"));
+                        }
+                        self.emit(&format!("char *{t} = ({elem});"));
+                        var_expr_override = Some(t);
+                        name = String::new();
+                    }
+                }
+            }
+        }
         if (name.contains('[') || name.contains('@') || name.contains('*'))
             && name != "@"
             && name != "*"
@@ -14355,7 +14622,9 @@ fn param_copy_alias(
             });
             return self.num_temp(&format!("(long long)strlen({v})"));
         }
-        let var_expr = if name.is_empty() {
+        let var_expr = if let Some(v) = var_expr_override {
+            v
+        } else if name.is_empty() {
             "\"\"".to_string()
         } else if name == "#" {
             self.need_sh = true;
@@ -16094,6 +16363,11 @@ fn param_copy_alias(
 
     fn array_index_read(&mut self, var: &str, key: &str) -> String {
         self.arrays.insert(var.to_string());
+        // post-decl first sighting → never assigned → empty (same
+        // discovery-order hole as array_join_all).
+        if self.array_decls_done && !self.array_declared.contains(var) {
+            return String::from("\"\"");
+        }
         self.need_sh = true;
         let id = self.c_ident(var);
         // `${arr[${k}]}` — the core keeps the `${...}` text; strip it
@@ -16192,6 +16466,12 @@ fn param_copy_alias(
             return t;
         }
         self.arrays.insert(var.to_string());
+        // first seen after decl emission (backend text-parsed refs) →
+        // never assigned → empty. Must precede the assoc/int branches
+        // (they'd reference undeclared storage).
+        if self.array_decls_done && !self.array_declared.contains(var) {
+            return String::from("\"\"");
+        }
         self.need_sh = true;
         let id = self.c_ident(var);
         let t = self.vbuf_temp();
@@ -18138,7 +18418,14 @@ fn param_copy_alias(
                 let cur = std::mem::take(&mut self.nonnull_var);
                 post_if.retain(|v| cur.contains(v));
                 self.nonnull_var = post_if;
-                self.emit("}");
+                if else_.is_empty() {
+                    // POSIX: false condition + no else → status 0, not
+                    // the condition's status (BASHC_FIX §2.5). A taken
+                    // arm skips this; the empty body keeps proofs intact.
+                    self.emit("} else { _sh_rc = 0; }");
+                } else {
+                    self.emit("}");
+                }
             }
             IrStmt::Exit(e) => {
                 let code = e.as_ref().map(|x| self.expr(x)).unwrap_or_else(|| "0".into());
@@ -18683,6 +18970,57 @@ fn param_copy_alias(
                     }
                     return;
                 }
+                // process-substitution producer to a __ps_tmp fifo with
+                // an INFINITE producer (BASHC_FIX §2.7): the tempfile
+                // path would run it to completion and hang. mkfifo over
+                // the mktemp'd path, background the producer, record its
+                // pid; the consumer reads concurrently and the rm site
+                // kills by pidfile. Finite producers keep the tempfile.
+                let ps_inf = redirects.iter().find_map(|rd| match (&rd.mode, &rd.target) {
+                    (m, IrExpr::Var(n, _))
+                        if (m == "w" || m == "a") && n.starts_with("__ps_") =>
+                    {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(target) = ps_inf {
+                    if Self::ps_producer_infinite(inner) {
+                        let inner = inner.clone();
+                        let site = self.shell_site(
+                            |r| {
+                                r.emit("_sh_reset();");
+                                let tv = IrExpr::Var(target.clone(), None);
+                                r.sh_raw(CmdBuf::Shared, "{");
+                                r.sh_raw(CmdBuf::Shared, "rm");
+                                r.sh_raw(CmdBuf::Shared, "-f");
+                                r.sh_word(CmdBuf::Shared, &tv);
+                                r.sh_raw(CmdBuf::Shared, ";");
+                                r.sh_raw(CmdBuf::Shared, "mkfifo");
+                                r.sh_word(CmdBuf::Shared, &tv);
+                                r.sh_raw(CmdBuf::Shared, ";");
+                                r.sh_raw(CmdBuf::Shared, "(");
+                                r.sh_stage(CmdBuf::Shared, &inner);
+                                r.sh_raw(CmdBuf::Shared, ")");
+                                r.sh_raw(CmdBuf::Shared, ">");
+                                r.sh_word(CmdBuf::Shared, &tv);
+                                r.sh_raw(CmdBuf::Shared, "&");
+                                r.sh_raw(CmdBuf::Shared, "echo");
+                                r.sh_raw(CmdBuf::Shared, "$!");
+                                r.sh_raw(CmdBuf::Shared, ">");
+                                r.sh_raw(
+                                    CmdBuf::Shared,
+                                    &format!("${{{}}}.pid", target),
+                                );
+                                r.sh_raw(CmdBuf::Shared, ";");
+                                r.sh_raw(CmdBuf::Shared, "}");
+                            },
+                            false,
+                        );
+                        self.emit(&format!("{site};"));
+                        return;
+                    }
+                }
                 // `cmd > file 2>&1` — reconstruct the full shell text and
                 // run it (bash applies the redirections exactly)
                 let inner = inner.clone();
@@ -18978,13 +19316,20 @@ fn param_copy_alias(
             IrStmt::Return(e) => {
                 if self.in_function {
                     if let Some(v) = e {
-                        // the echo-return-lift's VALUE return: echo the
-                        // value (the fnValue/capture dispatch reads the
-                        // function's stdout). `_sh_rc = atoll(v)` would
-                        // corrupt STRING values (strSlice → 0).
+                        // `return N`: status is the value (forcing
+                        // _sh_rc=0 made `if f` true for `return 1` —
+                        // BASHC_FIX §2.2). The echo is the
+                        // fnValue/capture value channel, so it stays —
+                        // but statement/condition callers set _sh_noecho
+                        // around the call (bash prints nothing), while
+                        // capture dispatch leaves it zero and reads
+                        // stdout. Stabilize once: value may be impure.
                         let v = self.value_c(v);
+                        let rv = format!("_rv{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("char *{rv} = ({v});"));
                         self.emit(&format!(
-                            "(_sh_rc = 0, printf(\"%s\\n\", (char*)({v})));"
+                            "{{ _sh_rc = (int)atoll({rv}); if (!_sh_noecho) printf(\"%s\\n\", (char*)({rv})); }}"
                         ));
                     } else {
                         self.emit("_sh_rc = 0;");
@@ -19651,6 +19996,10 @@ fn param_copy_alias(
         vars.retain(|v| !v.contains('['));
         self.store.retain(|v| !v.contains('['));
         let arrays: Vec<String> = self.arrays.iter().cloned().collect();
+        // snapshot: reads discovered after this point (main/fn-body
+        // render) reference no storage — see array_declared.
+        self.array_declared = self.arrays.clone();
+        self.array_decls_done = true;
         for a in &arrays {
             if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG decl array {a}"); }
             let id = self.c_ident(a);
@@ -27231,6 +27580,29 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     if rest.is_empty() {
         return Some(vec![s(&name)]); // getVar shape
     }
+    // subscripted name plus operator (`arr[@]:off:len`, `arr[i]#pat`):
+    // keep the subscript on the name (param_call resolves the element
+    // — including its op divert) and parse the operator after `]`.
+    // Unmodeled before → fell back to literal text (BASHC_FIX §2.x:
+    // `${default[@]:0:2}` printed literally).
+    if rest.starts_with('[') {
+        if let Some(clo) = rest.find(']') {
+            let full = format!("{name}{}", &rest[..=clo]);
+            if let Some(v) = brace_op_vec(&full, &rest[clo + 1..]) {
+                return Some(v);
+            }
+        }
+        return None;
+    }
+    return brace_op_vec(&name, &rest);
+}
+
+/// Operator chain after a `${name…}` body: `:-`/slice/`#`/… with the
+/// operand as raw text (param_call's default_word expands `$`-bearing
+/// operands recursively). Shared by plain names and subscripted names
+/// (`arr[@]`, `arr[i]` — the subscript stays on the name).
+fn brace_op_vec(name: &str, rest: &str) -> Option<Vec<IrExpr>> {
+    let s = |t: &str| IrExpr::Str(t.to_string(), crate::ir::StrStyle::DoubleQuoted);
     // array-element marker: `arr[@]` inside ops stays unmodeled
     let (op, arg): (String, String) = if let Some(r) = rest.strip_prefix(":-") {
         (":-".into(), r.to_string())
