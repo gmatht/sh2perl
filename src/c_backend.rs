@@ -2196,6 +2196,11 @@ fn array_fixed_caps(
                 func == "split"
                     || ((func == "listVar" || func == "arrayItems")
                         && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "@"))
+                    // unquoted `arr=($(...))` captures word-split at
+                    // runtime (BASHC_FIX 064_07); quoted ones arrive
+                    // wrapped, never bare here.
+                    || func == "capture"
+                    || func == "captureWords"
             }
             _ => false,
         }
@@ -16602,6 +16607,38 @@ fn param_copy_alias(
         }
     }
 
+    /// Append each whitespace-separated word of a runtime string as its
+    /// own array element (BASHC_FIX: unquoted `arr=($(...))` captures
+    /// word-split like the split() marker; quoted values never reach
+    /// here as bare calls). Shared by the split() arm and capture items.
+    /// `ai` is the running index var name (updated past the new words).
+    fn emit_split_words(&mut self, var: &str, id: &str, ai: &str, v: String) {
+        let t = format!("_sp{}", self.temp_seq);
+        self.temp_seq += 1;
+        // copy first — _sh_split NUL-terminates words IN PLACE, and the
+        // source may be const/read-only (literals, static buffers).
+        self.emit(&format!(
+            "static _sh_vbuf {t} = {{0, 0}}; static char **{t}_w = 0; static size_t {t}_wc = 0; _sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"
+        ));
+        self.emit(&format!("size_t _sn{t} = _sh_split({t}.p, &{t}_w, &{t}_wc);"));
+        // P1: refuse past the cap (fixed) / grow (vec) — same stores.
+        if self.vec_arrays.contains(var) {
+            let sfx = self.vec_grow_suffix(var);
+            self.emit(&format!(
+                "while ({ai} + _sn{t} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
+            ));
+        } else {
+            self.emit(&format!(
+                "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+            ));
+        }
+        self.emit(&format!(
+            "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = _sh_xstrdup({t}_w[_sk{t}]);"
+        ));
+        self.emit(&format!("{id}_len = {ai} + _sn{t};"));
+        self.emit(&format!("{ai} += _sn{t};"));
+    }
+
     fn emit_set_array(&mut self, var: &str, args: &[IrExpr]) {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
@@ -16734,33 +16771,15 @@ fn param_copy_alias(
             if let IrExpr::Call { func, args } = it {
                 if func == "split" {
                     let v = self.value_c(args.first().unwrap_or(it));
-                    let t = format!("_sp{}", self.temp_seq);
-                    self.temp_seq += 1;
-                    // copy first — _sh_split NUL-terminates words IN
-                    // PLACE, and the source may be const/read-only
-                    // (string literals, static buffers)
-                    self.emit(&format!(
-                        "static _sh_vbuf {t} = {{0, 0}}; static char **{t}_w = 0; static size_t {t}_wc = 0; _sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"
-                    ));
-                    self.emit(&format!("size_t _sn{t} = _sh_split({t}.p, &{t}_w, &{t}_wc);"));
-                    // P1: the loop below writes {ai} + _sn elements into
-                    // a fixed [ARR_CAP] array — refuse upfront.
-                    // Vec arrays grow instead (same stores either way).
-                    if self.vec_arrays.contains(var) {
-                        let sfx = self.vec_grow_suffix(var);
-                        self.emit(&format!(
-                            "while ({ai} + _sn{t} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
-                        ));
-                    } else {
-                        self.emit(&format!(
-                            "if ({ai} + _sn{t} > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
-                        ));
-                    }
-                    self.emit(&format!(
-                        "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = _sh_xstrdup({t}_w[_sk{t}]);"
-                    ));
-                    self.emit(&format!("{id}_len = {ai} + _sn{t};"));
-                    self.emit(&format!("{ai} += _sn{t};"));
+                    self.emit_split_words(var, &id, &ai, v);
+                    continue;
+                }
+                // `arr=($(...))` — an unquoted capture expands with
+                // word-splitting (BASHC_FIX 064_07: kept whole). Quoted
+                // captures arrive wrapped, never bare here.
+                if func == "capture" || func == "captureWords" {
+                    let v = self.value_c(it);
+                    self.emit_split_words(var, &id, &ai, v);
                     continue;
                 }
             }
@@ -17386,6 +17405,27 @@ fn param_copy_alias(
     /// `printf -v VAR fmt args…` renders into VAR (a snprintf into the
     /// store) instead of stdout; `into == None` writes stdout.
     fn try_native_printf_into(&mut self, words: &[&IrExpr], into: Option<&str>) -> Option<String> {
+        // unquoted-split args (`printf %s $x`) expand to N words with
+        // format recycling — the native single-shot rendering would
+        // pass the whole joined string as one arg (BASHC_FIX t62).
+        // Refuse (shell-out splits correctly); native split+recycle
+        // is a future optimization, not a correctness fix.
+        fn has_split(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { func, args } => {
+                    func == "split" || args.iter().any(has_split)
+                }
+                IrExpr::Array(items) => items.iter().any(has_split),
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    InterpPart::Expr(x) => has_split(x),
+                    _ => false,
+                }),
+                _ => false,
+            }
+        }
+        if words.iter().any(|w| has_split(w)) {
+            return None;
+        }
         // the format word is often a pure-literal Interpolate — collapse
         // it so printf -v formats don't fall back to shell-out
         let fmt_str = match words.first() {
