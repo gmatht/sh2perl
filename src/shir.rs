@@ -5831,6 +5831,16 @@ fn st(s: &str) -> IrExpr {
     IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
 }
 
+/// A QUOTED literal (`'...'` or `"..."` with no expansions — the parser
+/// produced Word::Literal, so there is nothing to expand): SingleQuoted
+/// style pins it verbatim. The ESTree render emits these opaquely
+/// (`sh2.lit("...")`) so downstream interpolation (JS lift passes turn
+/// `"$v"` text into `${v}` templates) cannot rewrite single-quoted
+/// payloads like the mimecroft fragment shader's `putb $b`.
+fn st_single(s: &str) -> IrExpr {
+    IrExpr::Str(s.to_string(), StrStyle::SingleQuoted)
+}
+
 // ── AST → IR ─────────────────────────────────────────────────────────
 
 pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
@@ -11116,6 +11126,8 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
             // marker the AST cannot distinguish `'*.txt'` from `*.txt`.
             if ann.is_none() && has_glob_chars(&s2) {
                 st(&format!("{GLOB_MAGIC}{s2}"))
+            } else if ann.is_some() {
+                st_single(&s2)
             } else {
                 st(&s2)
             }
@@ -11156,7 +11168,10 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
 /// from the raw-text path).
 fn array_element_ir(w: &Word) -> IrExpr {
     match w {
-        Word::Literal(s, ann) => st(&shell_quote_removal(s, ann.is_some())),
+        Word::Literal(s, ann) => {
+            let s2 = shell_quote_removal(s, ann.is_some());
+            if ann.is_some() { st_single(&s2) } else { st(&s2) }
+        }
         Word::Variable(name, _, _) if name != "@" && name != "*" => {
             call("split", vec![call("getVar", vec![st(name)])])
         }
@@ -44695,11 +44710,27 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             raw: None,
             regex: None,
         },
-        IrExpr::Str(s, _) => Expr::Literal {
-            value: serde_json::Value::String(s.clone()),
-            raw: None,
-            regex: None,
-        },
+        IrExpr::Str(s, style) => {
+            // SingleQuoted holding `$` (a quoted literal the parser left
+            // unexpanded, e.g. 'putb $b') renders opaquely: downstream
+            // interpolation turns Literal text into templates, which
+            // would rewrite verbatim payloads. sh2.lit is the runtime
+            // identity — passes treat it as opaque and the value is
+            // byte-identical. Gated on `$` so plain quoted text keeps
+            // the exact current rendering (no behavior change elsewhere).
+            if matches!(style, StrStyle::SingleQuoted) && s.contains('$') {
+                return sh2_call_estree("lit", vec![Expr::Literal {
+                    value: serde_json::Value::String(s.clone()),
+                    raw: None,
+                    regex: None,
+                }]);
+            }
+            Expr::Literal {
+                value: serde_json::Value::String(s.clone()),
+                raw: None,
+                regex: None,
+            }
+        }
         IrExpr::Bool(b) => Expr::Literal {
             value: serde_json::Value::Bool(*b),
             raw: None,
