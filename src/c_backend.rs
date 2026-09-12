@@ -10722,6 +10722,52 @@ fn param_copy_alias(
         }
     }
 
+    /// A pipeline stage renders with top-level list operators
+    /// (`&&`/`||` from and/or-chains, `;` from multi-stmt stages): piping
+    /// it onward (`stage | next`) rebinds to the LAST command
+    /// (`a && b | c` = `a && (b|c)`). Wrap such stages in `{ ...; }`
+    /// (BASHC_FIX 064_09: `paste && cleanup | head` stranded paste's
+    /// output). Compound commands (if/while/subshell) bind as units.
+    fn stage_needs_group(stmts: &[IrStmt]) -> bool {
+        if stmts.len() > 1 {
+            return true;
+        }
+        let Some(s) = stmts.first() else {
+            return false;
+        };
+        fn expr_needs_group(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { func, args } if func == "and" || func == "or" => true,
+                IrExpr::Call { func, args } if func == "redirect" => args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Arrow(inner) => Some(inner.iter().any(|s| match s {
+                            IrStmt::Expr(e) => expr_needs_group(e),
+                            _ => false,
+                        })),
+                        _ => None,
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        match s {
+            IrStmt::Expr(e) => expr_needs_group(e),
+            _ => false,
+        }
+    }
+
+    /// Emit a pipeline stage, grouped in `{ ...; }` when it needs it.
+    fn sh_stage_grouped(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
+        if Self::stage_needs_group(stmts) {
+            self.sh_raw(buf, "{");
+            self.sh_stage(buf, stmts);
+            self.sh_raw(buf, ";}");
+        } else {
+            self.sh_stage(buf, stmts);
+        }
+    }
+
     fn sh_stage(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
         // track what THIS stage assigns (child-owned vars — see the
         // field docs); nested sh_stage calls scope their own set
@@ -11371,7 +11417,7 @@ fn param_copy_alias(
                         if i > 0 {
                             self.sh_raw(buf, "|");
                         }
-                        self.sh_stage(buf, stage);
+                        self.sh_stage_grouped(buf, stage);
                     }
                 }
                 _ => {
@@ -11986,7 +12032,7 @@ fn param_copy_alias(
                             other => vec![other.clone()],
                         })
                         .collect();
-                    self.sh_stage(buf, &cleaned);
+                    self.sh_stage_grouped(buf, &cleaned);
                 }
             }
         }
