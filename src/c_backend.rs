@@ -304,6 +304,13 @@ pub struct Render {
     /// statement — the proof must survive across the statements
     /// between assign and use).
     nonnull_var: HashSet<String>,
+    /// num_temp `_sN` buffers (`static char _sN[32]`): arrays, so they
+    /// never decay to NULL — printf/test guards skip them (item 24
+    /// extended to compiler temps; precise membership, not name shape).
+    num_temp_bufs: HashSet<String>,
+    /// num_temp `_sN` → the `(long long)(...)` expression it formats
+    /// (item 33: single-use print fusion inlines it as `%lld`).
+    num_temp_src: HashMap<String, String>,
     /// Generated function names proven to never return NULL: every
     /// return goes through `_sh_xstrdup` (aborts on OOM instead of
     /// returning NULL), with no early bare `return`. Computed by a
@@ -2104,6 +2111,48 @@ fn small_int_arrays(
 /// Trip counts come from const `For` iters only (Range bounds, Array
 /// length); While/cstyleFor/unknown-iter bodies are unboundable
 /// (writes inside poison the array to ARR_CAP).
+/// The max slot an index-write touches, if every index is a literal
+/// non-negative integer (structured `indices` AND flattened `arr[1]`).
+/// Dynamic/negative/multi-bracket shapes → None (unboundable). Item 41.
+fn literal_write_index(t: &crate::ir::AssignTarget) -> Option<u64> {
+    fn lit(e: &IrExpr) -> Option<u64> {
+        match e {
+            IrExpr::Int(n) if *n >= 0 => Some(*n as u64),
+            IrExpr::Str(s, _) => {
+                let s = s.trim();
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                    s.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            }
+            IrExpr::Arith(a) => match a.as_ref() {
+                crate::ir::ArithAst::Num(n) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    if !t.indices.is_empty() {
+        let mut m = 0u64;
+        for ix in &t.indices {
+            m = m.max(lit(ix)?);
+        }
+        return Some(m);
+    }
+    // flattened `arr[N]`: exactly one bracket pair, digits only
+    let tail = t.var.split_once('[')?.1;
+    let inner = tail.strip_suffix(']')?;
+    if inner.contains('[') || inner.trim().is_empty() {
+        return None;
+    }
+    let inner = inner.trim();
+    if !inner.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    inner.parse::<u64>().ok()
+}
+
 fn array_fixed_caps(
     prog: &IrProgram,
     exclude: &HashSet<String>,
@@ -2115,6 +2164,17 @@ fn array_fixed_caps(
         defined: bool,
         indexed_write: bool,
         unbounded: bool,
+        // max over LITERAL index writes (arr[1]=x needs cap >= 2).
+        // Dynamic indices keep indexed_write (poison); literal ones only
+        // raise this bound (item 41) — same slot rewritten in a loop
+        // never grows the array, so trip counts don't multiply it.
+        lit_index_max: u64,
+        // any index write at all (literal or dynamic)
+        has_index_write: bool,
+        // assoc-flagged bulk seen (setArray with Bool(true)): numeric
+        // index writes on assocs are extra string keys beyond bulk
+        // counts — they poison literal sizing (item 41).
+        is_assoc: bool,
     }
     // a bulk item that expands to a runtime-unknown element count
     fn is_multi(e: &IrExpr) -> bool {
@@ -2190,6 +2250,11 @@ fn array_fixed_caps(
             {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     let info = map.entry(name.clone()).or_default();
+                    // assoc-flagged bulk: numeric index writes are extra
+                    // string keys beyond bulk counts (item 41)
+                    if matches!(args.get(2), Some(IrExpr::Bool(true))) {
+                        info.is_assoc = true;
+                    }
                     record_bulk(func, args, info, mult, depth);
                 }
                 for a in args {
@@ -2279,7 +2344,19 @@ fn array_fixed_caps(
                             let base = t.var.split('[').next().unwrap_or(&t.var);
                             let info = map.entry(base.to_string()).or_default();
                             info.defined = true;
-                            info.indexed_write = true;
+                            info.has_index_write = true;
+                            match literal_write_index(t) {
+                                // literal non-negative: needs cap >= idx+1
+                                // (item 41) — overwrites never grow
+                                Some(n) => {
+                                    info.lit_index_max =
+                                        info.lit_index_max.max(n.saturating_add(1));
+                                }
+                                // dynamic/negative: unboundable
+                                None => {
+                                    info.indexed_write = true;
+                                }
+                            }
                         } else if let IrExpr::Array(items) = expr {
                             // `xs = (...)` literal: reset at any depth
                             // (Assign-Array always re-fills from len).
@@ -2762,6 +2839,17 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     for sub in &mut prog.subs {
         fold_range_for(&mut sub.body);
     }
+    // const-branch fold (items 29/30/32): decidable if/elsif chains keep
+    // only the live branch; const-false whiles vanish. Runs on final
+    // layout (after range-for); const_rhs was built with the analyses.
+    {
+        let const_rhs_owned: std::collections::HashMap<String, IrExpr> =
+            r.const_rhs.clone();
+        fold_const_branch_list(&mut prog.stmts, &const_rhs_owned);
+        for sub in &mut prog.subs {
+            fold_const_branch_list(&mut sub.body, &const_rhs_owned);
+        }
+    }
     // small-int arrays (native sum/max/min fast path): string-stored
     // arrays with int-domain elements only. After fold_range_for
     // (final statement layout) and before rendering; needs var_types
@@ -2782,6 +2870,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     }
     r.program(&prog);
     r.trim_sh_runtime();
+    // drop discarded `, _sh_rc == N` comma tails BEFORE the dead-rc
+    // strip so the removed reads can cascade (item 39)
+    r.trim_discarded_rc_cmp();
     // _sh_rc models bash's `$?`: the renderer stores it after every
     // command so a LATER read sees the right value. When nothing in
     // the final program reads it (no `$?`, no surviving shell-out
@@ -2795,6 +2886,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.fold_init_store();
     // drop `1;`-style constant statements (strip_dead_rc residue)
     r.drop_const_stmts();
+    // `static T v = 0;` → `static T v;` (static zero-init)
+    r.strip_static_zero_init();
     // drop orphaned num temps: `static char _sN[32]; snprintf(_sN,
     // ...)` pairs whose temp is never read afterwards (a consumer took
     // a different path after the temp was emitted — e.g. a test cond
@@ -5003,6 +5096,69 @@ impl Render {
         }
     }
 
+    /// `static T v = 0;` → `static T v;` (item 44): static storage is
+    /// zero-initialized by the language, so the explicit `= 0` is always
+    /// dead. Single declarators only (no comma, no parens, single
+    /// statement per line) — conservative shape, covers `_len`/`_n`/`_rc`
+    /// counters and scalar temps.
+    fn strip_static_zero_init(&mut self) {
+        for line in self.out.iter_mut() {
+            let t = line.trim();
+            if !t.starts_with("static ") || !t.ends_with("= 0;") {
+                continue;
+            }
+            let inner = t[..t.len() - 4].trim_end();
+            if inner.contains([';', ',', '(', ')', '{', '}', '*', '[', ']']) {
+                continue;
+            }
+            let words: Vec<&str> = inner.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+            let name = words[words.len() - 1];
+            if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            *line = format!("{indent}static {} {};", words[1..words.len() - 1].join(" "), name);
+        }
+    }
+
+    /// Drop a discarded trailing `, _sh_rc[ == N| != N]` from a statement
+    /// comma expression (item 39): `(f(), _sh_rc == 0);` → `f();`. The
+    /// comparison is pure and its value discarded, so only a bogus `$?`
+    /// READ disappears — which can cascade: with the read gone,
+    /// strip_dead_rc (which runs right after) strips the now-dead stores.
+    /// Only whole-line `( ... );` statements (value positions like
+    /// `return`/`if`/assign never start with `(`); argv restores and
+    /// other side-effecting parts stay.
+    fn trim_discarded_rc_cmp(&mut self) {
+        for line in self.out.iter_mut() {
+            let t = line.trim();
+            if !t.starts_with('(') || !t.ends_with(");") {
+                continue;
+            }
+            let inner = t[1..t.len() - 2].trim();
+            let Some(comma) = last_top_comma(inner) else {
+                continue;
+            };
+            let tail = inner[comma + 1..].trim();
+            if !is_pure_rc_read(tail) {
+                continue;
+            }
+            let rest = inner[..comma].trim();
+            let indent = &line[..line.len() - line.trim_start().len()];
+            // single remainder: the parens are redundant too
+            if last_top_comma(rest).is_none() {
+                *line = format!("{}{};", indent, rest);
+            } else {
+                *line = format!("{}({});", indent, rest);
+            }
+        }
+    }
+
     fn drop_const_stmts(&mut self) {
         self.out.retain(|line| {
             let t = line.trim();
@@ -5626,7 +5782,10 @@ impl Render {
             }
             if let Some(b) = self.buf_bound(v) {
                 let name = self.c_ident(v);
-                self.emit(&format!("if ({name}) assert(strlen({name}) <= {b});"));
+                // buf_bound ⟺ fixed char[N] array — `if (name)` is
+                // dead-true (arrays never null); keep the bare assert
+                // as the length tripwire (item 25)
+                self.emit(&format!("assert(strlen({name}) <= {b});"));
             }
         }
     }
@@ -7712,6 +7871,11 @@ fn param_copy_alias(
             format!("_sh_mstr_get(&{id})")
         } else if self.capture_vars.contains(name) {
             format!("({id} ? {id} : \"\")")
+        } else if self.buf_bound(name).is_some() {
+            // fixed char[N] buffer — arrays never decay to NULL, so the
+            // guard is dead (item 24). buf_bound ⟺ array decl (both the
+            // const and mutable decl paths emit char[N]).
+            id
         } else {
             format!("({id} ? {id} : \"\")")
         }
@@ -7804,6 +7968,8 @@ fn param_copy_alias(
     fn num_temp(&mut self, v: &str) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
+        self.num_temp_bufs.insert(t.clone());
+        self.num_temp_src.insert(t.clone(), format!("(long long)({v})"));
         // STATIC: a file-scope var may hold the temp's address (`n =
         // _s17`); a plain local's stack slot is reused by sibling
         // scopes (gcc -O0 coalesces non-overlapping blocks) and the var
@@ -7811,6 +7977,46 @@ fn param_copy_alias(
         self.emit(&format!("static char {t}[32];"));
         self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
         t
+    }
+
+    /// Fuse a single-use num_temp into a `%lld` printf arg (item 33):
+    /// `static char _sN[32]; snprintf(_sN, sizeof _sN, "%lld", EXPR);`
+    /// + `printf("%s", _sN)` → `printf("%lld", EXPR)`. Sound only when
+    /// `_sN` appears nowhere else (exactly the two known lines) AND the
+    /// snprintf is the last non-blank emission (moving EXPR's evaluation
+    /// across intervening statements could reorder side effects).
+    /// Returns the inlined `(long long)(...)` expression.
+    fn fuse_num_temp(&mut self, v: &str) -> Option<String> {
+        let src = self.num_temp_src.get(v)?.clone();
+        let decl = format!("static char {v}[32];");
+        let snp = format!("snprintf({v}, sizeof {v}, \"%lld\", ");
+        let mut hits = 0usize;
+        let mut snp_idx = None;
+        for (i, l) in self.out.iter().enumerate() {
+            if !has_ident(l, v) {
+                continue;
+            }
+            let t = l.trim();
+            if t == decl {
+                hits += 1;
+            } else if t.starts_with(&snp) && t.ends_with(");") {
+                hits += 1;
+                snp_idx = Some(i);
+            } else {
+                return None;
+            }
+        }
+        if hits != 2 {
+            return None;
+        }
+        let si = snp_idx?;
+        if self.out[si + 1..].iter().any(|l| !l.trim().is_empty()) {
+            return None;
+        }
+        self.out.retain(|l| !has_ident(l, v));
+        // the recorded temp stays in num_temp_bufs (harmless: no lines
+        // mention it anymore, and re-emission would re-record)
+        Some(src)
     }
 
     /// `sortedIntJoin`/`sortedBigintJoin` over an array — the native
@@ -13738,9 +13944,17 @@ fn param_copy_alias(
                     } else {
                         self.store_read(&name)
                     };
-                    let t = self.vbuf_temp();
-                    self.emit(&format!("_sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"));
-                    format!("{t}.p")
+                    // _sh_substr only READS its input: a stable lvalue
+                    // (bare ident — vars, arrays, temps all outlive the
+                    // call) needs no stabilizing copy (item 34). Anything
+                    // else (calls, ternaries) keeps the copy.
+                    if is_ident(&v) {
+                        v
+                    } else {
+                        let t = self.vbuf_temp();
+                        self.emit(&format!("_sh_vgrow(&{t}, strlen({v}) + 1); strcpy({t}.p, {v});"));
+                        format!("{t}.p")
+                    }
                 };
                 let off_idx = if idx_is_at { 3 } else { 2 };
                 let len_idx = off_idx + 1;
@@ -14999,7 +15213,7 @@ fn param_copy_alias(
                     return;
                 }
                 self.emit(&format!(
-                    "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {i}, {v});"
+                    "_sh_arr_set({id}, &{id}_len, {acap}, {i}, {v});"
                 ));
             } else if is_ident(k.trim())
                 && (self.var_types.contains_key(k.trim())
@@ -15017,7 +15231,7 @@ fn param_copy_alias(
                     return;
                 }
                 self.emit(&format!(
-                    "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {kv}, {v});"
+                    "_sh_arr_set({id}, &{id}_len, {acap}, {kv}, {v});"
                 ));
             } else {
                 self.assoc_arrays.insert(var.to_string());
@@ -15037,7 +15251,7 @@ fn param_copy_alias(
                 return;
             }
             self.emit(&format!(
-                "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {k}, {v});"
+                "_sh_arr_set({id}, &{id}_len, {acap}, {k}, {v});"
             ));
         }
         // `arr[$i]=x` — the Str key carries the raw `$i` text
@@ -15050,7 +15264,7 @@ fn param_copy_alias(
                         format!("(long long)atoll({})", self.store_ref(rest))
                     };
                     self.emit(&format!(
-                        "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {kv}, {v});"
+                        "_sh_arr_set({id}, &{id}_len, {acap}, {kv}, {v});"
                     ));
                     return;
                 }
@@ -15066,6 +15280,13 @@ fn param_copy_alias(
     fn store_int_item_c(&mut self, e: &IrExpr) -> String {
         let native = match e {
             IrExpr::Int(i) => Some(format!("(long long)({i}LL)")),
+            // a numeric string literal is its value (atoll would parse
+            // the same digits at runtime; non-numeric/overflowing
+            // strings fall through to atoll, preserving its clamp)
+            IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                Ok(n) => Some(format!("(long long)({n}LL)")),
+                Err(_) => None,
+            },
             IrExpr::Arith(a) => Some(format!("(long long)({})", self.arith(a))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.is_num(name) {
@@ -15359,15 +15580,18 @@ fn param_copy_alias(
                 }
             }
             let v = self.value_c(it);
-            // P1: {ai} is the running index into a fixed [ARR_CAP]
-            // array — refuse past the cap instead of overflowing.
-            // Vec arrays grow instead (same stores either way).
+            // P1: {ai} is the running index into a fixed array — refuse
+            // past the cap instead of overflowing. Vec arrays grow instead
+            // (same stores either way). With a PROVEN cap (item 43) the
+            // guard is dead: {ai} runs 0..items.len()-1 and the proof sized
+            // cap >= that count (same ShIR the proof walked), so it can
+            // never fire; unproven arrays keep the guard.
             if self.vec_arrays.contains(var) {
                 let sfx = self.vec_grow_suffix(var);
                 self.emit(&format!(
                     "while ({ai} + 1 > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);"
                 ));
-            } else {
+            } else if !self.array_caps.contains_key(var) {
                 let cap = self.array_cap(var);
                 self.emit(&format!("if ({ai} >= {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"));
             }
@@ -15867,6 +16091,14 @@ fn param_copy_alias(
                         }
                     }
                     NumSpec::Str => {
+                        // item 33: a single-use num_temp fuses to %lld —
+                        // drop its static decl + snprintf, inline the
+                        // already-long-long expression
+                        if let Some(fused) = self.fuse_num_temp(&v) {
+                            fmt.push_str("%lld");
+                            cargs.push(fused);
+                            continue;
+                        }
                         fmt.push_str("%s");
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
@@ -15893,9 +16125,15 @@ fn param_copy_alias(
                             || self.nonnull_var.contains(&v)
                             || self.nonnull.contains(stripped)
                             || self.nonnull_var.contains(stripped)
+                            || self.num_temp_bufs.contains(&v)
+                            || self.num_temp_bufs.contains(stripped)
                             || is_nonnull_helper_call(&v)
                         {
                             cargs.push(v);
+                        } else if guarded_deref_nonnull(&v) {
+                            // `(C && P) ? P : ""` with P proven non-null:
+                            // single evaluation + one cast (item 23)
+                            cargs.push(format!("(char*)({v})"));
                         } else {
                             cargs.push(format!(
                                 "((char*)({v}) ? (char*)({v}) : \"\")"
@@ -17110,7 +17348,8 @@ fn param_copy_alias(
                         return;
                     }
                     self.emit(&format!(
-                        "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {id}_len, {v});"
+                        "_sh_arr_set({id}, &{id}_len, {}, {id}_len, {v});",
+                        self.array_cap(&t.var)
                     ));
                     return;
                 }
@@ -21271,6 +21510,275 @@ fn unescaped_literal(rhs: &str) -> Option<String> {
     None
 }
 
+/// Byte offset of the last top-level `,` in `s` (paren/quote aware),
+/// or None. Used to peel trailing comma parts off statement expressions.
+fn last_top_comma(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = 0u8;
+    let mut i = 0;
+    let mut last = None;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = c,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => last = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    last
+}
+
+/// A pure `$?` read used as a discarded comma part: `_sh_rc`,
+/// `_sh_rc == N`, `_sh_rc != N` (N digits). No side effects, so dropping
+/// it from a value-discarded position is always sound.
+fn is_pure_rc_read(tail: &str) -> bool {
+    let t = tail.trim();
+    if t == "_sh_rc" {
+        return true;
+    }
+    for op in ["==", "!="] {
+        if let Some((l, r)) = t.split_once(op) {
+            // `==` inside `!=`? split_once("==") on "a != b" gives
+            // ("a !", " b") — the lhs must be exactly the var
+            if l.trim() == "_sh_rc"
+                && !r.trim().is_empty()
+                && r.trim().chars().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strip one layer of parens wrapping the whole string (`(a && b)` →
+/// `a && b`); returns the input unchanged when the outer parens don't
+/// wrap everything (`(a) + (b)`, casts like `(long long)(x)`).
+fn strip_outer_parens(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'(' {
+        return s;
+    }
+    let mut depth = 0usize;
+    let mut quote = 0u8;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = c,
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return s;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    // closes the first paren: whole-wrap iff at end
+                    if i == b.len() - 1 {
+                        return s[1..b.len() - 1].trim();
+                    }
+                    return s;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    s
+}
+
+/// Is `x` a guarded-deref ternary provably non-null — `(C) ? P : ""`
+/// where C true implies P non-null? (item 23). Requires: else-branch
+/// exactly `""`; P pure (no calls/assigns) and appearing VERBATIM as a
+/// top-level `&&`-conjunct of C (mere mention is NOT enough: `(P == 0)`
+/// mentions P but takes the branch when P is null); C itself pure (no
+/// calls/assigns — the guard evaluates X twice, removing it must not
+/// drop side effects). Lets printf replace the guard (and its double
+/// evaluation) with a single cast: `((char*)(X) ? ... : "")` →
+/// `(char*)(X)`.
+fn guarded_deref_nonnull(x: &str) -> bool {
+    // split outermost top-level `? :` (nested ternaries bail)
+    fn split_ternary(s: &str) -> Option<(&str, &str, &str)> {
+        let b = s.as_bytes();
+        let mut depth = 0usize;
+        let mut quote = 0u8;
+        let mut i = 0;
+        let mut qpos = None;
+        while i < b.len() {
+            let c = b[i];
+            if quote != 0 {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b'?' if depth == 0 => {
+                    qpos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let q = qpos?;
+        let mut depth = 0usize;
+        let mut quote = 0u8;
+        let mut i = q + 1;
+        let mut cpos = None;
+        while i < b.len() {
+            let c = b[i];
+            if quote != 0 {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b':' if depth == 0 => {
+                    cpos = Some(i);
+                    break;
+                }
+                b'?' if depth == 0 => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        let c = cpos?;
+        Some((s[..q].trim(), s[q + 1..c].trim(), s[c + 1..].trim()))
+    }
+    // pure: no calls, assigns, commas, ternaries, blocks (what may be
+    // evaluated fewer times when the double evaluation collapses).
+    // `=` only counts outside ==/!=/<=/>=.
+    fn pure_expr(s: &str) -> bool {
+        let mut t = s.to_string();
+        for op in ["==", "!=", "<=", ">="] {
+            t = t.replace(op, "  ");
+        }
+        let b = t.as_bytes();
+        let mut quote = 0u8;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if quote != 0 {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'(' | b'=' | b',' | b'?' | b':' | b';' | b'{' | b'}' => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        true
+    }
+    // top-level `&&` conjuncts (paren/quote aware)
+    fn conjuncts(s: &str) -> Vec<&str> {
+        let b = s.as_bytes();
+        let mut depth = 0usize;
+        let mut quote = 0u8;
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if quote != 0 {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b'&' if depth == 0 && b.get(i + 1) == Some(&b'&') => {
+                    out.push(s[start..i].trim());
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push(s[start..].trim());
+        out
+    }
+    let s = strip_outer_parens(x.trim());
+    let Some((cond, branch, els)) = split_ternary(s) else {
+        return false;
+    };
+    if els != "\"\"" || branch.is_empty() {
+        return false;
+    }
+    let cond = strip_outer_parens(cond);
+    let branch = strip_outer_parens(branch);
+    if !pure_expr(branch) || !pure_expr(cond) {
+        return false;
+    }
+    // some `&&`-conjunct must BE the branch verbatim (its truthiness
+    // proves non-null); compare paren-stripped
+    conjuncts(cond)
+        .iter()
+        .any(|c| strip_outer_parens(c) == branch)
+}
+
 /// main() prologue line? (see trim_main_prologue)
 fn is_prologue_line(line: &str) -> bool {
     let t = line.trim_start();
@@ -22515,6 +23023,432 @@ fn stmts_contain_continue(stmts: &[IrStmt]) -> bool {
 /// while path); this pass re-folds it for the C renderer. Conservative:
 /// only the exact counting-loop shape folds, and only when the body has
 /// no native `continue` (see stmts_contain_continue).
+/// Const-branch fold (items 29/30/32): an `if`/`elsif` chain whose
+/// conditions decide at emit time keeps only the live branch; a `while`
+/// with a const-false condition vanishes. Only side-effect-free shapes
+/// decide (numeric consts, const_vars, literal string tests without `$`
+/// or backticks) — anything possibly effectful bails to None and the
+/// statement is left untouched. Untaken branch bodies never execute, so
+/// dropping them is always safe; skipped elsif conds after a decided-true
+/// never evaluate in the original either (short-circuit).
+fn fold_const_branch_list(
+    stmts: &mut Vec<IrStmt>,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        let folded: Option<Vec<IrStmt>> = match &stmts[i] {
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                fold_const_if(cond, then, elsifs, else_, const_rhs)
+            }
+            IrStmt::While { cond, .. } => {
+                if eval_const_cond(cond, const_rhs) == Some(false) {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(repl) = folded {
+            stmts.splice(i..i + 1, repl);
+            continue;
+        }
+        fold_const_branch_stmt(&mut stmts[i], const_rhs);
+        i += 1;
+    }
+}
+
+/// Recurse the const-branch fold into nested statement lists.
+fn fold_const_branch_stmt(
+    st: &mut IrStmt,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) {
+    match st {
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            fold_const_branch_list(b, const_rhs)
+        }
+        IrStmt::If { then, elsifs, else_, .. } => {
+            fold_const_branch_list(then, const_rhs);
+            for (_, b) in elsifs {
+                fold_const_branch_list(b, const_rhs);
+            }
+            fold_const_branch_list(else_, const_rhs);
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. } => fold_const_branch_list(body, const_rhs),
+        IrStmt::ForInit { init, step, body, .. } => {
+            fold_const_branch_list(init, const_rhs);
+            fold_const_branch_list(step, const_rhs);
+            fold_const_branch_list(body, const_rhs);
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            fold_const_branch_list(body, const_rhs);
+            for (_, b) in named_blocks {
+                fold_const_branch_list(b, const_rhs);
+            }
+        }
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                fold_const_branch_list(&mut c.body, const_rhs);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            fold_const_branch_list(body, const_rhs);
+            for e in excepts {
+                fold_const_branch_list(&mut e.body, const_rhs);
+            }
+            fold_const_branch_list(else_body, const_rhs);
+            fold_const_branch_list(finally_body, const_rhs);
+        }
+        _ => {}
+    }
+}
+
+/// Decide an if/elsif chain: the first decidable-true branch wins; all
+/// false through the else keeps the else. Any undecidable condition keeps
+/// the whole chain (returned None) — but nested folds still run via the
+/// recursion in fold_const_branch_list.
+fn fold_const_if(
+    cond: &IrExpr,
+    then: &[IrStmt],
+    elsifs: &[(IrExpr, Vec<IrStmt>)],
+    else_: &[IrStmt],
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) -> Option<Vec<IrStmt>> {
+    match eval_const_cond(cond, const_rhs) {
+        Some(true) => Some(then.to_vec()),
+        Some(false) => {
+            let mut rest = elsifs;
+            loop {
+                match rest.split_first() {
+                    None => return Some(else_.to_vec()),
+                    Some(((ec, eb), tail)) => match eval_const_cond(ec, const_rhs) {
+                        Some(true) => return Some(eb.clone()),
+                        Some(false) => rest = tail,
+                        None => return None,
+                    },
+                }
+            }
+        }
+        None => None,
+    }
+}
+
+/// A resolved constant operand: integer or string.
+enum ConstVal {
+    Int(i64),
+    Str(String),
+}
+
+/// Resolve a side-effect-free constant operand: numeric literals, const
+/// vars (via const_rhs — single-write, no read-before-write by
+/// construction), and string literals (Int when the digits parse).
+/// Anything else (calls, captures, index reads, non-const vars) → None.
+fn resolve_const_operand(
+    e: &IrExpr,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) -> Option<ConstVal> {
+    match e {
+        IrExpr::Int(i) => Some(ConstVal::Int(*i)),
+        IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+            Ok(n) => Some(ConstVal::Int(n)),
+            Err(_) => Some(ConstVal::Str(s.clone())),
+        },
+        IrExpr::Arith(a) => match a.as_ref() {
+            ArithAst::Num(n) => Some(ConstVal::Int(*n)),
+            ArithAst::Var(v) | ArithAst::Ident(v) => resolve_const_var(v, const_rhs),
+            _ => None,
+        },
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => resolve_const_var(v, const_rhs),
+        _ => None,
+    }
+}
+
+/// A const var's value, if it is itself a constant (Int/Num literal or
+/// a digit/all-string literal). const_rhs holds the single assigned
+/// RHS; anything else (calls, arith trees, captures) → None.
+fn resolve_const_var(
+    v: &str,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) -> Option<ConstVal> {
+    match const_rhs.get(v)? {
+        IrExpr::Int(i) => Some(ConstVal::Int(*i)),
+        IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+            Ok(n) => Some(ConstVal::Int(n)),
+            Err(_) => Some(ConstVal::Str(s.clone())),
+        },
+        IrExpr::Arith(a) => match a.as_ref() {
+            ArithAst::Num(n) => Some(ConstVal::Int(*n)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decide a branch condition at emit time. Pure shapes only: numeric
+/// comparisons/arith on constants, string ==/!= on literals, literal
+/// test(1) strings without `$`/backticks/globs, &&/||/! over decidable
+/// parts. Division/modulo by zero and overflow bail (None) so runtime
+/// behavior is preserved exactly.
+fn eval_const_cond(
+    e: &IrExpr,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) -> Option<bool> {
+    match e {
+        IrExpr::Bool(b) => Some(*b),
+        IrExpr::Int(i) => Some(*i != 0),
+        IrExpr::Arith(a) => eval_const_arith(a, const_rhs).map(|v| match v {
+            ConstVal::Int(n) => n != 0,
+            ConstVal::Str(s) => !s.is_empty(),
+        }),
+        IrExpr::BinOp { lhs, op, rhs } => {
+            use crate::ir::BinOpKind;
+            match op {
+                BinOpKind::And => match (eval_const_cond(lhs, const_rhs), eval_const_cond(rhs, const_rhs)) {
+                    (Some(a), Some(b)) => Some(a && b),
+                    _ => None,
+                },
+                BinOpKind::Or => match (eval_const_cond(lhs, const_rhs), eval_const_cond(rhs, const_rhs)) {
+                    (Some(a), Some(b)) => Some(a || b),
+                    _ => None,
+                },
+                BinOpKind::Not => eval_const_cond(lhs, const_rhs).map(|a| !a),
+                _ => None,
+            }
+        }
+        IrExpr::Call { func, args } if func == "test" => {
+            if let [IrExpr::Str(t, _)] = args.as_slice() {
+                eval_const_test(t)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate side-effect-free integer/string arithmetic to a constant.
+fn eval_const_arith(
+    a: &ArithAst,
+    const_rhs: &std::collections::HashMap<String, IrExpr>,
+) -> Option<ConstVal> {
+    match a {
+        ArithAst::Num(n) => Some(ConstVal::Int(*n)),
+        ArithAst::Var(v) | ArithAst::Ident(v) => resolve_const_var(v, const_rhs),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = eval_const_arith(lhs, const_rhs)?;
+            let r = eval_const_arith(rhs, const_rhs)?;
+            match (l, r) {
+                (ConstVal::Int(x), ConstVal::Int(y)) => {
+                    match op.as_str() {
+                        "<" => Some(ConstVal::Int((x < y) as i64)),
+                        "<=" => Some(ConstVal::Int((x <= y) as i64)),
+                        ">" => Some(ConstVal::Int((x > y) as i64)),
+                        ">=" => Some(ConstVal::Int((x >= y) as i64)),
+                        "==" => Some(ConstVal::Int((x == y) as i64)),
+                        "!=" => Some(ConstVal::Int((x != y) as i64)),
+                        "+" => Some(ConstVal::Int(x.checked_add(y)?)),
+                        "-" => Some(ConstVal::Int(x.checked_sub(y)?)),
+                        "*" => Some(ConstVal::Int(x.checked_mul(y)?)),
+                        "/" => Some(ConstVal::Int(x.checked_div(y)?)),
+                        "%" => Some(ConstVal::Int(x.checked_rem(y)?)),
+                        _ => None,
+                    }
+                }
+                (ConstVal::Str(x), ConstVal::Str(y)) => match op.as_str() {
+                    "==" => Some(ConstVal::Int((x == y) as i64)),
+                    "!=" => Some(ConstVal::Int((x != y) as i64)),
+                    _ => None,
+                },
+                (ConstVal::Int(x), ConstVal::Str(y)) | (ConstVal::Str(y), ConstVal::Int(x)) => {
+                    // mixed: coerce the string through i64 (bash arith
+                    // would); unparseable → bail
+                    let y = y.trim().parse::<i64>().ok()?;
+                    match op.as_str() {
+                        "<" => Some(ConstVal::Int((x < y) as i64)),
+                        "<=" => Some(ConstVal::Int((x <= y) as i64)),
+                        ">" => Some(ConstVal::Int((x > y) as i64)),
+                        ">=" => Some(ConstVal::Int((x >= y) as i64)),
+                        "==" => Some(ConstVal::Int((x == y) as i64)),
+                        "!=" => Some(ConstVal::Int((x != y) as i64)),
+                        _ => None,
+                    }
+                }
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let v = eval_const_arith(arg, const_rhs)?;
+            match (op.as_str(), v) {
+                ("!", ConstVal::Int(n)) => Some(ConstVal::Int((n == 0) as i64)),
+                ("-", ConstVal::Int(n)) => Some(ConstVal::Int(n.checked_neg()?)),
+                ("~", ConstVal::Int(n)) => Some(ConstVal::Int(!n)),
+                _ => None,
+            }
+        }
+        ArithAst::Cond { test, then, else_ } => {
+            let t = eval_const_arith(test, const_rhs)?;
+            let take_then = match t {
+                ConstVal::Int(n) => n != 0,
+                ConstVal::Str(s) => !s.is_empty(),
+            };
+            if take_then {
+                eval_const_arith(then, const_rhs)
+            } else {
+                eval_const_arith(else_, const_rhs)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Decide a literal `test` string: `"a"="a"`, `"a"!="b"`, `-n/-z`
+/// on literals, integer `-eq/-ne/-lt/-le/-gt/-ge` on digits. Bails on
+/// `$`, backticks (possible substitution), glob chars in ==/!= (pattern
+/// semantics), parens, and anything unrecognized. Operators are found
+/// quote-aware: `"x!=y"` is a single non-empty word (TRUE), not a
+/// comparison — splitting inside quotes would invert the answer.
+fn eval_const_test(t: &str) -> Option<bool> {
+    let t = t.trim();
+    if t.contains('$') || t.contains('`') || t.contains('(') || t.contains(')') {
+        return None;
+    }
+    // leading `! ` negation
+    if let Some(rest) = t.strip_prefix("! ").or_else(|| t.strip_prefix("!")) {
+        return eval_const_test(rest.trim()).map(|b| !b);
+    }
+    // binary string compare / integer compare — quote-aware: the
+    // operator must sit OUTSIDE quotes (`"a"="a"` compares; `"x=y"`
+    // is one word)
+    for (sep, is_eq) in [("!=", false), ("=", true)] {
+        if let Some(eq) = find_unquoted(t, sep) {
+            let (l, r) = t.split_at(eq);
+            let r = &r[sep.len()..];
+            // a `-` directly before `=` means an integer operator
+            // (`-eq`), not string `=`
+            if sep == "=" && l.trim_end().ends_with('-') {
+                continue;
+            }
+            let l = strip_test_word(l.trim());
+            let r = strip_test_word(r.trim());
+            if l.contains(['*', '?', '[']) || r.contains(['*', '?', '[']) {
+                return None;
+            }
+            return Some(if is_eq { l == r } else { l != r });
+        }
+    }
+    // `-n X` / `-z X` — only for a single word (multi-word is a test
+    // syntax error at runtime, exit 2 — never fold that)
+    if let Some(rest) = t.strip_prefix("-n ").or_else(|| t.strip_prefix("-n\t")) {
+        let w = strip_test_word(rest.trim());
+        if !has_unquoted_blank(&w) {
+            return Some(!w.is_empty());
+        }
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("-z ").or_else(|| t.strip_prefix("-z\t")) {
+        let w = strip_test_word(rest.trim());
+        if !has_unquoted_blank(&w) {
+            return Some(w.is_empty());
+        }
+        return None;
+    }
+    // integer comparisons — quote-aware like above
+    for op in ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"] {
+        if let Some(at) = find_unquoted(t, op) {
+            let (l, r) = t.split_at(at);
+            let r = &r[op.len()..];
+            let x = strip_test_word(l.trim()).parse::<i64>().ok()?;
+            let y = strip_test_word(r.trim()).parse::<i64>().ok()?;
+            return Some(match op {
+                "-eq" => x == y,
+                "-ne" => x != y,
+                "-lt" => x < y,
+                "-le" => x <= y,
+                "-gt" => x > y,
+                _ => x >= y,
+            });
+        }
+    }
+    None
+}
+
+/// Does `w` contain whitespace outside quotes (i.e. more than one word)?
+fn has_unquoted_blank(w: &str) -> bool {
+    let b = w.as_bytes();
+    let mut i = 0;
+    let mut quote = 0u8;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            quote = c;
+        } else if c == b' ' || c == b'\t' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Byte offset of `op` in `t` outside any quotes, or None. `"` and `'`
+/// both quote; backslash escapes the next char (already rejected above
+/// for `$`/backtick, but harmless to honor here).
+fn find_unquoted(t: &str, op: &str) -> Option<usize> {
+    let b = t.as_bytes();
+    let o = op.as_bytes();
+    let mut i = 0;
+    let mut quote = 0u8;
+    while i + o.len() <= b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            quote = c;
+            i += 1;
+            continue;
+        }
+        if &b[i..i + o.len()] == o {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip one layer of matching quotes from a test word.
+fn strip_test_word(w: &str) -> String {
+    let w = w.trim();
+    if w.len() >= 2
+        && ((w.starts_with('"') && w.ends_with('"'))
+            || (w.starts_with('\'') && w.ends_with('\'')))
+    {
+        w[1..w.len() - 1].to_string()
+    } else {
+        w.to_string()
+    }
+}
+
 fn fold_range_for(stmts: &mut Vec<IrStmt>) {
     let mut out = Vec::with_capacity(stmts.len());
     let mut i = 0;
@@ -27511,8 +28445,8 @@ mod tests {
             "Not BinOp stripped to broken !():\n{out}"
         );
         assert!(
-            out.contains("static int _sh_rc = 0;"),
-            "_sh_rc declaration stripped:\n{out}"
+            out.contains("static int _sh_rc;"),
+            "_sh_rc declaration stripped (item 44 renders the zero-init as bare static):\n{out}"
         );
     }
 
@@ -28748,7 +29682,9 @@ mod tests {
         let decl = out.find("char *a[").expect("no array decl:\n{out}");
         let dn: usize = out[decl + 8..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().expect("decl size");
         assert!(dn < 1024, "blanket cap leaked:\n{out}");
-        assert!(out.contains(&format!("_ai0 >= {dn}")), "guard disagrees with decl:\n{out}");
+        // proven cap ⇒ the per-store `_ai0 >= dn` guard is dead (ai runs
+        // 0..2, cap is 3 by the same proof) and omitted (item 43)
+        assert!(!out.contains(&format!("_ai0 >= {dn}")), "dead guard survives:\n{out}");
         // indexed write → 1024 status quo or vec (arr_set sites are
         // unthreaded, so never a small fixed decl).
         let out = shir_to_c(&prog_of(vec![
