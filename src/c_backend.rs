@@ -14264,12 +14264,18 @@ fn param_copy_alias(
         if herestrings != 1 || redirects.len() != 1 {
             return None;
         }
+        // NATIVE only pays when a read-loop consumes the string —
+        // a bare `grep <<< str` (no While) must fall through to the
+        // shell path (`<<<` intact), not render plainly with the
+        // herestring dropped (BASHC_FIX parse-herestring).
+        let mut has_read_loop = false;
         for s in inner {
             match s {
                 IrStmt::While { .. } => {
                     if Self::herestring_read_while(s).is_none() {
                         return None;
                     }
+                    has_read_loop = true;
                 }
                 _ => {
                     if !Self::herestring_loop_body_ok(std::slice::from_ref(s)) {
@@ -14277,6 +14283,9 @@ fn param_copy_alias(
                     }
                 }
             }
+        }
+        if !has_read_loop {
+            return None;
         }
         Some(hs)
     }
