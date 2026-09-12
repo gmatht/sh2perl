@@ -12457,9 +12457,9 @@ fn param_copy_alias(
             match mode {
                 "w" => {
                     // `2>&1` — the target is a fd reference: no quoting
-                    // (a quoted `'&1'` would name a file)
+                    // (a quoted `'&1'` would name a file). `>&-` closes.
                     if let crate::ir::IrExpr::Str(t, _) = &rd.target {
-                        if t.starts_with('&') {
+                        if t.starts_with('&') || *t == "-" {
                             raw(self, &format!("{fd_pre}>"));
                             add(self, t); // NO leading space: `2>&1`
                             continue;
@@ -12478,6 +12478,15 @@ fn param_copy_alias(
                     self.sh_word(buf, &rd.target);
                 }
                 "r" | "r+" => {
+                    // `<&N` dup and `<&-` close (BASHC_FIX arith-ambiguous):
+                    // quoted would name files.
+                    if let crate::ir::IrExpr::Str(t, _) = &rd.target {
+                        if t.starts_with('&') || *t == "-" {
+                            raw(self, &format!("{fd_pre}<"));
+                            add(self, t); // NO leading space
+                            continue;
+                        }
+                    }
                     raw(self, &format!("{fd_pre}<"));
                     self.sh_word(buf, &rd.target);
                 }
