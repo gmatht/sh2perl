@@ -280,6 +280,12 @@ pub struct Render {
     /// -x vars assigned by the current declare command, awaiting
     /// post-emission env sync (setenv must run AFTER the value lands).
     pending_export: Vec<String>,
+    /// procsub temps already claimed as producer-written (BASHC_FIX
+    /// 063_11): the frontend lowers `< <(producer)` with the PRODUCER's
+    /// redirect as (fd 0, mode r) — same as the consumer's. The first
+    /// r+__ps_ redirect per temp is the producer (flip to write); later
+    /// ones are consumers (keep as read).
+    ps_producer_done: std::collections::HashSet<String>,
     /// GMP bigint temps (_mpzN) created inline for bigint-param calls,
     /// dead after the enclosing statement. Cleared (mpz_clear) at the
     /// same statement boundaries as pending_frees.
@@ -760,6 +766,268 @@ fn select_vec_arrays(
         })
         .map(|(a, _)| a.clone())
         .collect()
+}
+
+/// Demote Int verdicts to Str when the var is assigned stringy text
+/// (capture/command-subst, interpolate, non-numeric literal, or a read
+/// of a non-Int var). Transitive (demoted sources demote targets).
+/// Covers top-level stmts, function bodies, and Declare inits.
+fn demote_stringy_ints(prog: &mut IrProgram) {
+    use crate::ir::{IrExpr, IrStmt};
+    use std::collections::HashSet;
+    let mut int_set: HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == crate::ir::IrType::Int)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if int_set.is_empty() {
+        return;
+    }
+    fn is_numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            // numeric-text literal (`n="1"` stays Int; anything with
+            // whitespace/signs/radix demotes — exact text must survive
+            // for string contexts, BASHC_FIX test-string-arith).
+            IrExpr::Str(s, _) => {
+                let t = s.strip_prefix('-').unwrap_or(s);
+                !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit())
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                ints.contains(n) || matches!(n.as_str(), "?" | "#" | "!" | "$")
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match crate::c_backend::Render::str_arg(args, 0).as_deref() {
+                    Some(n) => {
+                        ints.contains(n) || matches!(n, "?" | "#" | "!" | "$")
+                    }
+                    None => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "param" => {
+                matches!(
+                    crate::c_backend::Render::str_arg(args, 0).as_deref(),
+                    Some("len" | "#")
+                )
+            }
+            _ => false,
+        }
+    }
+    fn walk(stmts: &[IrStmt], ints: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    let stringy = !is_numeric(expr, ints);
+                    // nested assigns inside RHS? (rare; the RHS walk
+                    // below covers expression-embedded stmts via Arrow)
+                    if stringy {
+                        for t in targets {
+                            if t.indices.is_empty() {
+                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site1)", &t.var); }                                ints.remove(&t.var);
+                            }
+                        }
+                    }
+                    // recurse into Arrow bodies in RHS (captures etc.)
+                    fn walk_expr(e: &IrExpr, ints: &mut HashSet<String>) {
+                        match e {
+                            IrExpr::Call { args, .. } => {
+                                for a in args {
+                                    walk_expr(a, ints);
+                                }
+                            }
+                            IrExpr::Array(items) => {
+                                for a in items {
+                                    walk_expr(a, ints);
+                                }
+                            }
+                            IrExpr::Arrow(stmts) => walk(stmts, ints),
+                            IrExpr::Interpolate(parts) => {
+                                for p in parts {
+                                    if let crate::ir::InterpPart::Expr(x) =
+                                        p
+                                    {
+                                        walk_expr(x, ints);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    walk_expr(expr, ints);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    if let Some(e) = init {
+                        if !is_numeric(e, ints) {
+                            for v in vars {
+                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site2)", &v.name); }                                ints.remove(&v.name);
+                            }
+                        }
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    walk_cond(cond, ints);
+                    walk(then, ints);
+                    for (c, b) in elsifs {
+                        walk_cond(c, ints);
+                        walk(b, ints);
+                    }
+                    walk(else_, ints);
+                }
+                IrStmt::While { cond, body, .. }
+                | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_cond(cond, ints);
+                    walk(body, ints);
+                }
+                IrStmt::For { body, .. } => walk(body, ints),
+                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints),
+                IrStmt::Redirect { inner, .. } => walk(inner, ints),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, ints);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, ints);
+                    for (_, b) in named_blocks {
+                        walk(b, ints);
+                    }
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, ints);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    walk(body, ints);
+                    for e in excepts {
+                        walk(&e.body, ints);
+                    }
+                    walk(else_body, ints);
+                    walk(finally_body, ints);
+                }
+                IrStmt::ForInit { body, .. } => walk(body, ints),
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    // `local x=$(...)` / `export x=...` as builtin CALLS
+                    // (not Declare): stringy inits demote (BASHC_FIX 062).
+                    if let IrExpr::Call { func, args } = e {
+                        if (func == "builtin" || func == "exec")
+                            && matches!(
+                                Render::str_arg(args, 0).as_deref(),
+                                Some(
+                                    "local"
+                                        | "declare"
+                                        | "typeset"
+                                        | "export"
+                                        | "readonly"
+                                )
+                            )
+                        {
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                let mut i = 0;
+                                while i < items.len() {
+                                    // `name=` + value as SEPARATE words, or
+                                    // combined `name=value` one word.
+                                    if let IrExpr::Str(s, _) = &items[i] {
+                                        if s.ends_with('=')
+                                            && crate::c_backend::is_ident(
+                                                &s[..s.len() - 1],
+                                            )
+                                        {
+                                            let nm =
+                                                s[..s.len() - 1].to_string();
+                                            if let Some(v) = items.get(i + 1)
+                                            {
+                                                if !is_numeric(v, ints) {
+                                                    if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site3)", &nm); }                                                    ints.remove(&nm);
+                                                }
+                                            }
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if let Some((nm, vv)) =
+                                            s.split_once('=')
+                                        {
+                                            // combined `n=v` literal: demote
+                                            // unless numeric text.
+                                            if crate::c_backend::is_ident(nm)
+                                                && vv.parse::<i64>().is_err()
+                                            {
+                                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site4)", &nm.to_string()); }                                                ints.remove(&nm.to_string());
+                                            }
+                                        }
+                                    }
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    // expression-embedded Arrows (captures, pipelines)
+                    fn walk_e(e: &IrExpr, ints: &mut HashSet<String>) {
+                        match e {
+                            IrExpr::Arrow(stmts) => walk(stmts, ints),
+                            IrExpr::Call { args, .. } => {
+                                for a in args {
+                                    walk_e(a, ints);
+                                }
+                            }
+                            IrExpr::Array(items) => {
+                                for a in items {
+                                    walk_e(a, ints);
+                                }
+                            }
+                            IrExpr::Interpolate(parts) => {
+                                for p in parts {
+                                    if let crate::ir::InterpPart::Expr(x) =
+                                        p
+                                    {
+                                        walk_e(x, ints);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    walk_e(e, ints);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_cond(e: &IrExpr, ints: &mut HashSet<String>) {
+        // conditions may embed Arrows; assigns there are rare but walk
+        // them for completeness (same helper as Expr above, inlined
+        // to avoid closure borrow issues).
+        match e {
+            IrExpr::Arrow(stmts) => walk(stmts, ints),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_cond(a, ints);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    walk_cond(a, ints);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_cond(x, ints);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut int_set);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut int_set);
+    }
+
+    prog.var_types
+        .retain(|(n, t)| *t != crate::ir::IrType::Int || int_set.contains(n));
 }
 
 fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
@@ -2740,6 +3008,12 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             prog.var_types.push((n.clone(), t.clone()));
         }
     }
+    // STRINGLY-WINS demotion (BASHC_FIX 062): a var the A2 verdicts
+    // call Int but which is assigned stringy text ANYWHERE (e.g.
+    // `result` is arith elsewhere but `result=$(echo ...)` here)
+    // must be Str — an Int decl truncates the string pointer to 16
+    // bits (garbage numbers). Numeric uses still work via atoll.
+    demote_stringy_ints(&mut prog);
     // sort for deterministic serialization (the C backend reads it as a
     // map, but the sort keeps output stable across runs)
     prog.var_types.sort_by(|a, b| a.0.cmp(&b.0));
@@ -10275,6 +10549,15 @@ fn param_copy_alias(
                                 )),
                             }
                         }
+                        Some("$") => {
+                            // `$$` is the MAIN shell PID (constant) — a
+                            // literal `"$$"` would expand to each
+                            // `bash -c` child's own PID (varying per
+                            // site, breaking `$$`-named temp files —
+                            // BASHC_FIX realpath). Expand inline.
+                            let t = self.num_temp("getpid()");
+                            word(self, t);
+                        }
                         Some(n) => {
                             let v = if self.const_lifted.contains(n) {
                                 // const-lifted: reference the C ident —
@@ -10391,6 +10674,47 @@ fn param_copy_alias(
                         word(self, t);
                     }
                 }
+                "param" => {
+                    // `${arr[@]}` (whole array, no bounds) as a COMMAND
+                    // word: expand to SEPARATELY quoted words (a joined
+                    // single word made the child exec 'realpath /bin' as
+                    // one filename → ENOENT/127, BASHC_FIX realpath).
+                    // Mirrors the listVar-$@ loop. Assoc/int arrays and
+                    // bounded slices keep the joined value_c fallback.
+                    let is_whole_at = match args.as_slice() {
+                        [IrExpr::Str(op, _), IrExpr::Str(arr, _), IrExpr::Str(at, _), IrExpr::Str(len, _)] => {
+                            op == "slice"
+                                && at == "@"
+                                && len.is_empty()
+                                && is_ident(arr)
+                                && self.arrays.contains(arr)
+                                && !self.assoc_arrays.contains(arr)
+                                && !self.int_arrays.contains(arr)
+                        }
+                        _ => false,
+                    };
+                    if is_whole_at {
+                        let arr = match &args[1] {
+                            IrExpr::Str(a, _) => a.clone(),
+                            _ => String::new(),
+                        };
+                        let id = self.c_ident(&arr);
+                        let addq = Self::cstr(" '");
+                        let escq = Self::cstr("'\"'\"'");
+                        let endq = Self::cstr("'");
+                        match buf {
+                            CmdBuf::Shared => self.emit(&format!(
+                                "{{ for (size_t _qi = 0; _qi < {id}_len; _qi++) {{ const char *_qa = {id}[_qi] ? {id}[_qi] : \"\"; _sh_add({addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_add({escq}); else _sh_addc(*_qp); }} _sh_add({endq}); }} }}",
+                            )),
+                            CmdBuf::Private(bid) => self.emit(&format!(
+                                "{{ for (size_t _qi = 0; _qi < {id}_len; _qi++) {{ const char *_qa = {id}[_qi] ? {id}[_qi] : \"\"; _sh_badd(&_c{bid}_cmd, &_c{bid}_cap, {addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{bid}_cmd, &_c{bid}_cap, {escq}); else _sh_baddc(&_c{bid}_cmd, &_c{bid}_cap, *_qp); }} _sh_badd(&_c{bid}_cmd, &_c{bid}_cap, {endq}); }} }}",
+                            )),
+                        }
+                    } else {
+                        let v = self.value_c(e);
+                        word(self, v);
+                    }
+                }
                 _ => {
                     let v = self.value_c(e);
                     // a site call returns int — stringify for the buffer
@@ -10505,7 +10829,27 @@ fn param_copy_alias(
                             }
                             IrExpr::Call { func, args } if func == "getVar" => {
                                 let n = Self::str_arg(args, 0).unwrap_or_default();
-                                if n == "@" || n == "*" {
+                                if n == "$" {
+                                    let t = self.num_temp("getpid()");
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            if first_seg {
+                                                self.emit(&format!("_sh_word({t});"));
+                                            } else {
+                                                self.emit(&format!("_sh_add({t});"));
+                                            }
+                                        }
+                                        CmdBuf::Private(id) => {
+                                            if first_seg {
+                                                self.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {t});"));
+                                            } else {
+                                                self.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t});"));
+                                            }
+                                        }
+                                    }
+                                    first_seg = false;
+                                    return;
+                                } else if n == "@" || n == "*" {
                                     // "$@" — the JOINED positional value at
                                     // site-build time (an env export of "@"
                                     // is always empty)
@@ -12004,6 +12348,26 @@ fn param_copy_alias(
 
     /// Append the redirect text (`> f`, `>> f`, `< f`, heredoc, ...).
     fn sh_redirect_text(&mut self, buf: CmdBuf, redirects: &[crate::ir::IrRedirect]) {
+        // producer-direction flip (see ps_producer_done field docs).
+        let flipped: Vec<crate::ir::IrRedirect>;
+        let redirects = {
+            let mut v: Vec<crate::ir::IrRedirect> = redirects.to_vec();
+            for rd in v.iter_mut() {
+                let is_ps_read = rd.mode == "r"
+                    && rd.fd == Some(0)
+                    && matches!(&rd.target, crate::ir::IrExpr::Var(n, _) if n.starts_with("__ps_"));
+                if is_ps_read {
+                    if let crate::ir::IrExpr::Var(n, _) = &rd.target {
+                        if self.ps_producer_done.insert(n.clone()) {
+                            rd.mode = "w".to_string();
+                            rd.fd = Some(1);
+                        }
+                    }
+                }
+            }
+            flipped = v;
+            flipped.as_slice()
+        };
         let raw = |r: &mut Render, s: &str| match buf {
             CmdBuf::Shared => r.emit(&format!("_sh_addraw({});", Self::cstr(s))),
             CmdBuf::Private(id) => r.emit(&format!(
@@ -17088,6 +17452,17 @@ fn param_copy_alias(
         if std::env::var("SH2_DEBUG_PAT").is_ok() {
             eprintln!("PAT: {:?}", pat);
         }
+        // ANSI-C NUL (`$'\\x00'`, `$'\\0'`): bash truncates at NUL, so the
+        // expansion is EMPTY (a `*$'\\x00'*` pattern becomes `**`,
+        // match-all — BASHC_FIX realpath). Other ANSI escapes keep
+        // existing handling.
+        let pat_owned;
+        let pat = if pat.contains("$'") {
+            pat_owned = pat.replace("$'\\x00'", "").replace("$'\\0'", "");
+            pat_owned.as_str()
+        } else {
+            pat
+        };
         let unquoted: String = pat
             .chars()
             .filter(|c| *c != '"' && *c != '\'')
