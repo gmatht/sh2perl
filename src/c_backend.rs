@@ -21229,6 +21229,83 @@ fn param_copy_alias(
                         return;
                     }
                 }
+                // NATIVE function call with file redirects (`myfunc < f`,
+                // `myfunc > f`): a site-out child lacks script functions.
+                // dup2/freopen fds around the in-process call (BASHC_FIX tty).
+                // Only single exec of a KNOWN function + Str file targets
+                // on fds 0/1 (modes r/w/a); else fall through to site.
+                {
+                    let is_fn_redirect = match inner.as_slice() {
+                        [IrStmt::Expr(IrExpr::Call { func, args })]
+                            if func == "exec" || func == "builtin" =>
+                        {
+                            match Self::str_arg(args, 0).as_deref() {
+                                Some(cmd) => self.functions.contains(cmd),
+                                None => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    let fds_ok = !redirects.is_empty()
+                        && redirects.iter().all(|rd| {
+                            matches!(rd.fd.unwrap_or(1), 0 | 1)
+                                && matches!(rd.mode.as_str(), "r" | "w" | "a")
+                        });
+                    if is_fn_redirect && fds_ok {
+                        // unique save slots (nested calls recurse safely).
+                        let slot = self.temp_seq;
+                        self.temp_seq += 1;
+                        for rd in redirects {
+                            let fd = rd.fd.unwrap_or(1);
+                            let t = self.value_c(&rd.target);
+                            let fomode = match rd.mode.as_str() {
+                                "a" => "a",
+                                "r" => "r",
+                                _ => "w",
+                            };
+                            // freopen NULL (missing file): bash fails the
+                            // command (rc 1), body never runs. Flush
+                            // buffered stdout BEFORE redirecting (else
+                            // pending output lands in the file).
+                            if fd == 1 {
+                                self.emit("fflush(stdout);");
+                            }
+                            self.emit(&format!(
+                                "int _sfd{slot}_{fd} = dup({fd}); FILE *_rff{slot}_{fd} = freopen({t}, \"{fomode}\", {fdstd});",
+                                fdstd = if fd == 0 { "stdin" } else { "stdout" },
+                            ));
+                        }
+                        self.emit(&format!(
+                            "if ({}) {{",
+                            redirects
+                                .iter()
+                                .map(|rd| {
+                                    let fd = rd.fd.unwrap_or(1);
+                                    format!("_rff{slot}_{fd} != 0")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" && ")
+                        ));
+                        self.depth += 1;
+                        for s in inner {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.emit("{");
+                        for rd in redirects {
+                            let fd = rd.fd.unwrap_or(1);
+                            if fd == 1 {
+                                self.emit("fflush(stdout);");
+                            }
+                            self.emit(&format!(
+                                "dup2(_sfd{slot}_{fd}, {fd}); close(_sfd{slot}_{fd});"
+                            ));
+                        }
+                        self.emit("}");
+                        return;
+                    }
+                }
                 // `cmd > file 2>&1` — reconstruct the full shell text and
                 // run it (bash applies the redirections exactly)
                 let inner = inner.clone();
