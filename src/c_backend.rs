@@ -4038,6 +4038,27 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_baddc(b, cap, '\\'');");
             self.emit("}");
+            // glued runtime values with newlines would break shell syntax
+            // (BASHC_FIX 000 nested backticks): quote IFF newline present
+            // (spaces still split — unquoted semantics preserved).
+            self.emit("static void _sh_baddqn(char **b, size_t *cap, const char *s) {");
+            self.emit("  if (!s) return;");
+            self.emit("  if (!strchr(s, '\\n')) { _sh_badd(b, cap, s); return; }");
+            self.emit("  _sh_badd(b, cap, \"'\");");
+            self.emit("  for (const char *p = s; *p; p++) {");
+            self.emit("    if (*p == '\\'') _sh_badd(b, cap, \"'\\\"'\\\"'\"); else _sh_baddc(b, cap, *p);");
+            self.emit("  }");
+            self.emit("  _sh_baddc(b, cap, '\\'');");
+            self.emit("}");
+            self.emit("static void _sh_addqn(const char *s) {");
+            self.emit("  if (!s) return;");
+            self.emit("  if (!strchr(s, '\\n')) { _sh_add(s); return; }");
+            self.emit("  _sh_add(\"'\");");
+            self.emit("  for (const char *p = s; *p; p++) {");
+            self.emit("    if (*p == '\\'') _sh_add(\"'\\\"'\\\"'\"); else _sh_addc(*p);");
+            self.emit("  }");
+            self.emit("  _sh_addc('\\'');");
+            self.emit("}");
             self.emit("static void _sh_assoc_init(char **b, size_t *cap, const char *name, char **k, char **v, size_t n) {");
             self.emit("  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");");
             self.emit("  for (size_t i = 0; i < n; i++) {");
@@ -10941,10 +10962,13 @@ fn param_copy_alias(
                                 if first_seg {
                                     word(self, v);
                                 } else {
+                                    // glued runtime value: quote IFF it holds
+                                    // newlines (else shell syntax breaks —
+                                    // BASHC_FIX 000). Spaces still split.
                                     match buf {
-                                        CmdBuf::Shared => self.emit(&format!("_sh_add({v});")),
+                                        CmdBuf::Shared => self.emit(&format!("_sh_addqn({v});")),
                                         CmdBuf::Private(id) => self.emit(&format!(
-                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"
+                                            "_sh_baddqn(&_c{id}_cmd, &_c{id}_cap, {v});"
                                         )),
                                     }
                                 }
