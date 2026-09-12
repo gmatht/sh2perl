@@ -10741,6 +10741,30 @@ fn param_copy_alias(
                     }
                 }
                 _ => {
+                    // malformed-! param: emit RAW text (unquoted) so the
+                    // child expands it and rejects (skips command, no
+                    // output — BASHC_FIX 063_04). Quoted evaluation would
+                    // print empty/newline (wrong).
+                    if Self::is_malformed_bang(e) {
+                        if let IrExpr::Call { args, .. } = e {
+                            let name = Self::str_arg(args, 1)
+                                .unwrap_or_default();
+                            let at = Self::str_arg(args, 2)
+                                .unwrap_or_else(|| "@".to_string());
+                            let raw = format!("${{{name}[{at}]}}");
+                            match buf {
+                                CmdBuf::Shared => self.emit(&format!(
+                                    "_sh_addraw({});",
+                                    Self::cstr(&format!(" {raw}"))
+                                )),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                    Self::cstr(&format!(" {raw}"))
+                                )),
+                            }
+                            return;
+                        }
+                    }
                     let v = self.value_c(e);
                     // a site call returns int — stringify for the buffer
                     let v = if v.starts_with("_sh_site_") {
@@ -12654,6 +12678,29 @@ fn param_copy_alias(
         };
         match cmd.as_str() {
             "echo" => {
+                // malformed-! arg: bash skips the whole command (no
+                // output, nonzero). Emit nothing (BASHC_FIX 063_04).
+                {
+                    fn has_bad(e: &crate::ir::IrExpr) -> bool {
+                        if Render::is_malformed_bang(e) {
+                            return true;
+                        }
+                        if let crate::ir::IrExpr::Interpolate(parts) = e {
+                            for p in parts {
+                                if let crate::ir::InterpPart::Expr(x) = p {
+                                    if Render::is_malformed_bang(x) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                    if words.iter().any(|w| has_bad(w)) {
+                        self.need_sh = true;
+                        return "(_sh_rc = 1, 0)".into();
+                    }
+                }
                 // native echo iff every word is a plain string value
                 // (a split word would collapse whitespace in bash)
                 if words.iter().all(|w| self.echo_native_ok(w)) {
@@ -13744,7 +13791,49 @@ fn param_copy_alias(
     /// A capture is fine: in-process fn captures lower to a char* temp,
     /// and every other capture renders as a `_cap_N()` CALL evaluated
     /// inside the printf args (position-safe under &&/||/?:).
+    /// Malformed indirect/prefix-match (`${!prefix*[@]}` — bash
+    /// rejects prefix-match with a subscript). Native evaluation
+    /// yields empty (wrong); the child bash arbitrates correctly
+    /// (skips command, no output). BASHC_FIX 063_04/063_hard.
+    fn is_malformed_bang(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if func != "param" {
+                return false;
+            }
+            let strs: Vec<&str> = args
+                .iter()
+                .filter_map(|a| match a {
+                    IrExpr::Str(s, _) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if strs.len() >= 3 {
+                if let [_, name, at, ..] = strs.as_slice() {
+                    let prefix_match = name.starts_with('!')
+                        && (name.ends_with('*') || name.ends_with('@'));
+                    if prefix_match && !at.is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn echo_native_ok(&self, w: &IrExpr) -> bool {
+        // malformed-! forces shell-out (child rejects correctly).
+        if Self::is_malformed_bang(w) {
+            return false;
+        }
+        if let IrExpr::Interpolate(parts) = w {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    if Self::is_malformed_bang(x) {
+                        return false;
+                    }
+                }
+            }
+        }
         match w {
             IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_)
             | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_)
@@ -14253,6 +14342,10 @@ fn param_copy_alias(
                         CmdBuf::Shared,
                         &IrExpr::Str(cmd, crate::ir::StrStyle::DoubleQuoted),
                     );
+                } else if let Some(cmd_expr) = args.first() {
+                    // non-Str command (`"$@"` listVar, capture): render
+                    // via sh_word (was dropped → empty site, BASHC_FIX tty).
+                    r.sh_word(CmdBuf::Shared, cmd_expr);
                 }
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     for w in items {
