@@ -2912,6 +2912,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.drop_const_stmts();
     // `(exit(X), 0);` statement → `exit(X);` (BASHC_OPT item 21)
     r.drop_exit_comma();
+    // `(_sh_rc = N, CONST);` with live rc → `_sh_rc = N;`
+    // (BASHC_OPT item 58; dead-rc whole drops are item 19's)
+    r.drop_live_comma_tail();
     // `} else {` + `}` (empty else) → `}` (BASHC_OPT item 46;
     // runs after the rc strip, which empties dead-rc-only elses)
     r.drop_empty_else();
@@ -5744,6 +5747,66 @@ impl Render {
             }
         }
         self.out = kept;
+    }
+
+    /// BASHC_OPT item 58: statement `(_sh_rc = N, CONST);` with a
+    /// LIVE rc store → `_sh_rc = N;`. The store is kept (rc is read
+    /// later — item 19 drops the whole statement only when rc is
+    /// dead); the trailing constant value is discarded at statement
+    /// position. Narrow: exactly one `_sh_rc = <int>` head + const
+    /// tail (effectful tails keep their shape — item 36's area).
+    fn drop_live_comma_tail(&mut self) {
+        for line in self.out.iter_mut() {
+            let t = line.trim();
+            let Some(body) = t.strip_suffix(';') else {
+                continue;
+            };
+            // peel one balanced outer paren layer.
+            let mut inner = body.trim();
+            if !(inner.starts_with('(') && inner.ends_with(')')) {
+                continue;
+            }
+            let b = inner.as_bytes();
+            let mut depth = 0usize;
+            let mut ok = true;
+            for (k, &ch) in b.iter().enumerate() {
+                if ch == b'(' {
+                    depth += 1;
+                } else if ch == b')' {
+                    depth -= 1;
+                    if depth == 0 && k != b.len() - 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || depth != 0 {
+                continue;
+            }
+            inner = inner[1..inner.len() - 1].trim();
+            let Some(idx) = last_top_comma(inner) else {
+                continue;
+            };
+            let (head, tail) = (inner[..idx].trim(), inner[idx + 1..].trim());
+            // head must be exactly `_sh_rc = <int>` (no further comma).
+            if last_top_comma(head).is_some() {
+                continue;
+            }
+            let Some(eq) = head.strip_prefix("_sh_rc") else {
+                continue;
+            };
+            let Some(val) = eq.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            if val.trim().parse::<i64>().is_err() {
+                continue;
+            }
+            if !is_const_rhs(tail) {
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            *line = format!("{indent}{head};");
+        }
     }
 
     fn drop_exit_comma(&mut self) {
@@ -12451,10 +12514,23 @@ fn param_copy_alias(
                         } else {
                             self.store_read(&ws)
                         };
-                        self.emit(&format!(
-                            "setenv({}, {v} ? {v} : \"\", 1);",
-                            Self::cstr(&ws)
-                        ));
+                        // BASHC_OPT item 57: a fixed-buffer var
+                        // (`char[N]`) is never NULL (array decay to a
+                        // constant address) — the guard is dead; emit
+                        // the ident bare. (Heap `char*` keeps the guard
+                        // — nullability there needs a proof, items 24+.)
+                        if self.buf_bound(&ws).is_some() {
+                            self.emit(&format!(
+                                "setenv({}, {}, 1);",
+                                Self::cstr(&ws),
+                                self.c_ident(&ws)
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "setenv({}, {v} ? {v} : \"\", 1);",
+                                Self::cstr(&ws)
+                            ));
+                        }
                     }
                     i += 1;
                     continue;
@@ -31955,6 +32031,43 @@ mod tests {
         r.drop_empty_else();
         assert_eq!(r.out[3], "    }");
         assert_eq!(r.out[4], "    } else {");
+    }
+
+    #[test]
+    fn bashc_opt_round6_buffer_guard_and_comma_tail() {
+        // Item 57: bare `export` of a fixed-buffer var emits the
+        // ident with no guard (array decay never NULL); a heap var
+        // keeps its guard.
+        let mut r = Render::default();
+        r.var_lengths.insert("SHELL_VAR".to_string(), Some(11));
+        let w =
+            IrExpr::Str("SHELL_VAR".to_string(), crate::ir::StrStyle::DoubleQuoted);
+        r.declare_words(&[&w]);
+        assert!(
+            r.out.iter().any(|l| l.contains("setenv(\"SHELL_VAR\", SHELL_VAR, 1)")),
+            "buffer guard kept: {:?}",
+            r.out
+        );
+        let mut r = Render::default();
+        let w = IrExpr::Str("plain".to_string(), crate::ir::StrStyle::DoubleQuoted);
+        r.declare_words(&[&w]);
+        assert!(
+            r.out.iter().any(|l| l.contains('?')),
+            "heap guard dropped: {:?}",
+            r.out
+        );
+        // Item 58: `(_sh_rc = N, CONST);` statement → store only;
+        // effectful tails and multi-store heads keep the shape.
+        let mut r = Render::default();
+        r.out = vec![
+            "    (_sh_rc = 0, 1);".to_string(),
+            "    (_sh_rc = 0, printf(\"%s \", x));".to_string(),
+            "    (_sh_rc = 0, _sh_rc = 1, 1);".to_string(),
+        ];
+        r.drop_live_comma_tail();
+        assert_eq!(r.out[0], "    _sh_rc = 0;");
+        assert!(r.out[1].contains("printf"), "effectful tail cut: {}", r.out[1]);
+        assert!(r.out[2].contains(", _sh_rc = 1,"), "multi-store cut: {}", r.out[2]);
     }
 
     #[test]
