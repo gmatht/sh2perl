@@ -19949,13 +19949,19 @@ fn param_copy_alias(
                                 },
                                 false,
                             );
+                            // bash loop status = last BODY rc (not the exiting
+                            // test's). Save per-iteration, restore if ran.
+                            let lrc = format!("_sh_lrc{}", self.temp_seq);
+                            self.temp_seq += 1;
                             self.emit("{ int _went = 0;");
+                            self.emit(&format!("int {lrc} = 0;"));
                             self.emit(&format!("while ({site}) {{"));
                             self.depth += 1;
                             self.emit("_went = 1;");
                             for s in &body_stmts {
                                 self.stmt(s);
                             }
+                            self.emit(&format!("{lrc} = _sh_rc;"));
                             self.depth -= 1;
                             self.emit("}");
                             // bash: a while whose condition failed BEFORE
@@ -19964,7 +19970,9 @@ fn param_copy_alias(
                             // BEARING here: the site tail runs _sh_system_rc()
                             // per evaluation, so a pre-set _sh_rc = 0 would be
                             // overwritten by the failing cond itself.
-                            self.emit("if (!_went) _sh_rc = 0;");
+                            self.emit(&format!(
+                                "if (!_went) _sh_rc = 0; else _sh_rc = {lrc};"
+                            ));
                             self.emit("}");
                         }
                         return;
@@ -21015,10 +21023,14 @@ fn param_copy_alias(
                 // call in the cond, keep the load-bearing _went flag.
                 // strip_dead_rc removes the pre-set when nothing reads $?.
                 let cond_pure = !has_call(&c);
+                // body-rc save/restore (see site-1 above).
+                let lrc2 = format!("_sh_lrc{}", self.temp_seq);
+                self.temp_seq += 1;
                 if cond_pure {
                     self.emit("_sh_rc = 0;");
                 } else {
                     self.emit("{ int _went = 0;");
+                    self.emit(&format!("int {lrc2} = 0;"));
                 }
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
@@ -21028,10 +21040,15 @@ fn param_copy_alias(
                 for s in body {
                     self.stmt(s);
                 }
+                if !cond_pure {
+                    self.emit(&format!("{lrc2} = _sh_rc;"));
+                }
                 self.depth -= 1;
                 self.emit("}");
                 if !cond_pure {
-                    self.emit("if (!_went) { _sh_rc = 0; }");
+                    self.emit(&format!(
+                        "if (!_went) {{ _sh_rc = 0; }} else {{ _sh_rc = {lrc2}; }}"
+                    ));
                     self.emit("}");
                 }
             }
@@ -21430,6 +21447,15 @@ fn param_copy_alias(
                 // exactly what omitting the else does in C. (The IR has
                 // no else field; the old `else { /* no default */ }`
                 // was pure noise.)
+                // STATUS: no-match exits 0 (must clear a stale rc from
+                // discriminant eval, e.g. failed $() → 127 — BASHC_FIX
+                // parse-case-dollarparen). Item 20 stays (no output).
+                if first {
+                    // zero clauses: `case x in esac` → 0.
+                    self.emit("_sh_rc = 0;");
+                } else {
+                    self.emit("else { _sh_rc = 0; }");
+                }
             }
             IrStmt::WriteFile { path, content, append } => {
                 let p = self.value_c(path);
@@ -22314,12 +22340,13 @@ fn param_copy_alias(
         for v in &bigint_consts {
             self.emit(&format!("  mpz_clear(_bigint_{v});"));
         }
-        // NOTE (BASHC_FIX parse-bracket): `return _sh_rc` (bash parity
-        // for trailing-status exit codes) EXPOSES 8 latent status bugs
-        // (pipeline/subshell/until stale rc — §2.6 class), net -7. Kept
-        // as `return 0` until status propagation is sound; parse-bracket
-        // stays red on exit-code only (stdout matches via [[ ]] fix).
-        self.emit("return 0;");
+        // EXPERIMENTAL (status audit): return _sh_rc to expose latent
+        // status bugs. Pure-native trims _sh_rc (need_sh false).
+        if self.need_sh {
+            self.emit("return _sh_rc;");
+        } else {
+            self.emit("return 0;");
+        }
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
