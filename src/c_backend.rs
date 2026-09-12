@@ -3420,6 +3420,12 @@ impl Render {
                 '\n' => out.push_str("\\n"),
                 '\t' => out.push_str("\\t"),
                 '\r' => out.push_str("\\r"),
+                // byte-preserving markers (U+F800+byte, from read_source):
+                // emit as raw single-byte escapes (bash passthrough —
+                // BASHC_FIX utf8). Mirrors estree map_raw_bytes.
+                c if (0xF800..=0xF8FF).contains(&(c as u32)) => {
+                    out.push_str(&format!("\\x{:02x}", (c as u32 - 0xF800) as u8))
+                }
                 c if (c as u32) < 32 => out.push_str(&format!("\\x{:02x}", c as u32)),
                 c => out.push(c),
             }
