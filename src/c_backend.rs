@@ -5984,6 +5984,7 @@ impl Render {
                 ],
             ),
             ("<assert.h>", &["assert("]),
+            ("<signal.h>", &["kill(", "SIGTERM"]),
         ];
         let full = self.out.join("\n");
         self.out.retain(|l| {
@@ -10575,6 +10576,83 @@ fn param_copy_alias(
         Some(tmps)
     }
 
+    /// Emit procsub-cleanup text (`rm -f $tmp` + kill by pidfile)
+    /// for infinite producers (BASHC_FIX §2.7). Returns true if handled
+    /// (caller returns). Safe for every procsub rm: finite producers
+    /// have no pidfile (kill no-ops), rm drops both paths. Only fires
+    /// when ALL non-flag args are __ps_tmp refs.
+    fn emit_ps_cleanup(&mut self, buf: CmdBuf, cmd: &IrExpr, args: &[IrExpr]) -> bool {
+        if !matches!(cmd, IrExpr::Str(s, _) if s == "rm") {
+            return false;
+        }
+        let words: Vec<&IrExpr> = args.iter().collect();
+        let Some(tmps) = Self::ps_cleanup_tmps(&words) else {
+            return false;
+        };
+        self.sh_raw(buf, "{");
+        for t in &tmps {
+            self.sh_raw(buf, "kill");
+            self.sh_raw(buf, &format!("$(cat ${{{}}}.pid)", t));
+            self.sh_raw(buf, "2>/dev/null;");
+        }
+        self.sh_raw(buf, "rm");
+        self.sh_raw(buf, "-f");
+        for t in &tmps {
+            self.sh_raw(buf, &format!("${{{}}}", t));
+            self.sh_raw(buf, &format!("${{{}}}.pid", t));
+        }
+        self.sh_raw(buf, ";");
+        self.sh_raw(buf, "}");
+        true
+    }
+
+    /// Native procsub-cleanup (BASHC_FIX §2.6): kill background
+    /// infinite producers by pidfile + unlink tmp/pidfile, WITHOUT
+    /// touching _sh_rc (the core-emitted rm sits between the consumer
+    /// and a `$?` read — a site would clobber diff's status).
+    fn emit_ps_cleanup_native(&mut self, words: &[&IrExpr]) {
+        let mut tmps: Vec<String> = Vec::new();
+        for w in words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') => {}
+                IrExpr::Str(s, _)
+                    if s.starts_with("__ps_tmp")
+                        && s["__ps_tmp".len()..]
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
+                    tmps.push(s.clone());
+                }
+                IrExpr::Var(n, _) if n.starts_with("__ps_tmp") => {
+                    tmps.push(n.clone());
+                }
+                IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+                    tmps.push(n.clone());
+                }
+                _ => {}
+            }
+        }
+        for t in &tmps {
+            let id = self.c_ident(t);
+            let q = format!("_pc{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit("{");
+            self.emit(&format!("FILE *{q}f = NULL; char {q}p[4096];"));
+            self.emit(&format!("if ({id}) {{"));
+            self.emit(&format!("snprintf({q}p, sizeof {q}p, \"%s.pid\", {id});"));
+            self.emit(&format!("{q}f = fopen({q}p, \"r\");"));
+            self.emit(&format!("if ({q}f) {{"));
+            self.emit(&format!("int {q}n = 0;"));
+            self.emit(&format!("if (fscanf({q}f, \"%d\", &{q}n) == 1 && {q}n > 1 && {q}n != getpid()) kill({q}n, 15);"));
+            self.emit(&format!("fclose({q}f);"));
+            self.emit("}");
+            self.emit(&format!("unlink({id});"));
+            self.emit(&format!("unlink({q}p);"));
+            self.emit("}");
+            self.emit("}");
+        }
+    }
+
     fn sh_stage(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
         // track what THIS stage assigns (child-owned vars — see the
         // field docs); nested sh_stage calls scope their own set
@@ -11019,35 +11097,10 @@ fn param_copy_alias(
                     self.sh_raw(buf, "esac");
                 }
                 IrStmt::Exec { cmd, args, capture, redirects, env } => {
-                    // procsub cleanup for infinite producers (BASHC_FIX
-                    // §2.7): `rm -f $tmp` for a __ps_tmp fifo must also
-                    // kill the background producer (pid in $tmp.pid).
-                    // Finite producers have no pidfile (kill no-ops on
-                    // the missing file; rm drops both paths harmlessly),
-                    // so this shape is safe for every procsub rm. Only
-                    // fires when ALL non-flag args are __ps_tmp refs.
-                    if matches!(cmd, IrExpr::Str(s, _) if s == "rm") {
-                        let words: Vec<&IrExpr> = args.iter().collect();
-                        if let Some(tmps) = Self::ps_cleanup_tmps(&words) {
-                            self.sh_raw(buf, "{");
-                            for t in &tmps {
-                                self.sh_raw(buf, "kill");
-                                self.sh_raw(
-                                    buf,
-                                    &format!("$(cat ${{{}}}.pid)", t),
-                                );
-                                self.sh_raw(buf, "2>/dev/null;");
-                            }
-                            self.sh_raw(buf, "rm");
-                            self.sh_raw(buf, "-f");
-                            for t in &tmps {
-                                self.sh_raw(buf, &format!("${{{}}}", t));
-                                self.sh_raw(buf, &format!("${{{}}}.pid", t));
-                            }
-                            self.sh_raw(buf, ";");
-                            self.sh_raw(buf, "}");
-                            return;
-                        }
+                    // procsub cleanup (kill + rm): shared helper
+                    // (also called from stmt()'s inline site builder).
+                    if self.emit_ps_cleanup(buf, cmd, args) {
+                        return;
                     }
                     // the REAL Exec stmt node (the Call form is above):
                     // env prefix, cmd word, args, then the redirects
@@ -20169,18 +20222,44 @@ fn param_copy_alias(
                     );
                     self.emit(&format!("{site};"));
                 } else {
+                    // procsub cleanup rm: run NATIVELY inline (no site,
+                    // no shell, no _sh_rc touch — BASHC_FIX §2.6: the
+                    // core-emitted `rm` sits between the consumer and a
+                    // `$?` read, and a site would clobber the status).
+                    // Kills background infinite producers by pidfile,
+                    // unlinks tmp+pidfile. Only for bare rms (no
+                    // capture/redirects here by construction).
+                    if let [cmd0, IrExpr::Array(items)] = call_args.as_slice() {
+                        if matches!(cmd0, IrExpr::Str(s, _) if s == "rm") {
+                            let ws: Vec<&IrExpr> = items.iter().collect();
+                            if Self::ps_cleanup_tmps(&ws).is_some() {
+                                self.emit_ps_cleanup_native(&ws);
+                                return;
+                            }
+                        }
+                    }
                     let site = self.shell_site(
                         |r| {
                             r.emit("_sh_reset();");
-                            if let Some(c) = Self::str_arg(&call_args, 0) {
-                                r.sh_word(
-                                    CmdBuf::Shared,
-                                    &IrExpr::Str(c, crate::ir::StrStyle::DoubleQuoted),
-                                );
-                            }
-                            if let Some(IrExpr::Array(items)) = call_args.get(1) {
-                                for w in items {
-                                    r.sh_word(CmdBuf::Shared, w);
+                            // procsub cleanup (kill + rm): shared helper
+                            // with sh_stage's Exec arm.
+                            let handled = match call_args.as_slice() {
+                                [cmd, IrExpr::Array(items)] => {
+                                    r.emit_ps_cleanup(CmdBuf::Shared, cmd, items)
+                                }
+                                _ => false,
+                            };
+                            if !handled {
+                                if let Some(c) = Self::str_arg(&call_args, 0) {
+                                    r.sh_word(
+                                        CmdBuf::Shared,
+                                        &IrExpr::Str(c, crate::ir::StrStyle::DoubleQuoted),
+                                    );
+                                }
+                                if let Some(IrExpr::Array(items)) = call_args.get(1) {
+                                    for w in items {
+                                        r.sh_word(CmdBuf::Shared, w);
+                                    }
                                 }
                             }
                         },
