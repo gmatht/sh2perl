@@ -2898,8 +2898,17 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.drop_const_stmts();
     // `(exit(X), 0);` statement → `exit(X);` (BASHC_OPT item 21)
     r.drop_exit_comma();
+    // `} else {` + `}` (empty else) → `}` (BASHC_OPT item 46;
+    // runs after the rc strip, which empties dead-rc-only elses)
+    r.drop_empty_else();
     // `atoll` of a literal → the literal constant (BASHC_OPT item 25)
     r.fold_atoll_consts();
+    // `V = xstrdup((V = E))` → `V = xstrdup(E)` (BASHC_OPT item 53)
+    r.fold_self_copy();
+    // `(T)((T)X)` → `(T)X` (BASHC_OPT item 52)
+    r.fold_stacked_casts();
+    // guard on a string literal → the literal (BASHC_OPT item 51)
+    r.drop_literal_guards();
     // `static T v = 0;` → `static T v;` (static zero-init)
     r.strip_static_zero_init();
     // drop orphaned num temps: `static char _sN[32]; snprintf(_sN,
@@ -5347,6 +5356,363 @@ impl Render {
             }
         }
         out
+    }
+
+    /// BASHC_OPT item 51: guard on a string literal → the literal.
+    /// `(X ? X : "")` where X (after peeling balanced outer parens
+    /// and `(char*)` casts) is a double-quoted literal is dead — a
+    /// literal is non-NULL by construction, no proof needed. Only the
+    /// exact then==cond literal shape fires (anything else keeps the
+    /// guard: item 30's vbuf/call shapes are separate items). The
+    /// scan is forward-only (backward string scanning cannot tell
+    /// quote direction — caught during implementation).
+    fn drop_literal_guards(&mut self) {
+        fn strip_casts(mut s: &str) -> &str {
+            loop {
+                s = s.trim();
+                // cast prefix FIRST: `(char*)(...)` is two groups, so
+                // the balanced-outer check below would reject it.
+                if let Some(rest) = s.strip_prefix("(char*)") {
+                    s = rest;
+                    continue;
+                }
+                if let Some(rest) = s.strip_prefix("(char *)") {
+                    s = rest;
+                    continue;
+                }
+                if s.starts_with('(') && s.ends_with(')') {
+                    let b = s.as_bytes();
+                    let mut depth = 0usize;
+                    let mut ok = true;
+                    for (k, &ch) in b.iter().enumerate() {
+                        if ch == b'(' {
+                            depth += 1;
+                        } else if ch == b')' {
+                            depth -= 1;
+                            if depth == 0 && k != b.len() - 1 {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok || depth != 0 {
+                        return s;
+                    }
+                    let inner = s[1..s.len() - 1].trim();
+                    if let Some(rest) = inner.strip_prefix("(char*)") {
+                        s = rest;
+                        continue;
+                    }
+                    if let Some(rest) = inner.strip_prefix("(char *)") {
+                        s = rest;
+                        continue;
+                    }
+                    // balanced parens, no cast: the content is the
+                    // guarded value (e.g. `("lit")` → `"lit"`).
+                    return inner;
+                }
+                if let Some(rest) = s.strip_prefix("(char*)") {
+                    s = rest;
+                    continue;
+                }
+                if let Some(rest) = s.strip_prefix("(char *)") {
+                    s = rest;
+                    continue;
+                }
+                return s;
+            }
+        }
+        fn is_lit(s: &str) -> bool {
+            let b = s.as_bytes();
+            if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+                return false;
+            }
+            let mut i = 1;
+            while i + 1 < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        // Try to parse `(C ? T : "")` opening at `o`; the full span
+        // on success (replaced by the literal when C==T==literal).
+        fn ternary_at(cur: &str, o: usize) -> Option<(usize, usize, String)> {
+            let b = cur.as_bytes();
+            let mut depth = 0usize;
+            let mut instr = false;
+            let mut i = o + 1;
+            let mut q = None;
+            while i < b.len() {
+                let ch = b[i] as char;
+                if instr {
+                    if ch == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '"' {
+                        instr = false;
+                    }
+                } else if ch == '"' {
+                    instr = true;
+                } else if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                } else if ch == '?' && depth == 0 {
+                    q = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let q = q?;
+            let mut depth = 0usize;
+            let mut instr = false;
+            let mut i = q + 1;
+            let mut c = None;
+            while i < b.len() {
+                let ch = b[i] as char;
+                if instr {
+                    if ch == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '"' {
+                        instr = false;
+                    }
+                } else if ch == '"' {
+                    instr = true;
+                } else if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                } else if ch == '?' {
+                    depth += 1;
+                } else if ch == ':' && depth == 0 {
+                    c = Some(i);
+                    break;
+                } else if ch == ':' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let c = c?;
+            let after = cur[c + 1..].trim_start();
+            if !after.starts_with("\"\"") {
+                return None;
+            }
+            let close = c + 1 + (cur[c + 1..].len() - after.len()) + 2;
+            if cur[close..].trim_start().starts_with(')') {
+                let cond = cur[o + 1..q].trim();
+                let then = cur[q + 1..c].trim();
+                if cond == then {
+                    let lit = strip_casts(cond).to_string();
+                    if is_lit(&lit) {
+                        return Some((o, close + 1, lit));
+                    }
+                }
+            }
+            None
+        }
+        for line in self.out.iter_mut() {
+            if !line.contains('?') {
+                continue;
+            }
+            let mut cur = line.clone();
+            let mut pos = 0;
+            while pos < cur.len() {
+                // next `(` at/after pos, skipping string contents.
+                let b = cur.as_bytes();
+                let mut instr = false;
+                let mut i = pos;
+                let mut o = None;
+                while i < b.len() {
+                    let ch = b[i] as char;
+                    if instr {
+                        if ch == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if ch == '"' {
+                            instr = false;
+                        }
+                    } else if ch == '"' {
+                        instr = true;
+                    } else if ch == '(' {
+                        o = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                let Some(o) = o else {
+                    break;
+                };
+                match ternary_at(&cur, o) {
+                    Some((s, e, lit)) => {
+                        cur = format!("{}{lit}{}", &cur[..s], &cur[e..]);
+                        pos = s + lit.len();
+                    }
+                    None => {
+                        pos = o + 1;
+                    }
+                }
+            }
+            *line = cur;
+        }
+    }
+
+    /// BASHC_OPT item 52: `(T)((T)X)` → `(T)X` (the `expr_as_num`
+    /// wrapper doesn't see the inner render is already T — casts are
+    /// pure and idempotent, so the inner one is dead). Exact-match on
+    /// a small cast list, fixpoint loop (bounded: each pass removes
+    /// at least one cast).
+    fn fold_stacked_casts(&mut self) {
+        const CASTS: &[&str] = &["long long", "int", "unsigned", "size_t", "char*"];
+        for line in self.out.iter_mut() {
+            let mut cur = line.clone();
+            loop {
+                let mut fired = false;
+                for t in CASTS {
+                    let pat = format!("({t})(({t})");
+                    if let Some(idx) = cur.find(&pat) {
+                        cur = format!("{}({})({}", &cur[..idx], t, &cur[idx + pat.len()..]);
+                        fired = true;
+                        break;
+                    }
+                }
+                if !fired {
+                    break;
+                }
+            }
+            *line = cur;
+        }
+    }
+
+    /// BASHC_OPT item 53: `V = _sh_xstrdup((char*)((V = E)))` →
+    /// `V = _sh_xstrdup((char*)(E))`. The inner assign is dead
+    /// (overwritten by the outer; no sequence point observes `V`
+    /// mid-expression). Safe only for known-copy `f` (xstrdup
+    /// evaluates E before the outer write) and only when E does not
+    /// mention V (else the inner write feeds E — keep). General
+    /// `v = f((v = E))` has a miscompile cliff: stays narrow.
+    fn fold_self_copy(&mut self) {
+        fn is_ident(s: &str) -> bool {
+            !s.is_empty()
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !s.bytes().next().is_some_and(|c| c.is_ascii_digit())
+        }
+        for line in self.out.iter_mut() {
+            let t = line.trim();
+            // statement shape only (trailing `;` kept aside).
+            let Some(body) = t.strip_suffix(';') else {
+                continue;
+            };
+            let marker = "_sh_xstrdup((char*)((";
+            let Some(m) = body.find(marker) else {
+                continue;
+            };
+            let outer = body[..m].trim_end().strip_suffix('=').map(str::trim);
+            let Some(v) = outer else {
+                continue;
+            };
+            if !is_ident(v) {
+                continue;
+            }
+            let rest = &body[m + marker.len()..];
+            let ipat = format!("{v} = ");
+            let Some(ebody) = rest.strip_prefix(ipat.as_str()) else {
+                continue;
+            };
+            // E ends at the first depth-0 `)` (E itself balanced).
+            let b = ebody.as_bytes();
+            let mut depth = 0usize;
+            let mut instr = false;
+            let mut i = 0;
+            let mut end = None;
+            while i < b.len() {
+                let ch = b[i] as char;
+                if instr {
+                    if ch == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '"' {
+                        instr = false;
+                    }
+                } else if ch == '"' {
+                    instr = true;
+                } else if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let Some(e) = end else {
+                continue;
+            };
+            let eval = &ebody[..e];
+            // E must not mention V (fail-closed text check).
+            if eval.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|w| w == v) {
+                continue;
+            }
+            // expect the closes: E's ender is D's close (consumed with
+            // the removed `(V = `); the tail keeps B-close + A-close.
+            let tail = &ebody[e..];
+            if !tail.starts_with(')') {
+                continue;
+            }
+            let tail = &tail[1..];
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let head = &body[..m];
+            *line = format!("{indent}{head}_sh_xstrdup((char*)({eval}{tail};");
+        }
+    }
+
+    /// BASHC_OPT item 46: `} else {` immediately followed by its
+    /// own `}` (same indent) → `}`, and the single-line `} else { }`
+    /// (left by the rc strip hollowing a dead-rc-only else) → `}`.
+    /// The pair opens an empty else and closes it; replacing with a
+    /// lone `}` closes the if body instead. Same-indent + adjacency
+    /// makes it unambiguous (a non-empty else always has content).
+    fn drop_empty_else(&mut self) {
+        fn indent_of(s: &str) -> &str {
+            &s[..s.len() - s.trim_start().len()]
+        }
+        let mut kept: Vec<String> = Vec::with_capacity(self.out.len());
+        let mut i = 0;
+        while i < self.out.len() {
+            if self.out[i].trim() == "} else { }" {
+                kept.push(format!("{}}}", indent_of(&self.out[i])));
+                i += 1;
+            } else if self.out[i].trim() == "} else {"
+                && i + 1 < self.out.len()
+                && self.out[i + 1].trim() == "}"
+                && indent_of(&self.out[i]) == indent_of(&self.out[i + 1])
+            {
+                kept.push(format!("{}}}", indent_of(&self.out[i])));
+                i += 2;
+            } else {
+                kept.push(self.out[i].clone());
+                i += 1;
+            }
+        }
+        self.out = kept;
     }
 
     fn drop_exit_comma(&mut self) {
@@ -11512,12 +11878,47 @@ fn param_copy_alias(
                         _ => false,
                     });
                     if has_rc {
-                        let q = format!("_q{}", self.temp_seq);
-                        self.temp_seq += 1;
-                        self.emit(&format!("long long {q} = _sh_rc;"));
-                        for pt in parts.iter_mut() {
-                            if let Part::Arg(v, _) = pt {
-                                *v = v.replace("_sh_rc", &q);
+                        // BASHC_OPT item 40: skip the snapshot when no
+                        // sibling arg can clobber `_sh_rc` mid-printf (C
+                        // arg order is unspecified). Captures, sites,
+                        // call_fn, pipelines and inline rc stores do;
+                        // pure siblings evaluate untouched — the inline
+                        // read (before the trailing `, _sh_rc = 0`) is
+                        // exact, no temp. (`==` reads excluded from the
+                        // store scan below.)
+                        let touches_rc = |v: &str| {
+                            v.contains("_cap_")
+                                || v.contains("_sh_pipeline")
+                                || v.contains("_sh_site_")
+                                || v.contains("_sh_call_fn")
+                                || {
+                                    let mut s = v;
+                                    let mut found = false;
+                                    while let Some(i) = s.find("_sh_rc =") {
+                                        let after = &s[i + "_sh_rc =".len()..];
+                                        if !after.starts_with('=') {
+                                            found = true;
+                                            break;
+                                        }
+                                        s = after;
+                                    }
+                                    found
+                                }
+                        };
+                        let clobbered = parts.iter().any(|pt| match pt {
+                            Part::Arg(v, _) => touches_rc(v),
+                            _ => false,
+                        });
+                        if !clobbered {
+                            // leave `_sh_rc` inline (no temp, no replace).
+                        } else {
+                            let q = format!("_q{}", self.temp_seq);
+                            self.temp_seq += 1;
+                            self.emit(&format!("long long {q} = _sh_rc;"));
+                            for pt in parts.iter_mut() {
+                                if let Part::Arg(v, _) = pt {
+                                    *v = v.replace("_sh_rc", &q);
+                                }
                             }
                         }
                     }
@@ -17794,14 +18195,17 @@ fn param_copy_alias(
                             IrExpr::BinOp { op: crate::ir::BinOpKind::Not, .. });
                         if chain_lhs {
                             let l = self.expr(lhs.as_ref());
-                            let t = self.temp_seq;
-                            self.temp_seq += 1;
-                            self.emit(&format!("{{ int _t{t} = ({l});"));
-                            self.emit(&format!("  _sh_rc = _t{t} ? 0 : 1;"));
+                            // BASHC_OPT item 54: the `_tN` temp was
+                            // single-use by construction (rc set + one
+                            // branch test) — inline the test. rc
+                            // behavior identical: taken path runs B
+                            // (publishing its own rc after the pre-set,
+                            // exactly as before), skipped path keeps
+                            // the 0/1 store.
                             if *op == crate::ir::BinOpKind::And {
-                                self.emit(&format!("  if (_t{t}) {{"));
+                                self.emit(&format!("{{ if (({l})) {{ _sh_rc = 0;"));
                             } else {
-                                self.emit(&format!("  if (!_t{t}) {{"));
+                                self.emit(&format!("{{ if (({l})) {{ _sh_rc = 0; }} else {{ _sh_rc = 1;"));
                             }
                             self.depth += 1;
                             // the rhs may itself be a chain — recurse as a
@@ -17809,7 +18213,11 @@ fn param_copy_alias(
                             let rhs_stmt = IrStmt::Expr((**rhs).clone());
                             self.stmt(&rhs_stmt);
                             self.depth -= 1;
-                            self.emit("  }");
+                            if *op == crate::ir::BinOpKind::And {
+                                self.emit("  } else { _sh_rc = 1; }");
+                            } else {
+                                self.emit("  }");
+                            }
                             self.emit("}");
                             return;
                         }
@@ -30747,6 +31155,49 @@ mod tests {
             "string var folded: {:?}",
             r.out
         );
+    }
+
+    #[test]
+    fn bashc_opt_item51_literal_guard_folds() {
+        // BASHC_OPT item 51: `(X ? X : "")` with X a literal folds
+        // to the literal; non-literal guards (vbuf `.p`, vars) and
+        // mismatched arms keep the guard.
+        let mut r = Render::default();
+        r.out = vec![
+            "x = ((char*)(\"a\") ? (char*)(\"a\") : \"\");".to_string(),
+            "    printf(\"%s\\n\", ((_v0.p) ? (_v0.p) : \"\"));".to_string(),
+            "    printf(\"%s\\n\", ((x) ? (y) : \"\"));".to_string(),
+        ];
+        r.drop_literal_guards();
+        assert_eq!(r.out[0], "x = \"a\";");
+        assert!(r.out[1].contains("?"), "vbuf guard dropped: {}", r.out[1]);
+        assert!(r.out[2].contains("?"), "mismatch dropped: {}", r.out[2]);
+    }
+
+    #[test]
+    fn bashc_opt_round5_post_passes() {
+        // Items 52/53/46: stacked casts, self-assign-copy, empty
+        // else — plus negatives (unbalanced, mentioning E, live
+        // content).
+        let mut r = Render::default();
+        r.out = vec![
+            "    printf(\"%lld\\n\", (long long)((long long)arr_len));".to_string(),
+            "    y = _sh_xstrdup((char*)((y = _s0)));".to_string(),
+            "    y = _sh_xstrdup((char*)((y = y)));".to_string(),
+            "    } else { }".to_string(),
+            "    } else {".to_string(),
+            "        x = 1;".to_string(),
+            "    }".to_string(),
+        ];
+        r.fold_stacked_casts();
+        assert!(r.out[0].contains("(long long)(arr_len)"), "stacked: {}", r.out[0]);
+        assert!(!r.out[0].contains("((long long)"), "stacked leftover: {}", r.out[0]);
+        r.fold_self_copy();
+        assert_eq!(r.out[1], "    y = _sh_xstrdup((char*)(_s0));");
+        assert!(r.out[2].contains("(y = y)"), "self-mention folded: {}", r.out[2]);
+        r.drop_empty_else();
+        assert_eq!(r.out[3], "    }");
+        assert_eq!(r.out[4], "    } else {");
     }
 
     #[test]
