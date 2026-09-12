@@ -277,6 +277,9 @@ pub struct Render {
     /// the caller must free after the enclosing statement (unless moved
     /// into a store var). Flushed at statement boundaries.
     pending_frees: Vec<String>,
+    /// -x vars assigned by the current declare command, awaiting
+    /// post-emission env sync (setenv must run AFTER the value lands).
+    pending_export: Vec<String>,
     /// GMP bigint temps (_mpzN) created inline for bigint-param calls,
     /// dead after the enclosing statement. Cleared (mpz_clear) at the
     /// same statement boundaries as pending_frees.
@@ -533,6 +536,11 @@ pub struct Render {
     reduce_arrays: HashSet<String>,
     /// associative-array names (`name_k`/`name_v`/`name_n` stores)
     assoc_arrays: BTreeSet<String>,
+    /// typeset attributes per var (BASHC_FIX typeset-cmdsub): bitmask
+    /// (I=1 integer-eval on assign, L=2 lowercase, U=4 uppercase, R=8
+    /// readonly-recorded). Sticky across commands (plain later assigns
+    /// still apply); `+X` clears. Only declare-family commands update it.
+    typeset_attrs: std::collections::HashMap<String, u8>,
     /// `shopt -s nocasematch` → [[ == ]] globs match case-insensitively
     nocasematch: bool,
     /// rendering inside a shell function body (Return emits `return;`)
@@ -2532,7 +2540,14 @@ fn array_fixed_caps(
         if exclude.contains(name) {
             continue;
         }
-        let need = info.max_reset.saturating_add(info.appends);
+        // literal index writes need max(idx)+1 slots too (BASHC_FIX:
+        // `typeset -a arr` + arr[0]/arr[1] sized [1], overflowing).
+        // max (not sum): each term upper-bounds the final length
+        // independently (bulk fill vs max index); overwrites never grow.
+        let need = info
+            .max_reset
+            .saturating_add(info.appends)
+            .max(info.lit_index_max);
         // defined-but-always-empty still needs one slot; need >=
         // ARR_CAP keeps the status quo.
         if need < ARR_CAP as u64 {
@@ -6173,6 +6188,44 @@ impl Render {
     }
 
     /// Native C arithmetic from ArithAst (the numeric path).
+    /// BASHC_OPT item 61: value of a fully-constant arith subtree
+    /// (checked, non-trapping ops only). `+ - *` via checked_* (C
+    /// signed overflow is UB — a wrapped fold could differ from the
+    /// runtime path, so overflow bails to runtime); `& | ^ ~` are
+    /// total. NEVER `/ %` (fold turns a runtime abort into a compile
+    /// error), shifts (C UB on overshift/negative lhs), `**`/calls
+    /// (helper-defined overflow), comparisons/logic (unobserved).
+    /// Render-local (analyses read the unfolded IR): the Bin/Un arms
+    /// try the whole subtree first, recursion folds partial consts.
+    fn const_arith_value(a: &ArithAst) -> Option<i64> {
+        match a {
+            ArithAst::Num(n) => Some(*n),
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = Self::const_arith_value(lhs)?;
+                let r = Self::const_arith_value(rhs)?;
+                match op.as_str() {
+                    "+" => l.checked_add(r),
+                    "-" => l.checked_sub(r),
+                    "*" => l.checked_mul(r),
+                    "&" => Some(l & r),
+                    "|" => Some(l | r),
+                    "^" => Some(l ^ r),
+                    _ => None,
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let v = Self::const_arith_value(arg)?;
+                match op.as_str() {
+                    "-" => v.checked_neg(),
+                    "+" => Some(v),
+                    "~" => Some(!v),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => {
@@ -6246,6 +6299,12 @@ impl Render {
                 }
             }
             ArithAst::Bin { op, lhs, rhs } => {
+                // BASHC_OPT item 61: fully-const subtree folds (the
+                // Num arm re-applies the LL-suffix rule, so wide
+                // products stay correct).
+                if let Some(n) = Self::const_arith_value(a) {
+                    return self.arith(&ArithAst::Num(n));
+                }
                 // bash arithmetic is intmax_t (64-bit): a constant subtree
                 // whose proven value exceeds int must render with LL
                 // literals, or C folds the PRODUCT as int BEFORE the
@@ -6279,7 +6338,13 @@ impl Render {
                     format!("({l} {op} {r})")
                 }
             }
-            ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
+            ArithAst::Un { op, arg } => {
+                // BASHC_OPT item 61 (see Bin): `- -5`, `~0` fold.
+                if let Some(n) = Self::const_arith_value(a) {
+                    return self.arith(&ArithAst::Num(n));
+                }
+                format!("({op}{})", self.arith(arg))
+            }
             ArithAst::Cond { test, then, else_ } => format!(
                 "({} ? {} : {})",
                 self.arith(test),
@@ -10007,7 +10072,11 @@ fn param_copy_alias(
                             }
                         }
                         Some(n) => {
-                            let v = if self.is_num(n) {
+                            let v = if self.const_lifted.contains(n) {
+                                // const-lifted: reference the C ident —
+                                // getenv misses it (never in env/store).
+                                self.c_ident(n)
+                            } else if self.is_num(n) {
                                 let t = self.num_temp(&self.c_ident(n));
                                 t
                             } else {
@@ -11439,7 +11508,9 @@ fn param_copy_alias(
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(n) = Self::str_arg(args, 0) {
-                    let v = if self.is_num(&n) {
+                    let v = if self.const_lifted.contains(&n) {
+                        self.c_ident(&n)
+                    } else if self.is_num(&n) {
                         let t = self.num_temp(&self.c_ident(&n));
                         t
                     } else {
@@ -12097,6 +12168,18 @@ fn param_copy_alias(
                     // right-to-left (gcc), reordering side effects where
                     // bash is strictly left-to-right. Hoist each bare
                     // _cap_N() arg into an ordered temp.
+                    // BASHC_OPT item 62: count side-effectful args
+                    // first — a SOLE one needs no ordering temp.
+                    let is_fx = |v: &str| {
+                        v.contains("_cap_")
+                            || v.contains("_sh_pipeline(")
+                            || v.contains("_sh_call_fn(")
+                            || v.contains("_sh_sorted_join(")
+                    };
+                    let n_fx = parts
+                        .iter()
+                        .filter(|pt| matches!(pt, Part::Arg(v, _) if is_fx(v)))
+                        .count();
                     let mut hoisted: Vec<String> = Vec::new();
                     for pt in parts.iter_mut() {
                         if let Part::Arg(v, _) = pt {
@@ -12105,10 +12188,19 @@ fn param_copy_alias(
                             // (the %s null-guard would otherwise EVALUATE
                             // the pipeline twice — C has no idea it is
                             // not a pure read)
-                            if v.contains("_cap_")
+                            // BASHC_OPT item 62: a bare `_cap_N()` call
+                            // that is the SOLE side-effectful arg needs
+                            // no ordering temp (nothing to reorder
+                            // against) — and item 31 renders it
+                            // guard-free downstream (single evaluation;
+                            // the guard would have run it twice).
+                            // (Negated single test: the hoist arm below
+                            // keeps every other shape.)
+                            if !(n_fx == 1 && is_bare_cap_call(v))
+                                && (v.contains("_cap_")
                                 || v.contains("_sh_pipeline(")
                                 || v.contains("_sh_call_fn(")
-                                || v.contains("_sh_sorted_join(")
+                                || v.contains("_sh_sorted_join("))
                             {
                                 let t = format!("_eh{}", self.temp_seq);
                                 self.temp_seq += 1;
@@ -12523,9 +12615,258 @@ fn param_copy_alias(
         }
     }
 
+    /// Parse a pure attribute flag word (`-il`, `+u`): Some((set,clear))
+    /// bitmasks, None for anything else (arrays `-a`, `-p`, `-f`, ...
+    /// keep existing paths). Tracked: i/l/u/r/x (X=16, auto-export).
+    fn typeset_flag_word(w: &str) -> Option<(u8, u8)> {
+        let (neg, rest) = match w.strip_prefix(['-', '+']) {
+            Some(r) => (w.starts_with('+'), r),
+            None => return None,
+        };
+        if rest.is_empty() || !rest.chars().all(|c| "ilurx".contains(c)) {
+            return None;
+        }
+        let mut bits = 0u8;
+        for c in rest.chars() {
+            bits |= match c {
+                'i' => 1,
+                'l' => 2,
+                'u' => 4,
+                'x' => 16,
+                _ => 8,
+            };
+        }
+        if neg {
+            Some((0, bits))
+        } else {
+            Some((bits, 0))
+        }
+    }
+
+    /// Runtime case-fold of a C string value (BASHC_FIX typeset -l/-u).
+    /// Mirrors the ^^/,, arms. Returns temp .p (caller assigns it).
+    fn fold_case_temp(&mut self, v: &str, to_upper: bool) -> String {
+        self.need_sh = true;
+        let t = self.vbuf_temp();
+        let f = if to_upper { "toupper" } else { "tolower" };
+        self.emit(&format!(
+            "{{ const char *_u = ({v}); _sh_vgrow(&{t}, strlen(_u) + 1); char *_d = {t}.p; size_t _i; for (_i = 0; _u[_i]; _i++) _d[_i] = (char){f}((unsigned char)_u[_i]); _d[_i] = 0; }}"
+        ));
+        format!("{t}.p")
+    }
+
+    /// Evaluate a value as shell integer for `typeset -i` (BASHC_FIX):
+    /// Arith nodes render natively; text tries parse_arith; anything
+    /// else atolls (numeric strings exact; expr-text-in-vars is a
+    /// documented edge — bash would evaluate, we take atoll).
+    /// Returns C long-long expression text.
+    fn attr_int_value(&mut self, e: &IrExpr) -> String {
+        match e {
+            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Str(s, _) => match crate::shir::parse_arith(s) {
+                Some(a) => self.arith(&a),
+                None => "0".into(),
+            },
+            _ => format!("(long long)atoll((char*)({}))", self.value_c(e)),
+        }
+    }
+
+    /// Merge current declare-command masks into a var's sticky attrs.
+    /// Sync an auto-export (-x) var into the environment after assign
+    /// (BASHC_FIX typeset -x): mirrors the bare-`export NAME` 3-way
+    /// (numeric via snprintf, arrays skipped, else null-guarded).
+    /// No-op without the x bit (sticky or fresh).
+    fn emit_export_var(&mut self, name: &str) {
+        if self.typeset_attrs.get(name).copied().unwrap_or(0) & 16 == 0 {
+            return;
+        }
+        let id = self.c_ident(name);
+        if self.is_num(name) {
+            self.emit(&format!(
+                "{{ char _b[32]; snprintf(_b, sizeof _b, \"%lld\", (long long)({id})); setenv(\"{name}\", _b, 1); }}"
+            ));
+        } else if self.arrays.contains(name) || self.assoc_arrays.contains(name) {
+        } else if self.buf_bound(name).is_some() {
+            self.emit(&format!("setenv(\"{name}\", {id}, 1);"));
+        } else {
+            // store_ref (not store_read): the assign just wrote the C
+            // decl, so the ident is live even when the var missed the
+            // store/var_types sets (the getenv fallback exported "").
+            let v = if self.const_lifted.contains(name) {
+                self.c_ident(name)
+            } else {
+                self.store_ref(name)
+            };
+            self.emit(&format!("setenv(\"{name}\", {v} ? {v} : \"\", 1);"));
+        }
+    }
+
+    fn note_declare_attrs(&mut self, name: &str, set_m: u8, clear_m: u8) {
+        let e = self.typeset_attrs.get(name).copied().unwrap_or(0);
+        let merged = (e | set_m) & !clear_m;
+        self.typeset_attrs.insert(name.to_string(), merged);
+        // auto-export (-x): queue for post-command env sync (the value
+        // lands later in the arm; flushing at end of declare_words).
+        if merged & 16 != 0 && !self.pending_export.iter().any(|n| n == name) {
+            self.pending_export.push(name.to_string());
+        }
+    }
+
+    /// Flush queued -x env syncs (end of declare_words: values landed).
+    fn flush_pending_export(&mut self) {
+        for n in std::mem::take(&mut self.pending_export) {
+            self.emit_export_var(&n);
+        }
+    }
+
+    /// Case-fold a rendered string value for -l/-u (BASHC_FIX typeset):
+    /// no-op without attrs; otherwise a runtime fold temp (mirrors the
+    /// ^^/,, arms). Caller assigns the result normally (all storage
+    /// types: folding digits is a no-op, heap/buf get folded text).
+    fn apply_case_fold(&mut self, name: &str, v: String) -> String {
+        let a = self.typeset_attrs.get(name).copied().unwrap_or(0);
+        // -u wins on conflict (rare); bash order-dependence ignored.
+        if a & 4 != 0 {
+            return self.fold_case_temp(&v, true);
+        }
+        if a & 2 != 0 {
+            return self.fold_case_temp(&v, false);
+        }
+        v
+    }
+
+    /// Integer-attribute assign (BASHC_FIX `typeset -i`): evaluate RHS
+    /// as arithmetic, store by target type (numeric direct, buf via
+    /// snprintf, heap via num_temp+strdup). Skips non-plain targets
+    /// (mstr/bigint/const keep existing paths — caller checks).
+    fn emit_attr_int(&mut self, name: &str, id: &str, e: &IrExpr) {
+        let n = self.attr_int_value(e);
+        if self.is_num(name) {
+            self.emit(&format!("{id} = {n};"));
+        } else if let Some(b) = self.buf_bound(name) {
+            self.emit(&format!(
+                "snprintf({id}, {}, \"%lld\", (long long)({n}));",
+                b + 1
+            ));
+        } else {
+            let t = self.num_temp(&n);
+            self.emit_owned_store(name, id, t);
+        }
+    }
+
+    /// `typeset -F [names...]`: list function names (BASHC_FIX).
+    /// Filters (literal) restrict to defined matches; no args lists all
+    /// (BTreeSet order — deterministic; bash uses hash order).
+    fn emit_declare_names(&mut self, filters: &[String]) {
+        if filters.is_empty() {
+            for f in self.functions.iter().cloned().collect::<Vec<_>>() {
+                self.emit(&format!("puts({});", Self::cstr(&f)));
+            }
+        } else {
+            for fl in filters {
+                if self.functions.contains(fl) {
+                    self.emit(&format!("puts({});", Self::cstr(fl)));
+                }
+            }
+        }
+    }
+
+    /// `typeset -p [names...]`: print `declare -<attrs> name="value"`
+    /// (BASHC_FIX). Attr order matches bash (a A i r x l u). Values
+    /// print unescaped (quotes/newlines are a known edge — bash uses
+    /// $'...' there). No args prints all attr-tracked vars.
+    fn emit_declare_print(&mut self, names: &[String]) {
+        let mut targets: Vec<String> = if names.is_empty() {
+            let mut v: Vec<String> = self.typeset_attrs.keys().cloned().collect();
+            v.sort();
+            v
+        } else {
+            names.to_vec()
+        };
+        for n in std::mem::take(&mut targets) {
+            let mut flags = String::from("-");
+            if self.arrays.contains(&n) {
+                flags.push('a');
+            }
+            if self.assoc_arrays.contains(&n) {
+                flags.push('A');
+            }
+            let ai = self.typeset_attrs.get(&n).copied().unwrap_or(0);
+            for (bit, ch) in [(1u8, 'i'), (8, 'r'), (16, 'x'), (2, 'l'), (4, 'u')] {
+                if ai & bit != 0 {
+                    flags.push(ch);
+                }
+            }
+            if flags == "-" {
+                flags.clear();
+            }
+            // string form of the current value (mirrors export reads).
+            let val = if self.const_lifted.contains(&n) {
+                self.c_ident(&n)
+            } else if self.is_num(&n) {
+                self.num_temp(&self.c_ident(&n))
+            } else {
+                self.store_ref(&n)
+            };
+            // `declare -ir name="value"` (or `declare name="value"`).
+            self.emit(&format!(
+                "printf(\"declare %s %s=\\\"%s\\\"\\n\", {}, {}, (char*)({val}));",
+                Self::cstr(&flags),
+                Self::cstr(&n),
+            ));
+        }
+    }
+
     fn declare_words(&mut self, words: &[&IrExpr]) {
+        // list/print modes divert BEFORE normal processing (`typeset -F`
+        // names, `typeset -p` prints; `-f` definitions need source text
+        // — left as no-op). Only when no `=` assigns are present.
+        {
+            let strs: Vec<&str> = words
+                .iter()
+                .filter_map(|w| match w {
+                    IrExpr::Str(s, _) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let has_assign = strs.iter().any(|s| s.contains('='));
+            if !has_assign {
+                if strs.iter().any(|s| *s == "-F") {
+                    let fl: Vec<String> = strs
+                        .iter()
+                        .filter(|s| !s.starts_with('-') && !s.starts_with('+'))
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.emit_declare_names(&fl);
+                    return;
+                }
+                if strs.iter().any(|s| *s == "-p") {
+                    let ns: Vec<String> = strs
+                        .iter()
+                        .filter(|s| !s.starts_with('-') && !s.starts_with('+'))
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.emit_declare_print(&ns);
+                    return;
+                }
+            }
+        }
         let mut i = 0;
+        // attribute flags for SUBSEQUENT vars in this command
+        // (`typeset -i n=1 m=2` marks both; `+X` clears). Merged into
+        // typeset_attrs at each var assign (sticky across commands).
+        let (mut attr_set, mut attr_clear) = (0u8, 0u8);
         while i < words.len() {
+            // pure `-il`/`+u` words (other flags keep old paths).
+            if let IrExpr::Str(f, _) = words[i] {
+                if let Some((s, c)) = Self::typeset_flag_word(f) {
+                    // later flags win per bit (`-i +i` clears).
+                    attr_set = (attr_set | s) & !c;
+                    attr_clear = (attr_clear | c) & !s;
+                    i += 1;
+                    continue;
+                }
+            }
             // `declare -a arr=(1 2)` — the core passes the literal as a
             // nested setArray call word (`declare -a` + setArray("arr",
             // [1, 2], false)); apply it like a plain assignment.
@@ -12548,8 +12889,10 @@ fn param_copy_alias(
             if let Some(ws) = Self::str_arg(&[(*words[i]).clone()], 0) {
                 // bare `export NAME` / `export arr` (no '='): sync the
                 // CURRENT value into the environment — children ($ENV in
-                // perl, _sh_export'd refs) must see it
+                // perl, _sh_export'd refs) must see it.
+                // Bare `typeset -r name` also merges sticky attrs.
                 if !ws.contains('=') && is_ident(&ws) {
+                    self.note_declare_attrs(&ws, attr_set, attr_clear);
                     let id = self.c_ident(&ws);
                     if self.is_num(&ws) {
                         self.emit(&format!(
@@ -12610,7 +12953,21 @@ fn param_copy_alias(
                             None
                         };
                         if let Some(e) = value_expr {
+                            self.note_declare_attrs(name, attr_set, attr_clear);
+                            let ai = self.typeset_attrs.get(name).copied().unwrap_or(0);
+                            // integer attr: evaluate arithmetically (not
+                            // for managed/bigint/const targets — those
+                            // keep existing paths).
+                            if ai & 1 != 0
+                                && !self.managed_strings.contains(name)
+                                && !self.bigint_vars.contains(name)
+                                && !self.const_lifted.contains(name)
+                            {
+                                self.emit_attr_int(name, &id, e);
+                                continue;
+                            }
                             let v = self.value_c(e);
+                            let v = self.apply_case_fold(name, v);
                             if self.managed_strings.contains(name) {
                                 // managed-string var: use the struct setter
                                 self.emit(&format!("_sh_mstr_set(&{id}, {v});"));
@@ -12628,25 +12985,98 @@ fn param_copy_alias(
                                 Err(_) => self.emit(&format!("{id} = 0;")),
                             }
                         } else if val.contains('$') {
-                            // `local n=$1` — the core keeps the source text
-                            let v =
-                                self.dollar_text_value(val).unwrap_or_else(|| "\"\"".into());
-                            if let Some(b) = self.buf_bound(name) {
-                                self.emit_guarded_copy(&id, b, &v);
+                            self.note_declare_attrs(name, attr_set, attr_clear);
+                            let ai = self.typeset_attrs.get(name).copied().unwrap_or(0);
+                            if ai & 1 != 0
+                                && !self.managed_strings.contains(name)
+                                && !self.bigint_vars.contains(name)
+                                && !self.const_lifted.contains(name)
+                            {
+                                // integer attr: text parses as arithmetic.
+                                self.emit_attr_int(
+                                    name,
+                                    &id,
+                                    &IrExpr::Str(
+                                        val.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    ),
+                                );
                             } else {
-                                self.emit_owned_store(name, &id, v);
+                                // `local n=$1` — the core keeps the source text
+                                let v = self
+                                    .dollar_text_value(val)
+                                    .unwrap_or_else(|| "\"\"".into());
+                                let v = self.apply_case_fold(name, v);
+                                if let Some(b) = self.buf_bound(name) {
+                                    self.emit_guarded_copy(&id, b, &v);
+                                } else {
+                                    self.emit_owned_store(name, &id, v);
+                                }
                             }
                         } else if let Some(b) = self.buf_bound(name) {
-                            let v = Self::cstr(val);
-                            self.emit_guarded_copy(&id, b, &v);
+                            self.note_declare_attrs(name, attr_set, attr_clear);
+                            let ai = self.typeset_attrs.get(name).copied().unwrap_or(0);
+                            if ai & 1 != 0
+                                && !self.managed_strings.contains(name)
+                                && !self.bigint_vars.contains(name)
+                                && !self.const_lifted.contains(name)
+                            {
+                                self.emit_attr_int(
+                                    name,
+                                    &id,
+                                    &IrExpr::Str(
+                                        val.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    ),
+                                );
+                            } else {
+                                // case attrs fold ASCII-exactly at render
+                                // (matches C tolower/toupper; Unicode
+                                // differs, so not .to_lowercase()).
+                                let lit = if ai & 4 != 0 {
+                                    val.to_ascii_uppercase()
+                                } else if ai & 2 != 0 {
+                                    val.to_ascii_lowercase()
+                                } else {
+                                    val.to_string()
+                                };
+                                let v = Self::cstr(&lit);
+                                self.emit_guarded_copy(&id, b, &v);
+                            }
                         } else {
-                            self.emit_owned_store(name, &id, Self::cstr(val));
+                            self.note_declare_attrs(name, attr_set, attr_clear);
+                            let ai = self.typeset_attrs.get(name).copied().unwrap_or(0);
+                            if ai & 1 != 0
+                                && !self.managed_strings.contains(name)
+                                && !self.bigint_vars.contains(name)
+                                && !self.const_lifted.contains(name)
+                            {
+                                self.emit_attr_int(
+                                    name,
+                                    &id,
+                                    &IrExpr::Str(
+                                        val.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    ),
+                                );
+                            } else {
+                                let lit = if ai & 4 != 0 {
+                                    val.to_ascii_uppercase()
+                                } else if ai & 2 != 0 {
+                                    val.to_ascii_lowercase()
+                                } else {
+                                    val.to_string()
+                                };
+                                self.emit_owned_store(name, &id, Self::cstr(&lit));
+                            }
                         }
                     }
                 }
             }
             i += 1;
         }
+        // queued -x env syncs: values landed, sync now (BASHC_FIX).
+        self.flush_pending_export();
     }
 
     /// `$(...)` whose body is EXACTLY one exec/builtin of a program-defined
@@ -18783,6 +19213,19 @@ fn param_copy_alias(
                     }
                     return;
                 }
+                // typeset attrs (sticky): -i evaluates arithmetically.
+                // (L/U fold after rhs renders, below.)
+                {
+                    let ai = self.typeset_attrs.get(&t.var).copied().unwrap_or(0);
+                    if ai & 1 != 0
+                        && !self.managed_strings.contains(&t.var)
+                        && !self.bigint_vars.contains(&t.var)
+                    {
+                        let id = self.c_ident(&t.var);
+                        self.emit_attr_int(&t.var, &id, expr);
+                        return;
+                    }
+                }
                 // bash `((expr))` arith STATEMENT (the core spells the
                 // side-effect forms as Assign with an Arith expr whose
                 // ROOT Assign/IncDec writes the target): the truthiness
@@ -18906,12 +19349,14 @@ fn param_copy_alias(
                     } else {
                         rhs
                     };
+                    let rhs = self.apply_case_fold(&t.var, rhs);
                     self.emit_guarded_copy(&name, b, &rhs);
                     // P1 follow-up: a fixed buffer address is never NULL
                     // (plus fn-written gate: calls might observe it).
                     if !self.fn_written.contains(&t.var) {
                         self.nonnull_var.insert(name.clone());
                     }
+                    self.emit_export_var(&t.var);
                     return;
                 }
                 let is_num = self.is_num(&t.var);
@@ -18993,6 +19438,7 @@ fn param_copy_alias(
                         e
                     }
                 };
+                let rhs = self.apply_case_fold(&t.var, rhs);
                 // A stub call (sh2_*) returns long long; cast for char*
                 // targets so the draft always compiles (the stub exits 2
                 // before returning, so the value never matters).
@@ -19042,6 +19488,8 @@ fn param_copy_alias(
                         if !self.fn_written.contains(&t.var) {
                             self.nonnull_var.insert(name.clone());
                         }
+                        // sticky auto-export (-x): re-sync after assign.
+                        self.emit_export_var(&t.var);
                     }
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
@@ -23008,6 +23456,20 @@ fn has_call(s: &str) -> bool {
 /// `_sh_arr_get` return `""` on every miss path (see their emitted
 /// bodies). Lets printf_from_parts skip the `%s` null-guard (which
 /// also double-evaluated the call).
+/// A bare `_cap_N()` call (digits-only id, empty args, nothing
+/// trailing). Its static vbuf `.p` is never NULL: `_sh_capture`
+/// vgrows first on every path (BASHC_OPT item 31's proof; item 62
+/// relies on it for guard-free inlining).
+fn is_bare_cap_call(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("_cap_")
+        && s.ends_with("()")
+        && {
+            let mid = &s["_cap_".len()..s.len() - 2];
+            !mid.is_empty() && mid.bytes().all(|c| c.is_ascii_digit())
+        }
+}
+
 fn is_nonnull_helper_call(v: &str) -> bool {
     let mut s = v.trim();
     loop {
@@ -23020,38 +23482,43 @@ fn is_nonnull_helper_call(v: &str) -> bool {
             break;
         }
     }
+    // BASHC_OPT item 31: a bare `_cap_N()` call (proof on
+    // `is_bare_cap_call`) — never NULL on any path.
+    if is_bare_cap_call(s) {
+        return true;
+    }
     for h in ["_sh_assoc_get(", "_sh_arr_get("] {
         if let Some(rest) = s.strip_prefix(h) {
-            // exactly the call: parens balance with the final `)`
-            // closing the helper's own paren — anything trailing
-            // (`, more`, `? :`) means a bigger expression, refuse
-            let mut depth = 1usize;
-            let b = rest.as_bytes();
-            let mut i = 0;
-            while i < b.len() {
-                match b[i] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return i == b.len() - 1;
-                        }
+        // exactly the call: parens balance with the final `)`
+        // closing the helper's own paren — anything trailing
+        // (`, more`, `? :`) means a bigger expression, refuse
+        let mut depth = 1usize;
+        let b = rest.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i == b.len() - 1;
                     }
-                    b'"' => {
-                        // skip string literals (parens inside quotes)
-                        i += 1;
-                        while i < b.len() && b[i] != b'"' {
-                            if b[i] == b'\\' {
-                                i += 1;
-                            }
+                }
+                b'"' => {
+                    // skip string literals (parens inside quotes)
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
                             i += 1;
                         }
+                        i += 1;
                     }
-                    _ => {}
                 }
-                i += 1;
+                _ => {}
             }
-            return false;
+            i += 1;
+        }
+        return false;
         }
     }
     false
@@ -32147,6 +32614,45 @@ mod tests {
         assert_eq!(r.out[0], "    _sh_rc = 0;");
         assert!(r.out[1].contains("printf"), "effectful tail cut: {}", r.out[1]);
         assert!(r.out[2].contains(", _sh_rc = 1,"), "multi-store cut: {}", r.out[2]);
+    }
+
+    #[test]
+    fn bashc_opt_round7_constfold_and_cap() {
+        // Item 61: pure-literal subtrees fold (checked); division,
+        // overflow, pow, and var leaves bail to runtime.
+        let bin = |op: &str, l: ArithAst, r: ArithAst| ArithAst::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let num = ArithAst::Num;
+        // ((2 + 3) * (4 - 1)) == 15 (the 062_04 shape).
+        let t = bin("*", bin("+", num(2), num(3)), bin("-", num(4), num(1)));
+        assert_eq!(Render::const_arith_value(&t), Some(15));
+        assert_eq!(Render::const_arith_value(&bin("/", num(1), num(0))), None);
+        assert_eq!(
+            Render::const_arith_value(&bin("+", num(i64::MAX), num(1))),
+            None
+        );
+        assert_eq!(Render::const_arith_value(&bin("**", num(5), num(2))), None);
+        assert_eq!(
+            Render::const_arith_value(&bin(
+                "+",
+                ArithAst::Var("x".to_string()),
+                num(1)
+            )),
+            None
+        );
+        assert_eq!(Render::const_arith_value(&bin("&", num(6), num(3))), Some(2));
+        // Items 31/62: bare `_cap_N()` is a proven call; args or
+        // trailing content refuse.
+        assert!(is_bare_cap_call("_cap_0()"));
+        assert!(is_bare_cap_call("_cap_12()"));
+        assert!(!is_bare_cap_call("_cap_()"));
+        assert!(!is_bare_cap_call("_cap_x()"));
+        assert!(!is_bare_cap_call("_cap_0(x)"));
+        assert!(is_nonnull_helper_call("_cap_3()"));
+        assert!(!is_nonnull_helper_call("_cap_3() , x"));
     }
 
     #[test]
