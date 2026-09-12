@@ -27291,15 +27291,38 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
                     right: Box::new(str_lit("EACCES")),
                 }),
                 consequent: Box::new(str_lit("Permission denied")),
-                alternate: Box::new(Expr::MemberExpression {
-                    object: Box::new(Expr::Identifier {
-                        name: "e".to_string(),
+                // non-EACCES failures (device errors like the webgl
+                // 'need both shaders first') carry no .code — report
+                // .message so the redirect error is diagnosable instead
+                // of 'bash: <target>: undefined'
+                alternate: Box::new(Expr::LogicalExpression {
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "code".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    property: Box::new(Expr::Identifier {
-                        name: "code".to_string(),
+                    operator: "??".to_string(),
+                    right: Box::new(Expr::LogicalExpression {
+                        left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "message".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    computed: false,
-                    optional: false,
+                        operator: "??".to_string(),
+                        right: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                    }),
                 }),
             }),
         }),
