@@ -2886,6 +2886,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.fold_init_store();
     // drop `1;`-style constant statements (strip_dead_rc residue)
     r.drop_const_stmts();
+    // `(exit(X), 0);` statement → `exit(X);` (BASHC_OPT item 21)
+    r.drop_exit_comma();
+    // `atoll` of a literal → the literal constant (BASHC_OPT item 25)
+    r.fold_atoll_consts();
     // `static T v = 0;` → `static T v;` (static zero-init)
     r.strip_static_zero_init();
     // drop orphaned num temps: `static char _sN[32]; snprintf(_sN,
@@ -4790,7 +4794,64 @@ impl Render {
                 out.push(stripped);
             }
         }
-        self.out = out;
+        // BASHC_OPT item 19: dead `(_sh_rc = N, const);` comma
+        // statements (rc is globally dead here — verified above — so
+        // every `_sh_rc = N` store is dead; dropping must live under
+        // this gate, never in drop_const_stmts which runs regardless
+        // and would miscompile `false; echo $?`).
+        let mut kept: Vec<String> = Vec::with_capacity(out.len());
+        for line in &out {
+            let t = line.trim();
+            let mut inner = t.strip_suffix(';').unwrap_or(t).trim();
+            // peel one layer of balanced outer parens
+            while inner.starts_with('(') && inner.ends_with(')') {
+                let b = inner.as_bytes();
+                let mut depth = 0usize;
+                let mut ok = true;
+                for (k, &ch) in b.iter().enumerate() {
+                    if ch == b'(' {
+                        depth += 1;
+                    } else if ch == b')' {
+                        depth -= 1;
+                        if depth == 0 && k != b.len() - 1 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || depth != 0 {
+                    break;
+                }
+                inner = inner[1..inner.len() - 1].trim();
+            }
+            let mut parts: Vec<String> = vec![inner.to_string()];
+            loop {
+                let last = parts.pop().unwrap();
+                match last_top_comma(&last) {
+                    Some(idx) => {
+                        parts.push(last[..idx].to_string());
+                        parts.push(last[idx + 1..].to_string());
+                    }
+                    None => {
+                        parts.push(last);
+                        break;
+                    }
+                }
+            }
+            if parts.len() >= 2
+                && parts[..parts.len() - 1].iter().all(|e| {
+                    let e = e.trim();
+                    e.strip_prefix("_sh_rc")
+                        .and_then(|r| r.trim_start().strip_prefix('='))
+                        .is_some_and(|v| v.trim().parse::<i64>().is_ok())
+                })
+                && is_const_rhs(parts[parts.len() - 1].trim())
+            {
+                continue;
+            }
+            kept.push(line.clone());
+        }
+        self.out = kept;
         // BASHC_OPT item 10: the while-status idiom leaves a dead
         // scaffold once the rc store is stripped — `{ int _went = 0;`
         // … `_went = 1;` … `if (!_went) { }` + block close. The flag is
@@ -5156,6 +5217,176 @@ impl Render {
             } else {
                 *line = format!("{}({});", indent, rest);
             }
+        }
+    }
+
+    /// BASHC_OPT item 21: `(exit(X), 0);` statement → `exit(X);`.
+    /// exit() never returns, so nothing observes the trailing 0 — but
+    /// only the full-line statement shape qualifies (nested/value uses
+    /// keep the value form), and exit must be FIRST (earlier comma
+    /// elements like `foo(), exit(1)` have side effects — kept).
+    /// BASHC_OPT item 25: `atoll(<literal>)` → the literal.
+    /// Rust-str::parse is the gate: only Rust-parseable literals fold
+    /// (C atoll tolerates garbage `atoll("")` = 0 vs Rust Err — the
+    /// fold must only fire when both agree). `atoll("")` → `0` comes
+    /// from the empty case. Quoted/escaped literals unfold FIRST
+    /// (`unescape_cstr`) since C source quotes are not the value.
+    fn fold_atoll_consts(&mut self) {
+        for line in self.out.iter_mut() {
+            if !line.contains("atoll(") {
+                continue;
+            }
+            let mut cur = line.clone();
+            loop {
+                let Some(op) = cur.find("atoll(") else {
+                    break;
+                };
+                let inner_start = op + 6;
+                let b = cur.as_bytes();
+                let mut depth = 1usize;
+                let mut instr = false;
+                let mut i = inner_start;
+                let mut end = None;
+                while i < b.len() {
+                    let ch = b[i] as char;
+                    if instr {
+                        if ch == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if ch == '"' {
+                            instr = false;
+                        }
+                    } else if ch == '"' {
+                        instr = true;
+                    } else if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let Some(close) = end else {
+                    break;
+                };
+                let inner = cur[inner_start..close].trim();
+                let unfolded = if inner.starts_with('"') {
+                    Self::unescape_cstr(inner)
+                } else {
+                    inner.to_string()
+                };
+                let folded = if unfolded.is_empty() {
+                    Some("0".to_string())
+                } else {
+                    unfolded.parse::<i64>().ok().map(|n| n.to_string())
+                };
+                let Some(rep) = folded else {
+                    break;
+                };
+                cur = format!("{}{rep}{}", &cur[..op], &cur[close + 1..]);
+            }
+            *line = cur;
+        }
+    }
+
+    /// Unescape a C string literal's inner text (no surrounding
+    /// quotes) to its value: `\\` → `\`, `\"` → `"`, `\n` →
+    /// newline, etc. Unknown escapes keep the backslash (fail-closed
+    /// for the atoll fold — a wrong value is worse than no fold).
+    fn unescape_cstr(s: &str) -> String {
+        let inner = s.strip_prefix('"').unwrap_or(s);
+        let inner = inner.strip_suffix('"').unwrap_or(inner);
+        let mut out = String::with_capacity(inner.len());
+        let mut it = inner.chars();
+        while let Some(ch) = it.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'),
+                Some(c) => out.push(c),
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    fn drop_exit_comma(&mut self) {
+        for line in self.out.iter_mut() {
+            let t = line.trim();
+            if !t.starts_with("(exit(") || !t.ends_with(");") {
+                continue;
+            }
+            let mut inner = t[..t.len() - 1].trim();
+            if !(inner.starts_with('(') && inner.ends_with(')')) {
+                continue;
+            }
+            let b = inner.as_bytes();
+            let mut depth = 0usize;
+            let mut ok = true;
+            for (k, &ch) in b.iter().enumerate() {
+                if ch == b'(' {
+                    depth += 1;
+                } else if ch == b')' {
+                    depth -= 1;
+                    if depth == 0 && k != b.len() - 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || depth != 0 {
+                continue;
+            }
+            inner = inner[1..inner.len() - 1].trim();
+            let mut parts: Vec<String> = vec![inner.to_string()];
+            loop {
+                let last = parts.pop().unwrap();
+                match last_top_comma(&last) {
+                    Some(idx) => {
+                        parts.push(last[..idx].to_string());
+                        parts.push(last[idx + 1..].to_string());
+                    }
+                    None => {
+                        parts.push(last);
+                        break;
+                    }
+                }
+            }
+            if parts.len() != 2 || parts[1].trim() != "0" {
+                continue;
+            }
+            let head = parts[0].trim();
+            if !head.starts_with("exit(") || !head.ends_with(')') {
+                continue;
+            }
+            let hb = head.as_bytes();
+            let mut d = 0usize;
+            let mut balanced = true;
+            for &ch in hb.iter() {
+                if ch == b'(' {
+                    d += 1;
+                } else if ch == b')' {
+                    if d == 0 {
+                        balanced = false;
+                        break;
+                    }
+                    d -= 1;
+                }
+            }
+            if !balanced || d != 0 {
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            *line = format!("{indent}{head};");
         }
     }
 
@@ -13879,6 +14110,101 @@ fn param_copy_alias(
         false
     }
 
+    /// A rendered string expression provably non-NULL by shape
+    /// (no var proof needed): an argv-guard ternary
+    /// `((N < _sh_argc && _sh_argv[N]) ? _sh_argv[N] : "")` with
+    /// matching indices (guarded element or `""` — either arm valid),
+    /// or a self-ternary `(X ? X : "")` (NULL takes the `""` arm).
+    /// Used for nonnull proofs at binding sites (BASHC_OPT item 24)
+    /// and hoist-temp registration.
+    fn is_null_safe_shape(v: &str) -> bool {
+        let mut t = v.trim();
+        if t.starts_with('(') && t.ends_with(')') {
+            let b = t.as_bytes();
+            let mut depth = 0usize;
+            let mut ok = true;
+            for (k, &ch) in b.iter().enumerate() {
+                if ch == b'(' {
+                    depth += 1;
+                } else if ch == b')' {
+                    depth -= 1;
+                    if depth == 0 && k != b.len() - 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || depth != 0 {
+                return false;
+            }
+            t = t[1..t.len() - 1].trim();
+        }
+        let Some((cond, then, els)) = Self::split_top_ternary(t) else {
+            return false;
+        };
+        if els != "\"\"" {
+            return false;
+        }
+        if then == cond {
+            return true;
+        }
+        let c = cond.trim();
+        let c = c.strip_prefix('(').unwrap_or(c);
+        let c = c.strip_suffix(')').unwrap_or(c).trim();
+        if let Some((l, r)) = c.split_once("&&") {
+            let l = l.trim();
+            let r = r.trim();
+            if let (Some(n1), Some(n2)) = (
+                l.split_whitespace().next(),
+                r.strip_prefix("_sh_argv[").and_then(|s| s.strip_suffix(']')),
+            ) {
+                if n1.parse::<i64>().is_ok() && n1 == n2 && then == format!("_sh_argv[{n1}]") {
+                    let parts: Vec<&str> = l.split_whitespace().collect();
+                    if parts.len() == 3 && parts[1] == "<" && parts[2] == "_sh_argc" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Split a top-level `cond ? then : els` (depth- and quote-aware).
+    /// None for non-ternaries (incl. GNU `?:` elvis).
+    fn split_top_ternary(s: &str) -> Option<(&str, &str, &str)> {
+        let b = s.as_bytes();
+        let mut depth = 0usize;
+        let mut instr = false;
+        let mut qi = None;
+        let mut i = 0;
+        while i < b.len() {
+            let ch = b[i] as char;
+            if instr {
+                if ch == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if ch == '"' {
+                    instr = false;
+                }
+            } else if ch == '"' {
+                instr = true;
+            } else if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth = depth.saturating_sub(1);
+            } else if ch == '?' && depth == 0 {
+                if qi.is_none() {
+                    qi = Some(i);
+                }
+            } else if ch == ':' && depth == 0 && qi.is_some() {
+                return Some((s[..qi.unwrap()].trim(), s[qi.unwrap() + 1..i].trim(), s[i + 1..].trim()));
+            }
+            i += 1;
+        }
+        None
+    }
+
     fn param_call(&mut self, args: &[IrExpr]) -> String {
         let Some(op) = Self::str_arg(args, 0) else {
             return "0".into();
@@ -13969,6 +14295,26 @@ fn param_copy_alias(
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
                     Some(_) => self.args_value_num(len_idx),
                 };
+                // BASHC_OPT item 28: whole-array slice — off
+                // missing/empty/0 with len missing/empty — returns
+                // the joined string directly (slicing everything is
+                // the identity; the helper would split + rejoin).
+                // Positional `$@` keeps its helper (argv slicing).
+                if is_array && !is_positional {
+                    let off_whole = match args.get(off_idx) {
+                        None => true,
+                        Some(IrExpr::Str(s, _)) => s.is_empty() || s == "0",
+                        _ => false,
+                    };
+                    let len_whole = match args.get(len_idx) {
+                        None => true,
+                        Some(IrExpr::Str(s, _)) => s.is_empty(),
+                        _ => false,
+                    };
+                    if off_whole && len_whole {
+                        return joined;
+                    }
+                }
                 self.need_sh = true;
                 let t = self.vbuf_temp();
                 if is_positional {
@@ -14060,6 +14406,13 @@ fn param_copy_alias(
         {
             let dt = format!("_d{}", self.temp_seq);
             self.temp_seq += 1;
+            // BASHC_OPT item 24 (chain): a null-safe hoisted value
+            // proves the temp (fresh name, single assign, never freed
+            // or reassigned — timeless), so later moves (`x = _dN`)
+            // inherit the proof via the existing move rule.
+            if Self::is_null_safe_shape(&var_expr) {
+                self.nonnull.insert(dt.clone());
+            }
             self.emit(&format!("const char *{dt} = ({var_expr});"));
             dt
         } else {
@@ -16958,6 +17311,41 @@ fn param_copy_alias(
                 }
             }
         }
+        // BASHC_OPT item 26: `cat <<'EOF'` (single static QUOTED
+        // heredoc, bare `cat` with no args) → native fputs. No
+        // fork/exec, no shell parse. Quoted only (!interpolate):
+        // unquoted bodies need expansion. Static Str body only;
+        // exact bytes (a heredoc body always ends with newline
+        // before the delimiter — no added newline, unlike the _hl
+        // delimiter-separation logic in the shell path). rc = 0
+        // (cat succeeds). Pipelines/extra redirects/args fall
+        // through to the shell path.
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if redirects.len() == 1
+                && matches!(redirects[0].mode.as_str(), "heredoc" | "heredoc-tabs")
+                && !redirects[0].interpolate
+            {
+                if let Some(words) = inner_first_words(inner) {
+                    if words.is_empty() {
+                        if let Some(IrStmt::Expr(IrExpr::Call { func, args })) =
+                            inner.first()
+                        {
+                            if (func == "exec" || func == "builtin")
+                                && Self::str_arg(args, 0).as_deref() == Some("cat")
+                            {
+                                if let IrExpr::Str(body, _) = &redirects[0].target {
+                                    self.emit(&format!(
+                                        "(fputs({}, stdout), _sh_rc = 0);",
+                                        Self::cstr(body)
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `A || continue` / `A && break` (also exit): a flow statement
         // inside an and/or chain cannot live in a shell site (the site
         // rendered `|| 1` and NEVER continued). Peel it: evaluate the
@@ -17688,6 +18076,19 @@ fn param_copy_alias(
                         self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                     }
                 }
+                // BASHC_OPT item 24: init value provably non-NULL by
+                // shape (argv-guard ternary, self-ternary) → the var is
+                // proven (numeric vars excluded: nonnull tracks char*).
+                if vars.len() == 1 {
+                    if let Some(v) = init_expr.as_ref() {
+                        if Self::is_null_safe_shape(v)
+                            && !self.is_num(&vars[0].name)
+                            && !self.fn_written.contains(&vars[0].name)
+                        {
+                            self.nonnull_var.insert(self.c_ident(&vars[0].name));
+                        }
+                    }
+                }
             }
             IrStmt::Output { value, newline, .. } => {
                 let v = self.value_c(value);
@@ -17755,28 +18156,27 @@ fn param_copy_alias(
                 // it afterwards.
                 if let Some((first, last, step)) = seq_iter_range(iter) {
                     let name = self.c_ident(var);
-                    let was_num = self.is_num(var);
                     let prev_type = self.var_types.get(var).copied();
-                    self.var_types.insert(var.clone(), IrType::Int);
-                    let cmp = if step > 0 { "<=" } else { ">=" };
-                    // BASHC_OPT item 7b: a brace-int-seq (`{1..5}`) with an
-                    // Int-homed loop var runs on a HIDDEN counter with a
-                    // per-iteration assign — never directly on the var. A
-                    // direct `for (i = 1; i <= 5; i++)` leaves i past the
-                    // end (6) where bash leaves the LAST element (5), so
-                    // any post-loop read (or break) would be off by one
-                    // (002: missing first Counter line). The hidden
-                    // counter preserves exact bash end-value/break
-                    // semantics while dropping the materialized table.
-                    // (Range iters keep the direct form — pre-existing
-                    // behavior, known latent end-value gap, untouched.)
-                    // Non-Int vars keep the string-table path below.
                     let is_brace_seq = matches!(iter,
                         IrExpr::Array(items)
                             if items.len() == 1
                                 && matches!(items.first(),
                                     Some(IrExpr::Call { func, .. }) if func == "brace"));
-                    if is_brace_seq && was_num {
+                    // A brace-seq var that is NOT Int-homed (mixed or
+                    // string use — the mark gate above refused it) skips
+                    // the native loop entirely and falls through to the
+                    // materialized-table path below, which has literals
+                    // for brace shapes. Range iters keep the direct form
+                    // (pre-existing behavior, untouched).
+                    if is_brace_seq && !self.is_num(var) {
+                        // fall through (no Int insert — not homed as Int).
+                    } else {
+                    self.var_types.insert(var.clone(), IrType::Int);
+                    let cmp = if step > 0 { "<=" } else { ">=" };
+                    // BASHC_OPT item 7b: brace-int-seq runs on a HIDDEN
+                    // counter (end-value/break semantics above); Range
+                    // iters use the loop var directly (pre-existing).
+                    if is_brace_seq {
                         let k = format!("_sk{}", self.temp_seq);
                         self.temp_seq += 1;
                         let kupd = match step {
@@ -17833,6 +18233,7 @@ fn param_copy_alias(
                         }
                     }
                     return;
+                    }
                 }
                 // Emit a C for loop over an index variable; each iteration
                 // assigns the loop var from a static items array. Supports
@@ -18153,7 +18554,19 @@ fn param_copy_alias(
                         "for (size_t _i_{var_name} = 0; _i_{var_name} < {n}; _i_{var_name}++) {{"
                     ));
                     self.depth += 1;
-                    self.emit(&format!("{var_name} = (char*){arr_id}[_i_{var_name}];"));
+                    // BASHC_OPT item 7 fallback: a buffer-homed loop var
+                    // (`char i[6]`) cannot take a plain assign (array
+                    // type) — guarded copy instead (same as any other
+                    // bounded store).
+                    if let Some(b) = self.buf_bound(var) {
+                        self.emit_guarded_copy(
+                            &var_name,
+                            b,
+                            &format!("(char*){arr_id}[_i_{var_name}]"),
+                        );
+                    } else {
+                        self.emit(&format!("{var_name} = (char*){arr_id}[_i_{var_name}];"));
+                    }
                     for s in body {
                         self.stmt(s);
                     }
@@ -18489,6 +18902,21 @@ fn param_copy_alias(
                 // (precision follow-up: intersect like If).
                 self.nonnull_var.clear();
                 let d = self.value_c(discriminant);
+                // BASHC_OPT item 22: bash expands the case word ONCE,
+                // but the branches below re-evaluate it per test. Hoist
+                // call-free non-trivial discriminants into a temp (pure
+                // reads: single evaluation is exact, and matches bash
+                // freeze semantics when bodies mutate inputs). Trivial
+                // idents/literals stay inline; call-containing forms
+                // keep today's inline behavior (status quo ante).
+                let d = if d.contains('(') && !Self::expr_has_call(&d) {
+                    let dt = format!("_cd{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    self.emit(&format!("const char *{dt} = ({d});"));
+                    dt
+                } else {
+                    d
+                };
                 self.need_fnmatch = true;
                 let mut first = true;
                 for cl in clauses {
@@ -18519,11 +18947,11 @@ fn param_copy_alias(
                         self.emit("}");
                     }
                 }
-                self.emit("else {");
-                self.depth += 1;
-                self.emit("/* no default */");
-                self.depth -= 1;
-                self.emit("}");
+                // BASHC_OPT item 20: no unconditional `else` — bash
+                // `case` without a default does nothing on no-match,
+                // exactly what omitting the else does in C. (The IR has
+                // no else field; the old `else { /* no default */ }`
+                // was pure noise.)
             }
             IrStmt::WriteFile { path, content, append } => {
                 let p = self.value_c(path);
@@ -19079,9 +19507,12 @@ fn param_copy_alias(
             vars.insert(n.clone());
         }
         // seq-range for-loop vars: the loop renders them as Int — hoist
-        // them at that type (bash leaves $i = LAST after the loop)
+        // them at that type (bash leaves $i = LAST after the loop).
+        // BASHC_OPT item 7 gate: vars assigned non-int values anywhere
+        // skip the mark (computed once here — needs bigint verdicts).
+        let non_int = assigned_non_int_vars(&prog, &self.var_types, &self.bigint_vars);
         for s in &prog.stmts {
-            mark_seq_loop_vars(s, &mut self.var_types);
+            mark_seq_loop_vars(s, &mut self.var_types, &non_int);
         }
         // cstyleFor header vars: the C backend renders the header
         // natively, so the loop var and cond operands are numeric (Int),
@@ -22920,42 +23351,274 @@ fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 
 /// Seq-range for-loop vars render as Int loops — hoist them at that
 /// type (the range analysis seeds their [lo, hi]).
-fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
+/// Vars ever assigned a non-int-shaped value (BASHC_OPT item 7
+/// soundness gate): a seq-loop var with a string assign anywhere
+/// (`for i in {1..3}; …; i=hello`) must NOT be Int-homed, or the
+/// string store renders into a long long (miscompile — caught on
+/// `i=hello` printing 0 instead of hello). Int-shaped RHS mirrors
+/// `is_int_expr` (literals, int strings, non-bigint arith,
+/// Int-typed var/getVar reads); everything else — unknown calls
+/// naming vars, non-seq loop headers, Ext — counts (fail-closed).
+/// An Ext anywhere marks every assigned var (opaque payloads could
+/// write anything).
+fn assigned_non_int_vars(
+    prog: &IrProgram,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) -> HashSet<String> {
+    // pure readers: naming one never writes.
+    fn is_reader(func: &str) -> bool {
+        matches!(
+            func,
+            "sortedIntJoin"
+                | "sortedBigintJoin"
+                | "max"
+                | "min"
+                | "sum"
+                | "arrayIndex"
+                | "arrayItems"
+                | "arrayLen"
+                | "getVar"
+        )
+    }
+    fn expr_names_call(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if !is_reader(func) {
+                    if let Some(IrExpr::Str(s, _)) = args.first() {
+                        out.insert(s.clone());
+                    }
+                }
+                for a in args {
+                    expr_names_call(a, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    expr_names_call(i, out);
+                }
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                expr_names_call(iter, out);
+                expr_names_call(elem, out);
+                if let Some(c) = cond {
+                    expr_names_call(c, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_names_call(lhs, out);
+                expr_names_call(rhs, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        expr_names_call(x, out);
+                    }
+                }
+            }
+            IrExpr::Arrow(b) => stmts_walk(b, out, &mut HashSet::new(), &mut false, &HashMap::new(), &BTreeSet::new()),
+            IrExpr::Lambda { body, .. } => stmts_walk(body, out, &mut HashSet::new(), &mut false, &HashMap::new(), &BTreeSet::new()),
+            _ => {}
+        }
+    }
+    fn stmts_walk(
+        stmts: &[IrStmt],
+        out: &mut HashSet<String>,
+        assigned: &mut HashSet<String>,
+        ext: &mut bool,
+        vt: &HashMap<String, IrType>,
+        big: &BTreeSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                        assigned.insert(base.clone());
+                        if !is_int_expr(expr, vt, big) {
+                            out.insert(base);
+                        }
+                    }
+                    expr_names_call(expr, out);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for d in vars {
+                        assigned.insert(d.name.clone());
+                        if let Some(e) = init {
+                            if !is_int_expr(e, vt, big) {
+                                out.insert(d.name.clone());
+                            }
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { .. } => {}
+                IrStmt::Expr(e) => expr_names_call(e, out),
+                IrStmt::Output { value, .. } => expr_names_call(value, out),
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr_names_call(path, out);
+                    expr_names_call(content, out);
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(v) = e {
+                        expr_names_call(v, out);
+                    }
+                }
+                IrStmt::SetChildError(e) => expr_names_call(e, out),
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                    expr_names_call(expr, out);
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    expr_names_call(cond, out);
+                    stmts_walk(then, out, assigned, ext, vt, big);
+                    for (c, b) in elsifs {
+                        expr_names_call(c, out);
+                        stmts_walk(b, out, assigned, ext, vt, big);
+                    }
+                    stmts_walk(else_, out, assigned, ext, vt, big);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                    expr_names_call(cond, out);
+                    stmts_walk(body, out, assigned, ext, vt, big);
+                }
+                IrStmt::For { var, iter, body } => {
+                    assigned.insert(var.clone());
+                    if seq_iter_range(iter).is_none() {
+                        out.insert(var.clone());
+                    }
+                    expr_names_call(iter, out);
+                    stmts_walk(body, out, assigned, ext, vt, big);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    stmts_walk(init, out, assigned, ext, vt, big);
+                    expr_names_call(cond, out);
+                    stmts_walk(step, out, assigned, ext, vt, big);
+                    stmts_walk(body, out, assigned, ext, vt, big);
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    stmts_walk(body, out, assigned, ext, vt, big);
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            expr_names_call(m, out);
+                        }
+                        stmts_walk(&e.body, out, assigned, ext, vt, big);
+                    }
+                    stmts_walk(else_body, out, assigned, ext, vt, big);
+                    stmts_walk(finally_body, out, assigned, ext, vt, big);
+                }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    expr_names_call(discriminant, out);
+                    for c in clauses {
+                        stmts_walk(&c.body, out, assigned, ext, vt, big);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    stmts_walk(body, out, assigned, ext, vt, big);
+                    for (_, b) in named_blocks {
+                        stmts_walk(b, out, assigned, ext, vt, big);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        stmts_walk(st, out, assigned, ext, vt, big);
+                    }
+                }
+                IrStmt::Select { clauses, .. } => {
+                    for c in clauses {
+                        if let Some(e) = c.ch.as_ref() {
+                            expr_names_call(e, out);
+                        }
+                        if let Some(e) = c.value.as_ref() {
+                            expr_names_call(e, out);
+                        }
+                        stmts_walk(&c.body, out, assigned, ext, vt, big);
+                    }
+                }
+                IrStmt::Redirect { inner, redirects, .. } => {
+                    stmts_walk(inner, out, assigned, ext, vt, big);
+                    for r in redirects {
+                        expr_names_call(&r.target, out);
+                    }
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    stmts_walk(b, out, assigned, ext, vt, big)
+                }
+                IrStmt::Exec { cmd, args, redirects, .. } => {
+                    expr_names_call(cmd, out);
+                    for a in args {
+                        expr_names_call(a, out);
+                    }
+                    for r in redirects {
+                        expr_names_call(r, out);
+                    }
+                }
+                IrStmt::Continue | IrStmt::Break => {}
+                IrStmt::Goto(_) | IrStmt::Label(_) | IrStmt::Require(_) => {}
+                IrStmt::RawText(_) | IrStmt::Asm { .. } => {}
+                IrStmt::Ext(_) | IrStmt::Shaderize { .. } => {
+                    *ext = true;
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    let mut assigned = HashSet::new();
+    let mut ext = false;
+    stmts_walk(&prog.stmts, &mut out, &mut assigned, &mut ext, vt, big);
+    for sub in &prog.subs {
+        stmts_walk(&sub.body, &mut out, &mut assigned, &mut ext, vt, big);
+    }
+    if ext {
+        return assigned;
+    }
+    out
+}
+
+fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>, non_int: &HashSet<String>) {
     match s {
         IrStmt::For { var, iter, body } => {
-            if seq_iter_range(iter).is_some() {
+            // BASHC_OPT item 7 gate, brace-shape only: a brace-seq loop
+            // var assigned non-int values elsewhere (`for i in {1..3};
+            // …; i=hello`) must NOT be Int-homed, or the string store
+            // renders into a long long (miscompile). Range iters keep
+            // unconditional marking (pre-existing behavior, untouched).
+            let is_brace = matches!(iter,
+                IrExpr::Array(items)
+                    if items.len() == 1
+                        && matches!(items.first(),
+                            Some(IrExpr::Call { func, .. }) if func == "brace"));
+            if seq_iter_range(iter).is_some() && (!is_brace || !non_int.contains(var)) {
                 var_types.insert(var.clone(), IrType::Int);
             }
             for b in body {
-                mark_seq_loop_vars(b, var_types);
+                mark_seq_loop_vars(b, var_types, non_int);
             }
         }
         IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
             for x in b {
-                mark_seq_loop_vars(x, var_types);
+                mark_seq_loop_vars(x, var_types, non_int);
             }
         }
         IrStmt::If { then, elsifs, else_, .. } => {
             for x in then {
-                mark_seq_loop_vars(x, var_types);
+                mark_seq_loop_vars(x, var_types, non_int);
             }
             for (_, b) in elsifs {
                 for x in b {
-                    mark_seq_loop_vars(x, var_types);
+                    mark_seq_loop_vars(x, var_types, non_int);
                 }
             }
             for x in else_ {
-                mark_seq_loop_vars(x, var_types);
+                mark_seq_loop_vars(x, var_types, non_int);
             }
         }
         IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
             for x in body {
-                mark_seq_loop_vars(x, var_types);
+                mark_seq_loop_vars(x, var_types, non_int);
             }
         }
         IrStmt::Function { body, .. } => {
             for x in body {
-                mark_seq_loop_vars(x, var_types);
+                mark_seq_loop_vars(x, var_types, non_int);
             }
         }
         _ => {}
@@ -29611,6 +30274,81 @@ mod tests {
         assert_eq!(seq_of_ints(&v(&["1", "x"])), None);
         assert_eq!(seq_of_ints(&v(&["5", "5"])), None);
         assert_eq!(seq_of_ints(&Vec::new()), None);
+    }
+
+    #[test]
+    fn bashc_opt_item24_null_safe_shapes() {
+        // BASHC_OPT item 24: argv-guard and self-ternary shapes prove
+        // non-NULL; wrong-index guards, non-empty else arms, and
+        // GNU `?:` elvis do not.
+        assert!(Render::is_null_safe_shape(
+            "((0 < _sh_argc && _sh_argv[0]) ? _sh_argv[0] : \"\")"
+        ));
+        assert!(Render::is_null_safe_shape("(x ? x : \"\")"));
+        // guard index ≠ value index: not proven.
+        assert!(!Render::is_null_safe_shape(
+            "((0 < _sh_argc && _sh_argv[0]) ? _sh_argv[1] : \"\")"
+        ));
+        // non-empty else arm: could be anything.
+        assert!(!Render::is_null_safe_shape("(x ? x : y)"));
+        // elvis `?:` (no then): not the proven shape.
+        assert!(!Render::is_null_safe_shape("(x ?: \"\")"));
+        // plain ident: no shape proof.
+        assert!(!Render::is_null_safe_shape("x"));
+    }
+
+    #[test]
+    fn bashc_opt_item7_mixed_use_skips_int_mark() {
+        // BASHC_OPT item 7 gate: a brace-seq loop var assigned a
+        // non-int value elsewhere (`i=hello`) lands in the non-int
+        // set, so the mark pass must not Int-home it.
+        use crate::ir::AssignTarget;
+        let seq_iter = IrExpr::Array(vec![IrExpr::Call {
+            func: "brace".to_string(),
+            args: vec![IrExpr::Str("1..3".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+        }]);
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::For {
+                    var: "i".to_string(),
+                    iter: seq_iter,
+                    body: vec![IrStmt::Output {
+                        value: IrExpr::Str("$i".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        newline: true,
+                        target: None,
+                    }],
+                },
+                IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: "i".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Str("hello".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let vt = HashMap::new();
+        let big = BTreeSet::new();
+        let non_int = assigned_non_int_vars(&prog, &vt, &big);
+        assert!(non_int.contains("i"));
+        let mut marked = HashMap::new();
+        for s in &prog.stmts {
+            mark_seq_loop_vars(s, &mut marked, &non_int);
+        }
+        assert!(!marked.contains_key("i"));
     }
 
     #[test]
