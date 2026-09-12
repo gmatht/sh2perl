@@ -402,6 +402,9 @@ pub struct Render {
     /// rounds), so the loop bound would be off by 1 for huge n — the
     /// Newton isqrt is exact for every long long.
     need_isqrt: bool,
+    /// `_sh_isint31` (bc-arith fast path): integer-shaped and
+    /// |v| ≤ 2^31, so atoll is safe and bounded +-* can't overflow i64.
+    need_isint31: bool,
     /// exact __int128-to-decimal helper (small-int sum past i64)
     need_i128: bool,
     /// GMP bigint runtime (the py-sh-go proven-big regime): set when
@@ -2849,6 +2852,12 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     for sub in &mut prog.subs {
         fold_range_for(&mut sub.body);
     }
+    // bc-arith fast path: `X=$(echo INT-ARITH | bc)` with vars → guarded
+    // native evaluation + spawn fallback (else real bc per evaluation).
+    fold_bc_arith_capture(&mut prog.stmts);
+    for sub in &mut prog.subs {
+        fold_bc_arith_capture(&mut sub.body);
+    }
     // const-branch fold (items 29/30/32): decidable if/elsif chains keep
     // only the live branch; const-false whiles vanish. Runs on final
     // layout (after range-for); const_rhs was built with the analyses.
@@ -4617,6 +4626,23 @@ impl Render {
             self.emit("  if (neg) d->p[0] = '-';");
             self.emit("  for (int i = 0; i < n; i++) d->p[neg + i] = tmp[n - 1 - i];");
             self.emit("  d->p[neg + n] = 0;");
+            self.emit("}");
+            self.emit("");
+        }
+        if self.need_isint31 {
+            self.emit("/* integer-shaped and |v| <= 2^31 (bc fast path) */");
+            self.emit("static int _sh_isint31(const char *s) {");
+            self.emit("  if (!s) return 0;");
+            self.emit("  while (*s == ' ' || *s == '\\t' || *s == '\\n') s++;");
+            self.emit("  if (*s == '-') s++;");
+            self.emit("  int nd = 0; long long v = 0;");
+            self.emit("  while (*s >= '0' && *s <= '9') { nd++; if (nd > 10) return 0;");
+            self.emit("    v = v * 10 + (*s - '0'); s++; }");
+            self.emit("  if (nd == 0) return 0;");
+            self.emit("  while (*s == ' ' || *s == '\\t' || *s == '\\n') s++;");
+            self.emit("  if (*s) return 0;");
+            self.emit("  if (v > 2147483648LL) return 0;");
+            self.emit("  return 1;");
             self.emit("}");
             self.emit("");
         }
@@ -9382,15 +9408,30 @@ fn param_copy_alias(
                     };
                     self.reduce_array(func, &name)
                 }
+                "isint31" => {
+                    // bc-arith fast-path guard: integer-shaped and
+                    // |v| ≤ 2^31 (atoll-safe, bounded +-* can't overflow
+                    // i64). Truthy int for && chains (like test sites).
+                    self.need_isint31 = true;
+                    let v = match args.first() {
+                        Some(e) => self.value_c(e),
+                        None => String::from("\"\""),
+                    };
+                    format!("_sh_isint31({v})")
+                }
                 "isqrt" => {
                     // structured integer sqrt (py-sh-go `int(Y**0.5)`
                     // node — no arith-string detour). Exact Newton
                     // helper; CPython-parity for int-domain (≤2^53).
+                    // value_c returns STRINGS: stringify (a bare long
+                    // long into char* is a crash — BASHC_FIX bc path).
+                    // Numeric contexts use arith()/expr(), not this arm.
                     let Some(IrExpr::Arith(a)) = args.first() else {
                         return "0".into();
                     };
                     self.need_isqrt = true;
-                    format!("_sh_isqrt({})", self.arith(a))
+                    let v = format!("_sh_isqrt({})", self.arith(a));
+                    self.num_temp(&v)
                 }
                 "arith" => {
                     if std::env::var("SH2_DBG_VARS").is_ok() {
@@ -12331,7 +12372,8 @@ fn param_copy_alias(
     /// Owned store assign for `declare`-family words (BASHC_FIX §2.x:
     /// `local x=$1` aliased argv, then `free(x)` segfaulted). Mirrors
     /// the Assign arm: MOVE a pending heap temp (no strdup, unpend it),
-    /// else free-before-reassign for file-scope vars (self-ref guard)
+    /// else free-AFTER-reassign for file-scope vars (temp swap — safe
+    /// across RHS evaluation and self-refs)
     /// and strdup into owned storage. Only for heap-store vars (num /
     /// buf / mstr / const have their own mechanisms — callers check).
     /// Plain `x = v` without this owns nothing (borrowed argv, env,
@@ -12348,10 +12390,16 @@ fn param_copy_alias(
             self.pending_frees.retain(|x| x != &v);
             return;
         }
-        if self.top_vars.contains(name) && !text_contains_ident(&v, id) {
-            self.emit(&format!("free({id});"));
+        // free-AFTER-reassign via temp swap (BASHC_FIX: free-before
+        // left the var dangling across RHS evaluation — captures read
+        // it via exports). Subsumes the self-ref guard.
+        if self.top_vars.contains(name) {
+            let old = format!("_old{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit(&format!("{{ char *{old} = {id}; {id} = _sh_xstrdup((char*)({v})); free({old}); }}"));
+        } else {
+            self.emit(&format!("{id} = _sh_xstrdup((char*)({v}));"));
         }
-        self.emit(&format!("{id} = _sh_xstrdup((char*)({v}));"));
     }
 
     fn declare_words(&mut self, words: &[&IrExpr]) {
@@ -14023,6 +14071,70 @@ fn param_copy_alias(
 
     /// Quote-aware test tokenizer: `"..."`/`'...'` and `${...}` (with
     /// embedded spaces in the pattern) stay ONE token.
+    /// `$((...))` span scanner shared by the test-arm bail, the
+    /// tokenizer, and the operand renderer (BASHC_FIX/perf: native
+    /// `[ $((...)) ]` avoids a bash spawn per evaluation). Returns the
+    /// byte index just past the closing `))` iff the span at `start`
+    /// is balanced, cmdsub/backquote-free, and parse_arith-able.
+    /// Single implementation so bailer and tokenizer can never
+    /// disagree (a mismatch would render atoll-garbage instead of
+    /// shelling out).
+    fn test_arith_span(s: &str, start: usize) -> Option<usize> {
+        let b = s.as_bytes();
+        if !s[start..].starts_with("$((") {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut j = start + 2;
+        while j < b.len() {
+            if b[j] == b'(' {
+                depth += 1;
+            } else if b[j] == b')' {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if b[j] == b'`' {
+                return None;
+            } else if b[j] == b'$' && j + 1 < b.len() && b[j + 1] == b'(' {
+                return None;
+            }
+            j += 1;
+        }
+        if depth != 0 || j + 1 >= b.len() || b[j + 1] != b')' {
+            return None;
+        }
+        let inner = &s[start + 3..j];
+        crate::shir::parse_arith(inner)?;
+        Some(j + 2)
+    }
+
+    /// True iff test text needs the child bash: a `$(` outside a valid
+    /// `$((...))` span, a bare backquote, or extglob patterns (existing).
+    fn test_needs_shell(s: &str) -> bool {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'`' {
+                return true;
+            }
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'(' {
+                match Self::test_arith_span(s, i) {
+                    Some(end) => {
+                        i = end;
+                        continue;
+                    }
+                    None => return true,
+                }
+            }
+            i += 1;
+        }
+        ["@(", "+(", "!(", "?("].iter().any(|e| s.contains(e))
+    }
+
     fn test_tokens(&self, s: &str) -> Vec<String> {
         let mut toks = Vec::new();
         let chars: Vec<char> = s.chars().collect();
@@ -14050,6 +14162,19 @@ fn param_copy_alias(
                 continue;
             }
             if c == '$' {
+                // `$((...))` — consume the whole balanced span as one
+                // token (operands stay whole for native evaluation).
+                // Unbalanced/garbage spans never arrive here (the bail
+                // shelled out); fall back to the old word-splitting.
+                // (i is a char index — resolve the byte offset first.)
+                let boff: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                if s[boff..].starts_with("$((") {
+                    if let Some(end) = Self::test_arith_span(s, boff) {
+                        toks.push(s[boff..end].to_string());
+                        i += s[boff..end].chars().count();
+                        continue;
+                    }
+                }
                 // `${...}` — consume through the matching `}` (the
                 // pattern may contain spaces)
                 t.push(c);
@@ -14469,7 +14594,7 @@ fn param_copy_alias(
     /// `${name}` of an Int-homed var (renders as the native ident).
     /// None otherwise (atoll path stays exact). Used by test_compare
     /// for native integer comparisons (BASHC_OPT item 4).
-    fn test_num_operand(&self, raw: &str) -> Option<String> {
+    fn test_num_operand(&mut self, raw: &str) -> Option<String> {
         let mut t = raw.trim();
         // strip one layer of matching quotes
         if t.len() >= 2
@@ -14480,6 +14605,18 @@ fn param_copy_alias(
         }
         if t.parse::<i64>().is_ok() {
             return Some(t.to_string());
+        }
+        // `$((...))` arithmetic operand — validated upstream by
+        // test_arith_spans_ok (balanced, cmdsub-free, parseable), so
+        // this parse succeeds on admitted inputs. Render natively
+        // (bash evaluates once, same as the test would).
+        if t.starts_with("$((") && t.ends_with("))") && t.len() > 5 {
+            let inner = &t[3..t.len() - 2];
+            if !inner.contains("$(") && !inner.contains('`') {
+                if let Some(a) = crate::shir::parse_arith(inner) {
+                    return Some(self.arith(&a));
+                }
+            }
         }
         // `$name` / `${name}` / `${name:-...}`? Only the bare forms
         // prove the VALUE is the var's (defaults/complex expansions
@@ -15508,10 +15645,11 @@ fn param_copy_alias(
                 Some(s) => {
                     // \$( ) command substitution or EXTGLOB patterns
                     // (@(…) +(…) !(…) ?(…)) have no native lowering —
-                    // the child bash evaluates them (extglob enabled)
-                    if s.contains("$(")
-                        || ["@(", "+(", "!(", "?("].iter().any(|e| s.contains(e))
-                    {
+                    // the child bash evaluates them (extglob enabled).
+                    // `$((...))` arithmetic spans render natively
+                    // (test_arith_span-validated); anything else with
+                    // `$(`/backquote shells out as before.
+                    if Self::test_needs_shell(&s) {
                         return self.test_shell_site(&s);
                     }
                     self.test_render(&s)
@@ -16006,6 +16144,16 @@ fn param_copy_alias(
                 // call compiles, not a stub
                 let name = Self::str_arg(args, 0).unwrap_or_default();
                 self.sorted_join_call(func, &name)
+            }
+            "isint31" => {
+                // bc-arith fast-path guard (duplicate of the value_c
+                // arm — conds render through this dispatcher).
+                self.need_isint31 = true;
+                let v = match args.first() {
+                    Some(e) => self.value_c(e),
+                    None => String::from("\"\"")
+                };
+                format!("_sh_isint31({v})")
             }
             _ => self.sh2_stub(func, args, func),
         }
@@ -17116,6 +17264,9 @@ fn param_copy_alias(
                 )
             }
             IrExpr::Call { func, .. } if func == "arrayLen" => true,
+            // structured isqrt returns long long (bc-arith fast path
+            // assigns it into Str vars — must stringify, not alias).
+            IrExpr::Call { func, .. } if func == "isqrt" => true,
             _ => false,
         }
     }
@@ -18703,20 +18854,19 @@ fn param_copy_alias(
                             self.nonnull_var.insert(name.clone());
                         }
                     } else {
-                        // free-before-reassign: a FILE-SCOPE heap store
-                        // var (hoisted to file scope because a function
-                        // assigns it — bash function assigns touch the
-                        // global) is reassigned on every call, leaking
-                        // the previous strdup'd value (LSan/valgrind
-                        // flag it). Free the old value first — free(NULL)
-                        // is a no-op, and the end-of-main/end-of-fn free
-                        // still owns the LAST value. Guard against a
-                        // self-referential RHS (`X = strdup(X)`), which
-                        // would free the source before the copy.
-                        if self.top_vars.contains(&t.var) && !rhs.contains(&name) {
-                            self.emit(&format!("free({name});"));
+                        // free-AFTER-reassign via temp swap (BASHC_FIX:
+                        // free-before left the var dangling across RHS
+                        // evaluation — captures read it via exports).
+                        // Temp-swap is self-ref safe, so no text guard.
+                        // Applies to FILE-SCOPE vars (reassigned across
+                        // calls); end-of-main/end-of-fn free owns LAST.
+                        if self.top_vars.contains(&t.var) {
+                            let old = format!("_old{}", self.temp_seq);
+                            self.temp_seq += 1;
+                            self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
+                        } else {
+                            self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
                         }
-                        self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
                         // P1 follow-up: _sh_xstrdup aborts on OOM, so the
                         // fresh copy is non-NULL by construction (plus
                         // fn-written gate).
@@ -24981,6 +25131,573 @@ fn fold_range_stmt(s: &mut IrStmt) {
         }
         _ => {}
     }
+}
+
+/// Static echo text (no vars): Lit pieces, words joined with single
+/// spaces (shell joining). None if any dynamic part.
+fn bc_static_text(words: &[IrExpr]) -> Option<String> {
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match w {
+            IrExpr::Str(s, _) => out.push_str(s),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => out.push_str(s),
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Operand to ArithAst.
+fn bc_operand_arith(op: &BcOperand) -> ArithAst {
+    match op {
+        BcOperand::Var(n, _) => ArithAst::Var(n.clone()),
+        BcOperand::Num(n) => ArithAst::Num(*n),
+        BcOperand::Neg(x) => ArithAst::Un {
+            op: "-".to_string(),
+            arg: Box::new(bc_operand_arith(x)),
+        },
+    }
+}
+
+/// isident for sqrt guard names (positional/special names refuse → spawn).
+fn bc_is_ident(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// isint31 guard conjunction over vars (single → itself).
+fn bc_guard(vars: &[(String, IrExpr)]) -> Option<IrExpr> {
+    let mut it = vars.iter().map(|(_, e)| IrExpr::Call {
+        func: "isint31".to_string(),
+        args: vec![e.clone()],
+    });
+    let mut acc = it.next()?;
+    for g in it {
+        acc = IrExpr::BinOp {
+            lhs: Box::new(acc),
+            op: crate::ir::BinOpKind::And,
+            rhs: Box::new(g),
+        };
+    }
+    Some(acc)
+}
+
+/// Match `echo ... | bc` 2-stage pipeline bodies. Returns echo words.
+fn bc_echo_words(stages: &[Vec<IrStmt>]) -> Option<Vec<IrExpr>> {
+    if stages.len() != 2 {
+        return None;
+    }
+    let one = |ss: &[IrStmt]| -> Option<(String, Vec<IrExpr>)> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = ss else {
+            return None;
+        };
+        if !matches!(func.as_str(), "exec" | "builtin") {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+            return None;
+        };
+        Some((cmd.clone(), words.clone()))
+    };
+    let (c0, w0) = one(&stages[0])?;
+    let (c1, w1) = one(&stages[1])?;
+    if c0 != "echo" || c1 != "bc" || !w1.is_empty() {
+        return None;
+    }
+    let mut words = w0;
+    while let Some(IrExpr::Str(f, _)) = words.first() {
+        if f == "-n" {
+            words.remove(0);
+        } else {
+            break;
+        }
+    }
+    if let Some(IrExpr::Str(f, _)) = words.first() {
+        if f.starts_with('-') && !f[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    Some(words)
+}
+
+/// Extract pipeline stage bodies: IrStmt::Pipeline or Call-pipeline.
+fn bc_pipeline_stages(stmt: &IrStmt) -> Option<Vec<Vec<IrStmt>>> {
+    match stmt {
+        IrStmt::Pipeline { stages, .. } => Some(stages.clone()),
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+            let [IrExpr::Array(items)] = args.as_slice() else {
+                return None;
+            };
+            let mut out = Vec::new();
+            for x in items {
+                match x {
+                    IrExpr::Arrow(st) => out.push(st.clone()),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Unwrap a capture expr (IrExpr::Capture or captureWords Call) to the
+/// single pipeline statement inside its Arrow. None otherwise.
+fn bc_capture_pipeline(cap: &IrExpr) -> Option<IrStmt> {
+    let body: &[IrStmt] = match cap {
+        IrExpr::Capture { expr, .. } => match expr.as_ref() {
+            IrExpr::Arrow(st) => st,
+            _ => return None,
+        },
+        IrExpr::Call { func, args } if func == "captureWords" || func == "capture" => {
+            let [IrExpr::Arrow(st)] = args.as_slice() else {
+                return None;
+            };
+            st
+        }
+        _ => return None,
+    };
+    if body.len() != 1 {
+        return None;
+    }
+    Some(body[0].clone())
+}
+/// bc-arith fast path (BASHC_FIX/perf): `X=$(echo INT-ARITH | bc)` with
+/// var operands spawns real bc per evaluation (051_primes: ~200 spawns).
+/// Rewrite to a guarded native evaluation with the original as fallback:
+/// `if (isint31(v) && ...) { X=$((ARITH)); } else { X=$(echo..|bc); }`.
+/// Guards make native exact: operands integer-shaped with |v| ≤ 2^31
+/// (atoll-safe; bounded +-* can't overflow i64; INT64_MIN excluded so /
+/// and % with literal-nonzero divisors are exact — C truncation matches
+/// bc scale-0, verified against GNU bc). sqrt(var) adds a >= 0 guard.
+/// Refused shapes (scale, decimals, ^, dynamic divisors, nested sqrt,
+/// parens, garbage, single vars) keep the spawn — fidelity by
+/// construction. Static programs (no vars) fold via bc_eval.
+fn fold_bc_arith_capture(stmts: &mut Vec<IrStmt>) {
+    let mut out = Vec::with_capacity(stmts.len());
+    for mut s in stmts.drain(..) {
+        fold_bc_arith_stmt(&mut s);
+        if let Some(repl) = fold_bc_arith_once(&s) {
+            out.push(repl);
+        } else {
+            out.push(s);
+        }
+    }
+    *stmts = out;
+}
+
+/// Recurse into nested statement lists (mirrors fold_range_stmt).
+fn fold_bc_arith_stmt(s: &mut IrStmt) {
+    match s {
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => fold_bc_arith_capture(b),
+        IrStmt::If { then, elsifs, else_, .. } => {
+            fold_bc_arith_capture(then);
+            for (_, b) in elsifs {
+                fold_bc_arith_capture(b);
+            }
+            fold_bc_arith_capture(else_);
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+            fold_bc_arith_capture(body);
+        }
+        IrStmt::ForInit { init, step, body, .. } => {
+            fold_bc_arith_capture(init);
+            fold_bc_arith_capture(step);
+            fold_bc_arith_capture(body);
+        }
+        IrStmt::Function { body, .. } => fold_bc_arith_capture(body),
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses {
+                fold_bc_arith_capture(&mut c.body);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            fold_bc_arith_capture(body);
+            for e in excepts {
+                fold_bc_arith_capture(&mut e.body);
+            }
+            fold_bc_arith_capture(else_body);
+            fold_bc_arith_capture(finally_body);
+        }
+        _ => {}
+    }
+}
+
+/// A bc integer operand: variable, in-bound literal, or negation.
+#[derive(Clone)]
+enum BcOperand {
+    Var(String, IrExpr),
+    Num(i64),
+    Neg(Box<BcOperand>),
+}
+
+/// Native shape: flat binary or top-level sqrt(var). Single vars keep
+/// the spawn (canonicalization needs the value); static programs fold
+/// via bc_eval, not here.
+enum BcNative {
+    Bin { op: char, lhs: BcOperand, rhs: BcOperand },
+    Sqrt { name: String, expr: IrExpr },
+}
+
+#[derive(Clone, PartialEq)]
+enum BcTok {
+    Num(String),
+    Var,
+    Op(char),
+    Sqrt,
+    LP,
+    RP,
+}
+
+/// Lex literal text; false = not bc-int (spawn fallback). Whitespace
+/// skipped. Single `-` is fine (unary); `--`/`+`/`.`/`;`/letters
+/// (except `sqrt(`) refuse — matching GNU bc's rejections.
+fn bc_lex_text(s: &str, toks: &mut Vec<BcTok>) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_digit() {
+            let mut j = i;
+            while j < b.len() && (b[j] as char).is_ascii_digit() {
+                j += 1;
+            }
+            toks.push(BcTok::Num(s[i..j].to_string()));
+            i = j;
+        } else if "+-*/%()".contains(c) {
+            toks.push(match c {
+                '(' => BcTok::LP,
+                ')' => BcTok::RP,
+                _ => BcTok::Op(c),
+            });
+            i += 1;
+        } else if c == 's' && s[i..].starts_with("sqrt") {
+            toks.push(BcTok::Sqrt);
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lex one echo word; var holes appended to vars in order.
+fn bc_lex_word(w: &IrExpr, toks: &mut Vec<BcTok>, vars: &mut Vec<(String, IrExpr)>) -> bool {
+    match w {
+        IrExpr::Str(s, _) => bc_lex_text(s, toks),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => {
+                        if !bc_lex_text(s, toks) {
+                            return false;
+                        }
+                    }
+                    InterpPart::Expr(e) => match e.as_ref() {
+                        IrExpr::Call { func, args } if func == "getVar" => {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                toks.push(BcTok::Var);
+                                vars.push((n.clone(), (**e).clone()));
+                            } else {
+                                return false;
+                            }
+                        }
+                        IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                            toks.push(BcTok::Var);
+                            vars.push((n.clone(), (**e).clone()));
+                        }
+                        _ => return false,
+                    },
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+const BC_BOUND: i128 = 2147483648; // 2^31
+
+/// Parse one operand: optional single `-`, then Num (in-bound) or Var.
+fn bc_parse_operand(
+    toks: &[BcTok],
+    pos: &mut usize,
+    vars: &[(String, IrExpr)],
+    vpos: &mut usize,
+) -> Option<BcOperand> {
+    let neg = if *pos < toks.len() && toks[*pos] == BcTok::Op('-') {
+        *pos += 1;
+        true
+    } else {
+        false
+    };
+    if *pos >= toks.len() {
+        return None;
+    }
+    let base = match &toks[*pos] {
+        BcTok::Num(ds) => {
+            let v: i128 = ds.parse().ok()?;
+            if v.abs() > BC_BOUND {
+                return None;
+            }
+            *pos += 1;
+            BcOperand::Num(v as i64)
+        }
+        BcTok::Var => {
+            if *vpos >= vars.len() {
+                return None;
+            }
+            let (n, e) = vars[*vpos].clone();
+            *vpos += 1;
+            *pos += 1;
+            BcOperand::Var(n, e)
+        }
+        _ => return None,
+    };
+    if neg {
+        match base {
+            BcOperand::Num(n) => Some(BcOperand::Num(n.checked_neg()?)),
+            v => Some(BcOperand::Neg(Box::new(v))),
+        }
+    } else {
+        Some(base)
+    }
+}
+
+/// Grammar: top-level sqrt(var) | flat binary | (single refused — spawn).
+/// No parens, no nesting, no ^. Divisor must be a nonzero literal
+/// (dynamic would SIGFPE; MIN/-1 impossible via the bound).
+fn bc_parse_shape(toks: &[BcTok], vars: &[(String, IrExpr)]) -> Option<BcNative> {
+    let mut pos = 0;
+    let mut vpos = 0;
+    if toks.first() == Some(&BcTok::Sqrt) {
+        pos = 1;
+        if pos < toks.len() && toks[pos] == BcTok::LP {
+            pos += 1;
+            let arg = bc_parse_operand(toks, &mut pos, vars, &mut vpos)?;
+            if pos < toks.len() && toks[pos] == BcTok::RP && pos + 1 == toks.len() {
+                return match arg {
+                    BcOperand::Var(n, e) => Some(BcNative::Sqrt { name: n, expr: e }),
+                    _ => None,
+                };
+            }
+        }
+        return None;
+    }
+    let lhs = bc_parse_operand(toks, &mut pos, vars, &mut vpos)?;
+    if pos >= toks.len() {
+        return None;
+    }
+    let op = match toks[pos] {
+        BcTok::Op(c @ ('+' | '-' | '*' | '/' | '%')) => {
+            pos += 1;
+            c
+        }
+        _ => return None,
+    };
+    let rhs = bc_parse_operand(toks, &mut pos, vars, &mut vpos)?;
+    if pos != toks.len() {
+        return None;
+    }
+    if (op == '/' || op == '%') && !matches!(rhs, BcOperand::Num(n) if n != 0) {
+        return None;
+    }
+    // at least one var (all-static folds via bc_eval, not here).
+    if vpos == 0 {
+        return None;
+    }
+    Some(BcNative::Bin { op, lhs, rhs })
+}
+/// Collect distinct (name, expr) guard vars in order.
+fn bc_collect_vars(op: &BcOperand, out: &mut Vec<(String, IrExpr)>) {
+    match op {
+        BcOperand::Var(n, e) => {
+            if !out.iter().any(|(m, _)| m == n) {
+                out.push((n.clone(), e.clone()));
+            }
+        }
+        BcOperand::Neg(x) => bc_collect_vars(x, out),
+        BcOperand::Num(_) => {}
+    }
+}
+
+/// Try lowering one bc-capture echo-words list to (native value expr,
+/// guard vars, sqrt>=0 var). Static (no vars) folds via bc_eval.
+fn bc_lower_words(words: &[IrExpr]) -> Option<(IrExpr, Vec<(String, IrExpr)>, Option<String>)> {
+    let mut toks = Vec::new();
+    let mut vars: Vec<(String, IrExpr)> = Vec::new();
+    for w in words {
+        if !bc_lex_word(w, &mut toks, &mut vars) {
+            return None;
+        }
+    }
+    // (no word-boundary separators needed: adjacency already rejects
+    // `1 2`, and `- 5`-style gaps agree via spawn fallback.)
+    if vars.is_empty() {
+        let text = bc_static_text(words)?;
+        let out = crate::bc::eval(&text).ok()?;
+        let lit = out.trim_end_matches('\n').to_string();
+        return Some((
+            IrExpr::Str(lit, crate::ir::StrStyle::DoubleQuoted),
+            vec![],
+            None,
+        ));
+    }
+    let shape = bc_parse_shape(&toks, &vars)?;
+    match shape {
+        BcNative::Bin { op, lhs, rhs } => {
+            let mut seen: Vec<(String, IrExpr)> = Vec::new();
+            bc_collect_vars(&lhs, &mut seen);
+            bc_collect_vars(&rhs, &mut seen);
+            let ast = ArithAst::Bin {
+                op: op.to_string(),
+                lhs: Box::new(bc_operand_arith(&lhs)),
+                rhs: Box::new(bc_operand_arith(&rhs)),
+            };
+            Some((IrExpr::Arith(Box::new(ast)), seen, None))
+        }
+        BcNative::Sqrt { name, expr } => {
+            if !bc_is_ident(&name) {
+                return None;
+            }
+            let isqrt = IrExpr::Call {
+                func: "isqrt".to_string(),
+                args: vec![IrExpr::Arith(Box::new(ArithAst::Var(name.clone())))],
+            };
+            Some((isqrt, vec![(name.clone(), expr)], Some(name)))
+        }
+    }
+}
+
+/// Build `if (guard) { native } else { orig }`. Static (no guard vars)
+/// returns the plain native assign (no If).
+fn bc_guarded_if(
+    guard_vars: &[(String, IrExpr)],
+    sqrt_ge: Option<String>,
+    native: IrStmt,
+    orig: IrStmt,
+) -> Option<IrStmt> {
+    if guard_vars.is_empty() {
+        return Some(native);
+    }
+    let mut guard = bc_guard(guard_vars)?;
+    if let Some(n) = sqrt_ge {
+        let ge = IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str(
+                    format!("{n} >= 0"),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )]),
+            ],
+        };
+        guard = IrExpr::BinOp {
+            lhs: Box::new(guard),
+            op: crate::ir::BinOpKind::And,
+            rhs: Box::new(ge),
+        };
+    }
+    Some(IrStmt::If {
+        cond: guard,
+        then: vec![native],
+        elsifs: vec![],
+        else_: vec![orig],
+    })
+}
+
+/// Rewrite one statement: Assign-target or local-builtin bc capture.
+fn fold_bc_arith_once(s: &IrStmt) -> Option<IrStmt> {
+    // Assign(t, capture-pipeline).
+    if let IrStmt::Assign { targets, expr, .. } = s {
+        if targets.len() == 1 && targets[0].indices.is_empty() {
+            if let IrExpr::Capture { .. } = expr {
+                if let Some(pipe) = bc_capture_pipeline(expr) {
+                    if let Some(stages) = bc_pipeline_stages(&pipe) {
+                        if let Some(words) = bc_echo_words(&stages) {
+                            if let Some((value, vars, sqrt_ge)) = bc_lower_words(&words) {
+                                let native = IrStmt::Assign {
+                                    targets: vec![targets[0].clone()],
+                                    expr: value,
+                                    asm: None,
+                                };
+                                if vars.is_empty() {
+                                    return Some(native);
+                                }
+                                return bc_guarded_if(&vars, sqrt_ge, native, (*s).clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    // `local x=$(...|bc)` builtin (also declare/typeset).
+    if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+        if !matches!(func.as_str(), "exec" | "builtin") {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(elems)] = args.as_slice() else {
+            return None;
+        };
+        if !matches!(cmd.as_str(), "local" | "declare" | "typeset") {
+            return None;
+        }
+        if elems.len() != 2 {
+            return None;
+        }
+        let IrExpr::Str(nv, _) = &elems[0] else {
+            return None;
+        };
+        let Some(tname) = nv.strip_suffix('=') else {
+            return None;
+        };
+        if tname.is_empty() || !bc_is_ident(tname) {
+            return None;
+        }
+        if let Some(pipe) = bc_capture_pipeline(&elems[1]) {
+            if let Some(stages) = bc_pipeline_stages(&pipe) {
+                if let Some(words) = bc_echo_words(&stages) {
+                    if let Some((value, vars, sqrt_ge)) = bc_lower_words(&words) {
+                        let mut new_elems = elems.clone();
+                        new_elems[1] = value;
+                        let native = IrStmt::Expr(IrExpr::Call {
+                            func: func.clone(),
+                            args: vec![
+                                IrExpr::Str(cmd.clone(), crate::ir::StrStyle::DoubleQuoted),
+                                IrExpr::Array(new_elems),
+                            ],
+                        });
+                        if vars.is_empty() {
+                            return Some(native);
+                        }
+                        return bc_guarded_if(&vars, sqrt_ge, native, (*s).clone());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The pair fold: `Assign { targets: [v], expr: Arith(a1) }` followed by
