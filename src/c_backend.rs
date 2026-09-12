@@ -5253,10 +5253,16 @@ impl Render {
                 continue;
             }
             let mut cur = line.clone();
+            // Cursor-based scan (item 32): a non-foldable match must
+            // only skip PAST itself — `break` here used to abandon
+            // the whole line, so `atoll("3")` survived whenever an
+            // unfoldable `atoll(` preceded it on the same line.
+            let mut pos = 0;
             loop {
-                let Some(op) = cur.find("atoll(") else {
+                let Some(rel) = cur[pos..].find("atoll(") else {
                     break;
                 };
+                let op = pos + rel;
                 let inner_start = op + 6;
                 let b = cur.as_bytes();
                 let mut depth = 1usize;
@@ -5300,10 +5306,18 @@ impl Render {
                 } else {
                     unfolded.parse::<i64>().ok().map(|n| n.to_string())
                 };
-                let Some(rep) = folded else {
-                    break;
-                };
-                cur = format!("{}{rep}{}", &cur[..op], &cur[close + 1..]);
+                match folded {
+                    Some(rep) => {
+                        cur = format!("{}{rep}{}", &cur[..op], &cur[close + 1..]);
+                        // rep is digits only — resume right after it.
+                        pos = op + rep.len();
+                    }
+                    // Unfoldable (variable, call, junk): skip past this
+                    // match's close paren and keep scanning the line.
+                    None => {
+                        pos = close + 1;
+                    }
+                }
             }
             *line = cur;
         }
@@ -30646,6 +30660,24 @@ mod tests {
         assert_eq!(seq_of_ints(&v(&["1", "x"])), None);
         assert_eq!(seq_of_ints(&v(&["5", "5"])), None);
         assert_eq!(seq_of_ints(&Vec::new()), None);
+    }
+
+    #[test]
+    fn bashc_opt_item32_atoll_fold_skips_past_unfoldable() {
+        // BASHC_OPT item 32: a non-foldable atoll( earlier on the
+        // line must not shield a later foldable one (the old `break`
+        // kept `atoll("3")` in `058`). Unbalanced tails stay
+        // fail-closed (line untouched).
+        let mut r = Render::default();
+        r.out = vec![
+            "    if ((atoll(x) > atoll(\"3\"))) {".to_string(),
+            "    y = atoll(\"\");".to_string(),
+            "    z = atoll(foo(bar); ".to_string(),
+        ];
+        r.fold_atoll_consts();
+        assert_eq!(r.out[0], "    if ((atoll(x) > 3)) {");
+        assert_eq!(r.out[1], "    y = 0;");
+        assert_eq!(r.out[2], "    z = atoll(foo(bar); ");
     }
 
     #[test]
