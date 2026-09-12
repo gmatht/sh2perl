@@ -18177,8 +18177,55 @@ fn param_copy_alias(
                     format!(
                         "(({rest} < _sh_argc && _sh_argv[{rest}]) ? _sh_argv[{rest}] : \"\")"
                     )
-                } else {
+                } else if rest.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '_'
+                }) {
+                    // simple `$name` key (fast path).
                     self.store_read(rest)
+                } else {
+                    // COMPOSITE key (`$i,$j`, `pre-$k`): interpolate
+                    // the `$name` refs and literal text (BASHC_FIX 058:
+                    // `matrix[$i,$j]` read empty via getenv("i,$j")).
+                    let mut parts: Vec<crate::ir::InterpPart> = Vec::new();
+                    let mut lit = String::new();
+                    let mut cs = key.chars().peekable();
+                    while let Some(c) = cs.next() {
+                        if c == '$' {
+                            let mut nm = String::new();
+                            while let Some(&d) = cs.peek() {
+                                if d.is_ascii_alphanumeric() || d == '_' {
+                                    nm.push(d);
+                                    cs.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !nm.is_empty() {
+                                if !lit.is_empty() {
+                                    parts.push(crate::ir::InterpPart::Lit(
+                                        std::mem::take(&mut lit),
+                                    ));
+                                }
+                                parts.push(crate::ir::InterpPart::Expr(
+                                    Box::new(crate::ir::IrExpr::Call {
+                                        func: "getVar".to_string(),
+                                        args: vec![crate::ir::IrExpr::Str(
+                                            nm,
+                                            crate::ir::StrStyle::DoubleQuoted,
+                                        )],
+                                    }),
+                                ));
+                            } else {
+                                lit.push('$');
+                            }
+                        } else {
+                            lit.push(c);
+                        }
+                    }
+                    if !lit.is_empty() {
+                        parts.push(crate::ir::InterpPart::Lit(lit));
+                    }
+                    self.value_c(&crate::ir::IrExpr::Interpolate(parts))
                 }
             } else {
                 Self::cstr(key)
@@ -21201,6 +21248,12 @@ fn param_copy_alias(
                 self.emit("}");
             }
             IrStmt::Case { discriminant, clauses } => {
+                // NOTE (BASHC_FIX parse-redirect-in-case-pattern):
+                // DYNAMIC patterns (`$(...)` calling a script function)
+                // compare against literal text (never match). Siting out
+                // fails too (child bash lacks script functions). Proper
+                // fix needs expr-patterns (frontend/core) or in-process
+                // pattern eval. Left red.
                 // P1 follow-up: branches may reassign — drop proofs
                 // (precision follow-up: intersect like If).
                 self.nonnull_var.clear();
