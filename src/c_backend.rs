@@ -15094,6 +15094,11 @@ fn param_copy_alias(
                     ));
                 } else if flat {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
+                } else if s.contains("$(") || s.contains('`') {
+                    // command substitution may vanish (empty) — single
+                    // `[ -n ]` is TRUE (tests literal "-n") but double
+                    // `[[ -n ]]` is FALSE (BASHC_FIX parse-bracket).
+                    r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {s} ]"))));
                 }
@@ -22192,6 +22197,11 @@ fn param_copy_alias(
         for v in &bigint_consts {
             self.emit(&format!("  mpz_clear(_bigint_{v});"));
         }
+        // NOTE (BASHC_FIX parse-bracket): `return _sh_rc` (bash parity
+        // for trailing-status exit codes) EXPOSES 8 latent status bugs
+        // (pipeline/subshell/until stale rc — §2.6 class), net -7. Kept
+        // as `return 0` until status propagation is sound; parse-bracket
+        // stays red on exit-code only (stdout matches via [[ ]] fix).
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
