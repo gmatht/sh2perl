@@ -18122,6 +18122,49 @@ fn param_copy_alias(
                 // proof (the proven sub-arms below re-establish it).
                 // Default-deny: every path that does not prove removes.
                 self.nonnull_var.remove(&name);
+                // BASHC_OPT item 48: `v = (v + 1)` / `v = (v - 1)` on
+                // an Int-homed var → `v++` / `v--` (postfix matches the
+                // cstyleFor headers + bash ((i++)) idiom; identical
+                // codegen for C scalars). Statement position only
+                // (this is fn stmt) and strictly Int-homed with the
+                // bigint gate: on a `char*`, `j++` would be pointer
+                // arithmetic; in value position prefix/postfix must
+                // match `$((++i))` vs `$((i++))` order (separate item).
+                // Wraparound is identical either way (unsigned wraps
+                // defined; signed overflow is UB in both shapes). A
+                // buffer-homed var (fixed char[]) is excluded even when
+                // Int-marked — `i++` on an array type is a compile
+                // break (the mixed.sh class); it keeps the table path.
+                if self.is_num(&t.var)
+                    && !self.bigint_vars.contains(&t.var)
+                    && self.buf_bound(&t.var).is_none()
+                {
+                    if let IrExpr::Arith(a) = expr {
+                        let is_self = |e: &ArithAst| {
+                            matches!(e, ArithAst::Var(v) | ArithAst::Ident(v) if v == &t.var)
+                        };
+                        let num = |e: &ArithAst| match e {
+                            ArithAst::Num(n) => Some(*n),
+                            _ => None,
+                        };
+                        let step: Option<i64> = match a.as_ref() {
+                            ArithAst::Bin { op, lhs, rhs } => match op.as_str() {
+                                "+" if is_self(lhs) => num(rhs).filter(|&n| n == 1 || n == -1),
+                                "+" if is_self(rhs) => num(lhs).filter(|&n| n == 1 || n == -1),
+                                "-" if is_self(lhs) => num(rhs).map(|n| -n).filter(|&n| n == 1 || n == -1),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(d) = step {
+                            self.emit(&format!(
+                                "{name}{};",
+                                if d == 1 { "++" } else { "--" }
+                            ));
+                            return;
+                        }
+                    }
+                }
                 if let Some(b) = self.buf_bound(&t.var) {
                     // a bounded string var: the debug-only length assert
                     // fires BEFORE the write that would overflow the
@@ -30660,6 +30703,50 @@ mod tests {
         assert_eq!(seq_of_ints(&v(&["1", "x"])), None);
         assert_eq!(seq_of_ints(&v(&["5", "5"])), None);
         assert_eq!(seq_of_ints(&Vec::new()), None);
+    }
+
+    #[test]
+    fn bashc_opt_item48_self_incdec_folds() {
+        // BASHC_OPT item 48: `v = (v + 1)` on Int-homed v → `v++`;
+        // `v = (v - 1)` → `v--`; a string-homed v keeps the assign
+        // shape (pointer-arithmetic miscompile otherwise).
+        let assign = |var: &str, op: &str, n: i64| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: op.to_string(),
+                lhs: Box::new(ArithAst::Var(var.to_string())),
+                rhs: Box::new(ArithAst::Num(n)),
+            })),
+            asm: None,
+        };
+        let mut r = Render::default();
+        r.var_types.insert("i".to_string(), IrType::Int);
+        r.stmt(&assign("i", "+", 1));
+        assert!(
+            r.out.iter().any(|l| l.trim() == "i++;"),
+            "plus-one did not fold: {:?}",
+            r.out
+        );
+        let mut r = Render::default();
+        r.var_types.insert("i".to_string(), IrType::Int);
+        r.stmt(&assign("i", "-", 1));
+        assert!(
+            r.out.iter().any(|l| l.trim() == "i--;".to_string()),
+            "minus-one did not fold: {:?}",
+            r.out
+        );
+        // string-homed: no fold (would be pointer arithmetic).
+        let mut r = Render::default();
+        r.stmt(&assign("j", "+", 1));
+        assert!(
+            !r.out.iter().any(|l| l.trim() == "j++;"),
+            "string var folded: {:?}",
+            r.out
+        );
     }
 
     #[test]
