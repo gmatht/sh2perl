@@ -551,6 +551,9 @@ pub struct Render {
     nocasematch: bool,
     /// rendering inside a shell function body (Return emits `return;`)
     in_function: bool,
+    /// C-loop nesting depth (BASHC_FIX parse-eval): orphan `break`/
+    /// `continue` (e.g. `select` without a loop) emit as no-op + rc 1.
+    loop_depth: u32,
     /// the name of the function currently being rendered (so an
     /// in-process dispatch to the SAME name is recognized as
     /// self-recursion — its file-scope globals must be saved/restored
@@ -11411,6 +11414,58 @@ fn param_copy_alias(
                 self.sh_raw(buf, ";");
             }
             first_stmt = false;
+            // `type KNOWNFN` in site text: child lacks script functions.
+            // Rewrite to equivalent echo (BASHC_FIX parse-eval).
+            let s_rewritten;
+            let s = match s {
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if func == "exec" || func == "builtin" =>
+                {
+                    if Self::str_arg(args, 0).as_deref() == Some("type") {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if items.len() == 1 {
+                                if let Some(nm) =
+                                    Self::str_arg(&[items[0].clone()], 0)
+                                {
+                                    if self.functions.contains(&nm) {
+                                        s_rewritten = IrStmt::Expr(
+                                            IrExpr::Call {
+                                                func: func.clone(),
+                                                args: vec![
+                                                    IrExpr::Str(
+                                                        "echo".to_string(),
+                                                        crate::ir::StrStyle::DoubleQuoted,
+                                                    ),
+                                                    IrExpr::Array(vec![
+                                                        IrExpr::Str(
+                                                            format!(
+                                                                "{nm} is a function"
+                                                            ),
+                                                            crate::ir::StrStyle::DoubleQuoted,
+                                                        ),
+                                                    ]),
+                                                ],
+                                            },
+                                        );
+                                        &s_rewritten
+                                    } else {
+                                        s
+                                    }
+                                } else {
+                                    s
+                                }
+                            } else {
+                                s
+                            }
+                        } else {
+                            s
+                        }
+                    } else {
+                        s
+                    }
+                }
+                _ => s,
+            };
             match s {
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
                     // a command reading a C-side array (`${LIST:-}`) needs
@@ -12951,6 +13006,26 @@ fn param_copy_alias(
                         return format!("({p}, _sh_rc = 0)");
                     }
                     return format!("({p}, _sh_rc = 0, 1)");
+                }
+                self.shell_exec(args)
+            }
+            "type" => {
+                // native `type NAME` for user functions (BASHC_FIX
+                // parse-eval): `NAME is a function` (rc 0). Others fall
+                // through to shell-out (child lacks script fns anyway;
+                // external `type ls` unchanged behavior).
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if items.len() == 1 {
+                        if let Some(nm) = Self::str_arg(&[items[0].clone()], 0) {
+                            if self.functions.contains(&nm) {
+                                self.need_sh = true;
+                                return format!(
+                                    "(printf(\"%s is a function\\n\", {}), _sh_rc = 0, 1)",
+                                    Self::cstr(&nm)
+                                );
+                            }
+                        }
+                    }
                 }
                 self.shell_exec(args)
             }
@@ -19322,7 +19397,50 @@ fn param_copy_alias(
         true
     }
 
+    /// Static `eval '...'` inline (BASHC_FIX parse-eval): functions were
+    /// hoisted to the preamble; run non-Function statements here.
+    /// Returns true if handled (dynamic args / parse fail fall through).
+    fn try_static_eval(&mut self, s: &IrStmt) -> bool {
+        let IrStmt::Expr(IrExpr::Call { func, args }) = s else {
+            return false;
+        };
+        if !(func == "builtin" || func == "exec") {
+            return false;
+        }
+        if !matches!(Self::str_arg(args, 0).as_deref(), Some("eval")) {
+            return false;
+        }
+        let Some(IrExpr::Array(items)) = args.get(1) else {
+            return false;
+        };
+        if items.len() != 1 {
+            return false;
+        }
+        let IrExpr::Str(text, _) = &items[0] else {
+            return false;
+        };
+        let Ok(cmds) = crate::parser::commands::Parser::new(text).parse() else {
+            return false;
+        };
+        let raw: Vec<IrStmt> = cmds
+            .iter()
+            .filter_map(crate::shir::stmt_for_command)
+            .collect();
+        for st in &raw {
+            // Function defs hoisted already (skip to avoid C redefinition).
+            if !matches!(st, IrStmt::Function { .. }) {
+                self.stmt(st);
+            }
+        }
+        // nested static evals inside render via stmt recursion (same path).
+        true
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
+        // static eval runs inline (functions hoisted to preamble).
+        if self.try_static_eval(s) {
+            return;
+        }
         // bare-`exec` fd setup runs in-process (dup2), never a child.
         if self.try_native_exec_dup(s) {
             return;
@@ -19863,11 +19981,11 @@ fn param_copy_alias(
                         }
                         if let IrExpr::Call { func, .. } = lhs.as_ref() {
                             if func == "break" {
-                                self.emit("break;");
+                                self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "break;" });
                                 return;
                             }
                             if func == "continue" {
-                                self.emit("continue;");
+                                self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "continue;" });
                                 return;
                             }
                         }
@@ -19938,11 +20056,11 @@ fn param_copy_alias(
                         return;
                     }
                     IrExpr::Call { func, args: _ } if func == "break" => {
-                        self.emit("break;");
+                        self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "break;" });
                         return;
                     }
                     IrExpr::Call { func, args: _ } if func == "continue" => {
-                        self.emit("continue;");
+                        self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "continue;" });
                         return;
                     }
                     IrExpr::Call { func, args } if func == "return" => {
@@ -19998,9 +20116,11 @@ fn param_copy_alias(
                             self.emit(&format!("while ({site}) {{"));
                             self.depth += 1;
                             self.emit("_went = 1;");
+                            self.loop_depth += 1;
                             for s in &body_stmts {
                                 self.stmt(s);
                             }
+                            self.loop_depth -= 1;
                             self.emit(&format!("{lrc} = _sh_rc;"));
                             self.depth -= 1;
                             self.emit("}");
@@ -20684,9 +20804,11 @@ fn param_copy_alias(
                         ));
                         self.depth += 1;
                         self.emit(&format!("{name} = {k};"));
+                        self.loop_depth += 1;
                         for s in body {
                             self.stmt(s);
                         }
+                        self.loop_depth -= 1;
                         self.depth -= 1;
                         self.emit("}");
                         match prev_type {
@@ -21100,9 +21222,11 @@ fn param_copy_alias(
                 if !cond_pure {
                     self.emit("_went = 1;");
                 }
+                self.loop_depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_depth -= 1;
                 if !cond_pure {
                     self.emit(&format!("{lrc2} = _sh_rc;"));
                 }
@@ -21121,9 +21245,11 @@ fn param_copy_alias(
                 let c = self.cond_site(cond);
                 self.emit("do {");
                 self.depth += 1;
+                self.loop_depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.depth -= 1;
                 if *until {
                     self.emit(&format!("}} while (!({c}));"));
@@ -21791,10 +21917,18 @@ fn param_copy_alias(
                 }
             }
             IrStmt::Continue => {
-                self.emit("continue;");
+                if self.loop_depth == 0 {
+                    self.emit("_sh_rc = 1;");
+                } else {
+                    self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "continue;" });
+                }
             }
             IrStmt::Break => {
-                self.emit("break;");
+                if self.loop_depth == 0 {
+                    self.emit("_sh_rc = 1;");
+                } else {
+                    self.emit(if self.loop_depth == 0 { "_sh_rc = 1;" } else { "break;" });
+                }
             }
             IrStmt::ForInit {
                 init,
@@ -21814,9 +21948,11 @@ fn param_copy_alias(
                 let cond_c = self.expr(cond);
                 self.emit(&format!("while ({cond_c}) {{"));
                 self.depth += 1;
+                self.loop_depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_depth -= 1;
                 for s in step {
                     self.stmt(s);
                 }
@@ -22134,6 +22270,7 @@ fn param_copy_alias(
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        collect_eval_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs, 0);
         // per-function private vars (mentioned nowhere outside the fn's
         // own direct subtree): safe for fn-local declarations. Needs the
         // collected bodies; consulted by emit_function (site/capture
@@ -25644,6 +25781,78 @@ fn collect_fn_defs(
             | IrStmt::Block(body)
             | IrStmt::Subshell(body)
             | IrStmt::Background(body) => collect_fn_defs(body, names, defs),
+            _ => {}
+        }
+    }
+}
+
+/// Static `eval '...'` function hoisting (BASHC_FIX parse-eval): parse
+/// the literal text with the core parser, collect Function defs for the
+/// preamble (so `type` + calls resolve). Non-function statements run at
+/// the eval point (rendered inline by stmt()). Depth-limited (nested
+/// static evals); dynamic args fall through to dot-source sites.
+/// Already-defined names win (no C redefinition; eval-redefinition edge
+/// documented).
+fn collect_eval_fn_defs(stmts: &[IrStmt], names: &mut BTreeSet<String>, defs: &mut Vec<(String, Vec<IrStmt>)>, depth: u32) {
+    if depth > 5 {
+        return;
+    }
+    fn eval_text_of(s: &IrStmt) -> Option<String> {
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if !(func == "builtin" || func == "exec") {
+                return None;
+            }
+            if !matches!(Render::str_arg(args, 0).as_deref(), Some("eval")) {
+                return None;
+            }
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                if items.len() == 1 {
+                    if let IrExpr::Str(t, _) = &items[0] {
+                        return Some(t.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+    for s in stmts {
+        if let Some(text) = eval_text_of(s) {
+            if let Ok(cmds) = crate::parser::commands::Parser::new(&text).parse() {
+                // RAW lowering (no DCE — ast_to_ir drops uncalled functions,
+                // but eval'd defs must survive for `type`/future calls).
+                let raw: Vec<IrStmt> = cmds
+                    .iter()
+                    .filter_map(crate::shir::stmt_for_command)
+                    .collect();
+                for st in &raw {
+                    if let IrStmt::Function { name, body, .. } = st {
+                        if !names.contains(name) {
+                            names.insert(name.clone());
+                            defs.push((name.clone(), body.clone()));
+                        }
+                    }
+                }
+                // nested static evals inside the eval'd code
+                collect_eval_fn_defs(&raw, names, defs, depth + 1);
+            }
+        }
+        // recurse into containers (eval inside if/loops/functions hoists
+        // too — over-defines for conditional eval, documented).
+        match s {
+            IrStmt::Function { body, .. } => collect_eval_fn_defs(body, names, defs, depth),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_eval_fn_defs(then, names, defs, depth);
+                for (_, b) in elsifs {
+                    collect_eval_fn_defs(b, names, defs, depth);
+                }
+                collect_eval_fn_defs(else_, names, defs, depth);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => collect_eval_fn_defs(body, names, defs, depth),
             _ => {}
         }
     }
