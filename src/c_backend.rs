@@ -554,6 +554,12 @@ pub struct Render {
     /// C-loop nesting depth (BASHC_FIX parse-eval): orphan `break`/
     /// `continue` (e.g. `select` without a loop) emit as no-op + rc 1.
     loop_depth: u32,
+    /// shell-site nesting depth (argv propagation): sites lack argc/argv.
+    in_site: u32,
+    /// a site references positionals → declare/init _sh_argv globals and
+    /// append argv to `bash -c` invocations (subshell semantics).
+    /// Cell: set from &self read paths (store_read/store_ref).
+    need_sh_argv: std::cell::Cell<bool>,
     /// nameref aliases (`typeset -n ref=target`): ref → target.
     /// Reads/writes resolve (cycle-guarded); `unset` removes.
     /// Function-scope documented gap (global map). BASHC_FIX typeset.
@@ -3783,7 +3789,7 @@ impl Render {
             // and reads the echo as the value. Trimmed with the
             // runtime when unreferenced.
             self.emit("static int _sh_noecho = 0;");
-        if !self.pos_const {
+        if !self.pos_const || self.need_sh_argv.get() {
             self.emit("static int _sh_argc = 0;");
             self.emit("static char **_sh_argv = 0;");
         }
@@ -4387,6 +4393,24 @@ impl Render {
             self.emit("    else *p++ = *c;");
             self.emit("  }");
             self.emit("  *p++ = '\\''; *p = 0;");
+            // subshell positionals (BASHC_FIX parse-dollar): `bash -c`
+            // children start with empty $@ — append ours (quoted) so
+            // sites see the caller's positionals ($0 = ours). Gated.
+            if self.need_sh_argv.get() {
+                self.emit("  if (_sh_argv) {");
+                self.emit("    for (int _wai = 0; _wai < _sh_argc; _wai++) {");
+                self.emit("      const char *_wa = _sh_argv[_wai] ? _sh_argv[_wai] : \"\";");
+                self.emit("      size_t _wl = strlen(_wa);");
+                self.emit("      _sh_grow(&_sh_wrap, &_sh_wrapcap, strlen(_sh_wrap) + _wl * 4 + 4);");
+                self.emit("      strcat(_sh_wrap, \" '\");");
+                self.emit("      for (const char *_wq = _wa; *_wq; _wq++) {");
+                self.emit("        if (*_wq == '\\'') strcat(_sh_wrap, \"'\\\"'\\\"'\");");
+                self.emit("        else { size_t _we = strlen(_sh_wrap); _sh_wrap[_we] = *_wq; _sh_wrap[_we+1] = 0; }");
+                self.emit("      }");
+                self.emit("      strcat(_sh_wrap, \"'\");");
+                self.emit("    }");
+                self.emit("  }");
+            }
             self.emit("}");
             self.emit("static int _sh_system_rc(void) {");
             self.emit("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");");
@@ -9265,7 +9289,10 @@ fn param_copy_alias(
             }
             return format!("(atoll((({p}) ? ({p}) : \"\")))");
         }
-        if self.pos_const && !self.in_function {
+        if self.in_site > 0 {
+            self.need_sh_argv.set(true);
+        }
+        if self.pos_const && !self.in_function && self.in_site == 0 {
             self.const_digits.set(true);
             return format!("(atoll((( {n} < argc && argv[{n}]) ? argv[{n}] : \"\")))");
         }
@@ -9279,7 +9306,10 @@ fn param_copy_alias(
         if let Some(p) = self.lifted_param(n) {
             return format!("(({p}) ? ({p}) : \"\")");
         }
-        if self.pos_const && !self.in_function {
+        if self.in_site > 0 {
+            self.need_sh_argv.set(true);
+        }
+        if self.pos_const && !self.in_function && self.in_site == 0 {
             self.const_digits.set(true);
             return format!("(({n} < argc && argv[{n}]) ? argv[{n}] : \"\")");
         }
@@ -10388,6 +10418,7 @@ fn param_copy_alias(
 
     fn shell_site(&mut self, body: impl FnOnce(&mut Render), invert: bool) -> String {
         self.need_sh = true;
+        self.in_site += 1;
         self.site_exported.clear();
         let id = self.site_seq;
         self.site_seq += 1;
@@ -10395,6 +10426,7 @@ fn param_copy_alias(
         let saved_depth = self.depth;
         self.depth = 0;
         body(self);
+        self.in_site -= 1;
         let body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         // bash truthiness: rc == 0 is TRUE — the site's C value must be
@@ -10823,6 +10855,28 @@ fn param_copy_alias(
                     }
                 }
                 _ => {
+                    // arith quirk-shape: RAW `$((...))` so child arbitrates
+                    // (argv propagated; empty→skip, set→value).
+                    if Self::has_arith_quirk(e) {
+                        // quirk-shape sites need positionals (argv).
+                        self.need_sh_argv.set(true);
+                        if let IrExpr::Call { args, .. } = e {
+                            if let Some(s) = Self::str_arg(args, 0) {
+                                let raw = format!("$(({}))", s);
+                                match buf {
+                                    CmdBuf::Shared => self.emit(&format!(
+                                        "_sh_addraw({});",
+                                        Self::cstr(&format!(" {raw}"))
+                                    )),
+                                    CmdBuf::Private(id) => self.emit(&format!(
+                                        "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                        Self::cstr(&format!(" {raw}"))
+                                    )),
+                                }
+                                return;
+                            }
+                        }
+                    }
                     // malformed-! param: emit RAW text (unquoted) so the
                     // child expands it and rejects (skips command, no
                     // output — BASHC_FIX 063_04). Quoted evaluation would
@@ -14023,15 +14077,62 @@ fn param_copy_alias(
         false
     }
 
+    /// `$N` before `*`/`/`/`%` with empty expansion → syntax error →
+    /// skip command (uniform empty-expansion, BASHC_FIX parse-dollar).
+    /// Shell out (child arbitrates; argv propagated to sites).
+    fn has_arith_quirk(e: &IrExpr) -> bool {
+        fn text_has_quirk(t: &str) -> bool {
+            let b = t.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'$' {
+                    let mut j = i + 1;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > i + 1 {
+                        let mut k = j;
+                        while k < b.len() && b[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k < b.len()
+                            && (b[k] == b'*' || b[k] == b'/' || b[k] == b'%')
+                        {
+                            return true;
+                        }
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            false
+        }
+        match e {
+            IrExpr::Call { func, args } if func == "arith" => {
+                matches!(Self::str_arg(args, 0).as_deref(), Some(s) if text_has_quirk(s))
+            }
+            _ => false,
+        }
+    }
+
     fn echo_native_ok(&self, w: &IrExpr) -> bool {
         // malformed-! forces shell-out (child rejects correctly).
         if Self::is_malformed_bang(w) {
+            return false;
+        }
+        if Self::has_arith_quirk(w) {
+            self.need_sh_argv.set(true);
             return false;
         }
         if let IrExpr::Interpolate(parts) = w {
             for p in parts {
                 if let crate::ir::InterpPart::Expr(x) = p {
                     if Self::is_malformed_bang(x) {
+                        return false;
+                    }
+                    if Self::has_arith_quirk(x) {
+                        self.need_sh_argv.set(true);
                         return false;
                     }
                 }
@@ -23110,17 +23211,41 @@ fn param_copy_alias(
         // a dropped def would not compile, so the halves stay in step).
         // Positional-const programs go further: the reads ARE the main()
         // parameters — no init, no globals.
+        // sites need positionals via globals (need_sh_argv): force
+        // argc/argv params + init even when top-level reads wouldn't.
+        let need_av = self.need_sh_argv.get();
         if self.pos_const {
             if self.const_digits.get() {
                 self.emit("int main(int argc, char **argv) {");
+                if need_av {
+                    self.emit("  _sh_argc = argc; _sh_argv = argv;");
+                }
             } else if self.const_hash.get() {
-                self.emit("int main(int argc) {");
+                if need_av {
+                    if argc_shadowed {
+                        self.emit("int main(int _mac, char **_mav) {");
+                        self.emit("  _sh_argc = _mac; _sh_argv = _mav;");
+                    } else {
+                        self.emit("int main(int argc, char **argv) {");
+                        self.emit("  _sh_argc = argc; _sh_argv = argv;");
+                    }
+                } else {
+                    self.emit("int main(int argc) {");
+                }
+            } else if need_av {
+                if argc_shadowed {
+                    self.emit("int main(int _mac, char **_mav) {");
+                    self.emit("  _sh_argc = _mac; _sh_argv = _mav;");
+                } else {
+                    self.emit("int main(int argc, char **argv) {");
+                    self.emit("  _sh_argc = argc; _sh_argv = argv;");
+                }
             } else {
                 self.emit("int main(void) {");
             }
-        } else if self.argc_reads == 0 && self.argvptr_reads == 0 {
+        } else if self.argc_reads == 0 && self.argvptr_reads == 0 && !need_av {
             self.emit("int main(void) {");
-        } else if self.argvptr_reads == 0 {
+        } else if self.argvptr_reads == 0 && !need_av {
             // $# only — C allows main(int argc) without argv
             if argc_shadowed {
                 self.emit("int main(int _mac) {");
