@@ -1110,7 +1110,27 @@ fn walk_int_array_stmt(
 ) {
     match s {
         IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt, big),
-        IrStmt::Assign { expr, .. } => walk_int_array_expr(expr, all, consumed, non_int, str_read, vt, big),
+        IrStmt::Assign { targets, expr, .. } => {
+            // direct index-assigns `a[k]=v` register the array (the
+            // bulk-oriented arms below never see them): int values
+            // consume-int, anything else poisons — same rule as
+            // setArray items. Reads of the index/key stay invisible
+            // (arith-context reads never stringify).
+            for t in targets {
+                if !t.indices.is_empty() || t.var.contains('[') {
+                    let base = t.var.split('[').next().unwrap_or(&t.var);
+                    if !base.is_empty() {
+                        all.insert(base.to_string());
+                        if is_int_expr(expr, vt, big) {
+                            consumed.insert(base.to_string());
+                        } else {
+                            non_int.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            walk_int_array_expr(expr, all, consumed, non_int, str_read, vt, big);
+        }
         IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt, big),
         IrStmt::If { cond, then, elsifs, else_ } => {
             walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
@@ -1126,6 +1146,15 @@ fn walk_int_array_stmt(
             for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::For { body, .. } => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            // C-style loops were invisible to homing (no arm): counted
+            // fills like `for ((i=0;i<n;i++)) a[$i]=...` stayed char*
+            // with a strdup per store. Walk every part.
+            for st in init { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in step { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
             for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::Function { body, .. } => {
@@ -2488,7 +2517,7 @@ fn literal_write_index(t: &crate::ir::AssignTarget) -> Option<u64> {
 fn array_fixed_caps(
     prog: &IrProgram,
     exclude: &HashSet<String>,
-) -> HashMap<String, usize> {
+) -> (HashMap<String, usize>, HashSet<String>) {
     #[derive(Default)]
     struct Info {
         max_reset: u64,
@@ -2542,6 +2571,27 @@ fn array_fixed_caps(
             _ => None,
         }
     }
+    // A counted-loop counter bound: literal max VALUE (exact) or a
+    // dynamic bound var read at runtime (demand-grow handles it).
+    #[derive(Clone)]
+    enum CounterBound {
+        Max(u64),
+        Dyn { boundvar: String, op: String },
+    }
+
+    // Per-array counter classification: literal max+1 (static-exact),
+    // dynamic bounds seen (vec-route candidates), dirty (an index write
+    // no classifier understood — keeps poison semantics), dense0 (every
+    // classified write covers [0, max] contiguously — the vec
+    // zero-parity requirement, since heap slots lack static zero-init).
+    #[derive(Default)]
+    struct CounterCell {
+        max: u64,
+        dirty: bool,
+        dyn_bounds: Vec<(String, String)>,
+        dense0: bool,
+    }
+
     // max VALUE of a counted-For counter (not trips: indices equal
     // values). Range is inclusive (like seq); int-literal arrays take
     // the max literal. Non-materializing (never expands). None =
@@ -2584,13 +2634,54 @@ fn array_fixed_caps(
         }
     }
 
+    // Dense-from-0 for a For iter: Range starting at 0, or int-literal
+    // arrays whose sorted values are exactly 0..=max (every slot
+    // covered — the vec zero-parity requirement).
+    fn for_counter_dense0(iter: &IrExpr) -> bool {
+        match iter {
+            IrExpr::Range { start, end } => *start == 0 && *end >= *start,
+            IrExpr::Array(items) => {
+                let mut vals: Vec<u64> = Vec::new();
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _) => {
+                            let t = s.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            match t.parse::<i64>() {
+                                Ok(n) if n >= 0 => vals.push(n as u64),
+                                _ => return false,
+                            }
+                        }
+                        IrExpr::Int(n) if *n >= 0 => vals.push(*n as u64),
+                        _ => return false,
+                    }
+                }
+                if vals.is_empty() {
+                    return false;
+                }
+                vals.sort_unstable();
+                // exactly 0..=max with no gaps or duplicates
+                vals.iter().enumerate().all(|(i, v)| *v as usize == i)
+            }
+            _ => false,
+        }
+    }
 
-    // (counter var, need = maxidx+1) for strip_cfor-output counted
-    // loops: cond `v</<=B` text (B nonneg literal), last body stmt a
-    // positive step on v. Init-independent (increasing loops only ever
-    // touch indices < B / <= B; empty loops contribute nothing).
-    // Countdowns, dynamic bounds, exotic steps → None (miss).
-    fn while_counter_need(cond: &IrExpr, body: &[IrStmt]) -> Option<(String, u64)> {
+    // A counted loop with a provable counter: cond `v</<=B` text plus a
+    // single positive step stmt on v. Bound is a literal max VALUE or a
+    // dynamic bound var (demand-grow handles it). Shared by While (step
+    // = last body stmt) and ForInit (step = step vec). Init-independent
+    // for increasing loops (every touched index is < B / <= B whatever
+    // init was; empty loops contribute nothing).
+    struct CountedLoop {
+        var: String,
+        bound: CounterBound,
+        step: u64,
+    }
+
+    fn counted_loop_info(cond: &IrExpr, step_stmt: &IrStmt) -> Option<CountedLoop> {
         let text = match cond {
             IrExpr::Call { func, args } if func == "builtin" || func == "test" => {
                 let mut found = None;
@@ -2616,66 +2707,134 @@ fn array_fixed_caps(
         if !is_ident(var) {
             return None;
         }
-        let b: i64 = r.trim().parse().ok()?;
-        if b < 0 {
-            return None;
-        }
-        // max VALUE the counter can hold on entry to the body
-        let maxv: u64 = if op == "<" {
-            if b < 1 {
-                return None;
-            }
-            (b - 1) as u64
-        } else {
-            b as u64
-        };
-        let last = body.last()?;
-        let ok_step = match last {
-            IrStmt::Assign { targets, expr, .. } => {
-                targets.len() == 1
-                    && targets[0].var == var
-                    && targets[0].indices.is_empty()
-                    && match expr {
-                        IrExpr::Arith(a) => match a.as_ref() {
-                            crate::ir::ArithAst::IncDec { var: v, delta, .. } => {
-                                v == var && *delta > 0
-                            }
-                            crate::ir::ArithAst::Assign { var: v, op, rhs } => {
-                                v == var
-                                    && (op == "+="
-                                        && matches!(rhs.as_ref(),
-                                            crate::ir::ArithAst::Num(n) if *n > 0))
-                            }
-                            crate::ir::ArithAst::Bin { op, lhs, rhs } => {
-                                op == "+"
-                                    && matches!(lhs.as_ref(),
-                                        crate::ir::ArithAst::Var(v)
-                                        | crate::ir::ArithAst::Ident(v) if v == var)
-                                    && matches!(rhs.as_ref(),
-                                        crate::ir::ArithAst::Num(n) if *n > 0)
-                            }
-                            _ => false,
-                        },
-                        _ => false,
+        let bound = match r.trim().parse::<i64>() {
+            Ok(b) if b >= 0 => {
+                let maxv: u64 = if op == "<" {
+                    if b < 1 {
+                        return None;
                     }
+                    (b - 1) as u64
+                } else {
+                    b as u64
+                };
+                CounterBound::Max(maxv)
             }
-            _ => false,
+            _ => {
+                let w = r.trim().strip_prefix('$').unwrap_or(r.trim());
+                if !is_ident(w) {
+                    return None;
+                }
+                CounterBound::Dyn {
+                    boundvar: w.to_string(),
+                    op: op.to_string(),
+                }
+            }
         };
-        if !ok_step {
-            return None;
-        }
-        Some((var.to_string(), maxv))
+        // step: single-target assign on the counter, positive magnitude.
+        let step = match step_stmt {
+            IrStmt::Assign { targets, expr, .. } => {
+                if targets.len() != 1
+                    || targets[0].var != var
+                    || !targets[0].indices.is_empty()
+                {
+                    return None;
+                }
+                let mag = match expr {
+                    IrExpr::Arith(a) => match a.as_ref() {
+                        crate::ir::ArithAst::IncDec { var: v, delta, .. }
+                            if v == var && *delta > 0 =>
+                        {
+                            *delta as u64
+                        }
+                        crate::ir::ArithAst::Assign { var: v, op, rhs }
+                            if v == var
+                                && (op == "+="
+                                    && matches!(rhs.as_ref(),
+                                        crate::ir::ArithAst::Num(n) if *n > 0)) =>
+                        {
+                            match rhs.as_ref() {
+                                crate::ir::ArithAst::Num(n) => *n as u64,
+                                _ => return None,
+                            }
+                        }
+                        crate::ir::ArithAst::Bin { op, lhs, rhs }
+                            if op == "+"
+                                && matches!(lhs.as_ref(),
+                                    crate::ir::ArithAst::Var(v)
+                                    | crate::ir::ArithAst::Ident(v) if v == var)
+                                && matches!(rhs.as_ref(),
+                                    crate::ir::ArithAst::Num(n) if *n > 0) =>
+                        {
+                            match rhs.as_ref() {
+                                crate::ir::ArithAst::Num(n) => *n as u64,
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                mag
+            }
+            _ => return None,
+        };
+        Some(CountedLoop { var: var.to_string(), bound, step })
     }
 
+    // `v = 0`-literal stmt (dense0 init proof for While's external init):
+    // plain Int(0), Arith Num(0), or Arith `v = 0`.
+    fn zero_assign_var(s: &IrStmt) -> Option<String> {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if targets.len() != 1 || !targets[0].indices.is_empty() {
+                    return None;
+                }
+                let v = targets[0].var.split('[').next().unwrap_or(&targets[0].var);
+                let is_zero = match expr {
+                    IrExpr::Int(0) => true,
+                    IrExpr::Arith(a) => match a.as_ref() {
+                        crate::ir::ArithAst::Num(0) => true,
+                        crate::ir::ArithAst::Assign { var: av, op, rhs }
+                            if av == v && op == "=" =>
+                        {
+                            matches!(rhs.as_ref(), crate::ir::ArithAst::Num(0))
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if is_zero && !v.is_empty() {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // ForInit `v = 0`-literal init is read off the last init stmt with
+    // zero_assign_var at the use site (which also checks the var name),
+    // so no separate helper is needed.
+
     // Index var name when it is exactly a live counter (`$v`, `v`,
-    // `${v}` flattened, or single structured Var/Ident/Str). Returns
-    // (array base, need): max over ALL same-name stack entries
-    // (shadowing-safe: every live binding's range covers the reads it
-    // dominates; anything narrower is a sound over-approximation).
-    fn counter_index_name(
+    // `${v}` flattened, or single structured Var/Ident/Str). Returns the
+    // array base plus every matching stack entry's claim: literal needs
+    // (maxed) and dynamic bounds (deduped), and whether the write is
+    // dense-contributing (unconditional position + every live binding
+    // from a dense0-proven loop).
+    struct CounterMatch {
+        arr: String,
+        lit_need: Option<u64>,
+        dyn_bounds: Vec<(String, String)>,
+        dense_ok: bool,
+    }
+
+    fn counter_index_match(
         t: &crate::ir::AssignTarget,
-        stack: &[(String, u64)],
-    ) -> Option<(String, u64)> {
+        stack: &[(String, CounterBound, bool)],
+        ctx: bool,
+    ) -> Option<CounterMatch> {
         fn bare(w: &str) -> Option<&str> {
             let t = w.trim();
             let t = t.strip_prefix('$').unwrap_or(t);
@@ -2693,7 +2852,6 @@ fn array_fixed_caps(
         if base.is_empty() {
             return None;
         }
-        // Collect the index var name without borrowing issues.
         let iname: Option<String> = if t.indices.len() == 1 {
             match &t.indices[0] {
                 IrExpr::Var(v, _) | IrExpr::Ident(v) => Some(v.clone()),
@@ -2712,31 +2870,79 @@ fn array_fixed_caps(
             }
         };
         let v = iname?;
-        let mut best: Option<u64> = None;
-        for (name, maxv) in stack {
-            if name == &v {
-                best = Some(best.unwrap_or(0).max(maxv.saturating_add(1)));
+        let mut lit_need: Option<u64> = None;
+        let mut dyn_bounds: Vec<(String, String)> = Vec::new();
+        let mut dense_ok = ctx;
+        let mut matched = false;
+        for (name, bound, loop_dense) in stack {
+            if name != &v {
+                continue;
             }
+            matched = true;
+            match bound {
+                CounterBound::Max(m) => {
+                    lit_need = Some(lit_need.unwrap_or(0).max(m.saturating_add(1)));
+                }
+                CounterBound::Dyn { boundvar, op } => {
+                    let b = (boundvar.clone(), op.clone());
+                    if !dyn_bounds.contains(&b) {
+                        dyn_bounds.push(b);
+                    }
+                }
+            }
+            dense_ok = dense_ok && *loop_dense;
         }
-        best.map(|need| (base.to_string(), need))
+        if !matched {
+            return None;
+        }
+        Some(CounterMatch { arr: base.to_string(), lit_need, dyn_bounds, dense_ok })
     }
 
-    // record a counter-exact array write: max-combine (independent upper
-    // bounds never shrink each other).
-    fn counter_record(out: &mut HashMap<String, (u64, bool)>, arr: String, need: u64) {
-        let e = out.entry(arr).or_insert((0, false));
-        e.0 = e.0.max(need);
+    // record a counter-classified array write: literal needs max-combine
+    // (independent upper bounds never shrink each other), dynamic bounds
+    // union, dense0 ANDs (any non-dense coverage breaks contiguity).
+    fn counter_classify(
+        out: &mut HashMap<String, CounterCell>,
+        m: CounterMatch,
+    ) {
+        let CounterMatch { arr, lit_need, dyn_bounds, dense_ok } = m;
+        let fresh = !out.contains_key(&arr);
+        let e = out.entry(arr).or_default();
+        if let Some(n) = lit_need {
+            e.max = e.max.max(n);
+        }
+        for b in dyn_bounds {
+            if !e.dyn_bounds.contains(&b) {
+                e.dyn_bounds.push(b);
+            }
+        }
+        e.dense0 = if fresh { dense_ok } else { e.dense0 && dense_ok };
     }
 
     // an index write no classifier understands (keeps poison semantics:
-    // an override needs a fully-classified array).
-    fn counter_dirty(out: &mut HashMap<String, (u64, bool)>, arr: String) {
-        out.entry(arr).or_insert((0, false)).1 = true;
+    // static override and vec-route both need a fully-classified array).
+    fn counter_dirty(out: &mut HashMap<String, CounterCell>, arr: String) {
+        out.entry(arr).or_default().dirty = true;
+    }
+
+    // a scalar rebind of a tracked array name (Assign/Declare/loop-var/
+    // select-target/except-name): representation confusion — disqualify.
+    fn counter_rebind(out: &mut HashMap<String, CounterCell>, name: &str) {
+        if let Some(e) = out.get_mut(name) {
+            e.dirty = true;
+        }
+    }
+
+    // a literal index write: classified but never dense-proven (a single
+    // slot can't prove contiguity — the init-then-loop shape stays a
+    // documented miss for routing; static-exact still applies).
+    fn counter_literal_write(out: &mut HashMap<String, CounterCell>, arr: String) {
+        out.entry(arr).or_default().dense0 = false;
     }
 
     // drop stack counters clobbered by `names`.
-    fn counter_drop(stack: &mut Vec<(String, u64)>, names: &BTreeSet<String>) {
-        stack.retain(|(n, _)| !names.contains(n));
+    fn counter_drop(stack: &mut Vec<(String, CounterBound, bool)>, names: &BTreeSet<String>) {
+        stack.retain(|(n, _, _)| !names.contains(n));
     }
 
     // scan an expr for parent-visible writes (ArithAssign/IncDec targets;
@@ -2748,44 +2954,453 @@ fn array_fixed_caps(
         Ok(tmp)
     }
 
+    // true when the expr contains nodes whose mentions can't be seen
+    // reliably (closures with stmt bodies, method calls, raw/foreign
+    // code): impurity there dirties every tracked array, never a guess.
+    fn counter_has_opaque(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Lambda { .. }
+            | IrExpr::Arrow(_)
+            | IrExpr::MethodCall { .. }
+            | IrExpr::RawExpr(_)
+            | IrExpr::Ext(_)
+            | IrExpr::ArrayComp { .. } => true,
+            IrExpr::Array(items) => items.iter().any(counter_has_opaque),
+            IrExpr::Call { args, .. } => args.iter().any(counter_has_opaque),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                counter_has_opaque(lhs) || counter_has_opaque(rhs)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                counter_has_opaque(cond) || counter_has_opaque(then) || counter_has_opaque(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                counter_has_opaque(expr) || counter_has_opaque(default)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                crate::ir::InterpPart::Expr(x) => counter_has_opaque(x),
+                _ => false,
+            }),
+            IrExpr::Capture { expr, .. } => counter_has_opaque(expr),
+            IrExpr::Index { key, .. } => counter_has_opaque(key),
+            IrExpr::Object(items) => items.iter().any(|(_, v)| counter_has_opaque(v)),
+            IrExpr::Splice(x) => counter_has_opaque(x),
+            IrExpr::Arith(a) => counter_arith_has_opaque(a),
+            _ => false,
+        }
+    }
+
+    // ArithAst has no closures, calls, or foreign nodes (verified
+    // against ir.rs) — mentions cannot hide inside arithmetic. New
+    // ArithAst kinds need a review here (see the expr collector below).
+    fn counter_arith_has_opaque(_a: &crate::ir::ArithAst) -> bool {
+        false
+    }
+
+    // collect var-ish mentions from an expr (impure-call escape check):
+    // Var/Ident names, Index bases, Call funcs, ArrayComp binder.
+    // String TEXTS are collected separately (substring-compared — an
+    // over-approximation, safe direction).
+    fn counter_collect_mentions(
+        e: &IrExpr,
+        vars: &mut HashSet<String>,
+        texts: &mut Vec<String>,
+    ) {
+        match e {
+            IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+                vars.insert(v.clone());
+            }
+            IrExpr::Index { var, key } => {
+                vars.insert(var.clone());
+                counter_collect_mentions(key, vars, texts);
+            }
+            IrExpr::Str(s, _) => {
+                texts.push(s.clone());
+            }
+            IrExpr::Call { func, args } => {
+                vars.insert(func.clone());
+                for a in args {
+                    counter_collect_mentions(a, vars, texts);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                counter_collect_mentions(obj, vars, texts);
+                for a in args {
+                    counter_collect_mentions(a, vars, texts);
+                }
+            }
+            IrExpr::Array(items) => {
+                for x in items {
+                    counter_collect_mentions(x, vars, texts);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                counter_collect_mentions(lhs, vars, texts);
+                counter_collect_mentions(rhs, vars, texts);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                counter_collect_mentions(cond, vars, texts);
+                counter_collect_mentions(then, vars, texts);
+                counter_collect_mentions(else_, vars, texts);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                counter_collect_mentions(expr, vars, texts);
+                counter_collect_mentions(default, vars, texts);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    match p {
+                        crate::ir::InterpPart::Expr(x) => {
+                            counter_collect_mentions(x, vars, texts)
+                        }
+                        // Lit is inert literal text (no expansion can hide
+                        // a var reference in it — the parser splits those
+                        // into Expr parts).
+                        _ => {}
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => counter_collect_mentions(expr, vars, texts),
+            IrExpr::Object(items) => {
+                for (k, v) in items {
+                    texts.push(k.clone());
+                    counter_collect_mentions(v, vars, texts);
+                }
+            }
+            IrExpr::Splice(x) => counter_collect_mentions(x, vars, texts),
+            IrExpr::Arith(a) => counter_collect_arith_mentions(a, vars, texts),
+            IrExpr::ArrayComp { var, iter, elem, cond } => {
+                vars.insert(var.clone());
+                counter_collect_mentions(iter, vars, texts);
+                counter_collect_mentions(elem, vars, texts);
+                if let Some(c) = cond {
+                    counter_collect_mentions(c, vars, texts);
+                }
+            }
+            IrExpr::Lambda { params: _, body } => {
+                for s in body {
+                    counter_collect_stmt_mentions(s, vars, texts);
+                }
+            }
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    counter_collect_stmt_mentions(s, vars, texts);
+                }
+            }
+            IrExpr::Regex { .. } | IrExpr::Range { .. } | IrExpr::Json(_) => {}
+            IrExpr::RawExpr(s) => texts.push(s.clone()),
+            IrExpr::Ext(_) => {}
+            // New IrExpr kinds need a review here: the `_` arm ignores
+            // them for mentions, which is sound only for data/read-only
+            // nodes. Anything that can write shell state must dirty.
+            _ => {}
+        }
+    }
+
+    fn counter_collect_arith_mentions(
+        a: &crate::ir::ArithAst,
+        vars: &mut HashSet<String>,
+        texts: &mut Vec<String>,
+    ) {
+        match a {
+            crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => {
+                vars.insert(v.clone());
+            }
+            crate::ir::ArithAst::Index { var, key } => {
+                vars.insert(var.clone());
+                counter_collect_arith_mentions(key, vars, texts);
+            }
+            crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+                counter_collect_arith_mentions(lhs, vars, texts);
+                counter_collect_arith_mentions(rhs, vars, texts);
+            }
+            // Assign/IncDec write `var` — covered by the rebind rule in
+            // counter_note_expr (lic records the target); the value is
+            // what mentions can hide in.
+            crate::ir::ArithAst::Assign { rhs, .. } => {
+                counter_collect_arith_mentions(rhs, vars, texts);
+            }
+            crate::ir::ArithAst::Un { arg, .. } => {
+                counter_collect_arith_mentions(arg, vars, texts);
+            }
+            crate::ir::ArithAst::Cond { test, then, else_ } => {
+                counter_collect_arith_mentions(test, vars, texts);
+                counter_collect_arith_mentions(then, vars, texts);
+                counter_collect_arith_mentions(else_, vars, texts);
+            }
+            crate::ir::ArithAst::Cast { arg, .. } => {
+                counter_collect_arith_mentions(arg, vars, texts);
+            }
+            _ => {}
+        }
+    }
+
+    // mentions from stmt positions (closure bodies): assign targets +
+    // call funcs/args + loop vars. Over-approximate (safe).
+    fn counter_collect_stmt_mentions(
+        s: &IrStmt,
+        vars: &mut HashSet<String>,
+        texts: &mut Vec<String>,
+    ) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    vars.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                    for ix in &t.indices {
+                        counter_collect_mentions(ix, vars, texts);
+                    }
+                }
+                counter_collect_mentions(expr, vars, texts);
+            }
+            IrStmt::Declare { vars: ds, init, .. } => {
+                for d in ds {
+                    vars.insert(d.name.clone());
+                }
+                if let Some(e) = init {
+                    counter_collect_mentions(e, vars, texts);
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                vars.insert(var.clone());
+                for e in elements {
+                    counter_collect_mentions(e, vars, texts);
+                }
+            }
+            IrStmt::Expr(e)
+            | IrStmt::Output { value: e, .. }
+            | IrStmt::WriteFile { content: e, .. }
+            | IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::SetChildError(e) => counter_collect_mentions(e, vars, texts),
+            IrStmt::WriteFile { path, .. } => counter_collect_mentions(path, vars, texts),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                counter_collect_mentions(cond, vars, texts);
+                for x in then {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                for (c, b) in elsifs {
+                    counter_collect_mentions(c, vars, texts);
+                    for x in b {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+                for x in else_ {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                counter_collect_mentions(cond, vars, texts);
+                for x in body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                vars.insert(var.clone());
+                counter_collect_mentions(iter, vars, texts);
+                for x in body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for x in init {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                counter_collect_mentions(cond, vars, texts);
+                for x in step {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                for x in body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    counter_collect_mentions(&r.target, vars, texts);
+                }
+                for x in inner {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                counter_collect_mentions(discriminant, vars, texts);
+                for c in clauses {
+                    for x in &c.body {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for x in body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                for e in excepts {
+                    if let Some(n) = &e.as_name {
+                        vars.insert(n.clone());
+                    }
+                    if let Some(m) = &e.match_expr {
+                        counter_collect_mentions(m, vars, texts);
+                    }
+                    for x in &e.body {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+                for x in else_body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                for x in finally_body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                for x in body {
+                    counter_collect_stmt_mentions(x, vars, texts);
+                }
+                for (_, b) in named_blocks {
+                    for x in b {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    for x in st {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    if let Some(t) = &c.target {
+                        vars.insert(t.clone());
+                    }
+                    if let Some(ch) = &c.ch {
+                        counter_collect_mentions(ch, vars, texts);
+                    }
+                    if let Some(v) = &c.value {
+                        counter_collect_mentions(v, vars, texts);
+                    }
+                    for x in &c.body {
+                        counter_collect_stmt_mentions(x, vars, texts);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn counter_base_name(n: &str) -> String {
+        let t = n.trim();
+        let t = t.strip_prefix('$').unwrap_or(t);
+        let owned;
+        let t = match t.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+            Some(x) => {
+                owned = x.to_string();
+                owned.as_str()
+            }
+            None => t,
+        };
+        t.split('[').next().unwrap_or(t).trim().to_string()
+    }
+
+    // scan one expr position: drops for clobbers, plus escape-dirt on
+    // impurity (a mentioned tracked array may alias through the call —
+    // eval/read -a/user-fns/nameref-declare; opaque nodes dirty all).
+    fn counter_note_expr(
+        e: &IrExpr,
+        stack: &mut Vec<(String, CounterBound, bool)>,
+        out: &mut HashMap<String, CounterCell>,
+    ) {
+        match counter_scan_expr(e) {
+            Err(_) => {
+                stack.clear();
+                if counter_has_opaque(e) {
+                    for cell in out.values_mut() {
+                        cell.dirty = true;
+                    }
+                } else {
+                    let mut vars = HashSet::new();
+                    let mut texts = Vec::new();
+                    counter_collect_mentions(e, &mut vars, &mut texts);
+                    if !vars.is_empty() || !texts.is_empty() {
+                        for (arr, cell) in out.iter_mut() {
+                            if vars.contains(arr)
+                                || texts.iter().any(|t| t.contains(arr.as_str()))
+                            {
+                                cell.dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(names) => {
+                counter_drop(stack, &names);
+                // arith-level writes to a tracked array (scalar rebind
+                // like `((a=5))`, or an unclassified index write like
+                // `((a[$i]=x))` which no Assign-target classifier sees):
+                // disqualify the base array.
+                for n in &names {
+                    counter_rebind(out, &counter_base_name(n));
+                }
+            }
+        }
+    }
+
     // Complete walker: every Assign position (a superset of the
     // poison-setting scan, so "clean" really means classified).
+    // ctx = position unconditional under the enclosing dense loops
+    // (If/Case/Try/Select arms and subshell stages clear it — partial
+    // coverage breaks contiguity).
     fn counter_walk_stmts(
         stmts: &[IrStmt],
-        stack: &mut Vec<(String, u64)>,
-        out: &mut HashMap<String, (u64, bool)>,
+        stack: &mut Vec<(String, CounterBound, bool)>,
+        out: &mut HashMap<String, CounterCell>,
+        ctx: bool,
     ) {
-        for s in stmts {
-            counter_walk_stmt(s, stack, out);
+        for (idx, s) in stmts.iter().enumerate() {
+            let prev_zero = if idx > 0 {
+                zero_assign_var(&stmts[idx - 1])
+            } else {
+                None
+            };
+            counter_walk_stmt(s, stack, out, ctx, prev_zero);
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn counter_walk_stmt(
         s: &IrStmt,
-        stack: &mut Vec<(String, u64)>,
-        out: &mut HashMap<String, (u64, bool)>,
+        stack: &mut Vec<(String, CounterBound, bool)>,
+        out: &mut HashMap<String, CounterCell>,
+        ctx: bool,
+        prev_zero: Option<String>,
     ) {
         match s {
             IrStmt::Assign { targets, expr, asm, .. } => {
                 // value first (evaluation order), then targets.
-                match counter_scan_expr(expr) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
+                counter_note_expr(expr, stack, out);
                 for t in targets {
                     let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
                     if !t.indices.is_empty() || t.var.contains('[') {
-                        match counter_index_name(t, stack) {
-                            Some((arr, need)) => counter_record(out, arr, need),
+                        match counter_index_match(t, stack, ctx) {
+                            Some(m) => counter_classify(out, m),
                             None => {
                                 // literal exact indices stay with the
-                                // existing term; anything else dirties.
-                                if literal_write_index(t).is_none() {
+                                // existing term (but never dense-proven);
+                                // anything else dirties.
+                                if literal_write_index(t).is_some() {
+                                    counter_literal_write(out, base.clone());
+                                } else {
                                     counter_dirty(out, base.clone());
                                 }
                             }
                         }
+                    } else if out.contains_key(&base) {
+                        // scalar rebind of a tracked array name.
+                        counter_rebind(out, &base);
                     }
                     if !base.is_empty() {
                         counter_drop(
@@ -2807,6 +3422,7 @@ fn array_fixed_caps(
             }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
+                    counter_rebind(out, &d.name);
                     counter_drop(
                         stack,
                         &{
@@ -2817,13 +3433,11 @@ fn array_fixed_caps(
                     );
                 }
                 if let Some(e) = init {
-                    match counter_scan_expr(e) {
-                        Err(_) => stack.clear(),
-                        Ok(names) => counter_drop(stack, &names),
-                    }
+                    counter_note_expr(e, stack, out);
                 }
             }
             IrStmt::DeclareArray { var, elements, .. } => {
+                counter_rebind(out, var);
                 counter_drop(
                     stack,
                     &{
@@ -2833,10 +3447,7 @@ fn array_fixed_caps(
                     },
                 );
                 for e in elements {
-                    match counter_scan_expr(e) {
-                        Err(_) => stack.clear(),
-                        Ok(names) => counter_drop(stack, &names),
-                    }
+                    counter_note_expr(e, stack, out);
                 }
             }
             IrStmt::Expr(e)
@@ -2845,56 +3456,45 @@ fn array_fixed_caps(
             | IrStmt::Exit(Some(e))
             | IrStmt::Die { expr: e, .. }
             | IrStmt::Warn { expr: e, .. }
-            | IrStmt::SetChildError(e) => match counter_scan_expr(e) {
-                Err(_) => stack.clear(),
-                Ok(names) => counter_drop(stack, &names),
-            },
+            | IrStmt::SetChildError(e) => counter_note_expr(e, stack, out),
             IrStmt::WriteFile { path, content, .. } => {
-                for e in [path, content] {
-                    match counter_scan_expr(e) {
-                        Err(_) => stack.clear(),
-                        Ok(names) => counter_drop(stack, &names),
-                    }
-                }
-            },
+                counter_note_expr(path, stack, out);
+                counter_note_expr(content, stack, out);
+            }
             IrStmt::If { cond, then, elsifs, else_, .. } => {
-                match counter_scan_expr(cond) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
-                counter_walk_stmts(then, stack, out);
+                counter_note_expr(cond, stack, out);
+                counter_walk_stmts(then, stack, out, false);
                 for (c, b) in elsifs {
-                    match counter_scan_expr(c) {
-                        Err(_) => stack.clear(),
-                        Ok(names) => counter_drop(stack, &names),
-                    }
-                    counter_walk_stmts(b, stack, out);
+                    counter_note_expr(c, stack, out);
+                    counter_walk_stmts(b, stack, out, false);
                 }
-                counter_walk_stmts(else_, stack, out);
+                counter_walk_stmts(else_, stack, out, false);
             }
             IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
-                match counter_scan_expr(cond) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
-                if let Some((var, maxv)) = while_counter_need(cond, body) {
-                    // max VALUE on the stack; +1 applied at record time.
-                    stack.push((var, maxv));
-                    counter_walk_stmts(body, stack, out);
-                    stack.pop();
-                } else {
-                    counter_walk_stmts(body, stack, out);
+                counter_note_expr(cond, stack, out);
+                let rec = body
+                    .last()
+                    .and_then(|last| counted_loop_info(cond, last));
+                match rec {
+                    Some(cl) => {
+                        let dense_loop = prev_zero.as_deref() == Some(cl.var.as_str())
+                            && cl.step == 1;
+                        stack.push((cl.var, cl.bound, dense_loop));
+                        counter_walk_stmts(body, stack, out, ctx);
+                        stack.pop();
+                    }
+                    None => counter_walk_stmts(body, stack, out, ctx),
                 }
             }
             IrStmt::For { var, iter, body } => {
-                match counter_scan_expr(iter) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
-                let pushed = match for_counter_max(iter) {
+                counter_note_expr(iter, stack, out);
+                counter_rebind(out, var);
+                match for_counter_max(iter) {
                     Some(m) => {
-                        stack.push((var.clone(), m));
-                        true
+                        let dense_loop = for_counter_dense0(iter);
+                        stack.push((var.clone(), CounterBound::Max(m), dense_loop));
+                        counter_walk_stmts(body, stack, out, ctx);
+                        stack.pop();
                     }
                     None => {
                         // dynamic iters rebind the var to unknown values:
@@ -2907,54 +3507,64 @@ fn array_fixed_caps(
                                 set
                             },
                         );
-                        false
+                        counter_walk_stmts(body, stack, out, ctx);
                     }
-                };
-                counter_walk_stmts(body, stack, out);
-                if pushed {
-                    stack.pop();
                 }
             }
             IrStmt::ForInit { init, cond, step, body } => {
-                // Unboundable per existing design: walk parts for drops
-                // and classification, push nothing.
-                counter_walk_stmts(init, stack, out);
-                match counter_scan_expr(cond) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
-                counter_walk_stmts(step, stack, out);
-                counter_walk_stmts(body, stack, out);
-            }
-            IrStmt::Block(b) => counter_walk_stmts(b, stack, out),
-            IrStmt::Redirect { inner, redirects, .. } => {
-                for r in redirects {
-                    match counter_scan_expr(&r.target) {
-                        Err(_) => stack.clear(),
-                        Ok(names) => counter_drop(stack, &names),
+                // Rich C-style loop: init/cond/step inline. Recovered
+                // like While (shared matcher); unrecovered stays a
+                // transparent miss (walked, pushed nothing).
+                counter_walk_stmts(init, stack, out, ctx);
+                counter_note_expr(cond, stack, out);
+                let rec = if step.len() == 1 {
+                    step.last().and_then(|last| counted_loop_info(cond, last))
+                } else {
+                    None
+                };
+                match rec {
+                    Some(cl) => {
+                        let dense_loop = init
+                            .last()
+                            .and_then(zero_assign_var)
+                            .as_deref()
+                            == Some(cl.var.as_str())
+                            && cl.step == 1;
+                        stack.push((cl.var, cl.bound, dense_loop));
+                        counter_walk_stmts(body, stack, out, ctx);
+                        stack.pop();
+                        // step runs after the body with the stepped value
+                        // (not the enumeration): walk it popped so a
+                        // stepped index read can't claim the loop max.
+                        counter_walk_stmts(step, stack, out, ctx);
+                    }
+                    None => {
+                        counter_walk_stmts(step, stack, out, ctx);
+                        counter_walk_stmts(body, stack, out, ctx);
                     }
                 }
-                counter_walk_stmts(inner, stack, out);
+            }
+            IrStmt::Block(b) => counter_walk_stmts(b, stack, out, ctx),
+            IrStmt::Redirect { inner, redirects, .. } => {
+                for r in redirects {
+                    counter_note_expr(&r.target, stack, out);
+                }
+                counter_walk_stmts(inner, stack, out, ctx);
             }
             IrStmt::Case { discriminant, clauses, .. } => {
-                match counter_scan_expr(discriminant) {
-                    Err(_) => stack.clear(),
-                    Ok(names) => counter_drop(stack, &names),
-                }
+                counter_note_expr(discriminant, stack, out);
                 for c in clauses {
-                    counter_walk_stmts(&c.body, stack, out);
+                    counter_walk_stmts(&c.body, stack, out, false);
                 }
             }
             IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                counter_walk_stmts(body, stack, out);
+                counter_walk_stmts(body, stack, out, false);
                 for e in excepts {
                     if let Some(m) = &e.match_expr {
-                        match counter_scan_expr(m) {
-                            Err(_) => stack.clear(),
-                            Ok(names) => counter_drop(stack, &names),
-                        }
+                        counter_note_expr(m, stack, out);
                     }
                     if let Some(n) = &e.as_name {
+                        counter_rebind(out, n);
                         counter_drop(
                             stack,
                             &{
@@ -2964,29 +3574,35 @@ fn array_fixed_caps(
                             },
                         );
                     }
-                    counter_walk_stmts(&e.body, stack, out);
+                    counter_walk_stmts(&e.body, stack, out, false);
                 }
-                counter_walk_stmts(else_body, stack, out);
-                counter_walk_stmts(finally_body, stack, out);
+                counter_walk_stmts(else_body, stack, out, false);
+                counter_walk_stmts(finally_body, stack, out, false);
             }
             IrStmt::Function { body, named_blocks, .. } => {
-                // Dynamic scope: outer counters unknowable inside.
-                let mut inner: Vec<(String, u64)> = Vec::new();
-                counter_walk_stmts(body, &mut inner, out);
+                // Coverage when executed is still contiguous (zero or
+                // full execution preserves contiguity), so the block
+                // top-level starts dense.
+                let mut inner: Vec<(String, CounterBound, bool)> = Vec::new();
+                counter_walk_stmts(body, &mut inner, out, true);
                 for (_, b) in named_blocks {
-                    let mut inner2: Vec<(String, u64)> = Vec::new();
-                    counter_walk_stmts(b, &mut inner2, out);
+                    let mut inner2: Vec<(String, CounterBound, bool)> = Vec::new();
+                    counter_walk_stmts(b, &mut inner2, out, true);
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
+                // stages run in subshells: writes vanish in the parent
+                // (cap claims stay sound over-approximations, but no
+                // dense coverage) — and drops stay local.
                 for st in stages {
-                    counter_walk_stmts(st, stack, out);
+                    let mut inner = stack.clone();
+                    counter_walk_stmts(st, &mut inner, out, false);
                 }
             }
             IrStmt::Select { clauses, .. } => {
                 for c in clauses {
-                    // select binds target (recv) — clobbers counters.
                     if let Some(t) = &c.target {
+                        counter_rebind(out, t);
                         counter_drop(
                             stack,
                             &{
@@ -2997,16 +3613,15 @@ fn array_fixed_caps(
                         );
                     }
                     for e in c.ch.iter().chain(c.value.iter()) {
-                        match counter_scan_expr(e) {
-                            Err(_) => stack.clear(),
-                            Ok(names) => counter_drop(stack, &names),
-                        }
+                        counter_note_expr(e, stack, out);
                     }
-                    counter_walk_stmts(&c.body, stack, out);
+                    counter_walk_stmts(&c.body, stack, out, false);
                 }
             }
             IrStmt::Subshell(b) | IrStmt::Background(b) => {
-                counter_walk_stmts(b, stack, out);
+                // Explicit subshells: same vanish rule as pipelines.
+                let mut inner = stack.clone();
+                counter_walk_stmts(b, &mut inner, out, false);
             }
             IrStmt::Break
             | IrStmt::Continue
@@ -3021,15 +3636,20 @@ fn array_fixed_caps(
             | IrStmt::Shaderize { .. }
             | IrStmt::Ext(_) => {
                 // External/unknown effects; Asm templates reference
-                // registers. Conservative: drop live counters (miss,
-                // never unsound sizing).
+                // registers. Conservative: drop live counters and dirty
+                // every tracked array (miss, never unsound sizing).
                 stack.clear();
+                for cell in out.values_mut() {
+                    cell.dirty = true;
+                }
             }
         }
     }
 
+    // Arrays eligible for growable-vec routing are collected by the
+    // array_fixed_caps merge (same walk, no re-walk); see `routed`.
+
     // record a setArray/setArrayAppend bulk under the current context:
-// record a setArray/setArrayAppend bulk under the current context:
     // loop-free setArray is a reset (max), everything else appends.
     fn record_bulk(
         func: &str,
@@ -3334,26 +3954,31 @@ fn array_fixed_caps(
         caps_of(&sub.body, &mut map, None, 1, &mut ext);
     }
     if ext {
-        return HashMap::new();
+        return (HashMap::new(), HashSet::new());
     }
     // Counter-indexed writes in counted loops size exactly (see
-    // counter_walk_stmts): merge only when the array's every index
-    // write classified clean. Runs after the ext bail (fail-closed,
-    // mirroring the poison scan).
+    // counter_walk_stmts): merge literal-max terms only when the
+    // array's every index write classified clean AND no dynamic bound
+    // is present (dynamic loops route to growable vecs instead — the
+    // static decl must keep its poison backstop there). Runs after the
+    // ext bail (fail-closed, mirroring the poison scan).
+    // The same walk also yields the vec-route set (clean + dense0 +
+    // dynamic bound); the caller unions it into vec_arrays.
+    let mut routed: HashSet<String> = HashSet::new();
     {
-        let mut counter: HashMap<String, (u64, bool)> = HashMap::new();
-        let mut stack: Vec<(String, u64)> = Vec::new();
-        counter_walk_stmts(&prog.stmts, &mut stack, &mut counter);
+        let mut counter: HashMap<String, CounterCell> = HashMap::new();
+        let mut stack: Vec<(String, CounterBound, bool)> = Vec::new();
+        counter_walk_stmts(&prog.stmts, &mut stack, &mut counter, true);
         for sub in &prog.subs {
-            let mut inner: Vec<(String, u64)> = Vec::new();
-            counter_walk_stmts(&sub.body, &mut inner, &mut counter);
+            let mut inner: Vec<(String, CounterBound, bool)> = Vec::new();
+            counter_walk_stmts(&sub.body, &mut inner, &mut counter, true);
         }
-        for (name, (cmax, dirty)) in counter {
-            if dirty || cmax == 0 {
+        for (name, cell) in &counter {
+            if cell.dirty || cell.max == 0 || !cell.dyn_bounds.is_empty() {
                 continue;
             }
-            if let Some(info) = map.get_mut(&name) {
-                info.counter_index_max = info.counter_index_max.max(cmax);
+            if let Some(info) = map.get_mut(name) {
+                info.counter_index_max = info.counter_index_max.max(cell.max);
                 // every index write classified → clear dynamic poison
                 info.indexed_write = false;
             }
@@ -3361,6 +3986,14 @@ fn array_fixed_caps(
             // there is no sized decl to adjust; creating one would
             // invent sizing the existing analysis left absent.)
         }
+        routed = counter
+            .into_iter()
+            .filter(|(_, c)| !c.dirty && c.dense0 && !c.dyn_bounds.is_empty())
+            .map(|(n, _)| n)
+            // fn-return/bigint exclusions apply to routing too (separate
+            // decls/paths that must not ride vec storage).
+            .filter(|n| !exclude.contains(n))
+            .collect();
     }
     let mut out = HashMap::new();
     for (name, info) in &map {
@@ -3387,7 +4020,7 @@ fn array_fixed_caps(
             out.insert(name.clone(), need.max(1) as usize);
         }
     }
-    out
+    (out, routed)
 }
 
 /// Collect every setArray/setArrayAppend element expression per array.
@@ -3740,11 +4373,19 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Same point: final layout, all sets ready. Array-return
     // and bigint-homed arrays never consult the map (separate
     // decls/paths), so excluding them is hygiene.
+    // The second return is the vec-route set (counter-dynamic dense
+    // fills): demand-growth handles any runtime size, and every use
+    // site renders identically through the pointer. The exclude set
+    // already drops fn-return/bigint arrays; assocs are removed from
+    // vec_arrays at render time (collect_assoc_names + retain below) —
+    // a routed assoc keeps its fixed k/v stores either way.
     {
         let mut exclude: HashSet<String> = r.array_return_fns.iter().cloned().collect();
         exclude.extend(r.array_return_arrays.values().cloned());
         exclude.extend(r.bigint_vars.iter().cloned());
-        r.array_caps = array_fixed_caps(&prog, &exclude);
+        let (caps, routed) = array_fixed_caps(&prog, &exclude);
+        r.array_caps = caps;
+        r.vec_arrays.extend(routed);
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -19325,6 +19966,23 @@ fn param_copy_alias(
         format!("_SHSPLIT{n}")
     }
 
+    /// Indexed store into a FIXED array: native direct assign for
+    /// int-homed arrays (routing a strdup pointer into long long[]
+    /// corrupts — it reads back as garbage), `_sh_arr_set` otherwise.
+    /// Guard mirrors _sh_arr_set exactly (negative stores nothing,
+    /// past-cap exits 127); native values are never null so no !v check.
+    fn emit_fixed_index_write(&mut self, var: &str, key: &str, val: &IrExpr, v: &str, acap: usize) {
+        let id = self.c_ident(var);
+        if self.int_arrays.contains(var) {
+            let nv = self.store_int_item_c(val);
+            self.emit(&format!("{{ long long _kk = (long long)({key}); if (_kk >= 0) {{ if (_kk >= {acap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+        } else {
+            self.emit(&format!(
+                "_sh_arr_set({id}, &{id}_len, {acap}, {key}, {v});"
+            ));
+        }
+    }
+
     /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
     fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
         self.arrays.insert(var.to_string());
@@ -19370,9 +20028,7 @@ fn param_copy_alias(
                     self.emit_vec_index_write(var, &i.to_string(), &v);
                     return;
                 }
-                self.emit(&format!(
-                    "_sh_arr_set({id}, &{id}_len, {acap}, {i}, {v});"
-                ));
+                self.emit_fixed_index_write(var, &i.to_string(), val, &v, acap);
             } else if is_ident(k.trim())
                 && (self.var_types.contains_key(k.trim())
                     || self.store.contains(k.trim()))
@@ -19388,9 +20044,7 @@ fn param_copy_alias(
                     self.emit_vec_index_write(var, &kv, &v);
                     return;
                 }
-                self.emit(&format!(
-                    "_sh_arr_set({id}, &{id}_len, {acap}, {kv}, {v});"
-                ));
+                self.emit_fixed_index_write(var, &kv, val, &v, acap);
             } else if !Self::is_bare_dollar_var(k.trim()) {
                 // A literal string key implies assoc (`m[os]=v` — an
                 // indexed array cannot have string keys). Bare `$var`
@@ -19413,9 +20067,7 @@ fn param_copy_alias(
                 self.emit_vec_index_write(var, &k, &v);
                 return;
             }
-            self.emit(&format!(
-                "_sh_arr_set({id}, &{id}_len, {acap}, {k}, {v});"
-            ));
+            self.emit_fixed_index_write(var, &k, val, &v, acap);
         }
         // `arr[$i]=x` — the Str key carries the raw `$i` text: dynamic,
         // assoc-aware. Indexed arrays take the numeric index; assoc
@@ -19435,9 +20087,23 @@ fn param_copy_alias(
                     } else {
                         format!("(long long)atoll({})", self.store_ref(rest))
                     };
-                    self.emit(&format!(
-                        "_sh_arr_set({id}, &{id}_len, {acap}, {kv}, {v});"
-                    ));
+                    if self.vec_arrays.contains(var) {
+                        if self.int_arrays.contains(var) {
+                            // native int store (no value_c/atoll round-trip:
+                            // the value renders as arithmetic directly).
+                            // Grow-while + direct assign + len extend —
+                            // the same shape as emit_vec_index_write but
+                            // with a native value (atoll per store would
+                            // dominate a counted fill).
+                            let sfx = self.vec_grow_suffix(var);
+                            let nv = self.store_int_item_c(val);
+                            self.emit(&format!("{{ long long _kk = (long long)({kv}); if (_kk >= 0) {{ while ((size_t)(_kk + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+                        } else {
+                            self.emit_vec_index_write(var, &kv, &v);
+                        }
+                        return;
+                    }
+                    self.emit_fixed_index_write(var, &kv, val, &v, acap);
                     return;
                 }
             }
@@ -35344,8 +36010,12 @@ mod tests {
             var_bash_env: vec![],
         };
         let out = shir_to_c(&prog);
+        // indexed store in either form: the legacy `_sh_arr_set` string
+        // path, or a native int store into an int-homed array (exact
+        // cap + direct assign — strictly better, same indices).
         assert!(
-            out.contains("_sh_arr_set(a, &a_len,"),
+            out.contains("_sh_arr_set(a, &a_len,")
+                || out.contains("a[_kk] ="),
             "indexed store missing:\n{out}"
         );
         assert!(
@@ -35637,6 +36307,136 @@ mod tests {
         assert!(
             out.contains("a[1024]"),
             "poison cleared past clobber:\n{out}"
+        );
+    }
+
+    // A ForInit counted loop (the C-for shape): init/step/cond inline.
+    fn counter_forinit(cond_text: &str, init_zero: bool) -> IrProgram {
+        let init_val = if init_zero { 0 } else { 5 };
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::ForInit {
+                init: vec![IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "i".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(crate::ir::ArithAst::Assign {
+                        var: "i".to_string(),
+                        op: "=".to_string(),
+                        rhs: Box::new(crate::ir::ArithAst::Num(init_val)),
+                    })),
+                    asm: None,
+                }],
+                cond: IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            cond_text.to_string(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                },
+                step: vec![lic_incr("i")],
+                body: vec![counter_idx_write(
+                    "a",
+                    IrExpr::Var("i".to_string(), None),
+                )],
+            }],
+            subs: vec![],
+            var_types: vec![("i".to_string(), crate::ir::IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn counter_forinit_literal_sizes_exact() {
+        // ForInit with a literal bound sizes exactly (same as While).
+        let out = shir_to_c(&counter_forinit("i<100", true));
+        assert!(out.contains("a[100]"), "exact decl missing:\n{out}");
+        assert!(!out.contains("a[1024]"), "poison survives:\n{out}");
+    }
+
+    #[test]
+    fn counter_forinit_dyn_routes_to_vec() {
+        // ForInit with a var bound + zero init + unit step: dense and
+        // dynamic → growable vec (pointer decl, no fixed cap), int-homed
+        // (native stores, no strdup round-trip).
+        let out = shir_to_c(&counter_forinit("i<n", true));
+        assert!(
+            out.contains("long long *a = NULL"),
+            "vec+int decl missing:\n{out}"
+        );
+        assert!(!out.contains("a[1024]"), "fixed poison survives:\n{out}");
+        assert!(out.contains("a[_kk"), "native vec store missing:\n{out}");
+    }
+
+    #[test]
+    fn counter_forinit_dyn_sparse_keeps_fixed() {
+        // Same dynamic loop but init=5 (sparse start): no dense proof →
+        // no route; the poison backstop keeps the fixed decl (works as
+        // today up to the cap, 127 past it — never garbage).
+        let out = shir_to_c(&counter_forinit("i<n", false));
+        assert!(
+            out.contains("a[1024]"),
+            "sparse dynamic loop misrouted:\n{out}"
+        );
+        assert!(
+            !out.contains("*a = NULL"),
+            "sparse dynamic loop vec-routed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn counter_impure_mention_dirties() {
+        // An impure call mentioning the array (escape risk: user fns can
+        // alias through namerefs) disqualifies routing (miss, safe).
+        let mut prog = counter_forinit("i<n", true);
+        prog.stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "myfunc".to_string(),
+            args: vec![IrExpr::Str(
+                "a".to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        }));
+        let out = shir_to_c(&prog);
+        assert!(
+            !out.contains("*a = NULL"),
+            "escaped array vec-routed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn counter_forinit_conditional_write_keeps_fixed() {
+        // A counter write under an If arm (partial coverage) is not
+        // dense: no route (static-exact may still apply to literal
+        // bounds; here the bound is dynamic so the fixed backstop stays).
+        let mut prog = counter_forinit("i<n", true);
+        if let IrStmt::ForInit { body, .. } = &mut prog.stmts[0] {
+            body.clear();
+            body.push(IrStmt::If {
+                cond: IrExpr::Var("c".to_string(), None),
+                then: vec![counter_idx_write(
+                    "a",
+                    IrExpr::Var("i".to_string(), None),
+                )],
+                elsifs: vec![],
+                else_: vec![],
+            });
+        }
+        let out = shir_to_c(&prog);
+        assert!(
+            !out.contains("*a = NULL"),
+            "conditional write vec-routed:\n{out}"
         );
     }
 
@@ -36421,14 +37221,20 @@ mod tests {
         // 0..2, cap is 3 by the same proof) and omitted (item 43)
         assert!(!out.contains(&format!("_ai0 >= {dn}")), "dead guard survives:\n{out}");
         // indexed write → 1024 status quo or vec (arr_set sites are
-        // unthreaded, so never a small fixed decl).
+        // unthreaded, so never a small fixed decl). Int-valued index
+        // writes may home the array to long long (same cap, native
+        // stores) — accept any element type here.
         let out = shir_to_c(&prog_of(vec![
             setarray("setArray", "b", vec![IrExpr::Int(1)]),
             index_write("b", "0"),
             echo_len("b"),
         ]));
+        // indexed write → 1024 status quo or vec (arr_set sites are
+        // unthreaded, so never a small fixed decl). Int-valued index
+        // writes may home/narrow the array (long long, u8 here) —
+        // accept any element type on either decl shape.
         assert!(
-            out.contains("char *b[1024]") || out.contains("char **b = NULL"),
+            out.contains("b[1024]") || out.contains("*b = NULL"),
             "indexed write small-fixed:\n{out}"
         );
         // split fill (runtime-unknown count) → 1024 status quo.
