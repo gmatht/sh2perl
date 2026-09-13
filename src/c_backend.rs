@@ -7978,6 +7978,56 @@ impl Render {
         }
     }
 
+    /// Proven-nonnegative arithmetic operand (unsigned lowering gate):
+    /// the shared range proof says lo >= 0. Unknown ranges → false
+    /// (stay signed — miss, never a wrap divergence).
+    fn arith_proven_nonneg(&self, a: &crate::ir::ArithAst) -> bool {
+        let state: HashMap<String, Option<(i128, i128)>> = self
+            .var_ranges
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(*v)))
+            .collect();
+        matches!(arith_range_local(a, &state), Some((lo, _)) if lo >= 0)
+            && Self::arith_fits_i64(a, &state)
+    }
+
+    /// Every subexpression range fits in i64 (no intermediate can wrap
+    /// at runtime — a wrapped-negative dividend would diverge under
+    /// unsigned lowering even when the math-integer range says >= 0).
+    /// u64-range operands miss here (safe; their wrap semantics differ).
+    fn arith_fits_i64(
+        a: &crate::ir::ArithAst,
+        state: &HashMap<String, Option<(i128, i128)>>,
+    ) -> bool {
+        const LO: i128 = i64::MIN as i128;
+        const HI: i128 = i64::MAX as i128;
+        let (lo, hi) = match arith_range_local(a, state) {
+            Some(r) => r,
+            None => return false,
+        };
+        if lo < LO || hi > HI {
+            return false;
+        }
+        match a {
+            crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_fits_i64(lhs, state) && Self::arith_fits_i64(rhs, state)
+            }
+            crate::ir::ArithAst::Un { arg, .. } => Self::arith_fits_i64(arg, state),
+            crate::ir::ArithAst::Cond { test, then, else_ } => {
+                Self::arith_fits_i64(test, state)
+                    && Self::arith_fits_i64(then, state)
+                    && Self::arith_fits_i64(else_, state)
+            }
+            crate::ir::ArithAst::Cast { arg, .. } => Self::arith_fits_i64(arg, state),
+            crate::ir::ArithAst::Index { key, .. } => Self::arith_fits_i64(key, state),
+            crate::ir::ArithAst::Assign { rhs, .. } => Self::arith_fits_i64(rhs, state),
+            // Num/Var/Ident/Sizeof leaves: covered by the top check.
+            // IncDec: arith_range_local refuses it (None → early false
+            // above), so reaching here is impossible; belt and braces.
+            _ => true,
+        }
+    }
+
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => {
@@ -8081,7 +8131,27 @@ impl Render {
                     // strictly inside ±i64, so the render can never
                     // overflow through zero) makes the guard dead — bare
                     // division.
-                    if crate::shir::arith_divisor_bounded_nonzero(rhs) {
+                    //
+                    // Proven-nonnegative dividend + positive literal
+                    // divisor → unsigned op (strength-reduces: `% 2` and
+                    // `/ 2` become bitwise ops, const mods become magic
+                    // multiplies — no div instruction, no sign fixup).
+                    // SOUND iff the dividend cannot be negative (else the
+                    // wrap differs from C99 truncation); the range proof
+                    // is the same one widths already trust, and the gate
+                    // guards it. Negative/unknown dividends stay signed.
+                    if matches!(rhs.as_ref(), crate::ir::ArithAst::Num(d) if *d > 0)
+                        && self.arith_proven_nonneg(lhs)
+                    {
+                        let body = format!(
+                            "(long long)((unsigned long long)({l}) {op} (unsigned long long)({r}))"
+                        );
+                        if crate::shir::arith_divisor_bounded_nonzero(rhs) {
+                            body
+                        } else {
+                            format!("({r} == 0 ? 0 : {body})")
+                        }
+                    } else if crate::shir::arith_divisor_bounded_nonzero(rhs) {
                         format!("({l} {op} {r})")
                     } else {
                         format!("({r} == 0 ? 0 : ({l} {op} {r}))")
@@ -11724,6 +11794,7 @@ fn param_copy_alias(
         if self.exit_trap_body.is_some() || self.err_trap_body.is_some() {
             return None; // async trap bodies could write the bound
         }
+
         let args = match cond {
             IrExpr::Call { func, args } if func == "builtin" || func == "test" => args.clone(),
             _ => return None,
@@ -11740,6 +11811,7 @@ fn param_copy_alias(
             _ => None,
         })?;
         let mut new_args = args;
+        let mut written: BTreeSet<String> = BTreeSet::new();
         let mut written: BTreeSet<String> = BTreeSet::new();
         lic_writes_stmts(body, &mut written).ok()?;
         // Atomicity gate first (see doc above).
@@ -17570,6 +17642,20 @@ fn param_copy_alias(
     /// One split attempt: atomic operands as before, else guarded arith.
     /// (The original atomic body moved here verbatim.)
     fn let_compare_operands(&mut self, l: &str, r: &str, op: &str) -> Option<String> {
+        // Power-of-two modulo zero-test (`v % 2 == 0`): bitmask equivalence
+        // (`(v & 1) == 0`) holds for ALL values including negatives
+        // (two's complement parity is a bit property — `v%2==0` ⟺ low bit
+        // clear for every v, unlike value-context `%` which needs a range
+        // proof). No div instruction, unconditional soundness. Only the
+        // ==0/!=0 test shape (a bare `v % 2` value still needs the mod).
+        if op == "==" || op == "!=" {
+            if let Some(c) = self.let_compare_modmask(l, r, op) {
+                return Some(c);
+            }
+            if let Some(c) = self.let_compare_modmask(r, l, op) {
+                return Some(c);
+            }
+        }
         // Per side: atomic lowering first (original behavior verbatim),
         // else guarded full arithmetic (see `let_compare`).
         let render_side = |slf: &mut Self, side: &str| -> Option<String> {
@@ -17608,6 +17694,36 @@ fn param_copy_alias(
         Some(format!("({lc} {op} {rc})"))
     }
 
+
+    /// `X % 2^p` (power-of-two literal) tested `==`/`!=` 0 → bitmask.
+    /// Returns None for any other shape (miss, never a guess).
+    fn let_compare_modmask(&mut self, mod_side: &str, zero_side: &str, op: &str) -> Option<String> {
+        let z = zero_side.trim().trim_start_matches('$');
+        if z.parse::<i64>().ok() != Some(0) {
+            // `$v` zero is also zero (atoll of unset is 0)... but a var
+            // read needs its own rendering; keep this arm literal-only
+            // (the var-zero shape stays on the generic arith path).
+            return None;
+        }
+        let t = mod_side.trim();
+        if t.contains(['<', '>', '=', '!']) {
+            return None; // chained comparison / shift: grouping hazard
+        }
+        let ast = crate::shir::parse_arith(t)?;
+        let (x, d) = match &ast {
+            crate::ir::ArithAst::Bin { op, lhs, rhs } if op == "%" => match rhs.as_ref() {
+                crate::ir::ArithAst::Num(d) if *d > 0 && (*d & (*d - 1)) == 0 => (lhs.as_ref(), *d),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if Self::arith_has_side_effects(&ast) || !Self::arith_divisors_nonzero(&ast) {
+            return None;
+        }
+        let xr = self.arith(x);
+        let mask = (d - 1) as i64;
+        Some(format!("(({xr} & {mask}) {op} 0)"))
+    }
 
     /// Every `/`/`%` divisor in the tree provably nonzero (else the
     /// value-path guard's 0 would falsify bash's abort-false in test
@@ -24272,7 +24388,24 @@ fn param_copy_alias(
                 for s in init {
                     self.stmt(s);
                 }
-                let cond_c = self.expr(cond);
+                // LIC bound hoist (same as While): the step executes per
+                // iteration too, so its writes join the body's in the
+                // invariance check (a step-written bound must not hoist).
+                let mut lic_restore = Vec::new();
+                let cond_owned;
+                let cond_ref: &IrExpr = {
+                    let mut both = body.clone();
+                    both.extend(step.iter().cloned());
+                    match self.lic_hoist_bound(cond, &both) {
+                        Some((nc, rs)) => {
+                            lic_restore = rs;
+                            cond_owned = nc;
+                            &cond_owned
+                        }
+                        None => cond,
+                    }
+                };
+                let cond_c = self.expr(cond_ref);
                 self.emit(&format!("while ({cond_c}) {{"));
                 self.depth += 1;
                 self.loop_depth += 1;
@@ -24285,6 +24418,16 @@ fn param_copy_alias(
                 }
                 self.depth -= 1;
                 self.emit("}");
+                for (name, prev) in lic_restore {
+                    match prev {
+                        Some(t) => {
+                            self.var_types.insert(name, t);
+                        }
+                        None => {
+                            self.var_types.remove(&name);
+                        }
+                    }
+                }
             }
             // NEW-CORE NODE: ForEachLine — STREAMING line iteration over
             // a file (O(1) memory; the node doc pins "C getline"). The
@@ -27039,6 +27182,27 @@ fn lic_base(var: &str) -> &str {
 
 /// A call provably free of shell-variable writes (args still scanned).
 fn lic_call_pure(func: &str, args: &[crate::ir::IrExpr]) -> bool {
+    // `builtin let` / `test` carrying a single inert comparison text
+    // (`i<n` with no `$`/backtick — no expansions can hide writers;
+    // the text is opaque data, and scanning its Str args finds nothing).
+    // Anything with expansions stays impure: `$(...)`/backticks execute
+    // (fnValue captures run in-process with visible writes), and `$v`
+    // bounds keep the status quo (miss, never a stale hoist).
+    if func == "builtin" || func == "test" {
+        for a in args {
+            let t = match a {
+                crate::ir::IrExpr::Array(items) if items.len() == 1 => match &items[0] {
+                    crate::ir::IrExpr::Str(t, _) => t.clone(),
+                    _ => continue,
+                },
+                crate::ir::IrExpr::Str(t, _) => t.clone(),
+                _ => continue,
+            };
+            if lic_split_cmp(&t).is_some() && !t.contains(['$', '`']) {
+                return true;
+            }
+        }
+    }
     match func {
         // pure readers / predicates (args scanned for nested writers)
         "test" | "arith" | "getVar" | "param" | "echo" | "true" | "false" | ":" => true,
@@ -36178,11 +36342,21 @@ mod tests {
 
     #[test]
     fn let_compare_renders_modulo_test_natively() {
-        // `((v % 2 == 0))` (the collatz hot test): native `%`, no
-        // per-iteration `bash -c` fork (which cost ~300x vs bash).
+        // `((v % 2 == 0))` (the collatz hot test): bitmask, no div
+        // instruction and no per-iteration `bash -c` fork (which cost
+        // ~300x vs bash). `% 2 == 0` ⟺ low bit clear holds for every v
+        // including negatives (two's complement parity is a bit
+        // property), so no range proof is needed here.
         let out = shir_to_c(&lic_while_text("v % 2 == 0", vec![lic_incr("v")]));
         assert!(!out.contains("static int _sh_site_"), "shell site survives:\n{out}");
-        assert!(out.contains('%'), "modulo missing:\n{out}");
+        assert!(out.contains("((v & 1) == 0)"), "bitmask missing:\n{out}");
+        // Non-power-of-two modulos keep the native `%` (no bitmask
+        // equivalence there): `((v % 3 == 0))` must still lower without
+        // a shell site.
+        let out3 = shir_to_c(&lic_while_text("v % 3 == 0", vec![lic_incr("v")]));
+        assert!(!out3.contains("static int _sh_site_"), "shell site survives:\n{out3}");
+        assert!(out3.contains('%'), "modulo missing:\n{out3}");
+        assert!(!out3.contains("& 2)"), "spurious bitmask:\n{out3}");
     }
 
     #[test]
@@ -36207,6 +36381,122 @@ mod tests {
     }
 
     #[test]
+    fn let_compare_modmask_neq() {
+        // `((v % 2 != 0))` masks too (oddness is a bit property).
+        let out = shir_to_c(&lic_while_text("v % 2 != 0", vec![lic_incr("v")]));
+        assert!(!out.contains("static int _sh_site_"), "shell site survives:\n{out}");
+        assert!(out.contains("((v & 1) != 0)"), "bitmask missing:\n{out}");
+    }
+
+    #[test]
+    fn let_compare_modmask_refuses_nonzero_test() {
+        // `((v % 2 == 1))` is NOT a bitmask shape (negative odd v gives
+        // -1, but v&1 is 1 — the test differs): native `%`, no mask.
+        let out = shir_to_c(&lic_while_text("v % 2 == 1", vec![lic_incr("v")]));
+        assert!(!out.contains("static int _sh_site_"), "shell site survives:\n{out}");
+        assert!(out.contains('%'), "modulo missing:\n{out}");
+        assert!(!out.contains("& 1"), "unsound bitmask:\n{out}");
+    }
+
+    // `v = <int>` scalar assign (range-seeding base for unsigned tests).
+    fn unsigned_assign(var: &str, n: i64) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Int(n),
+            asm: None,
+        }
+    }
+
+    // `x = <arith>` assign for unsigned dividend shapes.
+    fn unsigned_arith_assign(var: &str, a: crate::ir::ArithAst) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        }
+    }
+
+    fn unsigned_prog(dividend: crate::ir::ArithAst) -> IrProgram {
+        use crate::ir::ArithAst as A;
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                unsigned_assign("v", 5),
+                unsigned_arith_assign(
+                    "x",
+                    A::Bin {
+                        op: "%".to_string(),
+                        lhs: Box::new(dividend),
+                        rhs: Box::new(A::Num(8)),
+                    },
+                ),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn unsigned_mod_fires_on_ranged_nonneg() {
+        // `v = 5` seeds v:[5,5]; `(v*2) % 8` is nonneg with no wrap →
+        // unsigned (magic multiply, no div instruction).
+        use crate::ir::ArithAst as A;
+        let out = shir_to_c(&unsigned_prog(A::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(A::Var("v".to_string())),
+            rhs: Box::new(A::Num(2)),
+        }));
+        assert!(
+            out.contains("unsigned long long"),
+            "unsigned lowering missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unsigned_mod_refuses_negative_capable() {
+        // `(0 - v) % 8` with v:[5,5] is [-5,-5] — possibly negative →
+        // stays signed (unsigned would wrap-diverge).
+        use crate::ir::ArithAst as A;
+        let out = shir_to_c(&unsigned_prog(A::Bin {
+            op: "-".to_string(),
+            lhs: Box::new(A::Num(0)),
+            rhs: Box::new(A::Var("v".to_string())),
+        }));
+        assert!(
+            !out.contains("unsigned long long"),
+            "unsigned lowering on negative-capable dividend:\n{out}"
+        );
+        assert!(out.contains('%'), "modulo missing:\n{out}");
+    }
+
+    #[test]
+    fn unsigned_mod_refuses_unranged() {
+        // Bare `w % 8` with w unknown: no proof → signed (miss, safe).
+        use crate::ir::ArithAst as A;
+        let out = shir_to_c(&unsigned_prog(A::Var("w".to_string())));
+        assert!(
+            !out.contains("unsigned long long"),
+            "unsigned lowering without a proof:\n{out}"
+        );
+    }
+
+    #[test]
     fn lic_refuses_non_atomic_cond() {
         // `((v % 2 == n))` with `n` unwritten: native lowering fires but
         // the LIC hoist must NOT (the arith side may need temps a site
@@ -36214,6 +36504,76 @@ mod tests {
         let out = shir_to_c(&lic_while_text("v % 2 == n", vec![lic_incr("v")]));
         assert!(!out.contains("_lic"), "hoist into non-atomic cond:\n{out}");
         assert!(out.contains('%'), "native lowering missing:\n{out}");
+    }
+
+    #[test]
+    fn lic_hoists_forinit_invariant_bound() {
+        // ForInit `for ((i=0;i<n;i++))` with `n` never written: the
+        // `atoll(n)` bound hoists to a pre-loop temp (via the While arm
+        // — ForInit desugars to init;while(body;step) before render).
+        // The step's own write (i) must not block the bound (n).
+        // Array-index writes in the body don't block either (they write
+        // the array, not the bound) — this is the real squares-map shape.
+        let out = shir_to_c(&counter_forinit("i<n", true));
+        assert!(out.contains("_lic"), "ForInit bound not hoisted:\n{out}");
+        assert!(out.contains("i < _lic"), "cond not rewritten to temp:\n{out}");
+    }
+
+    #[test]
+    fn lic_hoists_through_nested_text_cond() {
+        // Outer `i<n` with an inner `while ((v>1))` text cond: the inner
+        // cond is inert comparison text (no `$`/backtick), so the writes
+        // walk passes through it and the outer bound still hoists.
+        // (Before the builtin-pure rule, every nested let-text cond
+        // bailed the whole walk — collatz's outer bound never hoisted.)
+        let out = shir_to_c(&lic_while_text(
+            "i<n",
+            vec![
+                IrStmt::While {
+                    cond: IrExpr::Call {
+                        func: "builtin".to_string(),
+                        args: vec![
+                            IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Str(
+                                "v>1".to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )]),
+                        ],
+                    },
+                    body: vec![lic_incr("v")],
+                },
+                lic_incr("i"),
+            ],
+        ));
+        assert!(out.contains("_lic"), "outer bound not hoisted:\n{out}");
+        assert!(out.contains("i < _lic"), "cond not rewritten to temp:\n{out}");
+    }
+
+    #[test]
+    fn lic_refuses_forinit_step_written_bound() {
+        // ForInit whose STEP writes the bound (`n+=1` alongside the
+        // counter step): the bound is not invariant → no hoist of `n`
+        // (a hoisted entry value would be stale). The counter step stays
+        // so the loop is non-degenerate.
+        let mut prog = counter_forinit("i<n", true);
+        if let IrStmt::ForInit { step, .. } = &mut prog.stmts[0] {
+            step.push(IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "n".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(crate::ir::ArithAst::Assign {
+                    var: "n".to_string(),
+                    op: "+=".to_string(),
+                    rhs: Box::new(crate::ir::ArithAst::Num(1)),
+                })),
+                asm: None,
+            });
+        }
+        let out = shir_to_c(&prog);
+        // `n` must stay live in the cond (no `_lic` substitution for it).
+        assert!(out.contains("< n)"), "step-written bound hoisted:\n{out}");
     }
 
     // `arr[$i] = v` index write (structured counter index).
