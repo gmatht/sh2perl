@@ -2507,6 +2507,12 @@ fn array_fixed_caps(
         // index writes on assocs are extra string keys beyond bulk
         // counts — they poison literal sizing (item 41).
         is_assoc: bool,
+        // max index+1 from counter-indexed writes in counted loops
+        // (exact by enumeration — see counter_index_caps; 0 = absent).
+        // Combined via max(); bypasses the ARR_CAP gate below (which
+        // keeps the status quo for heuristic terms only). A miscount
+        // still exits 127 loudly at the runtime guard — never overflows.
+        counter_index_max: u64,
     }
     // a bulk item that expands to a runtime-unknown element count
     fn is_multi(e: &IrExpr) -> bool {
@@ -10530,6 +10536,123 @@ fn param_copy_alias(
         )
     }
 
+    /// Loop-invariant bound hoist for While conditions (BASH-VULKAN
+    /// bench: an `atoll(bound)` re-parsed every iteration cost ~85% of a
+    /// scalar-accumulate loop).
+    ///
+    /// Narrow, refuse-first: only a `Call{"builtin"|"test"}` whose args
+    /// carry a single comparison text (`v < bound`), where each
+    /// substituted bound is a bare identifier provably unwritten by the
+    /// body (see the `lic_writes_*` analysis: any unknowable effect
+    /// bails). Each bound gets `long long _licN = <numeric value>;`
+    /// before the loop, an Int verdict (restored by the caller), and a
+    /// text substitution — so the per-iteration check is a bare integer
+    /// comparison (which also drops the `_went` machinery: no calls
+    /// remain in the rewritten cond).
+    ///
+    /// Atomicity gate: EVERY operand span must be a Num literal or a
+    /// bare identifier. A rewritten bound is safe only if sibling sides
+    /// render temp-free; an arith side (`v % 2`) may need temps a site
+    /// helper would re-render, where the hoisted local is invisible
+    /// (compile break). Non-atomic conds keep native lowering without
+    /// the hoist.
+    ///
+    /// Returns the rewritten cond plus (name, previous-type) pairs the
+    /// caller restores after the loop, or None (existing path untouched).
+    fn lic_hoist_bound(
+        &mut self,
+        cond: &IrExpr,
+        body: &[IrStmt],
+    ) -> Option<(IrExpr, Vec<(String, Option<IrType>)>)> {
+        if self.exit_trap_body.is_some() || self.err_trap_body.is_some() {
+            return None; // async trap bodies could write the bound
+        }
+        let args = match cond {
+            IrExpr::Call { func, args } if func == "builtin" || func == "test" => args.clone(),
+            _ => return None,
+        };
+        // Locate the single comparison text: `["let", ["v<bound"]]` or a
+        // lone [`"v<bound"`] word (never args[0] itself — the command
+        // word). Anything else keeps existing behavior.
+        let ai = args.iter().enumerate().find_map(|(i, a)| match a {
+            IrExpr::Array(items) if items.len() == 1 => match &items[0] {
+                IrExpr::Str(t, _) if lic_split_cmp(t).is_some() => Some(i),
+                _ => None,
+            },
+            IrExpr::Str(t, _) if i > 0 && lic_split_cmp(t).is_some() => Some(i),
+            _ => None,
+        })?;
+        let mut new_args = args;
+        let mut written: BTreeSet<String> = BTreeSet::new();
+        lic_writes_stmts(body, &mut written).ok()?;
+        // Atomicity gate first (see doc above).
+        {
+            let text = lic_cur_text(&new_args, ai)?;
+            let (l, _, r) = lic_split_cmp(&text)?;
+            for side in [l, r] {
+                let t = side.trim();
+                if t.parse::<i64>().is_err() && !is_ident(t) {
+                    return None;
+                }
+            }
+        }
+        let mut restores = Vec::new();
+        let mut changed = false;
+        // Substitute each bare-ident operand the body never writes. The
+        // loop counter itself is always covered (its step lives in the
+        // body after strip_cfor, or the operand isn't bare). Array names
+        // read as scalars elsewhere — miss those (which value is read
+        // must not change).
+        for want_lhs in [true, false] {
+            let cur = lic_cur_text(&new_args, ai)?;
+            let (l, _op, r) = lic_split_cmp(&cur)?;
+            let side = if want_lhs { l } else { r };
+            if !is_ident(side) || written.contains(side) {
+                continue;
+            }
+            if self.arrays.contains(side) || self.assoc_arrays.contains(side) {
+                continue;
+            }
+            let t = format!("_lic{}", self.temp_seq);
+            self.temp_seq += 1;
+            // Full-width coercion (value_ll, NOT value_num: the latter's
+            // `(int)atoll` truncates past 2^31 — the temp is long long).
+            let v = self.value_ll(&IrExpr::Var(side.to_string(), None));
+            self.emit(&format!("long long {t} = {v};"));
+            restores.push((t.clone(), self.var_types.insert(t.clone(), IrType::Int)));
+            let cur2 = lic_cur_text(&new_args, ai)?;
+            let (nl, no, nr) = lic_split_cmp(&cur2)?;
+            let (nl2, nr2) = if want_lhs {
+                (t, nr.to_string())
+            } else {
+                (nl.to_string(), t)
+            };
+            let new_text = format!("{nl2}{no}{nr2}");
+            match &mut new_args[ai] {
+                IrExpr::Array(items) => match &items[0] {
+                    IrExpr::Str(_, style) => {
+                        items[0] = IrExpr::Str(new_text, style.clone());
+                    }
+                    _ => return None,
+                },
+                IrExpr::Str(s, _) => {
+                    *s = new_text;
+                }
+                _ => return None,
+            }
+            changed = true;
+        }
+        if !changed {
+            debug_assert!(restores.is_empty());
+            return None;
+        }
+        let func = match cond {
+            IrExpr::Call { func, .. } => func.clone(),
+            _ => return None,
+        };
+        Some((IrExpr::Call { func, args: new_args }, restores))
+    }
+
     /// Register a capture site (private command/wb buffers + result buf).
     /// Returns the call expression `_cap_N()` (a char*).
     fn cap_site(&mut self, body: impl FnOnce(&mut Render, usize)) -> String {
@@ -16262,43 +16385,98 @@ fn param_copy_alias(
 
     /// A plain comparison (`i <= n`, `x == 3`) — the ForInit conds and
     /// simple `let` tests. Operands are idents / numbers / `$var`.
+    /// A plain comparison (`i <= n`, `x == 3`) — the ForInit conds and
+    /// simple `let` tests. Operands are idents / numbers / `$var`, or —
+    /// when atomic lowering fails — full arithmetic (`v % 2 == 0`,
+    /// BASH-VULKAN bench: the collatz hot test forked `bash -c` per
+    /// inner iteration for want of this arm).
+    ///
+    /// Soundness gates on the arith path (refuse-first, keep the shell
+    /// site): no chained comparisons (split-grouping hazard), no
+    /// assignment/inc-dec nodes (C evaluation order), and every `/`/`%`
+    /// divisor provably nonzero (`arith_divisor_nonzero` — a guarded
+    /// zero divisor yields 0 where bash aborts-false, so only proven
+    /// divisors may lower; the value path's own guard is preserved by
+    /// `arith()` itself).
     fn let_compare(&mut self, s: &str) -> Option<String> {
         let s = s.trim();
         for op in ["<=", ">=", "==", "!=", "<", ">"] {
             if let Some((l, r)) = s.split_once(op) {
-                let l = l.trim().trim_start_matches('$');
-                let r = r.trim().trim_start_matches('$');
-                if l.is_empty() || r.is_empty() {
-                    continue;
+                if let Some(c) = self.let_compare_operands(l, r, op) {
+                    return Some(c);
                 }
-                // __SHCNT_ tokens are pre-substituted array counts —
-                // already numeric-native, never atoll-wrapped
-                let lc = if l.starts_with("__SHCNT_") {
-                    self.apply_array_counts(&format!("(long long){l}"))
-                } else if let Ok(n) = l.parse::<i64>() {
-                    n.to_string()
-                } else if self.is_num(l) {
-                    self.c_ident(l)
-                } else if self.var_types.contains_key(l) || self.store.contains(l) {
-                    format!("(long long)atoll({})", self.store_ref(l))
-                } else {
-                    continue;
-                };
-                let rc = if r.starts_with("__SHCNT_") {
-                    self.apply_array_counts(&format!("(long long){r}"))
-                } else if let Ok(n) = r.parse::<i64>() {
-                    n.to_string()
-                } else if self.is_num(r) {
-                    self.c_ident(r)
-                } else if self.var_types.contains_key(r) || self.store.contains(r) {
-                    format!("(long long)atoll({})", self.store_ref(r))
-                } else {
-                    continue;
-                };
-                return Some(format!("({lc} {op} {rc})"));
             }
         }
         None
+    }
+
+    /// One split attempt: atomic operands as before, else guarded arith.
+    /// (The original atomic body moved here verbatim.)
+    fn let_compare_operands(&mut self, l: &str, r: &str, op: &str) -> Option<String> {
+        // Per side: atomic lowering first (original behavior verbatim),
+        // else guarded full arithmetic (see `let_compare`).
+        let render_side = |slf: &mut Self, side: &str| -> Option<String> {
+            let t = side.trim().trim_start_matches('$');
+            if t.is_empty() {
+                return None;
+            }
+            // Atomic operands: original lowering, verbatim.
+            if t.starts_with("__SHCNT_") {
+                return Some(slf.apply_array_counts(&format!("(long long){t}")));
+            }
+            if let Ok(n) = t.parse::<i64>() {
+                return Some(n.to_string());
+            }
+            if slf.is_num(t) {
+                return Some(slf.c_ident(t));
+            }
+            if slf.var_types.contains_key(t) || slf.store.contains(t) {
+                return Some(format!("(long long)atoll({})", slf.store_ref(t)));
+            }
+            // Full arithmetic side: guarded native render.
+            if t.contains(['<', '>', '=', '!']) {
+                return None; // chained comparison / shift: grouping hazard
+            }
+            let ast = crate::shir::parse_arith(t)?;
+            if Self::arith_has_side_effects(&ast) {
+                return None;
+            }
+            if !Self::arith_divisors_nonzero(&ast) {
+                return None;
+            }
+            Some(slf.arith(&ast))
+        };
+        let lc = render_side(self, l)?;
+        let rc = render_side(self, r)?;
+        Some(format!("({lc} {op} {rc})"))
+    }
+
+
+    /// Every `/`/`%` divisor in the tree provably nonzero (else the
+    /// value-path guard's 0 would falsify bash's abort-false in test
+    /// position — see `let_compare`).
+    fn arith_divisors_nonzero(a: &crate::ir::ArithAst) -> bool {
+        use crate::ir::ArithAst;
+        match a {
+            ArithAst::Bin { op, lhs, rhs } if op == "/" || op == "%" => {
+                crate::shir::arith_divisor_nonzero(rhs)
+                    && Self::arith_divisors_nonzero(lhs)
+                    && Self::arith_divisors_nonzero(rhs)
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_divisors_nonzero(lhs) && Self::arith_divisors_nonzero(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_divisors_nonzero(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                Self::arith_divisors_nonzero(test)
+                    && Self::arith_divisors_nonzero(then)
+                    && Self::arith_divisors_nonzero(else_)
+            }
+            ArithAst::Assign { rhs, .. } => Self::arith_divisors_nonzero(rhs),
+            ArithAst::Index { key, .. } => Self::arith_divisors_nonzero(key),
+            ArithAst::Cast { arg, .. } => Self::arith_divisors_nonzero(arg),
+            _ => true,
+        }
     }
     // ── test lowering ────────────────────────────────────────────────
 
@@ -22133,12 +22311,25 @@ fn param_copy_alias(
                 // see the conservative state; re-established by Assign
                 // hooks as the body renders).
                 self.nonnull_clear_written(std::slice::from_ref(s));
+                // LIC bound hoist (see lic_hoist_bound): invariant
+                // `atoll(bound)` becomes a pre-loop `long long` temp and
+                // the cond text is rewritten. Restores run after the loop.
+                let mut lic_restore = Vec::new();
+                let cond_owned;
+                let cond_ref: &IrExpr = match self.lic_hoist_bound(cond, body) {
+                    Some((nc, rs)) => {
+                        lic_restore = rs;
+                        cond_owned = nc;
+                        &cond_owned
+                    }
+                    None => cond,
+                };
                 // the cond is an IrExpr (the ShIR's `[ ... ]` is a
                 // Call("test") -> test_render, `while true` -> "1").
                 // Wrapped in a site helper: any numeric temps the cond
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
-                let c = self.cond_site(cond);
+                let c = self.cond_site(cond_ref);
                 // bash: a while whose condition failed BEFORE the first
                 // body run exits 0 — pre-set _sh_rc, but ONLY when the cond
                 // is call-free (no _sh_site_/_cap_/helper call can stash a
@@ -22171,6 +22362,16 @@ fn param_copy_alias(
                 }
                 self.depth -= 1;
                 self.emit("}");
+                for (name, prev) in lic_restore {
+                    match prev {
+                        Some(t) => {
+                            self.var_types.insert(name, t);
+                        }
+                        None => {
+                            self.var_types.remove(&name);
+                        }
+                    }
+                }
                 if !cond_pure {
                     self.emit(&format!(
                         "if (!_went) {{ _sh_rc = 0; }} else {{ _sh_rc = {lrc2}; }}"
@@ -25635,6 +25836,267 @@ fn has_call(s: &str) -> bool {
         i += 1;
     }
     false
+}
+
+// ── loop-invariant bound analysis (LIC hoist for While conds) ──
+//
+// Answers "which shell vars may this loop body WRITE", bailing (Err) on
+// anything whose effects aren't statically knowable. Conservative by
+// construction: a bail is a missed optimisation, never a miscompile.
+// Used to hoist `atoll(bound)` out of hot while-conditions (measured
+// ~85% of a scalar-accumulate loop); see `lic_hoist_bound`.
+use std::collections::BTreeSet as LicSet;
+
+/// Base name of an assign target (`n[i]` writes array `n`).
+fn lic_base(var: &str) -> &str {
+    match var.find('[') {
+        Some(o) => &var[..o],
+        None => var,
+    }
+}
+
+/// A call provably free of shell-variable writes (args still scanned).
+fn lic_call_pure(func: &str, args: &[crate::ir::IrExpr]) -> bool {
+    match func {
+        // pure readers / predicates (args scanned for nested writers)
+        "test" | "arith" | "getVar" | "param" | "echo" | "true" | "false" | ":" => true,
+        // `printf -v name ...` WRITES; every other printf form is output-only
+        "printf" => !args.iter().any(|a| matches!(
+            a,
+            crate::ir::IrExpr::Str(s, _) if s.trim() == "-v"
+        )),
+        _ => false,
+    }
+}
+
+fn lic_writes_stmts(stmts: &[crate::ir::IrStmt], out: &mut LicSet<String>) -> Result<(), ()> {
+    for s in stmts {
+        lic_writes_stmt(s, out)?;
+    }
+    Ok(())
+}
+
+fn lic_writes_stmt(s: &crate::ir::IrStmt, out: &mut LicSet<String>) -> Result<(), ()> {
+    use crate::ir::IrStmt::*;
+    match s {
+        Assign { targets, expr, .. } => {
+            for t in targets {
+                out.insert(lic_base(&t.var).to_string());
+            }
+            lic_writes_expr(expr, out)
+        }
+        Declare { vars, init, .. } => {
+            for d in vars {
+                out.insert(d.name.clone());
+            }
+            if let Some(e) = init {
+                lic_writes_expr(e, out)?;
+            }
+            Ok(())
+        }
+        DeclareArray { var, elements, .. } => {
+            out.insert(var.clone());
+            for e in elements {
+                lic_writes_expr(e, out)?;
+            }
+            Ok(())
+        }
+        Expr(e) => lic_writes_expr(e, out),
+        If { cond, then, elsifs, else_, .. } => {
+            lic_writes_expr(cond, out)?;
+            lic_writes_stmts(then, out)?;
+            for (_, b) in elsifs {
+                lic_writes_stmts(b, out)?;
+            }
+            lic_writes_stmts(else_, out)
+        }
+        While { cond, body } | DoWhile { body, cond, .. } => {
+            lic_writes_expr(cond, out)?;
+            lic_writes_stmts(body, out)
+        }
+        For { var, iter, body } => {
+            out.insert(var.clone());
+            lic_writes_expr(iter, out)?;
+            lic_writes_stmts(body, out)
+        }
+        ForInit { init, cond, step, body } => {
+            lic_writes_stmts(init, out)?;
+            lic_writes_expr(cond, out)?;
+            lic_writes_stmts(step, out)?;
+            lic_writes_stmts(body, out)
+        }
+        Block(b) | Subshell(b) | Background(b) => lic_writes_stmts(b, out),
+        Function { .. } => Ok(()), // definition doesn't execute
+        Break | Continue => Ok(()),
+        Return(e) | Exit(e) => {
+            if let Some(x) = e {
+                lic_writes_expr(x, out)?;
+            }
+            Ok(())
+        }
+        Die { expr, .. } | Warn { expr, .. } => lic_writes_expr(expr, out),
+        Redirect { inner, redirects, .. } => {
+            lic_writes_stmts(inner, out)?;
+            for r in redirects {
+                lic_writes_expr(&r.target, out)?;
+            }
+            Ok(())
+        }
+        Case { discriminant, clauses, .. } => {
+            lic_writes_expr(discriminant, out)?;
+            for c in clauses {
+                lic_writes_stmts(&c.body, out)?;
+            }
+            Ok(())
+        }
+        Try { body, excepts, else_body, finally_body, .. } => {
+            lic_writes_stmts(body, out)?;
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    lic_writes_expr(m, out)?;
+                }
+                if let Some(n) = &e.as_name {
+                    out.insert(n.clone());
+                }
+                lic_writes_stmts(&e.body, out)?;
+            }
+            lic_writes_stmts(else_body, out)?;
+            lic_writes_stmts(finally_body, out)
+        }
+        SetChildError(e) => lic_writes_expr(e, out),
+        Require(_) => Ok(()),
+        Output { value, .. } => lic_writes_expr(value, out),
+        WriteFile { path, content, .. } => {
+            lic_writes_expr(path, out)?;
+            lic_writes_expr(content, out)
+        }
+        Goto { .. } | Label { .. } => Ok(()),
+        // Raw asm, select loops (reply var), shader nodes, pipelines /
+        // captures / external commands, eval-style builtins, raw text,
+        // extension nodes: unknowable → bail.
+        Asm { .. } | Select { .. } | Shaderize { .. } => Err(()),
+        Pipeline { .. } | Exec { .. } | RawText(_) | Ext(_) => Err(()),
+    }
+}
+
+fn lic_writes_expr(e: &crate::ir::IrExpr, out: &mut LicSet<String>) -> Result<(), ()> {
+    use crate::ir::{InterpPart, IrExpr};
+    match e {
+        IrExpr::Str(..)
+        | IrExpr::Int(..)
+        | IrExpr::Var(..)
+        | IrExpr::Ident(..)
+        | IrExpr::Bool(..)
+        | IrExpr::Regex { .. }
+        | IrExpr::Range { .. } => Ok(()),
+        IrExpr::Index { key, .. } => lic_writes_expr(key, out),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            lic_writes_expr(lhs, out)?;
+            lic_writes_expr(rhs, out)
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            lic_writes_expr(cond, out)?;
+            lic_writes_expr(then, out)?;
+            lic_writes_expr(else_, out)
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            lic_writes_expr(expr, out)?;
+            lic_writes_expr(default, out)
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    lic_writes_expr(x, out)?;
+                }
+            }
+            Ok(())
+        }
+        IrExpr::Array(items) => {
+            for x in items {
+                lic_writes_expr(x, out)?;
+            }
+            Ok(())
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                lic_writes_expr(v, out)?;
+            }
+            Ok(())
+        }
+        IrExpr::Capture { expr, .. } => lic_writes_expr(expr, out),
+        IrExpr::Splice(x) => lic_writes_expr(x, out),
+        IrExpr::Arith(a) => lic_writes_arith(a, out),
+        IrExpr::Lambda { body, .. } => lic_writes_stmts(body, out),
+        IrExpr::ArrayComp { .. } => Err(()),
+        IrExpr::MethodCall { .. } => Err(()),
+        IrExpr::RawExpr(_) => Err(()),
+        IrExpr::Json(_) => Ok(()),
+        IrExpr::Call { func, args } => {
+            if !lic_call_pure(func, args) {
+                return Err(());
+            }
+            for a in args {
+                lic_writes_expr(a, out)?;
+            }
+            Ok(())
+        }
+        IrExpr::Arrow(body) => lic_writes_stmts(body, out),
+        IrExpr::Ext(_) => Err(()),
+    }
+}
+
+fn lic_writes_arith(a: &crate::ir::ArithAst, out: &mut LicSet<String>) -> Result<(), ()> {
+    use crate::ir::ArithAst;
+    match a {
+        ArithAst::Num(..) | ArithAst::Var(..) | ArithAst::Ident(..) | ArithAst::Sizeof(..) => {
+            Ok(())
+        }
+        ArithAst::Index { key, .. } => lic_writes_arith(key, out),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            lic_writes_arith(lhs, out)?;
+            lic_writes_arith(rhs, out)
+        }
+        ArithAst::Un { arg, .. } => lic_writes_arith(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            lic_writes_arith(test, out)?;
+            lic_writes_arith(then, out)?;
+            lic_writes_arith(else_, out)
+        }
+        ArithAst::Cast { arg, .. } => lic_writes_arith(arg, out),
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            lic_writes_arith(rhs, out)
+        }
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Read the comparison text at `args[ai]` (the shape validated by the
+/// caller): `Array[Str]` or bare `Str`.
+fn lic_cur_text(args: &[crate::ir::IrExpr], ai: usize) -> Option<String> {
+    match args.get(ai)? {
+        crate::ir::IrExpr::Array(items) => match items.first()? {
+            crate::ir::IrExpr::Str(t, _) => Some(t.clone()),
+            _ => None,
+        },
+        crate::ir::IrExpr::Str(t, _) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Split comparison text (`i<n`, `x <= 10`) into (lhs, op, rhs) with the
+/// same first-op grammar as the C condition renderers.
+fn lic_split_cmp(text: &str) -> Option<(&str, &str, &str)> {
+    let t = text.trim();
+    for op in ["<=", ">=", "==", "!=", "<", ">"] {
+        if let Some(pos) = t.find(op) {
+            return Some((t[..pos].trim(), op, t[pos + op.len()..].trim()));
+        }
+    }
+    None
 }
 
 /// A call expression provably never returning NULL: `_sh_assoc_get` /
@@ -34430,6 +34892,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn lic_while_text(cond_text: &str, body: Vec<IrStmt>) -> IrProgram {
+        // While with a let-text cond (c-for/test shape), `i` Int-homed.
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            cond_text.to_string(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                },
+                body,
+            }],
+            subs: vec![],
+            var_types: vec![("i".to_string(), crate::ir::IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn lic_incr(var: &str) -> IrStmt {
+        // `i = i + 1` body step (arith, no calls)
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(crate::ir::ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(crate::ir::ArithAst::Var(var.to_string())),
+                rhs: Box::new(crate::ir::ArithAst::Num(1)),
+            })),
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn lic_hoists_unwritten_bound() {
+        // Bound `n` never written in the body: one hoisted
+        // `long long _licN = atoll(n)`, a bare `i < _licN` check per
+        // iteration (no atoll in the loop, no _went machinery).
+        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i")]));
+        assert!(out.contains("_lic"), "no hoist temp:\n{out}");
+        assert_eq!(
+            out.matches("atoll(").count(),
+            1,
+            "atoll must appear exactly once (the hoist):\n{out}"
+        );
+        assert!(!out.contains("_went"), "went machinery survives:\n{out}");
+        assert!(out.contains("i < _lic"), "rewritten cond missing:\n{out}");
+    }
+
+    #[test]
+    fn lic_refuses_written_bound() {
+        // Bound `n` incremented in the body: no hoist (a hoisted entry
+        // value would be stale). Here the existing numeric homing types
+        // `n` as `long long`, so the cond is a bare `i < n` with no
+        // coercion at all — assert that shape, not atoll specifically.
+        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i"), lic_incr("n")]));
+        assert!(!out.contains("_lic"), "unsound hoist of written bound:\n{out}");
+        assert!(out.contains("i < n"), "bare cond missing:\n{out}");
+    }
+
+    #[test]
+    fn lic_refuses_non_comparison_cond() {
+        // A cond with no comparison text keeps the existing path (miss,
+        // never a rewrite of something unparsed).
+        let mut prog = lic_while_text("i<n", vec![lic_incr("i")]);
+        prog.stmts = vec![IrStmt::While {
+            cond: IrExpr::Call {
+                func: "builtin".to_string(),
+                args: vec![
+                    IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str(
+                        "1".to_string(),
+                        crate::ir::StrStyle::DoubleQuoted,
+                    )]),
+                ],
+            },
+            body: vec![lic_incr("i")],
+        }];
+        let out = shir_to_c(&prog);
+        assert!(!out.contains("_lic"), "hoist without a bound:\n{out}");
+    }
+
+    #[test]
+    fn let_compare_renders_modulo_test_natively() {
+        // `((v % 2 == 0))` (the collatz hot test): native `%`, no
+        // per-iteration `bash -c` fork (which cost ~300x vs bash).
+        let out = shir_to_c(&lic_while_text("v % 2 == 0", vec![lic_incr("v")]));
+        assert!(!out.contains("static int _sh_site_"), "shell site survives:\n{out}");
+        assert!(out.contains('%'), "modulo missing:\n{out}");
+    }
+
+    #[test]
+    fn let_compare_refuses_zero_divisor() {
+        // `((v % 0 == 0))`: bash aborts-false, a guarded 0 would compare
+        // true — keep the shell site (refuse-first).
+        let out = shir_to_c(&lic_while_text("v % 0 == 0", vec![lic_incr("v")]));
+        assert!(
+            out.contains("static int _sh_site_"),
+            "zero-divisor test went native (unsound):\n{out}"
+        );
+    }
+
+    #[test]
+    fn let_compare_refuses_dynamic_divisor() {
+        // `((v % x == 0))` with unproven `x`: same guard rationale.
+        let out = shir_to_c(&lic_while_text("v % x == 0", vec![lic_incr("v")]));
+        assert!(
+            out.contains("static int _sh_site_"),
+            "dynamic-divisor test went native (unsound):\n{out}"
+        );
+    }
+
+    #[test]
+    fn lic_refuses_non_atomic_cond() {
+        // `((v % 2 == n))` with `n` unwritten: native lowering fires but
+        // the LIC hoist must NOT (the arith side may need temps a site
+        // helper would re-render, where the hoisted local is invisible).
+        let out = shir_to_c(&lic_while_text("v % 2 == n", vec![lic_incr("v")]));
+        assert!(!out.contains("_lic"), "hoist into non-atomic cond:\n{out}");
+        assert!(out.contains('%'), "native lowering missing:\n{out}");
     }
 
     #[test]
