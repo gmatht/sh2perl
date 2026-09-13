@@ -3824,10 +3824,8 @@ impl Render {
             // strlen per append; tracked length makes it O(n) total.
             // Callers unchanged (helpers maintain it); save/restore with
             // the buffer in _sh_call_fn (else length/buffer mismatch).
-            self.emit("static size_t _sh_cmd_len = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
-            self.emit("static size_t _sh_wrap_len = 0;");
             self.emit("static void _sh_grow(char **b, size_t *cap, size_t need) {");
             self.emit("  if (need <= *cap) return;");
             self.emit("  *cap = need * 2;");
@@ -3854,18 +3852,16 @@ impl Render {
             self.emit("  return np;");
             self.emit("}");
             self.emit("static void _sh_add(const char *s) {");
-            self.emit("  size_t n = strlen(s), l = _sh_cmd_len;");
+            self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + n + 1);");
             self.emit("  memcpy(_sh_cmd + l, s, n + 1);");
-            self.emit("  _sh_cmd_len = l + n;");
             self.emit("}");
             self.emit("static void _sh_addc(char c) {");
-            self.emit("  size_t l = _sh_cmd_len;");
+            self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0;");
             self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + 2);");
             self.emit("  _sh_cmd[l] = c; _sh_cmd[l + 1] = 0;");
-            self.emit("  _sh_cmd_len = l + 1;");
             self.emit("}");
-            self.emit("static void _sh_reset(void) { _sh_grow(&_sh_cmd, &_sh_cap, 1); _sh_cmd[0] = 0; _sh_cmd_len = 0; }");
+            self.emit("static void _sh_reset(void) { _sh_grow(&_sh_cmd, &_sh_cap, 1); _sh_cmd[0] = 0; }");
             self.emit("static void _sh_wb_add(const char *s) {");
             self.emit("  size_t l = _sh_wb ? strlen(_sh_wb) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_wb, &_sh_wcap, l + n + 1);");
@@ -4406,7 +4402,6 @@ impl Render {
             self.emit("    else *p++ = *c;");
             self.emit("  }");
             self.emit("  *p++ = '\\''; *p = 0;");
-            self.emit("  _sh_wrap_len = (size_t)(p - _sh_wrap);");
             // subshell positionals (BASHC_FIX parse-dollar): `bash -c`
             // children start with empty $@ — append ours (quoted) so
             // sites see the caller's positionals ($0 = ours). Gated.
@@ -4415,13 +4410,13 @@ impl Render {
                 self.emit("    for (int _wai = 0; _wai < _sh_argc; _wai++) {");
                 self.emit("      const char *_wa = _sh_argv[_wai] ? _sh_argv[_wai] : \"\";");
                 self.emit("      size_t _wl = strlen(_wa);");
-                self.emit("      _sh_grow(&_sh_wrap, &_sh_wrapcap, _sh_wrap_len + _wl * 4 + 4);");
-                self.emit("      _sh_wrap[_sh_wrap_len++] = ' '; _sh_wrap[_sh_wrap_len++] = '\\'';");
+                self.emit("      _sh_grow(&_sh_wrap, &_sh_wrapcap, strlen(_sh_wrap) + _wl * 4 + 4);");
+                self.emit("      strcat(_sh_wrap, \" '\");");
                 self.emit("      for (const char *_wq = _wa; *_wq; _wq++) {");
-                self.emit("        if (*_wq == '\\'') { memcpy(_sh_wrap + _sh_wrap_len, \"'\\\"'\\\"'\", 5); _sh_wrap_len += 5; }");
-                self.emit("        else { _sh_wrap[_sh_wrap_len++] = *_wq; }");
+                self.emit("        if (*_wq == '\\'') strcat(_sh_wrap, \"'\\\"'\\\"'\");");
+                self.emit("        else { size_t _we = strlen(_sh_wrap); _sh_wrap[_we] = *_wq; _sh_wrap[_we+1] = 0; }");
                 self.emit("      }");
-                self.emit("      _sh_wrap[_sh_wrap_len++] = '\\''; _sh_wrap[_sh_wrap_len] = 0;");
+                self.emit("      strcat(_sh_wrap, \"'\");");
                 self.emit("    }");
                 self.emit("  }");
             }
@@ -4501,20 +4496,20 @@ impl Render {
             // swap is unobservable, omitted.
             if self.pos_const {
                 self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, _sh_vbuf *vb) {");
-                self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; size_t slen = _sh_cmd_len; _sh_cmd = 0; _sh_cap = 0; _sh_cmd_len = 0;");
+                self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
                 self.emit("  (void)av; (void)n;");
                 self.emit("  _sh_capture_fn(fn, vb);");
-                self.emit("  _sh_cmd = scmd; _sh_cap = scap; _sh_cmd_len = slen;");
+                self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
                 self.emit("  return vb->p;");
                 self.emit("}");
             } else {
             self.emit("static char *_sh_call_fn(void (*fn)(void), char **av, int n, _sh_vbuf *vb) {");
             self.emit("  char **sv = _sh_argv; int sc = _sh_argc;");
-            self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; size_t slen = _sh_cmd_len; _sh_cmd = 0; _sh_cap = 0; _sh_cmd_len = 0;");
+            self.emit("  char *scmd = _sh_cmd; size_t scap = _sh_cap; _sh_cmd = 0; _sh_cap = 0;");
             self.emit("  _sh_argv = av; _sh_argc = n;");
             self.emit("  _sh_capture_fn(fn, vb);");
             self.emit("  _sh_argv = sv; _sh_argc = sc;");
-            self.emit("  _sh_cmd = scmd; _sh_cap = scap; _sh_cmd_len = slen;");
+            self.emit("  _sh_cmd = scmd; _sh_cap = scap;");
             self.emit("  return vb->p;");
             self.emit("}");
             }
