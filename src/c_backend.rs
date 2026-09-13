@@ -2542,7 +2542,494 @@ fn array_fixed_caps(
             _ => None,
         }
     }
+    // max VALUE of a counted-For counter (not trips: indices equal
+    // values). Range is inclusive (like seq); int-literal arrays take
+    // the max literal. Non-materializing (never expands). None =
+    // unboundable (dynamic iters, globs, brace ranges, empty/negative
+    // ranges) — brace iters stay with the status quo (small literals
+    // the ARR_CAP path already covers; no untested payload parsing).
+    fn for_counter_max(iter: &IrExpr) -> Option<u64> {
+        match iter {
+            IrExpr::Range { start, end } if *start >= 0 && *end >= *start => {
+                Some(*end as u64)
+            }
+            IrExpr::Array(items) => {
+                let mut lit_max: Option<u64> = None;
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _) => {
+                            let t = s.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            match t.parse::<i64>() {
+                                Ok(n) if n >= 0 => {
+                                    lit_max = Some(lit_max.unwrap_or(0).max(n as u64))
+                                }
+                                _ => return None,
+                            }
+                        }
+                        IrExpr::Int(n) if *n >= 0 => {
+                            lit_max = Some(lit_max.unwrap_or(0).max(*n as u64))
+                        }
+                        _ => return None,
+                    }
+                }
+                match lit_max {
+                    Some(m) => Some(m),
+                    None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+
+    // (counter var, need = maxidx+1) for strip_cfor-output counted
+    // loops: cond `v</<=B` text (B nonneg literal), last body stmt a
+    // positive step on v. Init-independent (increasing loops only ever
+    // touch indices < B / <= B; empty loops contribute nothing).
+    // Countdowns, dynamic bounds, exotic steps → None (miss).
+    fn while_counter_need(cond: &IrExpr, body: &[IrStmt]) -> Option<(String, u64)> {
+        let text = match cond {
+            IrExpr::Call { func, args } if func == "builtin" || func == "test" => {
+                let mut found = None;
+                for a in args {
+                    match a {
+                        IrExpr::Array(items) if items.len() == 1 => {
+                            if let IrExpr::Str(t, _) = &items[0] {
+                                found = Some(t.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                found?
+            }
+            _ => return None,
+        };
+        let (l, op, r) = lic_split_cmp(&text)?;
+        if op != "<" && op != "<=" {
+            return None;
+        }
+        let var = l.trim().strip_prefix('$').unwrap_or(l.trim());
+        if !is_ident(var) {
+            return None;
+        }
+        let b: i64 = r.trim().parse().ok()?;
+        if b < 0 {
+            return None;
+        }
+        // max VALUE the counter can hold on entry to the body
+        let maxv: u64 = if op == "<" {
+            if b < 1 {
+                return None;
+            }
+            (b - 1) as u64
+        } else {
+            b as u64
+        };
+        let last = body.last()?;
+        let ok_step = match last {
+            IrStmt::Assign { targets, expr, .. } => {
+                targets.len() == 1
+                    && targets[0].var == var
+                    && targets[0].indices.is_empty()
+                    && match expr {
+                        IrExpr::Arith(a) => match a.as_ref() {
+                            crate::ir::ArithAst::IncDec { var: v, delta, .. } => {
+                                v == var && *delta > 0
+                            }
+                            crate::ir::ArithAst::Assign { var: v, op, rhs } => {
+                                v == var
+                                    && (op == "+="
+                                        && matches!(rhs.as_ref(),
+                                            crate::ir::ArithAst::Num(n) if *n > 0))
+                            }
+                            crate::ir::ArithAst::Bin { op, lhs, rhs } => {
+                                op == "+"
+                                    && matches!(lhs.as_ref(),
+                                        crate::ir::ArithAst::Var(v)
+                                        | crate::ir::ArithAst::Ident(v) if v == var)
+                                    && matches!(rhs.as_ref(),
+                                        crate::ir::ArithAst::Num(n) if *n > 0)
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        if !ok_step {
+            return None;
+        }
+        Some((var.to_string(), maxv))
+    }
+
+    // Index var name when it is exactly a live counter (`$v`, `v`,
+    // `${v}` flattened, or single structured Var/Ident/Str). Returns
+    // (array base, need): max over ALL same-name stack entries
+    // (shadowing-safe: every live binding's range covers the reads it
+    // dominates; anything narrower is a sound over-approximation).
+    fn counter_index_name(
+        t: &crate::ir::AssignTarget,
+        stack: &[(String, u64)],
+    ) -> Option<(String, u64)> {
+        fn bare(w: &str) -> Option<&str> {
+            let t = w.trim();
+            let t = t.strip_prefix('$').unwrap_or(t);
+            let t = t
+                .strip_prefix('{')
+                .and_then(|r| r.strip_suffix('}'))
+                .unwrap_or(t);
+            if is_ident(t) {
+                Some(t)
+            } else {
+                None
+            }
+        }
+        let base = t.var.split('[').next().unwrap_or(&t.var);
+        if base.is_empty() {
+            return None;
+        }
+        // Collect the index var name without borrowing issues.
+        let iname: Option<String> = if t.indices.len() == 1 {
+            match &t.indices[0] {
+                IrExpr::Var(v, _) | IrExpr::Ident(v) => Some(v.clone()),
+                IrExpr::Str(s, _) => bare(s).map(|x| x.to_string()),
+                _ => None,
+            }
+        } else if !t.indices.is_empty() {
+            None
+        } else {
+            // flattened `arr[...]`: exactly one bracket pair
+            let inner = t.var.split_once('[')?.1.strip_suffix(']')?;
+            if inner.contains('[') || inner.trim().is_empty() {
+                None
+            } else {
+                bare(inner.trim()).map(|x| x.to_string())
+            }
+        };
+        let v = iname?;
+        let mut best: Option<u64> = None;
+        for (name, maxv) in stack {
+            if name == &v {
+                best = Some(best.unwrap_or(0).max(maxv.saturating_add(1)));
+            }
+        }
+        best.map(|need| (base.to_string(), need))
+    }
+
+    // record a counter-exact array write: max-combine (independent upper
+    // bounds never shrink each other).
+    fn counter_record(out: &mut HashMap<String, (u64, bool)>, arr: String, need: u64) {
+        let e = out.entry(arr).or_insert((0, false));
+        e.0 = e.0.max(need);
+    }
+
+    // an index write no classifier understands (keeps poison semantics:
+    // an override needs a fully-classified array).
+    fn counter_dirty(out: &mut HashMap<String, (u64, bool)>, arr: String) {
+        out.entry(arr).or_insert((0, false)).1 = true;
+    }
+
+    // drop stack counters clobbered by `names`.
+    fn counter_drop(stack: &mut Vec<(String, u64)>, names: &BTreeSet<String>) {
+        stack.retain(|(n, _)| !names.contains(n));
+    }
+
+    // scan an expr for parent-visible writes (ArithAssign/IncDec targets;
+    // impure calls drop everything — reuse lic's conservative scan).
+    // Returns names to drop, or Err for drop-all.
+    fn counter_scan_expr(e: &IrExpr) -> Result<BTreeSet<String>, ()> {
+        let mut tmp = BTreeSet::new();
+        lic_writes_expr(e, &mut tmp).map_err(|_| ())?;
+        Ok(tmp)
+    }
+
+    // Complete walker: every Assign position (a superset of the
+    // poison-setting scan, so "clean" really means classified).
+    fn counter_walk_stmts(
+        stmts: &[IrStmt],
+        stack: &mut Vec<(String, u64)>,
+        out: &mut HashMap<String, (u64, bool)>,
+    ) {
+        for s in stmts {
+            counter_walk_stmt(s, stack, out);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn counter_walk_stmt(
+        s: &IrStmt,
+        stack: &mut Vec<(String, u64)>,
+        out: &mut HashMap<String, (u64, bool)>,
+    ) {
+        match s {
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // value first (evaluation order), then targets.
+                match counter_scan_expr(expr) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                for t in targets {
+                    let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                    if !t.indices.is_empty() || t.var.contains('[') {
+                        match counter_index_name(t, stack) {
+                            Some((arr, need)) => counter_record(out, arr, need),
+                            None => {
+                                // literal exact indices stay with the
+                                // existing term; anything else dirties.
+                                if literal_write_index(t).is_none() {
+                                    counter_dirty(out, base.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !base.is_empty() {
+                        counter_drop(
+                            stack,
+                            &{
+                                let mut set = BTreeSet::new();
+                                set.insert(base);
+                                set
+                            },
+                        );
+                    }
+                }
+                // asm-label specs only rename the object symbol (no
+                // runtime semantics), but an unexpected payload drops
+                // counters rather than risk a stale reading.
+                if asm.is_some() {
+                    stack.clear();
+                }
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for d in vars {
+                    counter_drop(
+                        stack,
+                        &{
+                            let mut set = BTreeSet::new();
+                            set.insert(d.name.clone());
+                            set
+                        },
+                    );
+                }
+                if let Some(e) = init {
+                    match counter_scan_expr(e) {
+                        Err(_) => stack.clear(),
+                        Ok(names) => counter_drop(stack, &names),
+                    }
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                counter_drop(
+                    stack,
+                    &{
+                        let mut set = BTreeSet::new();
+                        set.insert(var.clone());
+                        set
+                    },
+                );
+                for e in elements {
+                    match counter_scan_expr(e) {
+                        Err(_) => stack.clear(),
+                        Ok(names) => counter_drop(stack, &names),
+                    }
+                }
+            }
+            IrStmt::Expr(e)
+            | IrStmt::Output { value: e, .. }
+            | IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. }
+            | IrStmt::SetChildError(e) => match counter_scan_expr(e) {
+                Err(_) => stack.clear(),
+                Ok(names) => counter_drop(stack, &names),
+            },
+            IrStmt::WriteFile { path, content, .. } => {
+                for e in [path, content] {
+                    match counter_scan_expr(e) {
+                        Err(_) => stack.clear(),
+                        Ok(names) => counter_drop(stack, &names),
+                    }
+                }
+            },
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                match counter_scan_expr(cond) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                counter_walk_stmts(then, stack, out);
+                for (c, b) in elsifs {
+                    match counter_scan_expr(c) {
+                        Err(_) => stack.clear(),
+                        Ok(names) => counter_drop(stack, &names),
+                    }
+                    counter_walk_stmts(b, stack, out);
+                }
+                counter_walk_stmts(else_, stack, out);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                match counter_scan_expr(cond) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                if let Some((var, maxv)) = while_counter_need(cond, body) {
+                    // max VALUE on the stack; +1 applied at record time.
+                    stack.push((var, maxv));
+                    counter_walk_stmts(body, stack, out);
+                    stack.pop();
+                } else {
+                    counter_walk_stmts(body, stack, out);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                match counter_scan_expr(iter) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                let pushed = match for_counter_max(iter) {
+                    Some(m) => {
+                        stack.push((var.clone(), m));
+                        true
+                    }
+                    None => {
+                        // dynamic iters rebind the var to unknown values:
+                        // any outer counter of the same name is clobbered.
+                        counter_drop(
+                            stack,
+                            &{
+                                let mut set = BTreeSet::new();
+                                set.insert(var.clone());
+                                set
+                            },
+                        );
+                        false
+                    }
+                };
+                counter_walk_stmts(body, stack, out);
+                if pushed {
+                    stack.pop();
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                // Unboundable per existing design: walk parts for drops
+                // and classification, push nothing.
+                counter_walk_stmts(init, stack, out);
+                match counter_scan_expr(cond) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                counter_walk_stmts(step, stack, out);
+                counter_walk_stmts(body, stack, out);
+            }
+            IrStmt::Block(b) => counter_walk_stmts(b, stack, out),
+            IrStmt::Redirect { inner, redirects, .. } => {
+                for r in redirects {
+                    match counter_scan_expr(&r.target) {
+                        Err(_) => stack.clear(),
+                        Ok(names) => counter_drop(stack, &names),
+                    }
+                }
+                counter_walk_stmts(inner, stack, out);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                match counter_scan_expr(discriminant) {
+                    Err(_) => stack.clear(),
+                    Ok(names) => counter_drop(stack, &names),
+                }
+                for c in clauses {
+                    counter_walk_stmts(&c.body, stack, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                counter_walk_stmts(body, stack, out);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        match counter_scan_expr(m) {
+                            Err(_) => stack.clear(),
+                            Ok(names) => counter_drop(stack, &names),
+                        }
+                    }
+                    if let Some(n) = &e.as_name {
+                        counter_drop(
+                            stack,
+                            &{
+                                let mut set = BTreeSet::new();
+                                set.insert(n.clone());
+                                set
+                            },
+                        );
+                    }
+                    counter_walk_stmts(&e.body, stack, out);
+                }
+                counter_walk_stmts(else_body, stack, out);
+                counter_walk_stmts(finally_body, stack, out);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                // Dynamic scope: outer counters unknowable inside.
+                let mut inner: Vec<(String, u64)> = Vec::new();
+                counter_walk_stmts(body, &mut inner, out);
+                for (_, b) in named_blocks {
+                    let mut inner2: Vec<(String, u64)> = Vec::new();
+                    counter_walk_stmts(b, &mut inner2, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    counter_walk_stmts(st, stack, out);
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    // select binds target (recv) — clobbers counters.
+                    if let Some(t) = &c.target {
+                        counter_drop(
+                            stack,
+                            &{
+                                let mut set = BTreeSet::new();
+                                set.insert(t.clone());
+                                set
+                            },
+                        );
+                    }
+                    for e in c.ch.iter().chain(c.value.iter()) {
+                        match counter_scan_expr(e) {
+                            Err(_) => stack.clear(),
+                            Ok(names) => counter_drop(stack, &names),
+                        }
+                    }
+                    counter_walk_stmts(&c.body, stack, out);
+                }
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                counter_walk_stmts(b, stack, out);
+            }
+            IrStmt::Break
+            | IrStmt::Continue
+            | IrStmt::Return(None)
+            | IrStmt::Exit(None)
+            | IrStmt::Require(_)
+            | IrStmt::Goto(_)
+            | IrStmt::Label(_) => {}
+            IrStmt::Exec { .. }
+            | IrStmt::RawText(_)
+            | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. }
+            | IrStmt::Ext(_) => {
+                // External/unknown effects; Asm templates reference
+                // registers. Conservative: drop live counters (miss,
+                // never unsound sizing).
+                stack.clear();
+            }
+        }
+    }
+
     // record a setArray/setArrayAppend bulk under the current context:
+// record a setArray/setArrayAppend bulk under the current context:
     // loop-free setArray is a reset (max), everything else appends.
     fn record_bulk(
         func: &str,
@@ -2849,6 +3336,32 @@ fn array_fixed_caps(
     if ext {
         return HashMap::new();
     }
+    // Counter-indexed writes in counted loops size exactly (see
+    // counter_walk_stmts): merge only when the array's every index
+    // write classified clean. Runs after the ext bail (fail-closed,
+    // mirroring the poison scan).
+    {
+        let mut counter: HashMap<String, (u64, bool)> = HashMap::new();
+        let mut stack: Vec<(String, u64)> = Vec::new();
+        counter_walk_stmts(&prog.stmts, &mut stack, &mut counter);
+        for sub in &prog.subs {
+            let mut inner: Vec<(String, u64)> = Vec::new();
+            counter_walk_stmts(&sub.body, &mut inner, &mut counter);
+        }
+        for (name, (cmax, dirty)) in counter {
+            if dirty || cmax == 0 {
+                continue;
+            }
+            if let Some(info) = map.get_mut(&name) {
+                info.counter_index_max = info.counter_index_max.max(cmax);
+                // every index write classified → clear dynamic poison
+                info.indexed_write = false;
+            }
+            // (no entry: the poison scan never saw this array, so
+            // there is no sized decl to adjust; creating one would
+            // invent sizing the existing analysis left absent.)
+        }
+    }
     let mut out = HashMap::new();
     for (name, info) in &map {
         if info.indexed_write || info.unbounded || !info.defined {
@@ -2864,10 +3377,13 @@ fn array_fixed_caps(
         let need = info
             .max_reset
             .saturating_add(info.appends)
-            .max(info.lit_index_max);
+            .max(info.lit_index_max)
+            .max(info.counter_index_max);
         // defined-but-always-empty still needs one slot; need >=
-        // ARR_CAP keeps the status quo.
-        if need < ARR_CAP as u64 {
+        // ARR_CAP keeps the status quo — except counter-exact terms,
+        // which are proven (not heuristic) and bypass the gate (the
+        // runtime guard still exits 127 on any miscount: fail-closed).
+        if info.counter_index_max > 0 || need < ARR_CAP as u64 {
             out.insert(name.clone(), need.max(1) as usize);
         }
     }
@@ -35028,6 +35544,100 @@ mod tests {
         let out = shir_to_c(&lic_while_text("v % 2 == n", vec![lic_incr("v")]));
         assert!(!out.contains("_lic"), "hoist into non-atomic cond:\n{out}");
         assert!(out.contains('%'), "native lowering missing:\n{out}");
+    }
+
+    // `arr[$i] = v` index write (structured counter index).
+    fn counter_idx_write(arr: &str, idx: IrExpr) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: arr.to_string(),
+                sigil: None,
+                indices: vec![idx],
+            }],
+            expr: IrExpr::Int(0),
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn counter_while_sizes_exact() {
+        // Counted while `i<100` with `a[$i]` writes: exact cap 100,
+        // not the ARR_CAP poison (the bench-opt 100M row exits 127
+        // today; after this it sizes 100M+1).
+        let out = shir_to_c(&lic_while_text(
+            "i<100",
+            vec![
+                counter_idx_write("a", IrExpr::Var("i".to_string(), None)),
+                lic_incr("i"),
+            ],
+        ));
+        assert!(out.contains("a[100]"), "exact decl missing:\n{out}");
+        assert!(!out.contains("a[1024]"), "poison survives:\n{out}");
+    }
+
+    #[test]
+    fn counter_for_range_sizes_exact() {
+        // `for i in 0..99` (Range, inclusive): slots 0..=99 → cap 100.
+        let mut prog = lic_while_text(
+            "i<100",
+            vec![counter_idx_write(
+                "a",
+                IrExpr::Var("i".to_string(), None),
+            )],
+        );
+        prog.stmts = vec![IrStmt::For {
+            var: "i".to_string(),
+            iter: IrExpr::Range { start: 0, end: 99 },
+            body: vec![counter_idx_write(
+                "a",
+                IrExpr::Var("i".to_string(), None),
+            )],
+        }];
+        let out = shir_to_c(&prog);
+        assert!(out.contains("a[100]"), "exact decl missing:\n{out}");
+        assert!(!out.contains("a[1024]"), "poison survives:\n{out}");
+    }
+
+    #[test]
+    fn counter_dynamic_index_keeps_poison() {
+        // A second, unclassified index write (`a[$j]`, j unknown)
+        // dirties the array: the poison stays (miss, never shrunk on
+        // a guess).
+        let out = shir_to_c(&lic_while_text(
+            "i<100",
+            vec![
+                counter_idx_write("a", IrExpr::Var("i".to_string(), None)),
+                counter_idx_write("a", IrExpr::Var("j".to_string(), None)),
+                lic_incr("i"),
+            ],
+        ));
+        assert!(out.contains("a[1024]"), "poison cleared on dirty:\n{out}");
+    }
+
+    #[test]
+    fn counter_clobber_keeps_poison() {
+        // Counter rebound before the write (`i=5; a[$i]=x`): the read
+        // no longer sees the enumeration → dirty (miss, never stale).
+        let out = shir_to_c(&lic_while_text(
+            "i<100",
+            vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "i".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(5),
+                    asm: None,
+                },
+                counter_idx_write("a", IrExpr::Var("i".to_string(), None)),
+                lic_incr("i"),
+            ],
+        ));
+        assert!(
+            out.contains("a[1024]"),
+            "poison cleared past clobber:\n{out}"
+        );
     }
 
     #[test]
