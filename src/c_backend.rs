@@ -554,6 +554,10 @@ pub struct Render {
     /// C-loop nesting depth (BASHC_FIX parse-eval): orphan `break`/
     /// `continue` (e.g. `select` without a loop) emit as no-op + rc 1.
     loop_depth: u32,
+    /// nameref aliases (`typeset -n ref=target`): ref → target.
+    /// Reads/writes resolve (cycle-guarded); `unset` removes.
+    /// Function-scope documented gap (global map). BASHC_FIX typeset.
+    nameref: std::collections::HashMap<String, String>,
     /// the name of the function currently being rendered (so an
     /// in-process dispatch to the SAME name is recognized as
     /// self-recursion — its file-scope globals must be saved/restored
@@ -9193,6 +9197,20 @@ fn param_copy_alias(
     /// render as the empty string, matching bash's unset semantics in
     /// expansions).
     fn store_ref(&self, name: &str) -> String {
+        // nameref: read ultimate target (BASHC_FIX typeset -n). Positional
+        // params ($1…) never alias (skip resolve for digit names).
+        let resolved;
+        let name = if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            name
+        } else {
+            match self.nameref.get(name) {
+                Some(_) => {
+                    resolved = self.resolve_nameref(name);
+                    resolved.as_str()
+                }
+                None => name,
+            }
+        };
         // positional params ($1, $2, …) — the caller's _sh_argv (the
         // fnValue dispatch / fn-call lowering swaps it around in-process
         // calls, so a function body's `$1` reads ITS call's argv). A
@@ -9287,7 +9305,37 @@ fn param_copy_alias(
     /// store; anything else reads the real environment (unset → "").
     /// Render-time membership is safe here — pass 1 hoisted every
     /// assigned var, so a name absent from the store was never assigned.
+    /// Ultimate nameref target (cycle-guarded, depth 32). Returns
+    /// `name` itself if unmapped or cyclic.
+    fn resolve_nameref(&self, name: &str) -> String {
+        let mut cur = name.to_string();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(cur.clone());
+        for _ in 0..32 {
+            match self.nameref.get(&cur) {
+                Some(t) => {
+                    if !seen.insert(t.clone()) {
+                        break;
+                    }
+                    cur = t.clone();
+                }
+                None => break,
+            }
+        }
+        cur
+    }
+
     fn store_read(&mut self, name: &str) -> String {
+        // nameref: read the ultimate target (BASHC_FIX typeset -n).
+        // (Owned to satisfy borrowck; hot path, small strings.)
+        let resolved;
+        let name = match self.nameref.get(name) {
+            Some(_) => {
+                resolved = self.resolve_nameref(name);
+                resolved.as_str()
+            }
+            None => name,
+        };
         if self.store.contains(name) || self.var_types.contains_key(name) {
             self.store_ref(name)
         } else {
@@ -13094,6 +13142,16 @@ fn param_copy_alias(
                 self.need_sh = true;
                 for w in &words {
                     if let Some(name) = Self::str_arg(&[(*w).clone()], 0) {
+                        // nameref: `unset [-n] ref` removes the alias (not
+                        // the target). Strip `-n` flag word if present.
+                        // (BASHC_FIX typeset -n.)
+                        if name == "-n" {
+                            continue;
+                        }
+                        if self.nameref.remove(&name).is_some() {
+                            self.nonnull_forget(&name);
+                            continue;
+                        }
                         // P1 follow-up: unset clears the var (over-removal
                         // if an exotic path preserves it — sound).
                         self.nonnull_forget(&name);
@@ -13660,15 +13718,45 @@ fn param_copy_alias(
         // (`typeset -i n=1 m=2` marks both; `+X` clears). Merged into
         // typeset_attrs at each var assign (sticky across commands).
         let (mut attr_set, mut attr_clear) = (0u8, 0u8);
+        // `typeset -n` (nameref): subsequent `ref=target` words alias
+        // (no value storage). Static ident targets only (BASHC_FIX).
+        let mut saw_n = false;
         while i < words.len() {
             // pure `-il`/`+u` words (other flags keep old paths).
             if let IrExpr::Str(f, _) = words[i] {
+                if f == "-n" {
+                    saw_n = true;
+                    i += 1;
+                    continue;
+                }
+                if f == "+n" {
+                    saw_n = false;
+                    i += 1;
+                    continue;
+                }
                 if let Some((s, c)) = Self::typeset_flag_word(f) {
                     // later flags win per bit (`-i +i` clears).
                     attr_set = (attr_set | s) & !c;
                     attr_clear = (attr_clear | c) & !s;
                     i += 1;
                     continue;
+                }
+            }
+            // nameref alias decl (`ref=target`, both idents).
+            if saw_n {
+                if let Some(ws) = Self::str_arg(&[(*words[i]).clone()], 0) {
+                    if let Some((rf, tg)) = ws.split_once('=') {
+                        if crate::c_backend::is_ident(rf)
+                            && crate::c_backend::is_ident(tg)
+                        {
+                            self.nameref.insert(rf.to_string(), tg.to_string());
+                            // forget stale proofs for the alias (reads
+                            // bypass storage now).
+                            self.nonnull_forget(rf);
+                            i += 1;
+                            continue;
+                        }
+                    }
                 }
             }
             // `declare -a arr=(1 2)` — the core passes the literal as a
@@ -20283,6 +20371,29 @@ fn param_copy_alias(
                     self.mark_todo("multi-target assign");
                     return;
                 };
+                // NAMEREF write-through (BASHC_FIX typeset -n): rewrite to
+                // ultimate target and re-dispatch (all normal logic then
+                // applies to the target). Base-only resolve (keep `[i]`).
+                {
+                    let (base, suffix) = match t.var.find('[') {
+                        Some(o) => (&t.var[..o], &t.var[o..]),
+                        None => (t.var.as_str(), ""),
+                    };
+                    if self.nameref.contains_key(base) {
+                        let rbase = self.resolve_nameref(base);
+                        let full = format!("{rbase}{suffix}");
+                        if full != t.var {
+                            let mut s2 = s.clone();
+                            if let IrStmt::Assign { targets, .. } = &mut s2 {
+                                if let Some(t2) = targets.first_mut() {
+                                    t2.var = full;
+                                }
+                            }
+                            self.stmt(&s2);
+                            return;
+                        }
+                    }
+                }
                 if !t.indices.is_empty() {
                     // `arr[1]=x` / `map[key]=x` — array element write
                     self.emit_array_assign(&t.var, &t.indices[0], expr);
