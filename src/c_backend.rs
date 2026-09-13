@@ -13733,6 +13733,142 @@ fn param_copy_alias(
         }
     }
 
+    /// Bash-canonical function deparse for `typeset -f` (BASHC_FIX).
+    /// Format (byte-exact vs bash): `name () \n{ \n` + 4-space-indented
+    /// commands (`;` after each except last) + `}\n`. Covers echo/local/
+    /// declare/assign/return/simple calls; others become `:` (documented).
+    /// `$x` refs stay literal (not evaluated).
+    fn fn_deparse(&mut self, name: &str, body: &[IrStmt]) -> String {
+        fn word_text(w: &IrExpr) -> String {
+            match w {
+                IrExpr::Str(s, st) => match st {
+                    crate::ir::StrStyle::SingleQuoted => format!("'{s}'"),
+                    _ => {
+                        if s.contains(' ') || s.contains('"') || s.contains('$') || s.is_empty() {
+                            // preserve double quotes (escape inner)? Bash
+                            // deparse keeps original quoting; approximate
+                            // with double quotes (escape $, `, \, ").
+                            let e = s.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`");
+                            format!("\"{e}\"")
+                        } else {
+                            s.clone()
+                        }
+                    }
+                },
+                IrExpr::Int(n) => n.to_string(),
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    match Render::str_arg(args, 0).as_deref() {
+                        Some(n) => format!("${n}"),
+                        None => "$?".to_string(),
+                    }
+                }
+                IrExpr::Interpolate(parts) => {
+                    // deparse as double-quoted with $refs (approximate).
+                    let mut s = String::from("\"");
+                    for p in parts {
+                        match p {
+                            crate::ir::InterpPart::Lit(t) => {
+                                s.push_str(&t.replace('"', "\\\""));
+                            }
+                            crate::ir::InterpPart::Expr(x) => {
+                                s.push_str(&word_text(x));
+                            }
+                        }
+                    }
+                    s.push('"');
+                    s
+                }
+                _ => ":".to_string(),
+            }
+        }
+        fn stmt_text(st: &IrStmt) -> Option<String> {
+            match st {
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "builtin" || func == "exec" => {
+                    let cmd = Render::str_arg(args, 0)?;
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        let ws: Vec<String> = items.iter().map(word_text).collect();
+                        Some(format!("{} {}", cmd, ws.join(" ")).trim_end().to_string())
+                    } else {
+                        Some(cmd)
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    let t = targets.first()?;
+                    if !t.indices.is_empty() {
+                        return None;
+                    }
+                    let v = match expr {
+                        IrExpr::Str(s, _) => {
+                            if s.contains(' ') {
+                                format!("\"{s}\"")
+                            } else {
+                                s.clone()
+                            }
+                        }
+                        IrExpr::Int(n) => n.to_string(),
+                        _ => return None,
+                    };
+                    Some(format!("{}={}", t.var, v))
+                }
+                IrStmt::Return(e) => {
+                    match e {
+                        Some(x) => Some(format!("return {}", word_text(x))),
+                        None => Some("return".to_string()),
+                    }
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    // `local x=5` (single var + init only; multi/complex → None).
+                    if vars.len() != 1 {
+                        return None;
+                    }
+                    let v = &vars[0];
+                    match init {
+                        None => Some(format!("local {}", v.name)),
+                        Some(e) => {
+                            let vs = match e {
+                                IrExpr::Str(s, _) => {
+                                    if s.contains(' ') {
+                                        format!("\"{s}\"")
+                                    } else {
+                                        s.clone()
+                                    }
+                                }
+                                IrExpr::Int(n) => n.to_string(),
+                                _ => return None,
+                            };
+                            // `local` vs `declare` keyword? Bash deparse uses
+                            // the original (`local` inside functions). Assume
+                            // local (functions are the -f context).
+                            Some(format!("local {}={}", v.name, vs))
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+        let mut out = format!("{name} () \n{{ \n");
+        let texts: Vec<String> = body.iter().filter_map(stmt_text).collect();
+        // if any stmt unsupported, fall back to `:` body? (Bash prints
+        // real code; we approximate. If counts differ, use `:` for all?
+        // Simpler: deparse what we can; unsupported become `:` lines to
+        // keep line count? NO — line count must match bash (which prints
+        // real stmts). If ANY unsupported, give up (return `:` stub)?
+        // For gate exactness on simple fns, all-supported is required;
+        // complex fns fall back to single `:` (red, documented).
+        if texts.len() != body.len() {
+            return format!("{name} () \n{{ \n    :\n}}\n");
+        }
+        for (i, t) in texts.iter().enumerate() {
+            if i + 1 < texts.len() {
+                out.push_str(&format!("    {t};\n"));
+            } else {
+                out.push_str(&format!("    {t}\n"));
+            }
+        }
+        out.push_str("}\n");
+        out
+    }
+
     fn declare_words(&mut self, words: &[&IrExpr]) {
         // list/print modes divert BEFORE normal processing (`typeset -F`
         // names, `typeset -p` prints; `-f` definitions need source text
@@ -13754,6 +13890,31 @@ fn param_copy_alias(
                         .map(|s| s.to_string())
                         .collect();
                     self.emit_declare_names(&fl);
+                    return;
+                }
+                if strs.iter().any(|s| *s == "-f") {
+                    // `typeset -f [names]` (definitions; BASHC_FIX).
+                    let ns: Vec<String> = strs
+                        .iter()
+                        .filter(|s| !s.starts_with('-') && !s.starts_with('+'))
+                        .map(|s| s.to_string())
+                        .collect();
+                    let targets: Vec<(String, Vec<IrStmt>)> = if ns.is_empty() {
+                        self.fn_defs.clone()
+                    } else {
+                        ns.iter()
+                            .filter_map(|n| {
+                                self.fn_defs
+                                    .iter()
+                                    .find(|(fn_, _)| fn_ == n)
+                                    .cloned()
+                            })
+                            .collect()
+                    };
+                    for (fn_, body) in &targets {
+                        let text = self.fn_deparse(fn_, body);
+                        self.emit(&format!("fputs({}, stdout);", Self::cstr(&text)));
+                    }
                     return;
                 }
                 if strs.iter().any(|s| *s == "-p") {
