@@ -996,14 +996,19 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "=" | "==" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
             "!=" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
+            // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
+            // old catchall parsed it as "text contains a -flag", a bogus
+            // truthiness). Perl accepts a STRING as the pattern, so the
+            // single-quoted render is safe against delimiter chars;
+            // Perl's dialect ≈ ERE for the corpus patterns.
             "=~" => {
-                // `[[ $s =~ re ]]` — regex match (triage-perl t68_case_glob,
-                // regex_test_op_renders_match). The rhs is a bare ERE
-                // pattern; single-quoted so delimiter/interpolation chars
-                // stay literal (Perl's dialect ≈ ERE for the corpus).
-                let l = left.trim().trim_matches('"');
-                let r = right.trim().trim_matches('"').replace('\'', "\\'");
-                IrExpr::Str(format!("({} =~ '{}')", l, r), StrStyle::Raw)
+                let l = left.trim_matches('"');
+                let pat = right
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, pat), StrStyle::Raw)
             }
             // numeric comparisons (`-eq`/`-ne`/`-gt`/`-ge`/`-lt`/`-le`):
             // the operands are `${name}` refs or literals — Perl numifies
@@ -1018,6 +1023,20 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
             "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
             "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
+            // old catchall parsed it as "text contains a -flag", a bogus
+            // truthiness). Perl accepts a STRING as the pattern, so the
+            // single-quoted render is safe against delimiter chars;
+            // Perl's dialect ≈ ERE for the corpus patterns.
+            "=~" => {
+                let l = left.trim_matches('"');
+                let pat = right
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, pat), StrStyle::Raw)
+            }
             "-ef" => {
                 // Compare device and inode: (stat(f))[0] eq (stat(g))[0] && (stat(f))[1] eq (stat(g))[1]
                 let stat_left = IrExpr::Str(format!("(stat(\"{}\"))[0]", left), StrStyle::Raw);

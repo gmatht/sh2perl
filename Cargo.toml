@@ -54,4 +54,3 @@ strip = true     # Strip symbols
 
 [profile.release.package."*"]
 opt-level = "z"
-
