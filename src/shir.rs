@@ -7386,39 +7386,6 @@ use std::collections::{HashMap, HashSet};
         dynamic: bool,
     }
 
-/// variable references inside a BAKED array-index name: `"tpx[$ti]"` /
-/// `"arr[${i}]"` → ["ti"] / ["i"]. Positional (`$1`) and special
-/// (`$?`, `$@`) names are not vars, so they are skipped.
-fn index_name_refs(name: &str) -> Vec<String> {
-    let b = name.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'$' && i + 1 < b.len() {
-            let braced = b[i + 1] == b'{';
-            let mut j = i + 1 + usize::from(braced);
-            let start = j;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                j += 1;
-            }
-            if j > start {
-                let nm = &name[start..j];
-                let positional = nm.bytes().all(|c| c.is_ascii_digit());
-                let arr_decor = name[j..].starts_with("[@]") || name[j..].starts_with("[*]");
-                if !positional && !arr_decor {
-                    out.push(nm.to_string());
-                }
-                i = if braced { j + 1 } else { j };
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
     fn site(acc: &mut Acc, name: &str, multi_run: bool) {
         *acc.sites.entry(name.to_string()).or_insert(0) += 1;
         if multi_run {
@@ -25731,6 +25698,39 @@ fn call_is_always_true(e: &Expr) -> bool {
 pub fn shir_to_estree_compiled(prog: &IrProgram) -> Program {
     let estree = crate::estree::fix_control_flow(shir_to_estree(prog));
     crate::estree::compile_head_passes(estree)
+}
+
+/// variable references inside a BAKED array-index name: `"tpx[$ti]"` /
+/// `"arr[${i}]"` → ["ti"] / ["i"]. Positional (`$1`) and special
+/// (`$?`, `$@`) names are not vars, so they are skipped.
+pub(crate) fn index_name_refs(name: &str) -> Vec<String> {
+    let b = name.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            let braced = b[i + 1] == b'{';
+            let mut j = i + 1 + usize::from(braced);
+            let start = j;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > start {
+                let nm = &name[start..j];
+                let positional = nm.bytes().all(|c| c.is_ascii_digit());
+                let arr_decor = name[j..].starts_with("[@]") || name[j..].starts_with("[*]");
+                if !positional && !arr_decor {
+                    out.push(nm.to_string());
+                }
+                i = if braced { j + 1 } else { j };
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {

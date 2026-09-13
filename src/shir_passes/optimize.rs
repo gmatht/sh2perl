@@ -197,7 +197,16 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
         IrStmt::Expr(e) => expr_reads(name, e),
         IrStmt::Assign { targets, expr, .. } => {
             expr_reads(name, expr)
-                || targets.iter().any(|t| t.indices.iter().any(|i| expr_reads(name, i)))
+                // the index is either a live `indices` expr OR BAKED into
+                // the target name (`arr[$i]=v` → var "arr[$i]"). Both are
+                // READS of the index variable: without the baked case the
+                // definition of `i` looks dead and the DSE below deletes
+                // it, so `arr[$i]=v` writes a dead key `arr[]` (mimecroft
+                // lost `sp_i=$1` and recorded 1 of 10 artifacts).
+                || targets.iter().any(|t| {
+                    t.indices.iter().any(|i| expr_reads(name, i))
+                        || crate::shir::index_name_refs(&t.var).iter().any(|r| r == name)
+                })
         }
         IrStmt::Declare { init, .. } => init.as_ref().is_some_and(|i| expr_reads(name, i)),
         IrStmt::DeclareArray { elements, .. } => elements.iter().any(|e| expr_reads(name, e)),
@@ -575,6 +584,12 @@ fn record_stmt_reads(rm: &mut ReadMap, name: &str, list: usize, pos: usize, st: 
             for t in targets {
                 for i in &t.indices {
                     record_expr_reads(rm, name, list, pos, i);
+                }
+                // baked index names (`arr[$i]`) read the index variable
+                for r in crate::shir::index_name_refs(&t.var) {
+                    if r == name {
+                        rm.reads.entry(r).or_default().push((list, pos));
+                    }
                 }
             }
         }
@@ -1448,6 +1463,11 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
                 for i in t.indices.iter() {
                     collect_expr_read_names(i, out);
                 }
+                // a BAKED index name (`arr[$i]=v`) reads `i`: this is the
+                // scan the DCE uses to decide a store is dead, so without
+                // it `i`'s own definition is dropped and the write lands
+                // on the dead key `arr[]` (mimecroft: 1 of 10 artifacts).
+                out.extend(crate::shir::index_name_refs(&t.var));
             }
         }
         IrStmt::Declare { init, .. } => {
