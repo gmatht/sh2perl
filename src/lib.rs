@@ -35,6 +35,7 @@ pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
 pub mod glsl_backend;
+pub mod vulkan_backend; // compute-shader emitter for bash-O4 autoshaderise (docs/BASH-O4.md §4.4)
 pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;

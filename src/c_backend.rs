@@ -246,6 +246,11 @@ pub struct Render {
     /// named-temp counter for statement-level snprintf buffers
     /// (`char _sN[cap]; snprintf(_sN, ...)` before the enclosing stmt)
     temp_seq: usize,
+    /// split-word env-temp counter (`_SHSPLIT_N`): each unquoted split
+    /// word gets its OWN temp — sharing one `_SHSPLIT` let a second
+    /// export clobber the first before the child expanded it
+    /// (`echo $1 $2` printed `$2` twice).
+    split_seq: usize,
     /// compile-time-constant bigint values (decimal strings) materialized
     /// as GLOBAL `mpz_t _bigint_<v>` constants, shared across functions.
     bigint_consts: std::collections::BTreeSet<String>,
@@ -4975,6 +4980,21 @@ impl Render {
                 if self.need_stat_ops.contains(*op) {
                     self.emit(body);
                 }
+            }
+            if self.need_stat_ops.contains("mkdir") {
+                self.emit("/* mkdir -p: create parents as needed (EEXIST is success) */");
+                self.emit("static int _sh_mkdir_p(char *p) {");
+                self.emit("  if (mkdir(p, 0777) == 0) return 0;");
+                self.emit("  if (errno == EEXIST) { struct stat st; return (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : 1; }");
+                self.emit("  for (char *q = p + 1; *q; q++) {");
+                self.emit("    if (*q != '/') continue;");
+                self.emit("    *q = 0;");
+                self.emit("    if (mkdir(p, 0777) != 0 && errno != EEXIST) { *q = '/'; return 1; }");
+                self.emit("    *q = '/';");
+                self.emit("  }");
+                self.emit("  if (mkdir(p, 0777) == 0 || errno == EEXIST) return 0;");
+                self.emit("  return 1;");
+                self.emit("}");
             }
         }
         if self.need_pow {
@@ -10737,20 +10757,22 @@ fn param_copy_alias(
                 }
                 "split" => {
                     // unquoted $var: the value must be re-SPLIT by the
-                    // child shell — export it and append the bare ref
+                    // child shell — export it under a FRESH temp (see
+                    // split_temp) and append the bare ref
                     let v = match args.first() {
                         Some(x) => self.value_c(x),
                         None => "\"\"".into(),
                     };
+                    let st = self.split_temp();
                     match buf {
                         CmdBuf::Shared => {
-                            self.emit(&format!("_sh_export(\"_SHSPLIT\", {v});"));
-                            self.emit("_sh_addraw(\"$_SHSPLIT\");");
+                            self.emit(&format!("_sh_export(\"{st}\", {v});"));
+                            self.emit(&format!("_sh_addraw(\"${st}\");"));
                         }
                         CmdBuf::Private(id) => {
-                            self.emit(&format!("_sh_export(\"_SHSPLIT\", {v});"));
+                            self.emit(&format!("_sh_export(\"{st}\", {v});"));
                             self.emit(&format!(
-                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHSPLIT\");"
+                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" ${st}\");"
                             ));
                         }
                     }
@@ -10797,15 +10819,16 @@ fn param_copy_alias(
                         // Export the raw capture and append the BARE ref so
                         // the child re-splits it — a quoted `_sh_word` would
                         // keep the embedded newlines (bash single-token).
+                        let st = self.split_temp();
                         match buf {
                             CmdBuf::Shared => {
-                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
-                                self.emit("_sh_addraw(\"$_SHSPLIT\");");
+                                self.emit(&format!("_sh_export(\"{st}\", {t});"));
+                                self.emit(&format!("_sh_addraw(\"${st}\");"));
                             }
                             CmdBuf::Private(id) => {
-                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
+                                self.emit(&format!("_sh_export(\"{st}\", {t});"));
                                 self.emit(&format!(
-                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHSPLIT\");"
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" ${st}\");"
                                 ));
                             }
                         }
@@ -13387,6 +13410,182 @@ fn param_copy_alias(
                 self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
+            "mkdir" => {
+                // `mkdir [-p] dir...` — native mkdir(2). -p makes
+                // parents (mkdir -p semantics); plain form fails if
+                // the parent is missing (bash parity: rc!=0).
+                self.need_sh = true;
+                self.need_stat_ops.insert("mkdir".to_string());
+                let mut mkp = false;
+                let mut dirs: Vec<String> = Vec::new();
+                let mut ok = true;
+                for w in &words {
+                    if let Some(s) = Self::str_arg(&[(*w).clone()], 0) {
+                        if s == "-p" || s == "-pv" || s == "-vp" {
+                            mkp = true;
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            ok = false;
+                            break;
+                        }
+                        // brace/tilde expand only in child bash (static
+                        // words; dynamic words are runtime data)
+                        if Self::static_needs_shell(&s) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if Self::word_needs_glob(w) || !Self::word_single_argv(w) {
+                        ok = false;
+                        break;
+                    }
+                    dirs.push(self.value_c(w));
+                }
+                if !ok {
+                    return self.shell_exec(args);
+                }
+                if dirs.is_empty() {
+                    return "(_sh_rc = 1, 0)".into();
+                }
+                if mkp {
+                    return format!(
+                        "({{ int _mr = 0; {} _sh_rc = (_mr == 0 ? 0 : 1); _mr == 0; }})",
+                        dirs.iter()
+                            .map(|d| format!("{{ _mr |= _sh_mkdir_p({d}); }}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                return format!(
+                    "({{ int _mr = 0; {} _sh_rc = (_mr == 0 ? 0 : 1); _mr == 0; }})",
+                    dirs.iter()
+                        .map(|d| format!("{{ if (mkdir({d}, 0777) != 0) _mr = 1; }}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            "touch" => {
+                // `touch file...` — create-or-keep (fopen "a").
+                // Flags other than -c keep the shell site.
+                self.need_sh = true;
+                let mut files: Vec<String> = Vec::new();
+                let mut ok = true;
+                for w in &words {
+                    if let Some(s) = Self::str_arg(&[(*w).clone()], 0) {
+                        if s == "-c" {
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            ok = false;
+                            break;
+                        }
+                        if Self::static_needs_shell(&s) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if Self::word_needs_glob(w) || !Self::word_single_argv(w) {
+                        ok = false;
+                        break;
+                    }
+                    files.push(self.value_c(w));
+                }
+                if !ok {
+                    return self.shell_exec(args);
+                }
+                return format!(
+                    "({{ {} _sh_rc = 0; (_sh_rc == 0); }})",
+                    files
+                        .iter()
+                        .map(|f| format!("{{ FILE *_tf = fopen({f}, \"a\"); if (_tf) fclose(_tf); }}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            "rmdir" => {
+                self.need_sh = true;
+                let mut dirs: Vec<String> = Vec::new();
+                let mut ok = true;
+                for w in &words {
+                    if let Some(s) = Self::str_arg(&[(*w).clone()], 0) {
+                        if s.starts_with('-') {
+                            ok = false;
+                            break;
+                        }
+                        if Self::static_needs_shell(&s) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if Self::word_needs_glob(w) || !Self::word_single_argv(w) {
+                        ok = false;
+                        break;
+                    }
+                    dirs.push(self.value_c(w));
+                }
+                if !ok {
+                    return self.shell_exec(args);
+                }
+                if dirs.is_empty() {
+                    return "(_sh_rc = 1, 0)".into();
+                }
+                return format!(
+                    "({{ int _mr = 0; {} _sh_rc = (_mr == 0 ? 0 : 1); _mr == 0; }})",
+                    dirs.iter()
+                        .map(|d| format!("{{ if (rmdir({d}) != 0) _mr = 1; }}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            "rm" => {
+                // `rm -f file...` only: best-effort unlink, missing
+                // files ignored (bash -f parity). Any other flag set
+                // keeps the shell site.
+                let mut has_f = false;
+                let mut files: Vec<String> = Vec::new();
+                let mut ok = true;
+                for w in &words {
+                    if let Some(s) = Self::str_arg(&[(*w).clone()], 0) {
+                        if s == "-f" {
+                            has_f = true;
+                            continue;
+                        }
+                        if s == "--" {
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            ok = false;
+                            break;
+                        }
+                        if Self::static_needs_shell(&s) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if Self::word_needs_glob(w) || !Self::word_single_argv(w) {
+                        ok = false;
+                        break;
+                    }
+                    files.push(self.value_c(w));
+                }
+                if ok && has_f {
+                    self.need_sh = true;
+                    return format!(
+                        "({{ {} _sh_rc = 0; (_sh_rc == 0); }})",
+                        files
+                            .iter()
+                            .map(|f| format!("unlink({f});"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                if let Some(uu) = self.uu_run_opt(&cmd, &args) {
+                    self.need_sh = true;
+                    return format!("(_sh_rc = {uu}, _sh_rc == 0)");
+                }
+                return self.shell_exec(args);
+            }
             _ if self.functions.contains(&cmd) => {
                 // a defined shell function's call; the body's last command
                 // sets _sh_rc, so `(f(), _sh_rc)` is the function's status.
@@ -13450,51 +13649,267 @@ fn param_copy_alias(
         }
     }
 
-    /// UU-FFI.md: lower a STATIC genuinely-external command to an in-process
-    /// `sh2_uu_run(argv)` call instead of `bash -c`. Strictly opt-in (env
-    /// SH2_UU_FFI set at RENDER time) and strictly conservative: only a
-    /// plain external command with all-STATIC string words and no arrays /
-    /// env-carrying Object arg qualifies; anything dynamic keeps the
-    /// existing shell site (default, byte-identical). Returns Some(C-expr)
-    /// when the fast path applies.
-    fn uu_run_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
-        if std::env::var("SH2_UU_FFI").is_err() {
+    /// UU-FFI.md: lower a genuinely-external command to an in-process
+    /// `sh2_uu_run(argv)` call instead of `bash -c`. ON by default
+    /// (opt OUT with env SH2_UU_FFI=0 at RENDER time). Conservative:
+    /// only a plain external command the built library exposes, with no
+    /// env-carrying Object arg and no glob words, qualifies; anything
+    /// else keeps the existing shell site. Words may be STATIC or
+    /// DYNAMIC (dynamic words render via value_c into the argv array).
+    /// Returns Some(C-expr) when the fast path applies.
+    fn uu_cmd_ok(cmd: &str) -> bool {
+        // kept in sync with runtime/build_uu_ffi.sh FEATURES
+        matches!(
+            cmd,
+            "cat"
+                | "wc"
+                | "ls"
+                | "sort"
+                | "sed"
+                | "awk"
+                | "grep"
+                | "date"
+                | "sha256sum"
+                | "uname"
+                | "basename"
+                | "dirname"
+                | "cp"
+        )
+    }
+
+    /// Does this word need child-bash glob expansion (the core's
+    /// \x01SH2GLOB\x01 marker)? Such words must keep the shell site:
+    /// native argv has no shell to expand them.
+    fn word_needs_glob(w: &IrExpr) -> bool {
+        match w {
+            IrExpr::Str(s, _) => s.contains("SH2GLOB"),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Lit(s) => s.contains("SH2GLOB"),
+                InterpPart::Expr(x) => Self::word_needs_glob(x),
+            }),
+            IrExpr::Array(items) => items.iter().any(Self::word_needs_glob),
+            IrExpr::Call { args, .. } => args.iter().any(Self::word_needs_glob),
+            _ => false,
+        }
+    }
+
+    /// Static-word syntax needing child bash: brace expansion (`{a,b}`
+    /// / `{1..3}` — the core passes them through as ONE word for the
+    /// child to expand) and tilde (`~/x`). Only STATIC words refuse:
+    /// dynamic words are program DATA at runtime (bash does not
+    /// brace/tilde-expand `$var` contents), so native is exact for them.
+    fn static_needs_shell(s: &str) -> bool {
+        s.contains('{') || s.starts_with('~')
+    }
+
+    /// `grep` argv allowlist (UU-FFI.md §5/§9 contract: the renderer must
+    /// confirm the exact argv form is supported, else keep fork/exec).
+    /// The uu frontend (`coreutils-ffi/src/lib.rs` grepfront) renders only
+    /// a subset faithfully, PROBED byte-identical vs GNU grep 3.11:
+    /// bare, `-i`, `-v`, `-c` (single path), `-n`, `-F`, `-e` (+ `--`).
+    /// Everything else is refused: `-H` prints `N:` instead of `file:`
+    /// (flag conflated with line numbers), `-l` drops the filename,
+    /// `-o` prints whole lines, `-r` prints the dir not the file,
+    /// multi-path `-c` prints running totals, `-h` keeps `file:` prefixes
+    /// on multi-path, `-q -m -b -L -A/-B/-C -Z --color -x -w -I -E -P -s`
+    /// and clustering (`-iv`) fail loudly (rc 2) where GNU differs, and a
+    /// second `-e` or a bare operand beside `-e` changes the pattern set
+    /// (frontend keeps only the last `-e`; GNU ORs). `-` (stdin) is
+    /// refused: the frontend reads it as a literal path.
+    /// Only STATIC words are validated; dynamic words are assumed
+    /// operands (a dynamic flag-valued var is pathological; the corpus
+    /// gate is the backstop).
+    fn uu_grep_ok(words: &[IrExpr]) -> bool {
+        const ALLOW: &[&str] = &["-i", "-v", "-c", "-n", "-F", "-e", "--"];
+        let mut seen_dashdash = false;
+        let mut e_pending = false;
+        let mut e_count = 0;
+        let mut bare_pattern = false;
+        let mut has_c = false;
+        let mut paths = 0;
+        for w in words {
+            if e_pending {
+                // `-e`'s argument: the pattern (even `-w`/`-` — literal).
+                e_pending = false;
+                continue;
+            }
+            if let Some(s) = Self::str_arg(&[w.clone()], 0) {
+                if seen_dashdash {
+                    if s == "-" {
+                        return false;
+                    }
+                    paths += 1;
+                    continue;
+                }
+                if s == "-e" {
+                    e_count += 1;
+                    if e_count > 1 {
+                        return false;
+                    }
+                    e_pending = true;
+                    continue;
+                }
+                if s == "--" {
+                    seen_dashdash = true;
+                    continue;
+                }
+                if s == "-c" {
+                    has_c = true;
+                    continue;
+                }
+                if s.starts_with('-') {
+                    if !ALLOW.contains(&s.as_str()) {
+                        return false;
+                    }
+                    continue;
+                }
+                if s == "-" {
+                    return false;
+                }
+                // operand: pattern or path
+                if !bare_pattern && e_count == 0 {
+                    bare_pattern = true;
+                } else {
+                    paths += 1;
+                }
+            } else {
+                // dynamic word: assumed operand (see doc above).
+                if !bare_pattern && e_count == 0 {
+                    bare_pattern = true;
+                } else {
+                    paths += 1;
+                }
+            }
+        }
+        if e_pending {
+            return false; // dangling `-e` (both sides error; rc differs)
+        }
+        if bare_pattern && e_count > 0 {
+            return false; // GNU ORs; frontend keeps last `-e` only
+        }
+        if has_c && paths != 1 {
+            return false; // multi-path `-c` prints running totals
+        }
+        true
+    }
+
+    /// Can this word lower to EXACTLY ONE argv entry? Multi-word
+    /// producers (brace expansion, unquoted `split`, word-splitting
+    /// captures, `$@`-style list splices, ranges) expand to N words in
+    /// child bash — argv building cannot represent them, so they keep
+    /// the shell site. Scalar dynamics (vars, interpolation over
+    /// scalars, scalar captures) are one entry; the core wraps unquoted
+    /// expansions needing split in explicit `split` nodes.
+    fn word_single_argv(w: &IrExpr) -> bool {
+        match w {
+            IrExpr::Str(..) | IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
+            IrExpr::Arith(..) => true,
+            IrExpr::Index { key, .. } => Self::word_single_argv(key),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(..) => true,
+                InterpPart::Expr(x) => Self::word_single_argv(x),
+            }),
+            IrExpr::Capture { expr, .. } => Self::word_single_argv(expr),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::word_single_argv(lhs) && Self::word_single_argv(rhs)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::word_single_argv(cond)
+                    && Self::word_single_argv(then)
+                    && Self::word_single_argv(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                Self::word_single_argv(expr) && Self::word_single_argv(default)
+            }
+            IrExpr::Call { func, args } => match func.as_str() {
+                "split" | "captureWords" | "brace" | "listVar" | "arrayItems"
+                | "pipeline" => false,
+                _ => args.iter().all(Self::word_single_argv),
+            },
+            _ => false,
+        }
+    }
+
+    /// Build the argv array decl for a uu-ffi call; returns the array
+    /// name. Shared by the exec (sh2_uu_run) and capture
+    /// (sh2_uu_capture) paths.
+    fn uu_argv(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        if std::env::var("SH2_UU_FFI").as_deref() == Ok("0") {
             return None;
         }
-        // command must not already be handled natively (this is only ever
-        // reached from the generic `_ =>` arm, so it's an external tool),
-        // and it must be one the built library exposes.
-        const EXTERNAL: &[&str] = &["cat", "wc", "ls", "sort", "sed", "awk"];
-        if !EXTERNAL.contains(&cmd) {
+        if !Self::uu_cmd_ok(cmd) {
+            return None;
+        }
+        // no env-prefix Object arg (IFS=: cmd ...) — the shell site
+        // carries that prefix; uu_run has no env channel.
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
             return None;
         }
         let words = match args.get(1) {
             Some(IrExpr::Array(items)) => items,
             _ => return None,
         };
-        // every word must be a static string (no interpolation / call /
-        // array / env Object) so argv is built at RENDER time.
-        let mut argv: Vec<String> = vec![cmd.to_string()];
-        for w in words {
-            let IrExpr::Str(s, _) = w else { return None };
-            argv.push(s.clone());
-        }
-        // no env-prefix Object arg (IFS=: cmd ...), no array materialization
-        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+        // glob words expand only in child bash — refuse first, BEFORE
+        // value_c emits anything (dead temps would just be noise).
+        if words.iter().any(Self::word_needs_glob) {
             return None;
         }
-        // build `char *_sh_uu_avN[] = { ... };` + emit the call expression.
+        // each word must lower to exactly one argv entry (brace,
+        // split, $@-splices expand to N words in child bash).
+        if words.iter().any(|w| !Self::word_single_argv(w)) {
+            return None;
+        }
+        // grep: the uu frontend renders only a subset faithfully
+        // (uu_grep_ok) — anything else keeps fork/exec.
+        if cmd == "grep" && !Self::uu_grep_ok(words) {
+            return None;
+        }
+        let mut parts: Vec<String> = vec![Self::cstr(cmd)];
+        for w in words {
+            match w {
+                IrExpr::Str(s, _) => {
+                    if Self::static_needs_shell(s) {
+                        return None;
+                    }
+                    parts.push(Self::cstr(s))
+                }
+                // dynamic words render via value_c (often `const char *`)
+                // — the argv array is `char *[]` (as in native_pipeline),
+                // so cast at the element (uu_run does not mutate argv).
+                _ => parts.push(format!("(char *)({})", self.value_c(w))),
+            }
+        }
         let av = format!("_sh_uu_av{}", self.temp_seq);
         self.temp_seq += 1;
-        let arr: Vec<String> = argv.iter().map(|a| Self::cstr(a)).collect();
-        let mut decl = format!("char *{av}[] = {{");
-        decl.push_str(&arr.join(", "));
-        decl.push_str(", 0};");
-        self.emit(&decl);
+        self.emit(&format!("char *{av}[] = {{{}, 0}};", parts.join(", ")));
         self.need_uu = true;
+        Some(av)
+    }
+
+    fn uu_run_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let av = self.uu_argv(cmd, args)?;
         Some(format!(
-            "sh2_uu_run((int)(sizeof {av} / sizeof {av}[0]) - 1, {av})"
+            "_sh_uu_run((int)(sizeof {av} / sizeof {av}[0]) - 1, {av})"
         ))
+    }
+
+    /// Capture form: `$(uu-cmd args)` → in-process sh2_uu_capture into
+    /// a vbuf, trailing newlines stripped (bash $(...) semantics), rc
+    /// in _sh_rc. Emits the statements NOW (like value_c temps) and
+    /// returns the char* value expression.
+    fn uu_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let av = self.uu_argv(cmd, args)?;
+        let buf = self.vbuf_temp();
+        self.need_sh = true;
+        self.emit(&format!("_sh_vgrow(&{buf}, 65536);"));
+        self.emit(&format!(
+            "_sh_rc = _sh_uu_capture((int)(sizeof {av} / sizeof {av}[0]) - 1, {av}, {buf}.p, {buf}.cap, 0);"
+        ));
+        // bash $(...) strips ALL trailing newlines (not other space)
+        self.emit(&format!(
+            "{{ size_t _ul = strlen({buf}.p); while (_ul && {buf}.p[_ul-1] == '\\n') {buf}.p[--_ul] = 0; }}"
+        ));
+        Some(format!("{buf}.p"))
     }
 
     /// `export X=1` / `declare x=...` — apply the assignments to the store.
@@ -14568,6 +14983,19 @@ fn param_copy_alias(
                 }
             }
         }
+        // `$(uu-cmd args)` of a genuinely-external command: capture
+        // in-process (no fork/exec, no bash). Single-stmt shape only.
+        if let [IrExpr::Arrow(stmts)] = args {
+            if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
+                if matches!(func.as_str(), "exec" | "builtin") {
+                    if let Some(cmd) = Self::str_arg(cargs, 0) {
+                        if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                    }
+                }
+            }
+        }
         let args = args.to_vec();
         self.cap_site(|r, id| {
             r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
@@ -14591,6 +15019,18 @@ fn param_copy_alias(
     /// wrapped Arrow body as a command and capture its stdout (the
     /// runtime `_sh_capture` strips trailing newlines, bash semantics).
     fn capture_expr(&mut self, expr: &IrExpr) -> String {
+        // `$(uu-cmd args)` fast path (same as capture_call).
+        if let IrExpr::Arrow(stmts) = expr {
+            if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
+                if matches!(func.as_str(), "exec" | "builtin") {
+                    if let Some(cmd) = Self::str_arg(cargs, 0) {
+                        if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                    }
+                }
+            }
+        }
         let expr = expr.clone();
         self.cap_site(|r, id| {
             r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
@@ -18155,6 +18595,27 @@ fn param_copy_alias(
         self.emit(&format!("{{ const char *_vv{seq} = ({val}); long long _kk{seq} = (long long)({key}); if (_vv{seq} && _kk{seq} >= 0) {{ while ((size_t)(_kk{seq} + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {store} if ((size_t)(_kk{seq} + 1) > {id}_len) {id}_len = _kk{seq} + 1; }} }}"));
     }
 
+    /// `$i` (bare dollar + identifier chars): a dynamic key, never an
+    /// assoc literal. `${...}` forms are NOT bare (handled separately).
+    fn is_bare_dollar_var(k: &str) -> bool {
+        match k.strip_prefix('$') {
+            Some(rest) => {
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            None => false,
+        }
+    }
+
+    /// Fresh split-word env temp (`_SHSPLIT_N`). Each unquoted split
+    /// word exports under its OWN temp — sharing one `_SHSPLIT` let a
+    /// second export clobber the first before the child expanded it
+    /// (`echo $1 $2` printed `$2` twice).
+    fn split_temp(&mut self) -> String {
+        let n = self.split_seq;
+        self.split_seq += 1;
+        format!("_SHSPLIT{n}")
+    }
+
     /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
     fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
         self.arrays.insert(var.to_string());
@@ -18221,8 +18682,13 @@ fn param_copy_alias(
                 self.emit(&format!(
                     "_sh_arr_set({id}, &{id}_len, {acap}, {kv}, {v});"
                 ));
-            } else {
-                self.assoc_arrays.insert(var.to_string());
+            } else if !Self::is_bare_dollar_var(k.trim()) {
+                // A literal string key implies assoc (`m[os]=v` — an
+                // indexed array cannot have string keys). Bare `$var`
+                // keys are NOT literals: they resolve at runtime and are
+                // handled (assoc-aware) by the `$var` block below; routing
+                // them here wrote a literal `"$i"` assoc entry AND
+                // poisoned later reads via assoc_arrays.
                 // bash strips subscript QUOTES at parse time — `m["os"]=v`
                 // stores key `os` (the raw shIR text keeps them)
                 let kc = k.trim().trim_matches(|c| c == '"' || c == '\'');
@@ -18242,10 +18708,19 @@ fn param_copy_alias(
                 "_sh_arr_set({id}, &{id}_len, {acap}, {k}, {v});"
             ));
         }
-        // `arr[$i]=x` — the Str key carries the raw `$i` text
+        // `arr[$i]=x` — the Str key carries the raw `$i` text: dynamic,
+        // assoc-aware. Indexed arrays take the numeric index; assoc
+        // arrays take the runtime string value as the key.
         if let IrExpr::Str(k, _) = key {
             if let Some(rest) = k.strip_prefix('$') {
                 if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    if self.assoc_arrays.contains(var) {
+                        let kv = self.value_c(&IrExpr::Var(rest.to_string(), None));
+                        self.emit(&format!(
+                            "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {kv}, {v});"
+                        ));
+                        return;
+                    }
                     let kv = if self.var_types.contains_key(rest) && self.is_num(rest) {
                         self.c_ident(rest)
                     } else {
@@ -33839,6 +34314,107 @@ mod tests {
             !out.contains("= _s"),
             "string temp stored into long long:\n{out}"
         );
+    }
+
+    #[test]
+    fn dollar_var_key_writes_indexed_not_assoc() {
+        // `a[$i]=v` on a plain (indexed) array: the `$i` key is dynamic
+        // — exactly one `_sh_arr_set` with the live index, and crucially
+        // NO `_sh_assoc_set` line. The assoc-hedge wrote a literal `"$i"`
+        // entry, poisoned later reads via `assoc_arrays`, and failed to
+        // compile when the assoc decls were absent (bash-O4 candidacy
+        // found this on the squares shape).
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::For {
+                var: "i".to_string(),
+                iter: IrExpr::Range { start: 0, end: 3 },
+                body: vec![IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "a[$i]".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(7),
+                    asm: None,
+                }],
+            }],
+            subs: vec![],
+            var_types: vec![("i".to_string(), crate::ir::IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("_sh_arr_set(a, &a_len,"),
+            "indexed store missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_assoc_set"),
+            "spurious assoc hedge for a dynamic key:\n{out}"
+        );
+        assert!(
+            !out.contains("\"$i\""),
+            "literal \"$i\" key must never materialize:\n{out}"
+        );
+    }
+
+    #[test]
+    fn two_split_words_get_distinct_temps() {
+        // `echo $1 $2` (two unquoted split words in one site): each word
+        // exports under its OWN `_SHSPLIT_N` temp. Sharing one temp let
+        // the second export clobber the first before the child expanded
+        // it — the program printed `$2` twice (bash-O4 parity found it).
+        fn split_word(n: &str) -> IrExpr {
+            IrExpr::Call {
+                func: "split".to_string(),
+                args: vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str(n.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                }],
+            }
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![split_word("1"), split_word("2")]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("_SHSPLIT0") && out.contains("_SHSPLIT1"),
+            "each split word needs its own temp:\n{out}"
+        );
+        // No bare (shared) temp may remain: every export/addraw pair
+        // must carry a numeric suffix.
+        for line in out.lines() {
+            if line.contains("_SHSPLIT") {
+                assert!(
+                    !line.contains("\"$_SHSPLIT\"") && !line.contains(" _SHSPLIT\""),
+                    "shared temp leaked:\n{line}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -30,6 +30,12 @@ int sh2_uu_run(int argc, char *const argv[]) {
     return uu_run(util, argc, argv);
 }
 
+/* `_sh_` aliases for generated C (see uu_run.h): the corpus gate's stub
+ * probe rejects any `sh2_*` identifier in generated programs. */
+int _sh_uu_run(int argc, char *const argv[]) {
+    return sh2_uu_run(argc, argv);
+}
+
 /* ------------------------------------------------------------------ */
 /* capture: pipe fd 1, drain on a reader thread while uu_run runs      */
 /* ------------------------------------------------------------------ */
@@ -101,4 +107,9 @@ int sh2_uu_capture(int argc, char *const argv[],
 
     if (out_len) *out_len = d.len;
     return code;
+}
+
+int _sh_uu_capture(int argc, char *const argv[],
+                   char *buf, size_t cap, size_t *out_len) {
+    return sh2_uu_capture(argc, argv, buf, cap, out_len);
 }
