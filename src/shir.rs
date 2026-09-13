@@ -7386,6 +7386,39 @@ use std::collections::{HashMap, HashSet};
         dynamic: bool,
     }
 
+/// variable references inside a BAKED array-index name: `"tpx[$ti]"` /
+/// `"arr[${i}]"` → ["ti"] / ["i"]. Positional (`$1`) and special
+/// (`$?`, `$@`) names are not vars, so they are skipped.
+fn index_name_refs(name: &str) -> Vec<String> {
+    let b = name.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            let braced = b[i + 1] == b'{';
+            let mut j = i + 1 + usize::from(braced);
+            let start = j;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > start {
+                let nm = &name[start..j];
+                let positional = nm.bytes().all(|c| c.is_ascii_digit());
+                let arr_decor = name[j..].starts_with("[@]") || name[j..].starts_with("[*]");
+                if !positional && !arr_decor {
+                    out.push(nm.to_string());
+                }
+                i = if braced { j + 1 } else { j };
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
     fn site(acc: &mut Acc, name: &str, multi_run: bool) {
         *acc.sites.entry(name.to_string()).or_insert(0) += 1;
         if multi_run {
@@ -7648,6 +7681,24 @@ use std::collections::{HashMap, HashSet};
                     if t.indices.is_empty() && !t.var.contains('[') {
                         site(acc, &t.var, multi_run);
                     } else {
+                        // the index expressions are READS — walk them
+                        for i in &t.indices {
+                            walk_expr(i, acc, multi_run);
+                        }
+                        // ... and the index may instead be BAKED into the
+                        // name (`arr[$i]=v` → var "arr[$i]", indices empty).
+                        // Those `$name` refs are reads too. Without them the
+                        // variable feeding the index looks unused (single
+                        // site, not multi-run) and is classified Const, so
+                        // the assignment that feeds it is elided as dead
+                        // code and the remaining positional args RENUMBER:
+                        //   set_pos() { ti=$1; tx=$2; tpx[$ti]=$tx; }
+                        // lost `ti=$1`, taking tx=$2 as sh2.positional[1],
+                        // so every `tpx[...]` write collapsed onto the dead
+                        // key `tpx[]` (mimecroft recorded 1 of 10 artifacts).
+                        for name in index_name_refs(&t.var) {
+                            site(acc, &name, multi_run);
+                        }
                         acc.index_written
                             .insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
                     }
@@ -50752,9 +50803,10 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
-        let differ_word = crate::generator::commands::cmp::cmp_differ_word();
+        // The differ wording ("byte" vs "char") follows the local cmp
+        // (see pipeline_native::capabilities::cmp); accept either.
         assert!(
-            perl.contains(&format!("differ: {differ_word}"))
+            perl.contains("differ: byte") || perl.contains("differ: char")
                 && perl.contains("%s %s differ")
                 && !perl.contains("system('bash'"),
             "bare cmp should lower to a native differ compare: {perl}"
