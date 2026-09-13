@@ -19436,6 +19436,82 @@ fn param_copy_alias(
         true
     }
 
+    /// Whole-pattern `$(...)` value (BASHC_FIX parse-redirect-in-case):
+    /// parse inner with core Parser, evaluate via capture machinery
+    /// (in-process for user fns, shell-out for external), return C temp.
+    /// None if not whole-pattern-substitution or parse fails (caller
+    /// falls back to literal text). Nested/quoted edge: balanced scan
+    /// with quote awareness.
+    fn case_subst_value(&mut self, pat: &str) -> Option<String> {
+        let t = pat.trim();
+        // backticks too (`...`).
+        let inner = if t.starts_with("$(") && t.ends_with(')') {
+            // balanced: find matching close for the opening `$(`.
+            let b = t.as_bytes();
+            let mut depth = 0;
+            let mut in_s = false;
+            let mut in_d = false;
+            let mut esc = false;
+            let mut end = None;
+            let mut i = 0;
+            while i < b.len() {
+                let c = b[i] as char;
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if in_s {
+                    if c == '\'' {
+                        in_s = false;
+                    }
+                } else if in_d {
+                    if c == '"' {
+                        in_d = false;
+                    }
+                } else if c == '\'' {
+                    in_s = true;
+                } else if c == '"' {
+                    in_d = true;
+                } else if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            // whole-pattern iff matching close is the last char.
+            match end {
+                Some(e) if e == b.len() - 1 => t[2..e].to_string(),
+                _ => return None,
+            }
+        } else if t.starts_with('`') && t.ends_with('`') && t.len() >= 2 {
+            t[1..t.len() - 1].to_string()
+        } else {
+            return None;
+        };
+        let Ok(cmds) = crate::parser::commands::Parser::new(&inner).parse() else {
+            return None;
+        };
+        let stmts: Vec<IrStmt> = cmds
+            .iter()
+            .filter_map(crate::shir::stmt_for_command)
+            .collect();
+        if stmts.is_empty() {
+            return None;
+        }
+        // capture node (Arrow body) → value_c runs it (fnValue in-process
+        // for user fns, shell-out otherwise — same as `$(...)` elsewhere).
+        let cap = IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![IrExpr::Arrow(stmts)],
+        };
+        Some(self.value_c(&cap))
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // static eval runs inline (functions hoisted to preamble).
         if self.try_static_eval(s) {
@@ -21696,7 +21772,12 @@ fn param_copy_alias(
                         // and an empty pattern must match the empty value
                         let pat_text = strip_glob(pat)
                             .trim_matches(|c| c == '"' || c == '\'');
-                        let pat_c = self.pattern_c(pat_text);
+                        // whole-pattern `$(...)`: evaluate in-process
+                        // (BASHC_FIX parse-redirect-in-case), else literal.
+                        let pat_c = match self.case_subst_value(&pat_text) {
+                            Some(v) => v,
+                            None => self.pattern_c(&pat_text),
+                        };
                         self.emit(&format!(
                             "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
                         ));
