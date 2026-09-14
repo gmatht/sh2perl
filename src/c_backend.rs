@@ -12619,7 +12619,9 @@ fn param_copy_alias(
             if self.reduce_arrays.contains(a) {
                 self.emit(&format!("long long {}_max = 0;", id));
                 self.emit(&format!("long long {}_min = 0;", id));
-                self.emit(&format!("long long {}_sum = 0;", id));
+                // exact for any memory-sized i64 array (M*2^64 < 2^127)
+                self.need_i128 = true;
+                self.emit(&format!("__int128 {}_sum = 0;", id));
             }
         }
         if !owned.is_empty() {
@@ -12961,6 +12963,16 @@ fn param_copy_alias(
         if self.int_arrays.contains(name) {
             if self.reduce_arrays.contains(name) {
                 // O(1): read the maintained aggregate (Optimisation 1)
+                if func == "sum" {
+                    // the maintained sum is __int128 (exact for any
+                    // memory-sized i64 array: M*2^64 < 2^127), printed
+                    // exact-decimal — a `long long` sum wrapped above
+                    // ~9.2e18 and diverged from CPython.
+                    self.need_i128 = true;
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_i128_str(&{vb}, {id}_sum);"));
+                    return format!("{vb}.p");
+                }
                 let agg = match func {
                     "max" => format!("{id}_max"),
                     "min" => format!("{id}_min"),
@@ -12970,6 +12982,19 @@ fn param_copy_alias(
             }
             let w = self.int_array_widths.get(name).copied().unwrap_or(Width::I64);
             let ct = w.c_type();
+            if func == "sum" {
+                // on-demand scan: accumulate in __int128, exact-decimal.
+                self.need_i128 = true;
+                self.emit(&format!(
+                    "__int128 {acc} = ({id}_len > 0) ? (__int128){id}[0] : 0;"
+                ));
+                self.emit(&format!(
+                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) {acc} += (__int128){id}[{li}];"
+                ));
+                let vb = self.vbuf_temp();
+                self.emit(&format!("_sh_i128_str(&{vb}, {acc});"));
+                return format!("{vb}.p");
+            }
             self.emit(&format!("{ct} {acc} = ({id}_len > 0) ? {id}[0] : 0;"));
             match func {
                 "max" => self.emit(&format!(
@@ -12977,9 +13002,6 @@ fn param_copy_alias(
                 )),
                 "min" => self.emit(&format!(
                     "for (size_t {li} = 1; {li} < {id}_len; {li}++) if ({id}[{li}] < {acc}) {acc} = {id}[{li}];"
-                )),
-                "sum" => self.emit(&format!(
-                    "for (size_t {li} = 1; {li} < {id}_len; {li}++) {acc} += {id}[{li}];"
                 )),
                 _ => {}
             }
@@ -23328,10 +23350,10 @@ fn param_copy_alias(
                 self.emit(&format!("{id}[{ai}] = {nv};"));
                 if self.reduce_arrays.contains(var) {
                     // maintain the aggregates (Optimisation 1)
-                    self.emit(&format!("if ({ai} == 0) {{ {id}_max = {id}_min = {id}_sum = {nv}; }} else {{"));
+                    self.emit(&format!("if ({ai} == 0) {{ {id}_max = {id}_min = (long long){nv}; {id}_sum = (__int128)({nv}); }} else {{"));
                     self.emit(&format!("    if ({nv} > {id}_max) {id}_max = {nv};"));
                     self.emit(&format!("    if ({nv} < {id}_min) {id}_min = {nv};"));
-                    self.emit(&format!("    {id}_sum += {nv};"));
+                    self.emit(&format!("    {id}_sum += (__int128)({nv});"));
                     self.emit("}");
                 }
             } else {
@@ -23395,10 +23417,10 @@ fn param_copy_alias(
                 self.emit(&format!("{id}[{idx}] = {nv};"));
                 if self.reduce_arrays.contains(var) {
                     // maintain the aggregates (Optimisation 1)
-                    self.emit(&format!("if ({idx} == 0) {{ {id}_max = {id}_min = {id}_sum = {nv}; }} else {{"));
+                    self.emit(&format!("if ({idx} == 0) {{ {id}_max = {id}_min = (long long){nv}; {id}_sum = (__int128)({nv}); }} else {{"));
                     self.emit(&format!("    if ({nv} > {id}_max) {id}_max = {nv};"));
                     self.emit(&format!("    if ({nv} < {id}_min) {id}_min = {nv};"));
-                    self.emit(&format!("    {id}_sum += {nv};"));
+                    self.emit(&format!("    {id}_sum += (__int128)({nv});"));
                     self.emit("}");
                 }
             } else {
@@ -27936,10 +27958,14 @@ fn param_copy_alias(
                         self.emit(&format!("static size_t {id}_len = 0;"));
                     }
                     if self.reduce_arrays.contains(a) {
-                        // maintained max/min/sum aggregates (Optimisation 1)
+                        // maintained max/min/sum aggregates (Optimisation 1).
+                        // The sum is __int128 so it cannot wrap like the
+                        // old `long long` (which diverged from CPython once
+                        // the total passed ~9.2e18).
                         self.emit(&format!("static long long {id}_max = 0;"));
                         self.emit(&format!("static long long {id}_min = 0;"));
-                        self.emit(&format!("static long long {id}_sum = 0;"));
+                        self.need_i128 = true;
+                        self.emit(&format!("static __int128 {id}_sum = 0;"));
                     }
                 }
             } else if self.vec_local.contains_key(a) {
