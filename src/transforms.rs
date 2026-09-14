@@ -89,6 +89,7 @@ pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (nativ
 pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process Capture{Call}
 pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
 pub mod for_recovery; // counter-while → native For recovery
+pub mod fuse_fill_consume; // fill+consume loop fusion with RHS forwarding
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
 pub mod i32_provable;
 pub mod const_capture_fold;
@@ -163,6 +164,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("loop-return-lift", loop_return_lift::transform),
         ("echo-return", echo_return::transform),
         ("unreachable-after-exit", unreachable_after_exit::transform),
+        // fuse-fill-consume: covering array-fill + same-space consumer
+        // → forwarded single loop (no materialization). Runs LAST: it
+        // matches final ForInit shapes (after for-recovery / seq-range-for
+        // / counted-while-forinit) and only deletes loops, so nothing
+        // downstream needs its output except the renderers.
+        ("fuse-fill-consume", fuse_fill_consume::transform),
         // split-set: set[int] → small ∪ big partitions (runtime routing).
         // Speed-class — gated by SH2_SPLIT_SETS (set at -O3/-O4 by the
         // CLI, mirroring set_dual_loops).
