@@ -696,3 +696,62 @@ fn assume_observed_width_guard() {
         "i was not narrowed:\n{c}"
     );
 }
+
+/// The middle tier: a bucket in 9..=16 means the observed value needs
+/// 65..128 bits, so the var is homed in `__int128` (exact and ~10-15x
+/// faster than GMP) instead of GMP. Requires the wide probe to have
+/// been taken, since the i64 instrumented build would have wrapped.
+#[test]
+fn assume_observed_width_i128_tier() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let pc = render_c(&prog_json(), true, &tmp("i128_prof.json"));
+    let hash = pc
+        .lines()
+        .find(|l| l.contains("_prof_hash ="))
+        .expect("hash line")
+        .split("0x")
+        .nth(1)
+        .expect("hex")
+        .split("ULL")
+        .next()
+        .expect("end")
+        .to_string();
+
+    let dir = tmp("i128");
+    std::fs::create_dir_all(&dir).unwrap();
+    let prof = dir.join("p.json");
+    // bucket 13 = 2**100-ish: fits 128, not 64
+    std::fs::write(
+        &prof,
+        format!(
+            "{{\"schema\":1,\"hash_algo\":\"fnv1a64\",\"source_hash\":\"{hash}\",\
+             \"options\":{{\"target\":\"c\"}},\"loops\":[],\"branches\":[],\
+             \"mags\":[{{\"name\":\"main:mag:i@0\",\"max_bucket\":13}}],\"lens\":[]}}"
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("SH2_ASSUME_OBSERVED_WIDTHS", "1");
+    std::env::set_var("SH2_PROFILE_IN", &prof);
+    std::env::remove_var("SH2_PROFILE");
+    std::env::remove_var("SH2_PROFILE_OUT");
+    let c = {
+        let prog = debashl::shir_json_in::shir_json_to_ir(&prog_json()).unwrap();
+        debashl::c_backend::shir_to_c(&prog)
+    };
+    std::env::remove_var("SH2_ASSUME_OBSERVED_WIDTHS");
+    std::env::remove_var("SH2_PROFILE_IN");
+
+    assert!(
+        c.contains("__int128 i = 0;"),
+        "i was not homed in the __int128 middle tier:\n{c}"
+    );
+    assert!(
+        c.contains("_sh_i128_str("),
+        "__int128 value must print through _sh_i128_str:\n{c}"
+    );
+    assert!(
+        !c.contains("mpz_t i;"),
+        "bucket 13 must not fall through to GMP:\n{c}"
+    );
+}

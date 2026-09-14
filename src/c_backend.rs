@@ -641,6 +641,11 @@ pub struct Render {
     /// [lo, hi] range its narrowed store must be checked against. Empty
     /// unless the assertive flag and a profile are both present.
     profile_bounds: HashMap<String, (i128, i128)>,
+    /// SH2_ASSUME_OBSERVED_WIDTHS middle tier: scalar vars whose observed
+    /// magnitude needs 65..128 bits. They are declared `__int128` and
+    /// printed through `_sh_i128_str` (scalar-only — array element widths
+    /// still use `Width`). Empty unless the flag and a wide probe are on.
+    i128_vars: HashSet<String>,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6041,13 +6046,15 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // narrow only when the var AND all its arithmetic stay in width.
     //
     // SH2_ASSUME_OBSERVED_WIDTHS (DUAL_LOOPS §4): before the widths are
-    // derived, seed the range analysis from the profile's observed
-    // magnitude buckets. A bucket ≤ 8 seeds [0, bucket_hi] so the
-    // existing machinery homes the var at u8..u64; a wider bucket is
-    // routed to GMP after `bigint_vars` (exact, no guard). The store
-    // guard lives in `profile_store` (assertive mode, §4.1).
+    // derived, map the profile's observed magnitude buckets to tiers.
+    //   1..=8  seed [0, bucket_hi] -> u8..u64, guarded store (§4.1)
+    //   9..=16 needs more than 64 bits but fits 128 -> __int128 tier
+    //   >=17   beyond 128 bits -> GMP (routed after bigint_vars)
+    // The bucket must come from a WIDE probe (`SH2_PROFILE_WIDE`), so the
+    // i64 instrumented build cannot have wrapped the value first.
     let prof_in = crate::c_profile::load_profile_in();
     let mut profile_bounds: HashMap<String, (i128, i128)> = HashMap::new();
+    let mut i128_vars: HashSet<String> = HashSet::new();
     if let Some(p) = prof_in.as_ref() {
         if p.assume_widths {
             // Staleness is refusal-grade for an assumed width (§4.2):
@@ -6066,12 +6073,20 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                 }
             }
             for (name, b) in &p.mag_buckets {
-                if *b == 0 || *b >= 8 {
-                    continue;
+                match *b {
+                    // never observed / beyond 128 bits (GMP, routed later)
+                    0 | 17.. => {}
+                    // needs 65..128 bits: the __int128 middle tier
+                    9..=16 => {
+                        i128_vars.insert(name.clone());
+                    }
+                    // 1..=8 bytes: a narrow C int with a guarded store
+                    b => {
+                        let hi = crate::c_profile::bucket_hi(b);
+                        ranges.insert(name.clone(), (0, hi));
+                        profile_bounds.insert(name.clone(), (0, hi));
+                    }
                 }
-                let hi = crate::c_profile::bucket_hi(*b);
-                ranges.insert(name.clone(), (0, hi));
-                profile_bounds.insert(name.clone(), (0, hi));
             }
         }
     }
@@ -6097,6 +6112,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     }
     r.prof_in = prof_in.clone();
     r.profile_bounds = profile_bounds;
+    r.i128_vars = i128_vars;
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lifetimes = prog.var_lifetimes.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
@@ -6138,17 +6154,28 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // reads). Set before rendering: decls need it, and need_gmp must
     // be settled before emit_runtime runs.
     r.bigint_vars = analyze_bigint_vars(&prog);
+    // SH2_PROFILE_WIDE (instrumented-build only): home the detected
+    // growers in GMP so the wide probe measures the true magnitude.
+    // Without it the probe reads a wrapped `long long` and the bucket
+    // saturates at 8 — the profile cannot say "128 bits suffice".
+    if r.prof.is_some()
+        && std::env::var("SH2_PROFILE_WIDE")
+            .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
+            .unwrap_or(false)
+    {
+        for v in profile_wide_vars(&prog) {
+            r.bigint_vars.insert(v);
+        }
+    }
     // SH2_ASSUME_OBSERVED_WIDTHS: a variable whose observed magnitude
-    // reached the 64-bit bucket (8 bytes) or beyond is homed in GMP —
-    // exact for any size, the "i128 or similar" wide tier, no guard
-    // needed. Bucket 8 from an i64 profiled build means the value hit
-    // the 8-byte edge and may have overflowed, so widening is the only
-    // safe reading of the measurement. Buckets 1..7 narrow instead
-    // (seeded above) and carry the store guard.
+    // is beyond 128 bits is homed in GMP — exact for any size, no guard
+    // needed. Bucket 17 means the wide probe saturated (>128 bits);
+    // buckets 9..16 were routed to the __int128 tier above (that is the
+    // fast middle tier this feature exists to find).
     if let Some(p) = prof_in.as_ref() {
         if p.assume_widths {
             for (name, b) in &p.mag_buckets {
-                if *b >= 8 {
+                if *b >= 17 {
                     r.bigint_vars.insert(name.clone());
                 }
             }
@@ -6339,7 +6366,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     }
     // SH2_PROFILE=1: splice the probe preamble after the last #include
     // (before trim_includes, so its fprintf/fopen uses keep <stdio.h>).
-    if let Some(st) = r.prof.clone() {
+    if let Some(mut st) = r.prof.clone() {
+        // the wide (mpz) probe is only emitted when a GMP slot exists
+        st.gmp = r.need_gmp;
         let pre = crate::c_profile::preamble(&st);
         let pos = r
             .out
@@ -10422,7 +10451,12 @@ impl Render {
                 if ok {
                     self.const_lifted.insert(v.to_string());
                     if self.is_num(v) {
-                        self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
+                        if self.i128_vars.contains(v) {
+                            self.need_i128 = true;
+                            self.emit(&format!("const __int128 {name} = {init}LL;"));
+                        } else {
+                            self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
+                        }
                     } else if let Some(b) = self.buf_bound(v) {
                         self.emit(&format!("const char {name}[{}] = {init};", b + 1));
                     } else {
@@ -10433,7 +10467,14 @@ impl Render {
             }
         }
         if self.is_num(v) {
-            self.emit(&format!("{} {name} = 0;", self.width_of_var(v).c_type()));
+            if self.i128_vars.contains(v) {
+                // SH2_ASSUME_OBSERVED_WIDTHS middle tier: 65..128-bit
+                // observed magnitudes are exact in __int128 (no GMP).
+                self.need_i128 = true;
+                self.emit(&format!("__int128 {name} = 0;"));
+            } else {
+                self.emit(&format!("{} {name} = 0;", self.width_of_var(v).c_type()));
+            }
         } else if let Some(b) = self.buf_bound(v) {
             // the fixed-buffer transform: the var_lengths analysis
             // proves len(v) <= b, so the buffer is b+1 bytes
@@ -13018,6 +13059,27 @@ fn param_copy_alias(
         arith_is_bigint(a, &self.bigint_vars)
     }
 
+    /// Does this arith expression read a `__int128`-homed var? Drives
+    /// the exact-decimal print path (printf cannot take `__int128`).
+    fn arith_mentions_i128(&self, a: &ArithAst) -> bool {
+        fn walk(a: &ArithAst, vars: &HashSet<String>) -> bool {
+            match a {
+                ArithAst::Var(n) | ArithAst::Ident(n) => vars.contains(n),
+                ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+                ArithAst::Index { key, .. } => walk(key, vars),
+                ArithAst::Bin { lhs, rhs, .. } => walk(lhs, vars) || walk(rhs, vars),
+                ArithAst::Un { arg, .. } => walk(arg, vars),
+                ArithAst::Cond { test, then, else_ } => {
+                    walk(test, vars) || walk(then, vars) || walk(else_, vars)
+                }
+                ArithAst::Assign { rhs, .. } => walk(rhs, vars),
+                ArithAst::IncDec { var, .. } => vars.contains(var),
+                ArithAst::Cast { arg, .. } => walk(arg, vars),
+            }
+        }
+        walk(a, &self.i128_vars)
+    }
+
     /// Strip Cast wrappers (the frontend wraps every Num leaf in
     /// Cast(Int64)) to reach the underlying node.
     fn unwrap_cast(a: &ArithAst) -> &ArithAst {
@@ -13342,6 +13404,14 @@ fn param_copy_alias(
                     self.need_gmp = true;
                     return format!("{vb}.p");
                 }
+                if self.i128_vars.contains(name) {
+                    // __int128 middle tier: printf cannot take it, so
+                    // render exact decimal through `_sh_i128_str`.
+                    self.need_i128 = true;
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_i128_str(&{vb}, {});", self.c_ident(name)));
+                    return format!("{vb}.p");
+                }
                 if self.is_num(name) {
                     self.num_temp(&self.c_ident(name))
                 } else {
@@ -13353,7 +13423,14 @@ fn param_copy_alias(
                     // bigint value in a string context: exact decimal
                     return self.bigint_decimal(a);
                 }
+                let mentions_i128 = self.arith_mentions_i128(a);
                 let a = self.arith(a);
+                if mentions_i128 {
+                    self.need_i128 = true;
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_i128_str(&{vb}, {a});"));
+                    return format!("{vb}.p");
+                }
                 self.num_temp(&a)
             }
             IrExpr::BinOp { .. } | IrExpr::Bool(_) => {
@@ -23508,6 +23585,12 @@ fn param_copy_alias(
                     self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
                     self.need_gmp = true;
                     vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)]
+                } else if self.i128_vars.contains(name) {
+                    // __int128: printf cannot take it — exact decimal text
+                    self.need_i128 = true;
+                    let vb = self.vbuf_temp();
+                    self.emit(&format!("_sh_i128_str(&{vb}, {});", self.c_ident(name)));
+                    vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)]
                 } else if self.is_num(name) {
                     vec![Part::Arg(self.c_ident(name), self.num_spec(e))]
                 } else {
@@ -23544,6 +23627,13 @@ fn param_copy_alias(
                 if self.is_bigint_arith(a) {
                     // bigint print: exact decimal text
                     vec![Part::Arg(self.bigint_decimal(a), NumSpec::Str)]
+                } else if self.arith_mentions_i128(a) {
+                    // __int128 print: exact decimal text
+                    self.need_i128 = true;
+                    let vb = self.vbuf_temp();
+                    let av = self.arith(a);
+                    self.emit(&format!("_sh_i128_str(&{vb}, {av});"));
+                    vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)]
                 } else {
                     vec![Part::Arg(self.arith(a), self.num_spec(e))]
                 }
@@ -23587,6 +23677,13 @@ fn param_copy_alias(
                                 let vb = self.vbuf_temp();
                                 self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
                                 self.need_gmp = true;
+                                return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
+                            }
+                            if self.i128_vars.contains(name) {
+                                // __int128: exact decimal text
+                                self.need_i128 = true;
+                                let vb = self.vbuf_temp();
+                                self.emit(&format!("_sh_i128_str(&{vb}, {});", self.c_ident(name)));
                                 return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
                             }
                             let spec = if self.is_num(name) {
@@ -25270,6 +25367,11 @@ fn param_copy_alias(
                     if self.is_bigint_arith(a) {
                         let name = self.c_ident(&t.var);
                         self.bigint_into(a, &name);
+                        // wide magnitude probe (SH2_PROFILE_WIDE): the true
+                        // value, not the wrapped i64 the release build has.
+                        if let Some(site) = self.prof_site(2, &t.var) {
+                            self.emit(&format!("_sh_prof_val_mpz({site}, {name});"));
+                        }
                         return;
                     }
                 }
@@ -25294,6 +25396,9 @@ fn param_copy_alias(
                                 "mpz_set_str({name}, {}, 10);",
                                 Self::cstr(txt)
                             ));
+                            if let Some(site) = self.prof_site(2, &t.var) {
+                                self.emit(&format!("_sh_prof_val_mpz({site}, {name});"));
+                            }
                             return;
                         }
                     }
@@ -28529,6 +28634,144 @@ fn arith_is_bigint(a: &ArithAst, vars: &BTreeSet<String>) -> bool {
             IrType::Int64 | IrType::UInt64 | IrType::Int32 | IrType::UInt32
         ),
     }
+}
+
+/// SH2_PROFILE_WIDE candidates: scalar vars that look like unbounded
+/// *growers* — a self-RMW arithmetic assignment using `*`, `**` or `<<`
+/// (`x = x * 2`), and never read in a loop/if condition. Homing these in
+/// GMP for the instrumented build lets the wide probe measure the true
+/// magnitude instead of the wrapped `long long` (which saturates the
+/// bucket at 8 and hides the difference between 64 and 128 bits).
+/// Deliberately heuristic: a profiling-build choice only, never a
+/// release lowering.
+fn profile_wide_vars(prog: &IrProgram) -> HashSet<String> {
+    fn cond_vars_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        fn ar(a: &ArithAst, out: &mut HashSet<String>) {
+            match a {
+                ArithAst::Var(n) | ArithAst::Ident(n) => {
+                    out.insert(n.clone());
+                }
+                ArithAst::Index { key, .. } => ar(key, out),
+                ArithAst::Bin { lhs, rhs, .. } => {
+                    ar(lhs, out);
+                    ar(rhs, out);
+                }
+                ArithAst::Un { arg, .. } => ar(arg, out),
+                ArithAst::Cond { test, then, else_ } => {
+                    ar(test, out);
+                    ar(then, out);
+                    ar(else_, out);
+                }
+                ArithAst::Assign { rhs, .. } => ar(rhs, out),
+                ArithAst::IncDec { var, .. } => {
+                    out.insert(var.clone());
+                }
+                ArithAst::Cast { arg, .. } => ar(arg, out),
+                _ => {}
+            }
+        }
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                out.insert(n.clone());
+            }
+            IrExpr::Arith(a) => ar(a, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    cond_vars_expr(a, out);
+                }
+            }
+            IrExpr::Array(v) => {
+                for a in v {
+                    cond_vars_expr(a, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                cond_vars_expr(lhs, out);
+                cond_vars_expr(rhs, out);
+            }
+            _ => {}
+        }
+    }
+    fn conds(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    cond_vars_expr(cond, out);
+                    conds(then, out);
+                    for (c, b) in elsifs {
+                        cond_vars_expr(c, out);
+                        conds(b, out);
+                    }
+                    conds(else_, out);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                    cond_vars_expr(cond, out);
+                    conds(body, out);
+                }
+                IrStmt::For { body, .. } => conds(body, out),
+                IrStmt::ForInit { init, cond, step, body } => {
+                    conds(init, out);
+                    cond_vars_expr(cond, out);
+                    conds(step, out);
+                    conds(body, out);
+                }
+                IrStmt::Function { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => conds(body, out),
+                IrStmt::Redirect { inner, .. } => conds(inner, out),
+                _ => {}
+            }
+        }
+    }
+    fn growers(stmts: &[IrStmt], cond: &HashSet<String>, out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    let Some(t) = targets.first() else { continue };
+                    if cond.contains(&t.var) {
+                        continue;
+                    }
+                    if let IrExpr::Arith(a) = expr {
+                        let selfside = |x: &ArithAst| {
+                            matches!(x, ArithAst::Var(v) | ArithAst::Ident(v) if v == &t.var)
+                        };
+                        if let ArithAst::Bin { op, lhs, rhs } = a.as_ref() {
+                            if matches!(op.as_str(), "*" | "**" | "<<")
+                                && (selfside(lhs) || selfside(rhs))
+                            {
+                                out.insert(t.var.clone());
+                            }
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    growers(then, cond, out);
+                    for (_, b) in elsifs {
+                        growers(b, cond, out);
+                    }
+                    growers(else_, cond, out);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => growers(body, cond, out),
+                IrStmt::For { body, .. } => growers(body, cond, out),
+                IrStmt::ForInit { body, .. } => growers(body, cond, out),
+                IrStmt::Function { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => growers(body, cond, out),
+                IrStmt::Redirect { inner, .. } => growers(inner, cond, out),
+                _ => {}
+            }
+        }
+    }
+    let mut cond = HashSet::new();
+    conds(&prog.stmts, &mut cond);
+    let mut out = HashSet::new();
+    growers(&prog.stmts, &cond, &mut out);
+    for sub in &prog.subs {
+        growers(&sub.body, &cond, &mut out);
+    }
+    out
 }
 
 fn analyze_bigint_vars(prog: &IrProgram) -> BTreeSet<String> {

@@ -41,6 +41,9 @@ pub struct ProfState {
     pub out: String,
     /// options actually in force (stamped into the report header)
     pub options: String,
+    /// a GMP slot is instrumented (emit the wide `_sh_prof_val_mpz`
+    /// probe, which measures past the 64-bit wrap)
+    pub gmp: bool,
 }
 
 /// The subset of a report the consumption path reads (advisory only).
@@ -102,7 +105,7 @@ pub fn assume_observed_widths() -> bool {
 /// unsigned magnitude). Bucket 0 = zero/never observed; 16 is the clamp
 /// for anything above 120 bits.
 pub fn bucket_hi(b: u8) -> i128 {
-    let b = b.min(16) as u32;
+    let b = b as u32;
     if b == 0 {
         0
     } else if b >= 16 {
@@ -120,9 +123,10 @@ fn env_opt(name: &str) -> String {
 /// site ids/lowering shapes — §4/§5.4).
 pub fn options_json() -> String {
     format!(
-        "{{\"target\": \"c\", \"SH2_DUAL_LOOPS\": \"{}\", \"SH2_LIST_VEC\": \"{}\"}}",
+        "{{\"target\": \"c\", \"SH2_DUAL_LOOPS\": \"{}\", \"SH2_LIST_VEC\": \"{}\", \"SH2_PROFILE_WIDE\": \"{}\"}}",
         env_opt("SH2_DUAL_LOOPS"),
-        env_opt("SH2_LIST_VEC")
+        env_opt("SH2_LIST_VEC"),
+        env_opt("SH2_PROFILE_WIDE")
     )
 }
 
@@ -175,7 +179,7 @@ pub fn load_profile_in() -> Option<ProfileIn> {
             let name = site.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let b = site.get("max_bucket").and_then(|n| n.as_i64()).unwrap_or(0);
             if let Some(var) = mag_site_name(name) {
-                let b = b.clamp(0, 16) as u8;
+                let b = b.clamp(0, 17) as u8;
                 let e = p.mag_buckets.entry(var).or_insert(0);
                 if b > *e {
                     *e = b;
@@ -324,9 +328,23 @@ pub fn preamble(st: &ProfState) -> Vec<String> {
     p("  uint64_t m = (v < 0) ? (~(uint64_t)v) + 1 : (uint64_t)v;".into());
     p("  unsigned b = 0;".into());
     p("  while (m) { b++; m >>= 8; }".into());
-    p("  if (b > 16) b = 16;".into());
+    // 17 buckets: byte 17 is the "past 128 bits" saturation marker
+    // (buckets 1..8 = u8..u64, 9..16 = needs __int128, 17 = needs GMP
+    // or wider). A narrower clamp would hide exactly the middle tier.
+    p("  if (b > 17) b = 17;".into());
     p("  if ((unsigned char)b > _prof_mag[i]) _prof_mag[i] = (unsigned char)b;".into());
     p("}".into());
+    if st.gmp {
+        // Wide probe: measure a GMP slot's true magnitude even after the
+        // release representation would have wrapped — this is what lets
+        // the profile distinguish "needs 128 bits" from "needs more".
+        p("static void _sh_prof_val_mpz(unsigned i, const mpz_t v) {".into());
+        p("  size_t bits = (mpz_sgn(v) == 0) ? 0 : mpz_sizeinbase(v, 2);".into());
+        p("  unsigned b = (unsigned)((bits + 7) / 8);".into());
+        p("  if (b > 17) b = 17;".into());
+        p("  if ((unsigned char)b > _prof_mag[i]) _prof_mag[i] = (unsigned char)b;".into());
+        p("}".into());
+    }
     p("static void _sh_prof_len(unsigned i, size_t n) {".into());
     p("  if ((uint64_t)n > _prof_len_max[i]) _prof_len_max[i] = (uint64_t)n;".into());
     p("  _prof_len_apps[i]++;".into());
