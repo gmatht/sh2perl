@@ -627,6 +627,16 @@ pub struct Render {
     /// `top_vars ∩ callee_assigned` (the vars the callee clobbers), since
     /// site_file_vars is only populated after the body render.
     top_vars: std::collections::BTreeSet<String>,
+    /// Phase-0 profiling state (`SH2_PROFILE=1`; None = probes are
+    /// no-ops and the render is byte-identical to the pre-profiler
+    /// output — docs/PROFILING.md §9.2 A/B firewall).
+    prof: Option<crate::c_profile::ProfState>,
+    /// Phase-2 advisory input (`SH2_PROFILE_IN`): observed array lengths,
+    /// consulted for vec pre-sizing only (never for correctness).
+    prof_in: Option<crate::c_profile::ProfileIn>,
+    /// file-scope vecs pre-sized from the profile (c id, C type, cap) —
+    /// allocated by a generated constructor.
+    prealloc: Vec<(String, String, usize)>,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6027,6 +6037,25 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // narrow only when the var AND all its arithmetic stay in width.
     let widths = effective_widths(&prog, &ranges);
     let mut r = Render::default();
+    // SH2_PROFILE=1: probe emission (default OFF — the A/B firewall).
+    // SH2_PROFILE_IN: advisory consumption, loaded independently so a
+    // profile can be both taken and consumed in one build.
+    if crate::c_profile::profile_enabled() {
+        let out = std::env::var("SH2_PROFILE_OUT").unwrap_or_else(|_| {
+            format!("sh2-profile.{}.json", std::process::id())
+        });
+        let hash = crate::c_profile::source_hash(
+            &format!("{:?}", prog.stmts),
+            &format!("{:?}", prog.subs),
+        );
+        r.prof = Some(crate::c_profile::ProfState {
+            hash,
+            out,
+            options: crate::c_profile::options_json(),
+            ..Default::default()
+        });
+    }
+    r.prof_in = crate::c_profile::load_profile_in();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lifetimes = prog.var_lifetimes.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
@@ -6251,6 +6280,30 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             r.out.splice(pos..pos, helper);
         }
     }
+    // SH2_PROFILE=1: splice the probe preamble after the last #include
+    // (before trim_includes, so its fprintf/fopen uses keep <stdio.h>).
+    if let Some(st) = r.prof.clone() {
+        let pre = crate::c_profile::preamble(&st);
+        let pos = r
+            .out
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("#include "))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        r.out.splice(pos..pos, pre);
+    }
+    // SH2_PROFILE_IN (§5.1): advisory pre-sizing — the constructor
+    // references the vec statics, so it goes after their declarations
+    // and before main.
+    if !r.prealloc.is_empty() {
+        let pre = crate::c_profile::prealloc_block(&r.prealloc);
+        let pos = r
+            .out
+            .iter()
+            .position(|l| l.trim_start().starts_with("int main("))
+            .unwrap_or(r.out.len());
+        r.out.splice(pos..pos, pre);
+    }
     // Only keep `#include`s whose symbols actually appear in the
     // emitted program (after the runtime trim removed helpers).
     r.trim_includes();
@@ -6307,6 +6360,28 @@ impl Render {
     fn mark_todo(&mut self, what: &str) {
         self.todo += 1;
         self.emit(&format!("/* TODO(unsupported): {what} */"));
+    }
+
+    /// SH2_PROFILE=1 site allocation (docs/PROFILING.md §9.1): ids are
+    /// positional in render order, so a duplicated body gets distinct
+    /// ids and the preamble/site vectors cannot alias. Returns `None`
+    /// when profiling is off — every call site then emits nothing and
+    /// the render stays byte-identical (the A/B firewall).
+    fn prof_site(&mut self, kind: u8, detail: &str) -> Option<usize> {
+        let scope = self
+            .current_fn
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        let st = self.prof.as_mut()?;
+        let (list, prefix): (&mut Vec<String>, &str) = match kind {
+            0 => (&mut st.loops, "loop"),
+            1 => (&mut st.branches, "branch"),
+            2 => (&mut st.mags, "mag"),
+            _ => (&mut st.lens, "len"),
+        };
+        let id = list.len();
+        list.push(format!("{scope}:{prefix}:{detail}@{id}"));
+        Some(id)
     }
 
     /// A6-consistent C-keyword mangling (mirrors the emitter's safe_ident,
@@ -22056,7 +22131,16 @@ fn param_copy_alias(
         cond_pure: bool,
         lrc2: &str,
     ) {
-        self.emit(&format!("while ({c}) {{"));
+        // SH2_PROFILE=1: wrap the cond so it is evaluated exactly once
+        // (the probe returns its truthiness) and seal the trip count at
+        // loop exit — `break` included, since the false-cond seal leaves
+        // `_prof_loop_cur` already zeroed (§9.1).
+        let site = self.prof_site(0, "while");
+        let cw = match site {
+            Some(id) => format!("_sh_prof_loop({id}, !!({c}))"),
+            None => c.to_string(),
+        };
+        self.emit(&format!("while ({cw}) {{"));
         self.depth += 1;
         if !cond_pure {
             self.emit("_went = 1;");
@@ -22073,6 +22157,9 @@ fn param_copy_alias(
         }
         self.depth -= 1;
         self.emit("}");
+        if let Some(id) = site {
+            self.emit(&format!("_sh_prof_loop_done({id});"));
+        }
     }
 
     /// One ForInit loop rendering: cond + `while (cond) { body; step; }`.
@@ -22957,6 +23044,12 @@ fn param_copy_alias(
             }
             self.emit(&format!("{id}_len = ++{ai};"));
         }
+        // SH2_PROFILE=1: a bulk literal is one length site (§9.1).
+        if !items.is_empty() {
+            if let Some(site) = self.prof_site(3, var) {
+                self.emit(&format!("_sh_prof_len({site}, {id}_len);"));
+            }
+        }
     }
 
     /// Element-width suffix for a vec array's grow helper (int homing);
@@ -23023,6 +23116,14 @@ fn param_copy_alias(
             self.emit(&format!("++{id}_len;"));
         } else {
             self.emit(&format!("{id}_len += {};", items.len()));
+        }
+        // SH2_PROFILE=1: one length site per append statement — the
+        // post-append length is the array's current extent (§9.1: never
+        // per-element, and never inside scan loops).
+        if !items.is_empty() {
+            if let Some(site) = self.prof_site(3, var) {
+                self.emit(&format!("_sh_prof_len({site}, {id}_len);"));
+            }
         }
     }
 
@@ -25210,6 +25311,13 @@ fn param_copy_alias(
                                 "{name}{};",
                                 if d == 1 { "++" } else { "--" }
                             ));
+                            // SH2_PROFILE=1: value-magnitude site for the
+                            // scalar store (§9.1, one probe per assign).
+                            if let Some(site) = self.prof_site(2, &t.var) {
+                                self.emit(&format!(
+                                    "_sh_prof_val({site}, (long long)({name}));"
+                                ));
+                            }
                             return;
                         }
                     }
@@ -25394,6 +25502,15 @@ fn param_copy_alias(
                     }
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
+                    // SH2_PROFILE=1: value-magnitude site for a scalar
+                    // numeric store (§9.1, one probe per assign).
+                    if is_num {
+                        if let Some(site) = self.prof_site(2, &t.var) {
+                            self.emit(&format!(
+                                "_sh_prof_val({site}, (long long)({name}));"
+                            ));
+                        }
+                    }
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
@@ -25515,6 +25632,10 @@ fn param_copy_alias(
                 self.in_cond += 1;
                 let c = self.expr(cond);
                 self.in_cond -= 1;
+                // SH2_PROFILE=1: one branch-arm site per arm; the arm
+                // marker counts entries (§9.2). Allocated in source arm
+                // order (then, elsifs, else) for stable ids.
+                let then_site = self.prof_site(1, "then");
                 // P1 follow-up: intersect proofs across branches — a
                 // var proven on every path stays proven; a reassign on
                 // any path drops it. (Each branch starts from the
@@ -25522,18 +25643,25 @@ fn param_copy_alias(
                 let pre_if = self.nonnull_var.clone();
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
+                if let Some(site) = then_site {
+                    self.emit(&format!("_sh_prof_arm({site});"));
+                }
                 for s in then {
                     self.stmt(s);
                 }
                 self.depth -= 1;
                 let mut post_if = std::mem::take(&mut self.nonnull_var);
                 for (ec, body) in elsifs {
+                    let arm_site = self.prof_site(1, "elsif");
                     self.nonnull_var = pre_if.clone();
                     self.in_cond += 1;
                     let ec = self.expr(ec);
                     self.in_cond -= 1;
                     self.emit(&format!("}} else if ({ec}) {{"));
                     self.depth += 1;
+                    if let Some(site) = arm_site {
+                        self.emit(&format!("_sh_prof_arm({site});"));
+                    }
                     for s in body {
                         self.stmt(s);
                     }
@@ -25543,8 +25671,12 @@ fn param_copy_alias(
                 }
                 self.nonnull_var = pre_if.clone();
                 if !else_.is_empty() {
+                    let else_site = self.prof_site(1, "else");
                     self.emit("} else {");
                     self.depth += 1;
+                    if let Some(site) = else_site {
+                        self.emit(&format!("_sh_prof_arm({site});"));
+                    }
                     for s in else_ {
                         self.stmt(s);
                     }
@@ -25643,8 +25775,15 @@ fn param_copy_alias(
                     // the loop var's width comes from the range analysis
                     // (seed + every arith expr in the body that mentions
                     // it) — the hoist declared it at that width
+                    // SH2_PROFILE=1: wrap the header cond (once) + seal.
+                    let loop_site = self.prof_site(0, "for");
+                    let cond_txt = format!("{name} {cmp} {last}");
+                    let cond_w = match loop_site {
+                        Some(id) => format!("_sh_prof_loop({id}, {cond_txt})"),
+                        None => cond_txt,
+                    };
                     self.emit(&format!(
-                        "for ({name} = {first}; {name} {cmp} {last}; {upd}) {{"
+                        "for ({name} = {first}; {cond_w}; {upd}) {{"
                     ));
                     self.depth += 1;
                     self.in_loop += 1;
@@ -25654,6 +25793,9 @@ fn param_copy_alias(
                     self.in_loop -= 1;
                     self.depth -= 1;
                     self.emit("}");
+                    if let Some(id) = loop_site {
+                        self.emit(&format!("_sh_prof_loop_done({id});"));
+                    }
                     match prev_type {
                         Some(t) => {
                             self.var_types.insert(var.clone(), t);
@@ -27397,6 +27539,10 @@ fn param_copy_alias(
                         // identically for fixed and vec storage.
                         self.emit(&format!("static {} *{id} = NULL;", w.c_type()));
                         self.emit(&format!("static size_t {id}_len = 0, {id}_cap = 0;"));
+                        // SH2_PROFILE_IN: observed-max pre-sizing (§5.1).
+                        if let Some(cap) = self.prof_in.as_ref().and_then(|p| p.cap_for(a)) {
+                            self.prealloc.push((id.clone(), w.c_type().to_string(), cap));
+                        }
                     } else {
                         self.emit(&format!("static {} {id}[{cap}] = {{0}};", w.c_type()));
                         self.emit(&format!("static size_t {id}_len = 0;"));
@@ -27416,6 +27562,10 @@ fn param_copy_alias(
                 // renders identically for fixed and vec storage.
                 self.emit(&format!("static char **{id} = NULL;"));
                 self.emit(&format!("static size_t {id}_len = 0, {id}_cap = 0;"));
+                // SH2_PROFILE_IN: observed-max pre-sizing (§5.1).
+                if let Some(cap) = self.prof_in.as_ref().and_then(|p| p.cap_for(a)) {
+                    self.prealloc.push((id.clone(), "char*".to_string(), cap));
+                }
             } else {
                 // exact proven capacity (sizing from proofs) or ARR_CAP
                 let cap = self.array_cap(a);
