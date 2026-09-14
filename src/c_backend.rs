@@ -25566,9 +25566,13 @@ fn param_copy_alias(
                     }
                 }
                 // GMP bigint assign: the target is bigint-declared by
-                // the same taint fixpoint, so evaluate straight into it
+                // the same taint fixpoint, so evaluate straight into it.
+                // A bigint-HOMED target always goes through `bigint_into`
+                // even when this particular RHS carries no Cast marker
+                // (a mixed accumulator): the declaration is `mpz_t`, so a
+                // native `v = …` store would not compile.
                 if let IrExpr::Arith(a) = expr {
-                    if self.is_bigint_arith(a) {
+                    if self.bigint_vars.contains(&t.var) || self.is_bigint_arith(a) {
                         let name = self.c_ident(&t.var);
                         self.bigint_into(a, &name);
                         // wide magnitude probe (SH2_PROFILE_WIDE): the true
@@ -28988,9 +28992,13 @@ fn analyze_bigint_vars(prog: &IrProgram) -> BTreeSet<String> {
             match s {
                 IrStmt::Assign { targets, expr, .. } => {
                     if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
-                        if t.indices.is_empty()
-                            && !out.iter().any(|(v, _)| v == &t.var)
-                        {
+                        // Record EVERY arithmetic assignment, not just the
+                        // first: a var assigned a plain arith once and a
+                        // `Cast(Int64)`-wrapped arith later (a mixed
+                        // accumulator) is bigint, and the old “first wins”
+                        // dedup missed it — leaving `long long v` declared
+                        // while the later assign rendered `mpz_add(v, …)`.
+                        if t.indices.is_empty() {
                             out.push((t.var.clone(), (**a).clone()));
                         }
                     }
@@ -37348,6 +37356,57 @@ mod tests {
             var_storage: vec![],
             var_bash_env: vec![],
         }
+    }
+
+    #[test]
+    fn mixed_bigint_assignment_homes_the_var() {
+        // A var assigned a plain arith once and a `Cast(Int64)`-wrapped
+        // arith later is a bigint accumulator; it must be DECLARED
+        // `mpz_t` so the later `mpz_add` store compiles. The old
+        // first-wins dedup in `analyze_bigint_vars` recorded only the
+        // plain assignment, leaving `long long v` with an `mpz_add(v,…)`
+        // store (found via python-O4's collatz after the loop-growth
+        // guard split its two assignments).
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "v".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let echo_v = IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str(
+                        "v".to_string(),
+                        crate::ir::StrStyle::DoubleQuoted,
+                    )],
+                }]),
+            ],
+        });
+        let mut prog = empty_prog(vec![
+            assign(A::Num(0)),
+            assign(A::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(cast(A::Var("v".to_string()))),
+                rhs: Box::new(cast(A::Num(1))),
+            }),
+            echo_v,
+        ]);
+        prog.var_types = vec![("v".to_string(), crate::ir::IrType::Int)];
+        let c = shir_to_c(&prog);
+        assert!(c.contains("mpz_t v;"), "mixed accumulator not homed bigint:\n{c}");
+        assert!(!c.contains("long long v;"), "declaration disagrees with the store:\n{c}");
     }
 
     #[test]
