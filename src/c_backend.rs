@@ -650,6 +650,16 @@ pub struct Render {
     /// mirror `<c_ident>_f` + `<c_ident>_big` flag, spilling to the GMP
     /// slot on 128-bit overflow (DUAL_LOOPS §4.1 "next tier up to GMP").
     tiered_vars: HashSet<String>,
+    /// Speculative-loop FAST arm (`try_spec_loop`): bigint vars rendered
+    /// through their i64 shadow `<c_ident>_s`. `None` outside the fast
+    /// arm, so the default render is untouched.
+    spec_fast: Option<HashSet<String>>,
+    /// `bigint_vars` minus `spec_fast`, used by `is_bigint_arith` while
+    /// the fast arm is active (precomputed: the check is hot).
+    spec_bigint: Option<BTreeSet<String>>,
+    /// The overflow-flag C name of the active speculative fast arm
+    /// (`spec_checked_expr` sets it and `break`s out on overflow).
+    spec_ovf: Option<String>,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6619,6 +6629,207 @@ impl Render {
     /// the observed range, and only then truncated to the narrow type.
     /// On violation the program stops with a diagnostic rather than
     /// silently wrapping (assertive mode, DUAL_LOOPS §4.1/§5.3).
+    /// Speculative-loop replay (the performance half of the B1 fix): a
+    /// bigint var that grows without a provable bound is otherwise pure
+    /// GMP. Render the enclosing loop twice — an i64 fast arm with
+    /// checked stores into a shadow, and the exact GMP arm — selected by
+    /// a sticky overflow flag. Sound: if the fast arm ever overflows, the
+    /// loop's entry state is restored and the GMP arm replays; otherwise
+    /// the i64 result was exact. Returns true when it emitted the loop.
+    fn try_spec_loop(&mut self, cond: &IrExpr, body: &[IrStmt]) -> bool {
+        let IrExpr::Arith(cond_a) = cond else {
+            return false;
+        };
+        let Some(v) = self.spec_growth_var(body) else {
+            return false;
+        };
+        if !arith_has_var(cond_a, &v) {
+            return false;
+        }
+        // Every loop-carried mutation must be a plain scalar (or the var).
+        let mut mutated: BTreeSet<String> = BTreeSet::new();
+        if !spec_collect(body, &mut mutated) {
+            return false;
+        }
+        for m in &mutated {
+            if m == &v {
+                continue;
+            }
+            if !self.is_num(m) || self.buf_bound(m).is_some() || self.managed_strings.contains(m) {
+                return false;
+            }
+        }
+        // The var's RHSs must be i64-check-renderable over int/num leaves.
+        if !spec_body_rhs_ok(body, &v, &self.bigint_vars) {
+            return false;
+        }
+        let v_id = self.c_ident(&v);
+        let v_s = format!("{v_id}_s");
+        let ovf = format!("_sp_ovf{}", self.temp_seq);
+        self.temp_seq += 1;
+        let mut snaps: Vec<(String, String)> = Vec::new();
+        for m in &mutated {
+            if m == &v {
+                continue;
+            }
+            let sid = self.c_ident(m);
+            let sn = format!("_sp_{}{}", sid, self.temp_seq);
+            self.temp_seq += 1;
+            snaps.push((sid, sn));
+        }
+        for m in &mutated {
+            self.nonnull_forget(m);
+        }
+        self.emit("_sh_rc = 0;");
+        self.emit("{");
+        self.depth += 1;
+        for (sid, sn) in &snaps {
+            let ty = self.width_of_var(sid).c_type();
+            self.emit(&format!("{ty} {sn} = {sid};"));
+        }
+        self.emit(&format!("int {ovf} = 0;"));
+        self.emit(&format!("long long {v_s} = 0;"));
+        self.emit(&format!(
+            "if (mpz_fits_slong_p({v_id})) {v_s} = mpz_get_si({v_id}); else {ovf} = 1;"
+        ));
+        // fast arm
+        self.emit(&format!("if (!{ovf}) {{"));
+        self.depth += 1;
+        self.spec_fast = Some([v.clone()].into_iter().collect());
+        self.spec_bigint = Some(
+            self.bigint_vars
+                .iter()
+                .filter(|x| **x != v)
+                .cloned()
+                .collect(),
+        );
+        self.spec_ovf = Some(ovf.clone());
+        self.in_cond += 1;
+        let cf = self.expr(cond);
+        self.in_cond -= 1;
+        self.emit(&format!("while ({cf}) {{"));
+        self.depth += 1;
+        self.loop_depth += 1;
+        self.in_loop += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        self.in_loop -= 1;
+        self.loop_depth -= 1;
+        self.depth -= 1;
+        self.emit("}");
+        self.spec_fast = None;
+        self.spec_bigint = None;
+        self.spec_ovf = None;
+        self.depth -= 1;
+        self.emit("}");
+        // exact replay from the snapshot
+        self.emit(&format!("if ({ovf}) {{"));
+        self.depth += 1;
+        for (sid, sn) in &snaps {
+            self.emit(&format!("{sid} = {sn};"));
+        }
+        self.in_cond += 1;
+        let cs = self.expr(cond);
+        self.in_cond -= 1;
+        self.emit(&format!("while ({cs}) {{"));
+        self.depth += 1;
+        self.loop_depth += 1;
+        self.in_loop += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        self.in_loop -= 1;
+        self.loop_depth -= 1;
+        self.depth -= 1;
+        self.emit("}");
+        self.depth -= 1;
+        self.emit(&format!("}} else {{ mpz_set_si({v_id}, {v_s}); }}"));
+        self.depth -= 1;
+        self.emit("}");
+        true
+    }
+
+    /// The single bigint var that GROWS inside this loop body (`v` under
+    /// `*`/`**`/`<<`). Nested loops are not searched: speculation is for
+    /// the loop that owns the growth.
+    fn spec_growth_var(&self, body: &[IrStmt]) -> Option<String> {
+        fn walk(stmts: &[IrStmt], big: &BTreeSet<String>, found: &mut Option<String>) {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, expr, .. } => {
+                        if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                            if big.contains(&t.var) && arith_self_growth(a, &t.var) {
+                                *found = Some(t.var.clone());
+                            }
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        walk(then, big, found);
+                        for (_, b) in elsifs {
+                            walk(b, big, found);
+                        }
+                        walk(else_, big, found);
+                    }
+                    IrStmt::Block(b) => walk(b, big, found),
+                    _ => {}
+                }
+            }
+        }
+        let mut found = None;
+        walk(body, &self.bigint_vars, &mut found);
+        found
+    }
+
+    /// Checked i64 expression for a speculative store: each `+`/`-`/`*`
+    /// becomes a `__builtin_*_overflow` check that sets the loop's
+    /// overflow flag and breaks to the GMP replay. `/`/`%` are safe with
+    /// a nonzero literal divisor (validated by `spec_rhs_ok`).
+    fn spec_checked_expr(&mut self, a: &ArithAst) -> String {
+        match a {
+            ArithAst::Cast { arg, .. } => self.spec_checked_expr(arg),
+            ArithAst::Num(n) => format!("{n}LL"),
+            ArithAst::Var(x) | ArithAst::Ident(x) => {
+                if self.spec_fast.as_ref().is_some_and(|f| f.contains(x.as_str())) {
+                    format!("{}_s", self.c_ident(x))
+                } else {
+                    self.c_ident(x)
+                }
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = self.spec_checked_expr(lhs);
+                let r = self.spec_checked_expr(rhs);
+                match op.as_str() {
+                    "+" | "-" | "*" => {
+                        let t = format!("_st{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let bi = match op.as_str() {
+                            "+" => "__builtin_add_overflow",
+                            "-" => "__builtin_sub_overflow",
+                            _ => "__builtin_mul_overflow",
+                        };
+                        let ovf = self.spec_ovf.clone().unwrap_or_default();
+                        self.emit(&format!("long long {t};"));
+                        self.emit(&format!(
+                            "if ({bi}({l}, {r}, &{t})) {{ {ovf} = 1; break; }}"
+                        ));
+                        t
+                    }
+                    "/" | "%" => format!("({l} {op} {r})"),
+                    _ => unreachable!("spec_rhs_ok gates the ops"),
+                }
+            }
+            _ => unreachable!("spec_rhs_ok gates the nodes"),
+        }
+    }
+
+    /// Store the checked i64 result into the speculative shadow.
+    fn spec_checked_store(&mut self, var: &str, a: &ArithAst) {
+        let id = self.c_ident(var);
+        let r = self.spec_checked_expr(a);
+        self.emit(&format!("{id}_s = {r};"));
+    }
+
     fn profile_store(&mut self, name: &str, var: &str, rhs: &str) {
         match self.profile_bound(var) {
             Some((lo, hi)) => {
@@ -10256,6 +10467,14 @@ impl Render {
                 }
             }
             ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if self
+                    .spec_fast
+                    .as_ref()
+                    .is_some_and(|f| f.contains(name.as_str()))
+                {
+                    // speculative fast arm: the bigint var is its i64 shadow
+                    return format!("{}_s", self.c_ident(name));
+                }
                 if self.bigint_vars.contains(name) {
                     // GMP slot in an i64 context: truncate (documented;
                     // exact paths go through bigint_into, never here)
@@ -13220,6 +13439,13 @@ fn param_copy_alias(
     /// reads a bigint var)? Such subtrees render via mpz statements,
     /// never native C operators.
     fn is_bigint_arith(&self, a: &ArithAst) -> bool {
+        // In a speculative fast arm the shadowed var reads its i64 slot,
+        // so exclude it from the bigint set AND unwrap the frontend's
+        // `Cast(Int64)` bigint marker (identity in this arm). Without the
+        // unwrap, every condition/op stayed on the mpz path.
+        if let Some(sb) = &self.spec_bigint {
+            return arith_is_bigint_spec(a, sb);
+        }
         arith_is_bigint(a, &self.bigint_vars)
     }
 
@@ -25565,6 +25791,21 @@ fn param_copy_alias(
                         }
                     }
                 }
+                // Speculative fast arm: a shadowed bigint var stores its
+                // checked i64 result; an overflow breaks out to the GMP
+                // replay. `try_spec_loop` pre-validated the shape.
+                if self
+                    .spec_fast
+                    .as_ref()
+                    .is_some_and(|f| f.contains(t.var.as_str()))
+                {
+                    if let IrExpr::Arith(a) = expr {
+                        self.spec_checked_store(&t.var, a);
+                        return;
+                    }
+                    self.mark_todo("speculative store shape");
+                    return;
+                }
                 // GMP bigint assign: the target is bigint-declared by
                 // the same taint fixpoint, so evaluate straight into it.
                 // A bigint-HOMED target always goes through `bigint_into`
@@ -26598,6 +26839,12 @@ fn param_copy_alias(
                 }
             }
             IrStmt::While { cond, body } => {
+                // B1 perf: a bigint var that grows without a provable bound
+                // gets the speculative i64 fast arm + exact GMP replay
+                // (`try_spec_loop`), instead of a pure-GMP loop.
+                if self.try_spec_loop(cond, body) {
+                    return;
+                }
                 // P1 follow-up: loop-body writes invalidate proofs
                 // (cleared before the cond/body render, so uses inside
                 // see the conservative state; re-established by Assign
@@ -28824,6 +29071,186 @@ fn lift_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
 /// arrives wrapped; the ESTree backend lowers the same nodes to JS
 /// BigInt). Fixpoint over var reads: `y = x + 1` with bigint x makes y
 /// bigint. Params are NOT included (shell boundary stays char*).
+/// Does `a` read `v`?
+fn arith_has_var(a: &ArithAst, v: &str) -> bool {
+    match a {
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+        ArithAst::Var(n) | ArithAst::Ident(n) => n == v,
+        ArithAst::Index { key, .. } => arith_has_var(key, v),
+        ArithAst::Bin { lhs, rhs, .. } => arith_has_var(lhs, v) || arith_has_var(rhs, v),
+        ArithAst::Un { arg, .. } => arith_has_var(arg, v),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_has_var(test, v) || arith_has_var(then, v) || arith_has_var(else_, v)
+        }
+        ArithAst::Assign { rhs, .. } => arith_has_var(rhs, v),
+        ArithAst::IncDec { var, .. } => var == v,
+        ArithAst::Cast { arg, .. } => arith_has_var(arg, v),
+    }
+}
+
+/// Self-referential growth: `v` under `*`/`**`/`<<` anywhere.
+fn arith_self_growth(a: &ArithAst, v: &str) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            ((op == "*" || op == "**" || op == "<<")
+                && (arith_has_var(lhs, v) || arith_has_var(rhs, v)))
+                || arith_self_growth(lhs, v)
+                || arith_self_growth(rhs, v)
+        }
+        ArithAst::Un { arg, .. } => arith_self_growth(arg, v),
+        ArithAst::Cast { arg, .. } => arith_self_growth(arg, v),
+        ArithAst::Assign { rhs, .. } => arith_self_growth(rhs, v),
+        _ => false,
+    }
+}
+
+/// Collect the scalar targets a speculative loop body assigns; false when
+/// the body shape is outside the supported subset (Assign of arith, If of
+/// arith conds, Block, side-effect arith). Nested loops / calls / arrays /
+/// captures / redirects are refused.
+fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                let Some(t) = targets.first() else { return false };
+                if !t.indices.is_empty() || !matches!(expr, IrExpr::Arith(_)) {
+                    return false;
+                }
+                out.insert(t.var.clone());
+            }
+            IrStmt::Expr(IrExpr::Arith(a)) => {
+                if !spec_collect_targets(a, out) {
+                    return false;
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                if !matches!(cond, IrExpr::Arith(_)) {
+                    return false;
+                }
+                if !spec_collect(then, out) {
+                    return false;
+                }
+                for (c, b) in elsifs {
+                    if !matches!(c, IrExpr::Arith(_)) || !spec_collect(b, out) {
+                        return false;
+                    }
+                }
+                if !spec_collect(else_, out) {
+                    return false;
+                }
+            }
+            IrStmt::Block(b) => {
+                if !spec_collect(b, out) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn spec_collect_targets(a: &ArithAst, out: &mut BTreeSet<String>) -> bool {
+    match a {
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+            true
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            spec_collect_targets(rhs, out)
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            spec_collect_targets(lhs, out) && spec_collect_targets(rhs, out)
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => spec_collect_targets(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            spec_collect_targets(test, out)
+                && spec_collect_targets(then, out)
+                && spec_collect_targets(else_, out)
+        }
+        _ => true,
+    }
+}
+
+/// Can this RHS be rendered as checked i64? Leaves must be the growth var
+/// or a non-bigint scalar; `/`/`%` need a nonzero literal divisor.
+fn spec_rhs_ok(a: &ArithAst, v: &str, big: &BTreeSet<String>) -> bool {
+    match a {
+        ArithAst::Num(_) => true,
+        ArithAst::Var(n) | ArithAst::Ident(n) => n == v || !big.contains(n),
+        ArithAst::Cast { arg, .. } => spec_rhs_ok(arg, v, big),
+        ArithAst::Bin { op, lhs, rhs } => match op.as_str() {
+            "+" | "-" | "*" => spec_rhs_ok(lhs, v, big) && spec_rhs_ok(rhs, v, big),
+            "/" | "%" => {
+                spec_rhs_ok(lhs, v, big)
+                    && matches!(rhs.as_ref(), ArithAst::Num(n) if *n != 0)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Every assignment to `v` in this body is check-renderable.
+fn spec_body_rhs_ok(stmts: &[IrStmt], v: &str, big: &BTreeSet<String>) -> bool {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if targets.first().is_some_and(|t| t.var == v) {
+                    match expr {
+                        IrExpr::Arith(a) if spec_rhs_ok(a, v, big) => {}
+                        _ => return false,
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                if !spec_body_rhs_ok(then, v, big) {
+                    return false;
+                }
+                for (_, b) in elsifs {
+                    if !spec_body_rhs_ok(b, v, big) {
+                        return false;
+                    }
+                }
+                if !spec_body_rhs_ok(else_, v, big) {
+                    return false;
+                }
+            }
+            IrStmt::Block(b) => {
+                if !spec_body_rhs_ok(b, v, big) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `arith_is_bigint` for a speculative fast arm: same fixpoint, but a
+/// `Cast(Int64)` leaf is an identity wrapper (unwrap it) rather than an
+/// unconditional bigint marker.
+fn arith_is_bigint_spec(a: &ArithAst, vars: &BTreeSet<String>) -> bool {
+    match a {
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+        ArithAst::Var(n) | ArithAst::Ident(n) => vars.contains(n),
+        ArithAst::Index { key, .. } => arith_is_bigint_spec(key, vars),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_is_bigint_spec(lhs, vars) || arith_is_bigint_spec(rhs, vars)
+        }
+        ArithAst::Un { arg, .. } => arith_is_bigint_spec(arg, vars),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_is_bigint_spec(test, vars)
+                || arith_is_bigint_spec(then, vars)
+                || arith_is_bigint_spec(else_, vars)
+        }
+        ArithAst::Assign { rhs, .. } => arith_is_bigint_spec(rhs, vars),
+        ArithAst::IncDec { var, .. } => vars.contains(var),
+        ArithAst::Cast { arg, .. } => arith_is_bigint_spec(arg, vars),
+    }
+}
+
 fn arith_is_bigint(a: &ArithAst, vars: &BTreeSet<String>) -> bool {
     match a {
         ArithAst::Num(_) => false,
@@ -37356,6 +37783,68 @@ mod tests {
             var_storage: vec![],
             var_bash_env: vec![],
         }
+    }
+
+    #[test]
+    fn speculative_growth_loop_emits_i64_fast_arm_and_gmp_replay() {
+        // A bigint var that grows inside a loop gets an i64 fast arm with
+        // checked stores plus an exact GMP replay, instead of a pure-GMP
+        // loop (the collatz CPU fix). Structural pins: both arms, the
+        // overflow flag + builtins, and the restored accumulator.
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let growth = bin(
+            "+",
+            bin("*", cast(A::Var("v".into())), A::Num(3)),
+            A::Num(1),
+        );
+        let mut prog = empty_prog(vec![IrStmt::While {
+            cond: IrExpr::Arith(Box::new(bin(">", cast(A::Var("v".into())), A::Num(1)))),
+            body: vec![
+                assign("v", growth),
+                assign("s", bin("+", A::Var("s".into()), A::Num(1))),
+            ],
+        }]);
+        prog.var_types = vec![
+            ("v".to_string(), crate::ir::IrType::Int),
+            ("s".to_string(), crate::ir::IrType::Int),
+        ];
+        let c = shir_to_c(&prog);
+        assert!(c.contains("_sp_ovf"), "no overflow flag:\n{c}");
+        assert!(
+            c.contains("__builtin_mul_overflow"),
+            "no checked fast store:\n{c}"
+        );
+        assert!(c.contains("long long v_s = 0;"), "no i64 shadow:\n{c}");
+        assert!(
+            c.contains("while ((v_s > 1))"),
+            "fast arm not on the i64 shadow:\n{c}"
+        );
+        assert!(
+            c.contains("mpz_cmp(") && c.contains("> 0)"),
+            "exact replay arm missing:\n{c}"
+        );
+        assert!(
+            c.contains("s = _sp_s"),
+            "loop-carried accumulator not restored for replay:\n{c}"
+        );
     }
 
     #[test]
