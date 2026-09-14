@@ -44,6 +44,14 @@ pub enum CuArith {
     /// Negative indices yield 0 (bash unset-in-arith); upper bounds are
     /// trusted (dense-fill coverage — documented v1 assumption).
     ArrRead { array: String, index: Box<CuArith> },
+    /// Lane-local variable (sequential-chain prelude of a seq reduce).
+    /// Renders as the `%ql_<name>` register the emitter declares from
+    /// the prelude's assign targets (candidacy guarantees domination).
+    Lane(String),
+    /// Arithmetic right shift by a literal (even-dividend `/2` peephole:
+    /// exact for all even s64, positive and negative — truncation and
+    /// floor agree on evens).
+    Shr(Box<CuArith>, u32),
 }
 
 /// One affine array store: `array[a*i + b] = value`.
@@ -127,6 +135,15 @@ fn arith(
         CuArith::ExtVar(name) => {
             let i = ext_idx.get(name).copied().unwrap_or(0);
             format!("%qe{i}")
+        }
+        CuArith::Lane(name) => format!("%ql_{}", ident(name)),
+        CuArith::Shr(a, k) => {
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let d = format!("%qh{tmp}");
+            used.insert(d.clone());
+            *tmp += 1;
+            out.push(format!("  shr.s64 {d}, {l}, {k};"));
+            d
         }
         CuArith::Add(a, b) => {
             let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
@@ -440,6 +457,25 @@ pub enum CuReduceOp {
     MaskAdd { mask: i64 },
 }
 
+/// A sequential-chain test (per-lane prelude comparisons). Sides lower
+/// through the shared `arith` (LoopVar/lane regs/externs/literals).
+/// v1: signed comparisons (sound for the guarded shapes candidacy
+/// admits); unsigned/shift specializations are V2 speed opts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CuTest {
+    Cmp { op: String, lhs: CuArith, rhs: CuArith },
+}
+
+/// A sequential-chain statement (per-lane prelude of a seq reduce).
+/// Restricted to scalar assigns + flat ifs + whiles over `CuTest`
+/// (the collatz-chain shape); anything richer vetoes in candidacy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CuSeqStmt {
+    Assign { var: String, expr: CuArith },
+    If { test: CuTest, then: Vec<CuSeqStmt>, else_: Vec<CuSeqStmt> },
+    While { test: CuTest, body: Vec<CuSeqStmt> },
+}
+
 /// One emittable scalar reduction over a counted loop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CuReduceSpec {
@@ -474,6 +510,12 @@ pub struct CuReduceSpec {
     pub mask_thresh: Option<i128>,
     /// Render pow2 `%`/`/` as `&`/shr (vehicle clone flag).
     pub mask_fast: bool,
+    /// Per-lane sequential prelude (empty = plain reduce). Scalar
+    /// assigns + flat ifs/whiles over lane regs; runs after the lane
+    /// index is derived, before the value. The value is then typically
+    /// `Lane(result)`. Candidacy's lane-privatization proof owns
+    /// soundness (private state never crosses lanes).
+    pub seq_prelude: Vec<CuSeqStmt>,
 }
 
 /// Render a reduction to PTX (total function).
@@ -484,6 +526,126 @@ pub struct CuReduceSpec {
 /// partials read back raw; host folds with the same op/mod. Add/Mul wrap
 /// mod 2^64 identically to bash (ring-exact, no bounds needed); Min/Max
 /// exact. Candidacy enforces modulus/mask <= 2^32 (veto otherwise).
+/// Lane-reg targets of a prelude (sorted dedup — deterministic decls).
+fn seq_lane_targets(prelude: &[CuSeqStmt], out: &mut BTreeSet<String>) {
+    for st in prelude {
+        match st {
+            CuSeqStmt::Assign { var, .. } => {
+                out.insert(format!("ql_{}", ident(var)));
+            }
+            CuSeqStmt::If { then, else_, .. } => {
+                seq_lane_targets(then, out);
+                seq_lane_targets(else_, out);
+            }
+            CuSeqStmt::While { body, .. } => seq_lane_targets(body, out),
+        }
+    }
+}
+
+/// Comparison PTX mnemonic (signed, v1).
+fn cmp_mnemonic(op: &str) -> Option<&'static str> {
+    match op {
+        "<" => Some("lt"),
+        ">" => Some("gt"),
+        "<=" => Some("le"),
+        ">=" => Some("ge"),
+        "==" => Some("eq"),
+        "!=" => Some("ne"),
+        _ => None,
+    }
+}
+
+/// Negated comparison (while-exit branches on test-FALSE).
+fn cmp_negated(op: &str) -> Option<&'static str> {
+    match op {
+        "<" => Some("ge"),
+        ">" => Some("le"),
+        "<=" => Some("gt"),
+        ">=" => Some("lt"),
+        "==" => Some("ne"),
+        "!=" => Some("eq"),
+        _ => None,
+    }
+}
+
+/// Render one test to `%pp` (sequential reuse: preds are consumed by
+/// the immediately following branch — no liveness survives).
+#[allow(clippy::too_many_arguments)]
+fn seq_test(
+    t: &CuTest,
+    ext_idx: &BTreeMap<String, usize>,
+    arr_idx: &BTreeMap<String, usize>,
+    tmp: &mut u32,
+    used: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+    mask_fast: bool,
+    negate: bool,
+) {
+    match t {
+        CuTest::Cmp { op, lhs, rhs } => {
+            let l = arith(lhs, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(rhs, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let m = if negate { cmp_negated(op) } else { cmp_mnemonic(op) };
+            match m {
+                Some(mn) => out.push(format!("  setp.{mn}.s64 %pp, {l}, {r};")),
+                None => {
+                    // Unknown comparison op (candidacy restricts to the
+                    // six; defense in depth — trap loudly, never guess).
+                    out.push(format!("  // SEQ-REFUSE: unknown cmp {op}"));
+                    out.push("  trap;".to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Render one chain statement (labels from `qlab`, bumped per If/While).
+#[allow(clippy::too_many_arguments)]
+fn seq_stmt(
+    st: &CuSeqStmt,
+    ext_idx: &BTreeMap<String, usize>,
+    arr_idx: &BTreeMap<String, usize>,
+    tmp: &mut u32,
+    used: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+    mask_fast: bool,
+    qlab: &mut u32,
+) {
+    match st {
+        CuSeqStmt::Assign { var, expr } => {
+            let r = arith(expr, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            out.push(format!("  mov.b64 %ql_{}, {r};", ident(var)));
+        }
+        CuSeqStmt::If { test, then, else_ } => {
+            let n = *qlab;
+            *qlab += 1;
+            seq_test(test, ext_idx, arr_idx, tmp, used, out, mask_fast, false);
+            out.push(format!("  @%pp bra QL{n}T;" ));
+            for e in else_ {
+                seq_stmt(e, ext_idx, arr_idx, tmp, used, out, mask_fast, qlab);
+            }
+            out.push(format!("  bra QL{n}D;" ));
+            out.push(format!("QL{n}T:" ));
+            for t in then {
+                seq_stmt(t, ext_idx, arr_idx, tmp, used, out, mask_fast, qlab);
+            }
+            out.push(format!("QL{n}D:" ));
+        }
+        CuSeqStmt::While { test, body } => {
+            let n = *qlab;
+            *qlab += 1;
+            out.push(format!("QL{n}H:" ));
+            seq_test(test, ext_idx, arr_idx, tmp, used, out, mask_fast, true);
+            out.push(format!("  @%pp bra QL{n}D;" ));
+            for b in body {
+                seq_stmt(b, ext_idx, arr_idx, tmp, used, out, mask_fast, qlab);
+            }
+            out.push(format!("  bra QL{n}H;" ));
+            out.push(format!("QL{n}D:" ));
+        }
+    }
+}
+
 pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
     let ext_idx: BTreeMap<String, usize> = spec
         .externs
@@ -503,6 +665,13 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
     let mut used: BTreeSet<String> = BTreeSet::new();
     let mut vlines: Vec<String> = Vec::new();
     let v = arith(&spec.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines, spec.mask_fast);
+    // Sequential prelude (lane chain): rendered up front so its temps
+    // join the declaration dump; emitted per-item inside KLOOP below.
+    let mut plines: Vec<String> = Vec::new();
+    let mut qlab: u32 = 0;
+    for st in &spec.seq_prelude {
+        seq_stmt(st, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut plines, spec.mask_fast, &mut qlab);
+    }
 
     let mut out = String::new();
     out.push_str(".version 7.0\n");
@@ -547,6 +716,20 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
         ));
     }
     out.push_str("  .shared .align 8 .s64 tile[256];\n");
+    // Lane-local registers (prelude assign targets, `%ql_` namespaced —
+    // collision-free by construction; candidacy proves domination).
+    {
+        let mut lanes = BTreeSet::new();
+        seq_lane_targets(&spec.seq_prelude, &mut lanes);
+        if !lanes.is_empty() {
+            let mut ls: Vec<&String> = lanes.iter().collect();
+            ls.sort();
+            let decl = ls.iter().map(|t| format!("%{t}")).collect::<Vec<_>>().join(", ");
+            out.push_str("  .reg .s64 ");
+            out.push_str(&decl);
+            out.push_str(";\n");
+        }
+    }
     for (bi, arr) in spec.arrays.iter().enumerate() {
         out.push_str(&format!("  ld.param.u64 %qb{bi}, [_{}];\n", ident(arr)));
     }
@@ -598,6 +781,12 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
         out.push_str("  mov.b64 %qi_, %qg1;\n");
     }
     for l in &vlines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    // Sequential prelude runs per item (after the lane index, before
+    // the value/accumulate — the value typically names a lane reg).
+    for l in &plines {
         out.push_str(l);
         out.push('\n');
     }
@@ -902,6 +1091,7 @@ mod tests {
             arrays: vec![],
             mask_thresh: None,
             mask_fast: false,
+            seq_prelude: vec![],
         }
     }
 
@@ -937,6 +1127,95 @@ mod tests {
         let p = shir_to_cu_reduce(&s);
         assert!(p.contains("and.b64"), "{p}");
         assert!(!p.contains("rem.s64"), "signed rem survives mask_fast:\n{p}");
+    }
+
+    #[test]
+    fn seq_prelude_renders_chain_and_declares_lanes() {
+        // Collatz-shaped seq reduce: seed + while + Lane(s) value.
+        let seq = CuReduceSpec {
+            id: "cu_seq_main_0".to_string(),
+            var: "k".to_string(),
+            lo: 0,
+            bound_var: "n".to_string(),
+            bound_lt: true,
+            step: 1,
+            threads: 256,
+            block_items: 1024,
+            op: CuReduceOp::Add,
+            value: CuArith::Lane("s".to_string()),
+            acc_init: 0,
+            externs: vec!["n".to_string()],
+            arrays: vec![],
+            mask_thresh: None,
+            mask_fast: false,
+            seq_prelude: vec![
+                CuSeqStmt::Assign {
+                    var: "v".to_string(),
+                    expr: CuArith::Mod(
+                        Box::new(CuArith::Add(
+                            Box::new(CuArith::Mul(
+                                Box::new(CuArith::LoopVar),
+                                Box::new(CuArith::Num(37)),
+                            )),
+                            Box::new(CuArith::Num(3)),
+                        )),
+                        Box::new(CuArith::Num(251)),
+                    ),
+                },
+                CuSeqStmt::Assign { var: "s".to_string(), expr: CuArith::Num(0) },
+                CuSeqStmt::While {
+                    test: CuTest::Cmp {
+                        op: ">".to_string(),
+                        lhs: CuArith::Lane("v".to_string()),
+                        rhs: CuArith::Num(1),
+                    },
+                    body: vec![
+                        CuSeqStmt::If {
+                            test: CuTest::Cmp {
+                                op: "==".to_string(),
+                                lhs: CuArith::Mod(
+                                    Box::new(CuArith::Lane("v".to_string())),
+                                    Box::new(CuArith::Num(2)),
+                                ),
+                                rhs: CuArith::Num(0),
+                            },
+                            then: vec![CuSeqStmt::Assign {
+                                var: "v".to_string(),
+                                expr: CuArith::Div(
+                                    Box::new(CuArith::Lane("v".to_string())),
+                                    Box::new(CuArith::Num(2)),
+                                ),
+                            }],
+                            else_: vec![CuSeqStmt::Assign {
+                                var: "v".to_string(),
+                                expr: CuArith::Add(
+                                    Box::new(CuArith::Mul(
+                                        Box::new(CuArith::Num(3)),
+                                        Box::new(CuArith::Lane("v".to_string())),
+                                    )),
+                                    Box::new(CuArith::Num(1)),
+                                ),
+                            }],
+                        },
+                        CuSeqStmt::Assign {
+                            var: "s".to_string(),
+                            expr: CuArith::Add(
+                                Box::new(CuArith::Lane("s".to_string())),
+                                Box::new(CuArith::Num(1)),
+                            ),
+                        },
+                    ],
+                },
+            ],
+        };
+        let p = shir_to_cu_reduce(&seq);
+        // Chain structure: while + if labels, lane regs, signed div/mod.
+        assert!(p.contains("QL0H:"), "{p}");
+        assert!(p.contains("QL1T:"), "{p}");
+        assert!(p.contains("%ql_v") && p.contains("%ql_s"), "{p}");
+        assert!(p.contains("rem.s64"), "v1 signed seed mod: {p}");
+        assert!(p.contains("div.s64"), "v1 signed halve: {p}");
+        assert!(undeclared_regs(&p).is_empty(), "{:?}", undeclared_regs(&p));
     }
 
     #[test]

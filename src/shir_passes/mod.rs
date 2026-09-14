@@ -45,6 +45,9 @@
 
 pub mod analysis;
 pub mod context;
+/// Sequential lane-nest privatization (shared analysis for CUDA
+/// nested-lane kernels; C/Vulkan later).
+pub mod lane_private;
 pub mod lifetime;
 /// Maskable unsigned lowering (shared analysis for C/CUDA/Vulkan).
 pub mod maskable;
