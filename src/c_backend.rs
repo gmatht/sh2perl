@@ -2588,6 +2588,25 @@ fn literal_write_index(t: &crate::ir::AssignTarget) -> Option<u64> {
 /// matcher). Requires `v</<=B` text with ident B plus a single
 /// positive step stmt on v (any of the three arith forms).
 fn counter_reserve_loop(cond: &IrExpr, step_stmt: &IrStmt) -> Option<(String, String, String)> {
+    // Structured condition (the Python frontend, and any A1 producer):
+    // the counted loop is `Arith(Bin{<|<=, Var counter, Var bound})`.
+    // The shell frontend emits the equivalent as a `builtin("let",
+    // ["i<n"])` TEXT word, handled below. Versioning is a generic
+    // lowering (dual_loops), so both shapes must reach it; before this
+    // arm, python-O4's counted loops were never versioned and sumred
+    // stayed on the signed modulo while bash-O4 got the unsigned arm.
+    if let IrExpr::Arith(a) = cond {
+        if let crate::ir::ArithAst::Bin { op, lhs, rhs } = unwrap_arith_cast(a.as_ref()) {
+            if op == "<" || op == "<=" {
+                if let (crate::ir::ArithAst::Var(l), crate::ir::ArithAst::Var(r)) =
+                    (unwrap_arith_cast(lhs.as_ref()), unwrap_arith_cast(rhs.as_ref()))
+                {
+                    return counter_reserve_finish(l, op, r, step_stmt);
+                }
+            }
+        }
+        return None;
+    }
     let text = match cond {
         IrExpr::Call { func, args } if func == "builtin" || func == "test" => {
             let mut found = None;
@@ -2606,6 +2625,24 @@ fn counter_reserve_loop(cond: &IrExpr, step_stmt: &IrStmt) -> Option<(String, St
         _ => return None,
     };
     let (l, op, r) = lic_split_cmp(&text)?;
+    counter_reserve_finish(l, op, r, step_stmt)
+}
+
+fn unwrap_arith_cast(a: &crate::ir::ArithAst) -> &crate::ir::ArithAst {
+    match a {
+        crate::ir::ArithAst::Cast { arg, .. } => unwrap_arith_cast(arg),
+        other => other,
+    }
+}
+
+/// Shared tail of `counter_reserve_loop`: validate the counter/bound
+/// idents and the step, then produce `(counter, bound, op)`.
+fn counter_reserve_finish(
+    l: &str,
+    op: &str,
+    r: &str,
+    step_stmt: &IrStmt,
+) -> Option<(String, String, String)> {
     if op != "<" && op != "<=" {
         return None;
     }
@@ -39419,6 +39456,61 @@ mod tests {
             })),
             asm: None,
         }
+    }
+
+    #[test]
+    fn counter_reserve_loop_accepts_structured_cond() {
+        // The Python frontend emits the counted loop as
+        // `Arith(Bin{<, Var i, Var n})`; the shell frontend emits the
+        // equivalent as `builtin("let", ["i<n"])` TEXT. Versioning
+        // (dual_loops) is generic, so both shapes must resolve — before
+        // this, python-O4's loops were never versioned and sumred's
+        // mod-chain stayed on the signed modulo (bash-O4 got the
+        // unsigned arm).
+        use crate::ir::ArithAst as A;
+        let step = lic_incr("i");
+        let structured = IrExpr::Arith(Box::new(A::Bin {
+            op: "<".to_string(),
+            lhs: Box::new(A::Var("i".to_string())),
+            rhs: Box::new(A::Var("n".to_string())),
+        }));
+        assert_eq!(
+            counter_reserve_loop(&structured, &step),
+            Some(("i".to_string(), "n".to_string(), "<".to_string())),
+            "structured cond must reach the versioning plan"
+        );
+        // identity Cast wrappers (the frontend's bigint marker) are OK
+        let casted = IrExpr::Arith(Box::new(A::Bin {
+            op: "<".to_string(),
+            lhs: Box::new(A::Cast {
+                ty: crate::ir::IrType::Int64,
+                arg: Box::new(A::Var("i".to_string())),
+            }),
+            rhs: Box::new(A::Var("n".to_string())),
+        }));
+        assert!(counter_reserve_loop(&casted, &step).is_some());
+        // the shell text form still resolves (A/B firewall)
+        let text = IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("let".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str(
+                    "i<n".to_string(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )]),
+            ],
+        };
+        assert_eq!(
+            counter_reserve_loop(&text, &step),
+            Some(("i".to_string(), "n".to_string(), "<".to_string()))
+        );
+        // a literal bound keeps the static-cap path (unchanged)
+        let lit = IrExpr::Arith(Box::new(A::Bin {
+            op: "<".to_string(),
+            lhs: Box::new(A::Var("i".to_string())),
+            rhs: Box::new(A::Num(5)),
+        }));
+        assert_eq!(counter_reserve_loop(&lit, &step), None);
     }
 
     #[test]
