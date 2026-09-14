@@ -541,11 +541,25 @@ pub struct Render {
     /// loop epilogue sets `len = max(len, need)`. Set/cleared around
     /// one counted loop (nested same-name writes disqualify).
     bulk_len: HashMap<String, String>,
+    /// Vars with untrustworthy ranges for unsigned lowering (see
+    /// loop_tainted_vars): loop-varying values have no valid single
+    /// range. Default empty (conservative only where set); shir_to_c
+    /// fills it from the IR scan. Empty var_ranges already imply no
+    /// fire, so direct-Render users stay safe.
+    loop_tainted: HashSet<String>,
     /// Program-level `$?` never observed (see prog_reads_rc): pure loop
     /// conds may render lean (no per-iteration rc store). Default false
     /// (conservative — keep stores) so paths that skip shir_to_c stay
     /// safe; shir_to_c sets it from the IR scan.
     rc_unobserved: bool,
+    /// Active versioning context (fast clone): force unsigned on
+    /// versionable mods (ver_threshold decides per site; the loop check
+    /// already discharged thresholds). None outside fast clones.
+    ver_ctx: Option<VerCtx>,
+    /// Inside a fast-clone body: arith forces versionable `%`/`/` to
+    /// unsigned (same predicate as collection — consistent by
+    /// construction). Default false (conservative).
+    ver_fast: bool,
     /// Inside a counted loop body (any nesting depth): arith-assign
     /// rc stores are dead when rc is globally unobserved (loop-nested
     /// stores never determine exit codes — post-loop commands and exit
@@ -3112,6 +3126,255 @@ fn stmt_mentions(s: &IrStmt, arr: &str, found: &mut bool) {
 /// conds render lean. Over-approximate (a found form may be dead code —
 /// miss, never an unobserved skip). Subs included (dynamic scope: a
 /// callee reads the caller's rc).
+/// Vars whose ranges are untrustworthy for unsigned lowering: assigned
+/// under loops (per-iteration-varying values have no valid single range —
+/// the flow-sensitive walk leaves stale narrow artifacts like a counter
+/// stuck at `(1,1)`), plus anything transitively defined from them
+/// (`x=$y` with stale `y`), plus all arith-assign targets (`x++` may wrap).
+/// Over-approximate (miss, never a stale-range trust). Applies ONLY to
+/// the unsigned gate (widths/narrowing untouched — separate machinery
+/// with its own backstops, gate-guarded as before).
+fn loop_tainted_vars(prog: &IrProgram) -> HashSet<String> {
+    use crate::ir::{ArithAst as A, IrExpr, IrStmt};
+    let mut tainted: HashSet<String> = HashSet::new();
+    // Phase 1: direct loop/function writes (init+step+bodies count —
+    // per-iteration-varying values have no single range).
+    fn collect_direct(stmts: &[IrStmt], tainted: &mut HashSet<String>, in_loop: bool, in_fn: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    // arith-assign targets taint everywhere (wrap risk)
+                    arith_targets(expr, tainted);
+                    if in_loop || in_fn {
+                        for t in targets {
+                            let base = t.var.split('[').next().unwrap_or(&t.var);
+                            if !base.is_empty() {
+                                tainted.insert(base.to_string());
+                            }
+                        }
+                    }
+                    collect_expr(expr, tainted, in_loop, in_fn);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    if in_loop || in_fn {
+                        for d in vars {
+                            tainted.insert(d.name.clone());
+                        }
+                    }
+                    if let Some(e) = init {
+                        collect_expr(e, tainted, in_loop, in_fn);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    if in_loop || in_fn {
+                        tainted.insert(var.clone());
+                    }
+                    for e in elements {
+                        collect_expr(e, tainted, in_loop, in_fn);
+                    }
+                }
+                IrStmt::Expr(e)
+                | IrStmt::Output { value: e, .. }
+                | IrStmt::WriteFile { content: e, .. }
+                | IrStmt::Return(Some(e))
+                | IrStmt::Exit(Some(e))
+                | IrStmt::Die { expr: e, .. }
+                | IrStmt::Warn { expr: e, .. }
+                | IrStmt::SetChildError(e) => collect_expr(e, tainted, in_loop, in_fn),
+                IrStmt::WriteFile { path, .. } => collect_expr(path, tainted, in_loop, in_fn),
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    collect_expr(cond, tainted, in_loop, in_fn);
+                    collect_direct(then, tainted, in_loop, in_fn);
+                    for (c, b) in elsifs {
+                        collect_expr(c, tainted, in_loop, in_fn);
+                        collect_direct(b, tainted, in_loop, in_fn);
+                    }
+                    collect_direct(else_, tainted, in_loop, in_fn);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                    collect_expr(cond, tainted, in_loop, in_fn);
+                    collect_direct(body, tainted, true, in_fn);
+                }
+                IrStmt::For { var, iter, body } => {
+                    tainted.insert(var.clone());
+                    collect_expr(iter, tainted, in_loop, in_fn);
+                    collect_direct(body, tainted, true, in_fn);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    collect_direct(init, tainted, true, in_fn);
+                    collect_expr(cond, tainted, in_loop, in_fn);
+                    collect_direct(step, tainted, true, in_fn);
+                    collect_direct(body, tainted, true, in_fn);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    collect_direct(b, tainted, in_loop, in_fn);
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    for r in redirects {
+                        collect_expr(&r.target, tainted, in_loop, in_fn);
+                    }
+                    collect_direct(inner, tainted, in_loop, in_fn);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    collect_expr(discriminant, tainted, in_loop, in_fn);
+                    for c in clauses {
+                        collect_direct(&c.body, tainted, in_loop, in_fn);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    collect_direct(body, tainted, in_loop, in_fn);
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            collect_expr(m, tainted, in_loop, in_fn);
+                        }
+                        collect_direct(&e.body, tainted, in_loop, in_fn);
+                    }
+                    collect_direct(else_body, tainted, in_loop, in_fn);
+                    collect_direct(finally_body, tainted, in_loop, in_fn);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    for x in body {
+                        collect_direct(std::slice::from_ref(x), tainted, in_loop, true);
+                    }
+                    for (_, b) in named_blocks {
+                        collect_direct(b, tainted, in_loop, true);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_direct(st, tainted, in_loop, in_fn);
+                    }
+                }
+                IrStmt::Select { clauses, .. } => {
+                    for c in clauses {
+                        collect_direct(&c.body, tainted, in_loop, in_fn);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn arith_targets(e: &IrExpr, tainted: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arith(a) => {
+                fn walk(a: &A, tainted: &mut HashSet<String>) {
+                    match a {
+                        A::Assign { var, .. } | A::IncDec { var, .. } => {
+                            tainted.insert(var.clone());
+                        }
+                        A::Bin { lhs, rhs, .. } => {
+                            walk(lhs, tainted);
+                            walk(rhs, tainted);
+                        }
+                        A::Un { arg, .. } => walk(arg, tainted),
+                        A::Cond { test, then, else_ } => {
+                            walk(test, tainted);
+                            walk(then, tainted);
+                            walk(else_, tainted);
+                        }
+                        A::Cast { arg, .. } => walk(arg, tainted),
+                        A::Index { key, .. } => walk(key, tainted),
+                        _ => {}
+                    }
+                }
+                walk(a, tainted);
+            }
+            _ => {}
+        }
+    }
+    fn collect_expr(e: &IrExpr, tainted: &mut HashSet<String>, in_loop: bool, in_fn: bool) {
+        // arith targets anywhere (wrap risk), plus recursion for the
+        // phase-2 mention scan (expressions don't define vars — only
+        // arith-assigns matter here).
+        arith_targets(e, tainted);
+        match e {
+            IrExpr::Array(items) => {
+                for x in items {
+                    collect_expr(x, tainted, in_loop, in_fn);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_expr(a, tainted, in_loop, in_fn);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_direct(&prog.stmts, &mut tainted, false, false);
+    for sub in &prog.subs {
+        collect_direct(&sub.body, &mut tainted, false, true);
+    }
+    // Phase 2: transitive taint (x defined from tainted y, anywhere).
+    // Fixpoint over scalar assigns + declare inits (index targets don't
+    // change scalar ranges; arith targets already tainted above).
+    loop {
+        let mut added = false;
+        let snapshot: Vec<String> = tainted.iter().cloned().collect();
+        let mentions = |e: &IrExpr| snapshot.iter().any(|n| expr_mentions(e, n));
+        fn scan(
+            stmts: &[IrStmt],
+            mentions: &dyn Fn(&IrExpr) -> bool,
+            tainted: &mut HashSet<String>,
+            added: &mut bool,
+        ) {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, expr, .. } => {
+                        if mentions(expr) {
+                            for t in targets {
+                                let base = t.var.split('[').next().unwrap_or(&t.var);
+                                if !base.is_empty() && tainted.insert(base.to_string()) {
+                                    *added = true;
+                                }
+                            }
+                        }
+                    }
+                    IrStmt::Declare { vars, init, .. } => {
+                        if let Some(e) = init {
+                            if mentions(e) {
+                                for d in vars {
+                                    if tainted.insert(d.name.clone()) {
+                                        *added = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        scan(then, mentions, tainted, added);
+                        for (_, b) in elsifs {
+                            scan(b, mentions, tainted, added);
+                        }
+                        scan(else_, mentions, tainted, added);
+                    }
+                    IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                        scan(body, mentions, tainted, added);
+                    }
+                    IrStmt::For { body, .. } => {
+                        scan(body, mentions, tainted, added);
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        scan(init, mentions, tainted, added);
+                        scan(step, mentions, tainted, added);
+                        scan(body, mentions, tainted, added);
+                    }
+                    IrStmt::Block(b) => scan(b, mentions, tainted, added),
+                    _ => {}
+                }
+            }
+        }
+        scan(&prog.stmts, &mentions, &mut tainted, &mut added);
+        for sub in &prog.subs {
+            scan(&sub.body, &mentions, &mut tainted, &mut added);
+        }
+        if !added {
+            break;
+        }
+    }
+    tainted
+}
+
 fn prog_reads_rc(prog: &IrProgram) -> bool {
     fn has_rc_expr(e: &IrExpr) -> bool {
         match e {
@@ -3241,6 +3504,789 @@ fn prog_reads_rc(prog: &IrProgram) -> bool {
         }
     }
     prog.stmts.iter().any(has_rc_stmt) || prog.subs.iter().any(|s| s.body.iter().any(has_rc_stmt))
+}
+
+/// Loop versioning for unsigned lowering (bench-opt sumred gap).
+///
+/// VALIDATION TRAP (do not "verify" with a chunked oracle): per-element
+/// signed truncation is NOT chunkable — residues mod 2^32 are not unique
+/// in `[-(M-1), M-1]` (e.g. 5 vs 5-M), so chunked sums diverge from
+/// sequential bash/C semantics once values go negative past the wrap
+/// point. Validate adversarial-N via C consensus (-O0 vs -O3 vs bo4,
+/// all using hardware div on wrapped values) plus agreement at/below
+/// the threshold, never via chunked reimplementation.
+///
+/// A `% C` / `/ C` (C positive literal) with a counter-dependent dividend
+/// lowers to unsigned ops iff the dividend is provably nonneg with no i64
+/// wrap. With a dynamic bound that proof is statically impossible — but a
+/// RUNTIME check (`counter_init >= 0 && bound <= THRESH`) discharges it
+/// exactly, so the loop renders twice: a masked fast clone and a signed
+/// slow clone. Adversarial N takes the slow path (byte-identical to
+/// today's code); practical N takes fast.
+///
+/// Threshold = max bound value with soundness (inclusive). Derived per
+/// dividend shape over i in [init_v, max_i] with init_v >= 0 (entry
+/// checked) and max_i = n-1 (`<`) or n (`<=`):
+/// - bare counter: no constraint (an i64 always fits) → INF.
+/// - linear `i*c+k`, c>0 lit, k>=0 lit: min at init (>= k >= 0);
+///   max_i*c+k <= M (M = i64::MAX) gives the threshold.
+/// - square `i*i`: min init_v^2 >= 0 always; max_i <= isqrt(M).
+/// - accumulator-fed `(V+X)`: V bounded [0,m) by induction (entry
+///   checked, assigns preserve); X recursed (versionable or static).
+/// Anything else (c<=0, k<0, cubic+, foreign vars, dynamic divisors) →
+/// None (stays signed in both clones — miss, never unsound).
+///
+/// u64 note: thresholds fit u64 (<= M+1); INF = i128::MAX (the n-check
+/// is omitted when every threshold is INF — entry checks suffice).
+/// Integer floor-sqrt (binary search — f64 is inexact past 2^53).
+fn ver_isqrt_floor(x: i128) -> i128 {
+    if x <= 0 {
+        return 0;
+    }
+    let (mut lo, mut hi) = (1i128, x.min(1i128 << 64));
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        if mid <= x / mid {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    hi
+}
+
+/// Versioning context for one loop: the counter, `<` vs `<=` (max index
+/// is n-1 or n), the dynamic bound var (entry-read for the check), and
+/// accumulator moduli (var -> m, bound [0,m)).
+#[derive(Clone)]
+struct VerCtx {
+    counter: String,
+    lt: bool,
+    boundvar: String,
+    accums: HashMap<String, i64>,
+}
+
+/// No n-constraint from this mod (entry checks suffice): bare counters,
+/// statically-ranged dividends.
+const VER_INF: i128 = i128::MAX;
+/// i64::MAX as i128 (no-wrap ceiling).
+const VER_M: i128 = i64::MAX as i128;
+
+/// Threshold (max bound n, inclusive) for sound unsigned lowering of one
+/// `dividend % divisor` / `dividend / divisor` site (divisor > 0 literal
+/// checked by the caller). See the module doc above for the derivation.
+/// None = stays signed. INF = entry checks suffice (no n-constraint).
+fn ver_threshold(
+    dividend: &crate::ir::ArithAst,
+    divisor: i64,
+    ctx: &VerCtx,
+    state: &HashMap<String, Option<(i128, i128)>>,
+) -> Option<i128> {
+    use crate::ir::ArithAst as A;
+    if divisor <= 0 {
+        return None;
+    }
+    // Nested mods/divs inside the dividend: nested `%` recurses (its
+    // result feeds the outer as [0, m_i)); nested `/` or dynamic-divisor
+    // nesting refuses (result range unknowable — miss, safe).
+    fn nested(
+        a: &A,
+        ctx: &VerCtx,
+        state: &HashMap<String, Option<(i128, i128)>>,
+        out: &mut Vec<(A, i64)>,
+    ) -> bool {
+        match a {
+            A::Bin { op, lhs, rhs } if op == "%" || op == "/" => {
+                match rhs.as_ref() {
+                    A::Num(d) if *d > 0 => {
+                        if op == "%" {
+                            out.push(((**lhs).clone(), *d));
+                            nested(lhs, ctx, state, out)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            A::Bin { lhs, rhs, .. } => {
+                nested(lhs, ctx, state, out) && nested(rhs, ctx, state, out)
+            }
+            A::Un { arg, .. } => nested(arg, ctx, state, out),
+            A::Cond { test, then, else_ } => {
+                nested(test, ctx, state, out)
+                    && nested(then, ctx, state, out)
+                    && nested(else_, ctx, state, out)
+            }
+            A::Assign { rhs, .. } => nested(rhs, ctx, state, out),
+            A::Cast { arg, .. } => nested(arg, ctx, state, out),
+            A::Index { key, .. } => nested(key, ctx, state, out),
+            _ => true,
+        }
+    }
+    // Recurse nested first (their thresholds join the min).
+    let mut inner: Vec<(A, i64)> = Vec::new();
+    // Top-level node itself is the mod under test, not "nested".
+    let probe = match dividend {
+        A::Bin { lhs, .. } => lhs.as_ref(),
+        _ => dividend,
+    };
+    let _ = probe;
+    // (Nested collection happens on the dividend subtree below via
+    // ver_nested_thresholds; the top call handles the outer shape.)
+    let mut t_min: i128 = VER_INF;
+    for (mod_node, m) in ver_nested_mods(dividend) {
+        // Recurse on the nested mod's own dividend (structurally smaller;
+        // terminates). Its threshold joins the min.
+        if let crate::ir::ArithAst::Bin { lhs, .. } = &mod_node {
+            let t = ver_threshold(lhs, m, ctx, state)?;
+            t_min = t_min.min(t);
+        }
+    }
+    // Skeleton check with nested mods replaced by [0, m_i).
+    let t_outer = ver_skel_threshold(dividend, divisor, ctx, state)?;
+    Some(t_min.min(t_outer))
+}
+
+/// Full `dividend % m` mod nodes (positive literal m) nested inside a
+/// dividend, for wholesale substitution by [0, m) once versioned.
+fn ver_nested_mods(dividend: &crate::ir::ArithAst) -> Vec<(crate::ir::ArithAst, i64)> {
+    use crate::ir::ArithAst as A;
+    let mut out = Vec::new();
+    fn walk(a: &A, out: &mut Vec<(A, i64)>) {
+        match a {
+            A::Bin { op, lhs, rhs } if op == "%" => {
+                if let A::Num(d) = rhs.as_ref() {
+                    if *d > 0 {
+                        out.push((a.clone(), *d));
+                    }
+                }
+                walk(lhs, out);
+                walk(rhs, out);
+            }
+            A::Bin { lhs, rhs, .. } => {
+                walk(lhs, out);
+                walk(rhs, out);
+            }
+            A::Un { arg, .. } => walk(arg, out),
+            A::Cond { test, then, else_ } => {
+                walk(test, out);
+                walk(then, out);
+                walk(else_, out);
+            }
+            A::Assign { rhs, .. } => walk(rhs, out),
+            A::Cast { arg, .. } => walk(arg, out),
+            A::Index { key, .. } => walk(key, out),
+            _ => {}
+        }
+    }
+    // The dividend root itself is the outer mod's dividend only when
+    // called on one; nested collection skips nothing (the caller passes
+    // the dividend subtree, and any % inside it is nested by definition
+    // — the top-level Bin(%,_,_) under test is NOT passed here).
+    walk(dividend, &mut out);
+    out
+}
+
+/// Threshold for the outer shape with nested mods replaced by their
+/// [0, m_i) ranges. Pure-counter skeletons (bare/linear/square) derive
+/// from the bound; anything else needs a static [0, fits] range.
+fn ver_skel_threshold(
+    dividend: &crate::ir::ArithAst,
+    divisor: i64,
+    ctx: &VerCtx,
+    state: &HashMap<String, Option<(i128, i128)>>,
+) -> Option<i128> {
+    use crate::ir::ArithAst as A;
+    // Collect nested-mod ranges for substitution: (structurally-equal
+    // subtree -> modulus). Small trees; linear scan is fine.
+    let nested: Vec<(A, i64)> = ver_nested_mods(dividend);
+    // Pure-counter skeleton?
+    if ver_vars_subset_counter(dividend, &ctx.counter, &nested) {
+        return ver_counter_shape(dividend, &ctx.counter, ctx.lt);
+    }
+    // Static skeleton: every var ranged, nested replaced, fits i64.
+    match ver_static_range(dividend, ctx, state, &nested) {
+        Some((lo, hi)) if lo >= 0 && hi <= VER_M => Some(VER_INF),
+        _ => None,
+    }
+}
+
+/// All vars in the skeleton are the counter (nested mods excluded —
+/// they carry their own thresholds).
+fn ver_vars_subset_counter(
+    a: &crate::ir::ArithAst,
+    counter: &str,
+    nested: &[(crate::ir::ArithAst, i64)],
+) -> bool {
+    use crate::ir::ArithAst as A;
+    if nested.iter().any(|(n, _)| n == a) {
+        return true; // replaced wholesale — contents don't matter here
+    }
+    match a {
+        A::Num(_) => true,
+        A::Var(v) | A::Ident(v) => v == counter,
+        A::Bin { lhs, rhs, .. } => {
+            ver_vars_subset_counter(lhs, counter, nested)
+                && ver_vars_subset_counter(rhs, counter, nested)
+        }
+        A::Un { arg, .. } => ver_vars_subset_counter(arg, counter, nested),
+        A::Cond { test, then, else_ } => {
+            ver_vars_subset_counter(test, counter, nested)
+                && ver_vars_subset_counter(then, counter, nested)
+                && ver_vars_subset_counter(else_, counter, nested)
+        }
+        A::Assign { rhs, .. } => ver_vars_subset_counter(rhs, counter, nested),
+        A::Cast { arg, .. } => ver_vars_subset_counter(arg, counter, nested),
+        A::Index { key, .. } => ver_vars_subset_counter(key, counter, nested),
+        _ => false,
+    }
+}
+
+/// Threshold from a pure-counter skeleton (no nested mods inside —
+/// callers with nesting fall back to the static path, documented miss).
+/// Shapes: bare counter (INF), linear `i*c+k` (c>0, k>=0 lits), square
+/// `i*i`. Entry checks (init >= 0) cover the lower end in all cases.
+fn ver_counter_shape(
+    a: &crate::ir::ArithAst,
+    counter: &str,
+    lt: bool,
+) -> Option<i128> {
+    use crate::ir::ArithAst as A;
+    // bare counter
+    if matches!(a, A::Var(v) | A::Ident(v) if v == counter) {
+        return Some(VER_INF);
+    }
+    // linear i*c+k / k+i*c / i*c (k=0) / bare i handled by caller;
+    // anything else (nested, cubic, two-sided) is out of scope (miss).
+    fn lin_parts(a: &A, counter: &str) -> Option<(i128, i128)> {
+        match a {
+            A::Bin { op, lhs, rhs } if op == "+" => lin_const_side(lhs, rhs, counter),
+            A::Bin { op, lhs, rhs } if op == "*" => {
+                let (c, k) = match (lin_term(lhs, counter), lin_term(rhs, counter)) {
+                    (Some((true, _)), Some((false, c))) => (c, 0),
+                    (Some((false, c)), Some((true, _))) => (c, 0),
+                    _ => return None,
+                };
+                Some((c, k))
+            }
+            A::Var(v) | A::Ident(v) if v == counter => Some((1, 0)),
+            A::Num(n) => Some((0, *n as i128)),
+            _ => None,
+        }
+    }
+    // (is_counter_side, const_value)
+    fn lin_term(a: &A, counter: &str) -> Option<(bool, i128)> {
+        match a {
+            A::Var(v) | A::Ident(v) if v == counter => Some((true, 0)),
+            A::Num(n) => Some((false, *n as i128)),
+            _ => None,
+        }
+    }
+    // split `X + Y` where exactly one side mentions the counter
+    fn lin_const_side(lhs: &A, rhs: &A, counter: &str) -> Option<(i128, i128)> {
+        fn mentions(a: &A, counter: &str) -> bool {
+            match a {
+                A::Var(v) | A::Ident(v) => v == counter,
+                A::Bin { lhs, rhs, .. } => mentions(lhs, counter) || mentions(rhs, counter),
+                A::Un { arg, .. } => mentions(arg, counter),
+                A::Cond { test, then, else_ } => {
+                    mentions(test, counter) || mentions(then, counter) || mentions(else_, counter)
+                }
+                A::Assign { var, rhs, .. } => var == counter || mentions(rhs, counter),
+                A::Index { var, key } => var == counter || mentions(key, counter),
+                _ => false,
+            }
+        }
+        // linear only: `i*c + k` (c from a single *, k const)
+        let (cside, kside) = if mentions(lhs, counter) && !mentions(rhs, counter) {
+            (lhs, rhs)
+        } else if mentions(rhs, counter) && !mentions(lhs, counter) {
+            (rhs, lhs)
+        } else {
+            return None;
+        };
+        let (c, k0) = match cside {
+            A::Bin { op, lhs: l2, rhs: r2 } if op == "*" => match (lin_term(l2, counter), lin_term(r2, counter)) {
+                (Some((true, _)), Some((false, c))) => (c, 0),
+                (Some((false, c)), Some((true, _))) => (c, 0),
+                _ => return None,
+            },
+            A::Var(v) | A::Ident(v) if v == counter => (1, 0),
+            _ => return None,
+        };
+        let k1 = match kside {
+            A::Num(n) => *n as i128,
+            _ => return None,
+        };
+        Some((c, k0 + k1))
+    }
+    if let Some((c, k)) = lin_parts(a, counter) {
+        if c > 0 && k >= 0 {
+            // max_i*c+k <= M with max_i = n-1 (`<`) or n (`<=`)
+            let f = (VER_M - k) / c; // floor, nonneg (k <= M as i64 lit)
+            if f < 0 {
+                return None;
+            }
+            return Some(if lt { f + 1 } else { f });
+        }
+        return None;
+    }
+    // square i*i
+    if let A::Bin { op, lhs, rhs } = a {
+        if op == "*" {
+            let li = matches!(lhs.as_ref(), A::Var(v) | A::Ident(v) if v == counter);
+            let ri = matches!(rhs.as_ref(), A::Var(v) | A::Ident(v) if v == counter);
+            if li && ri {
+                let s = ver_isqrt_floor(VER_M);
+                return Some(if lt { s + 1 } else { s });
+            }
+        }
+    }
+    None
+}
+
+/// Static range for a skeleton with nested mods replaced by [0, m_i)
+/// and accumulators by [0, m). Returns None on unknown vars (counter
+/// included — it has no range), overflow past i64 (wrap possible), or
+/// unmodelable nodes. Over-approximate-or-None (miss, safe).
+fn ver_static_range(
+    a: &crate::ir::ArithAst,
+    ctx: &VerCtx,
+    state: &HashMap<String, Option<(i128, i128)>>,
+    nested: &[(crate::ir::ArithAst, i64)],
+) -> Option<(i128, i128)> {
+    use crate::ir::ArithAst as A;
+    const LO: i128 = i64::MIN as i128;
+    const HI: i128 = i64::MAX as i128;
+    // nested mod replaced wholesale
+    if let Some((_, m)) = nested.iter().find(|(n, _)| n == a) {
+        return Some((0, (*m as i128).saturating_sub(1)));
+    }
+    let r = match a {
+        A::Num(n) => (*n as i128, *n as i128),
+        A::Var(v) | A::Ident(v) => {
+            if v == &ctx.counter {
+                return None;
+            }
+            if let Some(m) = ctx.accums.get(v) {
+                (0, (*m as i128).saturating_sub(1))
+            } else {
+                state.get(v).copied().flatten()?
+            }
+        }
+        A::Bin { op, lhs, rhs } => {
+            let (l0, l1) = ver_static_range(lhs, ctx, state, nested)?;
+            let (r0, r1) = ver_static_range(rhs, ctx, state, nested)?;
+            match op.as_str() {
+                "+" => (l0.checked_add(r0)?, l1.checked_add(r1)?),
+                "-" => (l0.checked_sub(r1)?, l1.checked_sub(r0)?),
+                "*" => {
+                    let ps = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    (*ps.iter().min()?, *ps.iter().max()?)
+                }
+                _ => return None, // / % & ^ ... : miss (conservative)
+            }
+        }
+        A::Un { op, arg } => {
+            let (lo, hi) = ver_static_range(arg, ctx, state, nested)?;
+            match op.as_str() {
+                "-" => (-hi, -lo),
+                "+" => (lo, hi),
+                _ => return None,
+            }
+        }
+        A::Cond { test, then, else_ } => {
+            let _ = ver_static_range(test, ctx, state, nested)?;
+            let (a0, a1) = ver_static_range(then, ctx, state, nested)?;
+            let (b0, b1) = ver_static_range(else_, ctx, state, nested)?;
+            (a0.min(b0), a1.max(b1))
+        }
+        _ => return None, // Assign/IncDec/Index/Cast/Sizeof/...: miss
+    };
+    if r.0 < LO || r.1 > HI {
+        return None; // wrap possible — refuse (sound miss)
+    }
+    Some(r)
+}
+
+/// Accumulator moduli from body assigns: var V with every scalar assign
+/// shaped `V = (V+X) % m` / `V = (X+V) % m` (same m > 0 literal) gets
+/// bound [0,m) by induction (entry checked at runtime; assigns preserve
+/// given forced inners). Anything else assigned to V (plain, different
+/// m, index-assigns) disqualifies V — its mods stay signed. Counter and
+/// boundvar never qualify (own rules govern them).
+fn ver_accums(
+    body: &[crate::ir::IrStmt],
+    counter: &str,
+    boundvar: &str,
+) -> HashMap<String, i64> {
+    use crate::ir::{ArithAst as A, IrExpr, IrStmt};
+    let mut mods: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut bad: HashSet<String> = HashSet::new();
+    // Top-level body only (nested-loop assigns run under different
+    // counters — their induction is the inner loop's business; a nested
+    // write to an outer accum would break the bound, so any nested
+    // Assign to a candidate disqualifies — handled by the walk below
+    // recursing with poisoning).
+    fn walk_all(
+        stmts: &[IrStmt],
+        mods: &mut HashMap<String, Vec<i64>>,
+        bad: &mut HashSet<String>,
+        depth: u32,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var);
+                        if base.is_empty() {
+                            continue;
+                        }
+                        if depth > 0 {
+                            bad.insert(base.to_string());
+                            continue;
+                        }
+                        if !t.indices.is_empty() || t.var.contains('[') {
+                            bad.insert(base.to_string());
+                            continue;
+                        }
+                        match expr {
+                            IrExpr::Arith(a) => match a.as_ref() {
+                                A::Bin { op, lhs, rhs } if op == "%" => {
+                                    match (lhs.as_ref(), rhs.as_ref()) {
+                                        (A::Bin { op: op2, lhs: l2, rhs: r2 }, A::Num(m))
+                                            if op2 == "+" && *m > 0 =>
+                                        {
+                                            let is_v = |x: &A| {
+                                                matches!(x, A::Var(v) | A::Ident(v) if v == base)
+                                            };
+                                            if is_v(l2) || is_v(r2) {
+                                                mods.entry(base.to_string())
+                                                    .or_default()
+                                                    .push(*m);
+                                            } else {
+                                                bad.insert(base.to_string());
+                                            }
+                                        }
+                                        _ => {
+                                            bad.insert(base.to_string());
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    bad.insert(base.to_string());
+                                }
+                            },
+                            _ => {
+                                bad.insert(base.to_string());
+                            }
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_all(then, mods, bad, depth);
+                    for (_, b) in elsifs {
+                        walk_all(b, mods, bad, depth);
+                    }
+                    walk_all(else_, mods, bad, depth);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                    walk_all(body, mods, bad, depth + 1);
+                }
+                IrStmt::For { body, .. } => {
+                    walk_all(body, mods, bad, depth + 1);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk_all(init, mods, bad, depth);
+                    walk_all(step, mods, bad, depth);
+                    walk_all(body, mods, bad, depth + 1);
+                }
+                IrStmt::Block(b) => walk_all(b, mods, bad, depth),
+                _ => {}
+            }
+        }
+    }
+    walk_all(body, &mut mods, &mut bad, 0);
+    mods.into_iter()
+        .filter(|(v, ms)| {
+            v != counter && v != boundvar && !bad.contains(v) && {
+                let first = ms[0];
+                ms.iter().all(|m| *m == first)
+            }
+        })
+        .map(|(v, ms)| (v, ms[0]))
+        .collect()
+}
+
+/// Versioning plan for one loop: min threshold over versionable mods
+/// (INF allowed — entry checks alone then), plus accumulator moduli for
+/// entry checks. None = no versionable mod (render normally).
+struct VerPlan {
+    min_thresh: i128,
+    accums: HashMap<String, i64>,
+}
+
+/// Collect versionable `% C` / `/ C` (C positive literal) over loop
+/// stmts + cond + step. Unversionable mods are ignored (stay signed in
+/// both clones — sound). Returns None when nothing versionable found,
+/// or the finite min falls below the bloat cutoff (fast path would only
+/// fire on tiny loops — not worth cloning).
+fn ver_collect(
+    stmts: &[crate::ir::IrStmt],
+    cond: &crate::ir::IrExpr,
+    step: &[crate::ir::IrStmt],
+    counter: &str,
+    lt: bool,
+    boundvar: &str,
+    accums: &HashMap<String, i64>,
+    state: &HashMap<String, Option<(i128, i128)>>,
+) -> Option<VerPlan> {
+    use crate::ir::{ArithAst as A, IrExpr, IrStmt};
+    let ctx = VerCtx { counter: counter.to_string(), lt, boundvar: boundvar.to_string(), accums: accums.clone() };
+    let mut thresh: Vec<i128> = Vec::new();
+    fn varith(a: &A, ctx: &VerCtx, state: &HashMap<String, Option<(i128, i128)>>, out: &mut Vec<i128>) {
+        match a {
+            A::Bin { op, lhs, rhs } if op == "%" || op == "/" => {
+                if let A::Num(d) = rhs.as_ref() {
+                    if *d > 0 {
+                        if let Some(t) = ver_threshold(lhs, *d, ctx, state) {
+                            out.push(t);
+                        }
+                    }
+                }
+                varith(lhs, ctx, state, out);
+                varith(rhs, ctx, state, out);
+            }
+            A::Bin { lhs, rhs, .. } => {
+                varith(lhs, ctx, state, out);
+                varith(rhs, ctx, state, out);
+            }
+            A::Un { arg, .. } => varith(arg, ctx, state, out),
+            A::Cond { test, then, else_ } => {
+                varith(test, ctx, state, out);
+                varith(then, ctx, state, out);
+                varith(else_, ctx, state, out);
+            }
+            A::Assign { rhs, .. } => varith(rhs, ctx, state, out),
+            A::Cast { arg, .. } => varith(arg, ctx, state, out),
+            A::Index { key, .. } => varith(key, ctx, state, out),
+            _ => {}
+        }
+    }
+    fn vexpr(e: &IrExpr, ctx: &VerCtx, state: &HashMap<String, Option<(i128, i128)>>, out: &mut Vec<i128>) {
+        match e {
+            IrExpr::Arith(a) => varith(a, ctx, state, out),
+            IrExpr::Array(items) => {
+                for x in items {
+                    vexpr(x, ctx, state, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    vexpr(a, ctx, state, out);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                vexpr(obj, ctx, state, out);
+                for a in args {
+                    vexpr(a, ctx, state, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                vexpr(lhs, ctx, state, out);
+                vexpr(rhs, ctx, state, out);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                vexpr(cond, ctx, state, out);
+                vexpr(then, ctx, state, out);
+                vexpr(else_, ctx, state, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                vexpr(expr, ctx, state, out);
+                vexpr(default, ctx, state, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        vexpr(x, ctx, state, out);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => vexpr(expr, ctx, state, out),
+            IrExpr::Index { key, .. } => vexpr(key, ctx, state, out),
+            IrExpr::Object(items) => {
+                for (_, v) in items {
+                    vexpr(v, ctx, state, out);
+                }
+            }
+            IrExpr::Splice(x) => vexpr(x, ctx, state, out),
+            IrExpr::Lambda { body, .. } | IrExpr::Arrow(body) => {
+                for s in body {
+                    vstmt(s, ctx, state, out);
+                }
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                vexpr(iter, ctx, state, out);
+                vexpr(elem, ctx, state, out);
+                if let Some(c) = cond {
+                    vexpr(c, ctx, state, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn vstmt(s: &IrStmt, ctx: &VerCtx, state: &HashMap<String, Option<(i128, i128)>>, out: &mut Vec<i128>) {
+        match s {
+            IrStmt::Assign { expr, .. } => vexpr(expr, ctx, state, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    vexpr(e, ctx, state, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    vexpr(e, ctx, state, out);
+                }
+            }
+            IrStmt::Expr(e)
+            | IrStmt::Output { value: e, .. }
+            | IrStmt::WriteFile { content: e, .. }
+            | IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. }
+            | IrStmt::SetChildError(e) => vexpr(e, ctx, state, out),
+            IrStmt::WriteFile { path, .. } => vexpr(path, ctx, state, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                vexpr(cond, ctx, state, out);
+                for x in then {
+                    vstmt(x, ctx, state, out);
+                }
+                for (c, b) in elsifs {
+                    vexpr(c, ctx, state, out);
+                    for x in b {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+                for x in else_ {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                vexpr(cond, ctx, state, out);
+                for x in body {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                vexpr(iter, ctx, state, out);
+                for x in body {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for x in init {
+                    vstmt(x, ctx, state, out);
+                }
+                vexpr(cond, ctx, state, out);
+                for x in step {
+                    vstmt(x, ctx, state, out);
+                }
+                for x in body {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::Block(b) => {
+                for x in b {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    vexpr(&r.target, ctx, state, out);
+                }
+                for x in inner {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                vexpr(discriminant, ctx, state, out);
+                for c in clauses {
+                    for x in &c.body {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for x in body {
+                    vstmt(x, ctx, state, out);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        vexpr(m, ctx, state, out);
+                    }
+                    for x in &e.body {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+                for x in else_body {
+                    vstmt(x, ctx, state, out);
+                }
+                for x in finally_body {
+                    vstmt(x, ctx, state, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                for x in body {
+                    vstmt(x, ctx, state, out);
+                }
+                for (_, b) in named_blocks {
+                    for x in b {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    for x in st {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    for x in &c.body {
+                        vstmt(x, ctx, state, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in stmts {
+        vstmt(s, &ctx, state, &mut out);
+    }
+    vexpr(cond, &ctx, state, &mut out);
+    for s in step {
+        vstmt(s, &ctx, state, &mut out);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let finite: Vec<i128> = out.iter().copied().filter(|t| *t < VER_INF).collect();
+    // Bloat cutoff: a finite threshold below 16 fires only on tiny loops
+    // (cold) — cloning the loop isn't worth it.
+    if !finite.is_empty() && finite.iter().min().copied().unwrap_or(0) < 16 {
+        return None;
+    }
+    Some(VerPlan { min_thresh: out.into_iter().min().unwrap_or(VER_INF), accums: accums.clone() })
 }
 
 fn array_fixed_caps(
@@ -5117,6 +6163,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         // Lean loop conds need program-level proof (set once here; every
         // other Render construction keeps the conservative default).
         r.rc_unobserved = !prog_reads_rc(&prog);
+        // Unsigned lowering distrusts loop-varying ranges (same point).
+        r.loop_tainted = loop_tainted_vars(&prog);
         r.vec_arrays.extend(routed.iter().cloned());
         // Routed arrays are exactly clean + dense0 + dynamic: the
         // bulk-len eligibility base (per-loop checks add the rest).
@@ -8767,6 +9815,42 @@ impl Render {
     /// the shared range proof says lo >= 0. Unknown ranges → false
     /// (stay signed — miss, never a wrap divergence).
     fn arith_proven_nonneg(&self, a: &crate::ir::ArithAst) -> bool {
+        // Refuse tainted leaves (stale flow-sensitive ranges): any
+        // Var/Ident in the tree that the loop scan flagged. Literals
+        // and clean vars pass through to the range proof below.
+        {
+            let mut tainted_leaf = false;
+            fn walk(a: &crate::ir::ArithAst, t: &HashSet<String>, hit: &mut bool) {
+                if *hit {
+                    return;
+                }
+                match a {
+                    crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => {
+                        if t.contains(v) {
+                            *hit = true;
+                        }
+                    }
+                    crate::ir::ArithAst::Index { key, .. } => walk(key, t, hit),
+                    crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+                        walk(lhs, t, hit);
+                        walk(rhs, t, hit);
+                    }
+                    crate::ir::ArithAst::Assign { rhs, .. } => walk(rhs, t, hit),
+                    crate::ir::ArithAst::Un { arg, .. } => walk(arg, t, hit),
+                    crate::ir::ArithAst::Cond { test, then, else_ } => {
+                        walk(test, t, hit);
+                        walk(then, t, hit);
+                        walk(else_, t, hit);
+                    }
+                    crate::ir::ArithAst::Cast { arg, .. } => walk(arg, t, hit),
+                    _ => {}
+                }
+            }
+            walk(a, &self.loop_tainted, &mut tainted_leaf);
+            if tainted_leaf {
+                return false;
+            }
+        }
         let state: HashMap<String, Option<(i128, i128)>> = self
             .var_ranges
             .iter()
@@ -8917,6 +10001,35 @@ impl Render {
                     // overflow through zero) makes the guard dead — bare
                     // division.
                     //
+                    // Fast-clone forcing (loop versioning): the loop's
+                    // runtime check already discharged every collected
+                    // threshold, so versionable-shaped mods lower
+                    // unconditionally here. Same predicate as collection
+                    // (consistent by construction); anything else falls
+                    // through to the range-proofed and signed paths.
+                    if self.ver_fast {
+                        if let Some(vctx) = self.ver_ctx.clone() {
+                            if let crate::ir::ArithAst::Num(d) = rhs.as_ref() {
+                                if *d > 0 {
+                                    let state: HashMap<
+                                        String,
+                                        Option<(i128, i128)>,
+                                    > = self
+                                        .var_ranges
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Some(*v)))
+                                        .collect();
+                                    if ver_threshold(lhs, *d, &vctx, &state).is_some() {
+                                        // (divisor is a positive literal, so
+                                        // the zero guard is dead — bare.)
+                                        return format!(
+                                            "(long long)((unsigned long long)({l}) {op} (unsigned long long)({r}))"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Proven-nonnegative dividend + positive literal
                     // divisor → unsigned op (strength-reduces: `% 2` and
                     // `/ 2` become bitwise ops, const mods become magic
@@ -20932,6 +22045,334 @@ fn param_copy_alias(
     /// Bulk-len epilogue: `len = max(len, need)` after a bulk-len loop.
     /// Monotonic (never shrinks — prior phases' counts survive), so a
     /// smaller bound or an empty loop just keeps the old len.
+    /// One While loop rendering: `while (c) { body; }` with the
+    /// cond-purity machinery (pre-set vs _went flag, body-rc save).
+    /// Extracted so versioning can render fast/slow clones.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_while_loop(
+        &mut self,
+        c: &str,
+        body: &[IrStmt],
+        cond_pure: bool,
+        lrc2: &str,
+    ) {
+        self.emit(&format!("while ({c}) {{"));
+        self.depth += 1;
+        if !cond_pure {
+            self.emit("_went = 1;");
+        }
+        self.loop_depth += 1;
+        self.in_loop += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        self.in_loop -= 1;
+        self.loop_depth -= 1;
+        if !cond_pure {
+            self.emit(&format!("{lrc2} = _sh_rc;"));
+        }
+        self.depth -= 1;
+        self.emit("}");
+    }
+
+    /// One ForInit loop rendering: cond + `while (cond) { body; step; }`.
+    /// Extracted so versioning can render fast/slow clones (same code,
+    /// different ver flags).
+    fn emit_forinit_loop(&mut self, cond_ref: &IrExpr, body: &[IrStmt], step: &[IrStmt]) {
+        self.in_cond += 1;
+        let cond_c = self.expr(cond_ref);
+        self.in_cond -= 1;
+        self.emit(&format!("while ({cond_c}) {{"));
+        self.depth += 1;
+        self.loop_depth += 1;
+        self.in_loop += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        for s in step {
+            self.stmt(s);
+        }
+        self.in_loop -= 1;
+        self.loop_depth -= 1;
+        self.depth -= 1;
+        self.emit("}");
+    }
+
+    /// Versioning plan for one ForInit loop (dyn var bound only):
+    /// recovery + invariance/discipline gates + accumulator fixpoint +
+    /// threshold collection. Returns (ctx, min_threshold).
+    fn ver_loop_plan(
+        &self,
+        cond: &IrExpr,
+        body_full: &[IrStmt],
+        step_vec: &[IrStmt],
+        step_in_body: bool,
+    ) -> Option<(VerCtx, i128)> {
+        if step_vec.len() != 1 {
+            return None;
+        }
+        let step_stmt = step_vec.last()?;
+        let (counter, boundvar, op) = counter_reserve_loop(cond, step_stmt)?;
+        if boundvar == counter {
+            return None; // degenerate self-bound
+        }
+        // Body without the step (While: all but last; ForInit: all —
+        // the step lives separately there).
+        let body_no_step: &[IrStmt] = if step_in_body {
+            body_full.get(..body_full.len().saturating_sub(1)).unwrap_or(&[])
+        } else {
+            body_full
+        };
+        // Invariance + counter discipline (fail-closed on unknown writes).
+        // The cond itself must not write counter/boundvar either
+        // (`while ((i++ < n))` double-steps — unversionable).
+        {
+            let mut wb = BTreeSet::new();
+            lic_writes_stmts(body_no_step, &mut wb).ok()?;
+            if wb.contains(&boundvar) || wb.contains(&counter) {
+                return None;
+            }
+            let mut ws = BTreeSet::new();
+            lic_writes_stmts(step_vec, &mut ws).ok()?;
+            if ws.contains(&boundvar) {
+                return None;
+            }
+            // Cond writes (e.g. `while ((i++ < n))` double-steps the
+            // counter): refuse — the range proofs assume step-only writes.
+            {
+                let mut wc = BTreeSet::new();
+                // lic_writes_expr bails on impure (conservative skip) and
+                // records arith-assign targets otherwise.
+                match lic_writes_expr(cond, &mut wc) {
+                    Err(_) => return None,
+                    Ok(()) => {
+                        if wc.contains(&counter) || wc.contains(&boundvar) {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        let lt = op == "<";
+        let mut accums = ver_accums(body_full, &counter, &boundvar);
+        let state: HashMap<String, Option<(i128, i128)>> = self
+            .var_ranges
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(*v)))
+            .collect();
+        // Accumulator fixpoint: every detected accum's own assigns must
+        // verify (under the full map as induction hypothesis); drop
+        // failures and re-collect until stable (map only shrinks).
+        loop {
+            let plan = ver_collect(body_full, cond, step_vec, &counter, lt, &boundvar, &accums, &state)?;
+            let mut ok = true;
+            for (v, m) in accums.iter() {
+                if !self.ver_accum_verified(body_full, v, *m, &counter, lt, &boundvar, &accums, &state) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let _ = plan;
+                break;
+            }
+            // prune one failing accum and retry (recompute below)
+            let mut pruned = false;
+            for (v, m) in accums.clone().iter() {
+                if !self.ver_accum_verified(body_full, v, *m, &counter, lt, &boundvar, &accums, &state) {
+                    accums.remove(v);
+                    pruned = true;
+                    break;
+                }
+            }
+            if !pruned {
+                break;
+            }
+        }
+        let plan = ver_collect(body_full, cond, step_vec, &counter, lt, &boundvar, &accums, &state)?;
+        let ctx = VerCtx { counter, lt, boundvar, accums };
+        Some((ctx, plan.min_thresh))
+    }
+
+    /// Versioning plan for a While loop (desugared C-for shape): the
+    /// step is the last body stmt. Thin wrapper over ver_loop_plan.
+    fn ver_loop_plan_while(
+        &self,
+        cond: &IrExpr,
+        body: &[IrStmt],
+    ) -> Option<(VerCtx, i128)> {
+        let last = body.last()?;
+        self.ver_loop_plan(cond, body, std::slice::from_ref(last), true)
+    }
+
+    /// While version of the check emitter: wraps two While-loop renders
+    /// (cond string + purity + lrc shared; only one executes).
+    fn emit_ver_check_while(
+        &mut self,
+        ctx: &VerCtx,
+        thresh: i128,
+        c: &str,
+        body: &[IrStmt],
+        cond_pure: bool,
+        lrc2: &str,
+    ) {
+        let cv = self.value_ll(&IrExpr::Var(ctx.counter.clone(), None));
+        let bv = self.value_ll(&IrExpr::Var(ctx.boundvar.clone(), None));
+        let mut pre = format!("long long _vi = (long long)({cv}); ");
+        pre.push_str(&format!("long long _vn = (long long)({bv}); "));
+        let mut check = String::from("(_vi >= 0)");
+        if thresh <= VER_M {
+            check.push_str(&format!(" && (_vn <= {thresh}LL)"));
+        }
+        for (v, m) in ctx.accums.iter() {
+            let vv = self.value_ll(&IrExpr::Var(v.clone(), None));
+            pre.push_str(&format!("long long _v{v} = (long long)({vv}); "));
+            check.push_str(&format!(" && (_v{v} >= 0 && _v{v} < {m}LL)"));
+        }
+        self.emit(&format!("{{ {pre}if ({check}) {{"));
+        self.depth += 1;
+        let saved_fast = self.ver_fast;
+        let saved_ctx = self.ver_ctx.clone();
+        self.ver_fast = true;
+        self.ver_ctx = Some(ctx.clone());
+        self.emit_while_loop(c, body, cond_pure, lrc2);
+        self.ver_fast = saved_fast;
+        self.ver_ctx = saved_ctx;
+        self.depth -= 1;
+        self.emit("} else {");
+        self.depth += 1;
+        self.emit_while_loop(c, body, cond_pure, lrc2);
+        self.depth -= 1;
+        self.emit("}");
+        self.emit("}");
+    }
+
+    /// Verify one accumulator's assigns under the map hypothesis.
+    fn ver_accum_verified(
+        &self,
+        body: &[IrStmt],
+        var: &str,
+        m: i64,
+        counter: &str,
+        lt: bool,
+        boundvar: &str,
+        accums: &HashMap<String, i64>,
+        state: &HashMap<String, Option<(i128, i128)>>,
+    ) -> bool {
+        use crate::ir::{ArithAst as A, IrExpr, IrStmt};
+        let ctx = VerCtx { counter: counter.to_string(), lt, boundvar: boundvar.to_string(), accums: accums.clone() };
+        let mut ok = true;
+        fn walk(
+            stmts: &[IrStmt],
+            var: &str,
+            m: i64,
+            ctx: &VerCtx,
+            state: &HashMap<String, Option<(i128, i128)>>,
+            ok: &mut bool,
+        ) {
+            if !*ok {
+                return;
+            }
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, expr, .. } => {
+                        for t in targets {
+                            let base = t.var.split('[').next().unwrap_or(&t.var);
+                            if base != var {
+                                continue;
+                            }
+                            if !t.indices.is_empty() || t.var.contains('[') {
+                                *ok = false;
+                                return;
+                            }
+                            match expr {
+                                IrExpr::Arith(a) => match a.as_ref() {
+                                    A::Bin { op, lhs, rhs } if op == "%" => {
+                                        match rhs.as_ref() {
+                                            A::Num(mm) if *mm == m => {
+                                                if ver_threshold(lhs, m, ctx, state).is_none() {
+                                                    *ok = false;
+                                                    return;
+                                                }
+                                            }
+                                            _ => {
+                                                *ok = false;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        *ok = false;
+                                        return;
+                                    }
+                                },
+                                _ => {
+                                    *ok = false;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        walk(then, var, m, ctx, state, ok);
+                        for (_, b) in elsifs {
+                            walk(b, var, m, ctx, state, ok);
+                        }
+                        walk(else_, var, m, ctx, state, ok);
+                    }
+                    IrStmt::Block(b) => walk(b, var, m, ctx, state, ok),
+                    _ => {}
+                }
+            }
+        }
+        walk(body, var, m, &ctx, state, &mut ok);
+        ok
+    }
+
+    /// Emit the version check + fast/slow clones. Entry reads (counter,
+    /// bound, accum inits) feed one combined condition; fast renders
+    /// with ver flags (forced unsigned), slow renders normally. Only one
+    /// executes (side effects safe); reserve/LIC/bulk epilogue stay
+    /// outside (shared by both paths).
+    fn emit_ver_check(
+        &mut self,
+        ctx: &VerCtx,
+        thresh: i128,
+        cond_ref: &IrExpr,
+        body: &[IrStmt],
+        step: &[IrStmt],
+    ) {
+        let cv = self.value_ll(&IrExpr::Var(ctx.counter.clone(), None));
+        let bv = self.value_ll(&IrExpr::Var(ctx.boundvar.clone(), None));
+        let mut pre = format!("long long _vi = (long long)({cv}); ");
+        pre.push_str(&format!("long long _vn = (long long)({bv}); "));
+        let mut check = String::from("(_vi >= 0)");
+        if thresh <= VER_M {
+            check.push_str(&format!(" && (_vn <= {thresh}LL)"));
+        }
+        for (v, m) in ctx.accums.iter() {
+            let vv = self.value_ll(&IrExpr::Var(v.clone(), None));
+            pre.push_str(&format!("long long _v{v} = (long long)({vv}); "));
+            check.push_str(&format!(" && (_v{v} >= 0 && _v{v} < {m}LL)"));
+        }
+        self.emit(&format!("{{ {pre}if ({check}) {{"));
+        self.depth += 1;
+        let saved_fast = self.ver_fast;
+        let saved_ctx = self.ver_ctx.clone();
+        self.ver_fast = true;
+        self.ver_ctx = Some(ctx.clone());
+        self.emit_forinit_loop(cond_ref, body, step);
+        self.ver_fast = saved_fast;
+        self.ver_ctx = saved_ctx;
+        self.depth -= 1;
+        self.emit("} else {");
+        self.depth += 1;
+        self.emit_forinit_loop(cond_ref, body, step);
+        self.depth -= 1;
+        self.emit("}");
+        self.emit("}");
+    }
+
     fn emit_counter_bulk_end(&mut self, bulk: &[String], need: &str) {
         for arr in bulk {
             let id = self.c_ident(arr);
@@ -24616,23 +26057,14 @@ fn param_copy_alias(
                 if let Some(last) = body.last() {
                     bulk_end = self.emit_counter_reserve(cond, last, body);
                 }
-                self.emit(&format!("while ({c}) {{"));
-                self.depth += 1;
-                if !cond_pure {
-                    self.emit("_went = 1;");
+                // Loop versioning (unsigned fast + signed slow under
+                // a runtime bound check): the step is the last body stmt
+                // (strip_cfor shape). Only one clone executes.
+                if let Some((vctx, thresh)) = self.ver_loop_plan_while(cond, body) {
+                    self.emit_ver_check_while(&vctx, thresh, &c, body, cond_pure, &lrc2);
+                } else {
+                    self.emit_while_loop(&c, body, cond_pure, &lrc2);
                 }
-                self.loop_depth += 1;
-                self.in_loop += 1;
-                for s in body {
-                    self.stmt(s);
-                }
-                self.in_loop -= 1;
-                self.loop_depth -= 1;
-                if !cond_pure {
-                    self.emit(&format!("{lrc2} = _sh_rc;"));
-                }
-                self.depth -= 1;
-                self.emit("}");
                 if let Some((bulk, need)) = bulk_end {
                     self.emit_counter_bulk_end(&bulk, &need);
                 }
@@ -25396,23 +26828,21 @@ fn param_copy_alias(
                         None => cond,
                     }
                 };
-                self.in_cond += 1;
-                let cond_c = self.expr(cond_ref);
-                self.in_cond -= 1;
-                self.emit(&format!("while ({cond_c}) {{"));
-                self.depth += 1;
-                self.loop_depth += 1;
-                self.in_loop += 1;
-                for s in body {
-                    self.stmt(s);
+                // Loop versioning (unsigned fast clone + signed slow
+                // clone under a runtime bound check): discharges the
+                // counter/mods proofs exactly, so adversarial N stays
+                // correct via the slow path.
+                if let Some((vctx, thresh)) =
+                    self.ver_loop_plan(cond, body, step, false)
+                {
+                    // Clones use the LIC-rewritten cond (bound reads the
+                    // hoisted temp in both arms — no per-iteration atoll
+                    // in either clone).
+                    self.emit_ver_check(&vctx, thresh, cond_ref, body, step);
+                    // (emit_ver_check renders fast/slow clones itself)
+                } else {
+                    self.emit_forinit_loop(cond_ref, body, step);
                 }
-                for s in step {
-                    self.stmt(s);
-                }
-                self.in_loop -= 1;
-                self.loop_depth -= 1;
-                self.depth -= 1;
-                self.emit("}");
                 if let Some((bulk, need)) = bulk_end {
                     self.emit_counter_bulk_end(&bulk, &need);
                 }
@@ -37492,6 +38922,265 @@ mod tests {
             !out.contains("unsigned long long"),
             "unsigned lowering without a proof:\n{out}"
         );
+    }
+
+    // Versioning threshold unit tests (pure math — no render).
+    fn ver_ctx_of(counter: &str, lt: bool) -> VerCtx {
+        VerCtx { counter: counter.to_string(), lt, boundvar: "n".to_string(), accums: HashMap::new() }
+    }
+    fn ver_state_empty() -> HashMap<String, Option<(i128, i128)>> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn ver_bare_counter_is_inf() {
+        use crate::ir::ArithAst as A;
+        let ctx = ver_ctx_of("i", true);
+        let t = ver_threshold(&A::Var("i".to_string()), 8, &ctx, &ver_state_empty());
+        assert_eq!(t, Some(VER_INF), "bare counter needs no bound");
+    }
+
+    #[test]
+    fn ver_square_threshold() {
+        // i*i < 2^63 iff max_i <= 3037000499: `<` allows n <= 3037000500.
+        use crate::ir::ArithAst as A;
+        let sq = A::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(A::Var("i".to_string())),
+            rhs: Box::new(A::Var("i".to_string())),
+        };
+        let ctx_lt = ver_ctx_of("i", true);
+        assert_eq!(
+            ver_threshold(&sq, 251, &ctx_lt, &ver_state_empty()),
+            Some(3037000500),
+            "square `<` threshold"
+        );
+        let ctx_le = ver_ctx_of("i", false);
+        // `<=` allows n <= 3037000499 (recompute: same isqrt floor).
+        assert_eq!(
+            ver_threshold(&sq, 251, &ctx_le, &ver_state_empty()),
+            Some(3037000499),
+            "square `<=` threshold"
+        );
+        // Sanity: threshold^2 really brackets 2^63.
+        assert!((3037000499i128).pow(2) < (1i128 << 63));
+        assert!((3037000500i128).pow(2) >= (1i128 << 63));
+    }
+
+    #[test]
+    fn ver_linear_threshold() {
+        // i*37+3 < 2^63 iff max_i <= floor((M-3)/37).
+        use crate::ir::ArithAst as A;
+        let lin = A::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(A::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(A::Var("i".to_string())),
+                rhs: Box::new(A::Num(37)),
+            }),
+            rhs: Box::new(A::Num(3)),
+        };
+        let ctx = ver_ctx_of("i", true);
+        let t = ver_threshold(&lin, 251, &ctx, &ver_state_empty()).expect("linear");
+        let m: i128 = (1 << 63) - 1;
+        assert_eq!(t, (m - 3) / 37 + 1, "linear `<` threshold");
+        assert!(t > 240000000000000000, "threshold sane (huge)");
+    }
+
+    #[test]
+    fn ver_refuses_bad_shapes() {
+        use crate::ir::ArithAst as A;
+        let ctx = ver_ctx_of("i", true);
+        let st = ver_state_empty();
+        // negative k
+        let negk = A::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(A::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(A::Var("i".to_string())),
+                rhs: Box::new(A::Num(53)),
+            }),
+            rhs: Box::new(A::Num(-1000000)),
+        };
+        assert_eq!(ver_threshold(&negk, 256, &ctx, &st), None, "negative k");
+        // nonpositive multiplier
+        let negc = A::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(A::Var("i".to_string())),
+            rhs: Box::new(A::Num(-2)),
+        };
+        assert_eq!(ver_threshold(&negc, 8, &ctx, &st), None, "negative c");
+        // foreign var
+        assert_eq!(
+            ver_threshold(&A::Var("w".to_string()), 8, &ctx, &st),
+            None,
+            "foreign var"
+        );
+        // cubic
+        let cubic = A::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(A::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(A::Var("i".to_string())),
+                rhs: Box::new(A::Var("i".to_string())),
+            }),
+            rhs: Box::new(A::Var("i".to_string())),
+        };
+        assert_eq!(ver_threshold(&cubic, 8, &ctx, &st), None, "cubic");
+    }
+
+    // ForInit with a counter-dependent mod dividend for versioning tests.
+    fn ver_forinit_mod() -> IrProgram {
+        use crate::ir::ArithAst as A;
+        let mut prog = counter_forinit("i<n", true);
+        if let IrStmt::ForInit { body, .. } = &mut prog.stmts[0] {
+            body.clear();
+            body.push(IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(A::Bin {
+                    op: "%".to_string(),
+                    lhs: Box::new(A::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(A::Var("i".to_string())),
+                        rhs: Box::new(A::Var("i".to_string())),
+                    }),
+                    rhs: Box::new(A::Num(251)),
+                })),
+                asm: None,
+            });
+        }
+        prog
+    }
+
+    #[test]
+    fn ver_emits_fast_slow_clones() {
+        // `(i*i) % 251` with dynamic bound: runtime check + unsigned fast
+        // clone + signed slow clone (threshold 3037000500).
+        let out = shir_to_c(&ver_forinit_mod());
+        assert!(out.contains("_vi >= 0"), "entry check missing:\n{out}");
+        assert!(
+            out.contains("3037000500"),
+            "threshold missing:\n{out}"
+        );
+        assert!(
+            out.contains("unsigned long long"),
+            "fast clone not unsigned:\n{out}"
+        );
+        // slow clone keeps the signed mod (no `unsigned` cast on its
+        // `%`); fast clone has it. Exactly one signed occurrence.
+        assert!(
+            out.contains("((i * i) % 251)"),
+            "slow clone missing:\n{out}"
+        );
+        assert_eq!(
+            out.matches("((i * i) % 251)").count(),
+            1,
+            "slow clone duplicated or missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ver_skips_unversionable() {
+        // `(w*w) % 251` with foreign w: no versionable mod → single
+        // loop, no check, signed mod (today's code, untouched).
+        use crate::ir::ArithAst as A;
+        let mut prog = ver_forinit_mod();
+        if let IrStmt::ForInit { body, .. } = &mut prog.stmts[0] {
+            if let IrStmt::Assign { expr, .. } = &mut body[0] {
+                if let IrExpr::Arith(a) = expr {
+                    if let A::Bin { lhs, .. } = a.as_mut() {
+                        if let A::Bin { lhs: l2, rhs: r2, .. } = lhs.as_mut() {
+                            *l2 = Box::new(A::Var("w".to_string()));
+                            *r2 = Box::new(A::Var("w".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let out = shir_to_c(&prog);
+        assert!(!out.contains("_vi >= 0"), "spurious versioning:\n{out}");
+        assert!(
+            !out.contains("unsigned long long"),
+            "spurious unsigned:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ver_accumulator_outer_threshold() {
+        // `(s + (i*i)%m) % m` with s accumulator [0,m): outer versionable
+        // via induction (threshold = inner square threshold).
+        use crate::ir::ArithAst as A;
+        let m: i64 = 4294967296;
+        let inner = A::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(A::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(A::Var("i".to_string())),
+                rhs: Box::new(A::Var("i".to_string())),
+            }),
+            rhs: Box::new(A::Num(m)),
+        };
+        let outer_dividend = A::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(A::Var("s".to_string())),
+            rhs: Box::new(inner),
+        };
+        let mut accums = HashMap::new();
+        accums.insert("s".to_string(), m);
+        let ctx = VerCtx {
+            counter: "i".to_string(),
+            lt: true,
+            boundvar: "n".to_string(),
+            accums,
+        };
+        let t = ver_threshold(&outer_dividend, m, &ctx, &ver_state_empty());
+        assert_eq!(t, Some(3037000500), "accumulator outer threshold");
+    }
+
+    #[test]
+    fn ver_accumulator_detection() {
+        // `s = (s + X) % 256` assigns make s an accumulator (modulus 256);
+        // plain assigns and other-counter writes disqualify.
+        use crate::ir::{ArithAst as A, IrExpr, IrStmt};
+        let acc_assign = IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "s".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(A::Bin {
+                op: "%".to_string(),
+                lhs: Box::new(A::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(A::Var("s".to_string())),
+                    rhs: Box::new(A::Var("i".to_string())),
+                }),
+                rhs: Box::new(A::Num(256)),
+            })),
+            asm: None,
+        };
+        let m = ver_accums(std::slice::from_ref(&acc_assign), "i", "n");
+        assert_eq!(m.get("s"), Some(&256), "accumulator detected");
+        // counter itself never qualifies
+        let ci = IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "i".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(A::Bin {
+                op: "%".to_string(),
+                lhs: Box::new(A::Var("i".to_string())),
+                rhs: Box::new(A::Num(8)),
+            })),
+            asm: None,
+        };
+        let m2 = ver_accums(std::slice::from_ref(&ci), "i", "n");
+        assert!(!m2.contains_key("i"), "counter excluded");
     }
 
     #[test]
