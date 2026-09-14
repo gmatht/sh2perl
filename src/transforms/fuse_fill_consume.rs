@@ -403,7 +403,7 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
         };
         // Whole-program array discipline: every mention of the array is
         // the fill store or a forwarded consumer read.
-        if array_used_elsewhere(stmts, &fill.arr, i, l2, &counter) {
+        if array_used_elsewhere(stmts, &fill, i, l2, &counter) {
             i += 1;
             continue;
         }
@@ -417,40 +417,90 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
 
 // ---------- fill shape ----------
 
-struct Fill {
+/// One array's fill binding: the store target and the expression to
+/// forward at each `arr[<i>]` read.
+struct FillStore {
     arr: String,
     rhs: ArithAst,
-    /// Free scalar vars of rhs (excluding the counter).
+}
+
+/// A fill loop's stores (one per array) with the union of RHS free vars.
+/// MULTI-STORE since the twoarr shape (`a[$i]=..; b[$i]=..`) is the same
+/// rewrite applied per array — the CUDA map candidacy already accepted
+/// multi-store fills, so the shIR transform was the odd one out.
+struct Fill {
+    stores: Vec<FillStore>,
+    /// Union of RHS free vars, excluding the counter.
     free: BTreeSet<String>,
 }
 
-/// Exactly one `A[<i>] = <pure arith>` store, plain-`i` index.
+impl Fill {
+    /// Store for `arr`, if the fill writes it.
+    fn rhs(&self, arr: &str) -> Option<&ArithAst> {
+        self.stores.iter().find(|s| s.arr == arr).map(|s| &s.rhs)
+    }
+    /// Does a NAME (possibly the flattened `a[...]` text) name any
+    /// filled array?
+    fn name_hits(&self, v: &str) -> bool {
+        self.stores.iter().any(|s| v == s.arr || v.starts_with(&format!("{}[", s.arr)))
+    }
+    fn arrays(&self) -> impl Iterator<Item = &String> {
+        self.stores.iter().map(|s| &s.arr)
+    }
+    fn expr_hits(&self, e: &IrExpr) -> bool {
+        self.stores.iter().any(|s| expr_has_arr(e, &s.arr))
+    }
+    fn stmt_hits(&self, s: &IrStmt) -> bool {
+        self.stores.iter().any(|fs| stmt_has_arr(s, &fs.arr))
+    }
+    fn stmts_hit(&self, v: &[IrStmt]) -> bool {
+        self.stores.iter().any(|s| stmts_have_arr(v, &s.arr))
+    }
+    /// Does any ArithAst node inside a key expr name a filled array?
+    fn expr_arith_hits(&self, a: &ArithAst) -> bool {
+        self.stores.iter().any(|s| arith_has_arr(a, &s.arr))
+    }
+}
+
+/// One or more `A[<i>] = <pure arith>` stores, each with a plain-`i`
+/// index and a DISTINCT array (a repeated array would make the
+/// forwarding target ambiguous — veto).
 fn fill_shape(body: &[IrStmt], counter: &str) -> Option<Fill> {
-    let [IrStmt::Assign { targets, expr, .. }] = body else {
-        return None;
-    };
-    let [t] = targets.as_slice() else {
-        return None;
-    };
-    let (arr, key) = store_target(t, counter)?;
-    if key != (1, 0) {
+    let mut stores: Vec<FillStore> = Vec::new();
+    let mut free: BTreeSet<String> = BTreeSet::new();
+    for st in body {
+        let IrStmt::Assign { targets, expr, .. } = st else {
+            return None;
+        };
+        let [t] = targets.as_slice() else {
+            return None;
+        };
+        let (arr, key) = store_target(t, counter)?;
+        if key != (1, 0) {
+            return None;
+        }
+        let IrExpr::Arith(f) = expr else {
+            return None;
+        };
+        if !pure_fill_rhs(f) {
+            return None;
+        }
+        if stores.iter().any(|s| s.arr == arr) {
+            return None;
+        }
+        arith_free_vars(f, &mut free);
+        stores.push(FillStore { arr, rhs: (**f).clone() });
+    }
+    if stores.is_empty() {
         return None;
     }
-    let IrExpr::Arith(f) = expr else {
-        return None;
-    };
-    if !pure_fill_rhs(f) {
-        return None;
-    }
-    let mut free = BTreeSet::new();
-    arith_free_vars(f, &mut free);
     free.remove(counter);
     // Special vars (`$?`, `$@`, positionals) are statement-sensitive —
     // their values differ between fill-time and consume-time.
     if free.iter().any(|v| !is_plain_scalar(v)) {
         return None;
     }
-    Some(Fill { arr, rhs: (**f).clone(), free })
+    Some(Fill { stores, free })
 }
 
 /// `(array, (a, b))` for an array-store target in `counter`, or None.
@@ -865,7 +915,7 @@ fn gap_assign_ok(
     if !t.indices.is_empty() || t.var.contains('[') {
         return false;
     }
-    if t.var == fill.arr || &t.var == counter {
+    if fill.name_hits(&t.var) || &t.var == counter {
         return false;
     }
     if bound.is_some_and(|b| t.var == b) {
@@ -877,7 +927,7 @@ fn gap_assign_ok(
     if expr_mentions_status_or_call(expr) {
         return false;
     }
-    if expr_mentions_var(expr, counter) || expr_mentions_var(expr, &fill.arr) {
+    if expr_mentions_var(expr, counter) || fill.expr_hits(expr) {
         return false;
     }
     true
@@ -989,7 +1039,7 @@ fn consume_shape(
         let [t] = targets.as_slice() else {
             return None;
         };
-        if !t.indices.is_empty() || t.var.contains('[') || t.var == fill.arr {
+        if !t.indices.is_empty() || t.var.contains('[') || fill.name_hits(&t.var) {
             return None;
         }
         if &t.var == counter
@@ -1002,7 +1052,7 @@ fn consume_shape(
         let IrStmt::Assign { expr, .. } = s else {
             return None;
         };
-        let (new_expr, n) = substitute_reads(expr, &fill.arr, counter, &fill.rhs)?;
+        let (new_expr, n) = substitute_reads(expr, fill, counter)?;
         forwarded += n;
         let mut s2 = s.clone();
         if let IrStmt::Assign { expr: e, .. } = &mut s2 {
@@ -1024,24 +1074,26 @@ fn consume_shape(
 /// raw bridge text).
 fn substitute_reads(
     expr: &IrExpr,
-    arr: &str,
+    fill: &Fill,
     counter: &str,
-    f: &ArithAst,
 ) -> Option<(IrExpr, usize)> {
     struct Sub<'a> {
-        arr: &'a str,
+        fill: &'a Fill,
         counter: &'a str,
-        f: &'a ArithAst,
         count: usize,
     }
     impl Sub<'_> {
         fn arith(&mut self, a: &ArithAst) -> Option<ArithAst> {
             match a {
-                ArithAst::Index { var, key } if var == self.arr => {
+                // `arr[<i>]` on a FILLED array forwards that array's RHS.
+                // Reads of other arrays pass through (the whole-program
+                // discipline check vetoes them before commit).
+                ArithAst::Index { var, key } if self.fill.rhs(var).is_some() => {
+                    let f = self.fill.rhs(var)?.clone();
                     match arith_affine(key, self.counter) {
                         Some((1, 0)) => {
                             self.count += 1;
-                            Some(self.f.clone())
+                            Some(f)
                         }
                         _ => None,
                     }
@@ -1061,7 +1113,7 @@ fn substitute_reads(
                     else_: Box::new(self.arith(else_)?),
                 }),
                 ArithAst::Assign { var, op, rhs } => {
-                    if var == self.arr {
+                    if self.fill.name_hits(var) {
                         return None;
                     }
                     Some(ArithAst::Assign {
@@ -1071,7 +1123,7 @@ fn substitute_reads(
                     })
                 }
                 ArithAst::IncDec { var, .. } => {
-                    if var == self.arr {
+                    if self.fill.name_hits(var) {
                         return None;
                     }
                     Some(a.clone())
@@ -1091,19 +1143,15 @@ fn substitute_reads(
             // Whole-array scalar reads and word-level element reads are
             // not forwardable (v1: miss, safe).
             match e {
-                IrExpr::Var(v, _) | IrExpr::Ident(v)
-                    if v == self.arr || v.starts_with(&format!("{}[", self.arr)) =>
-                {
-                    return None;
-                }
-                IrExpr::Index { var, .. } if var == self.arr => return None,
+                IrExpr::Var(v, _) | IrExpr::Ident(v) if self.fill.name_hits(v) => return None,
+                IrExpr::Index { var, .. } if self.fill.name_hits(var) => return None,
                 IrExpr::RawExpr(_) => return None,
                 _ => {}
             }
             // Nested statement bodies keep strict discipline (any array
             // mention vetoes — no forwarding inside closures).
             for st in expr_stmts(e) {
-                if stmt_has_arr(st, self.arr) {
+                if self.fill.stmt_hits(st) {
                     return None;
                 }
             }
@@ -1188,7 +1236,7 @@ fn substitute_reads(
                 }
                 IrExpr::Splice(x) => Some(IrExpr::Splice(Box::new(self.expr(x)?))),
                 IrExpr::Ext(x) => {
-                    if x.children().iter().any(|c| expr_has_arr(c, self.arr)) {
+                    if x.children().iter().any(|c| self.fill.expr_hits(c)) {
                         return None;
                     }
                     Some(e.clone())
@@ -1197,7 +1245,7 @@ fn substitute_reads(
             }
         }
     }
-    let mut sub = Sub { arr, counter, f, count: 0 };
+    let mut sub = Sub { fill, counter, count: 0 };
     let out = sub.expr(expr)?;
     Some((out, sub.count))
 }
@@ -1210,96 +1258,117 @@ fn substitute_reads(
 /// of the substitution above — defense in depth).
 fn array_used_elsewhere(
     stmts: &[IrStmt],
-    arr: &str,
+    fill: &Fill,
     l1: usize,
     l2: usize,
     counter: &str,
 ) -> bool {
     for (k, s) in stmts.iter().enumerate() {
         if k == l1 {
-            // Fill: headers fully scanned; body target skipped (THE
-            // store); body expr (F) scanned (a `$A` read inside F vetoes).
+            // Fill: headers fully scanned; body TARGETS skipped (they
+            // ARE the stores — fill_shape pinned one distinct array per
+            // store with a plain-`i` index); body RHS + index keys
+            // scanned (a `$a` read inside F vetoes).
             let IrStmt::ForInit { init, cond, step, body } = s else {
                 return true;
             };
-            if stmts_have_arr(init, arr) || expr_has_arr(cond, arr) || stmts_have_arr(step, arr) {
+            if fill.stmts_hit(init) || fill.expr_hits(cond) || fill.stmts_hit(step) {
                 return true;
             }
-            let [IrStmt::Assign { expr, .. }] = body.as_slice() else {
-                return true;
-            };
-            if expr_has_arr(expr, arr) {
-                return true;
+            for b in body {
+                let IrStmt::Assign { targets, expr, .. } = b else {
+                    return true;
+                };
+                if targets
+                    .iter()
+                    .any(|t| t.indices.iter().any(|kk| fill.expr_hits(kk)))
+                {
+                    return true;
+                }
+                if fill.expr_hits(expr) {
+                    return true;
+                }
             }
         } else if k == l2 {
             // Consumer: headers + targets scanned; body exprs re-verified
-            // (only plain A[<i>] arith reads allowed).
+            // (only plain `A[<i>]` arith reads of a filled array allowed).
             let IrStmt::ForInit { init, cond, step, body } = s else {
                 return true;
             };
-            if stmts_have_arr(init, arr) || expr_has_arr(cond, arr) || stmts_have_arr(step, arr) {
+            if fill.stmts_hit(init) || fill.expr_hits(cond) || fill.stmts_hit(step) {
                 return true;
             }
             for b in body {
                 match b {
                     IrStmt::Assign { targets, expr, .. } => {
-                        if targets.iter().any(|t| target_has_arr(t, arr)) {
+                        if targets.iter().any(|t| fill_any_target_hits(t, fill)) {
                             return true;
                         }
-                        if expr_reads_violate(expr, arr, counter) {
+                        if expr_reads_violate(expr, fill, counter) {
                             return true;
                         }
                     }
                     _ => {
-                        if stmt_has_arr(b, arr) {
+                        if fill.stmt_hits(b) {
                             return true;
                         }
                     }
                 }
             }
-        } else if stmt_has_arr(s, arr) {
+        } else if fill.stmt_hits(s) {
             return true;
         }
     }
     false
 }
 
+/// Does an assign target mention any filled array (base name or index)?
+fn fill_any_target_hits(t: &AssignTarget, fill: &Fill) -> bool {
+    if fill.name_hits(&t.var) {
+        return true;
+    }
+    if let Some(open) = t.var.rfind('[') {
+        if t.var.ends_with(']') && fill.name_hits(&t.var[..open]) {
+            return true;
+        }
+    }
+    t.indices.iter().any(|k| fill.expr_hits(k))
+}
+
 /// Body-expr re-verification: every array mention is a plain `A[<i>]`
 /// arith read (anything else → true = veto). Nested statement bodies
 /// (Arrow/Lambda) are strict (any mention vetoes).
-fn expr_reads_violate(e: &IrExpr, arr: &str, counter: &str) -> bool {
+fn expr_reads_violate(e: &IrExpr, fill: &Fill, counter: &str) -> bool {
     // Returns true on VIOLATION (veto).
     match e {
-        IrExpr::Arith(a) => arith_reads_violate(a, arr, counter),
-        IrExpr::Index { var, .. } if var == arr => true,
-        IrExpr::Var(v, _) | IrExpr::Ident(v)
-            if v == arr || v.starts_with(&format!("{arr}[")) =>
-        {
-            true
-        }
-        IrExpr::Str(s, _) => s == arr || s.contains(&format!("{arr}[")),
+        IrExpr::Arith(a) => arith_reads_violate(a, fill, counter),
+        IrExpr::Index { var, .. } if fill.name_hits(var) => true,
+        IrExpr::Var(v, _) | IrExpr::Ident(v) if fill.name_hits(v) => true,
+        IrExpr::Str(s, _) => fill
+            .arrays()
+            .any(|a| s == a || s.contains(&format!("{a}["))),
         IrExpr::RawExpr(_) => true,
-        IrExpr::Lambda { body, .. } => stmts_have_arr(body, arr),
-        IrExpr::Arrow(b) => stmts_have_arr(b, arr),
-        IrExpr::Ext(x) => x.children().iter().any(|c| expr_has_arr(c, arr)),
+        IrExpr::Lambda { body, .. } => fill.stmts_hit(body),
+        IrExpr::Arrow(b) => fill.stmts_hit(b),
+        IrExpr::Ext(x) => x.children().iter().any(|c| fill.expr_hits(c)),
         _ => {
-            expr_kids(e).iter().any(|k| expr_reads_violate(k, arr, counter))
-                || expr_stmts(e).iter().any(|k| stmt_has_arr(k, arr))
+            expr_kids(e).iter().any(|k| expr_reads_violate(k, fill, counter))
+                || expr_stmts(e).iter().any(|k| fill.stmt_hits(k))
         }
     }
 }
 
-fn arith_reads_violate(a: &ArithAst, arr: &str, counter: &str) -> bool {
+fn arith_reads_violate(a: &ArithAst, fill: &Fill, counter: &str) -> bool {
     // Returns true on VIOLATION (veto).
     match a {
-        ArithAst::Index { var, key } if var == arr => {
+        ArithAst::Index { var, key } if fill.rhs(var).is_some() => {
             // Allowed ONLY as a plain-counter read of clean key.
-            arith_affine(key, counter) != Some((1, 0)) || arith_has_arr(key, arr)
+            arith_affine(key, counter) != Some((1, 0)) || fill.expr_arith_hits(key)
         }
-        ArithAst::Var(v) | ArithAst::Ident(v) => v == arr || v.starts_with(&format!("{arr}[")),
-        ArithAst::Assign { var, .. } if var == arr => true,
-        ArithAst::IncDec { var, .. } if var == arr => true,
-        _ => arith_kids(a).iter().any(|k| arith_reads_violate(k, arr, counter)),
+        ArithAst::Var(v) | ArithAst::Ident(v) => fill.name_hits(v),
+        ArithAst::Assign { var, .. } if fill.name_hits(var) => true,
+        ArithAst::IncDec { var, .. } if fill.name_hits(var) => true,
+        _ => arith_kids(a).iter().any(|k| arith_reads_violate(k, fill, counter)),
     }
 }
 
@@ -1585,6 +1654,144 @@ mod tests {
         assert!(transform(&mut prog));
         assert_eq!(prog.len(), 2);
         assert!(!stmts_have_arr(&prog, "a"));
+    }
+
+    /// Multi-store fill: `a[$i]=i*i; b[$i]=i+1` consumed as
+    /// `(s + a[i]*b[i]) & mask`.
+    fn twoarr_prog() -> Vec<IrStmt> {
+        let fill = for_init(vec![
+            IrStmt::Assign {
+                targets: vec![scalar("a[$i]")],
+                expr: arith(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(v("i")),
+                    rhs: Box::new(v("i")),
+                }),
+                asm: None,
+            },
+            IrStmt::Assign {
+                targets: vec![scalar("b[$i]")],
+                expr: arith(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(v("i")),
+                    rhs: Box::new(ArithAst::Num(1)),
+                }),
+                asm: None,
+            },
+        ]);
+        let cons = for_init(vec![assign(
+            "s",
+            arith(ArithAst::Bin {
+                op: "&".to_string(),
+                lhs: Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(v("s")),
+                    rhs: Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Index {
+                            var: "a".to_string(),
+                            key: Box::new(v("i")),
+                        }),
+                        rhs: Box::new(ArithAst::Index {
+                            var: "b".to_string(),
+                            key: Box::new(v("i")),
+                        }),
+                    }),
+                }),
+                rhs: Box::new(ArithAst::Num(4294967295)),
+            }),
+        )]);
+        vec![fill, assign("s", str_lit("0")), cons]
+    }
+
+    #[test]
+    fn multi_store_fill_fuses() {
+        let mut prog = twoarr_prog();
+        assert!(transform(&mut prog));
+        assert_eq!(prog.len(), 2, "fill deleted, gap + fused loop left");
+        assert!(!stmts_have_arr(&prog, "a") && !stmts_have_arr(&prog, "b"));
+        let IrStmt::ForInit { body, .. } = &prog[1] else {
+            panic!("expected fused loop");
+        };
+        let IrStmt::Assign { expr, .. } = &body[0] else {
+            panic!("expected assign");
+        };
+        assert!(expr_has_arr(expr, "a") == false && expr_has_arr(expr, "b") == false);
+        // Both RHS shapes survive.
+        let IrExpr::Arith(a) = expr else {
+            panic!("arith");
+        };
+        fn has(x: &ArithAst, want: i64) -> bool {
+            matches!(x, ArithAst::Num(n) if *n == want) || arith_kids(x).iter().any(|k| has(k, want))
+        }
+        assert!(has(a, 1), "b's `i+1` survived: {a:?}");
+    }
+
+    #[test]
+    fn duplicate_store_array_vetoes() {
+        // Same array written twice in the fill — forwarding target is
+        // ambiguous.
+        let mut prog = twoarr_prog();
+        let IrStmt::ForInit { body, .. } = &mut prog[0] else {
+            panic!("shape");
+        };
+        let IrStmt::Assign { targets, .. } = &mut body[1] else {
+            panic!("shape");
+        };
+        targets[0] = scalar("a[$i]");
+        assert!(!transform(&mut prog));
+    }
+
+    #[test]
+    fn extra_mention_of_second_array_vetoes() {
+        let mut prog = twoarr_prog();
+        prog.push(IrStmt::Output {
+            value: IrExpr::Index {
+                var: "b".to_string(),
+                key: Box::new(IrExpr::Int(0)),
+            },
+            newline: true,
+            target: None,
+        });
+        assert!(!transform(&mut prog));
+    }
+
+    #[test]
+    fn partially_read_multi_store_fuses() {
+        // Only `a` is read by the consumer — `b` becomes dead, which is
+        // still sound (its store is unobservable). Forwarded count is 1.
+        let mut prog = twoarr_prog();
+        let IrStmt::ForInit { body, .. } = &mut prog[2] else {
+            panic!("shape");
+        };
+        let IrStmt::Assign { expr, .. } = &mut body[0] else {
+            panic!("shape");
+        };
+        let IrExpr::Arith(a) = expr else {
+            panic!("shape");
+        };
+        // Replace `a[i]*b[i]` with plain `a[i]`.
+        let ArithAst::Bin { lhs, .. } = a.as_ref() else {
+            panic!("shape");
+        };
+        let ArithAst::Bin { lhs: plus, .. } = lhs.as_ref() else {
+            panic!("shape");
+        };
+        *a = Box::new(ArithAst::Bin {
+            op: "&".to_string(),
+            lhs: Box::new(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: plus.clone(),
+                rhs: Box::new(ArithAst::Index {
+                    var: "a".to_string(),
+                    key: Box::new(v("i")),
+                }),
+            }),
+            rhs: Box::new(ArithAst::Num(4294967295)),
+        });
+        assert!(transform(&mut prog));
+        assert!(!stmts_have_arr(&prog, "a"));
+        assert!(!stmts_have_arr(&prog, "b"));
     }
 
     #[test]
