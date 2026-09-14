@@ -660,6 +660,9 @@ pub struct Render {
     /// The overflow-flag C name of the active speculative fast arm
     /// (`spec_checked_expr` sets it and `break`s out on overflow).
     spec_ovf: Option<String>,
+    /// True while rendering a speculative EXACT replay arm: nested loops
+    /// must not speculate again (the arm is the GMP fallback).
+    spec_replay: bool,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6637,15 +6640,25 @@ impl Render {
     /// loop's entry state is restored and the GMP arm replays; otherwise
     /// the i64 result was exact. Returns true when it emitted the loop.
     fn try_spec_loop(&mut self, cond: &IrExpr, body: &[IrStmt]) -> bool {
-        let IrExpr::Arith(cond_a) = cond else {
+        // Already inside a speculative fast arm: a nested loop renders in
+        // the same arm (the outer wrapper owns the flag and the replay),
+        // so do not wrap it again. Likewise inside an exact replay arm.
+        if self.spec_fast.is_some() || self.spec_replay {
+            return false;
+        }
+        // Structured arith condition required; it need NOT mention the
+        // growth var. The outermost loop containing the growth is the
+        // preferred target: the whole loop (including the bigint
+        // assignment that precedes the growth) then runs in the i64 arm,
+        // so the i64<->mpz handoff happens once per outer entry instead
+        // of once per iteration (collatz's inner loop is entered 1.8e7
+        // times).
+        let IrExpr::Arith(_) = cond else {
             return false;
         };
         let Some(v) = self.spec_growth_var(body) else {
             return false;
         };
-        if !arith_has_var(cond_a, &v) {
-            return false;
-        }
         // Every loop-carried mutation must be a plain scalar (or the var).
         let mut mutated: BTreeSet<String> = BTreeSet::new();
         if !spec_collect(body, &mut mutated) {
@@ -6736,9 +6749,11 @@ impl Render {
         self.depth += 1;
         self.loop_depth += 1;
         self.in_loop += 1;
+        self.spec_replay = true;
         for s in body {
             self.stmt(s);
         }
+        self.spec_replay = false;
         self.in_loop -= 1;
         self.loop_depth -= 1;
         self.depth -= 1;
@@ -6772,6 +6787,10 @@ impl Render {
                         walk(else_, big, found);
                     }
                     IrStmt::Block(b) => walk(b, big, found),
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::ForInit { body, .. } => walk(body, big, found),
                     _ => {}
                 }
             }
@@ -6785,7 +6804,60 @@ impl Render {
     /// becomes a `__builtin_*_overflow` check that sets the loop's
     /// overflow flag and breaks to the GMP replay. `/`/`%` are safe with
     /// a nonzero literal divisor (validated by `spec_rhs_ok`).
+    /// Affine fast path for a checked store: `coef*x + k` (x a single
+    /// leaf) overflows iff `x` leaves the precomputed range, so ONE
+    /// compare replaces the per-op overflow builtins (collatz's
+    /// `3*v+1`). Returns None for anything not affine (the builtin walk
+    /// handles it) and for coefficients that are not i64 literals.
+    fn spec_affine_store(&mut self, a: &ArithAst) -> Option<String> {
+        let (x, coef, k) = spec_affine(a)?;
+        if coef == 0 {
+            return Some(format!("{k}LL"));
+        }
+        if coef < i64::MIN as i128
+            || coef > i64::MAX as i128
+            || k < i64::MIN as i128
+            || k > i64::MAX as i128
+        {
+            return None;
+        }
+        let xe = if self
+            .spec_fast
+            .as_ref()
+            .is_some_and(|f| f.contains(x.as_str()))
+        {
+            format!("{}_s", self.c_ident(&x))
+        } else {
+            self.c_ident(&x)
+        };
+        let lo_num = i64::MIN as i128 - k;
+        let hi_num = i64::MAX as i128 - k;
+        let (xlo, xhi) = if coef > 0 {
+            (div_ceil(lo_num, coef), div_floor(hi_num, coef))
+        } else {
+            (div_ceil(hi_num, coef), div_floor(lo_num, coef))
+        };
+        let ovf = self.spec_ovf.clone().unwrap_or_default();
+        let mut checks: Vec<String> = Vec::new();
+        if xlo > i64::MIN as i128 {
+            checks.push(format!("{xe} < {xlo}LL"));
+        }
+        if xhi < i64::MAX as i128 {
+            checks.push(format!("{xe} > {xhi}LL"));
+        }
+        if !checks.is_empty() {
+            self.emit(&format!(
+                "if ({}) {{ {ovf} = 1; break; }}",
+                checks.join(" || ")
+            ));
+        }
+        Some(format!("({coef}LL * {xe} + {k}LL)"))
+    }
+
     fn spec_checked_expr(&mut self, a: &ArithAst) -> String {
+        if let Some(e) = self.spec_affine_store(a) {
+            return e;
+        }
         match a {
             ArithAst::Cast { arg, .. } => self.spec_checked_expr(arg),
             ArithAst::Num(n) => format!("{n}LL"),
@@ -26949,6 +27021,14 @@ fn param_copy_alias(
                     ));
                     self.emit("}");
                 }
+                // A nested loop inside a speculative fast arm shares the
+                // arm's overflow flag: an inner checked store broke out of
+                // the INNER loop, so abort the outer one too and replay.
+                if self.spec_fast.is_some() {
+                    if let Some(ovf) = self.spec_ovf.clone() {
+                        self.emit(&format!("if ({ovf}) break;"));
+                    }
+                }
             }
             IrStmt::DoWhile { body, cond, until } => {
                 // P1 follow-up: see While.
@@ -29138,7 +29218,11 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else { return false };
-                if !t.indices.is_empty() || !matches!(expr, IrExpr::Arith(_)) {
+                // Pure scalar RHS only. Non-arith literals (`s = 0`) are
+                // fine — the spec var's own assigns are re-checked by
+                // `spec_body_rhs_ok`. Calls/arrays/captures may have side
+                // effects and are refused.
+                if !t.indices.is_empty() || !expr_is_pure_scalar(expr) {
                     return false;
                 }
                 out.insert(t.var.clone());
@@ -29169,10 +29253,42 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
                     return false;
                 }
             }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                if !matches!(cond, IrExpr::Arith(_)) || !spec_collect(body, out) {
+                    return false;
+                }
+            }
+            IrStmt::For { body, .. } => {
+                if !spec_collect(body, out) {
+                    return false;
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                if !matches!(cond, IrExpr::Arith(_))
+                    || !spec_collect(init, out)
+                    || !spec_collect(step, out)
+                    || !spec_collect(body, out)
+                {
+                    return false;
+                }
+            }
             _ => return false,
         }
     }
     true
+}
+
+/// A side-effect-free scalar RHS the fast arm can render as-is.
+fn expr_is_pure_scalar(e: &IrExpr) -> bool {
+    matches!(
+        e,
+        IrExpr::Arith(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Int(_)
+            | IrExpr::Var(_, _)
+            | IrExpr::Ident(_)
+            | IrExpr::Bool(_)
+    )
 }
 
 fn spec_collect_targets(a: &ArithAst, out: &mut BTreeSet<String>) -> bool {
@@ -29206,6 +29322,65 @@ fn spec_unwrap_cast(a: &ArithAst) -> &ArithAst {
     match a {
         ArithAst::Cast { arg, .. } => spec_unwrap_cast(arg),
         other => other,
+    }
+}
+
+fn div_floor(a: i128, b: i128) -> i128 {
+    a.div_euclid(b)
+}
+fn div_ceil(a: i128, b: i128) -> i128 {
+    -((-a).div_euclid(b))
+}
+
+fn spec_const(a: &ArithAst) -> Option<i128> {
+    match a {
+        ArithAst::Cast { arg, .. } => spec_const(arg),
+        ArithAst::Num(n) => Some(*n as i128),
+        _ => None,
+    }
+}
+
+/// `coef*x + k` (x a single leaf var) or None. Used by the affine
+/// checked store so a growth step needs one range compare, not the
+/// per-op overflow builtins.
+fn spec_affine(a: &ArithAst) -> Option<(String, i128, i128)> {
+    match a {
+        ArithAst::Cast { arg, .. } => spec_affine(arg),
+        ArithAst::Var(x) | ArithAst::Ident(x) => Some((x.clone(), 1, 0)),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = spec_affine(lhs);
+            let r = spec_affine(rhs);
+            match (op.as_str(), l, r) {
+                ("+", Some((x, a0, b0)), Some((y, a1, b1))) if x == y => {
+                    Some((x, a0.checked_add(a1)?, b0.checked_add(b1)?))
+                }
+                ("-", Some((x, a0, b0)), Some((y, a1, b1))) if x == y => {
+                    Some((x, a0.checked_sub(a1)?, b0.checked_sub(b1)?))
+                }
+                ("+", Some((x, a0, b0)), None) => {
+                    let c = spec_const(rhs)?;
+                    Some((x, a0, b0.checked_add(c)?))
+                }
+                ("+", None, Some((x, a1, b1))) => {
+                    let c = spec_const(lhs)?;
+                    Some((x, a1, b1.checked_add(c)?))
+                }
+                ("-", Some((x, a0, b0)), None) => {
+                    let c = spec_const(rhs)?;
+                    Some((x, a0, b0.checked_sub(c)?))
+                }
+                ("*", Some((x, a0, b0)), None) => {
+                    let c = spec_const(rhs)?;
+                    Some((x, a0.checked_mul(c)?, b0.checked_mul(c)?))
+                }
+                ("*", None, Some((x, a1, b1))) => {
+                    let c = spec_const(lhs)?;
+                    Some((x, a1.checked_mul(c)?, b1.checked_mul(c)?))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -29284,6 +29459,14 @@ fn spec_body_rhs_ok(stmts: &[IrStmt], v: &str, big: &BTreeSet<String>) -> bool {
             }
             IrStmt::Block(b) => {
                 if !spec_body_rhs_ok(b, v, big) {
+                    return false;
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::ForInit { body, .. } => {
+                if !spec_body_rhs_ok(body, v, big) {
                     return false;
                 }
             }
@@ -37940,8 +38123,10 @@ mod tests {
         ];
         let c = shir_to_c(&prog);
         assert!(c.contains("_sp_ovf"), "no overflow flag:\n{c}");
+        // `3*v+1` is affine, so the checked store is one range compare
+        // plus the native update (no per-op overflow builtins).
         assert!(
-            c.contains("__builtin_mul_overflow"),
+            c.contains("3LL * v_s") && c.contains("_sp_ovf") && c.contains("break;"),
             "no checked fast store:\n{c}"
         );
         assert!(c.contains("long long v_s = 0;"), "no i64 shadow:\n{c}");
