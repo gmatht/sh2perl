@@ -25814,6 +25814,31 @@ fn param_copy_alias(
                 // native `v = …` store would not compile.
                 if let IrExpr::Arith(a) = expr {
                     if self.bigint_vars.contains(&t.var) || self.is_bigint_arith(a) {
+                        // Native fast path: a bigint target whose RHS reads
+                        // NO bigint var and is proven within i64 is computed
+                        // natively and stored with one `mpz_set_si` instead
+                        // of a chain of mpz calls (collatz's per-iteration
+                        // `v = (k*37+3)%251` was 4 GMP calls each).
+                        if self.bigint_vars.contains(&t.var)
+                            && !arith_is_bigint_spec(a, &self.bigint_vars)
+                            && spec_rhs_ok(a, "\u{1}", &self.bigint_vars)
+                        {
+                            if let Some((lo, hi)) = arith_range_native(a, &self.var_ranges) {
+                                if lo >= i64::MIN as i128 && hi <= i64::MAX as i128 {
+                                    let e = self.arith(a);
+                                    let name = self.c_ident(&t.var);
+                                    self.emit(&format!("mpz_set_si({name}, {e});"));
+                                    // keep the wide magnitude probe (the mpz
+                                    // is set now, so it is exact either way)
+                                    if let Some(site) = self.prof_site(2, &t.var) {
+                                        self.emit(&format!(
+                                            "_sh_prof_val_mpz({site}, {name});"
+                                        ));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                         let name = self.c_ident(&t.var);
                         self.bigint_into(a, &name);
                         // wide magnitude probe (SH2_PROFILE_WIDE): the true
@@ -29173,6 +29198,46 @@ fn spec_collect_targets(a: &ArithAst, out: &mut BTreeSet<String>) -> bool {
     }
 }
 
+/// A small, LOCAL range walker for the native bigint-store fast path:
+/// handles `Cast` (identity), `+`/`-`/`*`, and Python floor-`%` with a
+/// provably-positive divisor. Deliberately does not touch the shared
+/// `arith_range_local` (whose verdicts size many other things).
+fn spec_unwrap_cast(a: &ArithAst) -> &ArithAst {
+    match a {
+        ArithAst::Cast { arg, .. } => spec_unwrap_cast(arg),
+        other => other,
+    }
+}
+
+fn arith_range_native(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
+    match a {
+        ArithAst::Cast { arg, .. } => arith_range_native(arg, ranges),
+        ArithAst::Num(n) => Some((*n as i128, *n as i128)),
+        ArithAst::Var(n) | ArithAst::Ident(n) => ranges.get(n).copied(),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let (l0, l1) = arith_range_native(lhs, ranges)?;
+            let (r0, r1) = arith_range_native(rhs, ranges)?;
+            match op.as_str() {
+                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
+                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+                "*" => {
+                    let ps = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    Some((*ps.iter().min()?, *ps.iter().max()?))
+                }
+                // Python floor-mod: result ∈ [0, m-1] for m > 0.
+                "%" if r0 > 0 => Some((0, r1 - 1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Can this RHS be rendered as checked i64? Leaves must be the growth var
 /// or a non-bigint scalar; `/`/`%` need a nonzero literal divisor.
 fn spec_rhs_ok(a: &ArithAst, v: &str, big: &BTreeSet<String>) -> bool {
@@ -29184,7 +29249,7 @@ fn spec_rhs_ok(a: &ArithAst, v: &str, big: &BTreeSet<String>) -> bool {
             "+" | "-" | "*" => spec_rhs_ok(lhs, v, big) && spec_rhs_ok(rhs, v, big),
             "/" | "%" => {
                 spec_rhs_ok(lhs, v, big)
-                    && matches!(rhs.as_ref(), ArithAst::Num(n) if *n != 0)
+                    && matches!(spec_unwrap_cast(rhs), ArithAst::Num(n) if *n != 0)
             }
             _ => false,
         },
@@ -37783,6 +37848,53 @@ mod tests {
             var_storage: vec![],
             var_bash_env: vec![],
         }
+    }
+
+    #[test]
+    fn bigint_store_with_i64_rhs_is_native() {
+        // A bigint target whose RHS reads no bigint var and is proven
+        // within i64 stores with one `mpz_set_si`, not an mpz chain
+        // (collatz's per-iteration `v = (k*37+3)%251`). A bigint-operand
+        // RHS keeps the GMP path.
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        // v = 5 — no bigint operand, range [5,5]: one native store.
+        // Two writes so the const-markup lift does not drop the assign.
+        let rhs = cast(A::Num(5));
+        let mut prog = empty_prog(vec![assign("v", cast(A::Num(1))), assign("v", rhs)]);
+        prog.var_types = vec![("v".to_string(), crate::ir::IrType::Int)];
+        let c = shir_to_c(&prog);
+        assert!(
+            c.contains("mpz_set_si(v, 5)"),
+            "i64-provable bigint store not native:\n{c}"
+        );
+
+        // control: reading a bigint var must keep the GMP path
+        let mut prog2 = empty_prog(vec![
+            assign("w", cast(A::Num(5))),
+            assign("v", cast(A::Var("w".into()))),
+        ]);
+        prog2.var_types = vec![
+            ("v".to_string(), crate::ir::IrType::Int),
+            ("w".to_string(), crate::ir::IrType::Int),
+        ];
+        let c2 = shir_to_c(&prog2);
+        assert!(
+            c2.contains("mpz_set(v, w);"),
+            "bigint-operand RHS did not copy via mpz:\n{c2}"
+        );
     }
 
     #[test]
