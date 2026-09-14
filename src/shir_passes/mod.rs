@@ -46,6 +46,8 @@
 pub mod analysis;
 pub mod context;
 pub mod lifetime;
+/// Maskable unsigned lowering (shared analysis for C/CUDA/Vulkan).
+pub mod maskable;
 /// List-container profiling (docs/LISTS.MD §4): census, frequency
 /// bounds, structure selection, use scopes. Consumed by the C backend
 /// (growable-vec selection + function-local vecs); nothing else

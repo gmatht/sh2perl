@@ -78,6 +78,13 @@ pub struct CuLoopSpec {
     pub externs: Vec<String>,
     /// Output stores (one buffer param per distinct array).
     pub stores: Vec<CuStore>,
+    /// Min threshold over maskable pow2-mod sites (None = none).
+    /// Candidacy guarantees every pow2-mod site contributed (or refuses
+    /// wholesale), so `mask_fast` may mask them all.
+    pub mask_thresh: Option<i128>,
+    /// Render pow2 `%`/`/` as `&`/shr (set by the vehicle on a clone
+    /// when bound <= mask_thresh; never set by candidacy directly).
+    pub mask_fast: bool,
 }
 
 fn ident(s: &str) -> String {
@@ -106,6 +113,7 @@ fn arith(
     tmp: &mut u32,
     used: &mut BTreeSet<String>,
     out: &mut Vec<String>,
+    mask_fast: bool,
 ) -> String {
     match e {
         CuArith::Num(n) => {
@@ -121,8 +129,8 @@ fn arith(
             format!("%qe{i}")
         }
         CuArith::Add(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qa{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -130,8 +138,8 @@ fn arith(
             d
         }
         CuArith::Sub(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qs{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -139,19 +147,19 @@ fn arith(
             d
         }
         CuArith::Mul(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qm{tmp}");
             used.insert(d.clone());
             *tmp += 1;
             out.push(format!("  mul.lo.s64 {d}, {l}, {r};"));
             d
         }
-        CuArith::Div(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, true),
-        CuArith::Mod(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, false),
+        CuArith::Div(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, true, mask_fast),
+        CuArith::Mod(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, false, mask_fast),
         CuArith::Min(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qn{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -160,8 +168,8 @@ fn arith(
             d
         }
         CuArith::Max(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qx{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -170,8 +178,8 @@ fn arith(
             d
         }
         CuArith::And(a, b) => {
-            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
-            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let d = format!("%qa{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -181,7 +189,7 @@ fn arith(
         CuArith::ArrRead { array, index } => {
             // Element load with negative guard (bash unset-in-arith is
             // 0); upper bounds trusted (dense-fill coverage assumption).
-            let k = arith(index, ext_idx, arr_idx, tmp, used, out);
+            let k = arith(index, ext_idx, arr_idx, tmp, used, out, mask_fast);
             let bi = arr_idx.get(array).copied().unwrap_or(0);
             let d = format!("%qd{tmp}");
             used.insert(d.clone());
@@ -213,11 +221,32 @@ fn divmod(
     used: &mut BTreeSet<String>,
     out: &mut Vec<String>,
     is_div: bool,
+    mask_fast: bool,
 ) -> String {
-    let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+    let l = arith(a, ext_idx, arr_idx, tmp, used, out, mask_fast);
+    // Mask fast path (loop-versioned flag): pow2 divisor sites were
+    // all threshold-covered by candidacy (all-or-nothing contract), so
+    // render `& mask` / `>> k` with no div instruction. Non-pow2 falls
+    // through to the guarded/bare paths below (unchanged).
+    if mask_fast {
+        if let CuArith::Num(d) = b {
+            if *d > 0 && (*d as u64).is_power_of_two() {
+                let dreg = format!("%qz{tmp}");
+                used.insert(dreg.clone());
+                *tmp += 1;
+                if is_div {
+                    let k = (*d as u64).trailing_zeros();
+                    out.push(format!("  shr.s64 {dreg}, {l}, {k};"));
+                } else {
+                    out.push(format!("  and.b64 {dreg}, {l}, {};" , *d - 1));
+                }
+                return dreg;
+            }
+        }
+    }
     // Literal divisor: bare when provably nonzero, guarded zero when 0.
     if let CuArith::Num(d) = b {
-        let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+        let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
         let op = if is_div { "div" } else { "rem" };
         let dreg = format!("%qz{tmp}");
         used.insert(dreg.clone());
@@ -231,7 +260,7 @@ fn divmod(
         }
         return dreg;
     }
-    let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+    let r = arith(b, ext_idx, arr_idx, tmp, used, out, mask_fast);
     let op = if is_div { "div" } else { "rem" };
     let dreg = format!("%qz{tmp}");
     used.insert(dreg.clone());
@@ -314,7 +343,7 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
         // exactly bash's drop-negative behavior.)
         if st.index_a == 1 && st.index_b == 0 {
             let mut vlines: Vec<String> = Vec::new();
-            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
+            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines, spec.mask_fast);
             body.extend(vlines);
             body.push("  mul.lo.u64 %qt, %gid, 8;".to_string());
             body.push(format!("  add.u64 %qa, %qb{bi}, %qt;"));
@@ -335,7 +364,7 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
                 vlines.push(format!("  mul.lo.s64 {t2}, %qi_, {};", st.index_a));
                 vlines.push(format!("  add.s64 {t}, {t2}, {};", st.index_b));
             }
-            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
+            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines, spec.mask_fast);
             body.extend(vlines);
             let lab = tmp;
             tmp += 1;
@@ -440,6 +469,11 @@ pub struct CuReduceSpec {
     pub externs: Vec<String>,
     /// Read-only input arrays (for ArrRead values).
     pub arrays: Vec<String>,
+    /// Min threshold over maskable pow2-mod sites (None = none).
+    /// Same contract as CuLoopSpec (all-or-nothing coverage).
+    pub mask_thresh: Option<i128>,
+    /// Render pow2 `%`/`/` as `&`/shr (vehicle clone flag).
+    pub mask_fast: bool,
 }
 
 /// Render a reduction to PTX (total function).
@@ -468,7 +502,7 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
     let mut tmp: u32 = 0;
     let mut used: BTreeSet<String> = BTreeSet::new();
     let mut vlines: Vec<String> = Vec::new();
-    let v = arith(&spec.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
+    let v = arith(&spec.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines, spec.mask_fast);
 
     let mut out = String::new();
     out.push_str(".version 7.0\n");
@@ -584,7 +618,14 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
         }
         CuReduceOp::ModAdd { modulus } => {
             out.push_str(&format!("  add.s64 %qacc, %qacc, {v};\n"));
-            out.push_str(&format!("  rem.s64 %qacc, %qacc, {modulus};\n"));
+            // Mask fast path: candidacy versioned the accum site (X
+            // threshold + acc entry range), so a pow2 modulus renders
+            // as `& mask` with no div instruction.
+            if spec.mask_fast && *modulus > 0 && (*modulus as u64).is_power_of_two() {
+                out.push_str(&format!("  and.b64 %qacc, %qacc, {};\n", *modulus - 1));
+            } else {
+                out.push_str(&format!("  rem.s64 %qacc, %qacc, {modulus};\n"));
+            }
         }
         CuReduceOp::MaskAdd { mask } => {
             out.push_str(&format!("  add.u64 %qacc, %qacc, {v};\n"));
@@ -737,6 +778,8 @@ mod tests {
                     Box::new(CuArith::LoopVar),
                 ),
             }],
+            mask_thresh: None,
+            mask_fast: false,
         }
     }
 
@@ -857,6 +900,8 @@ mod tests {
             acc_init: 0,
             externs: vec![],
             arrays: vec![],
+            mask_thresh: None,
+            mask_fast: false,
         }
     }
 
@@ -883,6 +928,22 @@ mod tests {
         assert!(shir_to_cu_reduce(&s).contains("mov.u64 %qacc, 1;"));
         s.op = CuReduceOp::Min;
         assert!(shir_to_cu_reduce(&s).contains("9223372036854775807;"));
+    }
+
+    #[test]
+    fn mask_fast_renders_and_not_rem() {
+        let mut s = sumred_spec();
+        s.mask_fast = true;
+        let p = shir_to_cu_reduce(&s);
+        assert!(p.contains("and.b64"), "{p}");
+        assert!(!p.contains("rem.s64"), "signed rem survives mask_fast:\n{p}");
+    }
+
+    #[test]
+    fn mask_fast_off_renders_rem() {
+        let p = shir_to_cu_reduce(&sumred_spec());
+        assert!(p.contains("rem.s64"), "{p}");
+        assert!(!p.contains("and.b64"), "{p}");
     }
 
     #[test]
