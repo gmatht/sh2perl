@@ -37,6 +37,13 @@ pub enum CuArith {
     Mul(Box<CuArith>, Box<CuArith>),
     Div(Box<CuArith>, Box<CuArith>),
     Mod(Box<CuArith>, Box<CuArith>),
+    Min(Box<CuArith>, Box<CuArith>),
+    Max(Box<CuArith>, Box<CuArith>),
+    And(Box<CuArith>, Box<CuArith>),
+    /// Array element read `array[index]` (reduce-over-array values).
+    /// Negative indices yield 0 (bash unset-in-arith); upper bounds are
+    /// trusted (dense-fill coverage — documented v1 assumption).
+    ArrRead { array: String, index: Box<CuArith> },
 }
 
 /// One affine array store: `array[a*i + b] = value`.
@@ -95,6 +102,7 @@ fn ident(s: &str) -> String {
 fn arith(
     e: &CuArith,
     ext_idx: &BTreeMap<String, usize>,
+    arr_idx: &BTreeMap<String, usize>,
     tmp: &mut u32,
     used: &mut BTreeSet<String>,
     out: &mut Vec<String>,
@@ -113,8 +121,8 @@ fn arith(
             format!("%qe{i}")
         }
         CuArith::Add(a, b) => {
-            let l = arith(a, ext_idx, tmp, used, out);
-            let r = arith(b, ext_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
             let d = format!("%qa{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -122,8 +130,8 @@ fn arith(
             d
         }
         CuArith::Sub(a, b) => {
-            let l = arith(a, ext_idx, tmp, used, out);
-            let r = arith(b, ext_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
             let d = format!("%qs{tmp}");
             used.insert(d.clone());
             *tmp += 1;
@@ -131,16 +139,66 @@ fn arith(
             d
         }
         CuArith::Mul(a, b) => {
-            let l = arith(a, ext_idx, tmp, used, out);
-            let r = arith(b, ext_idx, tmp, used, out);
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
             let d = format!("%qm{tmp}");
             used.insert(d.clone());
             *tmp += 1;
             out.push(format!("  mul.lo.s64 {d}, {l}, {r};"));
             d
         }
-        CuArith::Div(a, b) => divmod(a, b, ext_idx, tmp, used, out, true),
-        CuArith::Mod(a, b) => divmod(a, b, ext_idx, tmp, used, out, false),
+        CuArith::Div(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, true),
+        CuArith::Mod(a, b) => divmod(a, b, ext_idx, arr_idx, tmp, used, out, false),
+        CuArith::Min(a, b) => {
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let d = format!("%qn{tmp}");
+            used.insert(d.clone());
+            *tmp += 1;
+            out.push(format!("  setp.lt.s64 %qp, {l}, {r};"));
+            out.push(format!("  selp.s64 {d}, {l}, {r}, %qp;"));
+            d
+        }
+        CuArith::Max(a, b) => {
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let d = format!("%qx{tmp}");
+            used.insert(d.clone());
+            *tmp += 1;
+            out.push(format!("  setp.gt.s64 %qp, {l}, {r};"));
+            out.push(format!("  selp.s64 {d}, {l}, {r}, %qp;"));
+            d
+        }
+        CuArith::And(a, b) => {
+            let l = arith(a, ext_idx, arr_idx, tmp, used, out);
+            let r = arith(b, ext_idx, arr_idx, tmp, used, out);
+            let d = format!("%qa{tmp}");
+            used.insert(d.clone());
+            *tmp += 1;
+            out.push(format!("  and.b64 {d}, {l}, {r};"));
+            d
+        }
+        CuArith::ArrRead { array, index } => {
+            // Element load with negative guard (bash unset-in-arith is
+            // 0); upper bounds trusted (dense-fill coverage assumption).
+            let k = arith(index, ext_idx, arr_idx, tmp, used, out);
+            let bi = arr_idx.get(array).copied().unwrap_or(0);
+            let d = format!("%qd{tmp}");
+            used.insert(d.clone());
+            let lab = *tmp;
+            *tmp += 1;
+            out.push(format!("  setp.lt.s64 %qp, {k}, 0;"));
+            out.push(format!("  @%qp bra QARR{lab};"));
+            out.push(format!("  cvt.u64.s64 %qt, {k};"));
+            out.push("  mul.lo.u64 %qt, %qt, 8;".to_string());
+            out.push(format!("  add.u64 %qt, %qb{bi}, %qt;"));
+            out.push(format!("  ld.global.s64 {d}, [%qt];"));
+            out.push(format!("  bra QARRDONE{lab};"));
+            out.push(format!("QARR{lab}:"));
+            out.push(format!("  mov.s64 {d}, 0;"));
+            out.push(format!("QARRDONE{lab}:"));
+            d
+        }
     }
 }
 
@@ -150,15 +208,16 @@ fn divmod(
     a: &CuArith,
     b: &CuArith,
     ext_idx: &BTreeMap<String, usize>,
+    arr_idx: &BTreeMap<String, usize>,
     tmp: &mut u32,
     used: &mut BTreeSet<String>,
     out: &mut Vec<String>,
     is_div: bool,
 ) -> String {
-    let l = arith(a, ext_idx, tmp, used, out);
+    let l = arith(a, ext_idx, arr_idx, tmp, used, out);
     // Literal divisor: bare when provably nonzero, guarded zero when 0.
     if let CuArith::Num(d) = b {
-        let r = arith(b, ext_idx, tmp, used, out);
+        let r = arith(b, ext_idx, arr_idx, tmp, used, out);
         let op = if is_div { "div" } else { "rem" };
         let dreg = format!("%qz{tmp}");
         used.insert(dreg.clone());
@@ -172,7 +231,7 @@ fn divmod(
         }
         return dreg;
     }
-    let r = arith(b, ext_idx, tmp, used, out);
+    let r = arith(b, ext_idx, arr_idx, tmp, used, out);
     let op = if is_div { "div" } else { "rem" };
     let dreg = format!("%qz{tmp}");
     used.insert(dreg.clone());
@@ -202,6 +261,11 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
     }
     let ext_idx: BTreeMap<String, usize> = spec
         .externs
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let arr_idx: BTreeMap<String, usize> = arrays
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
@@ -250,7 +314,7 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
         // exactly bash's drop-negative behavior.)
         if st.index_a == 1 && st.index_b == 0 {
             let mut vlines: Vec<String> = Vec::new();
-            let v = arith(&st.value, &ext_idx, &mut tmp, &mut used, &mut vlines);
+            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
             body.extend(vlines);
             body.push("  mul.lo.u64 %qt, %gid, 8;".to_string());
             body.push(format!("  add.u64 %qa, %qb{bi}, %qt;"));
@@ -271,7 +335,7 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
                 vlines.push(format!("  mul.lo.s64 {t2}, %qi_, {};", st.index_a));
                 vlines.push(format!("  add.s64 {t}, {t2}, {};", st.index_b));
             }
-            let v = arith(&st.value, &ext_idx, &mut tmp, &mut used, &mut vlines);
+            let v = arith(&st.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
             body.extend(vlines);
             let lab = tmp;
             tmp += 1;
@@ -331,6 +395,323 @@ pub fn shir_to_cu_compute(spec: &CuLoopSpec) -> String {
     out.push_str("  ret;\n");
     out.push_str("}\n");
     out
+}
+
+/// Reduction op for block kernels. Add/Mul wrap mod 2^64 (ring-exact
+/// vs bash); Min/Max exact; ModAdd/MaskAdd fold per step on-lane with
+/// raw-add tree + host finish (exact given fit bounds — candidacy
+/// enforces modulus/mask <= 2^32).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CuReduceOp {
+    Add,
+    Mul,
+    Min,
+    Max,
+    ModAdd { modulus: i64 },
+    MaskAdd { mask: i64 },
+}
+
+/// One emittable scalar reduction over a counted loop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CuReduceSpec {
+    /// Stable id (`cu_red_<fn>_<n>`).
+    pub id: String,
+    /// Loop counter name (for comments; PTX derives lane indices).
+    pub var: String,
+    /// Inclusive lower bound literal (usually 0).
+    pub lo: i64,
+    /// Upper-bound extern var (host-provided; trips computed on host).
+    pub bound_var: String,
+    /// Exclusive (`<`) or inclusive (`<=`) bound.
+    pub bound_lt: bool,
+    /// Positive literal step.
+    pub step: i64,
+    /// Threads per block (256) and sequential items per lane (1024).
+    pub threads: u32,
+    pub block_items: u64,
+    /// Reduction op.
+    pub op: CuReduceOp,
+    /// Per-item value (counter arith, array reads, externs, literals).
+    pub value: CuArith,
+    /// Accumulator literal init (host seeds the finish with it).
+    pub acc_init: i64,
+    /// Host-provided s64 slots for value externs (declaration order).
+    /// (Bound is NOT read in-kernel — trips covers it.)
+    pub externs: Vec<String>,
+    /// Read-only input arrays (for ArrRead values).
+    pub arrays: Vec<String>,
+}
+
+/// Render a reduction to PTX (total function).
+/// Param contract: input array buffers (declaration order), then the
+/// partials buffer, then extern `.s64` slots, then `.u64` trips.
+/// Fit bounds (exactness): lane acc bounded (|x| <= 2^32 per step for
+/// mod/mask with modulus/mask <= 2^32); tree sums 256 lanes (<= 2^40);
+/// partials read back raw; host folds with the same op/mod. Add/Mul wrap
+/// mod 2^64 identically to bash (ring-exact, no bounds needed); Min/Max
+/// exact. Candidacy enforces modulus/mask <= 2^32 (veto otherwise).
+pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
+    let ext_idx: BTreeMap<String, usize> = spec
+        .externs
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let arr_idx: BTreeMap<String, usize> = spec
+        .arrays
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    // Render value subtree first (collects temps).
+    let mut tmp: u32 = 0;
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut vlines: Vec<String> = Vec::new();
+    let v = arith(&spec.value, &ext_idx, &arr_idx, &mut tmp, &mut used, &mut vlines);
+
+    let mut out = String::new();
+    out.push_str(".version 7.0\n");
+    out.push_str(".target sm_70\n");
+    out.push_str(".address_size 64\n");
+    out.push_str(&format!(
+        "// bash-O4 cuda-reduce: {} ({}..bound({}) step {})\n",
+        spec.id,
+        spec.lo,
+        if spec.bound_lt { "<" } else { "<=" },
+        spec.step
+    ));
+    let mut params: Vec<String> = Vec::new();
+    for arr in &spec.arrays {
+        params.push(format!(".param .u64 _{}", ident(arr)));
+    }
+    params.push(".param .u64 _partials".to_string());
+    for name in &spec.externs {
+        params.push(format!(".param .s64 _x{}", ident(name)));
+    }
+    params.push(".param .u64 _trips".to_string());
+    out.push_str(&format!(".visible .entry kern({})\n", params.join(", ")));
+    out.push_str("{\n");
+    out.push_str("  .reg .u64 %qt, %gid, %trips, %base, %ii, %kk, %blk;\n");
+    out.push_str("  .reg .s64 %qg0, %qg1;\n");
+    out.push_str("  .reg .u64 %qacc, %qpart;\n");
+    out.push_str("  .reg .u32 %qtid, %qbid, %qntid, %qo, %qx;\n");
+    out.push_str("  .reg .pred %qp, %qq, %pp;\n");
+    out.push_str("  .reg .s64 %qi_;\n");
+    for (i, name) in spec.externs.iter().enumerate() {
+        out.push_str(&format!("  .reg .s64 %qe{i}; // {name}\n"));
+    }
+    for (bi, arr) in spec.arrays.iter().enumerate() {
+        out.push_str(&format!("  .reg .u64 %qb{bi}; // {}\n", ident(arr)));
+    }
+    if !used.is_empty() {
+        let mut ts: Vec<&String> = used.iter().collect();
+        ts.sort();
+        out.push_str(&format!(
+            "  .reg .s64 {};\n",
+            ts.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push_str("  .shared .align 8 .s64 tile[256];\n");
+    for (bi, arr) in spec.arrays.iter().enumerate() {
+        out.push_str(&format!("  ld.param.u64 %qb{bi}, [_{}];\n", ident(arr)));
+    }
+    out.push_str("  ld.param.u64 %qpart, [_partials];\n");
+    for (i, name) in spec.externs.iter().enumerate() {
+        out.push_str(&format!(
+            "  ld.param.s64 %qe{i}, [_x{}]; // {}\n",
+            ident(name),
+            ident(name)
+        ));
+    }
+    out.push_str("  ld.param.u64 %trips, [_trips];\n");
+    out.push_str("  mov.u32 %qtid, %tid.x;\n");
+    out.push_str("  mov.u32 %qbid, %ctaid.x;\n");
+    out.push_str("  mov.u32 %qntid, %ntid.x;\n");
+    out.push_str("  mad.lo.u32 %qo, %qbid, %qntid, %qtid;\n");
+    out.push_str("  cvt.u64.u32 %gid, %qo;\n");
+    out.push_str("  mov.u64 %blk, 1024;\n");
+    out.push_str(&format!("  mov.u64 %blk, {};\n", spec.block_items));
+    out.push_str("  mul.lo.u64 %base, %gid, %blk;\n");
+    match &spec.op {
+        CuReduceOp::Add | CuReduceOp::ModAdd { .. } | CuReduceOp::MaskAdd { .. } => {
+            out.push_str("  mov.u64 %qacc, 0;\n");
+        }
+        CuReduceOp::Mul => {
+            out.push_str("  mov.u64 %qacc, 1;\n");
+        }
+        CuReduceOp::Min => {
+            out.push_str("  mov.u64 %qacc, 9223372036854775807;\n");
+        }
+        CuReduceOp::Max => {
+            // 2^63 as u64 bits (s64 MIN).
+            out.push_str("  mov.u64 %qacc, 9223372036854775808;\n");
+        }
+    }
+    out.push_str("  mov.u64 %kk, 0;\n");
+    out.push_str("KLOOP:\n");
+    out.push_str("  setp.ge.u64 %pp, %kk, %blk;\n");
+    out.push_str("  @%pp bra KDONE;\n");
+    out.push_str("  add.u64 %ii, %base, %kk;\n");
+    out.push_str("  setp.ge.u64 %qq, %ii, %trips;\n");
+    out.push_str("  @%qq bra KNEXT;\n");
+    if spec.lo == 0 && spec.step == 1 {
+        out.push_str("  cvt.s64.u64 %qi_, %ii;\n");
+    } else {
+        out.push_str("  cvt.s64.u64 %qi_, %ii;\n");
+        out.push_str(&format!("  mul.lo.s64 %qg0, %qi_, {};\n", spec.step));
+        out.push_str(&format!("  add.s64 %qg1, %qg0, {};\n", spec.lo));
+        out.push_str("  mov.b64 %qi_, %qg1;\n");
+    }
+    for l in &vlines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    match &spec.op {
+        CuReduceOp::Add => {
+            out.push_str(&format!("  add.u64 %qacc, %qacc, {v};\n"));
+        }
+        CuReduceOp::Mul => {
+            out.push_str(&format!("  mul.lo.u64 %qacc, %qacc, {v};\n"));
+        }
+        CuReduceOp::Min => {
+            out.push_str(&format!("  setp.lt.s64 %pp, {v}, %qacc;\n"));
+            out.push_str(&format!("  selp.s64 %qacc, {v}, %qacc, %pp;\n"));
+        }
+        CuReduceOp::Max => {
+            out.push_str(&format!("  setp.gt.s64 %pp, {v}, %qacc;\n"));
+            out.push_str(&format!("  selp.s64 %qacc, {v}, %qacc, %pp;\n"));
+        }
+        CuReduceOp::ModAdd { modulus } => {
+            out.push_str(&format!("  add.s64 %qacc, %qacc, {v};\n"));
+            out.push_str(&format!("  rem.s64 %qacc, %qacc, {modulus};\n"));
+        }
+        CuReduceOp::MaskAdd { mask } => {
+            out.push_str(&format!("  add.u64 %qacc, %qacc, {v};\n"));
+            out.push_str(&format!("  and.b64 %qacc, %qacc, {mask};\n"));
+        }
+    }
+    out.push_str("KNEXT:\n");
+    out.push_str("  add.u64 %kk, %kk, 1;\n");
+    out.push_str("  bra KLOOP;\n");
+    out.push_str("KDONE:\n");
+    out.push_str("  mov.b64 %qi_, %qacc;\n");
+    out.push_str("  mul.lo.u32 %qo, %qtid, 8;\n");
+    out.push_str("  st.shared.s64 [%qo], %qi_;\n");
+    out.push_str("  bar.sync 0;\n");
+    out.push_str("  mov.u32 %qntid, 128;\n");
+    out.push_str("TLOOP:\n");
+    out.push_str("  setp.eq.u32 %pp, %qntid, 0;\n");
+    out.push_str("  @%pp bra TDONE;\n");
+    out.push_str("  setp.lt.u32 %pp, %qtid, %qntid;\n");
+    out.push_str("  @%pp bra TSKIP;\n");
+    out.push_str("  bra TCONT;\n");
+    out.push_str("TSKIP:\n");
+    match &spec.op {
+        CuReduceOp::Min => {
+            out.push_str("  add.u32 %qo, %qtid, %qntid;\n");
+            out.push_str("  mul.lo.u32 %qx, %qo, 8;\n");
+            out.push_str("  ld.shared.s64 %qi_, [%qx];\n");
+            out.push_str("  mul.lo.u32 %qx, %qtid, 8;\n");
+            out.push_str("  ld.shared.s64 %qacc, [%qx];\n");
+            out.push_str("  setp.lt.s64 %pp, %qi_, %qacc;\n");
+            out.push_str("  selp.s64 %qacc, %qi_, %qacc, %pp;\n");
+            out.push_str("  st.shared.s64 [%qx], %qacc;\n");
+        }
+        CuReduceOp::Max => {
+            out.push_str("  add.u32 %qo, %qtid, %qntid;\n");
+            out.push_str("  mul.lo.u32 %qx, %qo, 8;\n");
+            out.push_str("  ld.shared.s64 %qi_, [%qx];\n");
+            out.push_str("  mul.lo.u32 %qx, %qtid, 8;\n");
+            out.push_str("  ld.shared.s64 %qacc, [%qx];\n");
+            out.push_str("  setp.gt.s64 %pp, %qi_, %qacc;\n");
+            out.push_str("  selp.s64 %qacc, %qi_, %qacc, %pp;\n");
+            out.push_str("  st.shared.s64 [%qx], %qacc;\n");
+        }
+        CuReduceOp::Mul => {
+            out.push_str("  add.u32 %qo, %qtid, %qntid;\n");
+            out.push_str("  mul.lo.u32 %qx, %qo, 8;\n");
+            out.push_str("  ld.shared.s64 %qi_, [%qx];\n");
+            out.push_str("  mul.lo.u32 %qx, %qtid, 8;\n");
+            out.push_str("  ld.shared.s64 %qacc, [%qx];\n");
+            out.push_str("  mul.lo.u64 %qacc, %qacc, %qi_;\n");
+            out.push_str("  st.shared.s64 [%qx], %qacc;\n");
+        }
+        _ => {
+            out.push_str("  add.u32 %qo, %qtid, %qntid;\n");
+            out.push_str("  mul.lo.u32 %qx, %qo, 8;\n");
+            out.push_str("  ld.shared.s64 %qi_, [%qx];\n");
+            out.push_str("  mul.lo.u32 %qx, %qtid, 8;\n");
+            out.push_str("  ld.shared.s64 %qacc, [%qx];\n");
+            out.push_str("  add.u64 %qacc, %qacc, %qi_;\n");
+            out.push_str("  st.shared.s64 [%qx], %qacc;\n");
+        }
+    }
+    out.push_str("TCONT:\n");
+    out.push_str("  bar.sync 0;\n");
+    out.push_str("  shr.u32 %qntid, %qntid, 1;\n");
+    out.push_str("  bra TLOOP;\n");
+    out.push_str("TDONE:\n");
+    out.push_str("  setp.eq.u32 %pp, %qtid, 0;\n");
+    out.push_str("  @%pp bra PSTALL;\n");
+    out.push_str("  bra PDONE;\n");
+    out.push_str("PSTALL:\n");
+    out.push_str("  mov.u32 %qo, 0;\n");
+    out.push_str("  ld.shared.s64 %qacc, [%qo];\n");
+    out.push_str("  cvt.u64.u32 %qt, %qbid;\n");
+    out.push_str("  mul.lo.u64 %qt, %qt, 8;\n");
+    out.push_str("  add.u64 %qt, %qpart, %qt;\n");
+    out.push_str("  st.global.s64 [%qt], %qacc;\n");
+    out.push_str("PDONE:\n");
+    out.push_str("  ret;\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Registers referenced but never declared (assembler rejects with an
+/// opaque 218). Structural guard: every `%q...`/special used must be
+/// declared (or a known special/param-derived name).
+#[cfg(test)]
+fn undeclared_regs(ptx: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for line in ptx.lines() {
+        let t = line.trim();
+        // declaration lines: `.reg ... %a, %b;`
+        if let Some(rest) = t.strip_prefix(".reg ") {
+            for tok in rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '%')) {
+                if let Some(name) = tok.strip_prefix('%') {
+                    if !name.is_empty() {
+                        declared.insert(name.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        // label definitions (`FOO:`) are not regs; skip pure-label lines.
+        if t.ends_with(':') && !t.contains(' ') {
+            continue;
+        }
+        // uses: %name tokens (skip specials resolved by the driver:
+        // tid/ctaid/ntid/nctaid/laneid + param refs [_x]).
+        for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '%' || c == '.')) {
+            if let Some(name) = tok.strip_prefix('%') {
+                if matches!(name, "tid" | "ctaid" | "ntid" | "nctaid" | "laneid" | "clock" | "clock64" | "gridid" | "smid" | "nsmid" | "warpid" | "nwarpid" | "laneid" | "envreg0") {
+                    continue;
+                }
+                // dotted specials (%tid.x) split at '.' — head already handled
+                let base = name.split('.').next().unwrap_or(name);
+                if ["tid", "ctaid", "ntid", "nctaid", "laneid"].contains(&base) {
+                    continue;
+                }
+                if !base.is_empty() {
+                    used.insert(base.to_string());
+                }
+            }
+        }
+    }
+    used.into_iter().filter(|u| !declared.contains(u)).collect()
 }
 
 #[cfg(test)]
@@ -452,6 +833,88 @@ mod tests {
         // WSL parser just says 218).
         let p = shir_to_cu_compute(&squares_dyn());
         assert!(p.contains(".reg .pred %qp, %qq, %pp;"), "{p}");
+    }
+
+    // Reduction emitter tests.
+    fn sumred_spec() -> CuReduceSpec {
+        CuReduceSpec {
+            id: "cu_red_main_0".to_string(),
+            var: "i".to_string(),
+            lo: 0,
+            bound_var: "n".to_string(),
+            bound_lt: true,
+            step: 1,
+            threads: 256,
+            block_items: 1024,
+            op: CuReduceOp::ModAdd { modulus: 4294967296 },
+            value: CuArith::Mod(
+                Box::new(CuArith::Mul(
+                    Box::new(CuArith::LoopVar),
+                    Box::new(CuArith::LoopVar),
+                )),
+                Box::new(CuArith::Num(4294967296)),
+            ),
+            acc_init: 0,
+            externs: vec![],
+            arrays: vec![],
+        }
+    }
+
+    #[test]
+    fn reduce_has_block_shape() {
+        let p = shir_to_cu_reduce(&sumred_spec());
+        assert!(p.contains(".version 7.0"), "{p}");
+        assert!(p.contains(".shared .align 8 .s64 tile[256];"), "{p}");
+        assert!(p.contains("bar.sync 0;"), "{p}");
+        // partials param present (after zero arrays, before externs/trips)
+        assert!(
+            p.contains(".param .u64 _partials, .param .u64 _trips"),
+            "{p}"
+        );
+        assert!(p.contains("rem.s64"), "{p}");
+    }
+
+    #[test]
+    fn reduce_lane_identity_per_op() {
+        let mut s = sumred_spec();
+        s.op = CuReduceOp::Add;
+        assert!(shir_to_cu_reduce(&s).contains("mov.u64 %qacc, 0;"));
+        s.op = CuReduceOp::Mul;
+        assert!(shir_to_cu_reduce(&s).contains("mov.u64 %qacc, 1;"));
+        s.op = CuReduceOp::Min;
+        assert!(shir_to_cu_reduce(&s).contains("9223372036854775807;"));
+    }
+
+    #[test]
+    fn reduce_all_regs_declared() {
+        assert_eq!(
+            undeclared_regs(&shir_to_cu_reduce(&sumred_spec())),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn reduce_array_read_guards_negative() {
+        // `a[i]` reads: negative index yields 0 (bash unset-in-arith).
+        let mut s = sumred_spec();
+        s.arrays = vec!["a".to_string()];
+        s.value = CuArith::ArrRead {
+            array: "a".to_string(),
+            index: Box::new(CuArith::LoopVar),
+        };
+        s.op = CuReduceOp::MaskAdd { mask: 4294967295 };
+        let p = shir_to_cu_reduce(&s);
+        assert!(p.contains("ld.global.s64"), "{p}");
+        assert!(p.contains("QARR"), "{p}");
+        assert!(p.contains(".param .u64 _a, .param .u64 _partials"), "{p}");
+    }
+
+    #[test]
+    fn all_regs_declared_map() {
+        // Structural JIT guard: undeclared regs fail on-device with an
+        // opaque error (twice bitten: %pp). This catches them statically.
+        let p = shir_to_cu_compute(&squares_dyn());
+        assert_eq!(undeclared_regs(&p), Vec::<String>::new(), "{p}");
     }
 
     #[test]
