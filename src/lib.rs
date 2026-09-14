@@ -3,6 +3,24 @@
 #![allow(dead_code)]
 #![allow(unexpected_cfgs)]
 
+/// Debug traces from the shell parser/renderer, normally OFF.
+///
+/// These used to be unconditional `eprintln!`s, so ordinary constructs —
+/// `${1:-5}`, `a[0]`, `declare -A m` — wrote `DEBUG ...` lines to stderr:
+/// 26 of the 552 corpus examples did.  Set `SH2_DEBUG_PARSER=1` to get them
+/// back (the same env-gate convention `SH2_DEBUG_DEMOTE` already uses in
+/// `c_backend.rs`).
+///
+/// Defined before the `mod` declarations so textual macro scoping makes it
+/// available throughout the crate without touching the public surface.
+macro_rules! pdebug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SH2_DEBUG_PARSER").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 pub mod ast;
 pub mod ast_words;
 pub mod lexer;

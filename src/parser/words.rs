@@ -392,7 +392,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Handle backtick command substitution first
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
         if crate::debug::is_debug_enabled() {
-            eprintln!("DEBUG: Found backtick in parse_word");
+            pdebug!("DEBUG: Found backtick in parse_word");
         }
         lexer.next(); // consume the opening backtick
         let mut cmd_content = String::new();
@@ -411,18 +411,18 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
         }
         if crate::debug::is_debug_enabled() {
-            eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
+            pdebug!("DEBUG: Backtick content: '{}'", cmd_content);
         }
         // Parse the command content
         match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
             Ok(command) => {
                 if crate::debug::is_debug_enabled() {
-                    eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
+                    pdebug!("DEBUG: Successfully parsed backtick command: {:?}", command);
                 }
                 return Ok(Word::CommandSubstitution(Box::new(command), None));
             }
             Err(e) => {
-                eprintln!(
+                pdebug!(
                     "DEBUG: Failed to parse backtick command '{}': {:?}",
                     cmd_content, e
                 );
@@ -2346,7 +2346,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 }
             }
 
-            eprintln!(
+            pdebug!(
                 "DEBUG parse_variable_expansion: braced_content='{}'",
                 braced_content
             );
@@ -2403,7 +2403,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     None,
                 ));
             } else if braced_content.contains(":-") {
-                eprintln!(
+                pdebug!(
                     "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
                     braced_content
                 );
@@ -3065,10 +3065,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         }
         Some(Token::DollarBraceAt) => {
             lexer.next();
-            eprintln!("DEBUG DollarBraceAt: peek={:?}", lexer.peek());
+            pdebug!("DEBUG DollarBraceAt: peek={:?}", lexer.peek());
             if matches!(lexer.peek(), Some(Token::BraceClose)) {
                 lexer.next();
-                eprintln!("DEBUG DollarBraceAt: just @");
+                pdebug!("DEBUG DollarBraceAt: just @");
                 Ok(Word::Variable("@".to_string(), true, None))
             } else {
                 // ${@...} with additional operators — build content and analyze
@@ -3350,7 +3350,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let content = unescape_interpolation_content(content);
 
     if crate::debug::is_debug_enabled() {
-        eprintln!(
+        pdebug!(
             "DEBUG parse_string_interpolation: content len={}, content={:?}",
             content.len(),
             &content[..content.len().min(80)]
@@ -3499,7 +3499,7 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                 let mut sub_parser = Parser::new_with_lexer(sub_lexer);
                 match sub_parser.parse() {
                     Ok(commands) => {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: String interpolation parsed command '{}' as {} commands",
                             cmd_content,
                             commands.len()
@@ -3527,7 +3527,7 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: String interpolation failed to parse command '{}': {:?}",
                             cmd_content, e
                         );
@@ -3800,12 +3800,12 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
                     if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
+                        pdebug!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
                     }
                     if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content)
                     {
                         if crate::debug::is_debug_enabled() {
-                            eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
+                            pdebug!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
                         }
                         if cmds.is_empty() {
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
@@ -3821,19 +3821,19 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                         }
                     } else {
                         if crate::debug::is_debug_enabled() {
-                            eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
+                            pdebug!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
                         }
                         // Fallback: try the old pipeline-based parser
                         if let Ok(cmd) =
                             crate::parser::commands::parse_pipeline_from_text(cmd_content)
                         {
                             if crate::debug::is_debug_enabled() {
-                                eprintln!("DEBUG parse_string_interpolation: pipeline parser OK");
+                                pdebug!("DEBUG parse_string_interpolation: pipeline parser OK");
                             }
                             parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                         } else {
                             if crate::debug::is_debug_enabled() {
-                                eprintln!("DEBUG parse_string_interpolation: both parsers failed, using literal");
+                                pdebug!("DEBUG parse_string_interpolation: both parsers failed, using literal");
                             }
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
                         }
