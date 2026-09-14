@@ -1305,13 +1305,17 @@ fn arith_reads_violate(a: &ArithAst, arr: &str, counter: &str) -> bool {
 
 // ---------- strict mention scans (any mention vetoes) ----------
 
-fn stmts_have_arr(stmts: &[IrStmt], arr: &str) -> bool {
+/// Shared scope-audit scanners (consumed cross-crate by CUDA
+/// candidacy's nest-scope checks). Visibility-only; logic untouched.
+pub fn stmts_have_arr(stmts: &[IrStmt], arr: &str) -> bool {
     stmts.iter().any(|s| stmt_has_arr(s, arr))
 }
 
 /// Any mention of the array (reads, writes, decls, string text,
 /// reflective uses, raw bridge text).
-fn stmt_has_arr(s: &IrStmt, arr: &str) -> bool {
+/// Shared scope-audit scanners (consumed cross-crate by CUDA
+/// candidacy's nest-scope checks). Visibility-only; logic untouched.
+pub fn stmt_has_arr(s: &IrStmt, arr: &str) -> bool {
     let own = match s {
         IrStmt::Assign { targets, .. } => targets.iter().any(|t| target_has_arr(t, arr)),
         IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == arr),
@@ -1335,7 +1339,9 @@ fn target_has_arr(t: &AssignTarget, arr: &str) -> bool {
     t.indices.iter().any(|k| expr_has_arr(k, arr))
 }
 
-fn expr_has_arr(e: &IrExpr, arr: &str) -> bool {
+/// Shared scope-audit scanners (consumed cross-crate by CUDA
+/// candidacy's nest-scope checks). Visibility-only; logic untouched.
+pub fn expr_has_arr(e: &IrExpr, arr: &str) -> bool {
     let own = match e {
         IrExpr::Arith(a) => arith_has_arr(a, arr),
         IrExpr::Var(v, _) | IrExpr::Ident(v) => v == arr || v.starts_with(&format!("{arr}[")),
