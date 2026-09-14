@@ -531,6 +531,33 @@ pub struct Render {
     /// Subset of `int_arrays`; every `{id}[k]`/`{id}_len` use site works
     /// unchanged — only decl/append/indexed-write/free differ.
     vec_arrays: HashSet<String>,
+    /// Counter-dense arrays (clean + dense0 + dynamic bound, from the
+    /// array_fixed_caps walk): eligible for bulk-len elision at counted
+    /// loop entries. Computed in shir_to_c; consulted when emitting
+    /// reserves and indexed stores.
+    counter_dense: HashSet<String>,
+    /// Per-loop bulk-len mode (array -> counter var): indexed stores
+    /// with exactly this counter skip the per-store len update; the
+    /// loop epilogue sets `len = max(len, need)`. Set/cleared around
+    /// one counted loop (nested same-name writes disqualify).
+    bulk_len: HashMap<String, String>,
+    /// Program-level `$?` never observed (see prog_reads_rc): pure loop
+    /// conds may render lean (no per-iteration rc store). Default false
+    /// (conservative — keep stores) so paths that skip shir_to_c stay
+    /// safe; shir_to_c sets it from the IR scan.
+    rc_unobserved: bool,
+    /// Inside a counted loop body (any nesting depth): arith-assign
+    /// rc stores are dead when rc is globally unobserved (loop-nested
+    /// stores never determine exit codes — post-loop commands and exit
+    /// machinery overwrite; the pre-existing loop-ending divergence is
+    /// unchanged either way). Counter for nesting (functions render in
+    /// the preamble at zero).
+    in_loop: u32,
+    /// Inside a condition render (while/if/do-while/for-init conds):
+    /// `let`-text may drop its rc store (the value is used, rc is
+    /// auxiliary there). Statement-position `let` always keeps it (its
+    /// rc IS the effect — exit codes). Counter for nesting.
+    in_cond: u32,
     /// vec arrays owned by one function (single safe scope): declared
     /// as function locals at the owner's top instead of file-scope
     /// statics, freed at every function exit. Computed in program().
@@ -2726,6 +2753,496 @@ fn counter_reserve_targets(
     out
 }
 
+/// Bulk-len eligibility for one array in one counted loop: every
+/// in-loop len observation must already be exact without per-store
+/// updates, so the epilogue `len = max(len, need)` suffices.
+/// Disqualify on: scalar rebinds of A (representation confusion),
+/// ANY read of A (element/len/iteration/call-mention — the in-loop len
+/// is stale by design), writes to A under a nested loop (whose max may
+/// exceed this loop's need), unstructured exits (break/return/goto skip
+/// the epilogue), or a boundvar written in-body (stale need).
+/// Allowed: counter-keyed index writes (skip updates) and other-keyed
+/// index writes (update normally via the key-match rule).
+fn bulk_eligible(body: &[IrStmt], arr: &str, counter: &str, boundvar: &str) -> bool {
+    // bound invariance (a mid-loop bound change stales `need`)
+    {
+        let mut written = BTreeSet::new();
+        match lic_writes_stmts(body, &mut written) {
+            Err(_) => return false,
+            Ok(()) => {
+                if written.contains(boundvar) {
+                    return false;
+                }
+            }
+        }
+    }
+    // true = disqualified (found a disqualifier under stmts)
+    fn walk(
+        stmts: &[IrStmt],
+        arr: &str,
+        counter: &str,
+        in_nested_loop: bool,
+    ) -> bool {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var);
+                        if base == arr {
+                            if t.indices.is_empty() && !t.var.contains('[') {
+                                return true; // scalar rebind
+                            }
+                            if in_nested_loop {
+                                // A nested loop's max may exceed this
+                                // loop's need (different counter/bound) →
+                                // the epilogue max() could understate.
+                                return true;
+                            }
+                            // Top-level index writes (counter-keyed or
+                            // otherwise) are fine: counter keys skip
+                            // updates via the key-match rule, others
+                            // update normally.
+                        }
+                    }
+                    if expr_mentions(expr, arr) {
+                        return true;
+                    }
+                }
+                IrStmt::Break
+                | IrStmt::Continue
+                | IrStmt::Return(None)
+                | IrStmt::Exit(None)
+                | IrStmt::Require(_)
+                | IrStmt::Goto(_)
+                | IrStmt::Label(_) => {
+                    if !matches!(s, IrStmt::Continue) {
+                        return true; // unstructured exit skips epilogue
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    if expr_mentions(cond, arr) {
+                        return true;
+                    }
+                    if walk(then, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                    for (c, b) in elsifs {
+                        if expr_mentions(c, arr) {
+                            return true;
+                        }
+                        if walk(b, arr, counter, in_nested_loop) {
+                            return true;
+                        }
+                    }
+                    if walk(else_, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                }
+                IrStmt::While { cond, body }
+                | IrStmt::DoWhile { body, cond, .. } => {
+                    if expr_mentions(cond, arr) {
+                        return true;
+                    }
+                    if walk(body, arr, counter, true) {
+                        return true;
+                    }
+                }
+                IrStmt::For { var: _, iter, body } => {
+                    if expr_mentions(iter, arr) {
+                        return true;
+                    }
+                    if walk(body, arr, counter, true) {
+                        return true;
+                    }
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    if walk(init, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                    if expr_mentions(cond, arr) {
+                        return true;
+                    }
+                    if walk(step, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                    if walk(body, arr, counter, true) {
+                        return true;
+                    }
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b) => {
+                    if walk(b, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    for r in redirects {
+                        if expr_mentions(&r.target, arr) {
+                            return true;
+                        }
+                    }
+                    if walk(inner, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    if expr_mentions(discriminant, arr) {
+                        return true;
+                    }
+                    for c in clauses {
+                        if walk(&c.body, arr, counter, in_nested_loop) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    if walk(body, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            if expr_mentions(m, arr) {
+                                return true;
+                            }
+                        }
+                        if walk(&e.body, arr, counter, in_nested_loop) {
+                            return true;
+                        }
+                    }
+                    if walk(else_body, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                    if walk(finally_body, arr, counter, in_nested_loop) {
+                        return true;
+                    }
+                }
+                IrStmt::Function { .. } => {
+                    // Definitions don't execute inline; calls are gated
+                    // at their call sites (user fns disqualify via the
+                    // func gate in expr_mentions), and post-loop calls
+                    // observe post-loop len. Nothing to check here.
+                }
+                IrStmt::Select { clauses, .. } => {
+                    for c in clauses {
+                        if walk(&c.body, arr, counter, in_nested_loop) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        if walk(st, arr, counter, in_nested_loop) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for d in vars {
+                        if d.name == arr {
+                            return true;
+                        }
+                    }
+                    if let Some(e) = init {
+                        if expr_mentions(e, arr) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    if var == arr {
+                        return true;
+                    }
+                    for e in elements {
+                        if expr_mentions(e, arr) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Expr(e)
+                | IrStmt::Output { value: e, .. }
+                | IrStmt::WriteFile { content: e, .. }
+                | IrStmt::Return(Some(e))
+                | IrStmt::Exit(Some(e))
+                | IrStmt::Die { expr: e, .. }
+                | IrStmt::Warn { expr: e, .. }
+                | IrStmt::SetChildError(e) => {
+                    if expr_mentions(e, arr) {
+                        return true;
+                    }
+                }
+                IrStmt::WriteFile { path, .. } => {
+                    if expr_mentions(path, arr) {
+                        return true;
+                    }
+                }
+                IrStmt::Exec { .. }
+                | IrStmt::RawText(_)
+                | IrStmt::Asm { .. }
+                | IrStmt::Shaderize { .. }
+                | IrStmt::Ext(_) => return true,
+            }
+        }
+        false
+    }
+    !walk(body, arr, counter, false)
+}
+
+/// Any read of array `arr` in an expression position (element reads via
+/// Index/arrayIndex/arrayItems, len via arrayLen, whole-array getVar,
+/// bare Var/Ident reads, iteration/split helpers naming it, or any Call
+/// mentioning it — bulk writes and user-fn observations included).
+/// Over-approximate (miss, never an unseen stale-len read).
+fn expr_mentions(e: &IrExpr, arr: &str) -> bool {
+    match e {
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => v == arr,
+        IrExpr::Index { var, .. } => var == arr,
+        IrExpr::Str(s, _) => s.contains(arr),
+        IrExpr::Call { func, args } => {
+            // Unknown/user functions may read the array through dynamic
+            // scope (or alias it) — disqualify. Transparent builtins
+            // (output-only, predicates, and data constructors whose args
+            // are scanned) recurse into args; a Str arg naming the array
+            // (bulk writes, iterations) still disqualifies via the scan.
+            // `printf -v` writes (like lic_call_pure); anything else
+            // printf does not observe arrays.
+            let transparent = match func.as_str() {
+                "test" | "arith" | "getVar" | "param" | "echo" | "true"
+                | "false" | ":" | "exec" | "builtin" | "let" | "declare"
+                | "setArray" | "setArrayAppend" | "arrayIndex"
+                | "arrayItems" | "arrayLen" | "listVar" | "max" | "min"
+                | "sum" | "sortedIntJoin" | "sortedBigintJoin" | "split"
+                | "capture" | "captureWords" => true,
+                "printf" => !args.iter().any(|a| matches!(
+                    a,
+                    IrExpr::Str(s, _) if s.trim() == "-v"
+                )),
+                _ => false,
+            };
+            if !transparent {
+                return true;
+            }
+            args.iter().any(|a| expr_mentions(a, arr))
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            expr_mentions(obj, arr) || args.iter().any(|a| expr_mentions(a, arr))
+        }
+        IrExpr::Array(items) => items.iter().any(|x| expr_mentions(x, arr)),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            expr_mentions(lhs, arr) || expr_mentions(rhs, arr)
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_mentions(cond, arr)
+                || expr_mentions(then, arr)
+                || expr_mentions(else_, arr)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            expr_mentions(expr, arr) || expr_mentions(default, arr)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            crate::ir::InterpPart::Expr(x) => expr_mentions(x, arr),
+            _ => false,
+        }),
+        IrExpr::Capture { expr, .. } => expr_mentions(expr, arr),
+        IrExpr::Object(items) => {
+            items.iter().any(|(k, v)| k.contains(arr) || expr_mentions(v, arr))
+        }
+        IrExpr::Splice(x) => expr_mentions(x, arr),
+        IrExpr::Arith(a) => arith_mentions(a, arr),
+        IrExpr::Lambda { params: _, body } => body.iter().any(|s| {
+            let mut found = false;
+            stmt_mentions(s, arr, &mut found);
+            found
+        }),
+        IrExpr::Arrow(body) => body.iter().any(|s| {
+            let mut found = false;
+            stmt_mentions(s, arr, &mut found);
+            found
+        }),
+        _ => false,
+    }
+}
+
+fn arith_mentions(a: &crate::ir::ArithAst, arr: &str) -> bool {
+    match a {
+        crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => v == arr,
+        crate::ir::ArithAst::Index { var, key } => {
+            var == arr || arith_mentions(key, arr)
+        }
+        crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+            arith_mentions(lhs, arr) || arith_mentions(rhs, arr)
+        }
+        crate::ir::ArithAst::Assign { rhs, .. } => arith_mentions(rhs, arr),
+        crate::ir::ArithAst::Un { arg, .. } => arith_mentions(arg, arr),
+        crate::ir::ArithAst::Cond { test, then, else_ } => {
+            arith_mentions(test, arr)
+                || arith_mentions(then, arr)
+                || arith_mentions(else_, arr)
+        }
+        crate::ir::ArithAst::Cast { arg, .. } => arith_mentions(arg, arr),
+        _ => false,
+    }
+}
+
+fn stmt_mentions(s: &IrStmt, arr: &str, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match s {
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets {
+                if t.var.split('[').next().unwrap_or(&t.var) == arr {
+                    *found = true;
+                    return;
+                }
+            }
+            if expr_mentions(expr, arr) {
+                *found = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Program-level `$?` observation: any IR node that reads the last
+/// status (explicit `?` var/getVar refs, or bare `return`/`exit` which
+/// propagate it). When false, loop-cond rc stores are dead (nothing
+/// observes them — the exit-code `return _sh_rc` reads only the last
+/// non-cond store, and loop-exit machinery sets its own) and pure
+/// conds render lean. Over-approximate (a found form may be dead code —
+/// miss, never an unobserved skip). Subs included (dynamic scope: a
+/// callee reads the caller's rc).
+fn prog_reads_rc(prog: &IrProgram) -> bool {
+    fn has_rc_expr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(v, _) | IrExpr::Ident(v) => v == "?",
+            IrExpr::Call { func, args } => {
+                if func == "getVar" {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n == "?" {
+                            return true;
+                        }
+                    }
+                }
+                args.iter().any(has_rc_expr)
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                has_rc_expr(obj) || args.iter().any(has_rc_expr)
+            }
+            IrExpr::Array(items) => items.iter().any(has_rc_expr),
+            IrExpr::BinOp { lhs, rhs, .. } => has_rc_expr(lhs) || has_rc_expr(rhs),
+            IrExpr::Ternary { cond, then, else_ } => {
+                has_rc_expr(cond) || has_rc_expr(then) || has_rc_expr(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => has_rc_expr(expr) || has_rc_expr(default),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                crate::ir::InterpPart::Expr(x) => has_rc_expr(x),
+                _ => false,
+            }),
+            IrExpr::Capture { expr, .. } => has_rc_expr(expr),
+            IrExpr::Index { key, .. } => has_rc_expr(key),
+            IrExpr::Object(items) => items.iter().any(|(_, v)| has_rc_expr(v)),
+            IrExpr::Splice(x) => has_rc_expr(x),
+            IrExpr::Arith(a) => has_rc_arith(a),
+            IrExpr::Lambda { body, .. } | IrExpr::Arrow(body) => {
+                body.iter().any(has_rc_stmt)
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                has_rc_expr(iter)
+                    || has_rc_expr(elem)
+                    || cond.as_ref().is_some_and(|c| has_rc_expr(c))
+            }
+            _ => false,
+        }
+    }
+    fn has_rc_arith(a: &crate::ir::ArithAst) -> bool {
+        match a {
+            crate::ir::ArithAst::Var(v) | crate::ir::ArithAst::Ident(v) => {
+                v == "?"
+            }
+            crate::ir::ArithAst::Index { key, .. } => has_rc_arith(key),
+            crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+                has_rc_arith(lhs) || has_rc_arith(rhs)
+            }
+            crate::ir::ArithAst::Assign { rhs, .. } => has_rc_arith(rhs),
+            crate::ir::ArithAst::Un { arg, .. } => has_rc_arith(arg),
+            crate::ir::ArithAst::Cond { test, then, else_ } => {
+                has_rc_arith(test) || has_rc_arith(then) || has_rc_arith(else_)
+            }
+            crate::ir::ArithAst::Cast { arg, .. } => has_rc_arith(arg),
+            _ => false,
+        }
+    }
+    fn has_rc_stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Return(None) | IrStmt::Exit(None) => true,
+            IrStmt::Assign { expr, .. } => has_rc_expr(expr),
+            IrStmt::Declare { init, .. } => init.as_ref().is_some_and(|e| has_rc_expr(e)),
+            IrStmt::DeclareArray { elements, .. } => elements.iter().any(has_rc_expr),
+            IrStmt::Expr(e)
+            | IrStmt::Output { value: e, .. }
+            | IrStmt::WriteFile { content: e, .. }
+            | IrStmt::Return(Some(e))
+            | IrStmt::Exit(Some(e))
+            | IrStmt::Die { expr: e, .. }
+            | IrStmt::Warn { expr: e, .. }
+            | IrStmt::SetChildError(e) => has_rc_expr(e),
+            IrStmt::WriteFile { path, .. } => has_rc_expr(path),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                has_rc_expr(cond)
+                    || then.iter().any(has_rc_stmt)
+                    || elsifs.iter().any(|(c, b)| has_rc_expr(c) || b.iter().any(has_rc_stmt))
+                    || else_.iter().any(has_rc_stmt)
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                has_rc_expr(cond) || body.iter().any(has_rc_stmt)
+            }
+            IrStmt::For { iter, body, .. } => {
+                has_rc_expr(iter) || body.iter().any(has_rc_stmt)
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                init.iter().any(has_rc_stmt)
+                    || has_rc_expr(cond)
+                    || step.iter().any(has_rc_stmt)
+                    || body.iter().any(has_rc_stmt)
+            }
+            IrStmt::Block(b)
+            | IrStmt::Subshell(b)
+            | IrStmt::Background(b) => b.iter().any(has_rc_stmt),
+            IrStmt::Redirect { inner, redirects } => {
+                inner.iter().any(has_rc_stmt)
+                    || redirects.iter().any(|r| has_rc_expr(&r.target))
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                has_rc_expr(discriminant) || clauses.iter().any(|c| c.body.iter().any(has_rc_stmt))
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                body.iter().any(has_rc_stmt)
+                    || excepts.iter().any(|e| {
+                        e.match_expr.as_ref().is_some_and(|m| has_rc_expr(m))
+                            || e.body.iter().any(has_rc_stmt)
+                    })
+                    || else_body.iter().any(has_rc_stmt)
+                    || finally_body.iter().any(has_rc_stmt)
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                body.iter().any(has_rc_stmt)
+                    || named_blocks.iter().any(|(_, b)| b.iter().any(has_rc_stmt))
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                stages.iter().any(|st| st.iter().any(has_rc_stmt))
+            }
+            IrStmt::Select { clauses, .. } => clauses.iter().any(|c| {
+                c.ch.as_ref().is_some_and(|e| has_rc_expr(e))
+                    || c.value.as_ref().is_some_and(|e| has_rc_expr(e))
+                    || c.body.iter().any(has_rc_stmt)
+            }),
+            _ => false,
+        }
+    }
+    prog.stmts.iter().any(has_rc_stmt) || prog.subs.iter().any(|s| s.body.iter().any(has_rc_stmt))
+}
+
 fn array_fixed_caps(
     prog: &IrProgram,
     exclude: &HashSet<String>,
@@ -4597,7 +5114,13 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         exclude.extend(r.bigint_vars.iter().cloned());
         let (caps, routed) = array_fixed_caps(&prog, &exclude);
         r.array_caps = caps;
-        r.vec_arrays.extend(routed);
+        // Lean loop conds need program-level proof (set once here; every
+        // other Render construction keeps the conservative default).
+        r.rc_unobserved = !prog_reads_rc(&prog);
+        r.vec_arrays.extend(routed.iter().cloned());
+        // Routed arrays are exactly clean + dense0 + dynamic: the
+        // bulk-len eligibility base (per-loop checks add the rest).
+        r.counter_dense = routed;
     }
     r.program(&prog);
     r.trim_sh_runtime();
@@ -15017,6 +15540,9 @@ fn param_copy_alias(
                                 let cexpr = self.arith(&ast);
                                 let cexpr = self.apply_array_counts(&cexpr);
                                 self.need_sh = true;
+                                if self.rc_unobserved && self.in_cond > 0 {
+                                    return format!("({cexpr})");
+                                }
                                 return format!(
                                     "({{ long long _r = ({cexpr}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
                                 );
@@ -15025,7 +15551,17 @@ fn param_copy_alias(
                         }
                         if let Some(c) = self.let_render(expr) {
                             self.need_sh = true;
-                            // `let` succeeds (rc 0) iff the arith is nonzero
+                            // `let` succeeds (rc 0) iff the arith is nonzero.
+                            // In cond position with unobserved rc, the
+                            // store is dead (the value is used, rc is
+                            // auxiliary there) — render the bare comparison
+                            // (comparisons already yield 0/1, so the
+                            // `_r != 0` normalization is identity).
+                            // Statement `let` always keeps it (its rc IS
+                            // the effect — exit codes observe it).
+                            if self.rc_unobserved && self.in_cond > 0 {
+                                return format!("({c})");
+                            }
                             return format!(
                                 "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
                             );
@@ -20305,6 +20841,31 @@ fn param_copy_alias(
         Some(format!("{t}.p"))
     }
 
+    /// Skip the per-store len update iff this store is exactly the
+    /// bulk-len loop's counter write (other keys — literals, other
+    /// vars — still update normally, so multi-phase and mixed fills
+    /// keep exact lens). Flattened `$c` arrives as Str (bare-matched);
+    /// structured Var/Ident match directly.
+    fn bulk_skip_len(&self, var: &str, key: &IrExpr) -> bool {
+        let counter = match self.bulk_len.get(var) {
+            Some(c) => c,
+            None => return false,
+        };
+        match key {
+            IrExpr::Var(v, _) | IrExpr::Ident(v) => v == counter,
+            IrExpr::Str(s, _) => {
+                let t = s.trim();
+                let t = t.strip_prefix('$').unwrap_or(t);
+                let t = t
+                    .strip_prefix('{')
+                    .and_then(|r| r.strip_suffix('}'))
+                    .unwrap_or(t);
+                t == counter.as_str()
+            }
+            _ => false,
+        }
+    }
+
     /// Reserve a vec array to a counted loop's bound at loop entry
     /// (stage-2 bench-opt): one exact realloc instead of a doubling
     /// copy chain. Purely performance — demand-growth stays as the
@@ -20319,28 +20880,65 @@ fn param_copy_alias(
         cond: &IrExpr,
         step_stmt: &IrStmt,
         body: &[IrStmt],
-    ) {
+    ) -> Option<(Vec<String>, String)> {
         let (counter, boundvar, op) = match counter_reserve_loop(cond, step_stmt) {
             Some(x) => x,
-            None => return,
+            None => return None,
         };
         let targets = counter_reserve_targets(body, &counter, &self.vec_arrays);
         if targets.is_empty() {
-            return;
+            return None;
         }
-        let bv = self.value_ll(&IrExpr::Var(boundvar, None));
-        for arr in targets {
+        let bv = self.value_ll(&IrExpr::Var(boundvar.clone(), None));
+        let need_expr = if op == "<=" {
+            format!("(size_t)({bv}) + 1")
+        } else {
+            format!("(size_t)({bv})")
+        };
+        let mut bulk: Vec<String> = Vec::new();
+        for arr in &targets {
             let id = self.c_ident(&arr);
             let sfx = self.vec_grow_suffix(&arr);
             self.need_reserve.insert(sfx.to_string());
-            let need = if op == "<=" {
-                "(size_t)_rsv + 1".to_string()
-            } else {
-                "(size_t)_rsv".to_string()
-            };
             self.emit(&format!(
-                "{{ long long _rsv = (long long)({bv}); if (_rsv > 0) _sh_reserve_{sfx}(&{id}, &{id}_cap, {need}); }}"
+                "{{ long long _rsv = (long long)({bv}); if (_rsv > 0) _sh_reserve_{sfx}(&{id}, &{id}_cap, {need}); }}",
+                need = if op == "<=" {
+                    "(size_t)_rsv + 1"
+                } else {
+                    "(size_t)_rsv"
+                }
             ));
+            // Bulk-len: per-store len updates go quiet for this loop
+            // when the epilogue max() provably suffices (dense array,
+            // invariant bound, no stale-len observers, no early exits).
+            if self.counter_dense.contains(arr)
+                && bulk_eligible(body, arr, &counter, &boundvar)
+            {
+                self.bulk_len.insert(arr.clone(), counter.clone());
+                bulk.push(arr.clone());
+            }
+        }
+        if bulk.is_empty() {
+            // No epilogue will run: withdraw any flags set above so
+            // later stores update normally.
+            for arr in targets {
+                self.bulk_len.remove(&arr);
+            }
+            return None;
+        }
+        Some((bulk, need_expr))
+    }
+
+    /// Bulk-len epilogue: `len = max(len, need)` after a bulk-len loop.
+    /// Monotonic (never shrinks — prior phases' counts survive), so a
+    /// smaller bound or an empty loop just keeps the old len.
+    fn emit_counter_bulk_end(&mut self, bulk: &[String], need: &str) {
+        for arr in bulk {
+            let id = self.c_ident(arr);
+            self.emit(&format!(
+                "{{ size_t _need = (size_t)({need}); if (_need > {id}_len) {id}_len = _need; }}"
+            ));
+            self.bulk_len.remove(arr);
         }
     }
 
@@ -20349,7 +20947,7 @@ fn param_copy_alias(
     /// — exactly `_sh_arr_set`'s `i < 0 || !v` guard), grow past the
     /// index, store, extend len. Int vecs store `atoll` (the value is
     /// always a `char*` — see `value_c`); string vecs strdup.
-    fn emit_vec_index_write(&mut self, var: &str, key: &str, val: &str) {
+    fn emit_vec_index_write(&mut self, var: &str, key: &str, val: &str, skip_len: bool) {
         let id = self.c_ident(var);
         let sfx = self.vec_grow_suffix(var);
         let seq = self.temp_seq;
@@ -20359,7 +20957,15 @@ fn param_copy_alias(
         } else {
             format!("{id}[_kk{seq}] = _sh_xstrdup(_vv{seq});")
         };
-        self.emit(&format!("{{ const char *_vv{seq} = ({val}); long long _kk{seq} = (long long)({key}); if (_vv{seq} && _kk{seq} >= 0) {{ while ((size_t)(_kk{seq} + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {store} if ((size_t)(_kk{seq} + 1) > {id}_len) {id}_len = _kk{seq} + 1; }} }}"));
+        // Bulk-len mode: the loop epilogue sets len = max(len, need),
+        // so per-store len traffic goes quiet (callers prove this store
+        // is the bulk loop's counter write via bulk_skip_len).
+        let len_up = if skip_len {
+            String::new()
+        } else {
+            format!(" if ((size_t)(_kk{seq} + 1) > {id}_len) {id}_len = _kk{seq} + 1;")
+        };
+        self.emit(&format!("{{ const char *_vv{seq} = ({val}); long long _kk{seq} = (long long)({key}); if (_vv{seq} && _kk{seq} >= 0) {{ while ((size_t)(_kk{seq} + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {store}{len_up} }} }}"));
     }
 
     /// `$i` (bare dollar + identifier chars): a dynamic key, never an
@@ -20442,7 +21048,8 @@ fn param_copy_alias(
             // a literal key: numeric for indexed arrays, string for assoc
             if let Ok(i) = k.trim().parse::<i64>() {
                 if self.vec_arrays.contains(var) {
-                    self.emit_vec_index_write(var, &i.to_string(), &v);
+                    let skip = self.bulk_skip_len(var, key);
+                    self.emit_vec_index_write(var, &i.to_string(), &v, skip);
                     return;
                 }
                 self.emit_fixed_index_write(var, &i.to_string(), val, &v, acap);
@@ -20458,7 +21065,8 @@ fn param_copy_alias(
                     format!("(long long)atoll({})", self.store_read(k.trim()))
                 };
                 if self.vec_arrays.contains(var) {
-                    self.emit_vec_index_write(var, &kv, &v);
+                    let skip = self.bulk_skip_len(var, key);
+                    self.emit_vec_index_write(var, &kv, &v, skip);
                     return;
                 }
                 self.emit_fixed_index_write(var, &kv, val, &v, acap);
@@ -20481,7 +21089,8 @@ fn param_copy_alias(
             // dynamic key: `arr[$i]=x` — the key is an index value
             let k = self.value_num(key);
             if self.vec_arrays.contains(var) {
-                self.emit_vec_index_write(var, &k, &v);
+                let skip = self.bulk_skip_len(var, key);
+                self.emit_vec_index_write(var, &k, &v, skip);
                 return;
             }
             self.emit_fixed_index_write(var, &k, val, &v, acap);
@@ -20507,6 +21116,10 @@ fn param_copy_alias(
                         format!("(long long)atoll({})", self.store_ref(rest))
                     };
                     if self.vec_arrays.contains(var) {
+                        // Bulk-len: counter writes skip per-store len
+                        // updates (epilogue max() covers); other keys
+                        // update normally.
+                        let skip = self.bulk_skip_len(var, key);
                         if self.int_arrays.contains(var) {
                             // native int store (no value_c/atoll round-trip:
                             // the value renders as arithmetic directly).
@@ -20518,13 +21131,23 @@ fn param_copy_alias(
                             // is trivial) — index it directly.
                             let sfx = self.vec_grow_suffix(var);
                             let nv = self.store_int_item_c(val);
-                            if kv_direct {
-                                self.emit(&format!("{{ if (({kv}) >= 0) {{ while ((size_t)(({kv}) + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[{kv}] = {nv}; if ((size_t)(({kv}) + 1) > {id}_len) {id}_len = ({kv}) + 1; }} }}"));
+                            let len_up_direct = if skip {
+                                String::new()
                             } else {
-                                self.emit(&format!("{{ long long _kk = (long long)({kv}); if (_kk >= 0) {{ while ((size_t)(_kk + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+                                format!(" if ((size_t)(({kv}) + 1) > {id}_len) {id}_len = ({kv}) + 1;")
+                            };
+                            let len_up_kk = if skip {
+                                String::new()
+                            } else {
+                                format!(" if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1;")
+                            };
+                            if kv_direct {
+                                self.emit(&format!("{{ if (({kv}) >= 0) {{ while ((size_t)(({kv}) + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[{kv}] = {nv};{len_up_direct} }} }}"));
+                            } else {
+                                self.emit(&format!("{{ long long _kk = (long long)({kv}); if (_kk >= 0) {{ while ((size_t)(_kk + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[_kk] = {nv};{len_up_kk} }} }}"));
                             }
                         } else {
-                            self.emit_vec_index_write(var, &kv, &v);
+                            self.emit_vec_index_write(var, &kv, &v, skip);
                         }
                         return;
                     }
@@ -22977,8 +23600,10 @@ fn param_copy_alias(
                     if self.vec_arrays.contains(&t.var) {
                         // growable vec: store at len (= append). The
                         // helper hoists value+key (single evaluation,
-                        // null-safe) and extends len itself.
-                        self.emit_vec_index_write(&t.var, &format!("{id}_len"), &v);
+                        // null-safe) and extends len itself. Appends are
+                        // never bulk-len counter writes (they extend len
+                        // by construction), so len updates stay.
+                        self.emit_vec_index_write(&t.var, &format!("{id}_len"), &v, false);
                         return;
                     }
                     self.emit(&format!(
@@ -23068,16 +23693,30 @@ fn param_copy_alias(
                         self.need_sh = true;
                         let is_self = matches!(a.as_ref(), ArithAst::IncDec { var, .. } if var == &t.var)
                             || matches!(a.as_ref(), ArithAst::Assign { var, .. } if var == &t.var);
+                        // Loop-nested arith assigns with unobserved rc:
+                        // the status store is dead (see in_loop) — emit
+                        // the bare effect. Top-level and observed-rc
+                        // keeps the modeling store (exit codes).
+                        let lean_assign =
+                            self.rc_unobserved && self.in_loop > 0;
                         if is_self {
                             // the expr carries the side effect (i++ /
                             // x = y + 1) — emit it once, read the value
                             // for the status
-                            self.emit(&format!("_sh_rc = !(({c}) != 0);"));
+                            if lean_assign {
+                                self.emit(&format!("({c});"));
+                            } else {
+                                self.emit(&format!("_sh_rc = !(({c}) != 0);"));
+                            }
                         } else {
                             // `((j = i++))` — the target receives the
                             // value AND the status reflects it
                             let name = self.c_ident(&t.var);
-                            self.emit(&format!("_sh_rc = !(({name} = ({c})) != 0);"));
+                            if lean_assign {
+                                self.emit(&format!("{name} = ({c});"));
+                            } else {
+                                self.emit(&format!("_sh_rc = !(({name} = ({c})) != 0);"));
+                            }
                         }
                         return;
                     }
@@ -23428,7 +24067,9 @@ fn param_copy_alias(
                 }
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
+                self.in_cond += 1;
                 let c = self.expr(cond);
+                self.in_cond -= 1;
                 // P1 follow-up: intersect proofs across branches — a
                 // var proven on every path stays proven; a reassign on
                 // any path drops it. (Each branch starts from the
@@ -23443,7 +24084,9 @@ fn param_copy_alias(
                 let mut post_if = std::mem::take(&mut self.nonnull_var);
                 for (ec, body) in elsifs {
                     self.nonnull_var = pre_if.clone();
+                    self.in_cond += 1;
                     let ec = self.expr(ec);
+                    self.in_cond -= 1;
                     self.emit(&format!("}} else if ({ec}) {{"));
                     self.depth += 1;
                     for s in body {
@@ -23529,9 +24172,11 @@ fn param_copy_alias(
                         self.depth += 1;
                         self.emit(&format!("{name} = {k};"));
                         self.loop_depth += 1;
+                        self.in_loop += 1;
                         for s in body {
                             self.stmt(s);
                         }
+                        self.in_loop -= 1;
                         self.loop_depth -= 1;
                         self.depth -= 1;
                         self.emit("}");
@@ -23557,9 +24202,11 @@ fn param_copy_alias(
                         "for ({name} = {first}; {name} {cmp} {last}; {upd}) {{"
                     ));
                     self.depth += 1;
+                    self.in_loop += 1;
                     for s in body {
                         self.stmt(s);
                     }
+                    self.in_loop -= 1;
                     self.depth -= 1;
                     self.emit("}");
                     match prev_type {
@@ -23936,7 +24583,9 @@ fn param_copy_alias(
                 // Wrapped in a site helper: any numeric temps the cond
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
+                self.in_cond += 1;
                 let c = self.cond_site(cond_ref);
+                self.in_cond -= 1;
                 // bash: a while whose condition failed BEFORE the first
                 // body run exits 0 — pre-set _sh_rc, but ONLY when the cond
                 // is call-free (no _sh_site_/_cap_/helper call can stash a
@@ -23958,8 +24607,10 @@ fn param_copy_alias(
                 // The step is the last body stmt (strip_cfor shape).
                 // Original cond (not the LIC rewrite — the bound var
                 // re-read is one atoll and always in scope).
+                // Bulk-len epilogue runs after the loop (len catch-up).
+                let mut bulk_end: Option<(Vec<String>, String)> = None;
                 if let Some(last) = body.last() {
-                    self.emit_counter_reserve(cond, last, body);
+                    bulk_end = self.emit_counter_reserve(cond, last, body);
                 }
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
@@ -23967,15 +24618,20 @@ fn param_copy_alias(
                     self.emit("_went = 1;");
                 }
                 self.loop_depth += 1;
+                self.in_loop += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.in_loop -= 1;
                 self.loop_depth -= 1;
                 if !cond_pure {
                     self.emit(&format!("{lrc2} = _sh_rc;"));
                 }
                 self.depth -= 1;
                 self.emit("}");
+                if let Some((bulk, need)) = bulk_end {
+                    self.emit_counter_bulk_end(&bulk, &need);
+                }
                 for (name, prev) in lic_restore {
                     match prev {
                         Some(t) => {
@@ -23996,13 +24652,17 @@ fn param_copy_alias(
             IrStmt::DoWhile { body, cond, until } => {
                 // P1 follow-up: see While.
                 self.nonnull_clear_written(std::slice::from_ref(s));
+                self.in_cond += 1;
                 let c = self.cond_site(cond);
+                self.in_cond -= 1;
                 self.emit("do {");
                 self.depth += 1;
                 self.loop_depth += 1;
+                self.in_loop += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.in_loop -= 1;
                 self.loop_depth -= 1;
                 self.depth -= 1;
                 if *until {
@@ -24708,9 +25368,11 @@ fn param_copy_alias(
                 // loop fills (one realloc, no doubling chain). Bound read
                 // after init (init may assign it); demand-growth backstops
                 // any staleness, so this is purely performance.
+                // Bulk-len epilogue runs after the loop (len catch-up).
+                let mut bulk_end: Option<(Vec<String>, String)> = None;
                 if step.len() == 1 {
                     if let Some(last) = step.last() {
-                        self.emit_counter_reserve(cond, last, body);
+                        bulk_end = self.emit_counter_reserve(cond, last, body);
                     }
                 }
                 // LIC bound hoist (same as While): the step executes per
@@ -24730,19 +25392,26 @@ fn param_copy_alias(
                         None => cond,
                     }
                 };
+                self.in_cond += 1;
                 let cond_c = self.expr(cond_ref);
+                self.in_cond -= 1;
                 self.emit(&format!("while ({cond_c}) {{"));
                 self.depth += 1;
                 self.loop_depth += 1;
+                self.in_loop += 1;
                 for s in body {
                     self.stmt(s);
                 }
-                self.loop_depth -= 1;
                 for s in step {
                     self.stmt(s);
                 }
+                self.in_loop -= 1;
+                self.loop_depth -= 1;
                 self.depth -= 1;
                 self.emit("}");
+                if let Some((bulk, need)) = bulk_end {
+                    self.emit_counter_bulk_end(&bulk, &need);
+                }
                 for (name, prev) in lic_restore {
                     match prev {
                         Some(t) => {
@@ -36842,6 +37511,111 @@ mod tests {
         let out = shir_to_c(&counter_forinit("i<n", true));
         assert!(out.contains("_lic"), "ForInit bound not hoisted:\n{out}");
         assert!(out.contains("i < _lic"), "cond not rewritten to temp:\n{out}");
+    }
+
+    #[test]
+    fn lean_cond_skips_rc_store() {
+        // No `$?` anywhere: a pure `i<n` loop cond renders bare (no
+        // per-iteration `_sh_rc` store, no `_r` temp).
+        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i")]));
+        assert!(
+            out.contains("((i < _lic"),
+            "lean cond missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_rc = (_r"),
+            "dead rc store survives:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bulk_len_epilogue_replaces_per_store_updates() {
+        // Dense dynamic fill: per-store `a_len` traffic goes quiet, one
+        // monotonic epilogue `len = max(len, need)` catches up. Exactly
+        // one `a_len =` in the whole render (the epilogue).
+        let out = shir_to_c(&counter_forinit("i<n", true));
+        assert!(out.contains("_need > a_len"), "epilogue missing:\n{out}");
+        // one `a_len` store total besides the decl (the epilogue) —
+        // no per-store updates in the loop body.
+        assert_eq!(
+            out.matches("a_len =").count(),
+            2, // decl `= 0` + epilogue
+            "per-store len updates survive:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bulk_len_skips_on_break() {
+        // A `break` in the body skips the epilogue (early exit) → normal
+        // per-store updates (len stays exact).
+        let mut prog = counter_forinit("i<n", true);
+        if let IrStmt::ForInit { body, .. } = &mut prog.stmts[0] {
+            body.push(IrStmt::Break);
+        }
+        let out = shir_to_c(&prog);
+        assert!(
+            !out.contains("_need > a_len"),
+            "epilogue with unstructured exit:\n{out}"
+        );
+        assert!(
+            out.matches("a_len =").count() > 1,
+            "per-store updates missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn lean_assign_skips_rc_in_loop() {
+        // Loop-nested arith assigns with unobserved rc: bare effect, no
+        // `_sh_rc` store (the step runs per iteration — hot path).
+        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i")]));
+        assert!(
+            out.contains("i = (i + 1);")
+                || out.contains("(i + 1);")
+                || out.contains("i++;"),
+            "bare step missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_rc = !((i"),
+            "dead step rc store survives:\n{out}"
+        );
+    }
+
+    #[test]
+    fn lean_assign_keeps_rc_top_level() {
+        // Top-level assigns keep their rc store (exit codes observe the
+        // last one) even with no `$?` reads.
+        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i")]));
+        // the init `i = 0` is top-level (lic_while_text has no init, so
+        // use a prog with a trailing top-level assign instead)
+        let mut prog = lic_while_text("i<n", vec![lic_incr("i")]);
+        prog.stmts.push(unsigned_assign("z", 42));
+        let out = shir_to_c(&prog);
+        assert!(out.contains("_sh_rc"), "top-level rc modeling gone:\n{out}");
+    }
+
+    #[test]
+    fn lean_cond_keeps_store_on_qmark() {
+        // A `$?` read after the loop keeps the wrapper store (the read
+        // observes the cond's rc).
+        let mut prog = lic_while_text("i<n", vec![lic_incr("i")]);
+        prog.stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str(
+                        "?".to_string(),
+                        crate::ir::StrStyle::DoubleQuoted,
+                    )],
+                }]),
+            ],
+        }));
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("_sh_rc = (_r"),
+            "rc store wrongly stripped with $? read:\n{out}"
+        );
     }
 
     #[test]
