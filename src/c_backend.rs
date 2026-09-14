@@ -646,6 +646,10 @@ pub struct Render {
     /// printed through `_sh_i128_str` (scalar-only — array element widths
     /// still use `Width`). Empty unless the flag and a wide probe are on.
     i128_vars: HashSet<String>,
+    /// Tiered growers (bucket >= 17): source vars with an `__int128` fast
+    /// mirror `<c_ident>_f` + `<c_ident>_big` flag, spilling to the GMP
+    /// slot on 128-bit overflow (DUAL_LOOPS §4.1 "next tier up to GMP").
+    tiered_vars: HashSet<String>,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6055,6 +6059,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     let prof_in = crate::c_profile::load_profile_in();
     let mut profile_bounds: HashMap<String, (i128, i128)> = HashMap::new();
     let mut i128_vars: HashSet<String> = HashSet::new();
+    let mut tiered_vars: HashSet<String> = HashSet::new();
     if let Some(p) = prof_in.as_ref() {
         if p.assume_widths {
             // Staleness is refusal-grade for an assumed width (§4.2):
@@ -6168,17 +6173,24 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         }
     }
     // SH2_ASSUME_OBSERVED_WIDTHS: a variable whose observed magnitude
-    // is beyond 128 bits is homed in GMP — exact for any size, no guard
-    // needed. Bucket 17 means the wide probe saturated (>128 bits);
-    // buckets 9..16 were routed to the __int128 tier above (that is the
-    // fast middle tier this feature exists to find).
+    // is beyond 128 bits needs GMP for correctness. If it is a detected
+    // grower (`x = x * 2`) it additionally gets a tiered form: an
+    // __int128 fast mirror (`<id>_f`) that spills to the GMP slot on
+    // 128-bit overflow. That keeps the ~15x-fast path for the common
+    // case while staying exact for the observed >128 values (§4.1).
+    // Non-growers (no tractable overflow check) keep pure GMP.
     if let Some(p) = prof_in.as_ref() {
         if p.assume_widths {
+            let growers = profile_wide_vars(&prog);
             for (name, b) in &p.mag_buckets {
                 if *b >= 17 {
                     r.bigint_vars.insert(name.clone());
+                    if growers.contains(name) {
+                        tiered_vars.insert(name.clone());
+                    }
                 }
             }
+            r.tiered_vars = tiered_vars;
         }
     }
     if !r.bigint_vars.is_empty() {
@@ -6475,6 +6487,92 @@ impl Render {
     /// same key the `mags` sites are named with.
     fn profile_bound(&self, var: &str) -> Option<(i128, i128)> {
         self.profile_bounds.get(var).copied()
+    }
+
+    /// The `__int128` fast-mirror C ident for a tiered grower.
+    fn tiered_fast(&self, v: &str) -> String {
+        format!("{}_f", self.c_ident(v))
+    }
+
+    /// Emit a tiered grower's current value as exact decimal text into a
+    /// fresh vbuf and return its `.p`. Picks the `__int128` mirror or
+    /// the GMP slot at runtime.
+    fn tiered_decimal(&mut self, v: &str) -> String {
+        let name = self.c_ident(v);
+        let fast = self.tiered_fast(v);
+        let vb = self.vbuf_temp();
+        self.need_gmp = true;
+        self.need_i128 = true;
+        self.emit(&format!("if ({name}_big) _sh_mpz_str(&{vb}, {name}); else _sh_i128_str(&{vb}, {fast});"));
+        format!("{vb}.p")
+    }
+
+    /// Tiered grower store: `x = x op k` keeps an `__int128` fast path
+    /// and spills to the GMP slot on 128-bit overflow. Recognises only
+    /// `+`/`-`/`*` with a literal operand (the shape `profile_wide_vars`
+    /// detects); anything else returns false and falls through to the
+    /// pure-GMP store. Returns true when it emitted the store.
+    fn tiered_store(&mut self, var: &str, a: &ArithAst) -> bool {
+        let (op, k) = match a {
+            ArithAst::Bin { op, lhs, rhs } => {
+                let selfside = |x: &ArithAst| {
+                    matches!(x, ArithAst::Var(v) | ArithAst::Ident(v) if v == var)
+                };
+                if selfside(lhs) {
+                    match rhs.as_ref() {
+                        ArithAst::Num(k) => (op.clone(), *k),
+                        _ => return false,
+                    }
+                } else if selfside(rhs) {
+                    match lhs.as_ref() {
+                        ArithAst::Num(k) => (op.clone(), *k),
+                        _ => return false,
+                    }
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        let builtin = match op.as_str() {
+            "+" => "__builtin_add_overflow",
+            "-" => "__builtin_sub_overflow",
+            "*" => "__builtin_mul_overflow",
+            _ => return false,
+        };
+        let name = self.c_ident(var);
+        let fast = self.tiered_fast(var);
+        let rt = format!("_tr{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.need_i128 = true;
+        self.need_gmp = true;
+        self.emit(&format!("if (!{name}_big) {{"));
+        self.depth += 1;
+        self.emit(&format!("__int128 {rt};"));
+        self.emit(&format!(
+            "if ({builtin}({fast}, (__int128)({k}LL), &{rt})) {{"
+        ));
+        self.depth += 1;
+        // spill: lift the current fast value into the GMP slot, then let
+        // the GMP path apply the operation exactly.
+        let vb = self.vbuf_temp();
+        self.emit(&format!("_sh_i128_str(&{vb}, {fast});"));
+        self.emit(&format!("mpz_set_str({name}, {vb}.p, 10);"));
+        self.bigint_into(a, &name);
+        self.emit(&format!("{name}_big = 1;"));
+        self.depth -= 1;
+        self.emit(&format!("}} else {{"));
+        self.depth += 1;
+        self.emit(&format!("{fast} = {rt};"));
+        self.depth -= 1;
+        self.emit("}");
+        self.depth -= 1;
+        self.emit(&format!("}} else {{"));
+        self.depth += 1;
+        self.bigint_into(a, &name);
+        self.depth -= 1;
+        self.emit("}");
+        true
     }
 
     /// Store `name = rhs` (a scalar Int target). Under
@@ -10401,6 +10499,13 @@ impl Render {
             // the main prologue (tracked once).
             let name = self.c_ident(v);
             self.emit(&format!("mpz_t {name};"));
+            // Tiered grower: the profile-licensed `__int128` fast mirror
+            // and its spill flag (the GMP slot is the exact fallback).
+            if self.tiered_vars.contains(v) {
+                self.need_i128 = true;
+                self.emit(&format!("__int128 {} = 0;", self.tiered_fast(v)));
+                self.emit(&format!("int {name}_big = 0;"));
+            }
             if !self.bigint_declared.contains(&name) {
                 self.bigint_declared.push(name);
             }
@@ -13397,6 +13502,11 @@ fn param_copy_alias(
             IrExpr::Str(s, _) => Self::cstr(s),
             IrExpr::Int(i) => self.num_temp(&i.to_string()),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                if self.tiered_vars.contains(name) {
+                    // tiered grower: i128 mirror or GMP slot at runtime
+                    let p = self.tiered_decimal(name);
+                    return p;
+                }
                 if self.bigint_vars.contains(name) {
                     // GMP slot in a string context: exact decimal text
                     let vb = self.vbuf_temp();
@@ -16480,7 +16590,9 @@ fn param_copy_alias(
                                 }
                                 IrExpr::Call { func, args } if func == "getVar" => {
                                     if let Some(name) = Self::str_arg(args, 0) {
-                                        if self.bigint_vars.contains(&name) {
+                                        if self.bigint_vars.contains(&name)
+                                            && !self.tiered_vars.contains(&name)
+                                        {
                                             self.need_gmp = true;
                                             direct = Some(self.c_ident(&name));
                                         }
@@ -23579,7 +23691,10 @@ fn param_copy_alias(
             IrExpr::Str(s, _) => vec![Part::Lit(s.clone())],
             IrExpr::Int(i) => vec![Part::Arg(i.to_string(), self.num_spec(e))],
             IrExpr::Var(name, _) => {
-                if self.bigint_vars.contains(name) {
+                if self.tiered_vars.contains(name) {
+                    let p = self.tiered_decimal(name);
+                    vec![Part::Arg(p, NumSpec::Str)]
+                } else if self.bigint_vars.contains(name) {
                     // GMP slot printed: exact decimal text
                     let vb = self.vbuf_temp();
                     self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(name)));
@@ -23672,6 +23787,10 @@ fn param_copy_alias(
                             )];
                         }
                         if self.var_types.contains_key(name) {
+                            if self.tiered_vars.contains(name) {
+                                let p = self.tiered_decimal(name);
+                                return vec![Part::Arg(p, NumSpec::Str)];
+                            }
                             if self.bigint_vars.contains(name) {
                                 // GMP slot printed: exact decimal text
                                 let vb = self.vbuf_temp();
@@ -25360,6 +25479,32 @@ fn param_copy_alias(
                         self.array_cap(&t.var)
                     ));
                     return;
+                }
+                // Tiered grower (SH2_ASSUME_OBSERVED_WIDTHS bucket >= 17):
+                // try the `__int128` fast mirror first and spill to the
+                // GMP slot on 128-bit overflow. Must run before the plain
+                // bigint assign below (the var is also in bigint_vars).
+                if self.tiered_vars.contains(&t.var) {
+                    if let IrExpr::Arith(a) = expr {
+                        if self.tiered_store(&t.var, a) {
+                            return;
+                        }
+                    }
+                    if let IrExpr::Str(s, _) = expr {
+                        let txt = s.trim();
+                        if !txt.is_empty()
+                            && txt
+                                .trim_start_matches('-')
+                                .chars()
+                                .all(|c| c.is_ascii_digit())
+                        {
+                            let name = self.c_ident(&t.var);
+                            let fast = self.tiered_fast(&t.var);
+                            self.need_i128 = true;
+                            self.emit(&format!("{fast} = {txt}; {name}_big = 0;"));
+                            return;
+                        }
+                    }
                 }
                 // GMP bigint assign: the target is bigint-declared by
                 // the same taint fixpoint, so evaluate straight into it

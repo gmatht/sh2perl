@@ -755,3 +755,90 @@ fn assume_observed_width_i128_tier() {
         "bucket 13 must not fall through to GMP:\n{c}"
     );
 }
+
+/// A minimal grower (`x = x * 2` in a loop) for the tiered test.
+fn grow_prog_json() -> String {
+    r##"{
+ "type": "Program", "contract_version": 1,
+ "imports": [], "requires": [], "subs": [],
+ "var_types": [{"name": "x", "type": "Int"}, {"name": "i", "type": "Int"}],
+ "stmts": [
+  {"type": "Assign", "targets": [{"var": "x", "sigil": null, "indices": []}],
+   "expr": {"type": "Str", "style": "DoubleQuoted", "value": "1"}},
+  {"type": "Assign", "targets": [{"var": "i", "sigil": null, "indices": []}],
+   "expr": {"type": "Str", "style": "DoubleQuoted", "value": "0"}},
+  {"type": "While", "runs": true,
+   "cond": {"type": "Call", "func": "test", "purity": "Emulable",
+    "args": [{"type": "Str", "style": "DoubleQuoted", "value": "$i -lt 5"}]},
+   "body": [
+    {"type": "Assign", "targets": [{"var": "x", "sigil": null, "indices": []}],
+     "expr": {"type": "Arith", "ast": {"type": "Bin", "op": "*",
+      "lhs": {"type": "Var", "name": "x"}, "rhs": {"type": "Num", "value": 2}}}},
+    {"type": "Assign", "targets": [{"var": "i", "sigil": null, "indices": []}],
+     "expr": {"type": "Arith", "ast": {"type": "Bin", "op": "+",
+      "lhs": {"type": "Var", "name": "i"}, "rhs": {"type": "Num", "value": 1}}}}
+   ]},
+  {"type": "Expr", "expr": {"type": "Call", "func": "exec", "purity": "Emulable",
+   "args": [{"type": "Str", "style": "DoubleQuoted", "value": "echo"},
+    {"type": "Array", "elements": [{"type": "Call", "func": "getVar", "purity": "Emulable",
+      "args": [{"type": "Str", "style": "DoubleQuoted", "value": "x"}]}]}]}}
+ ]
+}"##.to_string()
+}
+
+/// Bucket 17 (beyond 128 bits) on a detected grower must keep BOTH tiers:
+/// an `__int128` fast mirror that spills to the GMP slot on overflow.
+/// This is what makes a merged profile (max bucket 17) still contain the
+/// fast 128-bit path instead of degrading to pure GMP.
+#[test]
+fn assume_observed_width_tiered_grower() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let pc = render_c(&grow_prog_json(), true, &tmp("tier_prof.json"));
+    let hash = pc
+        .lines()
+        .find(|l| l.contains("_prof_hash ="))
+        .expect("hash line")
+        .split("0x")
+        .nth(1)
+        .expect("hex")
+        .split("ULL")
+        .next()
+        .expect("end")
+        .to_string();
+
+    let dir = tmp("tier");
+    std::fs::create_dir_all(&dir).unwrap();
+    let prof = dir.join("p.json");
+    std::fs::write(
+        &prof,
+        format!(
+            "{{\"schema\":1,\"hash_algo\":\"fnv1a64\",\"source_hash\":\"{hash}\",\
+             \"options\":{{\"target\":\"c\"}},\"loops\":[],\"branches\":[],\
+             \"mags\":[{{\"name\":\"main:mag:x@0\",\"max_bucket\":17}}],\"lens\":[]}}"
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("SH2_ASSUME_OBSERVED_WIDTHS", "1");
+    std::env::set_var("SH2_PROFILE_IN", &prof);
+    std::env::remove_var("SH2_PROFILE");
+    std::env::remove_var("SH2_PROFILE_OUT");
+    let c = {
+        let prog = debashl::shir_json_in::shir_json_to_ir(&grow_prog_json()).unwrap();
+        debashl::c_backend::shir_to_c(&prog)
+    };
+    std::env::remove_var("SH2_ASSUME_OBSERVED_WIDTHS");
+    std::env::remove_var("SH2_PROFILE_IN");
+
+    assert!(c.contains("__int128 x_f = 0;"), "fast mirror missing:\n{c}");
+    assert!(c.contains("mpz_t x;"), "GMP spill slot missing:\n{c}");
+    assert!(c.contains("int x_big = 0;"), "spill flag missing:\n{c}");
+    assert!(
+        c.contains("__builtin_mul_overflow(x_f"),
+        "fast path overflow check missing:\n{c}"
+    );
+    assert!(
+        c.contains("if (x_big) _sh_mpz_str"),
+        "runtime-select print missing:\n{c}"
+    );
+}
