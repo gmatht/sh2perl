@@ -1171,12 +1171,296 @@ fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
             &bigint_vars,
         );
     }
+    // Pass 2: every array READ anywhere (not just the known string
+    // reads). A write-only int list may be homed natively; one that is
+    // read by an unhandled consumer (slice/join/…) falls back to the old
+    // int-consumer requirement, so no string consumer can be surprised by
+    // a native representation.
+    let mut any_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        mark_reads_stmt(s, &all_arrays, &mut any_read);
+    }
     all_arrays
         .into_iter()
         .filter(|a| {
-            int_consumed.contains(a) && !non_int_write.contains(a) && !string_read.contains(a)
+            // Home as a native int store when EVERY write is int-domain,
+            // no element is read as text, and the array is either an int
+            // consumer or never read at all (docs/PY_BENCH.md finding C:
+            // an explicit accumulator instead of `sum(xs)` used to force
+            // snprintf+strdup per element).
+            !non_int_write.contains(a)
+                && !string_read.contains(a)
+                && (int_consumed.contains(a) || !any_read.contains(a))
         })
         .collect()
+}
+
+/// Pass 2: mark every array name that is READ as a value (write targets
+/// excluded). Conservative: an unknown call mentioning an array name is a
+/// read. The statement match is exhaustive (mirrors `count_stmt`) so a new
+/// IR variant is a compile error rather than a silent over-home.
+fn mark_reads_stmt(s: &IrStmt, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match s {
+        IrStmt::Expr(e) => mark_reads_expr(e, all, out),
+        IrStmt::Output { value, .. } => mark_reads_expr(value, all, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            mark_reads_expr(path, all, out);
+            mark_reads_expr(content, all, out);
+        }
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets {
+                for ix in &t.indices {
+                    mark_reads_expr(ix, all, out);
+                }
+            }
+            mark_reads_expr(expr, all, out);
+        }
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            mark_reads_expr(cond, all, out);
+            for b in then.iter().chain(else_) {
+                mark_reads_stmt(b, all, out);
+            }
+            for (c, b) in elsifs {
+                mark_reads_expr(c, all, out);
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for b in body.iter().chain(else_body).chain(finally_body) {
+                mark_reads_stmt(b, all, out);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    mark_reads_expr(m, all, out);
+                }
+                for b in &e.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is the read.
+            mark_reads_expr(iter, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for st in init.iter().chain(step).chain(body) {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Continue | IrStmt::Break => {}
+        IrStmt::While { cond, body } => {
+            mark_reads_expr(cond, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => mark_reads_expr(expr, all, out),
+        IrStmt::Exec { cmd, args, redirects, .. } => {
+            mark_reads_expr(cmd, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(r, all, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                mark_reads_expr(x, all, out);
+            }
+        }
+        IrStmt::SetChildError(e) => mark_reads_expr(e, all, out),
+        IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Label(_) | IrStmt::Goto(_) => {}
+        IrStmt::Case { discriminant, clauses } => {
+            mark_reads_expr(discriminant, all, out);
+            for c in clauses {
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                mark_reads_stmt(b, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(&r.target, all, out);
+            }
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+            for (_, b) in named_blocks {
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    mark_reads_expr(ch, all, out);
+                }
+                if let Some(v) = &c.value {
+                    mark_reads_expr(v, all, out);
+                }
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs) {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::Shaderize { body, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() {
+                mark_reads_stmt(c, all, out);
+            }
+        }
+    }
+}
+
+fn mark_reads_expr(e: &IrExpr, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "setArray" || func == "setArrayAppend" {
+                // args[0] is the WRITE target — recurse the rest only.
+                for a in args.iter().skip(1) {
+                    mark_reads_expr(a, all, out);
+                }
+                return;
+            }
+            if func == "arrayLen" {
+                // `${#xs[@]}` / `len(xs)` — the element COUNT only, never
+                // an element: a count read must not defeat native homing.
+                return;
+            }
+            // Any string argument naming an array is a conservative READ:
+            // consumers that reference the array by name (a slice's
+            // `slice("arr", …)`, a join, an echo) must not be handed a
+            // native int store.
+            for a in args {
+                if let IrExpr::Str(name, _) = a {
+                    if all.contains(name) {
+                        out.insert(name.clone());
+                    }
+                }
+                mark_reads_expr(a, all, out);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            mark_reads_expr(obj, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+        }
+        // A direct element read (`x[0]`, `IrExpr::Index`, distinct from
+        // the `arrayIndex` call) is a read. Marking it here (rather than
+        // in `string_read`) keeps the relaxation narrow: an array that is
+        // also an int consumer (`sum(xs)`) still homes as before, while a
+        // pure index-read array is not newly homed.
+        IrExpr::Index { var, key } => {
+            if all.contains(var) {
+                out.insert(var.clone());
+            }
+            mark_reads_expr(key, all, out);
+        }
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+            if all.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            mark_reads_expr(lhs, all, out);
+            mark_reads_expr(rhs, all, out);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            mark_reads_expr(cond, all, out);
+            mark_reads_expr(then, all, out);
+            mark_reads_expr(else_, all, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            mark_reads_expr(expr, all, out);
+            mark_reads_expr(default, all, out);
+        }
+        IrExpr::Capture { expr, .. } => mark_reads_expr(expr, all, out),
+        IrExpr::Array(items) => {
+            for it in items {
+                mark_reads_expr(it, all, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            mark_reads_expr(iter, all, out);
+            mark_reads_expr(elem, all, out);
+            if let Some(c) = cond {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        IrExpr::Arrow(body) | IrExpr::Lambda { body, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrExpr::Object(vals) => {
+            for (_, v) in vals {
+                mark_reads_expr(v, all, out);
+            }
+        }
+        IrExpr::Splice(x) => mark_reads_expr(x, all, out),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    mark_reads_expr(x, all, out);
+                }
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn walk_int_array_stmt(
@@ -1225,7 +1509,11 @@ fn walk_int_array_stmt(
             walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
             for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
-        IrStmt::For { body, .. } => {
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is a `slice` read of
+            // the array; walking only the body missed it, so an array
+            // iterated as strings could still home natively.
+            walk_int_array_expr(iter, all, consumed, non_int, str_read, vt, big);
             for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
         }
         IrStmt::ForInit { init, cond, step, body } => {
@@ -1304,6 +1592,16 @@ fn walk_int_array_expr(
             }
             "exec" | "builtin" => {
                 // the array may appear in the argv (a string context)
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "slice" => {
+                // `${arr[@]}` / `${arr[@]:a:b}` — a string-element read:
+                // args[0] is the literal "slice", args[1] the array.
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
                 for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
             }
             "arrayIndex" | "arrayItems" => {
@@ -6647,7 +6945,7 @@ impl Render {
             return false;
         }
         // Structured arith condition required; it need NOT mention the
-        // growth var. The outermost loop containing the growth is the
+        // growth vars. The outermost loop containing the growth is the
         // preferred target: the whole loop (including the bigint
         // assignment that precedes the growth) then runs in the i64 arm,
         // so the i64<->mpz handoff happens once per outer entry instead
@@ -6656,33 +6954,38 @@ impl Render {
         let IrExpr::Arith(_) = cond else {
             return false;
         };
-        let Some(v) = self.spec_growth_var(body) else {
+        // EVERY bigint var that grows here — multiplicative (`v = 3*v+1`)
+        // or additive (`s = s+1`, `total = total+s`). Shadowing the whole
+        // set (not just the first) is what lets a loop with several
+        // carried counters run in one i64 arm (collatz carries v, s and
+        // total).
+        let growth = self.spec_growth_vars(body);
+        if growth.is_empty() {
             return false;
-        };
-        // Every loop-carried mutation must be a plain scalar (or the var).
+        }
+        // Every other loop-carried mutation must be a plain scalar.
         let mut mutated: BTreeSet<String> = BTreeSet::new();
         if !spec_collect(body, &mut mutated) {
             return false;
         }
         for m in &mutated {
-            if m == &v {
+            if growth.contains(m) {
                 continue;
             }
             if !self.is_num(m) || self.buf_bound(m).is_some() || self.managed_strings.contains(m) {
                 return false;
             }
         }
-        // The var's RHSs must be i64-check-renderable over int/num leaves.
-        if !spec_body_rhs_ok(body, &v, &self.bigint_vars) {
+        // Every assignment to a shadowed var must be i64-check-renderable
+        // over the shadowed set + int/num leaves.
+        if !spec_body_rhs_ok(body, &growth, &self.bigint_vars) {
             return false;
         }
-        let v_id = self.c_ident(&v);
-        let v_s = format!("{v_id}_s");
         let ovf = format!("_sp_ovf{}", self.temp_seq);
         self.temp_seq += 1;
         let mut snaps: Vec<(String, String)> = Vec::new();
         for m in &mutated {
-            if m == &v {
+            if growth.contains(m) {
                 continue;
             }
             let sid = self.c_ident(m);
@@ -6701,18 +7004,26 @@ impl Render {
             self.emit(&format!("{ty} {sn} = {sid};"));
         }
         self.emit(&format!("int {ovf} = 0;"));
-        self.emit(&format!("long long {v_s} = 0;"));
-        self.emit(&format!(
-            "if (mpz_fits_slong_p({v_id})) {v_s} = mpz_get_si({v_id}); else {ovf} = 1;"
-        ));
+        // One i64 shadow per growth var; a var that does not fit i64
+        // forces the exact replay before the fast arm runs at all.
+        let mut shadows: Vec<(String, String)> = Vec::new();
+        for g in &growth {
+            let g_id = self.c_ident(g);
+            let g_s = format!("{g_id}_s");
+            self.emit(&format!("long long {g_s} = 0;"));
+            self.emit(&format!(
+                "if (mpz_fits_slong_p({g_id})) {g_s} = mpz_get_si({g_id}); else {ovf} = 1;"
+            ));
+            shadows.push((g_id, g_s));
+        }
         // fast arm
         self.emit(&format!("if (!{ovf}) {{"));
         self.depth += 1;
-        self.spec_fast = Some([v.clone()].into_iter().collect());
+        self.spec_fast = Some(growth.iter().cloned().collect());
         self.spec_bigint = Some(
             self.bigint_vars
                 .iter()
-                .filter(|x| **x != v)
+                .filter(|x| !growth.contains(*x))
                 .cloned()
                 .collect(),
         );
@@ -6759,23 +7070,28 @@ impl Render {
         self.depth -= 1;
         self.emit("}");
         self.depth -= 1;
-        self.emit(&format!("}} else {{ mpz_set_si({v_id}, {v_s}); }}"));
+        let sets: Vec<String> = shadows
+            .iter()
+            .map(|(g, s)| format!("mpz_set_si({g}, {s});"))
+            .collect();
+        self.emit(&format!("}} else {{ {} }}", sets.join(" ")));
         self.depth -= 1;
         self.emit("}");
         true
     }
 
-    /// The single bigint var that GROWS inside this loop body (`v` under
-    /// `*`/`**`/`<<`). Nested loops are not searched: speculation is for
-    /// the loop that owns the growth.
-    fn spec_growth_var(&self, body: &[IrStmt]) -> Option<String> {
-        fn walk(stmts: &[IrStmt], big: &BTreeSet<String>, found: &mut Option<String>) {
+    /// Every bigint var that GROWS inside this loop body (multiplicative
+    /// `*`/`**`/`<<`, or additive `+`/`-` with a nonzero step). Nested
+    /// loops ARE searched: the outer wrapper owns the shadow set, so a
+    /// growth in an inner loop is shadowed by the outer arm (collatz).
+    fn spec_growth_vars(&self, body: &[IrStmt]) -> BTreeSet<String> {
+        fn walk(stmts: &[IrStmt], big: &BTreeSet<String>, found: &mut BTreeSet<String>) {
             for s in stmts {
                 match s {
                     IrStmt::Assign { targets, expr, .. } => {
                         if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
                             if big.contains(&t.var) && arith_self_growth(a, &t.var) {
-                                *found = Some(t.var.clone());
+                                found.insert(t.var.clone());
                             }
                         }
                     }
@@ -6795,7 +7111,7 @@ impl Render {
                 }
             }
         }
-        let mut found = None;
+        let mut found = BTreeSet::new();
         walk(body, &self.bigint_vars, &mut found);
         found
     }
@@ -6866,6 +7182,23 @@ impl Render {
                     format!("{}_s", self.c_ident(x))
                 } else {
                     self.c_ident(x)
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let x = self.spec_checked_expr(arg);
+                match op.as_str() {
+                    "+" => x,
+                    "-" => {
+                        let t = format!("_st{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let ovf = self.spec_ovf.clone().unwrap_or_default();
+                        self.emit(&format!("long long {t};"));
+                        self.emit(&format!(
+                            "if (__builtin_sub_overflow(0LL, {x}, &{t})) {{ {ovf} = 1; break; }}"
+                        ));
+                        t
+                    }
+                    _ => unreachable!("spec_rhs_ok gates unary ops"),
                 }
             }
             ArithAst::Bin { op, lhs, rhs } => {
@@ -13649,6 +13982,40 @@ fn param_copy_alias(
                     self.emit(&format!("mpz_set_str({target}, \"{digits}\", 10);"));
                     return;
                 }
+                // Small literal operand: `x op k` becomes ONE
+                // `mpz_*_ui`/`mpz_mul_si` call with no constant mpz and
+                // no aliasing copy (typed Cython's `mpz_mul_ui(x, x, 3)`
+                // shape). GMP allows the target to alias the operand.
+                if let Some(k) = Self::bigint_small_const(rhs) {
+                    let lt = self.bigint_operand(lhs);
+                    let e = match op.as_str() {
+                        "+" if k >= 0 => Some(format!("mpz_add_ui({target}, {lt}, {k}ULL);")),
+                        "+" => Some(format!("mpz_sub_ui({target}, {lt}, {}ULL);", -k)),
+                        "-" if k >= 0 => Some(format!("mpz_sub_ui({target}, {lt}, {k}ULL);")),
+                        "-" => Some(format!("mpz_add_ui({target}, {lt}, {}ULL);", -k)),
+                        "*" if k >= 0 => Some(format!("mpz_mul_ui({target}, {lt}, {k}ULL);")),
+                        "*" => Some(format!("mpz_mul_si({target}, {lt}, {k}L);")),
+                        _ => None,
+                    };
+                    if let Some(e) = e {
+                        self.emit(&e);
+                        return;
+                    }
+                }
+                // Commutative left constants: `k + x` / `k * x`.
+                if let Some(k) = Self::bigint_small_const(lhs) {
+                    let rt = self.bigint_operand(rhs);
+                    let e = match op.as_str() {
+                        "+" if k >= 0 => Some(format!("mpz_add_ui({target}, {rt}, {k}ULL);")),
+                        "*" if k >= 0 => Some(format!("mpz_mul_ui({target}, {rt}, {k}ULL);")),
+                        "*" => Some(format!("mpz_mul_si({target}, {rt}, {k}L);")),
+                        _ => None,
+                    };
+                    if let Some(e) = e {
+                        self.emit(&e);
+                        return;
+                    }
+                }
                 let lt = self.bigint_operand(lhs);
                 let rt = self.bigint_operand(rhs);
                 match op.as_str() {
@@ -13773,13 +14140,26 @@ fn param_copy_alias(
     /// (init-once guard; limbs reused across evaluations like the
     /// _sh_vbuf high-water discipline — no leaks, no scope tracking).
     fn bigint_operand(&mut self, a: &ArithAst) -> String {
-        match a {
+        // Unwrap the frontend's identity `Cast(Int64, …)` first: a
+        // `Cast(Var x)` must render as `x` itself, not an aliasing
+        // `mpz_set(tmp, x)` copy (GMP allows `a = a op b` in place).
+        match Self::unwrap_cast(a) {
             ArithAst::Var(name) | ArithAst::Ident(name)
                 if self.bigint_vars.contains(name) =>
             {
                 self.c_ident(name)
             }
-            _ => self.bigint_eval_temp(a),
+            other => self.bigint_eval_temp(other),
+        }
+    }
+
+    /// A literal operand that fits a small GMP unsigned/signed helper
+    /// (`mpz_mul_ui` etc.), as a signed i64. None when it is not a
+    /// constant (after unwrapping the identity Cast).
+    fn bigint_small_const(a: &ArithAst) -> Option<i64> {
+        match Self::unwrap_cast(a) {
+            ArithAst::Num(n) => Some(*n),
+            _ => None,
         }
     }
 
@@ -25893,7 +26273,7 @@ fn param_copy_alias(
                         // `v = (k*37+3)%251` was 4 GMP calls each).
                         if self.bigint_vars.contains(&t.var)
                             && !arith_is_bigint_spec(a, &self.bigint_vars)
-                            && spec_rhs_ok(a, "\u{1}", &self.bigint_vars)
+                            && spec_rhs_ok(a, &BTreeSet::new(), &self.bigint_vars)
                         {
                             if let Some((lo, hi)) = arith_range_native(a, &self.var_ranges) {
                                 if lo >= i64::MIN as i128 && hi <= i64::MAX as i128 {
@@ -29197,10 +29577,19 @@ fn arith_has_var(a: &ArithAst, v: &str) -> bool {
 fn arith_self_growth(a: &ArithAst, v: &str) -> bool {
     match a {
         ArithAst::Bin { op, lhs, rhs } => {
-            ((op == "*" || op == "**" || op == "<<")
-                && (arith_has_var(lhs, v) || arith_has_var(rhs, v)))
-                || arith_self_growth(lhs, v)
-                || arith_self_growth(rhs, v)
+            let grows_here = match op.as_str() {
+                "*" | "**" | "<<" => arith_has_var(lhs, v) || arith_has_var(rhs, v),
+                // Additive recurrence: `v = v + e` / `v = v - e` with a
+                // nonzero step. Over-approximate (`v - v` also matches):
+                // shadowing a var only ADDS an overflow check, so a
+                // false positive costs a shadow, never correctness.
+                "+" | "-" => {
+                    (arith_has_var(lhs, v) && spec_const(rhs) != Some(0))
+                        || (arith_has_var(rhs, v) && spec_const(lhs) != Some(0))
+                }
+                _ => false,
+            };
+            grows_here || arith_self_growth(lhs, v) || arith_self_growth(rhs, v)
         }
         ArithAst::Un { arg, .. } => arith_self_growth(arg, v),
         ArithAst::Cast { arg, .. } => arith_self_growth(arg, v),
@@ -29389,6 +29778,16 @@ fn arith_range_native(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> O
         ArithAst::Cast { arg, .. } => arith_range_native(arg, ranges),
         ArithAst::Num(n) => Some((*n as i128, *n as i128)),
         ArithAst::Var(n) | ArithAst::Ident(n) => ranges.get(n).copied(),
+        // Unary `-`/`+` are exact sign flips of the operand interval
+        // (the interval invariant lo <= hi is preserved).
+        ArithAst::Un { op, arg } => {
+            let (l0, l1) = arith_range_native(arg, ranges)?;
+            match op.as_str() {
+                "-" => Some((l1.checked_neg()?, l0.checked_neg()?)),
+                "+" => Some((l0, l1)),
+                _ => None,
+            }
+        }
         ArithAst::Bin { op, lhs, rhs } => {
             let (l0, l1) = arith_range_native(lhs, ranges)?;
             let (r0, r1) = arith_range_native(rhs, ranges)?;
@@ -29404,6 +29803,19 @@ fn arith_range_native(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> O
                     ];
                     Some((*ps.iter().min()?, *ps.iter().max()?))
                 }
+                // Truncating i64 division (what the backend emits): only
+                // non-negative numerators + positive divisors are
+                // modelled, where truncation and floor agree. The
+                // extremes sit at the interval corners.
+                "/" if r0 > 0 && l0 >= 0 => {
+                    let cs = [
+                        l0.checked_div(r0)?,
+                        l0.checked_div(r1)?,
+                        l1.checked_div(r0)?,
+                        l1.checked_div(r1)?,
+                    ];
+                    Some((*cs.iter().min()?, *cs.iter().max()?))
+                }
                 // Python floor-mod: result ∈ [0, m-1] for m > 0.
                 "%" if r0 > 0 => Some((0, r1 - 1)),
                 _ => None,
@@ -29415,50 +29827,59 @@ fn arith_range_native(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> O
 
 /// Can this RHS be rendered as checked i64? Leaves must be the growth var
 /// or a non-bigint scalar; `/`/`%` need a nonzero literal divisor.
-fn spec_rhs_ok(a: &ArithAst, v: &str, big: &BTreeSet<String>) -> bool {
+fn spec_rhs_ok(a: &ArithAst, shadowed: &BTreeSet<String>, big: &BTreeSet<String>) -> bool {
     match a {
         ArithAst::Num(_) => true,
-        ArithAst::Var(n) | ArithAst::Ident(n) => n == v || !big.contains(n),
-        ArithAst::Cast { arg, .. } => spec_rhs_ok(arg, v, big),
+        ArithAst::Var(n) | ArithAst::Ident(n) => shadowed.contains(n) || !big.contains(n),
+        ArithAst::Cast { arg, .. } => spec_rhs_ok(arg, shadowed, big),
         ArithAst::Bin { op, lhs, rhs } => match op.as_str() {
-            "+" | "-" | "*" => spec_rhs_ok(lhs, v, big) && spec_rhs_ok(rhs, v, big),
+            "+" | "-" | "*" => {
+                spec_rhs_ok(lhs, shadowed, big) && spec_rhs_ok(rhs, shadowed, big)
+            }
+            // Positive literal divisor only: the checked arm renders the
+            // raw `l / r` (`% r`), and `LLONG_MIN / -1` (and `LLONG_MIN %
+            // -1`) is UB. A negative divisor keeps the exact GMP path.
             "/" | "%" => {
-                spec_rhs_ok(lhs, v, big)
-                    && matches!(spec_unwrap_cast(rhs), ArithAst::Num(n) if *n != 0)
+                spec_rhs_ok(lhs, shadowed, big)
+                    && matches!(spec_unwrap_cast(rhs), ArithAst::Num(n) if *n > 0)
             }
             _ => false,
         },
+        // Unary sign is check-renderable (`__builtin_sub_overflow(0, x)`).
+        ArithAst::Un { op, arg } => {
+            (op == "-" || op == "+") && spec_rhs_ok(arg, shadowed, big)
+        }
         _ => false,
     }
 }
 
 /// Every assignment to `v` in this body is check-renderable.
-fn spec_body_rhs_ok(stmts: &[IrStmt], v: &str, big: &BTreeSet<String>) -> bool {
+fn spec_body_rhs_ok(stmts: &[IrStmt], shadowed: &BTreeSet<String>, big: &BTreeSet<String>) -> bool {
     for s in stmts {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
-                if targets.first().is_some_and(|t| t.var == v) {
+                if targets.first().is_some_and(|t| shadowed.contains(&t.var)) {
                     match expr {
-                        IrExpr::Arith(a) if spec_rhs_ok(a, v, big) => {}
+                        IrExpr::Arith(a) if spec_rhs_ok(a, shadowed, big) => {}
                         _ => return false,
                     }
                 }
             }
             IrStmt::If { then, elsifs, else_, .. } => {
-                if !spec_body_rhs_ok(then, v, big) {
+                if !spec_body_rhs_ok(then, shadowed, big) {
                     return false;
                 }
                 for (_, b) in elsifs {
-                    if !spec_body_rhs_ok(b, v, big) {
+                    if !spec_body_rhs_ok(b, shadowed, big) {
                         return false;
                     }
                 }
-                if !spec_body_rhs_ok(else_, v, big) {
+                if !spec_body_rhs_ok(else_, shadowed, big) {
                     return false;
                 }
             }
             IrStmt::Block(b) => {
-                if !spec_body_rhs_ok(b, v, big) {
+                if !spec_body_rhs_ok(b, shadowed, big) {
                     return false;
                 }
             }
@@ -29466,7 +29887,7 @@ fn spec_body_rhs_ok(stmts: &[IrStmt], v: &str, big: &BTreeSet<String>) -> bool {
             | IrStmt::DoWhile { body, .. }
             | IrStmt::For { body, .. }
             | IrStmt::ForInit { body, .. } => {
-                if !spec_body_rhs_ok(body, v, big) {
+                if !spec_body_rhs_ok(body, shadowed, big) {
                     return false;
                 }
             }
@@ -38034,6 +38455,113 @@ mod tests {
     }
 
     #[test]
+    fn arith_range_native_covers_division_and_unary() {
+        // The i64-provable verdict is an interval analysis, not a shape
+        // list: + - * / % and unary sign over provable leaves. `/` is
+        // modelled only where truncation == floor (non-negative
+        // numerator, positive divisor) so the emitted C `/` matches.
+        use crate::ir::ArithAst as A;
+        let mut ranges: HashMap<String, (i128, i128)> = HashMap::new();
+        ranges.insert("k".to_string(), (0, 100));
+        let v = |n: &str| A::Var(n.to_string());
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let num = |n: i64| A::Num(n);
+
+        // (k*3 + 7) / 2 over k in [0,100] = [3, 153].
+        let e = bin(
+            "/",
+            bin("+", bin("*", v("k"), num(3)), num(7)),
+            num(2),
+        );
+        assert_eq!(arith_range_native(&e, &ranges), Some((3, 153)));
+        // -k = [-100, 0].
+        let neg = A::Un { op: "-".to_string(), arg: Box::new(v("k")) };
+        assert_eq!(arith_range_native(&neg, &ranges), Some((-100, 0)));
+        // Negative divisor / possibly-negative numerator: refused (the
+        // emitted `/` truncates, so the corner rule would be unsound).
+        assert_eq!(arith_range_native(&bin("/", v("k"), num(-2)), &ranges), None);
+        assert_eq!(
+            arith_range_native(&bin("/", bin("-", v("k"), num(50)), num(2)), &ranges),
+            None
+        );
+        assert_eq!(arith_range_native(&bin("%", v("k"), num(-3)), &ranges), None);
+        // k % 5 = [0, 4].
+        assert_eq!(arith_range_native(&bin("%", v("k"), num(5)), &ranges), Some((0, 4)));
+    }
+
+    #[test]
+    fn spec_rhs_ok_covers_unary_and_positive_divisors() {
+        // The speculative checked arm renders `l / r` raw, so only a
+        // POSITIVE literal divisor is accepted (`LLONG_MIN / -1` is UB).
+        use crate::ir::ArithAst as A;
+        let big: BTreeSet<String> = BTreeSet::new();
+        let v = |n: &str| A::Var(n.to_string());
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        assert!(spec_rhs_ok(&bin("/", v("k"), A::Num(2)), &BTreeSet::new(), &big));
+        assert!(!spec_rhs_ok(&bin("/", v("k"), A::Num(-1)), &BTreeSet::new(), &big));
+        assert!(!spec_rhs_ok(&bin("%", v("k"), A::Num(0)), &BTreeSet::new(), &big));
+        assert!(spec_rhs_ok(
+            &A::Un { op: "-".to_string(), arg: Box::new(v("k")) },
+            &BTreeSet::new(),
+            &big
+        ));
+    }
+
+    #[test]
+    fn bigint_store_with_constant_division_rhs_is_native() {
+        // Wiring pin for the interval verdict: a division RHS that the
+        // `+ - * %`-only version refused now proves i64 and stores with
+        // `mpz_set_si`, not a GMP division chain. (Coverage alone would
+        // not prove the call site consumes the interval.)
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        // v = (7 * 4) / 2 — the multiply folds to 28, the division stays,
+        // and the whole RHS must be proven and stored with mpz_set_si
+        // (no GMP division call).
+        let rhs = cast(bin(
+            "/",
+            bin("*", A::Num(7), A::Num(4)),
+            A::Num(2),
+        ));
+        let mut prog = empty_prog(vec![assign("v", cast(A::Num(1))), assign("v", rhs)]);
+        prog.var_types = vec![("v".to_string(), crate::ir::IrType::Int)];
+        let c = shir_to_c(&prog);
+        assert!(
+            c.contains("mpz_set_si(v, (long long)((unsigned long long)(28) / (unsigned long long)(2)))"),
+            "division bigint store not native:\n{c}"
+        );
+        assert!(
+            !c.contains("mpz_fdiv_q") && !c.contains("mpz_tdiv_q"),
+            "division fell into a GMP call:\n{c}"
+        );
+    }
+
+    #[test]
     fn bigint_store_with_i64_rhs_is_native() {
         // A bigint target whose RHS reads no bigint var and is proven
         // within i64 stores with one `mpz_set_si`, not an mpz chain
@@ -38141,6 +38669,73 @@ mod tests {
         assert!(
             c.contains("s = _sp_s"),
             "loop-carried accumulator not restored for replay:\n{c}"
+        );
+    }
+
+    #[test]
+    fn speculative_fast_arm_shadows_every_growth_var() {
+        // Multi-var + additive speculation: collatz carries `v`
+        // (multiplicative) plus `s` and `total` (additive). All three
+        // must get their own i64 shadow, checked stores, and an exact
+        // mpz write-back on the replay path — not just the first growth
+        // var, and not additive vars snapshotted as plain scalars.
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let v = |n: &str| cast(A::Var(n.to_string()));
+        let mut prog = empty_prog(vec![IrStmt::While {
+            cond: IrExpr::Arith(Box::new(bin(">", v("v"), A::Num(1)))),
+            body: vec![
+                // v = 3*v + 1  (multiplicative growth)
+                assign("v", cast(bin("+", bin("*", v("v"), A::Num(3)), A::Num(1)))),
+                // s = s + 1  (additive growth)
+                assign("s", cast(bin("+", v("s"), A::Num(1)))),
+                // total = total + s  (additive growth reading another growth var)
+                assign("total", cast(bin("+", v("total"), v("s")))),
+            ],
+        }]);
+        prog.var_types = vec![
+            ("v".to_string(), crate::ir::IrType::Int),
+            ("s".to_string(), crate::ir::IrType::Int),
+            ("total".to_string(), crate::ir::IrType::Int),
+        ];
+        let c = shir_to_c(&prog);
+        for sh in ["long long v_s = 0;", "long long s_s = 0;", "long long total_s = 0;"] {
+            assert!(c.contains(sh), "missing shadow `{sh}`:\n{c}");
+        }
+        // Every growth var is written back exactly on the replay path.
+        for w in [
+            "mpz_set_si(v, v_s);",
+            "mpz_set_si(s, s_s);",
+            "mpz_set_si(total, total_s);",
+        ] {
+            assert!(c.contains(w), "missing write-back `{w}`:\n{c}");
+        }
+        assert!(
+            c.contains("while ((v_s > 1))"),
+            "fast arm not on the i64 shadow:\n{c}"
+        );
+        assert!(c.contains("_sp_ovf") && c.contains("break;"), "no checked arm:\n{c}");
+        // `s`/`total` must NOT be plain-scalar snapshots any more.
+        assert!(
+            !c.contains("_sp_s") && !c.contains("_sp_total"),
+            "additive growth vars were snapshotted, not shadowed:\n{c}"
         );
     }
 
@@ -38371,6 +38966,92 @@ mod tests {
         // the chain's per-digit mpz_mul/mpz_add steps must be gone
         assert!(!out.contains("mpz_mul"), "chain *10 steps not folded:\n{out}");
         assert!(!out.contains("mpz_add"), "chain +digit steps not folded:\n{out}");
+    }
+
+    #[test]
+    fn bigint_small_const_op_uses_mpz_ui_in_place() {
+        // finding B (docs/PY_BENCH.md §8): `x = x * 3` on a bigint must
+        // render as ONE in-place `mpz_mul_ui(x, x, 3)`, not
+        // `mpz_set(_bigint_tmp, x); mpz_mul(x, _bigint_tmp, _bigint_3)`.
+        use crate::ir::{ArithAst, AssignTarget, IrType};
+        fn num(n: i64) -> ArithAst {
+            ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Num(n)),
+            }
+        }
+        fn var(name: &str) -> ArithAst {
+            ArithAst::Cast {
+                ty: IrType::Int64,
+                arg: Box::new(ArithAst::Var(name.to_string())),
+            }
+        }
+        // 30-digit literal, in the Horner digit-chain shape the frontend
+        // emits for a >i64 literal — homes `x` bigint.
+        let digits = "123456789012345678901234567890";
+        let first = digits.chars().next().unwrap().to_digit(10).unwrap() as i64;
+        let mut acc = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(ArithAst::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(num(0)),
+                rhs: Box::new(num(10)),
+            }),
+            rhs: Box::new(num(first)),
+        };
+        for c in digits.chars().skip(1) {
+            let d = c.to_digit(10).unwrap() as i64;
+            acc = ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(acc),
+                    rhs: Box::new(num(10)),
+                }),
+                rhs: Box::new(num(d)),
+            };
+        }
+        let assign = |rhs: ArithAst| IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "x".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(rhs)),
+            asm: None,
+        };
+        let mul3 = ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(var("x")),
+            rhs: Box::new(num(3)),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![assign(acc), assign(mul3)],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("mpz_mul_ui(x, x, 3"),
+            "small-const bigint mul not in-place mpz_mul_ui:\n{out}"
+        );
+        assert!(
+            !out.contains("mpz_mul(x,"),
+            "aliasing two-operand mpz_mul survived:\n{out}"
+        );
+        assert!(
+            !out.contains("_bigint_tmp"),
+            "aliasing bigint temp leaked:\n{out}"
+        );
     }
 
     #[test]
@@ -42033,10 +42714,18 @@ mod tests {
                 var_bash_env: vec![],
             }
         }
-        // three literals, no appends → exact small decl (not 1024),
-        // decl and guard agreeing on the number.
+        // three STRING literals, no appends → exact small decl (not
+        // 1024), decl and guard agreeing on the number.
         let out = shir_to_c(&prog_of(vec![
-            setarray("setArray", "a", vec![IrExpr::Int(1), IrExpr::Int(2), IrExpr::Int(3)]),
+            setarray(
+                "setArray",
+                "a",
+                vec![
+                    IrExpr::Str("x".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Str("y".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Str("z".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                ],
+            ),
             echo_len("a"),
         ]));
         let decl = out.find("char *a[").expect("no array decl:\n{out}");
@@ -42045,6 +42734,17 @@ mod tests {
         // proven cap ⇒ the per-store `_ai0 >= dn` guard is dead (ai runs
         // 0..2, cap is 3 by the same proof) and omitted (item 43)
         assert!(!out.contains(&format!("_ai0 >= {dn}")), "dead guard survives:\n{out}");
+        // Int literals read only by `len()` (`arrayLen`, not an element
+        // read) home natively with the same exact cap — no snprintf /
+        // strdup per element (docs/PY_BENCH.md finding C).
+        let out = shir_to_c(&prog_of(vec![
+            setarray("setArray", "a", vec![IrExpr::Int(1), IrExpr::Int(2), IrExpr::Int(3)]),
+            echo_len("a"),
+        ]));
+        assert!(
+            out.contains("a[3]") && !out.contains("char *a["),
+            "int literal array not homed natively:\n{out}"
+        );
         // indexed write → 1024 status quo or vec (arr_set sites are
         // unthreaded, so never a small fixed decl). Int-valued index
         // writes may home the array to long long (same cap, native
