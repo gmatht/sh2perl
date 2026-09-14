@@ -66,6 +66,7 @@ pub mod arith_forms;
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
+pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod grep_pcre; // `grep -P 'PCRE'` → portable `grep -E 'ERE'` (lookbehind absorbed + var patterns reduced; refuse>guess)
 pub mod cat_read; // `cat [-n] FILE` → ForEachLine streaming loop (native in every backend)
@@ -170,6 +171,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // / counted-while-forinit) and only deletes loops, so nothing
         // downstream needs its output except the renderers.
         ("fuse-fill-consume", fuse_fill_consume::transform),
+        ("isolate-accumulate", isolate_accumulate::transform),
+        // isolate-accumulate: single-use loop-private temps fold into a
+        // self-referential tail (single-accumulate isolation for loop
+        // candidacies). Runs after fuse (disjoint patterns); only
+        // shrinks bodies, so order vs peers is irrelevant.
         // split-set: set[int] → small ∪ big partitions (runtime routing).
         // Speed-class — gated by SH2_SPLIT_SETS (set at -O3/-O4 by the
         // CLI, mirroring set_dual_loops).

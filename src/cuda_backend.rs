@@ -510,6 +510,11 @@ pub struct CuReduceSpec {
     pub mask_thresh: Option<i128>,
     /// Render pow2 `%`/`/` as `&`/shr (vehicle clone flag).
     pub mask_fast: bool,
+    /// Mask the OUTER accum mod too (default true). When the outer
+    /// dividend is unversionable but inner pow2 sites are covered,
+    /// candidacy sets this false: inners mask (exact), the outer stays
+    /// `rem` (exact) — all-or-nothing per site, never a wrong mask.
+    pub mask_outer: bool,
     /// Per-lane sequential prelude (empty = plain reduce). Scalar
     /// assigns + flat ifs/whiles over lane regs; runs after the lane
     /// index is derived, before the value. The value is then typically
@@ -810,7 +815,7 @@ pub fn shir_to_cu_reduce(spec: &CuReduceSpec) -> String {
             // Mask fast path: candidacy versioned the accum site (X
             // threshold + acc entry range), so a pow2 modulus renders
             // as `& mask` with no div instruction.
-            if spec.mask_fast && *modulus > 0 && (*modulus as u64).is_power_of_two() {
+            if spec.mask_fast && spec.mask_outer && *modulus > 0 && (*modulus as u64).is_power_of_two() {
                 out.push_str(&format!("  and.b64 %qacc, %qacc, {};\n", *modulus - 1));
             } else {
                 out.push_str(&format!("  rem.s64 %qacc, %qacc, {modulus};\n"));
@@ -1091,6 +1096,7 @@ mod tests {
             arrays: vec![],
             mask_thresh: None,
             mask_fast: false,
+            mask_outer: true,
             seq_prelude: vec![],
         }
     }
@@ -1148,6 +1154,7 @@ mod tests {
             arrays: vec![],
             mask_thresh: None,
             mask_fast: false,
+            mask_outer: true,
             seq_prelude: vec![
                 CuSeqStmt::Assign {
                     var: "v".to_string(),
@@ -1215,6 +1222,18 @@ mod tests {
         assert!(p.contains("%ql_v") && p.contains("%ql_s"), "{p}");
         assert!(p.contains("rem.s64"), "v1 signed seed mod: {p}");
         assert!(p.contains("div.s64"), "v1 signed halve: {p}");
+        assert!(undeclared_regs(&p).is_empty(), "{:?}", undeclared_regs(&p));
+    }
+
+    #[test]
+    fn mask_outer_false_keeps_outer_rem() {
+        // Inners mask, outer stays `rem` (unversionable-outer contract).
+        let mut s = sumred_spec();
+        s.mask_fast = true;
+        s.mask_outer = false;
+        let p = shir_to_cu_reduce(&s);
+        assert!(p.contains("and.b64"), "inners mask: {p}");
+        assert!(p.contains("rem.s64"), "outer stays rem: {p}");
         assert!(undeclared_regs(&p).is_empty(), "{:?}", undeclared_regs(&p));
     }
 
