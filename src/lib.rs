@@ -28,6 +28,7 @@ pub mod shir_json_in;
 // (branch backend/<lang>). Each consumes the ShIR in-process and emits
 // <lang> source — one library, every target (PLAN §4 "unified otranspiler").
 pub mod c_backend;
+pub mod c_profile;
 pub mod go_backend;
 pub mod java_backend;
 pub mod mir_simple;
@@ -35,7 +36,8 @@ pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
 pub mod glsl_backend;
-pub mod vulkan_backend; // compute-shader emitter for bash-O4 autoshaderise (docs/BASH-O4.md §4.4)
+pub mod vulkan_backend;
+pub mod cuda_backend; // compute-shader emitter for bash-O4 autoshaderise (docs/BASH-O4.md §4.4)
 pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;
