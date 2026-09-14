@@ -638,3 +638,61 @@ fn profile_hash_tracks_source() {
     let h1b = h(&prog_json());
     assert_eq!(h1, h1b, "same source must hash stably");
 }
+
+/// SH2_ASSUME_OBSERVED_WIDTHS (docs/DUAL_LOOPS.MD §4): a observed
+/// magnitude bucket seeds the range, and the narrowed store carries a
+/// runtime guard. The profile's hash must match or the render refuses.
+#[test]
+fn assume_observed_width_guard() {
+    let _g = TEST_LOCK.lock().unwrap();
+    // Take a profiling render to read the program's own staleness key.
+    let pc = render_c(&prog_json(), true, &tmp("aw_prof.json"));
+    let hash = pc
+        .lines()
+        .find(|l| l.contains("_prof_hash ="))
+        .expect("hash line")
+        .split("0x")
+        .nth(1)
+        .expect("hex")
+        .split("ULL")
+        .next()
+        .expect("end")
+        .to_string();
+
+    let dir = tmp("aw");
+    std::fs::create_dir_all(&dir).unwrap();
+    let prof = dir.join("p.json");
+    // `i` observed in bucket 1 (fits u8); the loop's counter and incr
+    // stores must then be guarded against [0, 255].
+    std::fs::write(
+        &prof,
+        format!(
+            "{{\"schema\":1,\"hash_algo\":\"fnv1a64\",\"source_hash\":\"{hash}\",\
+             \"options\":{{\"target\":\"c\"}},\"loops\":[],\"branches\":[],\
+             \"mags\":[{{\"name\":\"main:mag:i@0\",\"max_bucket\":1}}],\"lens\":[]}}"
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("SH2_ASSUME_OBSERVED_WIDTHS", "1");
+    std::env::set_var("SH2_PROFILE_IN", &prof);
+    std::env::remove_var("SH2_PROFILE");
+    std::env::remove_var("SH2_PROFILE_OUT");
+    let c = {
+        let prog = debashl::shir_json_in::shir_json_to_ir(&prog_json()).unwrap();
+        debashl::c_backend::shir_to_c(&prog)
+    };
+    std::env::remove_var("SH2_ASSUME_OBSERVED_WIDTHS");
+    std::env::remove_var("SH2_PROFILE_IN");
+
+    assert!(
+        c.contains("exceeded the observed range [0, 255]"),
+        "assumed-width store guard missing:\n{c}"
+    );
+    // The narrowed declaration must exist (u8/i8 or wider via i+1's
+    // range — assert only that it is no longer `long long`).
+    assert!(
+        !c.contains("long long i;") && !c.contains("long long i ="),
+        "i was not narrowed:\n{c}"
+    );
+}

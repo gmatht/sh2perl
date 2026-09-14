@@ -50,6 +50,13 @@ pub struct ProfileIn {
     pub max_lens: HashMap<String, usize>,
     /// the report's staleness key (None when the report predates hashing)
     pub hash: Option<u64>,
+    /// var/array -> max magnitude bucket seen (bytes; 0..16, 16 = >120 bits).
+    /// Read from the `mags` sites; drives `SH2_ASSUME_OBSERVED_WIDTHS`.
+    pub mag_buckets: HashMap<String, u8>,
+    /// `SH2_ASSUME_OBSERVED_WIDTHS` in force (the assertive tier flag,
+    /// DUAL_LOOPS §4). Default OFF: the buckets are still parsed but no
+    /// width is specialised from them.
+    pub assume_widths: bool,
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -78,6 +85,30 @@ pub fn profile_enabled() -> bool {
     match std::env::var("SH2_PROFILE") {
         Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "no"),
         Err(_) => false,
+    }
+}
+
+/// `SH2_ASSUME_OBSERVED_WIDTHS` truthy? See `profile_enabled` for the
+/// value convention. DUAL_LOOPS §4: compile as if every integer fits
+/// the max bucket its profile records, with a guard on the store.
+pub fn assume_observed_widths() -> bool {
+    match std::env::var("SH2_ASSUME_OBSERVED_WIDTHS") {
+        Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "no"),
+        Err(_) => false,
+    }
+}
+
+/// The inclusive upper bound implied by a magnitude bucket (bytes of
+/// unsigned magnitude). Bucket 0 = zero/never observed; 16 is the clamp
+/// for anything above 120 bits.
+pub fn bucket_hi(b: u8) -> i128 {
+    let b = b.min(16) as u32;
+    if b == 0 {
+        0
+    } else if b >= 16 {
+        i128::MAX
+    } else {
+        (1i128 << (8 * b)) - 1
     }
 }
 
@@ -139,7 +170,32 @@ pub fn load_profile_in() -> Option<ProfileIn> {
             }
         }
     }
+    if let Some(mags) = v.get("mags").and_then(|m| m.as_array()) {
+        for site in mags {
+            let name = site.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let b = site.get("max_bucket").and_then(|n| n.as_i64()).unwrap_or(0);
+            if let Some(var) = mag_site_name(name) {
+                let b = b.clamp(0, 16) as u8;
+                let e = p.mag_buckets.entry(var).or_insert(0);
+                if b > *e {
+                    *e = b;
+                }
+            }
+        }
+    }
+    p.assume_widths = assume_observed_widths();
     Some(p)
+}
+
+/// `{scope}:mag:{var}@{id}` -> `{var}` (None for a foreign shape).
+fn mag_site_name(name: &str) -> Option<String> {
+    let rest = name.split(":mag:").nth(1)?;
+    let var = rest.split('@').next()?;
+    if var.is_empty() {
+        None
+    } else {
+        Some(var.to_string())
+    }
 }
 
 /// `{scope}:len:{array}@{id}` -> `{array}` (None for a foreign shape).
@@ -162,6 +218,12 @@ impl ProfileIn {
             Some(0) | None => None,
             Some(n) => Some(*n),
         }
+    }
+
+    /// The observed magnitude bucket for a var/array (None when the
+    /// profile never named it).
+    pub fn bucket_for(&self, name: &str) -> Option<u8> {
+        self.mag_buckets.get(name).copied()
     }
 }
 
@@ -262,7 +324,7 @@ pub fn preamble(st: &ProfState) -> Vec<String> {
     p("  uint64_t m = (v < 0) ? (~(uint64_t)v) + 1 : (uint64_t)v;".into());
     p("  unsigned b = 0;".into());
     p("  while (m) { b++; m >>= 8; }".into());
-    p("  if (b > 7) b = 7;".into());
+    p("  if (b > 16) b = 16;".into());
     p("  if ((unsigned char)b > _prof_mag[i]) _prof_mag[i] = (unsigned char)b;".into());
     p("}".into());
     p("static void _sh_prof_len(unsigned i, size_t n) {".into());

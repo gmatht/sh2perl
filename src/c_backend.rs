@@ -637,6 +637,10 @@ pub struct Render {
     /// file-scope vecs pre-sized from the profile (c id, C type, cap) —
     /// allocated by a generated constructor.
     prealloc: Vec<(String, String, usize)>,
+    /// SH2_ASSUME_OBSERVED_WIDTHS (DUAL_LOOPS §4): var -> the observed
+    /// [lo, hi] range its narrowed store must be checked against. Empty
+    /// unless the assertive flag and a profile are both present.
+    profile_bounds: HashMap<String, (i128, i128)>,
 }
 
 /// Which command-text buffer a word append targets: the SHARED
@@ -6035,6 +6039,42 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Effective widths: a var's width must cover every arith-expr result
     // mentioning it (e.g. i in [1, 70000] is u32, but i*i needs i64), so
     // narrow only when the var AND all its arithmetic stay in width.
+    //
+    // SH2_ASSUME_OBSERVED_WIDTHS (DUAL_LOOPS §4): before the widths are
+    // derived, seed the range analysis from the profile's observed
+    // magnitude buckets. A bucket ≤ 8 seeds [0, bucket_hi] so the
+    // existing machinery homes the var at u8..u64; a wider bucket is
+    // routed to GMP after `bigint_vars` (exact, no guard). The store
+    // guard lives in `profile_store` (assertive mode, §4.1).
+    let prof_in = crate::c_profile::load_profile_in();
+    let mut profile_bounds: HashMap<String, (i128, i128)> = HashMap::new();
+    if let Some(p) = prof_in.as_ref() {
+        if p.assume_widths {
+            // Staleness is refusal-grade for an assumed width (§4.2):
+            // an assumption about a different program is unsound.
+            let want = crate::c_profile::source_hash(
+                &format!("{:?}", prog.stmts),
+                &format!("{:?}", prog.subs),
+            );
+            if let Some(h) = p.hash {
+                if h != want {
+                    eprintln!(
+                        "sh2-profile: source_hash mismatch ({h:016x} vs {want:016x}) \
+                         — refusing SH2_ASSUME_OBSERVED_WIDTHS"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            for (name, b) in &p.mag_buckets {
+                if *b == 0 || *b >= 8 {
+                    continue;
+                }
+                let hi = crate::c_profile::bucket_hi(*b);
+                ranges.insert(name.clone(), (0, hi));
+                profile_bounds.insert(name.clone(), (0, hi));
+            }
+        }
+    }
     let widths = effective_widths(&prog, &ranges);
     let mut r = Render::default();
     // SH2_PROFILE=1: probe emission (default OFF — the A/B firewall).
@@ -6055,7 +6095,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             ..Default::default()
         });
     }
-    r.prof_in = crate::c_profile::load_profile_in();
+    r.prof_in = prof_in.clone();
+    r.profile_bounds = profile_bounds;
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lifetimes = prog.var_lifetimes.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
@@ -6097,6 +6138,22 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // reads). Set before rendering: decls need it, and need_gmp must
     // be settled before emit_runtime runs.
     r.bigint_vars = analyze_bigint_vars(&prog);
+    // SH2_ASSUME_OBSERVED_WIDTHS: a variable whose observed magnitude
+    // reached the 64-bit bucket (8 bytes) or beyond is homed in GMP —
+    // exact for any size, the "i128 or similar" wide tier, no guard
+    // needed. Bucket 8 from an i64 profiled build means the value hit
+    // the 8-byte edge and may have overflowed, so widening is the only
+    // safe reading of the measurement. Buckets 1..7 narrow instead
+    // (seeded above) and carry the store guard.
+    if let Some(p) = prof_in.as_ref() {
+        if p.assume_widths {
+            for (name, b) in &p.mag_buckets {
+                if *b >= 8 {
+                    r.bigint_vars.insert(name.clone());
+                }
+            }
+        }
+    }
     if !r.bigint_vars.is_empty() {
         r.need_gmp = true;
     }
@@ -6382,6 +6439,55 @@ impl Render {
         let id = list.len();
         list.push(format!("{scope}:{prefix}:{detail}@{id}"));
         Some(id)
+    }
+
+    /// The observed-[lo,hi] the profile assumed for a var, if the
+    /// assertive width flag is on. Keyed by SOURCE name (`t.var`), the
+    /// same key the `mags` sites are named with.
+    fn profile_bound(&self, var: &str) -> Option<(i128, i128)> {
+        self.profile_bounds.get(var).copied()
+    }
+
+    /// Store `name = rhs` (a scalar Int target). Under
+    /// SH2_ASSUME_OBSERVED_WIDTHS the target was narrowed to the
+    /// observed bucket, so the store carries a real range guard: the
+    /// RHS is evaluated once into an `__int128` temp, checked against
+    /// the observed range, and only then truncated to the narrow type.
+    /// On violation the program stops with a diagnostic rather than
+    /// silently wrapping (assertive mode, DUAL_LOOPS §4.1/§5.3).
+    fn profile_store(&mut self, name: &str, var: &str, rhs: &str) {
+        match self.profile_bound(var) {
+            Some((lo, hi)) => {
+                let t = format!("_pv{}", self.temp_seq);
+                self.temp_seq += 1;
+                self.emit(&format!("{{ __int128 {t} = (__int128)({rhs});"));
+                self.emit(&format!(
+                    "  if ({t} < {lo} || {t} > {hi}) {{ fprintf(stderr, \"sh2-profile: %s exceeded the observed range [{lo}, {hi}] (SH2_ASSUME_OBSERVED_WIDTHS); rebuild with a matching profile or drop the flag\\n\", \"{var}\"); exit(127); }}"
+                ));
+                self.emit(&format!("  {name} = ({t}); }}"));
+            }
+            None => self.emit(&format!("{name} = {rhs};")),
+        }
+    }
+
+    /// `name` ++/-- one, guarded like `profile_store` (compute in
+    /// `__int128` so a narrow type cannot wrap before the check).
+    fn profile_incdec(&mut self, name: &str, var: &str, delta: i64) -> bool {
+        match self.profile_bound(var) {
+            Some((lo, hi)) => {
+                let t = format!("_pv{}", self.temp_seq);
+                self.temp_seq += 1;
+                let op = if delta >= 0 { "+" } else { "-" };
+                let d = delta.abs();
+                self.emit(&format!("{{ __int128 {t} = (__int128)({name}) {op} {d};"));
+                self.emit(&format!(
+                    "  if ({t} < {lo} || {t} > {hi}) {{ fprintf(stderr, \"sh2-profile: %s exceeded the observed range [{lo}, {hi}] (SH2_ASSUME_OBSERVED_WIDTHS); rebuild with a matching profile or drop the flag\\n\", \"{var}\"); exit(127); }}"
+                ));
+                self.emit(&format!("  {name} = ({t}); }}"));
+                true
+            }
+            None => false,
+        }
     }
 
     /// A6-consistent C-keyword mangling (mirrors the emitter's safe_ident,
@@ -25167,6 +25273,31 @@ fn param_copy_alias(
                         return;
                     }
                 }
+                // A bigint-homed target from a plain literal (`x = 1`
+                // before the growing loop): mpz_set, not `x = 1` (an
+                // mpz_t is an array type — assignment is a compile
+                // error). Profile-guided GMP routing
+                // (SH2_ASSUME_OBSERVED_WIDTHS) can home a var the taint
+                // fixpoint saw only as a literal-initialised int.
+                if self.bigint_vars.contains(&t.var) {
+                    if let IrExpr::Str(s, _) = expr {
+                        let txt = s.trim();
+                        if !txt.is_empty()
+                            && txt
+                                .trim_start_matches('-')
+                                .chars()
+                                .all(|c| c.is_ascii_digit())
+                        {
+                            let name = self.c_ident(&t.var);
+                            self.need_gmp = true;
+                            self.emit(&format!(
+                                "mpz_set_str({name}, {}, 10);",
+                                Self::cstr(txt)
+                            ));
+                            return;
+                        }
+                    }
+                }
                 // const-markup lift: the declaration already carries the
                 // literal initializer (emit_var_decl) — the assignment
                 // statement is redundant (the verdict guarantees this is
@@ -25307,10 +25438,15 @@ fn param_copy_alias(
                             _ => None,
                         };
                         if let Some(d) = step {
-                            self.emit(&format!(
-                                "{name}{};",
-                                if d == 1 { "++" } else { "--" }
-                            ));
+                            // DUAL_LOOPS §4.1: the assumed-width store
+                            // guard recomputes in __int128 so a narrowed
+                            // type cannot wrap before the check.
+                            if !self.profile_incdec(&name, &t.var, if d == 1 { 1 } else { -1 }) {
+                                self.emit(&format!(
+                                    "{name}{};",
+                                    if d == 1 { "++" } else { "--" }
+                                ));
+                            }
                             // SH2_PROFILE=1: value-magnitude site for the
                             // scalar store (§9.1, one probe per assign).
                             if let Some(site) = self.prof_site(2, &t.var) {
@@ -25501,7 +25637,9 @@ fn param_copy_alias(
                         self.emit_export_var(&t.var);
                     }
                 } else {
-                    self.emit(&format!("{name} = {rhs};"));
+                    // DUAL_LOOPS §4.1: an assumed-width store carries a
+                    // range guard (no-op unless the assertive flag is on).
+                    self.profile_store(&name, &t.var, &rhs);
                     // SH2_PROFILE=1: value-magnitude site for a scalar
                     // numeric store (§9.1, one probe per assign).
                     if is_num {
