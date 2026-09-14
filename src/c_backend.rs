@@ -538,6 +538,9 @@ pub struct Render {
     /// grow-helper widths needed (`_sh_grow_{suffix}` emitters in the
     /// runtime prelude), by width suffix
     need_grow: BTreeSet<String>,
+    /// reserve-helper widths needed (`_sh_reserve_{suffix}` exact-size
+    /// pre-growers for counted-loop entries), by width suffix
+    need_reserve: BTreeSet<String>,
     /// list-profile verdicts (structure + append bound + escape),
     /// computed in shir_to_c; consumed when finalizing `vec_arrays`
     /// in program() (after assoc discovery so decl/append/free agree)
@@ -2512,6 +2515,215 @@ fn literal_write_index(t: &crate::ir::AssignTarget) -> Option<u64> {
         return None;
     }
     inner.parse::<u64>().ok()
+}
+
+/// A dynamic counted loop for reserve purposes: (counter, bound var,
+/// op). Minimal mirror of the analysis-side counted_loop_info (which
+/// also computes literal maxes and step magnitudes — unneeded here;
+/// the reserve is purely performance, so this stays a small local
+/// matcher). Requires `v</<=B` text with ident B plus a single
+/// positive step stmt on v (any of the three arith forms).
+fn counter_reserve_loop(cond: &IrExpr, step_stmt: &IrStmt) -> Option<(String, String, String)> {
+    let text = match cond {
+        IrExpr::Call { func, args } if func == "builtin" || func == "test" => {
+            let mut found = None;
+            for a in args {
+                match a {
+                    IrExpr::Array(items) if items.len() == 1 => {
+                        if let IrExpr::Str(t, _) = &items[0] {
+                            found = Some(t.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found?
+        }
+        _ => return None,
+    };
+    let (l, op, r) = lic_split_cmp(&text)?;
+    if op != "<" && op != "<=" {
+        return None;
+    }
+    let var = l.trim().strip_prefix('$').unwrap_or(l.trim());
+    if !is_ident(var) {
+        return None;
+    }
+    // dynamic bounds only (literal loops keep static caps)
+    if r.trim().parse::<i64>().is_ok() {
+        return None;
+    }
+    let w = r.trim().strip_prefix('$').unwrap_or(r.trim());
+    if !is_ident(w) {
+        return None;
+    }
+    let ok_step = match step_stmt {
+        IrStmt::Assign { targets, expr, .. } => {
+            targets.len() == 1
+                && targets[0].var == var
+                && targets[0].indices.is_empty()
+                && match expr {
+                    IrExpr::Arith(a) => match a.as_ref() {
+                        crate::ir::ArithAst::IncDec { var: v, delta, .. } => {
+                            v == var && *delta > 0
+                        }
+                        crate::ir::ArithAst::Assign { var: v, op, rhs } => {
+                            v == var
+                                && (op == "+="
+                                    && matches!(rhs.as_ref(),
+                                        crate::ir::ArithAst::Num(n) if *n > 0))
+                        }
+                        crate::ir::ArithAst::Bin { op, lhs, rhs } => {
+                            op == "+"
+                                && matches!(lhs.as_ref(),
+                                    crate::ir::ArithAst::Var(v)
+                                    | crate::ir::ArithAst::Ident(v) if v == var)
+                                && matches!(rhs.as_ref(),
+                                    crate::ir::ArithAst::Num(n) if *n > 0)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if !ok_step {
+        return None;
+    }
+    Some((var.to_string(), w.to_string(), op.to_string()))
+}
+
+/// Vec arrays index-written with `counter` anywhere under `body`
+/// (structured `$v`/`v` or flattened bare — the same name rule as the
+/// analysis side; literals and other vars don't need this loop's
+/// bound). Deduped, vec-membership filtered by the caller set.
+fn counter_reserve_targets(
+    body: &[IrStmt],
+    counter: &str,
+    vec_arrays: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    fn bare(w: &str) -> Option<&str> {
+        let t = w.trim();
+        let t = t.strip_prefix('$').unwrap_or(t);
+        let t = t
+            .strip_prefix('{')
+            .and_then(|r| r.strip_suffix('}'))
+            .unwrap_or(t);
+        if is_ident(t) {
+            Some(t)
+        } else {
+            None
+        }
+    }
+    fn matches(t: &crate::ir::AssignTarget, counter: &str) -> Option<String> {
+        let base = t.var.split('[').next().unwrap_or(&t.var);
+        if base.is_empty() {
+            return None;
+        }
+        let is_c = if t.indices.len() == 1 {
+            match &t.indices[0] {
+                IrExpr::Var(v, _) | IrExpr::Ident(v) => v == counter,
+                IrExpr::Str(s, _) => bare(s) == Some(counter),
+                _ => false,
+            }
+        } else if !t.indices.is_empty() {
+            false
+        } else {
+            match t.var.split_once('[') {
+                Some((_, rest)) => match rest.strip_suffix(']') {
+                    Some(inner)
+                        if !inner.contains('[') && !inner.trim().is_empty() =>
+                    {
+                        bare(inner.trim()) == Some(counter)
+                    }
+                    _ => false,
+                },
+                None => false,
+            }
+        };
+        if is_c {
+            Some(base.to_string())
+        } else {
+            None
+        }
+    }
+    fn walk(
+        stmts: &[IrStmt],
+        counter: &str,
+        vec_arrays: &std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        if let Some(a) = matches(t, counter) {
+                            if vec_arrays.contains(&a) && !out.contains(&a) {
+                                out.push(a);
+                            }
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, counter, vec_arrays, out);
+                    for (_, b) in elsifs {
+                        walk(b, counter, vec_arrays, out);
+                    }
+                    walk(else_, counter, vec_arrays, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => {
+                    walk(body, counter, vec_arrays, out);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, counter, vec_arrays, out);
+                    walk(step, counter, vec_arrays, out);
+                    walk(body, counter, vec_arrays, out);
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    walk(inner, counter, vec_arrays, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, counter, vec_arrays, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    walk(body, counter, vec_arrays, out);
+                    for e in excepts {
+                        walk(&e.body, counter, vec_arrays, out);
+                    }
+                    walk(else_body, counter, vec_arrays, out);
+                    walk(finally_body, counter, vec_arrays, out);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, counter, vec_arrays, out);
+                    for (_, b) in named_blocks {
+                        walk(b, counter, vec_arrays, out);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, counter, vec_arrays, out);
+                    }
+                }
+                IrStmt::Select { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, counter, vec_arrays, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, counter, vec_arrays, &mut out);
+    out
 }
 
 fn array_fixed_caps(
@@ -5329,6 +5541,50 @@ impl Render {
                 self.emit("  *p = np; *cap = ncap;");
                 self.emit("}");
             }
+            // exact-size reserve helpers for counted-loop entries
+            // (stage-2 bench-opt): one realloc to the bound (no doubling
+            // copy chain). need <= cap is a no-op; oversize fails stop
+            // (loud 127). NO zeroing: reads are len-guarded everywhere
+            // (unwritten slots yield 0/"" via the guard, never the raw
+            // slot), so memset would only burn memory bandwidth — dense
+            // fills overwrite every slot anyway, and sparse tails stay
+            // guard-selected.
+            let reserves: Vec<String> = self.need_reserve.iter().cloned().collect();
+            for sfx in &reserves {
+                // Element type mirrors the grow helpers (str vecs hold
+                // char* so the array itself is char**).
+                if sfx == "str" {
+                    self.emit("static void _sh_reserve_str(char ***p, size_t *cap, size_t need) {");
+                    self.emit("  if (need <= *cap) return;");
+                    self.emit("  if (need > (size_t)-1 / sizeof **p) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                    self.emit("  char **np = (char**)realloc(*p, need * sizeof *np);");
+                    self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                    self.emit("  *p = np; *cap = need;");
+                    self.emit("}");
+                    continue;
+                }
+                let t = match sfx.as_str() {
+                    "i8" => "int8_t",
+                    "u8" => "uint8_t",
+                    "i16" => "int16_t",
+                    "u16" => "uint16_t",
+                    "u32" => "uint32_t",
+                    "i32" => "int32_t",
+                    "u64" => "unsigned long long",
+                    _ => "long long",
+                };
+                self.emit(&format!(
+                    "static void _sh_reserve_{sfx}({t} **p, size_t *cap, size_t need) {{"
+                ));
+                self.emit("  if (need <= *cap) return;");
+                self.emit(&format!(
+                    "  if (need > (size_t)-1 / sizeof *(*p)) {{ fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }}"
+                ));
+                self.emit(&format!("  {t} *np = ({t}*)realloc(*p, need * sizeof *np);"));
+                self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                self.emit("  *p = np; *cap = need;");
+                self.emit("}");
+            }
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
@@ -6404,6 +6660,12 @@ impl Render {
     /// `return _sh_rc;`, and the fn-call status `(f(), …, _sh_rc)` —
     /// all of which bail this cleanup out entirely.
     fn strip_dead_rc(&mut self) {
+        // NOTE: currently best-effort — prelude helpers always contain
+        // `return _sh_rc` (shell-out protocol) and main ends with
+        // `return _sh_rc` (exit code), so rc_is_read usually bails and
+        // per-iteration cond stores survive. Killing those needs an IR
+        // pre-pass (program-level $?-read info + exit-code care), not
+        // string surgery — tracked as follow-up, not attempted here.
         let full = self.out.join("\n");
         if rc_is_read(&full) {
             return;
@@ -20043,6 +20305,45 @@ fn param_copy_alias(
         Some(format!("{t}.p"))
     }
 
+    /// Reserve a vec array to a counted loop's bound at loop entry
+    /// (stage-2 bench-opt): one exact realloc instead of a doubling
+    /// copy chain. Purely performance — demand-growth stays as the
+    /// backstop, so an undersized/stale reserve only costs growth, and
+    /// bound re-reads per entry are one atoll (negligible). Negative or
+    /// zero bounds skip (demand handles them); `<=` adds one with
+    /// saturating wrap-to-zero (which also skips — backstop again).
+    /// Only dynamic var bounds reserve (literal loops keep their exact
+    /// static caps — nothing to gain).
+    fn emit_counter_reserve(
+        &mut self,
+        cond: &IrExpr,
+        step_stmt: &IrStmt,
+        body: &[IrStmt],
+    ) {
+        let (counter, boundvar, op) = match counter_reserve_loop(cond, step_stmt) {
+            Some(x) => x,
+            None => return,
+        };
+        let targets = counter_reserve_targets(body, &counter, &self.vec_arrays);
+        if targets.is_empty() {
+            return;
+        }
+        let bv = self.value_ll(&IrExpr::Var(boundvar, None));
+        for arr in targets {
+            let id = self.c_ident(&arr);
+            let sfx = self.vec_grow_suffix(&arr);
+            self.need_reserve.insert(sfx.to_string());
+            let need = if op == "<=" {
+                "(size_t)_rsv + 1".to_string()
+            } else {
+                "(size_t)_rsv".to_string()
+            };
+            self.emit(&format!(
+                "{{ long long _rsv = (long long)({bv}); if (_rsv > 0) _sh_reserve_{sfx}(&{id}, &{id}_cap, {need}); }}"
+            ));
+        }
+    }
+
     /// Indexed write into a growable vec: hoist value+key into temps
     /// (single evaluation; null value or negative index stores nothing
     /// — exactly `_sh_arr_set`'s `i < 0 || !v` guard), grow past the
@@ -20198,7 +20499,9 @@ fn param_copy_alias(
                         ));
                         return;
                     }
-                    let kv = if self.var_types.contains_key(rest) && self.is_num(rest) {
+                    let kv_direct =
+                        self.var_types.contains_key(rest) && self.is_num(rest);
+                    let kv = if kv_direct {
                         self.c_ident(rest)
                     } else {
                         format!("(long long)atoll({})", self.store_ref(rest))
@@ -20210,10 +20513,16 @@ fn param_copy_alias(
                             // Grow-while + direct assign + len extend —
                             // the same shape as emit_vec_index_write but
                             // with a native value (atoll per store would
-                            // dominate a counted fill).
+                            // dominate a counted fill). A plain numeric
+                            // ident needs no _kk temp (single evaluation
+                            // is trivial) — index it directly.
                             let sfx = self.vec_grow_suffix(var);
                             let nv = self.store_int_item_c(val);
-                            self.emit(&format!("{{ long long _kk = (long long)({kv}); if (_kk >= 0) {{ while ((size_t)(_kk + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+                            if kv_direct {
+                                self.emit(&format!("{{ if (({kv}) >= 0) {{ while ((size_t)(({kv}) + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[{kv}] = {nv}; if ((size_t)(({kv}) + 1) > {id}_len) {id}_len = ({kv}) + 1; }} }}"));
+                            } else {
+                                self.emit(&format!("{{ long long _kk = (long long)({kv}); if (_kk >= 0) {{ while ((size_t)(_kk + 1) > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap); {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+                            }
                         } else {
                             self.emit_vec_index_write(var, &kv, &v);
                         }
@@ -23645,6 +23954,13 @@ fn param_copy_alias(
                     self.emit("{ int _went = 0;");
                     self.emit(&format!("int {lrc2} = 0;"));
                 }
+                // Stage-2 reserve (see ForInit): exact-size vec fills.
+                // The step is the last body stmt (strip_cfor shape).
+                // Original cond (not the LIC rewrite — the bound var
+                // re-read is one atoll and always in scope).
+                if let Some(last) = body.last() {
+                    self.emit_counter_reserve(cond, last, body);
+                }
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
                 if !cond_pure {
@@ -24387,6 +24703,15 @@ fn param_copy_alias(
                 // loop (a hoisted step temp would freeze the loop).
                 for s in init {
                     self.stmt(s);
+                }
+                // Stage-2 reserve: exact-size the vec arrays this counted
+                // loop fills (one realloc, no doubling chain). Bound read
+                // after init (init may assign it); demand-growth backstops
+                // any staleness, so this is purely performance.
+                if step.len() == 1 {
+                    if let Some(last) = step.last() {
+                        self.emit_counter_reserve(cond, last, body);
+                    }
                 }
                 // LIC bound hoist (same as While): the step executes per
                 // iteration too, so its writes join the body's in the
@@ -36798,6 +37123,40 @@ mod tests {
             !out.contains("*a = NULL"),
             "conditional write vec-routed:\n{out}"
         );
+    }
+
+    #[test]
+    fn reserve_exact_sizes_dyn_fill() {
+        // Dynamic counted fill of a routed array: exact-size reserve at
+        // loop entry (one realloc, zeroed extension) + helper emitted.
+        // Defensive shape too: the reserve is guarded (positive bound),
+        // and demand-growth stays as the backstop.
+        let out = shir_to_c(&counter_forinit("i<n", true));
+        assert!(
+            out.contains("_sh_reserve_i64(&a, &a_cap,"),
+            "reserve call missing:\n{out}"
+        );
+        assert!(
+            out.contains("static void _sh_reserve_i64("),
+            "reserve helper missing:\n{out}"
+        );
+        assert!(out.contains("_rsv > 0"), "reserve guard missing:\n{out}");
+        // No memset: reads are len-guarded everywhere (unwritten slots
+        // yield 0/"" via the guard), so zeroing would only burn
+        // bandwidth on dense fills that overwrite every slot anyway.
+        assert!(!out.contains("memset"), "wasteful zeroing:\n{out}");
+    }
+
+    #[test]
+    fn reserve_skips_literal_loops() {
+        // Literal-bound loops keep exact static caps — no reserve (their
+        // decl already covers; reserving would only add noise).
+        let out = shir_to_c(&counter_forinit("i<100", true));
+        assert!(
+            !out.contains("_sh_reserve_"),
+            "spurious reserve on literal loop:\n{out}"
+        );
+        assert!(!out.contains("_rsv"), "spurious reserve temp:\n{out}");
     }
 
     #[test]
