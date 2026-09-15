@@ -30390,10 +30390,21 @@ fn expr_is_pure_scalar(e: &IrExpr) -> bool {
 fn spec_collect_targets(a: &ArithAst, out: &mut BTreeSet<String>) -> bool {
     match a {
         ArithAst::IncDec { var, .. } => {
+            // A baked array-index name (`a[0]`) is an ARRAY WRITE, not a
+            // scalar: it is a side effect (the replay would duplicate it)
+            // and the snapshot would reference the mangled `a_0_` ident.
+            // The structured Assign path already rejects `t.var.contains('[')`;
+            // the bare-arith path (e.g. `((a[0]++))`) must too.
+            if var.contains('[') {
+                return false;
+            }
             out.insert(var.clone());
             true
         }
         ArithAst::Assign { var, rhs, .. } => {
+            if var.contains('[') {
+                return false;
+            }
             out.insert(var.clone());
             spec_collect_targets(rhs, out)
         }
@@ -39679,6 +39690,35 @@ mod tests {
             !c.contains("_sh_arr_set(a, &a_len, 1024, i,"),
             "bare mpz_t ident used as the array index:\n{c}"
         );
+    }
+
+    #[test]
+    fn spec_collect_rejects_baked_array_index_in_bare_arith() {
+        // `((a[0]++))` / `((a[0] = x))` in an otherwise arm-eligible loop:
+        // a baked array-index name is an ARRAY WRITE (a side effect, which
+        // the speculative replay would duplicate), not a scalar. The
+        // structured `Assign` path already rejects `t.var.contains('[')`
+        // (speculative_loop_rejects_flattened_array_store); the bare-arith
+        // path must reject it too, or the arm snapshots the mangled
+        // `a_0_` ident (undeclared -> compile error).
+        use crate::ir::ArithAst as A;
+        let inc = IrStmt::Expr(IrExpr::Arith(Box::new(A::IncDec {
+            var: "a[0]".to_string(),
+            delta: 1,
+            prefix: false,
+        })));
+        let asg = IrStmt::Expr(IrExpr::Arith(Box::new(A::Assign {
+            var: "a[0]".to_string(),
+            op: "=".to_string(),
+            rhs: Box::new(A::Num(1)),
+        })));
+        for stmt in [inc, asg] {
+            let mut out = std::collections::BTreeSet::new();
+            assert!(
+                !spec_collect(std::slice::from_ref(&stmt), &mut out),
+                "baked array-index name admitted as a scalar: {out:?}"
+            );
+        }
     }
 
     #[test]
