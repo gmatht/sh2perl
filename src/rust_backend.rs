@@ -31,6 +31,7 @@
 //! `__SH_*` — deliberately NOT `sh2.*`, which the stub gate greps for.
 
 use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
+use num_bigint::BigInt;
 use std::collections::{BTreeSet, HashMap};
 
 /// The core's marker for an UNQUOTED glob word (`` `*.txt` `` arrives as
@@ -72,6 +73,9 @@ pub struct Render {
     var_types: HashMap<String, IrType>,
     /// vars written anywhere (declared at the top of main)
     written: BTreeSet<String>,
+    /// bigint-tainted vars (assigned huge consts or BigInt results;
+    /// rendered as num-bigint BigInt, not i64 — t87).
+    bigint_vars: BTreeSet<String>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -5731,6 +5735,12 @@ impl Render {
             written.insert(a.clone());
         }
         self.written = written.clone();
+        // bigint taint (t87 huge consts/propagations; needs prog.subs).
+        {
+            let mut big = BTreeSet::new();
+            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);
+            self.bigint_vars = big;
+        }
 
         // Pass 2: render the body first (helper flags known before preamble).
         let mut body_out = Vec::new();
@@ -8905,6 +8915,110 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_written_expr(else_, out);
         }
         _ => {}
+    }
+}
+
+/// Const-evaluate ArithAst with BigInt (None if uses vars; for
+/// taint magnitude checks, not codegen). Supports Num/Var/Bin/Un.
+/// Var returns None (unknown value; taint via bigint-use walk instead).
+fn eval_arith_bigint(a: &ArithAst) -> Option<BigInt> {
+    use num_bigint::BigInt;
+    match a {
+        ArithAst::Num(n) => Some(BigInt::from(*n)),
+        ArithAst::Var(_) | ArithAst::Ident(_) => None,
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = eval_arith_bigint(lhs)?;
+            let r = eval_arith_bigint(rhs)?;
+            match op.as_str() {
+                "+" => Some(l + r),
+                "-" => Some(l - r),
+                "*" => Some(l * r),
+                "/" => {
+                    if r == BigInt::from(0) {
+                        None
+                    } else {
+                        Some(l / r)
+                    }
+                }
+                "%" => {
+                    if r == BigInt::from(0) {
+                        None
+                    } else {
+                        Some(l % r)
+                    }
+                }
+                "**" => {
+                    // exp must fit u32 (else astronomically large; give up).
+                    let e: u32 = r.try_into().ok()?;
+                    Some(l.pow(e))
+                }
+                _ => None,
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let v = eval_arith_bigint(arg)?;
+            match op.as_str() {
+                "-" => Some(-v),
+                "+" => Some(v),
+                "~" => None,
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Does Arith use a bigint-tainted var? (For taint propagation.)
+fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => big.contains(n),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_uses_bigint(lhs, big) || arith_uses_bigint(rhs, big)
+        }
+        ArithAst::Un { arg, .. } => arith_uses_bigint(arg, big),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_uses_bigint(test, big)
+                || arith_uses_bigint(then, big)
+                || arith_uses_bigint(else_, big)
+        }
+        ArithAst::Index { key, .. } => arith_uses_bigint(key, big),
+        _ => false,
+    }
+}
+
+/// Collect bigint-tainted vars (assigned huge consts or BigInt results).
+/// Fixpoint (max 10 rounds; t87 converges in 1-2).
+fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BTreeSet<String>) {
+    for _ in 0..10 {
+        let mut changed = false;
+        let mut walk_stmts = |ss: &[IrStmt], out: &mut BTreeSet<String>| {
+            for s in ss {
+                if let IrStmt::Assign { targets, expr, .. } = s {
+                    if let IrExpr::Arith(a) = expr {
+                        for t in targets {
+                            if t.indices.is_empty() && !out.contains(&t.var) {
+                                let huge = eval_arith_bigint(a)
+                                    .map(|v| {
+                                        v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                                    })
+                                    .unwrap_or(false);
+                                if huge || arith_uses_bigint(a, out) {
+                                    out.insert(t.var.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        walk_stmts(stmts, out);
+        for sub in subs {
+            walk_stmts(&sub.body, out);
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
