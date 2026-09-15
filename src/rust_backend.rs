@@ -423,6 +423,12 @@ impl Render {
         if let Some(l) = self.captured.get(name) {
             return l.clone();
         }
+        // positionals ($1, ...) read argv (tls undeclared by design).
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            self.add_helper("arg");
+            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            return format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)");
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.get())")
     }
@@ -430,6 +436,11 @@ impl Render {
     fn read_str(&mut self, name: &str) -> String {
         if let Some(l) = self.captured.get(name) {
             return l.clone();
+        }
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            self.add_helper("arg");
+            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            return format!("__sh_arg({i})");
         }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().clone())")
@@ -9126,6 +9137,108 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 /// Collect bigint-tainted vars (assigned huge consts or BigInt results).
 /// Fixpoint (max 10 rounds; t87 converges in 1-2).
 fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BTreeSet<String>) {
+    // coarse: any huge const call arg ⇒ all assigned vars bigint (t89:
+    // `small_factors(2**64+1)`; callee params/vars must hold huge values).
+    // Sound (BigInt correct, slower); preserves t86 speed (no huge args).
+    // TODO: precise per-function mapping (needs param-position tracking).
+    {
+        use num_bigint::BigInt;
+        fn has_huge_arg(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { args, .. } => args.iter().any(|a| match a {
+                    IrExpr::Arith(x) => eval_arith_bigint(x)
+                        .map(|v| {
+                            v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                        })
+                        .unwrap_or(false),
+                    _ => has_huge_arg(a),
+                }),
+                IrExpr::Array(items) => items.iter().any(has_huge_arg),
+                IrExpr::Arrow(ss) => ss.iter().any(|s| match s {
+                    IrStmt::Expr(x) => has_huge_arg(x),
+                    _ => false,
+                }),
+                _ => false,
+            }
+        }
+        fn collect_targets(ss: &[IrStmt], out: &mut BTreeSet<String>) {
+            for s in ss {
+                match s {
+                    IrStmt::Assign { targets, .. } => {
+                        for t in targets {
+                            if t.indices.is_empty() {
+                                out.insert(t.var.clone());
+                            }
+                        }
+                    }
+                    IrStmt::Function { body, .. } => collect_targets(body, out),
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        collect_targets(then, out);
+                        for (_, b) in elsifs {
+                            collect_targets(b, out);
+                        }
+                        collect_targets(else_, out);
+                    }
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body) => collect_targets(body, out),
+                    IrStmt::Expr(e) => {
+                        // recurse for nested calls? has_huge_arg handles exprs;
+                        // here just collect targets (no-op for Expr).
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn has_huge_call(ss: &[IrStmt]) -> bool {
+            for s in ss {
+                match s {
+                    IrStmt::Expr(e) => {
+                        if has_huge_arg(e) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Function { body, .. } => {
+                        if has_huge_call(body) {
+                            return true;
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        if has_huge_call(then) {
+                            return true;
+                        }
+                        for (_, b) in elsifs {
+                            if has_huge_call(b) {
+                                return true;
+                            }
+                        }
+                        if has_huge_call(else_) {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body) => {
+                        if has_huge_call(body) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        if has_huge_call(stmts) {
+            collect_targets(stmts, out);
+            for sub in subs {
+                collect_targets(&sub.body, out);
+            }
+        }
+    }
     for _ in 0..10 {
         let mut changed = false;
         walk_bigint_stmts(stmts, out, &mut changed);
@@ -9139,6 +9252,79 @@ fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BT
 }
 
 /// Recursive worker (control-flow bodies included; t101's loop).
+/// Scan expressions for fnCall/fnValue with huge const args (mark
+/// positional digits `$N` for BigInt reads — t89 call-site huge).
+fn walk_bigint_expr(e: &IrExpr, out: &mut BTreeSet<String>, changed: &mut bool) {
+    use num_bigint::BigInt;
+    match e {
+        // huge const Arith ANYWHERE (call args, echo args, ...) marks
+        // positional digits (callee $N may receive huge values; t89).
+        // Over-approx (marks 1-9 even if only one used) — sound (BigInt
+        // path correct, minor perf), preserves t86 speed (no huge lits).
+        IrExpr::Arith(a) => {
+            let huge = eval_arith_bigint(a)
+                .map(|v| v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN))
+                .unwrap_or(false);
+            if huge {
+                for d in 1..=9 {
+                    let digit = d.to_string();
+                    if !out.contains(&digit) {
+                        out.insert(digit);
+                        *changed = true;
+                    }
+                }
+            }
+        }
+        IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+            // args[0] = name, args[1] = Array of arg exprs? Or... check shape.
+            // (Determine at runtime via debug? Assume [name, Array] like fn_call_stmt.)
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                for (idx, arg) in items.iter().enumerate() {
+                    let huge = match arg {
+                        IrExpr::Arith(a) => eval_arith_bigint(a)
+                            .map(|v| {
+                                v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if huge {
+                        let digit = (idx + 1).to_string();
+                        if !out.contains(&digit) {
+                            out.insert(digit);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+            for a in args {
+                walk_bigint_expr(a, out, changed);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                walk_bigint_expr(a, out, changed);
+            }
+        }
+        IrExpr::Array(items) => {
+            for a in items {
+                walk_bigint_expr(a, out, changed);
+            }
+        }
+        IrExpr::Arrow(stmts) => {
+            walk_bigint_stmts(stmts, out, changed);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    walk_bigint_expr(x, out, changed);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn walk_bigint_stmts(ss: &[IrStmt], out: &mut BTreeSet<String>, changed: &mut bool) {
     use num_bigint::BigInt;
     for s in ss {
@@ -9179,6 +9365,9 @@ fn walk_bigint_stmts(ss: &[IrStmt], out: &mut BTreeSet<String>, changed: &mut bo
             }
             IrStmt::Function { body, .. } => {
                 walk_bigint_stmts(body, out, changed);
+            }
+            IrStmt::Expr(e) => {
+                walk_bigint_expr(e, out, changed);
             }
             _ => {}
         }
