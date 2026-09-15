@@ -387,6 +387,11 @@ impl Render {
     // ── var classification ───────────────────────────────────────────
 
     fn is_num(&self, name: &str) -> bool {
+        // bigint-tainted vars hold decimal strings (not i64), even if
+        // var_types says Int — route to Str paths (t87).
+        if self.bigint_vars.contains(name) {
+            return false;
+        }
         !self.str_forced.contains(name)
             && (self.var_types.get(name).copied() == Some(IrType::Int) || self.int_vars.contains(name))
     }
@@ -875,7 +880,72 @@ impl Render {
     /// to empty on an evaluation error (division/modulo by zero), so the
     /// checked div/mod helpers set `__SH_ARITH_ERR` and the string
     /// boundary nulls the result (and lets the caller set rc 1).
+    /// BigInt-domain Arith rendering (decimal strings via num-bigint;
+    /// tier-0 string-BigInt: operands parsed from strings/ints, ops via
+    /// BigInt methods, result `.to_string()`. Triggered when tainted
+    /// (uses bigint var) or const-huge. Returned String expr (not i64).
+    fn arith_bigint(&mut self, a: &ArithAst) -> String {
+        self.arith_bigint_inner(a)
+    }
+
+    fn arith_bigint_inner(&mut self, a: &ArithAst) -> String {
+        match a {
+            ArithAst::Num(n) => format!("num_bigint::BigInt::from({}i64)", n),
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                // bigint Str var (decimal text) → parse; Int var → from.
+                if self.bigint_vars.contains(n) {
+                    let v = self.read_str(n);
+                    format!("({v}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
+                } else if self.is_num(n) {
+                    format!("num_bigint::BigInt::from({})", self.read_num(n))
+                } else {
+                    let v = self.read_str(n);
+                    format!("({v}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
+                }
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = self.arith_bigint_inner(lhs);
+                let r = self.arith_bigint_inner(rhs);
+                match op.as_str() {
+                    "+" => format!("({l} + {r})"),
+                    "-" => format!("({l} - {r})"),
+                    "*" => format!("({l} * {r})"),
+                    // truncating (Python floor differs for negatives; t87
+                    // non-negative — documented).
+                    "/" => format!("({l} / {r})"),
+                    "%" => format!("({l} % {r})"),
+                    "**" => {
+                        // exp as u32 (huge exps infeasible anyway).
+                        format!("({l}.pow({r}.to_string().parse::<u32>().unwrap_or(u32::MAX)))")
+                    }
+                    _ => format!("({l} + {r})"),
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let v = self.arith_bigint_inner(arg);
+                match op.as_str() {
+                    "-" => format!("(-{v})"),
+                    _ => v,
+                }
+            }
+            ArithAst::Cast { arg, .. } => self.arith_bigint_inner(arg),
+            _ => "num_bigint::BigInt::from(0)".to_string(),
+        }
+    }
+
     fn arith_str(&mut self, a: &ArithAst) -> String {
+        // BigInt domain (tainted or const-huge) → decimal string (t87).
+        {
+            use num_bigint::BigInt;
+            let tainted = arith_uses_bigint(a, &self.bigint_vars);
+            let huge = eval_arith_bigint(a)
+                .map(|v| v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN))
+                .unwrap_or(false);
+            if tainted || huge {
+                let b = self.arith_bigint_inner(a);
+                return format!("({b}).to_string()");
+            }
+        }
         self.add_helper("arith_err");
         format!(
             "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ String::new() }} else {{ __v }} }}",
@@ -2623,7 +2693,25 @@ impl Render {
                 }
             }
             IrExpr::Interpolate(parts) => format!("vec![{}]", self.interpolate(parts)),
-            IrExpr::Arith(a) => format!("vec![({}).to_string()]", self.arith(a)),
+            IrExpr::Arith(a) => {
+                // BigInt domain (tainted/huge) → decimal string (t87).
+                let tainted = arith_uses_bigint(a, &self.bigint_vars);
+                let huge = eval_arith_bigint(a)
+                    .map(|v| {
+                        use num_bigint::BigInt;
+                        v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                    })
+                    .unwrap_or(false);
+
+                if std::env::var("SH2_DBG_BIGINT").is_ok() {
+                    eprintln!("WORDS tainted={} ast={:?}", tainted, a);
+                }
+                if tainted || huge {
+                    format!("vec![({}).to_string()]", self.arith_bigint(a))
+                } else {
+                    format!("vec![({}).to_string()]", self.arith(a))
+                }
+            }
             IrExpr::Bool(b) => {
                 let _ = b;
                 "Vec::new()".to_string()
@@ -5113,6 +5201,24 @@ impl Render {
                     return;
                 }
                 let rhs = if let IrExpr::Arith(a) = expr {
+                    // BigInt domain (tainted/huge) → decimal string (t87).
+                    // (Checked before i64 path; flag-checked like below.)
+                    {
+                        let tainted = arith_uses_bigint(a, &self.bigint_vars);
+                        let huge = eval_arith_bigint(a)
+                            .map(|v| {
+                                use num_bigint::BigInt;
+                                v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                            })
+                            .unwrap_or(false);
+                        if tainted || huge {
+                            let b = self.arith_bigint(a);
+                            self.add_helper("arith_err");
+                            format!(
+                                "{{ let __v = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}"
+                            )
+                        } else {
                     // `x=$((...))` — bash collapses the expansion to
                     // EMPTY and sets rc 1 on an evaluation error
                     // (division/modulo by zero); the checked div/mod
@@ -5123,6 +5229,8 @@ impl Render {
                          __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}",
                         self.arith(a)
                     )
+                        }
+                    }
                 } else {
                     self.expr_any(expr)
                 };
@@ -5738,8 +5846,7 @@ impl Render {
         // bigint taint (t87 huge consts/propagations; needs prog.subs).
         {
             let mut big = BTreeSet::new();
-            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);
-            self.bigint_vars = big;
+            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            self.bigint_vars = big;
         }
 
         // Pass 2: render the body first (helper flags known before preamble).
@@ -5872,6 +5979,12 @@ impl Render {
         } else if self.is_array(v) {
             format!(
                 "thread_local! {{ static {m}: std::cell::RefCell<Vec<String>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
+            )
+        } else if self.bigint_vars.contains(v) {
+            // BigInt-tainted: decimal string holder (ops parse per use;
+            // tier-0 string-BigInt). Looks like Str (RefCell<String>).
+            format!(
+                "thread_local! {{ static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
             )
         } else if self.is_num(v) {
             format!(
@@ -8949,7 +9062,7 @@ fn eval_arith_bigint(a: &ArithAst) -> Option<BigInt> {
                 }
                 "**" => {
                     // exp must fit u32 (else astronomically large; give up).
-                    let e: u32 = r.try_into().ok()?;
+                    let e: u32 = r.to_string().parse().ok()?;
                     Some(l.pow(e))
                 }
                 _ => None,
@@ -8964,6 +9077,7 @@ fn eval_arith_bigint(a: &ArithAst) -> Option<BigInt> {
                 _ => None,
             }
         }
+        ArithAst::Cast { arg, .. } => eval_arith_bigint(arg),
         _ => None,
     }
 }
@@ -8976,6 +9090,7 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
             arith_uses_bigint(lhs, big) || arith_uses_bigint(rhs, big)
         }
         ArithAst::Un { arg, .. } => arith_uses_bigint(arg, big),
+        ArithAst::Cast { arg, .. } => arith_uses_bigint(arg, big),
         ArithAst::Cond { test, then, else_, .. } => {
             arith_uses_bigint(test, big)
                 || arith_uses_bigint(then, big)
