@@ -4049,6 +4049,65 @@ impl Render {
             return;
         };
         self.mark_written(name);
+        // ArrayComp: `[elem for var in iter if cond]` (py t80). Lower to
+        // a native loop (clear, iterate, test, push) mirroring For.
+        if let Some(IrExpr::ArrayComp { var, iter, elem, cond }) = args.get(1) {
+            let items: Vec<IrExpr> = match iter.as_ref() {
+                IrExpr::Array(items) => items.clone(),
+                _ => {
+                    self.mark_todo("ArrayComp iter not Array");
+                    return;
+                }
+            };
+            // clear target
+            let m = self.tls(name);
+            self.emit(&format!("{m}.with(|v| v.borrow_mut().clear());"));
+            // literal items vec (strings; numeric text preserved)
+            let mut lit_parts = Vec::new();
+            for it in &items {
+                match it {
+                    IrExpr::Str(s, _) => lit_parts.push(format!("{}, ", Self::rust_str_expr(s))),
+                    IrExpr::Int(n) => lit_parts.push(format!("{}.to_string(), ", n)),
+                    other => lit_parts.push(format!("{}, ", self.expr_str(other))),
+                }
+            }
+            let items_g = self.gensym("__sh_citems");
+            self.emit(&format!("let {}: Vec<String> = vec![{}];", items_g, lit_parts.join("")));
+            let idx_g = self.gensym("__sh_ci");
+            self.emit(&format!("let mut {idx_g}: usize = 0;"));
+            self.emit("loop {");
+            self.emit(&format!("if !({idx_g} < {items_g}.len()) {{ break; }}"));
+            self.loop_depth += 1;
+            self.depth += 1;
+            // bind loop var (string; numeric reads parse on demand)
+            self.mark_written(var);
+            let wst = self.write_str(var, &format!("{items_g}[{idx_g}].clone()"));
+            self.emit(&wst);
+            // filter
+            if let Some(c) = cond {
+                // cond is Call test(text) or structured; route through
+                // test machinery (reads thread-local loop var).
+                let b = match c.as_ref() {
+                    IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
+                    _ => self.expr_bool(c),
+                };
+                self.emit(&format!("if {b} {{"));
+                self.depth += 1;
+            }
+            // push elem
+            let ev = self.expr_str(elem);
+            self.emit(&format!("{m}.with(|v| v.borrow_mut().push({ev}));"));
+            if cond.is_some() {
+                self.depth -= 1;
+                self.emit("}");
+            }
+            self.emit(&format!("{idx_g} += 1;"));
+            self.depth -= 1;
+            self.loop_depth -= 1;
+            self.emit("}");
+            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            return;
+        }
         if self.is_assoc(name) {
             // `declare -A m=([k]=v ...)` / `local -A m=()` — the
             // elements arrive as literal `[key]=value` words; empty
