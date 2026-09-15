@@ -5530,7 +5530,22 @@ impl Render {
             IrStmt::Pipeline { stages, .. } => {
                 self.pipeline_stmt(stages);
             }
-            IrStmt::Try { .. } => self.mark_todo("try"),
+            // Try without throwing (our lowering produces defaults, never
+            // panics): run body, then else (no-error path), then finally.
+            // Except clauses skipped (no error to catch — t78). Early
+            // return/break inside skips finally (documented gap).
+            IrStmt::Try { body, else_body, finally_body, .. } => {
+                for s in body {
+                    self.stmt(s);
+                }
+                for s in else_body {
+                    self.stmt(s);
+                }
+                for s in finally_body {
+                    self.stmt(s);
+                }
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            }
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
             IrStmt::ForInit { init, cond, step, body } => {
