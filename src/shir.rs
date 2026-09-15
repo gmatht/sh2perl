@@ -50734,6 +50734,56 @@ mod range_analysis_tests {
         analyze_var_ranges(&prog)
     }
 
+    /// A tiny constant `range` collapses a modular recurrence: with N=1 the
+    /// body runs exactly once, so `h = (h*31 + i) % M` is `0` and the bound
+    /// should be [0,0] — NOT the modulus cap, and certainly not a straddling
+    /// interval.
+    ///
+    /// KNOWN GAP (2026-09-15) — the analysis is exact for the UNROLLED form and
+    /// wrong for the loop form, which localises the cause:
+    ///
+    ///   h=0; h=$(( (h*31 + 0) % M ))          -> h (0,0)      exact
+    ///   h=0; i=0; h=$(( (h*31 + i) % M ))     -> h (0,0)      exact
+    ///   h=0; for ((i=0;i<1;i++)); do ...      -> h (-(M-1),M-1)   loose
+    ///
+    /// ...and the tell is the counter: the loop form reports `i (1,1)` as the
+    /// body-entry range.  `walk_stmt_ranges`' ForInit arm walks the STEP into
+    /// the ENTRY state before `loop_fixpoint`, so the body is analysed with the
+    /// post-increment value (0 -> 1), the body's own result moves outward, and
+    /// `loop_fixpoint`'s widening then collapses it to the domain/straddle.
+    /// The counter is not in `carried` either (that set is the BODY's writes),
+    /// so nothing caps it back to the cond bound: the entry invariant is never
+    /// applied to it.
+    ///
+    /// Impact is precision, not a miscompile: the returned post-state is
+    /// widened so it still contains the true values (`i (1,1)` is even the
+    /// correct value AT loop exit); the body-entry state is the unsound part,
+    /// and it only feeds the body's own transfer.  Every consumer of
+    /// `analyze_var_ranges` — the i53/bigint homing gate, `range_width_name`'s
+    /// width choice, the GLSL mediump proof, and any annotator that displays
+    /// these bounds — inherits the lost precision.
+    #[test]
+    #[ignore = "known gap: the ForInit step is walked into the entry state, so the body sees the post-increment counter and the loop bound widens to a straddle"]
+    fn tiny_range_collapses_a_modular_recurrence() {
+        let r = ranges_of(
+            "h=0\nfor ((i=0;i<1;i++)); do h=$(( (h*31 + i) % 1000000007 )); done\necho $h\n",
+        );
+        assert_eq!(r.get("h"), Some(&(0, 0)), "h should collapse to [0,0], got {:?}", r.get("h"));
+        assert_eq!(r.get("i"), Some(&(0, 0)), "i should be [0,0], got {:?}", r.get("i"));
+    }
+
+    /// The large-trip counterpart genuinely IS capped at the modulus — the
+    /// difference is the trip count, not the analysis's mood.  This half
+    /// passes today and guards the other direction.
+    #[test]
+    fn large_trip_caps_at_the_modulus() {
+        let r = ranges_of(
+            "h=0\nfor ((i=0;i<2000000;i++)); do h=$(( (h*31 + i) % 1000000007 )); done\necho $h\n",
+        );
+        let h = r.get("h").copied().expect("h has a range");
+        assert!(h.0 <= 0 && h.1 >= 1000000006, "large trip must include the modulus range, got {h:?}");
+    }
+
     /// The grep-contains lift treats `printf '%s\n' ARG | grep PAT >/dev/null`
     /// as echo-equivalent (single line), so it lowers to native `contains`
     /// (index) with no bash -c — printf must match echo.
