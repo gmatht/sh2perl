@@ -854,8 +854,14 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_value(args),
             IrExpr::Index { var, key } => {
-                let k = self.expr_num(key);
-                self.array_elem(var, &k)
+                // assoc maps use string keys (dicts like t73).
+                if self.is_assoc(var) {
+                    let ks = self.expr_str(key);
+                    self.assoc_get(var, &ks)
+                } else {
+                    let k = self.expr_num(key);
+                    self.array_elem(var, &k)
+                }
             }
             other => self.expr_any(other),
         }
@@ -1147,8 +1153,14 @@ impl Render {
                 "String::new()".to_string()
             }
             IrExpr::Index { var, key } => {
-                let k = self.expr_num(key);
-                self.array_elem(var, &k)
+                // assoc maps use string keys (dicts like t73).
+                if self.is_assoc(var) {
+                    let ks = self.expr_str(key);
+                    self.assoc_get(var, &ks)
+                } else {
+                    let k = self.expr_num(key);
+                    self.array_elem(var, &k)
+                }
             }
             IrExpr::Capture { .. } => self.capture_expr_single(e),
             IrExpr::Regex { .. } => {
@@ -2595,8 +2607,13 @@ impl Render {
             }
             IrExpr::BinOp { .. } => format!("vec![{}]", self.expr_str(e)),
             IrExpr::Index { var, key } => {
-                let k = self.expr_num(key);
-                format!("vec![{}]", self.array_elem(var, &k))
+                if self.is_assoc(var) {
+                    let ks = self.expr_str(key);
+                    format!("vec![{}]", self.assoc_get(var, &ks))
+                } else {
+                    let k = self.expr_num(key);
+                    format!("vec![{}]", self.array_elem(var, &k))
+                }
             }
             IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
