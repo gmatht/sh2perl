@@ -663,7 +663,7 @@ impl Render {
     /// Render as an i64-typed expression.
     fn expr_num(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Int(i) => i.to_string(),
+            IrExpr::Int(i) => int_lit(*i),
             IrExpr::Str(s, _) => {
                 if let Ok(n) = s.trim().parse::<i64>() {
                     n.to_string()
@@ -764,7 +764,7 @@ impl Render {
     fn expr_str(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => Self::rust_str_expr(s),
-            IrExpr::Int(i) => format!("({i}).to_string()"),
+            IrExpr::Int(i) => format!("({}).to_string()", int_lit(*i)),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -933,7 +933,7 @@ impl Render {
             IrExpr::Bool(b) => {
                 if *b { "true".into() } else { "false".into() }
             }
-            IrExpr::Int(i) => format!("({i} != 0)"),
+            IrExpr::Int(i) => format!("({} != 0)", int_lit(*i)),
             IrExpr::Str(s, _) => format!("(!{}.is_empty())", Self::rust_str_expr(s)),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
@@ -1126,7 +1126,7 @@ impl Render {
     fn expr_any(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => Self::rust_str_expr(s),
-            IrExpr::Int(i) => format!("({i}).to_string()"),
+            IrExpr::Int(i) => format!("({}).to_string()", int_lit(*i)),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -1316,13 +1316,7 @@ impl Render {
             // time, even release). Suffix i64 past i32 range (t86's
             // 67108847*67108837). Small literals stay unsuffixed (zero
             // blast radius on inferred i32 contexts).
-            ArithAst::Num(n) => {
-                if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
-                    format!("{n}i64")
-                } else {
-                    n.to_string()
-                }
-            }
+            ArithAst::Num(n) => int_lit(*n),
             ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
@@ -2610,7 +2604,7 @@ impl Render {
                     format!("vec![{}]", Self::rust_str_expr(s))
                 }
             }
-            IrExpr::Int(i) => format!("vec![({i}).to_string()]"),
+            IrExpr::Int(i) => format!("vec![({}).to_string()]", int_lit(*i)),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -2799,6 +2793,9 @@ impl Render {
                         s.push_str(&m);
                         s.push_str(".with(|v| v.borrow().clone()); ");
                         s.push_str("__sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); ");
+                        // set semantics: dedupe (numeric equality; t88 sqrt
+                        // pushes i and n//i twice when equal).
+                        s.push_str("__sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0)); ");
                         s.push_str("__sv.join(\", \") }] ");
                         s
                     }
@@ -4148,7 +4145,7 @@ impl Render {
             for it in &items {
                 match it {
                     IrExpr::Str(s, _) => lit_parts.push(format!("{}, ", Self::rust_str_expr(s))),
-                    IrExpr::Int(n) => lit_parts.push(format!("{}.to_string(), ", n)),
+                    IrExpr::Int(n) => lit_parts.push(format!("{}.to_string(), ", int_lit(*n))),
                     other => lit_parts.push(format!("{}, ", self.expr_str(other))),
                 }
             }
@@ -6937,6 +6934,16 @@ fn array_base_name(name: &str) -> String {
         .trim_end_matches('@')
         .trim_end_matches('*')
         .to_string()
+}
+
+/// Integer literal text (i64-suffixed past i32 range; unsuffixed
+/// literals default i32 and hard-error on overflow at compile time).
+fn int_lit(n: i64) -> String {
+    if n > i32::MAX as i64 || n < i32::MIN as i64 {
+        format!("{n}i64")
+    } else {
+        n.to_string()
+    }
 }
 
 fn str_arg(args: &[IrExpr], i: usize) -> Option<&str> {
