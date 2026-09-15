@@ -9082,6 +9082,28 @@ fn eval_arith_bigint(a: &ArithAst) -> Option<BigInt> {
     }
 }
 
+/// Does Arith contain a literal past 2^60 (~1e18, near i64 overflow
+/// territory when accumulated/multiplied)? Heuristic taint trigger
+/// (t101's 4e18 addend; full range analysis is future).
+fn arith_has_large_literal(a: &ArithAst) -> bool {
+    const LIM: i64 = 1i64 << 60;
+    match a {
+        ArithAst::Num(n) => *n > LIM || *n < -LIM,
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_has_large_literal(lhs) || arith_has_large_literal(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_has_large_literal(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_has_large_literal(test)
+                || arith_has_large_literal(then)
+                || arith_has_large_literal(else_)
+        }
+        ArithAst::Index { key, .. } => arith_has_large_literal(key),
+        ArithAst::Cast { arg, .. } => arith_has_large_literal(arg),
+        _ => false,
+    }
+}
+
 /// Does Arith use a bigint-tainted var? (For taint propagation.)
 fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
     match a {
@@ -9106,33 +9128,59 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BTreeSet<String>) {
     for _ in 0..10 {
         let mut changed = false;
-        let mut walk_stmts = |ss: &[IrStmt], out: &mut BTreeSet<String>| {
-            for s in ss {
-                if let IrStmt::Assign { targets, expr, .. } = s {
-                    if let IrExpr::Arith(a) = expr {
-                        for t in targets {
-                            if t.indices.is_empty() && !out.contains(&t.var) {
-                                let huge = eval_arith_bigint(a)
-                                    .map(|v| {
-                                        v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
-                                    })
-                                    .unwrap_or(false);
-                                if huge || arith_uses_bigint(a, out) {
-                                    out.insert(t.var.clone());
-                                    changed = true;
-                                }
+        walk_bigint_stmts(stmts, out, &mut changed);
+        for sub in subs {
+            walk_bigint_stmts(&sub.body, out, &mut changed);
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Recursive worker (control-flow bodies included; t101's loop).
+fn walk_bigint_stmts(ss: &[IrStmt], out: &mut BTreeSet<String>, changed: &mut bool) {
+    use num_bigint::BigInt;
+    for s in ss {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    for t in targets {
+                        if t.indices.is_empty() && !out.contains(&t.var) {
+                            let huge = eval_arith_bigint(a)
+                                .map(|v| {
+                                    v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                                })
+                                .unwrap_or(false);
+                            if huge
+                                || arith_uses_bigint(a, out)
+                                || arith_has_large_literal(a)
+                            {
+                                out.insert(t.var.clone());
+                                *changed = true;
                             }
                         }
                     }
                 }
             }
-        };
-        walk_stmts(stmts, out);
-        for sub in subs {
-            walk_stmts(&sub.body, out);
-        }
-        if !changed {
-            break;
+            IrStmt::If { cond: _, then, elsifs, else_ } => {
+                walk_bigint_stmts(then, out, changed);
+                for (_, b) in elsifs {
+                    walk_bigint_stmts(b, out, changed);
+                }
+                walk_bigint_stmts(else_, out, changed);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body) => {
+                walk_bigint_stmts(body, out, changed);
+            }
+            IrStmt::Function { body, .. } => {
+                walk_bigint_stmts(body, out, changed);
+            }
+            _ => {}
         }
     }
 }
