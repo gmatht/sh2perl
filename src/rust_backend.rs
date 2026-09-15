@@ -1038,6 +1038,45 @@ impl Render {
                 BinOpKind::Not => format!("(!{})", self.expr_bool(lhs)),
                 BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
                 | BinOpKind::Le | BinOpKind::Ge => {
+                    // BigInt compare (t89 `n % i == 0` with huge n).
+                    // If either side is tainted/huge Arith, render both as
+                    // BigInt (numeric compare). Else fall through below.
+                    {
+                        use num_bigint::BigInt;
+                        fn is_big(e: &IrExpr, big: &BTreeSet<String>) -> bool {
+                            match e {
+                                IrExpr::Arith(a) => {
+                                    let tainted = arith_uses_bigint(a, big);
+                                    let huge = eval_arith_bigint(a)
+                                        .map(|v| {
+                                            v > BigInt::from(i64::MAX)
+                                                || v < BigInt::from(i64::MIN)
+                                        })
+                                        .unwrap_or(false);
+                                    tainted || huge
+                                }
+                                _ => false,
+                            }
+                        }
+                        if is_big(lhs.as_ref(), &self.bigint_vars) || is_big(rhs.as_ref(), &self.bigint_vars) {
+                            let lb = match lhs.as_ref() {
+                                IrExpr::Arith(a) => self.arith_bigint(a),
+                                _ => {
+                                    let s = self.expr_str(lhs);
+                                    format!("({s}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
+                                }
+                            };
+                            let rb = match rhs.as_ref() {
+                                IrExpr::Arith(a) => self.arith_bigint(a),
+                                _ => {
+                                    let s = self.expr_str(rhs);
+                                    format!("({s}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
+                                }
+                            };
+                            let rs_op = self.cmp_op(op);
+                            return format!("({lb} {rs_op} {rb})");
+                        }
+                    }
                     let rs_op = self.cmp_op(op);
                     if self.static_num(lhs) && self.static_num(rhs) {
                         let (l, r) = (self.expr_num(lhs), self.expr_num(rhs));
@@ -9342,6 +9381,28 @@ fn walk_bigint_stmts(ss: &[IrStmt], out: &mut BTreeSet<String>, changed: &mut bo
                                 || arith_uses_bigint(a, out)
                                 || arith_has_large_literal(a)
                             {
+                                out.insert(t.var.clone());
+                                *changed = true;
+                            }
+                        }
+                    }
+                }
+                // propagate through var/getVar reads (`n = $1` with $1
+                // marked ⇒ n marked; t89 params).
+                let src_vars: Vec<String> = match expr {
+                    IrExpr::Var(n, _) | IrExpr::Ident(n) => vec![n.clone()],
+                    IrExpr::Call { func, args } if func == "getVar" => {
+                        match str_arg(args, 0) {
+                            Some(n) => vec![n.to_string()],
+                            None => vec![],
+                        }
+                    }
+                    _ => vec![],
+                };
+                for sv in &src_vars {
+                    if out.contains(sv) {
+                        for t in targets {
+                            if t.indices.is_empty() && !out.contains(&t.var) {
                                 out.insert(t.var.clone());
                                 *changed = true;
                             }
