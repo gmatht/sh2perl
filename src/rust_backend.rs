@@ -912,10 +912,20 @@ impl Render {
                 if func == "test" || func == "testArith" || func == "arith" =>
             {
                 if let Some(IrExpr::Str(sv, _)) = args.first() {
-                    let norm = Self::norm_arith_text(sv);
-                    if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
-                        let r = self.arith(&ast);
-                        return format!("(({}) != 0)", r);
+                    // dash-letter prefix (`-e`, `-f`, `-n`, ...) is ALWAYS
+                    // a test operator, never arithmetic (negative numbers
+                    // are dash-digit). Skip parse_arith or `-e /etc/passwd`
+                    // parses as `(-e)/(etc)/(passwd)` division (t50).
+                    let t = sv.trim_start();
+                    let is_test_op = t.len() >= 2
+                        && t.starts_with('-')
+                        && t.as_bytes()[1].is_ascii_alphabetic();
+                    if !is_test_op {
+                        let norm = Self::norm_arith_text(sv);
+                        if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                            let r = self.arith(&ast);
+                            return format!("(({}) != 0)", r);
+                        }
                     }
                 }
                 self.test_call_bool(args)
