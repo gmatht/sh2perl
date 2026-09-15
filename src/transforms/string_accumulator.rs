@@ -8,12 +8,14 @@
 //! self-append sites; the two in `try_draw`/`draw_block` run 768×/
 //! frame):
 //!
-//!     blk_p=""
-//!     while …; do
-//!       blk_p="$blk_p$td_a $td_b $td_c 1 1 1 …\n"
-//!       …
-//!     done
-//!     echo "$blk_p" > /dev/webgl/…
+//! ```text
+//! blk_p=""
+//! while …; do
+//!   blk_p="$blk_p$td_a $td_b $td_c 1 1 1 …\n"
+//!   …
+//! done
+//! echo "$blk_p" > /dev/webgl/…
+//! ```
 //!
 //! The emitted code re-evaluates a growing template literal per append
 //! (`blk_p = \`${blk_p}${td_a} …\n\``) — ~1500 appends/frame growing to

@@ -2,11 +2,13 @@
 //! already present in the A1 contract from the shell frontend's canonical
 //! counter-while shape.
 //!
-//!     i=INIT
-//!     while [ CONDITION(i) ]; do
-//!         BODY
-//!         i=i+STEP
-//!     done
+//! ```text
+//! i=INIT
+//! while [ CONDITION(i) ]; do
+//!     BODY
+//!     i=i+STEP
+//! done
+//! ```
 //!
 //! becomes one `IrStmt::ForInit { init, cond, step, body }`. This is the
 //! shIR counterpart of lower.js::nativeForLoops: the transformation does

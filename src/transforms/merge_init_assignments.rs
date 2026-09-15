@@ -3,11 +3,15 @@
 //!
 //! The ESTree lower.js pass performs the equivalent rewrite after rendering:
 //!
-//!     let x = 0; x = 6;
+//! ```text
+//! let x = 0; x = 6;
+//! ```
 //!
 //! becomes:
 //!
-//!     let x = 6;
+//! ```text
+//! let x = 6;
+//! ```
 //!
 //! Keeping this at A1 means every backend can remove the same dead default
 //! and, more importantly, every backend sees the same first-definition fact.

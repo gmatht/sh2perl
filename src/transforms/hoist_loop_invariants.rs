@@ -3,7 +3,9 @@
 //! estree-20260813-201235 (hoist-pure-loop-invariants). The field hash
 //! in the texture generators is recomputed per pixel:
 //!
-//!     while [ "$y" -lt "$SIZE" ]; do … lat_hash $x 0 $SIZE 1; gph=$((lhn%3)); … done
+//! ```text
+//! while [ "$y" -lt "$SIZE" ]; do … lat_hash $x 0 $SIZE 1; gph=$((lhn%3)); … done
+//! ```
 //!
 //! ## Need
 //! The pseudorandom texture generators run ~256 pixels with ~2800

@@ -29752,6 +29752,21 @@ fn param_copy_alias(
             false
         }
         let pre_text = self.out.join("\n");
+        // The capture/site/stage helper BODIES are emitted just below
+        // (after this section) but precede the function block in the
+        // output, so a function a helper calls needs its prototype HERE.
+        // `_cap_0` runs `_sh_capture_fn(big, &buf)` and `big` is defined
+        // later: without its prototype gcc reports 'big' undeclared. The
+        // comment above already counts the helpers as "emitted above the
+        // function block"; the reference scan must see their text.
+        let helper_text: String = self
+            .site_bodies
+            .iter()
+            .chain(self.cap_bodies.iter())
+            .chain(self.stage_thunks.iter())
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut earlier = String::new();
         let mut fn_fwd: Vec<String> = Vec::new();
         let defs_aligned = fn_defs.len() == self.fn_fwd_decls.len();
@@ -29763,7 +29778,9 @@ fn param_copy_alias(
                     if !defs_aligned {
                         true
                     } else {
-                        c_ref_mentioned(&pre_text, nm) || c_ref_mentioned(&earlier, nm)
+                        c_ref_mentioned(&pre_text, nm)
+                            || c_ref_mentioned(&earlier, nm)
+                            || c_ref_mentioned(&helper_text, nm)
                     }
                 }
             };
