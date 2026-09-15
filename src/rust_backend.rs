@@ -976,6 +976,34 @@ impl Render {
             },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
+            // `caseMatch(value, [patterns])` (py startswith/in, t68):
+            // true if ANY pattern fnmatches (shared glob helper).
+            IrExpr::Call { func, args } if func == "caseMatch" => {
+                self.add_helper("fnmatch");
+                let v = match args.first() {
+                    Some(e) => self.expr_str(e),
+                    None => "String::new()".to_string(),
+                };
+                let pats: Vec<String> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items
+                        .iter()
+                        .filter_map(|it| match it {
+                            IrExpr::Str(s, _) => Some(format!(
+                                "__sh_fnmatch({}, &{})",
+                                Self::rust_str(s),
+                                v
+                            )),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                if pats.is_empty() {
+                    "false".to_string()
+                } else {
+                    format!("({})", pats.join(" || "))
+                }
+            }
             IrExpr::Call { func, args } if func == "grepMatches" => {
                 self.add_helper("grepmatches");
                 let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
