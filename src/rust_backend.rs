@@ -238,6 +238,10 @@ impl Render {
     }
 
     fn mark_written(&mut self, name: &str) {
+        // positionals are argv-reads, never declared (see above).
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            return;
+        }
         self.written.insert(name.to_string());
     }
 
@@ -1258,7 +1262,17 @@ impl Render {
 
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
-            ArithAst::Num(n) => n.to_string(),
+            // literals default to i32 (overflow hard-errors at compile
+            // time, even release). Suffix i64 past i32 range (t86's
+            // 67108847*67108837). Small literals stay unsuffixed (zero
+            // blast radius on inferred i32 contexts).
+            ArithAst::Num(n) => {
+                if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
+                    format!("{n}i64")
+                } else {
+                    n.to_string()
+                }
+            }
             ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
@@ -1286,7 +1300,9 @@ impl Render {
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
                         format!("(({l} {op} {r}) as i64)")
                     }
-                    ">>" | "<<" => format!("({l} {op} {r})"),
+                    // widen to i64 (unconstrained literal-literal ops
+                    // default i32 and hard-error on overflow at compile time).
+                    ">>" | "<<" => format!("(({l} as i64) {op} ({r} as i64))"),
                     "/" => {
                         self.add_helper("div");
                         format!("__sh_div({l},{r})")
@@ -1295,7 +1311,7 @@ impl Render {
                         self.add_helper("mod");
                         format!("__sh_mod({l},{r})")
                     }
-                    _ => format!("({l} {op} {r})"),
+                    _ => format!("(({l} as i64) {op} ({r} as i64))"),
                 }
             }
             ArithAst::Un { op, arg } => {
@@ -2688,6 +2704,29 @@ impl Render {
             "exec" | "builtin" => "Vec::new()".to_string(),
             "grepMatches" => "Vec::new()".to_string(),
             "contains" | "strHasPrefix" | "strHasSuffix" => "Vec::new()".to_string(),
+            "sortedIntJoin" => {
+                // sorted int-list print `[1, 2, ...]` (t86 `sorted()`).
+                // Args[0] = Vec<String> var name. Numeric sort (parse;
+                // unparseable sorts as 0 — t86 all numeric).
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        // `vec![{ let mut __sv = VEC.clone(); sort; "[" + join + "]" }]`
+                        // (single expression returning Vec<String> with one
+                        // formatted element, matching the print-words shape).
+                        let mut s = String::from("vec![{ let mut __sv = ");
+                        s.push_str(&m);
+                        s.push_str(".with(|v| v.borrow().clone()); ");
+                        s.push_str("__sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); ");
+                        s.push_str("__sv.join(\", \") }] ");
+                        s
+                    }
+                    None => {
+                        self.mark_todo("sortedIntJoin without var");
+                        "vec![String::new()]".to_string()
+                    }
+                }
+            }
             _ => {
                 self.mark_todo(&format!("word call {func}"));
                 "vec![String::new()]".to_string()
@@ -5524,6 +5563,11 @@ impl Render {
         collect_fn_defs(&prog.stmts, &mut defs);
         self.fn_defs = defs;
         for (n, _) in &prog.var_types {
+            // positional params ($1, $2, ...) read from argv (never
+            // declared as thread-locals; cf. getvar_str/num digit arms).
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
             written.insert(n.clone());
         }
         // array vars are declared even when only READ (arrayIndex/arrayLen/
@@ -8540,7 +8584,10 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
         IrExpr::Var(name, _) => {
-            out.insert(name.clone());
+            // positional reads ($1, $2, ...) are argv, never declared.
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+                out.insert(name.clone());
+            }
         }
         IrExpr::BinOp { lhs, rhs, .. } => {
             collect_written_expr(lhs, out);
@@ -8702,7 +8749,9 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 fn collect_written_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
         ArithAst::Var(name) | ArithAst::Ident(name) => {
-            out.insert(name.clone());
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+                out.insert(name.clone());
+            }
         }
         ArithAst::Index { var, key } => {
             out.insert(var.clone());
