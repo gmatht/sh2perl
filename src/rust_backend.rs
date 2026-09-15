@@ -2704,6 +2704,32 @@ impl Render {
             "exec" | "builtin" => "Vec::new()".to_string(),
             "grepMatches" => "Vec::new()".to_string(),
             "contains" | "strHasPrefix" | "strHasSuffix" => "Vec::new()".to_string(),
+            "sum" | "max" | "min" => {
+                // numeric reduction over Vec<String> (t94 `sum(xs)`).
+                // Empty: sum=0; max/min empty (Python raises; documented).
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        let op = if func == "sum" {
+                            "let mut __acc: i64 = 0; for __e in __vv.iter() { __acc += __e.trim().parse::<i64>().unwrap_or(0); } __acc.to_string()"
+                        } else if func == "max" {
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<i64>().unwrap_or(0); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<i64>().unwrap_or(0); if __v > __m { __m = __v; } } __m.to_string() }"
+                        } else {
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<i64>().unwrap_or(0); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<i64>().unwrap_or(0); if __v < __m { __m = __v; } } __m.to_string() }"
+                        };
+                        let mut s = String::from("vec![{ let __vv = ");
+                        s.push_str(&m);
+                        s.push_str(".with(|v| v.borrow().clone()); ");
+                        s.push_str(op);
+                        s.push_str(" }] ");
+                        s
+                    }
+                    None => {
+                        self.mark_todo("sum/max/min without var");
+                        "vec![String::new()]".to_string()
+                    }
+                }
+            }
             "sortedIntJoin" => {
                 // sorted int-list print `[1, 2, ...]` (t86 `sorted()`).
                 // Args[0] = Vec<String> var name. Numeric sort (parse;
