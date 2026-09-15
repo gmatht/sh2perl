@@ -1995,6 +1995,7 @@ pub fn optimize(prog: &mut IrProgram) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{ArithAst, StrStyle};
+    use crate::shir::index_name_refs;
 
     fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
@@ -2041,6 +2042,55 @@ mod tests {
         let mut prog = prog;
         assert!(dead_store_elim(&mut prog));
         assert_eq!(prog.stmts.len(), 1);
+    }
+
+    #[test]
+    fn index_name_refs_reads_baked_index_vars() {
+        // `arr[$i]=v` bakes the index into the target NAME — the refs are
+        // reads of those variables, not decoration.
+        assert_eq!(index_name_refs("tpx[$sp_i]"), vec!["sp_i".to_string()]);
+        assert_eq!(index_name_refs("a[${i}]"), vec!["i".to_string()]);
+        assert_eq!(index_name_refs("a[$i+$j]"), vec!["i".to_string(), "j".to_string()]);
+        // positionals/specials are not named vars; a literal index has no refs
+        assert!(index_name_refs("a[$1]").is_empty());
+        assert!(index_name_refs("a[7]").is_empty());
+        assert!(index_name_refs("plain").is_empty());
+    }
+
+    #[test]
+    fn dce_keeps_store_read_only_by_a_baked_index_name() {
+        // i=1; arr[$i]=v; …  → the ONLY use of `i` is inside the target
+        // name "arr[$i]". When the read scans missed that, DCE deleted
+        // `i=1`, the write landed on the dead key `arr[]` (the runtime
+        // expands an unset `$i` to "") and the remaining positional args
+        // renumbered — mimecroft recorded 1 of its 10 artifacts, so nine
+        // could never be claimed by walking into them.
+        let prog = prog_of(vec![
+            assign("i", IrExpr::Int(1)),
+            assign("arr[$i]", IrExpr::Str("v".to_string(), StrStyle::DoubleQuoted)),
+            assign("keep", IrExpr::Int(2)),
+            IrStmt::Expr(IrExpr::Call {
+                func: "arrayIndex".to_string(),
+                args: vec![
+                    IrExpr::Str("arr".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("1".to_string(), StrStyle::DoubleQuoted),
+                ],
+            }),
+        ]);
+        let mut prog = prog;
+        dead_store_elim(&mut prog);
+        assert!(
+            prog.stmts.iter().any(|s| matches!(s, IrStmt::Assign { targets, .. }
+                if targets.iter().any(|t| t.var == "i"))),
+            "DCE dropped the definition feeding the baked index name: {:?}",
+            prog.stmts.len()
+        );
+        // …and the same for the two other scans that decide liveness
+        let mut reads = std::collections::HashSet::new();
+        collect_stmt_reads(&assign("arr[$i]", IrExpr::Int(0)), &mut reads);
+        assert!(reads.contains("i"), "collect_stmt_read_names missed the baked index ref");
+        assert!(stmt_reads("i", &assign("arr[$i]", IrExpr::Int(0))),
+            "stmt_reads missed the baked index ref");
     }
 
     #[test]

@@ -198,7 +198,11 @@ pub fn classify_seq_chain(
     if op != "+" {
         return None;
     }
-    let acc_var = match (lhs.as_ref(), rhs.as_ref()) {
+    // The frontends wrap int-domain reads in `Cast(Int64, …)` (an
+    // exactness marker), so peel casts before matching the accumulator
+    // operand. The CUDA lane model is signed i64, where the cast is
+    // identity.
+    let acc_var = match (strip_cast(lhs), strip_cast(rhs)) {
         (ArithAst::Var(x), ArithAst::Var(y)) if x == &acc => y.clone(),
         (ArithAst::Var(y), ArithAst::Var(x)) if x == &acc => y.clone(),
         (ArithAst::Ident(x), ArithAst::Var(y)) if x == &acc => y.clone(),
@@ -227,6 +231,14 @@ pub fn classify_seq_chain(
         acc,
         acc_var,
     })
+}
+
+/// Peel frontend `Cast` markers (identity for the signed-i64 lane model).
+fn strip_cast(a: &ArithAst) -> &ArithAst {
+    match a {
+        ArithAst::Cast { arg, .. } => strip_cast(arg),
+        other => other,
+    }
 }
 
 /// One flat assign-block of a chain arm: every stmt a scalar Assign
@@ -533,6 +545,45 @@ mod tests {
         assert_eq!(c.while_idx, 2);
         assert_eq!(c.tail_idx, 3);
         assert!(matches!(c.inits[1], (_, InitRhs::Num(0))));
+    }
+
+    #[test]
+    fn cast_wrapped_collatz_classifies() {
+        // The Python frontend wraps bigint-domain reads in `Cast(Int64, …)`
+        // (its exactness marker). The lane model is signed i64, so the
+        // accumulator match must peel casts — otherwise the additive
+        // growth guard (docs/PY_BENCH.md finding E) would silently
+        // disable the CUDA seq path for collatz.
+        let cast = |a: ArithAst| ArithAst::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let mut body = collatz_body();
+        // tail: total = Cast(total) + Cast(s)
+        body[3] = assign(
+            "total",
+            arith(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(cast(v("total"))),
+                rhs: Box::new(cast(v("s"))),
+            }),
+        );
+        // chain: s = Cast(s) + 1
+        let IrStmt::While { body: wbody, .. } = &mut body[2] else {
+            panic!("shape");
+        };
+        wbody[1] = assign(
+            "s",
+            arith(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(cast(v("s"))),
+                rhs: Box::new(ArithAst::Num(1)),
+            }),
+        );
+        let c = classify_seq_chain(&body, "k", &["n"])
+            .expect("cast-wrapped collatz is still a lane-nest");
+        assert_eq!(c.acc, "total");
+        assert_eq!(c.acc_var, "s");
     }
 
     #[test]

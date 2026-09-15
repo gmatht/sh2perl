@@ -555,7 +555,6 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                         }
                     }
                     if let Some((replacement, _)) = try_lower_pipeline(stages, false) {
-                    if let Some((replacement, _)) = try_lower_pipeline(stages, false) {
                         *expr = replacement;
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -1638,7 +1637,9 @@ mod tests {
         // ${s:N:M} (scalar) and ${arr[@]:N:M} (array) share the same
         // param("slice", …) shape — reducing to a string SubStr would be
         // wrong for arrays, so slice stays with the runtime.
-        assert!(try_lower_param_op(&[st("slice"), st("v"), st("1"), st("2")]).is_none());
+        assert!(try_lower_param_op(&[st("slice"), st("v"), st("1"), st("2")], &std::collections::HashSet::new()).is_some());
+        let arrays: std::collections::HashSet<String> = ["v".to_string()].into_iter().collect();
+        assert!(try_lower_param_op(&[st("slice"), st("v"), st("1"), st("2")], &arrays).is_none());
     }
 
     #[test]
@@ -1673,9 +1674,12 @@ mod tests {
     #[test]
     fn statement_pipeline_reduces_to_output() {
         let mut stmt = stmt_pipeline(echo_stage(vec![st("x")]), wc_stage());
-        lower_stmt(&mut stmt, true);
-        let IrStmt::Output { value: IrExpr::Ext(n), .. } = &stmt else {
-            panic!("statement-level pipeline should reduce to Output, got {stmt:?}");
+        lower_stmt(&mut stmt, true, &std::collections::HashSet::new());
+        let IrStmt::Block(stmts) = &stmt else {
+            panic!("statement-level pipeline should reduce to Block, got {stmt:?}");
+        };
+        let [IrStmt::Output { value: IrExpr::Ext(n), .. }, IrStmt::SetChildError(_)] = stmts.as_slice() else {
+            panic!("unexpected statement block shape: {stmt:?}");
         };
         assert!(n.as_any().downcast_ref::<RegCount>().is_some());
     }
@@ -1691,7 +1695,7 @@ mod tests {
             expr: Box::new(IrExpr::Arrow(vec![inner.clone()])),
             native: false,
         };
-        lower_expr(&mut cap);
+        lower_expr(&mut cap, &std::collections::HashSet::new());
         let IrExpr::Capture { expr, .. } = &cap else { panic!() };
         let IrExpr::Arrow(body) = expr.as_ref() else { panic!() };
         assert_eq!(&body[0], &inner, "capture body must keep the original pipeline");
@@ -2257,7 +2261,7 @@ fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<
     const STATUS0: [&str; 7] = ["cut", "tr", "head", "tail", "wc", "xargs", "sed"];
     if !STATUS0.contains(&cmd_name) { return None; }
 
-    let value = lower_text_cmd(text, cmd_name, cmd_args)?;
+    let value = lower_text_cmd(text, cmd_name, cmd_args, true)?;
 
     // Preserve $?: the allowlisted pipeline exits 0.
     Some(IrStmt::Block(vec![
@@ -3003,7 +3007,12 @@ fn try_lower_grep_text_cmd(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStm
     let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() else { return None };
     if !matches!(n2.as_str(), "tr" | "sed") { return None; }
 
-    let val = lower_text_cmd(loop_var_read("__l"), n2, ca)?;
+    let val = lower_text_cmd(
+        TextSource { text: loop_var_read("__l"), trailing_newline: false, is_literal: false },
+        n2,
+        ca,
+        true,
+    )?;
     let cond = IrExpr::Ext(Box::new(StringContains {
         text: loop_var_read("__l"),
         pattern: pat,
@@ -3145,7 +3154,7 @@ fn try_lower_grep_cond(stage1: &IrExpr, stage2: &IrExpr) -> Option<IrExpr> {
     let s2 = peel_to_cmd_arrow(stage2)?;
     let b1 = match s1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
     let b2 = match s2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
-    let text = extract_text_from_stage(b1)?;
+    let TextSource { text, .. } = extract_text_from_stage(b1)?;
     let [IrStmt::Expr(IrExpr::Call { func, args })] = b2 else { return None };
     if !(func == "exec" || func == "builtin") { return None; }
     let [IrExpr::Str(n, _), IrExpr::Array(ga)] = args.as_slice() else { return None };

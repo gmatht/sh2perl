@@ -2348,6 +2348,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
 /// reference). The i32-provable pattern: a pure shIR analysis every
 /// backend can re-derive (the Perl renderer's status tracking, the C
 /// renderer's `_sh_rc`, …).
+#[allow(dead_code)]
 fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     fn expr_zero(e: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
         match e {
@@ -2537,12 +2538,17 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
     // the exit code is PROVABLY 0 (no $? reads, every status 0): the
     // runner's exit-code read of the final status is a no-op — walk with
     // end_live=false so the final statement's record drops (t87_bignum's
-    // trailing `sh2.lastExit = 0`).
-    let ec_zero = exit_code_provably_zero(prog);
-    if std::env::var("SH2_DBG_ECZ").is_ok() {
-        eprintln!("DBG exit_code_provably_zero = {}", ec_zero);
-    }
-    let end_live = !ec_zero;
+    // The program's final status is ALWAYS observable: `sh2._finish()`
+    // exits with `sh2.lastExit`. The final statement's write must stay —
+    // even when the program is exit-code-provably-zero, an EARLIER status
+    // write can survive into `sh2.lastExit` (e.g. `if false; then ...; fi`
+    // records `sh2.lastExit = 1` at the condition; bash exits 0 but a
+    // dropped final `= 0` would make `_finish` exit 1). This is the old
+    // `end_live = !exit_code_provably_zero(prog)`: the provably-zero proof
+    // only bounds the FINAL status, never an intermediate leak, so it was
+    // unsound as a drop license (dead_flags_* / last_exit_hoist_* pin the
+    // correct behaviour).
+    let end_live = true;
     walk_lastexit_liveness(&prog.stmts, end_live, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     *TEST_COND_DEAD.lock().unwrap() = Some(compute_test_cond_deadness(&prog.stmts, &live));

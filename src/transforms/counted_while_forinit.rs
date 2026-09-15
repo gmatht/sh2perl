@@ -73,7 +73,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             body,
         };
         changed = true;
-        i = i.saturating_sub(1);
+        i = i.saturating_sub(1).max(1);
     }
     changed
 }

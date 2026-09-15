@@ -526,6 +526,12 @@ pub struct Render {
     /// consumed by sortedIntJoin/sortedBigintJoin): stored as
     /// `long long name[N]` + `name_len` instead of `char* name[N]`
     int_arrays: HashSet<String>,
+    /// Vars that must render as STRINGS even when the A2/`var_types`
+    /// verdict says Int: a `for x in <string list>` loop var is assigned a
+    /// `char*` element, so declaring it `long long` (or reading it as an
+    /// integer) is wrong (t91). C-backend-local — every other backend
+    /// keeps the A1 verdict.
+    force_str: HashSet<String>,
     /// int-homed arrays with a growable-vec verdict (list-profile):
     /// `T *name` + `name_len` + `name_cap` instead of `T name[1024]`.
     /// Subset of `int_arrays`; every `{id}[k]`/`{id}_len` use site works
@@ -650,6 +656,12 @@ pub struct Render {
     /// mirror `<c_ident>_f` + `<c_ident>_big` flag, spilling to the GMP
     /// slot on 128-bit overflow (DUAL_LOOPS §4.1 "next tier up to GMP").
     tiered_vars: HashSet<String>,
+    /// Subset of `tiered_vars` whose fast mirror is `long long` (i64)
+    /// rather than `__int128`: native i64 STORAGE by default, promoting to
+    /// the exact GMP slot only on i64 overflow (the variable-scope form of
+    /// the speculative arm). Selected for unproven loop-carried
+    /// accumulators, independent of any profile.
+    tiered_i64: HashSet<String>,
     /// Speculative-loop FAST arm (`try_spec_loop`): bigint vars rendered
     /// through their i64 shadow `<c_ident>_s`. `None` outside the fast
     /// arm, so the default render is untouched.
@@ -761,6 +773,91 @@ fn sorted_join_array(stages: &[IrExpr]) -> Option<String> {
 /// `_max`/`_min`/`_sum` aggregates (Optimisation 1). Only int arrays that
 /// are reduced this way qualify (a bigint array's aggregate is a GMP
 /// value, not worth maintaining on the hot path).
+/// Loop vars that iterate a NON-int-homed array (`for x in <string list>`):
+/// the element read assigns a `char*`, so the var must be string-homed
+/// regardless of its Int verdict (t91: a set of decimal strings).
+fn string_loop_vars(prog: &IrProgram, int_arrays: &HashSet<String>) -> HashSet<String> {
+    use crate::ir::{IrExpr, IrStmt};
+    fn arr_of(iter: &IrExpr) -> Option<String> {
+        match iter {
+            IrExpr::Array(elems) if elems.len() == 1 => match &elems[0] {
+                IrExpr::Call { func, args } if func == "param" => Render::str_arg(args, 1),
+                _ => None,
+            },
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+    fn walk(stmts: &[IrStmt], int_arrays: &HashSet<String>, out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::For { var, iter, body } => {
+                    if let Some(a) = arr_of(iter) {
+                        if !int_arrays.contains(&a) && !var.is_empty() {
+                            out.insert(var.clone());
+                        }
+                    }
+                    walk(body, int_arrays, out);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, int_arrays, out);
+                    for (_, b) in elsifs {
+                        walk(b, int_arrays, out);
+                    }
+                    walk(else_, int_arrays, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Block(body) => walk(body, int_arrays, out),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, int_arrays, out);
+                    walk(step, int_arrays, out);
+                    walk(body, int_arrays, out);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, int_arrays, out);
+                    for (_, b) in named_blocks {
+                        walk(b, int_arrays, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, int_arrays, out);
+                    for e in excepts {
+                        walk(&e.body, int_arrays, out);
+                    }
+                    walk(else_body, int_arrays, out);
+                    walk(finally_body, int_arrays, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, int_arrays, out);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, int_arrays, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, int_arrays, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, int_arrays, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(&prog.stmts, int_arrays, &mut out);
+    for sub in &prog.subs {
+        walk(&sub.body, int_arrays, &mut out);
+    }
+    out
+}
+
 fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
     let int_arrays = analyze_int_arrays(prog);
     let mut reduce: HashSet<String> = HashSet::new();
@@ -834,6 +931,178 @@ fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
 /// (byte-identical output). SmallVec/Chunked/Gap/Rope verdicts lower as
 /// Vec until their own lowerings land (all correct on Vec; slower only).
 /// `SH2_LIST_VEC=0` disables the upgrade entirely (validation kill-switch).
+/// Native-i64 storage selection (variable-scope "native by default, exact
+/// on overflow"). A bigint var is selected when EVERY assignment is a
+/// numeric literal or a `+`/`-`/`*` tree over non-bigint leaves and
+/// already-selected i64 tiers, and at least one assignment is
+/// self-referential (an accumulator). Fixed point: `total = total + s`
+/// selects once `s` is selected. Refuse > guess — an unrecognised
+/// assignment excludes the candidate. Profile-tiered vars are skipped.
+fn select_tiered_i64(
+    prog: &IrProgram,
+    bigint: &BTreeSet<String>,
+    already_tiered: &HashSet<String>,
+) -> HashSet<String> {
+    let mut cands: BTreeSet<String> = bigint.iter().cloned().collect();
+    cands.retain(|v| !already_tiered.contains(v));
+    // Collect every assignment RHS targeting a candidate.
+    let mut assigns: std::collections::HashMap<String, Vec<IrExpr>> =
+        std::collections::HashMap::new();
+    fn scan(
+        stmts: &[IrStmt],
+        cand: &BTreeSet<String>,
+        assigns: &mut std::collections::HashMap<String, Vec<IrExpr>>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                        if cand.contains(&base) && t.indices.is_empty() {
+                            assigns.entry(base).or_default().push(expr.clone());
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    scan(then, cand, assigns);
+                    for (_, b) in elsifs {
+                        scan(b, cand, assigns);
+                    }
+                    scan(else_, cand, assigns);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Redirect { inner: body, .. } => scan(body, cand, assigns),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    scan(init, cand, assigns);
+                    scan(step, cand, assigns);
+                    scan(body, cand, assigns);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    scan(body, cand, assigns);
+                    for (_, b) in named_blocks {
+                        scan(b, cand, assigns);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    scan(body, cand, assigns);
+                    for e in excepts {
+                        scan(&e.body, cand, assigns);
+                    }
+                    scan(else_body, cand, assigns);
+                    scan(finally_body, cand, assigns);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        scan(&c.body, cand, assigns);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        scan(&c.body, cand, assigns);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    scan(&prog.stmts, &cands, &mut assigns);
+    for sub in &prog.subs {
+        scan(&sub.body, &cands, &mut assigns);
+    }
+    let mut sel: HashSet<String> = HashSet::new();
+    loop {
+        let mut added = false;
+        for v in &cands {
+            if sel.contains(v) {
+                continue;
+            }
+            let Some(exprs) = assigns.get(v) else { continue };
+            let mut selfref = false;
+            let mut ok = true;
+            for e in exprs {
+                match rhs_tierable(e, v, bigint, &sel) {
+                    Some(sr) => selfref |= sr,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && selfref {
+                sel.insert(v.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    sel
+}
+
+/// A RHS assignable to an i64 tier: numeric literal, or a `+`/`-`/`*`
+/// tree over non-bigint leaves and already-selected tiers. `Some(selfref)`
+/// when tierable, None otherwise.
+fn rhs_tierable(
+    e: &IrExpr,
+    v: &str,
+    bigint: &BTreeSet<String>,
+    sel: &HashSet<String>,
+) -> Option<bool> {
+    match e {
+        IrExpr::Int(_) => Some(false),
+        IrExpr::Str(s, _) => {
+            let t = s.trim();
+            if !t.is_empty() && t.trim_start_matches('-').chars().all(|c| c.is_ascii_digit()) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        IrExpr::Arith(a) => arith_tierable(a, v, bigint, sel),
+        _ => None,
+    }
+}
+
+fn arith_tierable(
+    a: &ArithAst,
+    v: &str,
+    bigint: &BTreeSet<String>,
+    sel: &HashSet<String>,
+) -> Option<bool> {
+    match a {
+        ArithAst::Num(_) => Some(false),
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if n == v {
+                Some(true)
+            } else if bigint.contains(n) {
+                if sel.contains(n) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                Some(false)
+            }
+        }
+        ArithAst::Cast { arg, .. } => arith_tierable(arg, v, bigint, sel),
+        ArithAst::Un { op, arg } if op == "-" || op == "+" => {
+            arith_tierable(arg, v, bigint, sel)
+        }
+        ArithAst::Bin { op, lhs, rhs } if matches!(op.as_str(), "+" | "-" | "*") => {
+            let l = arith_tierable(lhs, v, bigint, sel)?;
+            let r = arith_tierable(rhs, v, bigint, sel)?;
+            Some(l || r)
+        }
+        _ => None,
+    }
+}
+
 fn select_vec_arrays(
     verdicts: &BTreeMap<String, crate::shir_passes::list_profile::ListVerdict>,
     exclude: &HashSet<String>,
@@ -870,6 +1139,114 @@ fn select_vec_arrays(
 /// (capture/command-subst, interpolate, non-numeric literal, or a read
 /// of a non-Int var). Transitive (demoted sources demote targets).
 /// Covers top-level stmts, function bodies, and Declare inits.
+/// Demote `for x in <string list>` loop vars to Str (C-backend-local): the
+/// element read assigns a char*, so an Int A2 verdict would declare
+/// `long long` and assign a pointer — and read it back as an integer
+/// (t91: a set of decimal strings, one of them 2^100). The demoted var is
+/// then parsed exactly (`mpz_set_str`) in bigint contexts and via `atoll`
+/// in i64 ones.
+fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
+    use crate::ir::{IrExpr, IrStmt};
+    let int_arrays = analyze_int_arrays(prog);
+    fn numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
+        match e {
+            IrExpr::Int(_) | IrExpr::Arith(_) => true,
+            IrExpr::Str(s, _) => {
+                let t = s.strip_prefix('-').unwrap_or(s);
+                !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit())
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                ints.contains(n) || matches!(n.as_str(), "?" | "#" | "!" | "$")
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Render::str_arg(args, 0) {
+                    Some(n) => ints.contains(&n) || matches!(n.as_str(), "?" | "#" | "!" | "$"),
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    fn walk(stmts: &[IrStmt], int_arrays: &HashSet<String>, ints: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::For { var, iter, body } => {
+                    let stringy = match iter {
+                        IrExpr::Array(elems) if elems.len() == 1 => match &elems[0] {
+                            IrExpr::Call { func, args } if func == "param" => {
+                                match Render::str_arg(args, 1) {
+                                    Some(a) => !int_arrays.contains(&a),
+                                    None => elems.iter().any(|e| !numeric(e, ints)),
+                                }
+                            }
+                            e => !numeric(e, ints),
+                        },
+                        IrExpr::Array(elems) => elems.iter().any(|e| !numeric(e, ints)),
+                        IrExpr::Var(n, _) | IrExpr::Ident(n) => !int_arrays.contains(n),
+                        _ => false,
+                    };
+                    if stringy && !var.is_empty() {
+                        ints.remove(var);
+                    }
+                    walk(body, int_arrays, ints);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, int_arrays, ints);
+                    for (_, b) in elsifs {
+                        walk(b, int_arrays, ints);
+                    }
+                    walk(else_, int_arrays, ints);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Block(body) => walk(body, int_arrays, ints),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, int_arrays, ints);
+                    walk(step, int_arrays, ints);
+                    walk(body, int_arrays, ints);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, int_arrays, ints);
+                    for (_, b) in named_blocks {
+                        walk(b, int_arrays, ints);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, int_arrays, ints);
+                    for e in excepts {
+                        walk(&e.body, int_arrays, ints);
+                    }
+                    walk(else_body, int_arrays, ints);
+                    walk(finally_body, int_arrays, ints);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, int_arrays, ints);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, int_arrays, ints);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, int_arrays, ints),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, int_arrays, ints);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(&prog.stmts, &int_arrays, int_set);
+    for sub in &prog.subs {
+        walk(&sub.body, &int_arrays, int_set);
+    }
+}
+
 fn demote_stringy_ints(prog: &mut IrProgram) {
     use crate::ir::{IrExpr, IrStmt};
     use std::collections::HashSet;
@@ -882,7 +1259,8 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
     if int_set.is_empty() {
         return;
     }
-    fn is_numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
+    let int_arrays = analyze_int_arrays(prog);
+    fn is_numeric(e: &IrExpr, ints: &HashSet<String>, int_arrays: &HashSet<String>) -> bool {
         match e {
             IrExpr::Int(_) => true,
             IrExpr::Arith(_) => true,
@@ -910,14 +1288,23 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                     Some("len" | "#")
                 )
             }
+            // a typed reduction over an INT-homed array computes an int
+            // (`_min_xs = min(xs)`); over a string array it is a string
+            // (Python min of strings is lexicographic), so only int-homed.
+            IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                match crate::c_backend::Render::str_arg(args, 0) {
+                    Some(n) => int_arrays.contains(&n),
+                    None => false,
+                }
+            }
             _ => false,
         }
     }
-    fn walk(stmts: &[IrStmt], ints: &mut HashSet<String>) {
+    fn walk(stmts: &[IrStmt], ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
         for s in stmts {
             match s {
                 IrStmt::Assign { targets, expr, .. } => {
-                    let stringy = !is_numeric(expr, ints);
+                    let stringy = !is_numeric(expr, ints, &int_arrays);
                     // nested assigns inside RHS? (rare; the RHS walk
                     // below covers expression-embedded stmts via Arrow)
                     if stringy {
@@ -928,36 +1315,36 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                         }
                     }
                     // recurse into Arrow bodies in RHS (captures etc.)
-                    fn walk_expr(e: &IrExpr, ints: &mut HashSet<String>) {
+                    fn walk_expr(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
                         match e {
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_expr(a, ints);
+                                    walk_expr(a, ints, int_arrays);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_expr(a, ints);
+                                    walk_expr(a, ints, int_arrays);
                                 }
                             }
-                            IrExpr::Arrow(stmts) => walk(stmts, ints),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
                             IrExpr::Interpolate(parts) => {
                                 for p in parts {
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_expr(x, ints);
+                                        walk_expr(x, ints, int_arrays);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_expr(expr, ints);
+                    walk_expr(expr, ints, int_arrays);
                 }
                 IrStmt::Declare { vars, init, .. } => {
                     if let Some(e) = init {
-                        if !is_numeric(e, ints) {
+                        if !is_numeric(e, ints, &int_arrays) {
                             for v in vars {
                                 if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site2)", &v.name); }                                ints.remove(&v.name);
                             }
@@ -965,47 +1352,47 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                     }
                 }
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
-                    walk_cond(cond, ints);
-                    walk(then, ints);
+                    walk_cond(cond, ints, int_arrays);
+                    walk(then, ints, int_arrays);
                     for (c, b) in elsifs {
-                        walk_cond(c, ints);
-                        walk(b, ints);
+                        walk_cond(c, ints, int_arrays);
+                        walk(b, ints, int_arrays);
                     }
-                    walk(else_, ints);
+                    walk(else_, ints, int_arrays);
                 }
                 IrStmt::While { cond, body, .. }
                 | IrStmt::DoWhile { cond, body, .. } => {
-                    walk_cond(cond, ints);
-                    walk(body, ints);
+                    walk_cond(cond, ints, int_arrays);
+                    walk(body, ints, int_arrays);
                 }
-                IrStmt::For { body, .. } => walk(body, ints),
-                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints),
-                IrStmt::Redirect { inner, .. } => walk(inner, ints),
+                IrStmt::For { body, .. } => walk(body, ints, int_arrays),
+                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints, int_arrays),
+                IrStmt::Redirect { inner, .. } => walk(inner, ints, int_arrays),
                 IrStmt::Pipeline { stages, .. } => {
                     for st in stages {
-                        walk(st, ints);
+                        walk(st, ints, int_arrays);
                     }
                 }
                 IrStmt::Function { body, named_blocks, .. } => {
-                    walk(body, ints);
+                    walk(body, ints, int_arrays);
                     for (_, b) in named_blocks {
-                        walk(b, ints);
+                        walk(b, ints, int_arrays);
                     }
                 }
                 IrStmt::Case { clauses, .. } => {
                     for c in clauses {
-                        walk(&c.body, ints);
+                        walk(&c.body, ints, int_arrays);
                     }
                 }
                 IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                    walk(body, ints);
+                    walk(body, ints, int_arrays);
                     for e in excepts {
-                        walk(&e.body, ints);
+                        walk(&e.body, ints, int_arrays);
                     }
-                    walk(else_body, ints);
-                    walk(finally_body, ints);
+                    walk(else_body, ints, int_arrays);
+                    walk(finally_body, ints, int_arrays);
                 }
-                IrStmt::ForInit { body, .. } => walk(body, ints),
+                IrStmt::ForInit { body, .. } => walk(body, ints, int_arrays),
                 IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
                     // `local x=$(...)` / `export x=...` as builtin CALLS
                     // (not Declare): stringy inits demote (BASHC_FIX 062).
@@ -1037,7 +1424,7 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                                                 s[..s.len() - 1].to_string();
                                             if let Some(v) = items.get(i + 1)
                                             {
-                                                if !is_numeric(v, ints) {
+                                                if !is_numeric(v, ints, &int_arrays) {
                                                     if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site3)", &nm); }                                                    ints.remove(&nm);
                                                 }
                                             }
@@ -1062,17 +1449,17 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                         }
                     }
                     // expression-embedded Arrows (captures, pipelines)
-                    fn walk_e(e: &IrExpr, ints: &mut HashSet<String>) {
+                    fn walk_e(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
                         match e {
-                            IrExpr::Arrow(stmts) => walk(stmts, ints),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_e(a, ints);
+                                    walk_e(a, ints, int_arrays);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_e(a, ints);
+                                    walk_e(a, ints, int_arrays);
                                 }
                             }
                             IrExpr::Interpolate(parts) => {
@@ -1080,48 +1467,49 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_e(x, ints);
+                                        walk_e(x, ints, int_arrays);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_e(e, ints);
+                    walk_e(e, ints, int_arrays);
                 }
                 _ => {}
             }
         }
     }
-    fn walk_cond(e: &IrExpr, ints: &mut HashSet<String>) {
+    fn walk_cond(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
         // conditions may embed Arrows; assigns there are rare but walk
         // them for completeness (same helper as Expr above, inlined
         // to avoid closure borrow issues).
         match e {
-            IrExpr::Arrow(stmts) => walk(stmts, ints),
+            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
             IrExpr::Call { args, .. } => {
                 for a in args {
-                    walk_cond(a, ints);
+                    walk_cond(a, ints, int_arrays);
                 }
             }
             IrExpr::Array(items) => {
                 for a in items {
-                    walk_cond(a, ints);
+                    walk_cond(a, ints, int_arrays);
                 }
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let crate::ir::InterpPart::Expr(x) = p {
-                        walk_cond(x, ints);
+                        walk_cond(x, ints, int_arrays);
                     }
                 }
             }
             _ => {}
         }
     }
-    walk(&prog.stmts, &mut int_set);
+    demote_string_loop_vars(prog, &mut int_set);
+    walk(&prog.stmts, &mut int_set, &int_arrays);
     for sub in &prog.subs {
-        walk(&sub.body, &mut int_set);
+        walk(&sub.body, &mut int_set, &int_arrays);
     }
 
     prog.var_types
@@ -6473,6 +6861,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     r.int_arrays = analyze_int_arrays(&prog);
+    r.force_str = string_loop_vars(&prog, &r.int_arrays);
     r.reduce_arrays = analyze_reduce_arrays(&prog);
     r.int_array_widths = int_array_widths(&prog, &ranges);
     let mut capture_vars = BTreeSet::new();
@@ -6541,6 +6930,17 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             r.tiered_vars = tiered_vars;
         }
     }
+    // Native-i64 storage for unproven loop-carried accumulators: a bigint
+    // var whose every assignment is a literal or `v = v op <literal>` gets
+    // a `long long` mirror `_f` + a `_big` promotion flag, so the default
+    // representation is native and GMP is reached only on actual overflow.
+    {
+        let t64 = select_tiered_i64(&prog, &r.bigint_vars, &r.tiered_vars);
+        for v in &t64 {
+            r.tiered_vars.insert(v.clone());
+        }
+        r.tiered_i64 = t64;
+    }
     if !r.bigint_vars.is_empty() {
         r.need_gmp = true;
     }
@@ -6552,6 +6952,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             r.array_return_fns.iter().cloned().collect();
         exclude.extend(r.bigint_vars.iter().cloned());
         r.vec_arrays = select_vec_arrays(&r.list_verdicts, &exclude);
+        // Counter-dynamic fills (a non-literal indexed write, or an append)
+        // must GROW: the fixed ARR_CAP exits 127 once the length passes it
+        // (the `a[i]=i*i` / `a.append(i)` bench shapes). Escaped arrays keep
+        // their existing treatment (a shell-out consumer needs the fixed
+        // store), as do assoc/function-return/bigint arrays via `exclude`.
         let r_uses = crate::shir_passes::list_profile::scopes::use_scopes(&prog);
         let mut locals = HashMap::new();
         for a in &r.vec_arrays {
@@ -6855,6 +7260,105 @@ impl Render {
         format!("{vb}.p")
     }
 
+    /// Render `a` as checked i64 over i64-tiered mirrors. Each `+`/`-`/`*`
+    /// accumulates into `ov` (an early overflow leaves later ops on
+    /// wrapped-but-defined values that are then discarded). None when a
+    /// leaf cannot be computed in i64 (a non-tiered bigint var).
+    fn tiered_i64_expr(&mut self, a: &ArithAst, ov: &str) -> Option<String> {
+        match a {
+            ArithAst::Num(n) => Some(format!("{n}LL")),
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                if self.tiered_i64.contains(n) {
+                    Some(format!("{}_f", self.c_ident(n)))
+                } else if self.bigint_vars.contains(n) || !self.is_num(n) {
+                    // bigint (non-tiered) or a STRING read: not i64
+                    None
+                } else {
+                    Some(self.c_ident(n))
+                }
+            }
+            ArithAst::Cast { arg, .. } => self.tiered_i64_expr(arg, ov),
+            ArithAst::Un { op, arg } => {
+                let x = self.tiered_i64_expr(arg, ov)?;
+                match op.as_str() {
+                    "+" => Some(x),
+                    "-" => {
+                        let t = format!("_tt{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("long long {t};"));
+                        self.emit(&format!(
+                            "{ov} |= __builtin_sub_overflow(0LL, {x}, &{t});"
+                        ));
+                        Some(t)
+                    }
+                    _ => None,
+                }
+            }
+            ArithAst::Bin { op, lhs, rhs }
+                if matches!(op.as_str(), "+" | "-" | "*") =>
+            {
+                let l = self.tiered_i64_expr(lhs, ov)?;
+                let r = self.tiered_i64_expr(rhs, ov)?;
+                let t = format!("_tt{}", self.temp_seq);
+                self.temp_seq += 1;
+                let bi = match op.as_str() {
+                    "+" => "__builtin_add_overflow",
+                    "-" => "__builtin_sub_overflow",
+                    _ => "__builtin_mul_overflow",
+                };
+                self.emit(&format!("long long {t};"));
+                self.emit(&format!("{ov} |= {bi}({l}, {r}, &{t});"));
+                Some(t)
+            }
+            _ => None,
+        }
+    }
+
+    /// i64-tiered store for an arbitrary `+`/`-`/`*` RHS: compute in i64
+    /// over the mirrors; on overflow (or when a participant is already
+    /// promoted) spill every still-fast participant into its mpz slot and
+    /// recompute exactly. Returns true when it emitted the store.
+    fn tiered_store_general(&mut self, var: &str, a: &ArithAst) -> bool {
+        if !self.tiered_i64.contains(var) {
+            return false;
+        }
+        let Some(mut used) = self.tiered_i64_vars_in(a) else {
+            return false;
+        };
+        used.insert(var.to_string());
+        let ov = format!("_to{}", self.temp_seq);
+        self.temp_seq += 1;
+        let name = self.c_ident(var);
+        let fast = self.tiered_fast(var);
+        let guard: Vec<String> = used
+            .iter()
+            .map(|u| format!("!{}_big", self.c_ident(u)))
+            .collect();
+        self.need_gmp = true;
+        self.emit(&format!("int {ov} = !({});", guard.join(" && ")));
+        self.emit(&format!("if (!{ov}) {{"));
+        self.depth += 1;
+        match self.tiered_i64_expr(a, &ov) {
+            Some(t) => self.emit(&format!("if (!{ov}) {fast} = {t};")),
+            // shape drifted from the selector: stay exact via the mpz arm
+            None => self.emit(&format!("{ov} = 1;")),
+        }
+        self.depth -= 1;
+        self.emit("}");
+        self.emit(&format!("if ({ov}) {{"));
+        self.depth += 1;
+        for u in &used {
+            let uid = self.c_ident(u);
+            self.emit(&format!(
+                "if (!{uid}_big) {{ mpz_set_si({uid}, {uid}_f); {uid}_big = 1; }}"
+            ));
+        }
+        self.bigint_into(a, &name);
+        self.depth -= 1;
+        self.emit("}");
+        true
+    }
+
     /// Tiered grower store: `x = x op k` keeps an `__int128` fast path
     /// and spills to the GMP slot on 128-bit overflow. Recognises only
     /// `+`/`-`/`*` with a literal operand (the shape `profile_wide_vars`
@@ -6890,22 +7394,36 @@ impl Render {
         };
         let name = self.c_ident(var);
         let fast = self.tiered_fast(var);
+        let i64tier = self.tiered_i64.contains(var);
         let rt = format!("_tr{}", self.temp_seq);
         self.temp_seq += 1;
-        self.need_i128 = true;
+        if !i64tier {
+            self.need_i128 = true;
+        }
         self.need_gmp = true;
         self.emit(&format!("if (!{name}_big) {{"));
         self.depth += 1;
-        self.emit(&format!("__int128 {rt};"));
-        self.emit(&format!(
-            "if ({builtin}({fast}, (__int128)({k}LL), &{rt})) {{"
-        ));
+        if i64tier {
+            self.emit(&format!("long long {rt};"));
+            self.emit(&format!(
+                "if ({builtin}({fast}, (long long)({k}LL), &{rt})) {{"
+            ));
+        } else {
+            self.emit(&format!("__int128 {rt};"));
+            self.emit(&format!(
+                "if ({builtin}({fast}, (__int128)({k}LL), &{rt})) {{"
+            ));
+        }
         self.depth += 1;
         // spill: lift the current fast value into the GMP slot, then let
         // the GMP path apply the operation exactly.
-        let vb = self.vbuf_temp();
-        self.emit(&format!("_sh_i128_str(&{vb}, {fast});"));
-        self.emit(&format!("mpz_set_str({name}, {vb}.p, 10);"));
+        if i64tier {
+            self.emit(&format!("mpz_set_si({name}, {fast});"));
+        } else {
+            let vb = self.vbuf_temp();
+            self.emit(&format!("_sh_i128_str(&{vb}, {fast});"));
+            self.emit(&format!("mpz_set_str({name}, {vb}.p, 10);"));
+        }
         self.bigint_into(a, &name);
         self.emit(&format!("{name}_big = 1;"));
         self.depth -= 1;
@@ -7004,17 +7522,30 @@ impl Render {
             self.emit(&format!("{ty} {sn} = {sid};"));
         }
         self.emit(&format!("int {ovf} = 0;"));
-        // One i64 shadow per growth var; a var that does not fit i64
-        // forces the exact replay before the fast arm runs at all.
-        let mut shadows: Vec<(String, String)> = Vec::new();
+        // One i64 fast value per growth var: an i64-tiered var reuses its
+        // mirror `_f` (native storage), anything else gets the arm's `_s`
+        // shadow. A var whose mpz slot is authoritative (`_big`) forces the
+        // exact replay before the fast arm runs at all.
+        let mut shadows: Vec<(String, String, String)> = Vec::new();
         for g in &growth {
             let g_id = self.c_ident(g);
-            let g_s = format!("{g_id}_s");
-            self.emit(&format!("long long {g_s} = 0;"));
-            self.emit(&format!(
-                "if (mpz_fits_slong_p({g_id})) {g_s} = mpz_get_si({g_id}); else {ovf} = 1;"
-            ));
-            shadows.push((g_id, g_s));
+            if self.tiered_i64.contains(g) {
+                // The mirror is authoritative iff `!_big`; a promoted value
+                // forces the exact replay. Keep the ENTRY value so the
+                // replay (which reads the mpz slot) starts from the loop
+                // entry, not from the partially-executed fast arm.
+                self.emit(&format!("long long {g_id}_e0 = {g_id}_f;"));
+                self.emit(&format!("int {g_id}_w = {g_id}_big;"));
+                self.emit(&format!("if ({g_id}_big) {ovf} = 1;"));
+                shadows.push((g.clone(), g_id.clone(), format!("{g_id}_f")));
+            } else {
+                let g_s = format!("{g_id}_s");
+                self.emit(&format!("long long {g_s} = 0;"));
+                self.emit(&format!(
+                    "if (mpz_fits_slong_p({g_id})) {g_s} = mpz_get_si({g_id}); else {ovf} = 1;"
+                ));
+                shadows.push((g.clone(), g_id, g_s));
+            }
         }
         // fast arm
         self.emit(&format!("if (!{ovf}) {{"));
@@ -7053,6 +7584,16 @@ impl Render {
         for (sid, sn) in &snaps {
             self.emit(&format!("{sid} = {sn};"));
         }
+        // A tiered var's mpz slot is stale (the fast arm wrote the mirror):
+        // restore the ENTRY value into it and mark it authoritative before
+        // the replay body reads it.
+        for (ir, cid, _) in &shadows {
+            if self.tiered_i64.contains(ir) {
+                self.emit(&format!(
+                    "if (!{cid}_w) mpz_set_si({cid}, {cid}_e0); {cid}_big = 1;"
+                ));
+            }
+        }
         self.in_cond += 1;
         let cs = self.expr(cond);
         self.in_cond -= 1;
@@ -7072,7 +7613,14 @@ impl Render {
         self.depth -= 1;
         let sets: Vec<String> = shadows
             .iter()
-            .map(|(g, s)| format!("mpz_set_si({g}, {s});"))
+            .map(|(ir, cid, fs)| {
+                if self.tiered_i64.contains(ir) {
+                    // the mirror already holds the final value
+                    format!("{cid}_big = 0;")
+                } else {
+                    format!("mpz_set_si({cid}, {fs});")
+                }
+            })
             .collect();
         self.emit(&format!("}} else {{ {} }}", sets.join(" ")));
         self.depth -= 1;
@@ -7142,7 +7690,7 @@ impl Render {
             .as_ref()
             .is_some_and(|f| f.contains(x.as_str()))
         {
-            format!("{}_s", self.c_ident(&x))
+            self.fast_i64_ident(&x)
         } else {
             self.c_ident(&x)
         };
@@ -7179,7 +7727,7 @@ impl Render {
             ArithAst::Num(n) => format!("{n}LL"),
             ArithAst::Var(x) | ArithAst::Ident(x) => {
                 if self.spec_fast.as_ref().is_some_and(|f| f.contains(x.as_str())) {
-                    format!("{}_s", self.c_ident(x))
+                    self.fast_i64_ident(x)
                 } else {
                     self.c_ident(x)
                 }
@@ -7228,11 +7776,22 @@ impl Render {
         }
     }
 
-    /// Store the checked i64 result into the speculative shadow.
+    /// The i64 fast-value C ident for `v` inside a speculative fast arm:
+    /// an i64-tiered var's existing mirror `_f` (native storage), else the
+    /// arm's `_s` shadow.
+    fn fast_i64_ident(&self, v: &str) -> String {
+        if self.tiered_i64.contains(v) {
+            format!("{}_f", self.c_ident(v))
+        } else {
+            format!("{}_s", self.c_ident(v))
+        }
+    }
+
+    /// Store the checked i64 result into the speculative fast value.
     fn spec_checked_store(&mut self, var: &str, a: &ArithAst) {
-        let id = self.c_ident(var);
         let r = self.spec_checked_expr(a);
-        self.emit(&format!("{id}_s = {r};"));
+        let id = self.fast_i64_ident(var);
+        self.emit(&format!("{id} = {r};"));
     }
 
     fn profile_store(&mut self, name: &str, var: &str, rhs: &str) {
@@ -7360,7 +7919,8 @@ impl Render {
     }
 
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int)
+        !self.force_str.contains(name)
+            && self.var_types.get(name).copied() == Some(IrType::Int)
     }
 
     /// A store var that OWNS heap storage (a `char*` assigned via
@@ -10877,8 +11437,17 @@ impl Render {
                     .as_ref()
                     .is_some_and(|f| f.contains(name.as_str()))
                 {
-                    // speculative fast arm: the bigint var is its i64 shadow
-                    return format!("{}_s", self.c_ident(name));
+                    // speculative fast arm: the var's i64 fast value (a
+                    // tier mirror `_f` for i64-tiered vars, else `_s`)
+                    return self.fast_i64_ident(name);
+                }
+                if self.tiered_vars.contains(name) {
+                    // Tiered storage in an i64 context: the mirror when it
+                    // is authoritative, else the (truncating, documented)
+                    // GMP read. Exact paths go through `tiered_decimal`.
+                    let id = self.c_ident(name);
+                    let fast = self.tiered_fast(name);
+                    return format!("({id}_big ? mpz_get_si({id}) : (long long){fast})");
                 }
                 if self.bigint_vars.contains(name) {
                     // GMP slot in an i64 context: truncate (documented;
@@ -11163,8 +11732,14 @@ impl Render {
             // Tiered grower: the profile-licensed `__int128` fast mirror
             // and its spill flag (the GMP slot is the exact fallback).
             if self.tiered_vars.contains(v) {
-                self.need_i128 = true;
-                self.emit(&format!("__int128 {} = 0;", self.tiered_fast(v)));
+                if self.tiered_i64.contains(v) {
+                    // native i64 storage; promotes to the mpz slot on
+                    // i64 overflow (no __int128 dependency)
+                    self.emit(&format!("long long {} = 0;", self.tiered_fast(v)));
+                } else {
+                    self.need_i128 = true;
+                    self.emit(&format!("__int128 {} = 0;", self.tiered_fast(v)));
+                }
                 self.emit(&format!("int {name}_big = 0;"));
             }
             if !self.bigint_declared.contains(&name) {
@@ -13522,9 +14097,35 @@ fn param_copy_alias(
         }
     }
 
+    /// Numeric (i64) C text for a variable: an i64-tiered var's mirror
+    /// (with the promotion test), `mpz_get_si` for a pure bigint slot, else
+    /// the ident. Without this, a bigint/tiered var in an i64 position was
+    /// emitted as its bare (mpz_t) ident — a pointer where a number was
+    /// expected (found via `xs.append(i)` with an unproven `i`).
+    fn num_read_c(&self, name: &str) -> String {
+        if self.tiered_vars.contains(name) {
+            let id = self.c_ident(name);
+            let fast = self.tiered_fast(name);
+            format!("({id}_big ? mpz_get_si({id}) : (long long){fast})")
+        } else if self.bigint_vars.contains(name) {
+            format!("mpz_get_si({})", self.c_ident(name))
+        } else {
+            self.c_ident(name)
+        }
+    }
+
     /// Emit `char _sN[32]; snprintf(_sN, ..., "%lld", (long long)(v));`
     /// and return `_sN` — the string form of a numeric C expression.
+    /// A bare ident naming a bigint/tiered var is substituted with its
+    /// numeric read (the raw mpz_t is a pointer, not a number).
     fn num_temp(&mut self, v: &str) -> String {
+        let owned;
+        let v = if is_ident(v) && (self.tiered_vars.contains(v) || self.bigint_vars.contains(v)) {
+            owned = self.num_read_c(v);
+            owned.as_str()
+        } else {
+            v
+        };
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
         self.num_temp_bufs.insert(t.clone());
@@ -13939,6 +14540,9 @@ fn param_copy_alias(
             }
             ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.bigint_vars.contains(name) {
+                    if self.tiered_vars.contains(name) {
+                        self.flush_tiered(name);
+                    }
                     self.emit(&format!("mpz_set({target}, {});", self.c_ident(name)));
                 } else if self.is_num(name) {
                     self.emit(&format!("mpz_set_si({target}, {});", self.c_ident(name)));
@@ -14139,14 +14743,38 @@ fn param_copy_alias(
     /// directly, everything else evaluates into a fresh static temp
     /// (init-once guard; limbs reused across evaluations like the
     /// _sh_vbuf high-water discipline — no leaks, no scope tracking).
+    /// Flush a tiered var's authoritative i64/__int128 mirror into its mpz
+    /// slot (setting `_big`) so a bigint-context read of the slot is exact.
+    /// The mirror is authoritative while `_big` is clear, so a direct slot
+    /// read is stale (the dynamic-bound counter `while (i < n)` compared the
+    /// stale slot and never terminated). Flushing — rather than copying to a
+    /// temp — keeps the in-place `mpz_mul_ui(x, x, k)` fast path.
+    fn flush_tiered(&mut self, name: &str) {
+        let id = self.c_ident(name);
+        if self.tiered_i64.contains(name) {
+            self.need_gmp = true;
+            self.emit(&format!(
+                "if (!{id}_big) {{ mpz_set_si({id}, {id}_f); {id}_big = 1; }}"
+            ));
+        } else if self.tiered_vars.contains(name) {
+            self.need_gmp = true;
+            self.need_i128 = true;
+            let vb = self.vbuf_temp();
+            self.emit(&format!(
+                "if (!{id}_big) {{ _sh_i128_str(&{vb}, {id}_f); mpz_set_str({id}, {vb}.p, 10); {id}_big = 1; }}"
+            ));
+        }
+    }
+
     fn bigint_operand(&mut self, a: &ArithAst) -> String {
         // Unwrap the frontend's identity `Cast(Int64, …)` first: a
         // `Cast(Var x)` must render as `x` itself, not an aliasing
         // `mpz_set(tmp, x)` copy (GMP allows `a = a op b` in place).
         match Self::unwrap_cast(a) {
-            ArithAst::Var(name) | ArithAst::Ident(name)
-                if self.bigint_vars.contains(name) =>
-            {
+            ArithAst::Var(name) | ArithAst::Ident(name) if self.bigint_vars.contains(name) => {
+                if self.tiered_vars.contains(name) {
+                    self.flush_tiered(name);
+                }
                 self.c_ident(name)
             }
             other => self.bigint_eval_temp(other),
@@ -14593,8 +15221,10 @@ fn param_copy_alias(
                     format!("(int)atoll({})", Self::cstr(s))
                 }
             },
-            IrExpr::Var(name, _) | IrExpr::Ident(name) if self.bigint_vars.contains(name) => {
-                format!("mpz_get_si({})", self.c_ident(name))
+            IrExpr::Var(name, _) | IrExpr::Ident(name)
+                if self.bigint_vars.contains(name) || self.tiered_vars.contains(name) =>
+            {
+                self.num_read_c(name)
             }
             IrExpr::Var(name, _) | IrExpr::Ident(name) if self.is_num(name) => self.c_ident(name),
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -14603,7 +15233,7 @@ fn param_copy_alias(
                         return "_sh_rc".into();
                     }
                     if self.is_num(&name) {
-                        return self.c_ident(&name);
+                        return self.num_read_c(&name);
                     }
                 }
                 format!("(int)atoll({})", self.value_c(e))
@@ -22871,6 +23501,19 @@ fn param_copy_alias(
                 };
                 format!("_sh_isint31({v})")
             }
+            "isqrt" => {
+                // Structured `int(n**0.5)` (the py-sh-go isqrt node):
+                // exact Newton floor-sqrt of the i64 operand. Before this
+                // arm the node fell into the generic `sh2.*` stub list and
+                // the whole program printed `TODO sh2.isqrt`.
+                self.need_isqrt = true;
+                let v = match args.first() {
+                    Some(IrExpr::Arith(a)) => self.arith(a),
+                    Some(e) => self.value_num(e),
+                    None => "0".to_string(),
+                };
+                format!("_sh_isqrt({v})")
+            }
             _ => self.sh2_stub(func, args, func),
         }
     }
@@ -23624,7 +24267,7 @@ fn param_copy_alias(
                 // `result[i]=x` — the bare key names a VAR: an
                 // arithmetic index, not an assoc string key
                 let kv = if self.is_num(k.trim()) {
-                    self.c_ident(k.trim())
+                    self.num_read_c(k.trim())
                 } else {
                     format!("(long long)atoll({})", self.store_read(k.trim()))
                 };
@@ -25366,6 +26009,33 @@ fn param_copy_alias(
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // Speculative fast arm: EVERY assignment to a shadowed growth var
+        // must update its i64 shadow. This runs before static eval and the
+        // string/literal fast paths so a seed like `s = 0` (a Str literal)
+        // cannot fall through to the bigint slot and desync the fast arm
+        // from the exact replay. `spec_body_rhs_ok` pre-validated the RHS.
+        if let IrStmt::Assign { targets, expr, .. } = s {
+            if let Some(t) = targets.first() {
+                if t.indices.is_empty()
+                    && self
+                        .spec_fast
+                        .as_ref()
+                        .is_some_and(|f| f.contains(t.var.as_str()))
+                {
+                    if let IrExpr::Arith(a) = expr {
+                        self.spec_checked_store(&t.var, a);
+                        return;
+                    }
+                    if let Some(n) = spec_lit_i64(expr) {
+                        let id = self.fast_i64_ident(&t.var);
+                        self.emit(&format!("{id} = {n}LL;"));
+                        return;
+                    }
+                    self.mark_todo("speculative store shape");
+                    return;
+                }
+            }
+        }
         // static eval runs inline (functions hoisted to preamble).
         if self.try_static_eval(s) {
             return;
@@ -26223,7 +26893,9 @@ fn param_copy_alias(
                 // bigint assign below (the var is also in bigint_vars).
                 if self.tiered_vars.contains(&t.var) {
                     if let IrExpr::Arith(a) = expr {
-                        if self.tiered_store(&t.var, a) {
+                        if self.tiered_store_general(&t.var, a)
+                            || self.tiered_store(&t.var, a)
+                        {
                             return;
                         }
                     }
@@ -26237,7 +26909,9 @@ fn param_copy_alias(
                         {
                             let name = self.c_ident(&t.var);
                             let fast = self.tiered_fast(&t.var);
-                            self.need_i128 = true;
+                            if !self.tiered_i64.contains(&t.var) {
+                                self.need_i128 = true;
+                            }
                             self.emit(&format!("{fast} = {txt}; {name}_big = 0;"));
                             return;
                         }
@@ -26280,6 +26954,9 @@ fn param_copy_alias(
                                     let e = self.arith(a);
                                     let name = self.c_ident(&t.var);
                                     self.emit(&format!("mpz_set_si({name}, {e});"));
+                                    if self.tiered_vars.contains(&t.var) {
+                                        self.emit(&format!("{name}_big = 1;"));
+                                    }
                                     // keep the wide magnitude probe (the mpz
                                     // is set now, so it is exact either way)
                                     if let Some(site) = self.prof_site(2, &t.var) {
@@ -26293,6 +26970,13 @@ fn param_copy_alias(
                         }
                         let name = self.c_ident(&t.var);
                         self.bigint_into(a, &name);
+                        if self.tiered_vars.contains(&t.var) {
+                            // the mpz slot is authoritative now: the i64
+                            // mirror is stale, so every tiered read must take
+                            // the GMP branch (`total = total + x` with a
+                            // string element printed 0 without this).
+                            self.emit(&format!("{name}_big = 1;"));
+                        }
                         // wide magnitude probe (SH2_PROFILE_WIDE): the true
                         // value, not the wrapped i64 the release build has.
                         if let Some(site) = self.prof_site(2, &t.var) {
@@ -29610,8 +30294,14 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
                 // Pure scalar RHS only. Non-arith literals (`s = 0`) are
                 // fine — the spec var's own assigns are re-checked by
                 // `spec_body_rhs_ok`. Calls/arrays/captures may have side
-                // effects and are refused.
-                if !t.indices.is_empty() || !expr_is_pure_scalar(expr) {
+                // effects and are refused. A FLATTENED array-store target
+                // (`a[0]` as a bracketed name with no `indices`) is an
+                // array write, not a scalar: the arm would snapshot the
+                // mangled `a_0_` ident and fail to compile.
+                if !t.indices.is_empty()
+                    || t.var.contains('[')
+                    || !expr_is_pure_scalar(expr)
+                {
                     return false;
                 }
                 out.insert(t.var.clone());
@@ -29827,6 +30517,63 @@ fn arith_range_native(a: &ArithAst, ranges: &HashMap<String, (i128, i128)>) -> O
 
 /// Can this RHS be rendered as checked i64? Leaves must be the growth var
 /// or a non-bigint scalar; `/`/`%` need a nonzero literal divisor.
+/// A numeric literal RHS (the frontend emits Python int literals as
+/// `Str`), as an i64 for the speculative shadow store.
+fn spec_lit_i64(e: &IrExpr) -> Option<i64> {
+    match e {
+        IrExpr::Int(n) => Some(*n),
+        IrExpr::Str(t, _) => t.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Every i64-tiered var read by `a`, or None when the expression is not
+/// i64-computable: a bigint var that is not i64-tiered, or a NON-NUMERIC
+/// leaf (a Str-typed read such as a set/list element) — rendering those as
+/// bare idents fed a `char*` into integer arithmetic (t91).
+impl Render {
+    fn tiered_i64_vars_in(&self, a: &ArithAst) -> Option<BTreeSet<String>> {
+        fn walk(
+            a: &ArithAst,
+            bigint: &BTreeSet<String>,
+            t64: &HashSet<String>,
+            numeric: &dyn Fn(&str) -> bool,
+            out: &mut BTreeSet<String>,
+        ) -> bool {
+            match a {
+                ArithAst::Num(_) => true,
+                ArithAst::Var(n) | ArithAst::Ident(n) => {
+                    if t64.contains(n) {
+                        out.insert(n.clone());
+                        true
+                    } else if bigint.contains(n) {
+                        false
+                    } else {
+                        // Str-typed vars are not i64 leaves (parse the
+                        // exact decimal through the GMP path instead).
+                        numeric(n)
+                    }
+                }
+                ArithAst::Cast { arg, .. } => walk(arg, bigint, t64, numeric, out),
+                ArithAst::Un { op, arg } if op == "-" || op == "+" => {
+                    walk(arg, bigint, t64, numeric, out)
+                }
+                ArithAst::Bin { op, lhs, rhs } if matches!(op.as_str(), "+" | "-" | "*") => {
+                    walk(lhs, bigint, t64, numeric, out) && walk(rhs, bigint, t64, numeric, out)
+                }
+                _ => false,
+            }
+        }
+        let numeric = |n: &str| self.is_num(n);
+        let mut out = BTreeSet::new();
+        if walk(a, &self.bigint_vars, &self.tiered_i64, &numeric, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 fn spec_rhs_ok(a: &ArithAst, shadowed: &BTreeSet<String>, big: &BTreeSet<String>) -> bool {
     match a {
         ArithAst::Num(_) => true,
@@ -29861,6 +30608,9 @@ fn spec_body_rhs_ok(stmts: &[IrStmt], shadowed: &BTreeSet<String>, big: &BTreeSe
                 if targets.first().is_some_and(|t| shadowed.contains(&t.var)) {
                     match expr {
                         IrExpr::Arith(a) if spec_rhs_ok(a, shadowed, big) => {}
+                        // A literal seed/reset (`s = 0`) stores the shadow
+                        // directly (handled by the early gate in `stmt`).
+                        _ if spec_lit_i64(expr).is_some() => {}
                         _ => return false,
                     }
                 }
@@ -38562,6 +39312,44 @@ mod tests {
     }
 
     #[test]
+    fn interval_and_checked_ops_agree() {
+        // Item-2 pin: the i64-provable interval (`arith_range_native`) and
+        // the speculative checked renderer (`spec_rhs_ok`) must accept the
+        // SAME op set, or the native-store verdict silently falls back for
+        // a shape the checked arm would render. Every op the checked arm
+        // accepts over a ranged leaf must have an interval.
+        use crate::ir::ArithAst as A;
+        let mut ranges: HashMap<String, (i128, i128)> = HashMap::new();
+        ranges.insert("k".to_string(), (0, 100));
+        let v = || A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(A::Var("k".to_string())),
+        };
+        let num = |n: i64| A::Num(n);
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let un = |op: &str| A::Un { op: op.to_string(), arg: Box::new(v()) };
+        let cases: Vec<A> = vec![
+            bin("+", v(), num(7)),
+            bin("-", v(), num(7)),
+            bin("*", v(), num(7)),
+            bin("/", v(), num(7)),
+            bin("%", v(), num(7)),
+            un("-"),
+            un("+"),
+        ];
+        for a in &cases {
+            let checked = spec_rhs_ok(a, &BTreeSet::new(), &BTreeSet::new());
+            let proven = arith_range_native(a, &ranges).is_some();
+            assert!(checked, "checked arm must accept {a:?}");
+            assert!(proven, "interval must cover {a:?} (agreement with the checked arm)");
+        }
+    }
+
+    #[test]
     fn bigint_store_with_i64_rhs_is_native() {
         // A bigint target whose RHS reads no bigint var and is proven
         // within i64 stores with one `mpz_set_si`, not an mpz chain
@@ -38651,16 +39439,16 @@ mod tests {
         ];
         let c = shir_to_c(&prog);
         assert!(c.contains("_sp_ovf"), "no overflow flag:\n{c}");
-        // `3*v+1` is affine, so the checked store is one range compare
-        // plus the native update (no per-op overflow builtins).
+        // `3*v+1` is affine AND `v` is i64-tiered, so the checked store is
+        // one range compare plus the native update on the tier mirror.
         assert!(
-            c.contains("3LL * v_s") && c.contains("_sp_ovf") && c.contains("break;"),
+            c.contains("3LL * v_f") && c.contains("_sp_ovf") && c.contains("break;"),
             "no checked fast store:\n{c}"
         );
-        assert!(c.contains("long long v_s = 0;"), "no i64 shadow:\n{c}");
+        assert!(c.contains("long long v_f"), "no i64 tier mirror:\n{c}");
         assert!(
-            c.contains("while ((v_s > 1))"),
-            "fast arm not on the i64 shadow:\n{c}"
+            c.contains("while ((v_f > 1))"),
+            "fast arm not on the i64 fast value:\n{c}"
         );
         assert!(
             c.contains("mpz_cmp(") && c.contains("> 0)"),
@@ -38716,26 +39504,220 @@ mod tests {
             ("total".to_string(), crate::ir::IrType::Int),
         ];
         let c = shir_to_c(&prog);
-        for sh in ["long long v_s = 0;", "long long s_s = 0;", "long long total_s = 0;"] {
-            assert!(c.contains(sh), "missing shadow `{sh}`:\n{c}");
+        // All three growth vars are i64-TIERED (native storage), so the
+        // arm's fast value is their existing mirror `_f`, not a `_s` shadow.
+        for sh in ["long long v_f", "long long s_f", "long long total_f"] {
+            assert!(c.contains(sh), "missing tier mirror `{sh}`:\n{c}");
         }
-        // Every growth var is written back exactly on the replay path.
-        for w in [
-            "mpz_set_si(v, v_s);",
-            "mpz_set_si(s, s_s);",
-            "mpz_set_si(total, total_s);",
-        ] {
-            assert!(c.contains(w), "missing write-back `{w}`:\n{c}");
+        for b in ["int v_big", "int s_big", "int total_big"] {
+            assert!(c.contains(b), "missing promotion flag `{b}`:\n{c}");
+        }
+        // Non-overflow exit keeps the mirror authoritative.
+        for w in ["v_big = 0;", "s_big = 0;", "total_big = 0;"] {
+            assert!(c.contains(w), "missing tier write-back `{w}`:\n{c}");
         }
         assert!(
-            c.contains("while ((v_s > 1))"),
-            "fast arm not on the i64 shadow:\n{c}"
+            c.contains("while ((v_f > 1))"),
+            "fast arm not on the i64 fast value:\n{c}"
         );
         assert!(c.contains("_sp_ovf") && c.contains("break;"), "no checked arm:\n{c}");
         // `s`/`total` must NOT be plain-scalar snapshots any more.
         assert!(
             !c.contains("_sp_s") && !c.contains("_sp_total"),
-            "additive growth vars were snapshotted, not shadowed:\n{c}"
+            "additive growth vars were snapshotted, not tiered:\n{c}"
+        );
+    }
+
+    #[test]
+    fn tiered_growth_arm_snapshots_entry_value_for_replay() {
+        // A tiered (i64-storage) var that the speculative arm shadows must
+        // restore its ENTRY value into the mpz slot before the exact
+        // replay: the fast arm writes the mirror, leaving the mpz slot
+        // stale, so a replay reading it would start from the wrong value.
+        // (Found by t101_tier_overflow_replay; this is the structural pin.)
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        // s = 1; i = 0; while i < 5: { s = s + 4e18; i = i + 1 }
+        let mut prog = empty_prog(vec![
+            assign("s", cast(A::Num(1))),
+            assign("i", cast(A::Num(0))),
+            IrStmt::While {
+                cond: IrExpr::Arith(Box::new(bin("<", cast(A::Var("i".into())), A::Num(5)))),
+                body: vec![
+                    assign(
+                        "s",
+                        cast(bin(
+                            "+",
+                            cast(A::Var("s".into())),
+                            A::Num(4000000000000000000),
+                        )),
+                    ),
+                    assign("i", cast(bin("+", cast(A::Var("i".into())), A::Num(1)))),
+                ],
+            },
+        ]);
+        prog.var_types = vec![
+            ("s".to_string(), crate::ir::IrType::Int),
+            ("i".to_string(), crate::ir::IrType::Int),
+        ];
+        let c = shir_to_c(&prog);
+        assert!(c.contains("long long s_f") && c.contains("int s_big"), "no i64 tier:\n{c}");
+        assert!(c.contains("long long s_e0"), "no entry snapshot:\n{c}");
+        assert!(
+            c.contains("if (!s_w) mpz_set_si(s, s_e0); s_big = 1;"),
+            "replay prologue does not restore the tier entry value:\n{c}"
+        );
+    }
+
+    #[test]
+    fn isqrt_node_renders_natively_not_as_a_stub() {
+        // `int(n**0.5)` lowers to the structured `isqrt` Call node; the C
+        // renderer must route it to `_sh_isqrt` (exact Newton). Before
+        // this arm it fell into the generic `sh2.*` stub list and the
+        // whole program printed `TODO sh2.isqrt` (t86/t88).
+        use crate::ir::ArithAst as A;
+        let mut prog = empty_prog(vec![IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "r".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "isqrt".to_string(),
+                args: vec![IrExpr::Arith(Box::new(A::Cast {
+                    ty: crate::ir::IrType::Int64,
+                    arg: Box::new(A::Num(16)),
+                }))],
+            },
+            asm: None,
+        }]);
+        let c = shir_to_c(&prog);
+        assert!(c.contains("_sh_isqrt("), "isqrt not rendered natively:\n{c}");
+        assert!(!c.contains("sh2_isqrt"), "isqrt fell into the sh2.* stub:\n{c}");
+    }
+
+    #[test]
+    fn bigint_var_as_array_index_and_value_reads_numerically() {
+        // Regression pin: `a[i] = getVar(i)` with a BIGINT `i` used to
+        // emit the bare mpz_t ident in both the index and the value —
+        // a pointer where `long long`/`char*` was expected (found via
+        // `xs.append(i)` in a dynamic-bound loop, rewired to `xs[i] = i`
+        // by append-to-store).
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let mut prog = empty_prog(vec![
+            assign("i", cast(A::Num(3))),
+            IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "a[i]".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str(
+                        "i".to_string(),
+                        crate::ir::StrStyle::DoubleQuoted,
+                    )],
+                },
+                asm: None,
+            },
+        ]);
+        prog.var_types = vec![("i".to_string(), crate::ir::IrType::Int)];
+        let c = shir_to_c(&prog);
+        assert!(
+            c.contains("mpz_get_si(i)"),
+            "bigint index/value must read numerically:\n{c}"
+        );
+        assert!(
+            !c.contains("_sh_arr_set(a, &a_len, 1024, i,"),
+            "bare mpz_t ident used as the array index:\n{c}"
+        );
+    }
+
+    #[test]
+    fn speculative_loop_rejects_flattened_array_store() {
+        // Regression pin: a FLATTENED array-store target (`a[0]`) inside an
+        // otherwise arm-eligible loop used to be accepted as a "plain
+        // scalar", so the arm snapshotted the mangled `a_0_` ident and the
+        // render failed to compile (found via `a[0] = 7` in a dynamic-bound
+        // loop).
+        use crate::ir::ArithAst as A;
+        let cast = |a: A| A::Cast {
+            ty: crate::ir::IrType::Int64,
+            arg: Box::new(a),
+        };
+        let assign = |v: &str, a: A| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: v.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let bin = |op: &str, l: A, r: A| A::Bin {
+            op: op.to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        };
+        let mut prog = empty_prog(vec![
+            assign("s", cast(A::Num(0))),
+            IrStmt::While {
+                cond: IrExpr::Arith(Box::new(bin(
+                    "<",
+                    cast(A::Var("s".into())),
+                    A::Num(10),
+                ))),
+                body: vec![
+                    assign("s", cast(bin("+", cast(A::Var("s".into())), A::Num(1)))),
+                    IrStmt::Assign {
+                        targets: vec![crate::ir::AssignTarget {
+                            var: "a[0]".to_string(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Int(7),
+                        asm: None,
+                    },
+                ],
+            },
+        ]);
+        prog.var_types = vec![("s".to_string(), crate::ir::IrType::Int)];
+        let c = shir_to_c(&prog);
+        assert!(!c.contains("_sp_ovf"), "arm must veto the array store:\n{c}");
+        assert!(
+            !c.contains("_sp_a"),
+            "no snapshot of the mangled array name:\n{c}"
         );
     }
 

@@ -97,6 +97,8 @@ pub mod const_capture_fold;
 pub mod const_condition_elim;
 pub mod copy_propagation;
 pub mod counted_while_forinit;
+pub mod counted_arith_forinit; // structured-Arith counted while → ForInit (frontend shapes)
+pub mod append_to_store; // counted-loop `a = append(a,v)` → `a[i] = v` (frontend shapes)
 pub mod dead_store_elim;
 pub mod div_mod_pow2;
 pub mod hoist_loop_invariants;
@@ -154,6 +156,8 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("const-condition-elim", const_condition_elim::transform),
         ("copy-propagation", copy_propagation::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
+        ("counted-arith-forinit", counted_arith_forinit::transform),
+        ("append-to-store", append_to_store::transform),
         ("dead-store-elim", dead_store_elim::transform),
         ("div-mod-pow2", div_mod_pow2::transform),
         ("hoist-loop-invariants", hoist_loop_invariants::transform),

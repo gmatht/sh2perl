@@ -607,6 +607,10 @@ fn affine_of_text(text: &str, counter: &str) -> Option<(i64, i64)> {
 /// Affine (a, b) with idx = a*counter + b, or None.
 fn arith_affine(a: &ArithAst, counter: &str) -> Option<(i64, i64)> {
     match a {
+        // A `Cast` is a value coercion (identity for the i64 index
+        // model): treat it as transparent so frontend-emitted keys like
+        // `a[Cast(i)]` forward. The forwarded RHS keeps its own casts.
+        ArithAst::Cast { arg, .. } => arith_affine(arg, counter),
         ArithAst::Num(n) => Some((0, *n)),
         ArithAst::Var(v) | ArithAst::Ident(v) => {
             if v == counter {
@@ -709,25 +713,72 @@ fn counter_of_init(init: &[IrStmt]) -> Option<(String, i64)> {
     if !t.indices.is_empty() || t.var.contains('[') {
         return None;
     }
-    let n = match expr {
+    let n = init_num(expr, &t.var)?;
+    Some((t.var.clone(), n))
+}
+
+/// Init literal, Cast/Assign-tolerant (frontend `i = Cast(Int64, 0)`,
+/// shell `i = "0"`).
+fn init_num(expr: &IrExpr, var: &str) -> Option<i64> {
+    match expr {
         IrExpr::Int(n) => Some(*n),
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
         IrExpr::Arith(a) => match a.as_ref() {
-            ArithAst::Num(n) => Some(*n),
-            ArithAst::Assign { var, op, rhs } if var == &t.var && op == "=" => match rhs.as_ref() {
-                ArithAst::Num(n) => Some(*n),
-                _ => None,
-            },
-            _ => None,
+            ArithAst::Assign { var: v, op, rhs } if v == var && op == "=" => arith_num(rhs),
+            _ => arith_num(a),
         },
         _ => None,
-    };
-    Some((t.var.clone(), n?))
+    }
+}
+
+/// Numeric literal under Cast/Assign(=) wrapping.
+fn arith_num(a: &ArithAst) -> Option<i64> {
+    match a {
+        ArithAst::Num(n) => Some(*n),
+        ArithAst::Cast { arg, .. } => arith_num(arg),
+        ArithAst::Assign { op, rhs, .. } if op == "=" => arith_num(rhs),
+        _ => None,
+    }
+}
+
+/// Strip frontend `Cast` markers (identity for the affine/i64 model).
+fn strip_cast(a: &ArithAst) -> &ArithAst {
+    match a {
+        ArithAst::Cast { arg, .. } => strip_cast(arg),
+        _ => a,
+    }
+}
+
+/// The identifier a (possibly cast-wrapped) arith subtree names.
+fn arith_ident(a: &ArithAst) -> Option<&str> {
+    match strip_cast(a) {
+        ArithAst::Var(v) | ArithAst::Ident(v) => Some(v.as_str()),
+        _ => None,
+    }
 }
 
 /// A `let`-evaluation call in cond position: the shell path lowers
 /// `for ((…))` conds to `exec("let", […])` and a later transform
 /// refines it to `builtin` — accept both (same inert-text audit).
 fn bound_of_cond(cond: &IrExpr, counter: &str) -> Option<String> {
+    // Structured-Arith form (the frontends' `for i in range(N)` / c-style
+    // loops): `i < N` / `i <= N` with a bare bound ident. A literal bound
+    // returns None (no dynamic bound name — the gap-write discipline then
+    // refuses any gap, fail-closed).
+    if let IrExpr::Arith(a) = cond {
+        if let ArithAst::Bin { op, lhs, rhs } = strip_cast(a) {
+            if op == "<" || op == "<=" {
+                if arith_ident(lhs) == Some(counter) {
+                    if let Some(b) = arith_ident(rhs) {
+                        if b.parse::<i64>().is_err() {
+                            return Some(b.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
     // Shared shape check with cond_pure/cond_texts (exec→builtin).
     let args = let_call_args(cond)?;
     let mut texts = Vec::new();
@@ -1252,10 +1303,32 @@ fn substitute_reads(
 
 // ---------- whole-program array discipline ----------
 
+/// `a = setArray(a, [])` — the array's empty initialisation. After a
+/// successful fusion the array is dead, so this store is a dead store;
+/// a frontend-emitted init must not veto the fusion (the shell path
+/// usually has no explicit init statement).
+fn empty_array_init_of(s: &IrStmt, arr: &str) -> bool {
+    let IrStmt::Assign { targets, expr, .. } = s else {
+        return false;
+    };
+    let Some(t) = targets.first() else { return false };
+    if !t.indices.is_empty() || t.var != arr {
+        return false;
+    }
+    match expr {
+        IrExpr::Call { func, args } if func == "setArray" => {
+            matches!(args.get(1), Some(IrExpr::Array(items)) if items.is_empty())
+        }
+        IrExpr::Array(items) => items.is_empty(),
+        _ => false,
+    }
+}
+
 /// True = the array is used outside the fill store / forwarded consumer
 /// reads (veto). Allowed: the fill's store target (l1 body), and plain
 /// `A[<i>]` arith reads inside l2's body (re-verified here, independent
-/// of the substitution above — defense in depth).
+/// of the substitution above — defense in depth), plus the array's empty
+/// initialisation.
 fn array_used_elsewhere(
     stmts: &[IrStmt],
     fill: &Fill,
@@ -1316,7 +1389,15 @@ fn array_used_elsewhere(
                 }
             }
         } else if fill.stmt_hits(s) {
-            return true;
+            // Tolerated: an empty `a = setArray(a, [])` init of a filled
+            // array (dead after fusion). Any other mention vetoes.
+            let empty_ok = fill.arrays().any(|a| empty_array_init_of(s, a))
+                && !fill
+                    .arrays()
+                    .any(|a| stmt_has_arr(s, a) && !empty_array_init_of(s, a));
+            if !empty_ok {
+                return true;
+            }
         }
     }
     false
@@ -1950,5 +2031,120 @@ mod tests {
         assert_eq!(affine_of_text("2*i", "i"), Some((2, 0)));
         assert_eq!(affine_of_text("i", "j"), None);
         assert_eq!(affine_of_text("5", "i"), Some((0, 5)));
+    }
+
+    // ---- frontend-emitted (structured `Arith`) shapes ----
+    // py-sh-go / c-sh-go A1: structured `Arith` cond, `Cast(Int64, …)`
+    // exactness markers, flattened `a[i]` target, composed floor-mod
+    // value, and an explicit `a = setArray(a, [])` init statement. The
+    // shared `counted-arith-forinit` + `append-to-store` passes produce
+    // the loop shapes; fusion must then forward across the Casts.
+    fn fe_cast(a: ArithAst) -> ArithAst {
+        ArithAst::Cast { ty: crate::ir::IrType::Int64, arg: Box::new(a) }
+    }
+    fn fe_header() -> (Vec<IrStmt>, IrExpr, Vec<IrStmt>) {
+        let init = vec![assign("i", arith(ArithAst::Num(0)))];
+        let cond = arith(ArithAst::Bin {
+            op: "<".to_string(),
+            lhs: Box::new(v("i")),
+            rhs: Box::new(v("N")),
+        });
+        let step = vec![assign(
+            "i",
+            arith(ArithAst::IncDec { var: "i".to_string(), delta: 1, prefix: false }),
+        )];
+        (init, cond, step)
+    }
+    fn fe_fill() -> IrStmt {
+        let (init, cond, step) = fe_header();
+        IrStmt::ForInit {
+            init,
+            cond,
+            step,
+            body: vec![IrStmt::Assign {
+                targets: vec![scalar("a[i]")],
+                expr: arith(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(fe_cast(v("i"))),
+                    rhs: Box::new(fe_cast(v("i"))),
+                }),
+                asm: None,
+            }],
+        }
+    }
+    fn fe_consume() -> IrStmt {
+        let (init, cond, step) = fe_header();
+        // ((s + a[Cast(i)]) % M + M) % M
+        let m = || fe_cast(ArithAst::Num(4294967296));
+        let inner = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(fe_cast(v("s"))),
+            rhs: Box::new(ArithAst::Index {
+                var: "a".to_string(),
+                key: Box::new(fe_cast(v("i"))),
+            }),
+        };
+        let value = ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Bin {
+                    op: "%".to_string(),
+                    lhs: Box::new(inner),
+                    rhs: Box::new(m()),
+                }),
+                rhs: Box::new(m()),
+            }),
+            rhs: Box::new(m()),
+        };
+        IrStmt::ForInit {
+            init,
+            cond,
+            step,
+            body: vec![assign("s", arith(value))],
+        }
+    }
+    fn fe_empty_init() -> IrStmt {
+        assign(
+            "a",
+            IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    IrExpr::Str("a".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![]),
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn frontend_cast_shapes_fuse() {
+        let mut prog = vec![fe_empty_init(), fe_fill(), assign("s", str_lit("0")), fe_consume()];
+        assert!(transform(&mut prog), "frontend shapes must fuse");
+        // The two loops collapsed into one; that loop's body no longer
+        // mentions the array (the dead empty init may remain).
+        let loops: Vec<&IrStmt> = prog
+            .iter()
+            .filter(|s| matches!(s, IrStmt::ForInit { .. }))
+            .collect();
+        assert_eq!(loops.len(), 1, "one loop left: {prog:?}");
+        let IrStmt::ForInit { body, .. } = loops[0] else { panic!() };
+        assert!(
+            !body.iter().any(|s| stmt_has_arr(s, "a")),
+            "fused body still reads the array: {body:?}"
+        );
+    }
+
+    #[test]
+    fn frontend_literal_bound_still_vetoes_gap_write() {
+        // `i < 5` has no dynamic bound name: any gap write is unprovable.
+        let mut prog = vec![fe_empty_init(), fe_fill(), assign("s", str_lit("0")), fe_consume()];
+        let IrStmt::ForInit { cond, .. } = &mut prog[1] else { panic!() };
+        *cond = arith(ArithAst::Bin {
+            op: "<".to_string(),
+            lhs: Box::new(v("i")),
+            rhs: Box::new(ArithAst::Num(5)),
+        });
+        assert!(!transform(&mut prog), "literal bound + gap write must veto");
     }
 }
