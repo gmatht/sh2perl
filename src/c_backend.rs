@@ -11143,9 +11143,21 @@ impl Render {
                     (self.arith(lhs), self.arith(rhs))
                 };
                 if *op == "**" {
+                    if self.arith_has_float(lhs) || self.arith_has_float(rhs) {
+                        // float power: libm (math.h always emitted;
+                        // gate links -lm when present)
+                        return format!("(pow((double)({l}), (double)({r})))");
+                    }
                     // no libm on the gate's cc line — integer pow helper
                     self.need_pow = true;
                     format!("_sh_pow({l},{r})")
+                } else if *op == "%"
+                    && (self.arith_has_float(lhs) || self.arith_has_float(rhs))
+                {
+                    // float modulo: fmod (no SIGFPE for FP — NaN on
+                    // zero divisor propagates; Python raises, documented
+                    // divergence shared with the int guard-0 choice)
+                    return format!("(fmod((double)({l}), (double)({r})))");
                 } else if *op == "/" || *op == "%" {
                     // bash survives division by zero (result: error, the
                     // expansion vanishes); C would SIGFPE — guard it.
