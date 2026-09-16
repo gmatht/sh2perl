@@ -494,6 +494,20 @@ impl Render {
     }
 
     /// Array element read: `ARR[i]` (index arrays).
+    /// Python-strict index (`xs[i]`): negative wraps (`len+k`), OOB
+    /// aborts exit(1) (IndexError; prior output stands). Shell never emits
+    /// Index nodes (uses param strings), so this path is Python-only.
+    fn array_index_strict(&mut self, var: &str, key: &str) -> String {
+        let m = self.tls(var);
+        // key is i64 expr (may be negative); len from Vec.
+        format!(
+            "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+               let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+               if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
+               {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+        )
+    }
+
     fn array_elem(&mut self, name: &str, key: &str) -> String {
         if name == "PIPESTATUS" {
             // the pipeline stage rcs (populated by pipeline_stmt); the
@@ -758,6 +772,23 @@ impl Render {
                     "0".to_string()
                 }
             }
+            // numeric reductions (t98 `s += min(xs)`; empty max/min → 0,
+            // Python raises — documented gap, no test covers it).
+            IrExpr::Call { func, args } if func == "sum" || func == "max" || func == "min" => {
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        if func == "sum" {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
+                        } else if func == "max" {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().unwrap_or(0) }}")
+                        } else {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().unwrap_or(0) }}")
+                        }
+                    }
+                    None => "0".to_string(),
+                }
+            }
             IrExpr::Call { func, args } if func == "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text(&text) {
@@ -884,7 +915,7 @@ impl Render {
                     self.assoc_get(var, &ks)
                 } else {
                     let k = self.expr_num(key);
-                    self.array_elem(var, &k)
+                    self.array_index_strict(var, &k)
                 }
             }
             other => self.expr_any(other),
@@ -1325,7 +1356,7 @@ impl Render {
                     self.assoc_get(var, &ks)
                 } else {
                     let k = self.expr_num(key);
-                    self.array_elem(var, &k)
+                    self.array_index_strict(var, &k)
                 }
             }
             IrExpr::Capture { .. } => self.capture_expr_single(e),
@@ -1460,6 +1491,8 @@ impl Render {
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 if (self.is_array(var) || self.is_assoc(var)) && self.declared(var) {
+                    // arith-index stays forgiving (shell `$((arr[i]))`
+                    // uses this path; OOB gives 0 via unwrap_or below).
                     let e = self.array_elem(var, &k);
                     format!("{e}.trim().parse::<i64>().unwrap_or(0)")
                 } else {
@@ -2801,7 +2834,7 @@ impl Render {
                     format!("vec![{}]", self.assoc_get(var, &ks))
                 } else {
                     let k = self.expr_num(key);
-                    format!("vec![{}]", self.array_elem(var, &k))
+                    format!("vec![{}]", self.array_index_strict(var, &k))
                 }
             }
             IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
@@ -3173,7 +3206,7 @@ impl Render {
                     return self.assoc_get(var, &k);
                 }
                 let k = self.key_num_expr(key);
-                return self.array_elem(var, &k);
+                return self.array_index_strict(var, &k);
             }
         }
         "String::new()".to_string()
@@ -4927,6 +4960,23 @@ impl Render {
             "and" => {
                 let b = self.and_bool(args);
                 format!("{{ let _ = {b}; String::new() }}")
+            }
+            // numeric reductions as strings (t98 `_min_xs = min(xs)`;
+            // empty max/min → "" (Python raises; documented)).
+            "sum" | "max" | "min" => {
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        if func == "sum" {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
+                        } else if func == "max" {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().map(|v| v.to_string()).unwrap_or_default() }}")
+                        } else {
+                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
+                        }
+                    }
+                    None => "String::new()".to_string(),
+                }
             }
             _ => {
                 self.mark_todo(&format!("call {func}"));
