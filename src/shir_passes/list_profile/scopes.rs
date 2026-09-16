@@ -622,7 +622,7 @@ fn str_mention_all(text: &str, out: &mut impl FnMut(&str)) {
 }
 
 /// Every identifier token in a code-ish word (`let i++`, eval args).
-fn all_idents(text: &str) -> Vec<String> {
+pub(crate) fn all_idents(text: &str) -> Vec<String> {
     let b = text.as_bytes();
     let mut i = 0usize;
     let mut out = vec![];
@@ -690,7 +690,7 @@ fn is_ident_word(w: &str) -> bool {
 }
 
 /// `$`-reference variable names in a text.
-fn dollar_vars(text: &str) -> Vec<String> {
+pub(crate) fn dollar_vars(text: &str) -> Vec<String> {
     let b = text.as_bytes();
     let mut i = 0usize;
     let mut out = vec![];

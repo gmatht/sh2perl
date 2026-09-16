@@ -137,6 +137,11 @@ pub struct Render {
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
+    /// pass-6 native loop binding in scope: (var, binding). Reads of a
+    /// numeric loop var render as the register-held binding instead of
+    /// the static (the static still gets a writeback per iteration, so
+    /// all other observers see identical values)
+    active_loop: Option<(String, String)>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -848,6 +853,12 @@ impl Render {
     fn read_num(&mut self, name: &str) -> String {
         if let Some(l) = self.captured.get(name) {
             return l.clone();
+        }
+        // pass-6: a native loop binding holds the current value
+        if let Some((v, b)) = self.active_loop.clone() {
+            if v == name {
+                return b;
+            }
         }
         // positionals ($1, ...) read argv (tls undeclared by design).
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
@@ -6251,6 +6262,63 @@ impl Render {
                 self.mark_written(var);
                 match iter {
                     IrExpr::Range { start, end } if self.is_num(var) => {
+                        // pass-6: a clean numeric range binds natively
+                        // (`for i_g in a..=b`, register-held) when the var
+                        // is substitutable: plain scalar static, no
+                        // own-flow writes, no closures/shadowing binders,
+                        // read at least once. The static keeps the
+                        // pre-write (today's init) plus a per-iteration
+                        // writeback, so every other observer (later reads,
+                        // subshell snapshots, thread captures, nested fns)
+                        // sees identical values; body reads just skip the
+                        // TLS/Cell traffic.
+                        let mut native = self.declared(var)
+                            && !self.is_array(var)
+                            && !self.is_assoc(var)
+                            && !is_special_var(var)
+                            && !self.bigint_vars.contains(var)
+                            && !self.str_forced.contains(var)
+                            && !self.local_vars.contains_key(var)
+                            && !self.captured.contains_key(var)
+                            && !self.namerefs.contains_key(var)
+                            && !self.namerefs.values().any(|t| t == var);
+                        let mut binding = String::new();
+                        if native {
+                            let mut u = LoopVarUse::default();
+                            loop_var_scan(body, var, &mut u);
+                            if u.bad || !u.reads {
+                                native = false;
+                            } else {
+                                binding = self.gensym("__sh_lv");
+                            }
+                        }
+                        if native {
+                            let init = self
+                                .write_num(var, &start.to_string())
+                                .trim_end_matches(';')
+                                .to_string();
+                            // the trailing `;` must survive the comment
+                            // (see the legacy arm below)
+                            self.emit(&format!("{init}; // for {var} in {start}..={end}"));
+                            self.emit(&format!("for {binding} in {start}..={end} {{"));
+                            self.loop_depth += 1;
+                            self.depth += 1;
+                            let wb = self
+                                .write_num(var, &binding)
+                                .trim_end_matches(';')
+                                .to_string();
+                            self.emit(&format!("{wb};"));
+                            let old_loop =
+                                self.active_loop.replace((var.to_string(), binding));
+                            for s in body {
+                                self.stmt(s);
+                            }
+                            self.active_loop = old_loop;
+                            self.depth -= 1;
+                            self.loop_depth -= 1;
+                            self.emit("}");
+                            return;
+                        }
                         let init = self.write_num(var, &start.to_string()).trim_end_matches(';').to_string();
                         // the trailing `;` must survive the comment (the
                         // `// for i in N..=M` note would otherwise swallow
@@ -11267,6 +11335,447 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
     Some(out)
 }
 
+/// Pass-6 verdict use-record for one loop body scan.
+#[derive(Default)]
+struct LoopVarUse {
+    /// the var is read in own flow (a native binding must be used)
+    reads: bool,
+    /// substitution is unsound: an own-flow write, a shadowing binder,
+    /// a closure mentioning the var, or a name-taking builtin
+    bad: bool,
+}
+
+/// Builtins that take variable NAMES as words (`read x`, `unset x`,
+/// `printf -v x`, `eval <code>`...). A word naming the loop var is a
+/// write (conservative — `eval` can do anything).
+const LOOP_NAME_BUILTINS: &[&str] = &[
+    "read", "unset", "declare", "local", "typeset", "export", "readonly", "mapfile", "readarray",
+    "getopts", "printf", "let", "eval", "source", ".", "command", "builtin",
+];
+
+/// Can a static-Range numeric loop bind `var` natively? Scans the body:
+/// any own-flow write (assign/declare/arith-assign/loop binders,
+/// name-builtins, `VAR=x` env, captures), any shadowing binder, or any
+/// closure/lambda/arrow mentioning the var vetoes. Reads are recorded
+/// (an unread binding would be an unused-variable warning — skip those).
+fn loop_var_scan(stmts: &[IrStmt], var: &str, u: &mut LoopVarUse) {
+    use crate::shir_passes::list_profile::scopes::{all_idents, dollar_vars};
+    for s in stmts {
+        if u.bad {
+            return;
+        }
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    let base = t.var.split('[').next().unwrap_or(&t.var);
+                    if base == var {
+                        u.bad = true;
+                    }
+                    for ix in &t.indices {
+                        loop_var_scan_expr(ix, var, u);
+                    }
+                }
+                loop_var_scan_expr(expr, var, u);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                // a `local`/`declare` of the loop var shadows it
+                if vars.iter().any(|d| d.name == var) {
+                    u.bad = true;
+                }
+                if let Some(e) = init {
+                    loop_var_scan_expr(e, var, u);
+                }
+            }
+            IrStmt::DeclareArray { var: v, elements, .. } => {
+                if v == var {
+                    u.bad = true;
+                }
+                for e in elements {
+                    loop_var_scan_expr(e, var, u);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                loop_var_scan_expr(cond, var, u);
+                loop_var_scan(then, var, u);
+                for (c, b) in elsifs {
+                    loop_var_scan_expr(c, var, u);
+                    loop_var_scan(b, var, u);
+                }
+                loop_var_scan(else_, var, u);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                loop_var_scan(body, var, u);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        loop_var_scan_expr(m, var, u);
+                    }
+                    // `except ... as V` binds (shadows) V
+                    if e.as_name.as_deref() == Some(var) {
+                        u.bad = true;
+                    }
+                    loop_var_scan(&e.body, var, u);
+                }
+                loop_var_scan(else_body, var, u);
+                loop_var_scan(finally_body, var, u);
+            }
+            IrStmt::For { var: v, iter, body } => {
+                // a nested loop over the same var writes it
+                if v == var {
+                    u.bad = true;
+                }
+                loop_var_scan_expr(iter, var, u);
+                loop_var_scan(body, var, u);
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for b in init.iter().chain(step).chain(body) {
+                    loop_var_scan(std::slice::from_ref(b), var, u);
+                }
+                loop_var_scan_expr(cond, var, u);
+            }
+            IrStmt::While { cond, body } => {
+                loop_var_scan_expr(cond, var, u);
+                loop_var_scan(body, var, u);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                loop_var_scan(body, var, u);
+                loop_var_scan_expr(cond, var, u);
+            }
+            IrStmt::Exec { cmd, args, capture, redirects, env } => {
+                // `x=$(...)` with x == var writes it
+                if capture.as_deref() == Some(var) {
+                    u.bad = true;
+                }
+                // `VAR=x cmd` writes VAR
+                if env.iter().any(|(v, _)| v == var) {
+                    u.bad = true;
+                }
+                // name-taking builtins: a word naming var writes it.
+                // `let`/`eval` take code: any identifier mention writes
+                // (eval can do anything). A dynamic (Var/Ident) word to
+                // these builtins could name var at runtime — reject.
+                if let IrExpr::Str(b, _) = cmd {
+                    if LOOP_NAME_BUILTINS.contains(&b.as_str()) {
+                        let mut hit = false;
+                        for a in args {
+                            match a {
+                                IrExpr::Str(s, _) => {
+                                    if b == "let" || b == "eval" {
+                                        if all_idents(s).iter().any(|v| v == var) {
+                                            hit = true;
+                                        }
+                                    } else if b == "printf" {
+                                        // only `-v var` writes; other
+                                        // words are reads (walked below)
+                                        if s == "-v" {
+                                            hit = true;
+                                        } else if s == var {
+                                            // `printf -vV`? no — a bare
+                                            // var word is a read; but a
+                                            // `-v`-adjacent one writes.
+                                            // handled by window below.
+                                        }
+                                    } else if s == var {
+                                        hit = true;
+                                    }
+                                }
+                                IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                                    if n == var {
+                                        hit = true;
+                                    } else {
+                                        // dynamic name — could be var
+                                        hit = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        // `printf -v V` window (the word after -v names it)
+                        if b == "printf" {
+                            let words: Vec<&str> = args
+                                .iter()
+                                .filter_map(|a| match a {
+                                    IrExpr::Str(s, _) => Some(s.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            for w in words.windows(2) {
+                                if w[0] == "-v" && w[1] == var {
+                                    hit = true;
+                                }
+                            }
+                        }
+                        if hit {
+                            u.bad = true;
+                        }
+                    }
+                }
+                loop_var_scan_expr(cmd, var, u);
+                for a in args {
+                    loop_var_scan_expr(a, var, u);
+                }
+                for (_, v) in env {
+                    loop_var_scan_expr(v, var, u);
+                }
+                for r in redirects {
+                    loop_var_scan_expr(r, var, u);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    loop_var_scan(stage, var, u);
+                }
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    loop_var_scan_expr(x, var, u);
+                }
+            }
+            IrStmt::SetChildError(e) => loop_var_scan_expr(e, var, u),
+            IrStmt::Case { discriminant, clauses } => {
+                loop_var_scan_expr(discriminant, var, u);
+                for c in clauses {
+                    // patterns expand at match time — a $var ref reads it
+                    for p in &c.patterns {
+                        if dollar_vars(p).iter().any(|v| v == var) {
+                            u.reads = true;
+                        }
+                    }
+                    loop_var_scan(&c.body, var, u);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                loop_var_scan(inner, var, u);
+                for r in redirects {
+                    loop_var_scan_expr(&r.target, var, u);
+                }
+            }
+            IrStmt::Function { name, body, named_blocks } => {
+                // deferred execution: any mention of var inside vetoes
+                // (reads would miss loop-top values, writes the static)
+                u.bad = true;
+                let _ = (name, body, named_blocks);
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                loop_var_scan(b, var, u);
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if c.target.as_deref() == Some(var) {
+                        u.bad = true;
+                    }
+                    if let Some(e) = &c.ch {
+                        loop_var_scan_expr(e, var, u);
+                    }
+                    if let Some(e) = &c.value {
+                        loop_var_scan_expr(e, var, u);
+                    }
+                    loop_var_scan(&c.body, var, u);
+                }
+            }
+            IrStmt::Output { value, .. } => loop_var_scan_expr(value, var, u),
+            IrStmt::WriteFile { path, content, .. } => {
+                loop_var_scan_expr(path, var, u);
+                loop_var_scan_expr(content, var, u);
+            }
+            IrStmt::RawText(s) => {
+                if dollar_vars(s).iter().any(|v| v == var) {
+                    u.reads = true;
+                }
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                loop_var_scan_expr(expr, var, u)
+            }
+            IrStmt::Shaderize { var: v, body, .. } => {
+                if v == var {
+                    u.bad = true;
+                }
+                loop_var_scan(body, var, u);
+            }
+            IrStmt::Asm { inputs, outputs, .. } => {
+                for (_, e) in inputs {
+                    loop_var_scan_expr(e, var, u);
+                }
+                for (c, e) in outputs {
+                    if c == var {
+                        u.bad = true;
+                    }
+                    loop_var_scan_expr(e, var, u);
+                }
+            }
+            IrStmt::Ext(n) => {
+                // ForEachLine binds its var (streaming loop)
+                if let Some(fl) =
+                    n.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                {
+                    if fl.var == var {
+                        u.bad = true;
+                    }
+                }
+                for c in n.children() {
+                    loop_var_scan(std::slice::from_ref(c), var, u);
+                }
+            }
+            IrStmt::Expr(e) => loop_var_scan_expr(e, var, u),
+            IrStmt::Continue
+            | IrStmt::Break
+            | IrStmt::Require(_)
+            | IrStmt::Label(_)
+            | IrStmt::Goto(_) => {}
+        }
+    }
+}
+
+fn loop_var_scan_expr(e: &IrExpr, var: &str, u: &mut LoopVarUse) {
+    use crate::shir_passes::list_profile::scopes::dollar_vars;
+    match e {
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+            if n == var {
+                u.reads = true;
+            }
+        }
+        IrExpr::Index { var: v, key } => {
+            if v == var {
+                u.reads = true;
+            }
+            loop_var_scan_expr(key, var, u);
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            loop_var_scan_expr(lhs, var, u);
+            loop_var_scan_expr(rhs, var, u);
+        }
+        IrExpr::Call { func, args } => {
+            // name-taking readers (`getVar(i)`, `param(i,...)`, ...): a
+            // Str first arg naming var reads it
+            const READERS: &[&str] = &[
+                "getVar", "param", "len", "slice", "substr", "default", "arrayLen", "arrayIndex",
+                "line", "listVar",
+            ];
+            if READERS.contains(&func.as_str()) {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    let base = s.split('[').next().unwrap_or(s);
+                    if base == var {
+                        u.reads = true;
+                    }
+                }
+            }
+            for a in args {
+                loop_var_scan_expr(a, var, u);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            loop_var_scan_expr(obj, var, u);
+            for a in args {
+                loop_var_scan_expr(a, var, u);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            loop_var_scan_expr(cond, var, u);
+            loop_var_scan_expr(then, var, u);
+            loop_var_scan_expr(else_, var, u);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            loop_var_scan_expr(expr, var, u);
+            loop_var_scan_expr(default, var, u);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => {
+                        if dollar_vars(s).iter().any(|v| v == var) {
+                            u.reads = true;
+                        }
+                    }
+                    InterpPart::Expr(x) => loop_var_scan_expr(x, var, u),
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => loop_var_scan_expr(expr, var, u),
+        IrExpr::Arrow(body) | IrExpr::Lambda { body, .. } => {
+            // deferred execution mentioning var vetoes
+            u.bad = true;
+            let _ = body;
+        }
+        IrExpr::Array(items) => {
+            for it in items {
+                loop_var_scan_expr(it, var, u);
+            }
+        }
+        IrExpr::ArrayComp { var: v, iter, elem, cond } => {
+            // the comprehension binder shadows var
+            if v == var {
+                u.bad = true;
+            }
+            loop_var_scan_expr(iter, var, u);
+            loop_var_scan_expr(elem, var, u);
+            if let Some(c) = cond {
+                loop_var_scan_expr(c, var, u);
+            }
+        }
+        IrExpr::Arith(a) => loop_var_scan_arith(a, var, u),
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                loop_var_scan_expr(v, var, u);
+            }
+        }
+        IrExpr::Splice(x) => loop_var_scan_expr(x, var, u),
+        IrExpr::RawExpr(s) => {
+            if dollar_vars(s).iter().any(|v| v == var) {
+                u.reads = true;
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                loop_var_scan_expr(c, var, u);
+            }
+        }
+        IrExpr::Int(_)
+        | IrExpr::Str(_, _)
+        | IrExpr::Bool(_)
+        | IrExpr::Json(_)
+        | IrExpr::Range { .. }
+        | IrExpr::Regex { .. } => {}
+    }
+}
+
+fn loop_var_scan_arith(a: &ArithAst, var: &str, u: &mut LoopVarUse) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if n == var {
+                u.reads = true;
+            }
+        }
+        ArithAst::Index { var: v, key } => {
+            if v == var {
+                u.reads = true;
+            }
+            loop_var_scan_arith(key, var, u);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            loop_var_scan_arith(lhs, var, u);
+            loop_var_scan_arith(rhs, var, u);
+        }
+        ArithAst::Un { arg, .. } => loop_var_scan_arith(arg, var, u),
+        ArithAst::Cond { test, then, else_, .. } => {
+            loop_var_scan_arith(test, var, u);
+            loop_var_scan_arith(then, var, u);
+            loop_var_scan_arith(else_, var, u);
+        }
+        ArithAst::Assign { var: v, rhs, .. } => {
+            if v == var {
+                u.bad = true;
+            }
+            loop_var_scan_arith(rhs, var, u);
+        }
+        ArithAst::IncDec { var: v, .. } => {
+            if v == var {
+                u.bad = true;
+            }
+        }
+        ArithAst::Cast { arg, .. } => loop_var_scan_arith(arg, var, u),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+    }
+}
+
 /// Pass-2 locals: scalar vars whose every mention sits in a single
 /// non-risky scope (main or one user function). Arrays/assoc keep global
 /// storage (the list lowering owns them), and anything a dynamic-name
@@ -11658,6 +12167,27 @@ mod tests {
         let commands = Parser::new(src).parse().expect("parse");
         let prog = crate::shir::ast_to_ir(&commands);
         shir_to_rust(&prog)
+    }
+
+    #[test]
+    fn range_loop_binds_natively() {
+        // pass-6: a clean static-range numeric loop binds the var to a
+        // register-held loop var; the static keeps only the pre-write +
+        // writeback (no per-read TLS traffic in the body)
+        let out = render("for i in $(seq 1 3)\ndo\n  echo $i\ndone\n");
+        assert!(out.contains("for __sh_lv"), "{out}");
+        assert!(out.contains("..="), "{out}");
+        // writeback present, but no static READS in the body
+        assert!(out.contains(".set(__sh_lv"), "{out}");
+        assert!(!out.contains("__SHV_i.with(|v| v.get())"), "{out}");
+    }
+
+    #[test]
+    fn range_loop_vetoes_writes() {
+        // an own-flow write of the loop var keeps the legacy scheme
+        let out = render("for i in $(seq 1 3)\ndo\n  i=9\n  echo $i\ndone\n");
+        assert!(!out.contains("for __sh_lv"), "{out}");
+        assert!(out.contains("__SHV_i"), "{out}");
     }
 
     #[test]
