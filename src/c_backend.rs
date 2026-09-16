@@ -175,6 +175,8 @@ pub struct Render {
     depth: usize,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
+    /// Frontend Float-verdict vars (shadow set — see shir_to_c).
+    float_vars: HashSet<String>,
     /// var name -> conservative max string length (fbedac4's
     /// analyze_string_lengths); None = unbounded. Only vars in the
     /// analysis' assign set appear.
@@ -421,6 +423,8 @@ pub struct Render {
     need_isint31: bool,
     /// exact __int128-to-decimal helper (small-int sum past i64)
     need_i128: bool,
+    /// Python-repr float formatting helper emitted.
+    need_pyfloat: bool,
     /// GMP bigint runtime (the py-sh-go proven-big regime): set when
     /// any Cast(Int64) arith is rendered — <gmp.h> + _sh_mpz_* helpers.
     /// The gate links -lgmp (libgmp-dev installed); programs without
@@ -6146,6 +6150,18 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         .filter(|(_, t)| *t == IrType::Int)
         .cloned()
         .collect();
+    // frontend Float verdicts (py-sh-go Float(64)/Float(32)): kept ASIDE
+    // in `float_vars`, never merged into var_types (which the recompute
+    // below rebuilds Int/Str-only). Every existing match on var_types
+    // therefore sees exactly what it saw before; only the new
+    // is_float-gated paths diverge — and only for vars no shell source
+    // can produce.
+    let frontend_float: HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| matches!(t, IrType::Float(_)))
+        .map(|(n, _)| n.clone())
+        .collect();
     prog.var_types = crate::shir::analyze_var_types(&prog);
     // The frontend's Int verdicts are authoritative where the
     // bash-source heuristic (numeric_lift_vars, which lifts only
@@ -6275,6 +6291,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.profile_bounds = profile_bounds;
     r.i128_vars = i128_vars;
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.float_vars = frontend_float;
     r.var_lifetimes = prog.var_lifetimes.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
     r.var_storage = prog.var_storage.iter().cloned().collect();
@@ -7343,6 +7360,152 @@ impl Render {
             && self.var_types.get(name).copied() == Some(IrType::Int)
     }
 
+    /// A Float-verdict var (frontend `Float(64)`/`Float(32)` shadow set):
+    /// homed as C `double`/`float` instead of `char*`. Shell sources
+    /// never carry Float verdicts (no float syntax), so this is false
+    /// throughout the shell gate — zero behavior change there by
+    /// construction.
+    fn is_float(&self, name: &str) -> bool {
+        !self.force_str.contains(name) && self.float_vars.contains(name)
+    }
+
+    /// True when an expression denotes a float value in a string
+    /// context: a float-homed var, float-valued arith, or float arith
+    /// text (literals vanishing through folds keep their dot).
+    fn expr_is_float_valued(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => self.is_float(name),
+            IrExpr::Arith(a) => self.arith_has_float(a),
+            IrExpr::Call { func, args } if func == "arith" => {
+                matches!(Self::str_arg(args, 0).as_deref(), Some(s) if self.arith_text_is_float(s))
+            }
+            _ => false,
+        }
+    }
+
+    /// Double-valued RHS for a float-homed store: native double
+    /// expressions where the shape allows (arith text via the mathfunc
+    /// parser — already double-capable — structured Arith via arith(),
+    /// literals directly), else `atof` of the string form (always
+    /// value-correct: atof parses decimal text; unparseable -> 0.0,
+    /// the same class as the existing atoll->0 fallback).
+    fn float_rhs(&mut self, expr: &IrExpr) -> String {
+        match expr {
+            IrExpr::Call { func, args } if func == "arith" => {
+                if let [IrExpr::Str(text, _)] = args.as_slice() {
+                    if let Some(v) = self.mathfunc_arith_c(text) {
+                        return format!("(double)({v})");
+                    }
+                }
+                format!("atof({})", self.value_c(expr))
+            }
+            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Int(i) => format!("(double){i}"),
+            IrExpr::Str(s, _) => {
+                let t = s.trim();
+                // float-text literal stays a literal (never fold 100.0
+                // to 100 — floatness is load-bearing for prints)
+                if t.parse::<f64>().is_ok() && (t.contains('.') || t.contains('e') || t.contains('E')) {
+                    format!("(double)({t})")
+                } else {
+                    format!("atof({})", Self::cstr(s))
+                }
+            }
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                if self.is_float(name) {
+                    self.c_ident(name)
+                } else {
+                    format!("atof({})", self.value_c(expr))
+                }
+            }
+            _ => format!("atof({})", self.value_c(expr)),
+        }
+    }
+
+    /// True when an arith tree reads a float-homed var (float-valued
+    /// expression — printed/compared in double, never truncated).
+    fn arith_has_float(&self, a: &crate::ir::ArithAst) -> bool {
+        match a {
+            crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => self.is_float(n),
+            crate::ir::ArithAst::Index { key, .. } => self.arith_has_float(key),
+            crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+                self.arith_has_float(lhs) || self.arith_has_float(rhs)
+            }
+            crate::ir::ArithAst::Un { arg, .. } => self.arith_has_float(arg),
+            crate::ir::ArithAst::Cond { test, then, else_ } => {
+                self.arith_has_float(test)
+                    || self.arith_has_float(then)
+                    || self.arith_has_float(else_)
+            }
+            crate::ir::ArithAst::Assign { var, rhs, .. } => {
+                self.is_float(var) || self.arith_has_float(rhs)
+            }
+            crate::ir::ArithAst::IncDec { var, .. } => self.is_float(var),
+            crate::ir::ArithAst::Cast { arg, .. } => self.arith_has_float(arg),
+            crate::ir::ArithAst::Num(_) | crate::ir::ArithAst::Sizeof(_) => false,
+        }
+    }
+
+    /// Python-repr text of a double C expression via temp (mirrors the
+    /// i128/bigint decimal-temp pattern).
+    fn pyfloat_temp(&mut self, expr: &str) -> String {
+        self.need_pyfloat = true;
+        let vb = self.vbuf_temp();
+        self.emit(&format!("_sh_pyfloat_str(&{vb}, {expr});"));
+        format!("{vb}.p")
+    }
+
+    /// True when arith text denotes a float computation: a float literal
+    /// (`\d.\d`) or a reference to a float-homed var.
+    fn arith_text_is_float(&self, text: &str) -> bool {
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_ascii_digit() {
+                // float literal `d.d` (an int followed by `.digits`
+                // is a float even in shell-ish texts)
+                let mut j = i;
+                while j < b.len() && (b[j] as char).is_ascii_digit() {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'.'
+                    && j + 1 < b.len()
+                    && (b[j + 1] as char).is_ascii_digit()
+                {
+                    return true;
+                }
+                i = j;
+            } else if c.is_ascii_alphabetic() || c == '_' {
+                let mut j = i;
+                while j < b.len()
+                    && ((b[j] as char).is_ascii_alphanumeric() || b[j] == b'_')
+                {
+                    j += 1;
+                }
+                if self.is_float(&text[i..j]) {
+                    return true;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    /// C type for a float-homed var (f32-narrow proof -> `float`).
+    fn float_ctype(&self, name: &str) -> &'static str {
+        // width rides with the frontend verdict; the shadow set keeps
+        // only names (recompute wipes var_types), so consult the f32
+        // proof directly when present
+        if crate::transforms::f32_narrow::is_f32_var(name) {
+            "float"
+        } else {
+            "double"
+        }
+    }
+
     /// A store var that OWNS heap storage (a `char*` assigned via
     /// strdup/malloc) and is therefore safe to `free()`. Excludes the
     /// non-heap store shapes: Int vars (`long long`), bigint vars
@@ -7352,6 +7515,7 @@ impl Render {
     fn is_heap_store_var(&self, name: &str) -> bool {
         self.store.contains(name)
             && !self.is_num(name)
+            && !self.is_float(name)
             && !self.bigint_vars.contains(name)
             && !self.const_lifted.contains(name)
             && self.buf_bound(name).is_none()
@@ -8980,6 +9144,34 @@ impl Render {
             self.emit("  if (*s) return 0;");
             self.emit("  if (v > 2147483648LL) return 0;");
             self.emit("  return 1;");
+            self.emit("}");
+            self.emit("");
+        }
+        if self.need_pyfloat {
+            // Python-repr float formatting: %.17g round-trips exactly;
+            // strip mantissa trailing zeros for the shortest spelling
+            // (0.1 not 0.10000000000000001); integral values keep `.0`
+            // (5.0 not 5). inf/nan spell as Python does.
+            self.emit("/* Python-repr double formatting (shortest round-trip) */");
+            self.emit("static void _sh_pyfloat_str(_sh_vbuf *d, double v) {");
+            self.emit("  char tmp[64];");
+            self.emit("  if (v != v) { _sh_vgrow(d, 4); d->p[0]='n'; d->p[1]='a'; d->p[2]='n'; d->p[3]=0; return; }");
+            self.emit("  if (v > 1e308 || v < -1e308) { _sh_vgrow(d, 4); d->p[0]='i'; d->p[1]='n'; d->p[2]='f'; d->p[3]=0; return; }");
+            self.emit("  snprintf(tmp, sizeof tmp, \"%.17g\", v);");
+            self.emit("  char *e = strchr(tmp, 'e');");
+            self.emit("  char *end = e ? e : tmp + strlen(tmp);");
+            self.emit("  char *dot = strchr(tmp, '.');");
+            self.emit("  if (dot && dot < end) {");
+            self.emit("    while (end > dot + 1 && end[-1] == '0') end--;");
+            self.emit("    if (end == dot + 1) { end[0] = '0'; end[1] = 0; end = end + 1; } else { *end = 0; }");
+            self.emit("    if (e) { memmove(end, e, strlen(e) + 1); }");
+            self.emit("  } else if (!e) {");
+            self.emit("    // integral value, no dot from %.17g: append .0");
+            self.emit("    *end = '.'; end[1] = '0'; end[2] = 0;");
+            self.emit("  }");
+            self.emit("  size_t n = strlen(tmp) + 1;");
+            self.emit("  _sh_vgrow(d, n);");
+            self.emit("  memcpy(d->p, tmp, n);");
             self.emit("}");
             self.emit("");
         }
@@ -10876,6 +11068,9 @@ impl Render {
                 }
                 if self.is_num(name) {
                     self.c_ident(name)
+                } else if self.is_float(name) {
+                    // homed double reads directly (no atoll truncation)
+                    self.c_ident(name)
                 } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
                     // `$1` in `$(( ))` — a lifted fn's real C param, else
                     // the caller's _sh_argv (fnValue swaps it per call).
@@ -11183,7 +11378,10 @@ impl Render {
         // (see the Assign arm). Only literal RHSs are lifted — a
         // non-literal init would need a runtime write (and possibly a
         // var reference declared later in the hoist order).
-        if let Some(rhs) = self.const_rhs.get(v).cloned() {
+        // Float vars skip const lifting (a `const char*` would mistype;
+        // they get `double` decls plus regular assigns below instead)
+        if self.is_float(v) {
+        } else if let Some(rhs) = self.const_rhs.get(v).cloned() {
             // numeric vars need a numeric initializer: the Str RHS parses
             // as an integer (that is exactly the numeric lift's criterion)
             let init = if self.is_num(v) {
@@ -11227,7 +11425,10 @@ impl Render {
                 }
             }
         }
-        if self.is_num(v) {
+        if self.is_float(v) {
+            let ct = self.float_ctype(v);
+            self.emit(&format!("{ct} {name} = 0;"));
+        } else if self.is_num(v) {
             if self.i128_vars.contains(v) {
                 // SH2_ASSUME_OBSERVED_WIDTHS middle tier: 65..128-bit
                 // observed magnitudes are exact in __int128 (no GMP).
@@ -13360,7 +13561,11 @@ fn param_copy_alias(
     /// A char* read of a string-typed/untyped var (NULL-safe: unset vars
     /// render as the empty string, matching bash's unset semantics in
     /// expansions).
+    #[track_caller]
     fn store_ref(&self, name: &str) -> String {
+        if name == "h" || name == "c" {
+            eprintln!("DBG store_ref({}) from {}", name, std::panic::Location::caller());
+        }
         // nameref: read ultimate target (BASHC_FIX typeset -n). Positional
         // params ($1…) never alias (skip resolve for digit names).
         let resolved;
@@ -14307,6 +14512,13 @@ fn param_copy_alias(
                     self.emit(&format!("_sh_i128_str(&{vb}, {});", self.c_ident(name)));
                     return format!("{vb}.p");
                 }
+                if self.is_float(name) {
+                    // homed double in a string context: Python repr
+                    return self.pyfloat_temp(&self.c_ident(name));
+                }
+                if self.is_float(name) {
+                    return self.pyfloat_temp(&self.c_ident(name));
+                }
                 if self.is_num(name) {
                     self.num_temp(&self.c_ident(name))
                 } else {
@@ -14405,6 +14617,9 @@ fn param_copy_alias(
                     if name.chars().all(|c| c.is_ascii_digit()) {
                         return self.positional_str_l(&name);
                     }
+                    if self.is_float(&name) {
+                        return self.pyfloat_temp(&self.c_ident(&name));
+                    }
                     if self.is_num(&name) {
                         self.num_temp(&self.c_ident(&name))
                     } else if self.arrays.contains(&name) {
@@ -14500,6 +14715,9 @@ fn param_copy_alias(
                     // (`echo "$(( ))"`) is the fallback for texts the
                     // parser cannot handle.
                     if let Some(s) = Self::str_arg(args, 0) {
+                        // float arith text in a string context renders
+                        // Python-repr (never %lld-truncated)
+                        let text_is_float = self.arith_text_is_float(&s);
                         // ${#arr[@]} counts go NATIVE
                         let substituted = subst_array_counts(&s);
                         if substituted != *s {
@@ -14511,6 +14729,9 @@ fn param_copy_alias(
                                 // apply_array_counts.
                                 let native_cexpr = self.arith(&ast);
                                 let v2 = self.apply_array_counts(&native_cexpr);
+                                if text_is_float {
+                                    return self.pyfloat_temp(&v2);
+                                }
                                 return self.num_temp(&v2);
                             }
                         }
@@ -14521,6 +14742,9 @@ fn param_copy_alias(
                             } else {
                                 self.arith(&ast)
                             };
+                            if text_is_float {
+                                return self.pyfloat_temp(&v);
+                            }
                             return self.num_temp(&v);
                         }
                         // zsh-mathfunc texts (`int(sqrt($1)) + 1`) — the
@@ -14528,6 +14752,9 @@ fn param_copy_alias(
                         // capture (which real bash cannot even run: a
                         // mathfunc call is a bash arith SYNTAX error)
                         if let Some(v) = self.mathfunc_arith_c(&s) {
+                            if text_is_float {
+                                return self.pyfloat_temp(&v);
+                            }
                             return self.num_temp(&v);
                         }
                         let s = s.clone();
@@ -20023,6 +20250,11 @@ fn param_copy_alias(
         if self.is_num(name) {
             return format!("(long long)({})", self.c_ident(name));
         }
+        if self.is_float(name) {
+            // homed double (shell sources never mark Float, so int
+            // texts keep their exact shapes)
+            return format!("(double)({})", self.c_ident(name));
+        }
         format!("(long long)atoll({})", self.store_read(name))
     }
 
@@ -24508,6 +24740,9 @@ fn param_copy_alias(
                     vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)]
                 } else if self.is_num(name) {
                     vec![Part::Arg(self.c_ident(name), self.num_spec(e))]
+                } else if self.is_float(name) {
+                    let t = self.pyfloat_temp(&self.c_ident(name));
+                    vec![Part::Arg(t, NumSpec::Str)]
                 } else {
                     vec![Part::Arg(self.c_ident(name), NumSpec::Str)]
                 }
@@ -24542,6 +24777,11 @@ fn param_copy_alias(
                 if self.is_bigint_arith(a) {
                     // bigint print: exact decimal text
                     vec![Part::Arg(self.bigint_decimal(a), NumSpec::Str)]
+                } else if self.arith_has_float(a) {
+                    // float-valued arith prints Python-repr (5.0 not 5)
+                    let av = self.arith(a);
+                    let t = self.pyfloat_temp(&av);
+                    vec![Part::Arg(t, NumSpec::Str)]
                 } else if self.arith_mentions_i128(a) {
                     // __int128 print: exact decimal text
                     self.need_i128 = true;
@@ -24586,10 +24826,8 @@ fn param_copy_alias(
                                 NumSpec::Str,
                             )];
                         }
-                        if self.var_types.contains_key(name) {
+                        if self.var_types.contains_key(name) || self.is_float(name) {
                             if self.tiered_vars.contains(name) {
-                                let p = self.tiered_decimal(name);
-                                return vec![Part::Arg(p, NumSpec::Str)];
                             }
                             if self.bigint_vars.contains(name) {
                                 // GMP slot printed: exact decimal text
@@ -24604,6 +24842,11 @@ fn param_copy_alias(
                                 let vb = self.vbuf_temp();
                                 self.emit(&format!("_sh_i128_str(&{vb}, {});", self.c_ident(name)));
                                 return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
+                            }
+                            if self.is_float(name) {
+                                // homed double printed: Python repr
+                                let t = self.pyfloat_temp(&self.c_ident(name));
+                                return vec![Part::Arg(t, NumSpec::Str)];
                             }
                             let spec = if self.is_num(name) {
                                 self.num_spec(e)
@@ -26640,7 +26883,10 @@ fn param_copy_alias(
                     return;
                 }
                 let is_num = self.is_num(&t.var);
-                let rhs = if is_num {
+                let is_float = self.is_float(&t.var);
+                let rhs = if is_float {
+                    self.float_rhs(expr)
+                } else if is_num {
                     if let IrExpr::Call { func, args } = expr {
                         if func == "arith" {
                             // `n=$(( dyn ))` — the arith VALUE (the
@@ -26722,9 +26968,9 @@ fn param_copy_alias(
                 // A stub call (sh2_*) returns long long; cast for char*
                 // targets so the draft always compiles (the stub exits 2
                 // before returning, so the value never matters).
-                if !is_num && rhs.starts_with("sh2_") {
+                if !is_num && !is_float && rhs.starts_with("sh2_") {
                     self.emit(&format!("{name} = (char*)({rhs});"));
-                } else if !is_num {
+                } else if !is_num && !is_float {
                     // COPY: the RHS may be (or alias) a temp buffer that
                     // a later statement rewrites (a sibling snprintf
                     // self-aliases `snprintf(_sN, "%s * %s", _sN, x)`),
@@ -26894,6 +27140,17 @@ fn param_copy_alias(
                 }
             }
             IrStmt::Output { value, newline, .. } => {
+                // float-valued output prints Python-repr (5.0 not 5)
+                if self.expr_is_float_valued(value) {
+                    let d = self.float_rhs(value);
+                    let t = self.pyfloat_temp(&d);
+                    if *newline {
+                        self.emit(&format!("printf(\"%s\\n\", {t});"));
+                    } else {
+                        self.emit(&format!("fputs({t}, stdout);"));
+                    }
+                    return;
+                }
                 let v = self.value_c(value);
                 if *newline {
                     self.emit(&format!("printf(\"%s\\n\", (char*)({v}));"));
