@@ -1482,7 +1482,10 @@ impl Render {
                 if !name.is_empty()
                     && name.chars().all(|c| c.is_ascii_digit())
                     && self.num_param_cache.contains(name)
+                    && !self.bigint_vars.contains(name)
                 {
+                    // cached i64 (entry-bound). Skipped for bigint-tainted
+                    // (huge argv would truncate to 0 via i64 parse — t90).
                     format!("__pn_{name}")
                 } else {
                     self.getvar_num(name)
@@ -1514,6 +1517,32 @@ impl Render {
                     "&&" => format!("(({l} != 0 && {r} != 0) as i64)"),
                     "||" => format!("(({l} != 0 || {r} != 0) as i64)"),
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
+                        // BigInt compare (t89 huge `%`/`//` results vs 0).
+                        // If either side tainted/huge, render both as BigInt
+                        // (numeric compare, not string).
+                        // BigInt compare (t89 huge mod vs 0): if either
+                        // side tainted/huge, render both as numeric BigInt.
+                        {
+                            use num_bigint::BigInt;
+                            fn side_big(x: &ArithAst, big: &BTreeSet<String>) -> bool {
+                                if arith_uses_bigint(x, big) {
+                                    return true;
+                                }
+                                eval_arith_bigint(x)
+                                    .map(|v| {
+                                        v > BigInt::from(i64::MAX)
+                                            || v < BigInt::from(i64::MIN)
+                                    })
+                                    .unwrap_or(false)
+                            }
+                            if side_big(lhs, &self.bigint_vars)
+                                || side_big(rhs, &self.bigint_vars)
+                            {
+                                let lb = self.arith_bigint(lhs);
+                                let rb = self.arith_bigint(rhs);
+                                return format!("(({lb} {op} {rb}) as i64)");
+                            }
+                        }
                         format!("(({l} {op} {r}) as i64)")
                     }
                     // widen to i64 (unconstrained literal-literal ops
@@ -2991,6 +3020,27 @@ impl Render {
                     }
                     None => {
                         self.mark_todo("sortedIntJoin without var");
+                        "vec![String::new()]".to_string()
+                    }
+                }
+            }
+            "sortedBigintJoin" => {
+                // sorted bigint-list print (t90 `sorted(f)` with huge).
+                // Numeric sort via BigInt parse (handles > i64); dedup by
+                // BigInt equality (mirrors sortedIntJoin set semantics).
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        let mut s = String::from("vec![{ let mut __sv = ");
+                        s.push_str(&m);
+                        s.push_str(".with(|v| v.borrow().clone()); ");
+                        s.push_str("__sv.sort_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }); ");
+                        s.push_str("__sv.dedup_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }); ");
+                        s.push_str("__sv.join(\", \") }] ");
+                        s
+                    }
+                    None => {
+                        self.mark_todo("sortedBigintJoin without var");
                         "vec![String::new()]".to_string()
                     }
                 }
@@ -5961,7 +6011,7 @@ impl Render {
         // bigint taint (t87 huge consts/propagations; needs prog.subs).
         {
             let mut big = BTreeSet::new();
-            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            self.bigint_vars = big;
+            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            self.bigint_vars = big;
         }
 
         // Pass 2: render the body first (helper flags known before preamble).
@@ -6326,6 +6376,17 @@ fn helper_source(h: &str) -> &'static str {
 }"#,
         "mod" => r#"fn __sh_mod(a: i64, b: i64) -> i64 {
     if b == 0 { __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 } else { a % b }
+}"#,
+        // zero-remainder test for huge dividends (t89 `n % i == 0`).
+        // Parses via BigInt (correct past i64); small divisors fast
+        // enough (parse dominates, still beats Python). i64 callers
+        // unaffected (separate helper).
+        "mod_is_zero" => r#"fn __sh_mod_is_zero(a: &str, b: &str) -> bool {
+    use num_bigint::BigInt;
+    let av: BigInt = a.trim().parse().unwrap_or(BigInt::from(0));
+    let bv: BigInt = b.trim().parse().unwrap_or(BigInt::from(0));
+    if bv == BigInt::from(0) { __SH_ARITH_ERR.store(true, Ordering::SeqCst); return false; }
+    (av % bv) == BigInt::from(0)
 }"#,
         "arith_err" => r#"#[allow(dead_code)] fn __sh_arith_err() -> bool { __SH_ARITH_ERR.swap(false, Ordering::SeqCst) }"#,
         "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
@@ -9340,6 +9401,62 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 
 /// Collect bigint-tainted vars (assigned huge consts or BigInt results).
 /// Fixpoint (max 10 rounds; t87 converges in 1-2).
+/// Mark vars assigned huge literals (t90 `n = 2**64+1` as decimal
+/// text; mods/compares on them need BigInt, not i64).
+fn collect_huge_literal_assigns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    use num_bigint::BigInt;
+    fn rhs_huge(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(s, _) => {
+                let t = s.trim().trim_start_matches(['+', '-']);
+                // decimal digits only, > 18 digits (past i64::MAX 19 digits?
+                // i64::MAX is 19 digits; use > 18 to be safe? Actually
+                // 19-digit values may still fit (up to 922...). Parse to check.
+                if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(v) = t.parse::<BigInt>() {
+                        return v > BigInt::from(i64::MAX)
+                            || v < BigInt::from(i64::MIN);
+                    }
+                }
+                false
+            }
+            IrExpr::Arith(a) => eval_arith_bigint(a)
+                .map(|v| {
+                    v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if rhs_huge(expr) {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => collect_huge_literal_assigns(body, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_huge_literal_assigns(then, out);
+                for (_, b) in elsifs {
+                    collect_huge_literal_assigns(b, out);
+                }
+                collect_huge_literal_assigns(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body) => collect_huge_literal_assigns(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BTreeSet<String>) {
     // coarse: any huge const call arg ⇒ all assigned vars bigint (t89:
     // `small_factors(2**64+1)`; callee params/vars must hold huge values).
