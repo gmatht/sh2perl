@@ -8535,6 +8535,1159 @@ pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
 /// Width a [lo, hi] range maps to (target type table — C/Rust/GLSL).
 /// u64 fires only past signed-64 — a range only a C-frontend unsigned
 /// integer can produce (bash's arithmetic never leaves i64).
+// ── py2cy analysis support: exact evaluation, use-safety, widths ──
+// (A1 ports of the Go autocython proof rules in
+// frontends/py-sh-go/autocython_ranges.go `unsafeTypedNames` and
+// autocython_width.go. The shell-oriented `arith_range` above models bash
+// WRAPPING (`wrap_interval`); everything here is the Python-int reading:
+// unbounded values, any overflow is unknown.)
+
+/// Frontend `%` desugar `((a % b) + b) % b` (emitted when the operands
+/// are not plain-provable): returns the source `(a, b)`. Structural
+/// (`ArithAst: PartialEq`) — a hand-written identical shape means the
+/// same exact computation.
+fn as_mod_desugar<'a>(
+    lhs: &'a crate::ir::ArithAst,
+    rhs: &'a crate::ir::ArithAst,
+) -> Option<(&'a crate::ir::ArithAst, &'a crate::ir::ArithAst)> {
+    use crate::ir::ArithAst::Bin;
+    let Bin { op: o1, lhs: l1, rhs: r1 } = lhs else {
+        return None;
+    };
+    if o1 != "+" {
+        return None;
+    }
+    let Bin { op: o2, lhs: a, rhs: b1 } = &**l1 else {
+        return None;
+    };
+    if o2 != "%" || r1.as_ref() != rhs || b1.as_ref() != rhs {
+        return None;
+    }
+    Some((a, b1.as_ref()))
+}
+
+/// Frontend `//` desugar `(a - pythonmod(a, b)) / b` → the source
+/// `(a, b)`. The subtraction is exact (remainder removed), so C
+/// truncation coincides with Python floor — no veto inside.
+fn as_div_desugar<'a>(
+    lhs: &'a crate::ir::ArithAst,
+    rhs: &'a crate::ir::ArithAst,
+) -> Option<(&'a crate::ir::ArithAst, &'a crate::ir::ArithAst)> {
+    use crate::ir::ArithAst::Bin;
+    let Bin { op: o1, lhs: a, rhs: pm } = lhs else {
+        return None;
+    };
+    if o1 != "-" {
+        return None;
+    }
+    // pm must be `((a % b) + b) % b` over the SAME a, b
+    let Bin { op: o2, lhs: inner, rhs: b3 } = &**pm else {
+        return None;
+    };
+    if o2 != "%" || b3.as_ref() != rhs {
+        return None;
+    }
+    let (pa, pb) = as_mod_desugar(inner, rhs)?;
+    if pa != a.as_ref() || pb != rhs {
+        return None;
+    }
+    Some((a.as_ref(), rhs))
+}
+
+/// Exact (non-wrapping) interval evaluation of an arith tree for the
+/// Python-int reading: vars from `env` (absent = unknown), Nums exact,
+/// checked i128 operators — overflow, divide-by-zero, negative `**`
+/// exponent, unknown nodes, and float-producing `/` yield None.
+/// `%`/`//` use Python floor semantics (divisor range containing 0, or a
+/// non-point divisor straddling signs the analysis cannot bound, yields
+/// None). Comparisons yield [0,1] (always i64-safe — C comparison of two
+/// long longs cannot wrap).
+pub fn arith_range_exact(
+    a: &crate::ir::ArithAst,
+    env: &std::collections::HashMap<String, (i128, i128)>,
+) -> Option<(i128, i128)> {
+    use crate::ir::ArithAst::*;
+    match a {
+        Num(n) => Some((*n as i128, *n as i128)),
+        Var(n) | Ident(n) => env.get(n).copied(),
+        Index { .. } => None,
+        Bin { op, lhs, rhs } => {
+            let o = op.as_str();
+            // comparisons are always i64-contained
+            if matches!(o, "==" | "!=" | "<" | ">" | "<=" | ">=") {
+                return Some((0, 1));
+            }
+            // `%` desugar: evaluate the source op (floor), not the
+            // branchless lowering (whose inner `+` would veto sound
+            // participants — t90's loop counter)
+            if o == "%" {
+                if let Some((a, b)) = as_mod_desugar(lhs, rhs) {
+                    let (l0, l1) = arith_range_exact(a, env)?;
+                    let (r0, r1) = arith_range_exact(b, env)?;
+                    let _ = (l0, l1);
+                    if r0 > 0 {
+                        return Some((0, r1 - 1));
+                    } else if r1 < 0 {
+                        return Some((r0 + 1, 0));
+                    }
+                    return None;
+                }
+            }
+            // `//` desugar: source floor-div (exact division inside)
+            if o == "/" {
+                if let Some((a, b)) = as_div_desugar(lhs, rhs) {
+                    let (l0, l1) = arith_range_exact(a, env)?;
+                    let (r0, r1) = arith_range_exact(b, env)?;
+                    if r0 <= 0 && r1 >= 0 {
+                        return None;
+                    }
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &bb in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, bb)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    return Some((lo.checked_sub(1)?, hi.checked_add(1)?));
+                }
+            }
+            let (l0, l1) = arith_range_exact(lhs, env)?;
+            let (r0, r1) = arith_range_exact(rhs, env)?;
+            match o {
+                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
+                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+                "*" => {
+                    let vs = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    Some((*vs.iter().min()?, *vs.iter().max()?))
+                }
+                "**" => {
+                    if !(r0 == r1 && r0 >= 0 && l0 == l1) {
+                        return None;
+                    }
+                    pow_exact(l0, r0)
+                }
+                "%" => {
+                    // Python sign-of-divisor: the DIVISOR decides alone
+                    // (`a % m` needs no dividend bound). Point or
+                    // sign-constant range; a straddling/zero divisor
+                    // may raise -> unknown.
+                    if r0 > 0 {
+                        Some((0, r1 - 1))
+                    } else if r1 < 0 {
+                        Some((r0 + 1, 0))
+                    } else {
+                        None
+                    }
+                }
+                "//" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        // divisor range contains 0 (or straddles it)
+                        return None;
+                    }
+                    // hull over endpoint divisors × endpoint dividends,
+                    // ±1 seam slack for the floor step
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &b in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, b)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    Some((lo.checked_sub(1)?, hi.checked_add(1)?))
+                }
+                // `/` is true division (float) OR plain `//` (floor —
+                // the frontend maps plain `//` to `/`). Floor applies
+                // when both operands evaluate: a true-division claim
+                // would be float, and no Int-kind consumer consults a
+                // `/` claim, so the ambiguity is harmless either way.
+                "/" => {
+                    let (l0, l1) = arith_range_exact(lhs, env)?;
+                    let (r0, r1) = arith_range_exact(rhs, env)?;
+                    if r0 <= 0 && r1 >= 0 {
+                        return None;
+                    }
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &bb in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, bb)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    Some((lo.checked_sub(1)?, hi.checked_add(1)?))
+                }
+                "<<" | ">>" | "&" | "|" | "^" => None, // usage veto (below), never proven here
+                _ => None,
+            }
+        }
+        Un { op, arg } => {
+            let (l0, l1) = arith_range_exact(arg, env)?;
+            match op.as_str() {
+                "-" => {
+                    if l0 == i64::MIN as i128 {
+                        return None;
+                    }
+                    Some((0i128.checked_sub(l1)?, 0i128.checked_sub(l0)?))
+                }
+                "+" => Some((l0, l1)),
+                "~" => Some((
+                    0i128.checked_sub(l1)?.checked_sub(1)?,
+                    0i128.checked_sub(l0)?.checked_sub(1)?,
+                )),
+                _ => None,
+            }
+        }
+        Cond { test, then, else_ } => {
+            let (t0, t1) = arith_range_exact(test, env)?;
+            let (a0, a1) = arith_range_exact(then, env)?;
+            let (b0, b1) = arith_range_exact(else_, env)?;
+            let _ = (t0, t1);
+            Some((a0.min(b0), a1.max(b1)))
+        }
+        Assign { rhs, .. } => arith_range_exact(rhs, env),
+        IncDec { .. } => None,
+        Sizeof(_) => None,
+        Cast { arg, .. } => arith_range_exact(arg, env),
+    }
+}
+
+fn pow_exact(b: i128, e: i128) -> Option<(i128, i128)> {
+    if e < 0 {
+        return None;
+    }
+    if e == 0 {
+        return Some((1, 1));
+    }
+    let mut acc: i128 = 1;
+    let mut base = b;
+    let mut exp = e;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = acc.checked_mul(base)?;
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base = base.checked_mul(base)?;
+        }
+    }
+    Some((acc, acc))
+}
+
+fn floor_div_exact(a: i128, b: i128) -> Option<i128> {
+    if b == 0 {
+        return None;
+    }
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    // Rust truncates; Python floors: adjust when remainder disagrees
+    if r != 0 && ((r < 0) != (b < 0)) {
+        q.checked_sub(1)
+    } else {
+        Some(q)
+    }
+}
+
+/// The use-safety veto set (A1 port of Go `unsafeTypedNames`): names that
+/// must NOT be C-typed. A typed variable forces its whole expression into
+/// C, so every wrap-prone producer (`+ - * **` that is not exactly
+/// provable, always-veto shifts/bitwise `<< >> & | ^`, negating
+/// `i64::MIN`) vetoes every variable in its subtree. Comparisons,
+/// `%`, `//`, `/` never veto (Cython's default `cdivision=False` gives
+/// them Python semantics). Nested `Function` bodies are their own scope.
+/// Universe: callers intersect with their Int candidates.
+/// Stmts-level use-safety veto (per-scope entry): `env` is the scope's
+/// proved ranges (unknown vars simply absent). Returns names that must
+/// not be C-typed in this scope: vars in unprovable wrap-prone producers
+/// or shifts/bitwise, plus (when `quarantine`) quarantine vetoes (narrow
+/// claimed ranges with an inexactly-evaluable assigned RHS — wrap
+/// artifacts). Quarantine is for unbounded-int readings (Python); bash
+/// wrapping is exact, so bash callers pass `false`. Nested `Function`
+/// bodies are NOT descended (each scope runs this itself).
+pub fn analyze_use_safety_stmts(
+    stmts: &[crate::ir::IrStmt],
+    env: &std::collections::HashMap<String, (i128, i128)>,
+    quarantine: bool,
+) -> std::collections::HashSet<String> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+    use std::collections::{HashMap, HashSet};
+    fn vars_in_arith(a: &ArithAst, out: &mut HashSet<String>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                out.insert(n.clone());
+            }
+            ArithAst::Index { key, .. } => vars_in_arith(key, out),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                vars_in_arith(lhs, out);
+                vars_in_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => vars_in_arith(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                vars_in_arith(test, out);
+                vars_in_arith(then, out);
+                vars_in_arith(else_, out);
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                out.insert(var.clone());
+                vars_in_arith(rhs, out);
+            }
+            ArithAst::IncDec { var, .. } => {
+                out.insert(var.clone());
+            }
+            ArithAst::Cast { arg, .. } => vars_in_arith(arg, out),
+            ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        }
+    }
+    fn veto_arith(
+        a: &ArithAst,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } => {
+                let o = op.as_str();
+                // `%`/`//` desugars never veto their internals (the
+                // branchless lowering is exact; only the SOURCE operands
+                // are visited) — t90's loop counter
+                if o == "%" {
+                    if let Some((a, b)) = as_mod_desugar(lhs, rhs) {
+                        veto_arith(a, env, out);
+                        veto_arith(b, env, out);
+                        return;
+                    }
+                }
+                if o == "/" {
+                    if let Some((a, b)) = as_div_desugar(lhs, rhs) {
+                        veto_arith(a, env, out);
+                        veto_arith(b, env, out);
+                        return;
+                    }
+                }
+                if matches!(o, "+" | "-" | "*" | "**") {
+                    // wrap-prone: veto unless exactly provable AND
+                    // i64-contained (an exact-but-huge value, e.g.
+                    // `2**100`, is just as untypable as unknown)
+                    let ok = match arith_range_exact(a, env) {
+                        Some((lo, hi)) => {
+                            lo >= i64::MIN as i128 && hi <= i64::MAX as i128
+                        }
+                        None => false,
+                    };
+                    if !ok {
+                        let mut vs = HashSet::new();
+                        vars_in_arith(a, &mut vs);
+                        out.extend(vs);
+                    }
+                } else if matches!(o, "<<" | ">>" | "&" | "|" | "^") {
+                    // shifts/bitwise: always veto (matches Go)
+                    let mut vs = HashSet::new();
+                    vars_in_arith(a, &mut vs);
+                    out.extend(vs);
+                }
+                veto_arith(lhs, env, out);
+                veto_arith(rhs, env, out);
+            }
+            ArithAst::Un { op, arg } => {
+                if op == "-" {
+                    let ok = match arith_range_exact(arg, env) {
+                        Some((lo, _)) => lo > i64::MIN as i128,
+                        None => false,
+                    };
+                    if !ok {
+                        let mut vs = HashSet::new();
+                        vars_in_arith(arg, &mut vs);
+                        out.extend(vs);
+                    }
+                }
+                veto_arith(arg, env, out);
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                veto_arith(test, env, out);
+                veto_arith(then, env, out);
+                veto_arith(else_, env, out);
+            }
+            ArithAst::Assign { rhs, .. } => veto_arith(rhs, env, out),
+            ArithAst::Cast { arg, .. } => veto_arith(arg, env, out),
+            ArithAst::Index { key, .. } => veto_arith(key, env, out),
+            ArithAst::Var(_)
+            | ArithAst::Ident(_)
+            | ArithAst::Num(_)
+            | ArithAst::IncDec { .. }
+            | ArithAst::Sizeof(_) => {}
+        }
+    }
+    fn veto_expr(
+        e: &IrExpr,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match e {
+            IrExpr::Arith(a) => veto_arith(a, env, out),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                veto_expr(lhs, env, out);
+                veto_expr(rhs, env, out);
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        veto_expr(x, env, out);
+                    }
+                }
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                veto_expr(cond, env, out);
+                veto_expr(then, env, out);
+                veto_expr(else_, env, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                veto_expr(expr, env, out);
+                veto_expr(default, env, out);
+            }
+            IrExpr::Index { key, .. } => veto_expr(key, env, out),
+            IrExpr::MethodCall { obj, args, .. } => {
+                veto_expr(obj, env, out);
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Capture { expr, .. } => veto_expr(expr, env, out),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    veto_expr(v, env, out);
+                }
+            }
+            IrExpr::Splice(x) => veto_expr(x, env, out),
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                veto_expr(iter, env, out);
+                veto_expr(elem, env, out);
+                if let Some(c) = cond {
+                    veto_expr(c, env, out);
+                }
+            }
+            IrExpr::Int(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Var(_, _)
+            | IrExpr::Ident(_)
+            | IrExpr::Bool(_)
+            | IrExpr::Json(_)
+            | IrExpr::Range { .. }
+            | IrExpr::RawExpr(_)
+            | IrExpr::Regex { .. }
+            | IrExpr::Arrow(_)
+            | IrExpr::Lambda { .. }
+            | IrExpr::Ext(_) => {}
+        }
+    }
+    fn veto_stmt(
+        s: &IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match s {
+            IrStmt::Assign { expr, .. } => veto_expr(expr, env, out),
+            IrStmt::Expr(e) => veto_expr(e, env, out),
+            IrStmt::Output { value, .. } => veto_expr(value, env, out),
+            IrStmt::WriteFile { path, content, .. } => {
+                veto_expr(path, env, out);
+                veto_expr(content, env, out);
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                veto_expr(cond, env, out);
+                for b in then {
+                    veto_stmt(b, env, out);
+                }
+                for (c, b) in elsifs {
+                    veto_expr(c, env, out);
+                    for x in b {
+                        veto_stmt(x, env, out);
+                    }
+                }
+                for b in else_ {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    veto_stmt(b, env, out);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        veto_expr(m, env, out);
+                    }
+                    for b in &e.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                veto_expr(iter, env, out);
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for b in init.iter().chain(step).chain(body) {
+                    veto_stmt(b, env, out);
+                }
+                veto_expr(cond, env, out);
+            }
+            IrStmt::While { cond, body } => {
+                veto_expr(cond, env, out);
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+                veto_expr(cond, env, out);
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                veto_expr(discriminant, env, out);
+                for c in clauses {
+                    for b in &c.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for b in inner {
+                    veto_stmt(b, env, out);
+                }
+                for r in redirects {
+                    veto_expr(&r.target, env, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    veto_expr(x, env, out);
+                }
+            }
+            IrStmt::SetChildError(e) => veto_expr(e, env, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    veto_expr(e, env, out);
+                }
+            }
+            IrStmt::Exec { cmd, args, env: en, redirects, .. } => {
+                veto_expr(cmd, env, out);
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+                for (_, v) in en {
+                    veto_expr(v, env, out);
+                }
+                for r in redirects {
+                    veto_expr(r, env, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(e) = &c.ch {
+                        veto_expr(e, env, out);
+                    }
+                    if let Some(e) = &c.value {
+                        veto_expr(e, env, out);
+                    }
+                    for b in &c.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Shaderize { body, .. } => {
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    veto_stmt(x, env, out);
+                }
+            }
+            IrStmt::Ext(n) => {
+                for c in crate::shir_nodes::ExtNode::children(&**n) {
+                    veto_stmt(c, env, out);
+                }
+            }
+            IrStmt::Asm { inputs, outputs, .. } => {
+                for (_, e) in inputs.iter().chain(outputs) {
+                    veto_expr(e, env, out);
+                }
+            }
+            // nested functions are their own scope; labels/gotos,
+            // die/warn/raw text carry no arith
+            IrStmt::Function { .. }
+            | IrStmt::Die { .. }
+            | IrStmt::Warn { .. }
+            | IrStmt::RawText(_)
+            | IrStmt::Require(_)
+            | IrStmt::Label(_)
+            | IrStmt::Goto(_)
+            | IrStmt::Continue
+            | IrStmt::Break
+            | IrStmt::DeclareArray { .. } => {}
+        }
+    }
+    // quarantine helper (see rhs_exact_ok): narrow claimed ranges are
+    // distrusted wherever an assigned RHS is not exactly evaluable
+    fn quarantine_stmt(
+        s: &crate::ir::IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    // quarantine: the RHS is not exactly i64-contained
+                    // (unknown OR provably huge) yet the claimed range is
+                    // narrow — the narrow claim may be a wrap artifact
+                    let contained = match arith_range_exact(a, env) {
+                        Some((lo, hi)) => {
+                            lo >= i64::MIN as i128 && hi <= i64::MAX as i128
+                        }
+                        None => false,
+                    };
+                    if !contained {
+                        for t in targets {
+                            if t.indices.is_empty() {
+                                if let Some((lo, hi)) = env.get(&t.var) {
+                                    if *lo >= i64::MIN as i128 && *hi <= i64::MAX as i128
+                                    {
+                                        out.insert(t.var.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn quarantine_walk(
+        s: &crate::ir::IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        quarantine_stmt(s, env, out);
+        // recurse into inline nesting (never into nested Function bodies
+        // — the caller runs each scope separately)
+        match s {
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    quarantine_walk(b, env, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        quarantine_walk(x, env, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    quarantine_walk(b, env, out);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        quarantine_walk(b, env, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. } => {
+                for b in body {
+                    quarantine_walk(b, env, out);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                for b in init.iter().chain(step).chain(body) {
+                    quarantine_walk(b, env, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        quarantine_walk(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    quarantine_walk(b, env, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        quarantine_walk(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    quarantine_walk(x, env, out);
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        quarantine_walk(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Shaderize { body, .. } => {
+                for b in body {
+                    quarantine_walk(b, env, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in stmts {
+        veto_stmt(s, env, &mut out);
+        if quarantine {
+            quarantine_walk(s, env, &mut out);
+        }
+    }
+    out
+}
+
+/// Whole-program entry (top scope only; function bodies need their own
+/// scope runs — see otranspilerl `analyze`). Uses the bash-walk ranges
+/// as env (callers with python() ranges should use the stmts entry).
+pub fn analyze_use_safety(prog: &crate::ir::IrProgram) -> std::collections::HashSet<String> {
+    let env = analyze_var_ranges(prog);
+    analyze_use_safety_stmts(&prog.stmts, &env, true)
+}
+
+// ── per-scope facts for annotation consumers (py2cy.js) ──
+
+/// Stmts-level range entry (fresh state): lets callers run scopes
+/// separately. Same walk as `analyze_var_ranges` (bash wrapping
+/// semantics — Python consumers must apply the wrap-poison quarantine
+/// in `analyze_use_safety_stmts`, not trust narrow ranges blindly).
+pub fn analyze_var_ranges_stmts(
+    stmts: &[crate::ir::IrStmt],
+) -> std::collections::HashMap<String, (i128, i128)> {
+    let mut state: std::collections::HashMap<String, Option<(i128, i128)>> =
+        std::collections::HashMap::new();
+    for s in stmts {
+        walk_stmt_ranges(s, &mut state);
+    }
+    state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect()
+}
+
+/// Names assigned in `stmts`. `descend_fn` includes nested Function
+/// bodies (for whole-program assigned sets); the per-scope declare
+/// candidacy uses `false` (a scope declares what IT assigns, minus params).
+pub fn assigned_names(stmts: &[crate::ir::IrStmt], descend_fn: bool) -> std::collections::HashSet<String> {
+    use crate::ir::IrStmt;
+    use std::collections::HashSet;
+    fn walk(s: &IrStmt, descend_fn: bool, out: &mut HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        out.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                out.insert(var.clone());
+            }
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                for b in body {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                if descend_fn {
+                    for b in body {
+                        walk(b, descend_fn, out);
+                    }
+                    for (_, b) in named_blocks {
+                        for x in b {
+                            walk(x, descend_fn, out);
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    walk(b, descend_fn, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        walk(x, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    walk(b, descend_fn, out);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for x in body {
+                    walk(x, descend_fn, out);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                for b in init.iter().chain(step).chain(body) {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    if let Some(t) = &c.target {
+                        out.insert(t.clone());
+                    }
+                    for b in &c.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Exec { capture, env, .. } => {
+                if let Some(c) = capture {
+                    out.insert(c.clone());
+                }
+                for (v, _) in env {
+                    out.insert(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in stmts {
+        walk(s, descend_fn, &mut out);
+    }
+    out
+}
+
+/// One scope's facts for annotation consumers.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeFacts {
+    /// scope name ("<top>" or the function name)
+    pub name: String,
+    /// names assigned in this scope (declare candidacy before params cut)
+    pub assigned: Vec<String>,
+    /// proved ranges in this scope
+    pub ranges: std::collections::HashMap<String, (i128, i128)>,
+    /// use-safety + quarantine vetoes in this scope
+    pub vetoed: std::collections::HashSet<String>,
+    /// storage widths ("i32"/"i64") for Int vars with i64-contained ranges
+    pub widths: std::collections::HashMap<String, String>,
+}
+
+/// Per-scope facts: top scope (Function bodies excluded, then hulled
+/// with every function scope's ranges for same-named vars — a function
+/// may `global`-write them) plus one entry per Function body (fresh
+/// state, so parameters stay unknown). `var_types` (the frontend's
+/// Int/Str/Float domains) is read from the program by the caller.
+/// `python` selects the Python reading: floor `%`/`//` tolerance, the
+/// wrap-poison quarantine in each scope's veto, and the nested-loop-var
+/// fill below. Bash callers pass `false` (wrapping is exact there, and
+/// unset reads are `""`, not NameError).
+pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFacts> {
+    use crate::ir::IrStmt;
+    // top-level statements minus nested Function subtrees
+    let top_only: Vec<IrStmt> = prog
+        .stmts
+        .iter()
+        .filter(|s| !matches!(s, IrStmt::Function { .. }))
+        .cloned()
+        .collect();
+    let top_ranges = analyze_var_ranges_stmts(&top_only);
+    let top_assigned = assigned_names(&prog.stmts, false);
+    let top_vetoed = analyze_use_safety_stmts(&top_only, &top_ranges, python);
+    // function scopes
+    let mut fn_scopes: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            fn_scopes.push((name.clone(), body.clone()));
+        }
+    }
+    let mut fn_facts: Vec<ScopeFacts> = Vec::new();
+    for (name, body) in &fn_scopes {
+        let ranges = analyze_var_ranges_stmts(body);
+        let vetoed = analyze_use_safety_stmts(body, &ranges, python);
+        let assigned: Vec<String> = {
+            let mut v: Vec<String> = assigned_names(body, false).into_iter().collect();
+            v.sort();
+            v
+        };
+        let widths = analyze_widths(body, &ranges);
+        fn_facts.push(ScopeFacts {
+            name: name.clone(),
+            assigned,
+            ranges,
+            vetoed,
+            widths,
+        });
+    }
+    // module hull: same-named function writes widen top ranges (global
+    // writes are invisible in A1, so union conservatively)
+    let mut top_hulled = top_ranges.clone();
+    for f in &fn_facts {
+        for (n, (lo, hi)) in &f.ranges {
+            top_hulled
+                .entry(n.clone())
+                .and_modify(|e| {
+                    e.0 = e.0.min(*lo);
+                    e.1 = e.1.max(*hi);
+                })
+                .or_insert((*lo, *hi));
+        }
+    }
+    // Python-only nested-loop-var fill: the shared walk drops an inner
+    // loop var's range post-outer-loop (`join(None, [1,2])` = unknown),
+    // but a provably-nonempty iter bounds every VALUE ever observed —
+    // and an unbound read raises NameError identically typed or not, so
+    // filling is sound. (Bash unset reads `""`: never fill there.)
+    if python {
+        fn fill_for_vars(
+            stmts: &[crate::ir::IrStmt],
+            ranges: &mut std::collections::HashMap<String, (i128, i128)>,
+        ) {
+            for s in stmts {
+                match s {
+                    crate::ir::IrStmt::For { var, iter, body } => {
+                        if !ranges.contains_key(var) {
+                            if let Some((lo, hi)) = for_iter_range(iter) {
+                                // nonempty provable iter only
+                                let nonempty = match iter {
+                                    crate::ir::IrExpr::Array(items) => !items.is_empty(),
+                                    crate::ir::IrExpr::Range { start, end } => start <= end,
+                                    _ => false,
+                                };
+                                if nonempty {
+                                    ranges.insert(var.clone(), (lo, hi));
+                                }
+                            }
+                        }
+                        fill_for_vars(body, ranges);
+                    }
+                    _ => {}
+                }
+            }
+            // recurse into nesting for deeper fors (single-level match
+            // above covers the common shapes; walk the rest structurally)
+            for s in stmts {
+                match s {
+                    crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                        for b in then.iter().chain(else_) {
+                            fill_for_vars(std::slice::from_ref(b), ranges);
+                        }
+                        for (_, b) in elsifs {
+                            fill_for_vars(b, ranges);
+                        }
+                    }
+                    crate::ir::IrStmt::While { body, .. }
+                    | crate::ir::IrStmt::DoWhile { body, .. } => fill_for_vars(body, ranges),
+                    _ => {}
+                }
+            }
+        }
+        let mut filled = top_hulled.clone();
+        fill_for_vars(&prog.stmts, &mut filled);
+        top_hulled = filled;
+        for f in fn_facts.iter_mut() {
+            // fn bodies are walked per-scope already; nested fors inside
+            // them need the same fill (find the body by name)
+            for s in &prog.stmts {
+                if let crate::ir::IrStmt::Function { name, body, .. } = s {
+                    if name == &f.name {
+                        fill_for_vars(body, &mut f.ranges);
+                    }
+                }
+            }
+        }
+    }
+    let mut top_assigned: Vec<String> = top_assigned.into_iter().collect();
+    top_assigned.sort();
+    let top_widths = analyze_widths(&top_only, &top_hulled);
+    let mut out = vec![ScopeFacts {
+        name: "<top>".to_string(),
+        assigned: top_assigned,
+        ranges: top_hulled,
+        vetoed: top_vetoed,
+        widths: top_widths,
+    }];
+    out.extend(fn_facts);
+    out
+}
+
+/// Storage widths for one scope's statements: "i32" iff the (hulled)
+/// value range AND every assigned Arith RHS exactly evaluate within
+/// i32; else "i64". Only names present in `ranges` with an
+/// i64-contained range are considered (callers intersect with Int).
+pub fn analyze_widths(
+    stmts: &[crate::ir::IrStmt],
+    ranges: &std::collections::HashMap<String, (i128, i128)>,
+) -> std::collections::HashMap<String, String> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+    const I32MIN: i128 = i32::MIN as i128;
+    const I32MAX: i128 = i32::MAX as i128;
+    const I64MIN: i128 = i64::MIN as i128;
+    const I64MAX: i128 = i64::MAX as i128;
+    fn fits(v: (i128, i128), lo: i128, hi: i128) -> bool {
+        v.0 >= lo && v.1 <= hi
+    }
+    // assigned Arith RHS per var in this scope
+    fn collect_rhs(s: &IrStmt, out: &mut Vec<(String, ArithAst)>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            out.push((t.var.clone(), (**a).clone()));
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    collect_rhs(b, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        collect_rhs(x, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+                for b in body {
+                    collect_rhs(b, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    collect_rhs(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rhs_list: Vec<(String, ArithAst)> = Vec::new();
+    for s in stmts {
+        collect_rhs(s, &mut rhs_list);
+    }
+    // every subexpression of an assigned RHS must fit: `% M` bounds
+    // the stored VALUE but not the intermediate (`h*31` reaches 31e9
+    // while the stored `h` stays in [0,M-1])
+    fn subexpr_fits_i32(
+        a: &ArithAst,
+        ranges: &std::collections::HashMap<String, (i128, i128)>,
+    ) -> bool {
+        let ok_here = match arith_range_exact(a, ranges) {
+            Some(rr) => fits(rr, I32MIN, I32MAX),
+            None => false,
+        };
+        if !ok_here {
+            return false;
+        }
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => {
+                subexpr_fits_i32(lhs, ranges) && subexpr_fits_i32(rhs, ranges)
+            }
+            ArithAst::Un { arg, .. } => subexpr_fits_i32(arg, ranges),
+            ArithAst::Cond { test, then, else_, .. } => {
+                subexpr_fits_i32(test, ranges)
+                    && subexpr_fits_i32(then, ranges)
+                    && subexpr_fits_i32(else_, ranges)
+            }
+            ArithAst::Assign { rhs, .. } => subexpr_fits_i32(rhs, ranges),
+            ArithAst::Cast { arg, .. } => subexpr_fits_i32(arg, ranges),
+            ArithAst::Index { key, .. } => subexpr_fits_i32(key, ranges),
+            _ => true,
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (n, r) in ranges {
+        if !fits(*r, I64MIN, I64MAX) {
+            continue;
+        }
+        let mut ok32 = fits(*r, I32MIN, I32MAX);
+        if ok32 {
+            for (v, a) in &rhs_list {
+                if v == n && !subexpr_fits_i32(a, ranges) {
+                    ok32 = false;
+                    break;
+                }
+            }
+        }
+        out.insert(n.clone(), if ok32 { "i32".to_string() } else { "i64".to_string() });
+    }
+    out
+}
+
 pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
     if lo >= 0 && hi <= u8::MAX as i128 {
         "u8"
@@ -9546,6 +10699,49 @@ fn cond_bound_resolved(
             }
             _ => None,
         },
+        // structured arith comparison (frontend A1: py `while i < 3` —
+        // the shell path lowers conds to test/let TEXT, so this arm is a
+        // no-op there and pure gain for frontends). Integer `< <= > >=
+        // ==` only (`!=` cannot cap a range).
+        IrExpr::Arith(a) => {
+            let (op, l, r) = match a.as_ref() {
+                crate::ir::ArithAst::Bin { op, lhs, rhs } => (op.as_str(), lhs, rhs),
+                _ => return None,
+            };
+            let cmp = match op {
+                "<" => Cmp::Lt,
+                "<=" => Cmp::Le,
+                ">" => Cmp::Gt,
+                ">=" => Cmp::Ge,
+                "==" | "=" => Cmp::Eq,
+                _ => return None,
+            };
+            let var_name = |x: &crate::ir::ArithAst| match x {
+                crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => Some(n.clone()),
+                _ => None,
+            };
+            let num_val = |x: &crate::ir::ArithAst| match x {
+                crate::ir::ArithAst::Num(n) => Some(*n as i128),
+                crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
+                    // loop-invariant provable constant (mirrors resolve)
+                    if carried.contains(n) {
+                        return None;
+                    }
+                    match pre.get(n).copied().flatten() {
+                        Some((lo, hi)) if lo == hi => Some(lo),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let (Some(v), Some(n)) = (var_name(l), num_val(r)) {
+                Some((v, cmp, n))
+            } else if let (Some(n), Some(v)) = (num_val(l), var_name(r)) {
+                Some((v, cmp_flip(cmp), n))
+            } else {
+                None
+            }
+        }
         // `until cond` wraps the cond in BinOp(Not, cond, cond)
         IrExpr::BinOp {
             op: BinOpKind::Not,
@@ -49493,6 +50689,11 @@ mod lowering_shape_tests {
         // [`arith_has_div_mod`] excludes nonzero literals (no abort
         // possible — correct for the wrapper decision); the syntactic
         // detector must still see the operation (the zero-cmp gate).
+        // Hermetic: the divisor proof consults the process-global
+        // NONZERO_VARS verdict, which render tests leak across parallel
+        // workers — clear it so the conservative (unset) reading holds
+        // deterministically rather than by scheduling lottery.
+        *crate::shir::NONZERO_VARS.lock().unwrap() = None;
         assert!(arith_has_div_mod(&pct(var("n"), var("i"))));
         assert!(!arith_has_div_mod(&pct(var("n"), num(2))));
         assert!(arith_has_any_div_mod(&pct(var("n"), var("i"))));
@@ -51337,6 +52538,156 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod py2cy_analysis_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        // RAW IR: the full pipeline sets process-global verdict statics
+        // (NONZERO_VARS etc.) that leak across parallel tests — the
+        // range-analysis convention (see consts_of rationale)
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn env_of(pairs: &[(&str, (i128, i128))]) -> HashMap<String, (i128, i128)> {
+        pairs.iter().map(|(n, r)| (n.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn exact_eval_no_wrap() {
+        // exact i128 reading: `2**100` is its TRUE value (NOT wrapped to
+        // 0) — callers test i64-containment themselves; only i128
+        // overflow (or unknown/div-zero) is None
+        let env = env_of(&[]);
+        let pow = crate::ir::ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(2)),
+            rhs: Box::new(crate::ir::ArithAst::Num(100)),
+        };
+        assert_eq!(
+            arith_range_exact(&pow, &env),
+            Some((
+                1267650600228229401496703205376,
+                1267650600228229401496703205376
+            ))
+        );
+        let pow200 = crate::ir::ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(2)),
+            rhs: Box::new(crate::ir::ArithAst::Num(200)),
+        };
+        assert_eq!(arith_range_exact(&pow200, &env), None);
+        // small exact cases
+        let mul = crate::ir::ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(100)),
+            rhs: Box::new(crate::ir::ArithAst::Num(200)),
+        };
+        assert_eq!(arith_range_exact(&mul, &env), Some((20000, 20000)));
+        // i64 overflow is exact-but-huge (callers check containment)
+        let big = crate::ir::ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(i64::MAX)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&big, &env).expect("fits i128");
+        assert!(hi > i64::MAX as i128, "outside i64: {lo}..{hi}");
+    }
+
+    #[test]
+    fn exact_floor_mod() {
+        // Python floor semantics, decided by the divisor alone
+        let env = env_of(&[("a", (-7, -7)), ("b", (7, 7))]);
+        let neg_mod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("a".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(3)),
+        };
+        assert_eq!(arith_range_exact(&neg_mod, &env), Some((0, 2)));
+        let pos_mod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("b".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(3)),
+        };
+        assert_eq!(arith_range_exact(&pos_mod, &env), Some((0, 2)));
+        // zero divisor is unknown
+        let zmod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("b".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(0)),
+        };
+        assert_eq!(arith_range_exact(&zmod, &env), None);
+        // floor division contains the true value
+        let div = crate::ir::ArithAst::Bin {
+            op: "//".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(7)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&div, &env).expect("fdiv evaluable");
+        assert!(lo <= 3 && 3 <= hi, "7//2=3 in [{lo},{hi}]");
+        let ndiv = crate::ir::ArithAst::Bin {
+            op: "//".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(-7)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&ndiv, &env).expect("neg fdiv evaluable");
+        assert!(lo <= -4 && -4 <= hi, "-7//2=-4 in [{lo},{hi}]");
+    }
+
+    #[test]
+    fn veto_overflow_chain() {
+        // Go pin: x = 2**63-1; y = x + 1 leaves BOTH untyped
+        let prog = prog_of("x=$((2**63-1))\ny=$((x + 1))\necho $y");
+        let env = analyze_var_ranges(&prog);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        assert!(vetoed.contains("x"), "x feeds overflowing +1: {vetoed:?}");
+        assert!(vetoed.contains("y"), "y is the overflowing store: {vetoed:?}");
+    }
+
+    #[test]
+    fn veto_shifts_bitwise() {
+        // shifts/bitwise always veto (matches Go), even when provable
+        for src in ["y=$((x & 255))\necho $y", "y=$((x << 2))\necho $y"] {
+            let prog = prog_of(src);
+            let env = analyze_var_ranges(&prog);
+            let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+            assert!(vetoed.contains("x"), "{src}: {vetoed:?}");
+        }
+    }
+
+    #[test]
+    fn veto_spares_comparisons_and_mod() {
+        // comparisons and cdivision ops never veto
+        let prog = prog_of("x=5\nif [ $x -lt 10 ]; then y=$((x % 3)); echo $y; fi");
+        let env = analyze_var_ranges(&prog);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        assert!(!vetoed.contains("x"), "comparison/mod use is safe: {vetoed:?}");
+    }
+
+    #[test]
+    fn quarantine_wrap_artifact() {
+        // `2**100` wraps to [0,0] under bash semantics; the narrow claim
+        // with an inexactly-evaluable RHS must veto (else i32 typing)
+        let prog = prog_of("big=$((2**100))\necho $big");
+        let env = analyze_var_ranges(&prog);
+        assert_eq!(env.get("big"), Some(&(0, 0)), "bash wrap precondition");
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        assert!(vetoed.contains("big"), "wrap artifact vetoed: {vetoed:?}");
+    }
+
+    #[test]
+    fn widths_value_and_intermediate() {
+        // rolling-hash loop shape: h is mod-bounded (fits i32 by VALUE)
+        // but h*31 needs 64 bits, so h is i64 by INTERMEDIATE
+        let prog = prog_of("h=0\ni=0\nwhile [ $i -lt 100 ]; do h=$(((h*31 + i) % 1000000007)); i=$((i+1)); done");
+        let env = analyze_var_ranges(&prog);
+        let w = analyze_widths(&prog.stmts, &env);
+        assert_eq!(w.get("h").map(String::as_str), Some("i64"), "h*31: {w:?} env: {env:?}");
     }
 }
 
