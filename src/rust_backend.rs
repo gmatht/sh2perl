@@ -68,6 +68,32 @@ enum Part {
     Words(String),
 }
 
+/// Pass-3 parameter type: `String` unless the probe saw the positional
+/// read only numerically (then `i64`, parsed once at the call).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FnParamTy {
+    Str,
+    Num,
+}
+
+/// Pass-3 signature for one shell function: fixed arity, typed params,
+/// `-> String` (the sticky `__SH_RET` cell becomes the return value).
+#[derive(Clone, Debug)]
+struct FnSig {
+    arity: usize,
+    tys: Vec<FnParamTy>,
+    used: Vec<bool>,
+}
+
+/// Pass-3 probe record for one function-body render (legacy convention;
+/// output discarded, only the recording survives).
+#[derive(Default)]
+struct FnProbe {
+    num: BTreeSet<usize>,
+    str_: BTreeSet<usize>,
+    wild: bool,
+}
+
 #[derive(Default)]
 pub struct Render {
     out: Vec<String>,
@@ -100,6 +126,17 @@ pub struct Render {
     /// (`x=1; x=2; echo $x`): the deferred `let` needs
     /// `#[allow(unused_assignments)]` so we stay warning-clean
     local_dead_init: BTreeSet<String>,
+    /// pass-3 signatures: fn name -> fixed-arity typed signature (filled
+    /// by the probe loop before main renders, so call sites know them)
+    fn_sigs: HashMap<String, FnSig>,
+    /// pass-3 probe in progress (records positional reads + wildness)
+    probe: Option<FnProbe>,
+    /// function whose body is commit-rendering (digit reads become its
+    /// params); None in main and for legacy-convention functions
+    active_fn: Option<String>,
+    /// inside a `thread::spawn(move || ...)` body: `return` exits the
+    /// closure, so value-returns keep their legacy shape there
+    in_closure: usize,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -295,6 +332,49 @@ impl Render {
         self.written.insert(name.to_string());
     }
 
+    /// Pass-3 probe: a numeric read of positional `i` (`$1` is 0).
+    /// Every in-process argv read funnels through `__sh_arg`, and every
+    /// `__sh_arg` emit site records here — a new site must too (a missed
+    /// string read would mistype the param `i64` and lose e.g. `"007"`).
+    fn probe_num(&mut self, i: usize) {
+        if let Some(p) = self.probe.as_mut() {
+            p.num.insert(i);
+        }
+    }
+
+    /// Pass-3 probe: a string read of positional `i`.
+    fn probe_str(&mut self, i: usize) {
+        if let Some(p) = self.probe.as_mut() {
+            p.str_.insert(i);
+        }
+    }
+
+    /// Pass-3 probe: body touches the whole argv (`$@`/`$#`) or rebinds
+    /// it (`shift`/`set --`) or writes a positional — no signature.
+    fn probe_wild(&mut self) {
+        if let Some(p) = self.probe.as_mut() {
+            p.wild = true;
+        }
+    }
+
+    /// Pass-3 commit: `(base name, type)` for positional `i` when a
+    /// signature is active. None in main / legacy functions / out of
+    /// range (out of range is impossible: the probe saw every read of
+    /// this same body).
+    fn fn_param(&self, i: usize) -> Option<(String, FnParamTy)> {
+        let name = self.active_fn.as_ref()?;
+        let sig = self.fn_sigs.get(name)?;
+        if i >= sig.arity {
+            return None;
+        }
+        let base = if sig.used[i] {
+            format!("p{i}")
+        } else {
+            format!("_p{i}")
+        };
+        Some((base, sig.tys[i]))
+    }
+
     /// Capture the current rc as the enclosing loop's final status (bash's
     /// loop rc = last body command's status) — no-op outside a loop that
     /// restores it (a plain `for` needs no restore: no cond eval clobbers).
@@ -441,6 +521,11 @@ impl Render {
 
     /// Write an i64 value to a var (num cell, str cell or array elem 0).
     fn write_num_or_str(&mut self, name: &str, e: &str) -> String {
+        // pass-3: positionals are read-only (`set --` rebinds the whole
+        // vector instead) — writing one poisons the signature verdict
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            self.probe_wild();
+        }
         if self.is_num(name) {
             self.write_num(name, e)
         } else if self.is_array(name) {
@@ -604,6 +689,14 @@ impl Render {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            self.probe_num(i);
+            match self.fn_param(i) {
+                Some((b, FnParamTy::Num)) => return b,
+                Some((b, FnParamTy::Str)) => {
+                    return format!("{b}.trim().parse::<i64>().unwrap_or(0)")
+                }
+                None => {}
+            }
             return format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)");
         }
         if self.local_vars.contains_key(name) {
@@ -620,6 +713,15 @@ impl Render {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            self.probe_str(i);
+            match self.fn_param(i) {
+                Some((b, FnParamTy::Str)) => return format!("{b}.clone()"),
+                // numeric param read as string: impossible (the probe
+                // forces Str on any string read) — canonical form keeps
+                // the value correct if it ever fires
+                Some((b, FnParamTy::Num)) => return format!("{b}.to_string()"),
+                None => {}
+            }
             return format!("__sh_arg({i})");
         }
         if self.local_vars.contains_key(name) {
@@ -792,8 +894,14 @@ impl Render {
             match name {
                 "?" => "__SH_RC.load(Ordering::SeqCst).to_string()".to_string(),
                 "$" => "std::process::id().to_string()".to_string(),
-                "#" => "__SH_ARGV.lock().unwrap().len().to_string()".to_string(),
-                "@" | "*" => "__SH_ARGV.lock().unwrap().join(\" \")".to_string(),
+                "#" => {
+                    self.probe_wild();
+                    "__SH_ARGV.lock().unwrap().len().to_string()".to_string()
+                }
+                "@" | "*" => {
+                    self.probe_wild();
+                    "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
+                }
                 "0" => "std::env::args().next().unwrap_or_default()".to_string(),
                 "!" => {
                     // empty until a background job starts (bash's $!)
@@ -827,7 +935,12 @@ impl Render {
                 n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                     self.add_helper("arg");
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    format!("__sh_arg({i})")
+                    self.probe_str(i);
+                    match self.fn_param(i) {
+                        Some((b, FnParamTy::Str)) => format!("{b}.clone()"),
+                        Some((b, FnParamTy::Num)) => format!("{b}.to_string()"),
+                        None => format!("__sh_arg({i})"),
+                    }
                 }
                 _ => {
                     self.add_helper("env");
@@ -858,11 +971,23 @@ impl Render {
             match name {
                 "?" => "__SH_RC.load(Ordering::SeqCst)".to_string(),
                 "$" => "std::process::id() as i64".to_string(),
-                "#" => "__SH_ARGV.lock().unwrap().len() as i64".to_string(),
+                "#" => {
+                    self.probe_wild();
+                    "__SH_ARGV.lock().unwrap().len() as i64".to_string()
+                }
                 n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                     self.add_helper("arg");
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)")
+                    self.probe_num(i);
+                    match self.fn_param(i) {
+                        Some((b, FnParamTy::Num)) => b,
+                        Some((b, FnParamTy::Str)) => {
+                            format!("{b}.trim().parse::<i64>().unwrap_or(0)")
+                        }
+                        None => {
+                            format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)")
+                        }
+                    }
                 }
                 _ => {
                     self.add_helper("env");
@@ -1690,7 +1815,17 @@ impl Render {
                 {
                     // cached i64 (entry-bound). Skipped for bigint-tainted
                     // (huge argv would truncate to 0 via i64 parse — t90).
-                    format!("__pn_{name}")
+                    let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    self.probe_num(i);
+                    match self.fn_param(i) {
+                        // pass-3: a numeric param IS the cache
+                        Some((b, FnParamTy::Num)) => b,
+                        // a string param parses on demand (its uses
+                        // aren't cached) — via getvar_num so the probe
+                        // records the numeric read too
+                        Some((_, FnParamTy::Str)) => self.getvar_num(name),
+                        None => format!("__pn_{name}"),
+                    }
                 } else {
                     self.getvar_num(name)
                 }
@@ -1932,6 +2067,8 @@ impl Render {
                     Some(w) => self.expr_num(w),
                     None => "1".to_string(),
                 };
+                // pass-3: rebinding argv poisons the signature verdict
+                self.probe_wild();
                 self.emit(&format!(
                     "{{ let mut __v = __SH_ARGV.lock().unwrap(); let __n = ({n}).min(__v.len() as i64) as usize; __v.drain(0..__n); }}"
                 ));
@@ -2669,6 +2806,8 @@ impl Render {
                     .map(|w| self.words_expr(w))
                     .collect();
                 self.add_helper("cat");
+                // pass-3: `set --` rebinds argv — no signature
+                self.probe_wild();
                 self.emit(&format!(
                     "let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new;",
                     ws.join(", ")
@@ -2952,7 +3091,22 @@ impl Render {
             if !pos.is_empty() && !single {
                 let checks: Vec<String> = pos
                     .iter()
-                    .map(|i| format!("__sh_arg({}).trim().is_empty()", i.saturating_sub(1)))
+                    .map(|i| {
+                        let j = i.saturating_sub(1);
+                        self.probe_str(j);
+                        match self.fn_param(j) {
+                            Some((b, FnParamTy::Str)) => {
+                                format!("{b}.trim().is_empty()")
+                            }
+                            // a guard on a numeric param is impossible
+                            // (the probe forces Str) — loud, not wrong
+                            Some((_, FnParamTy::Num)) => {
+                                "unreachable!(\"pass-3: emptiness guard on numeric param\")"
+                                    .to_string()
+                            }
+                            None => format!("__sh_arg({j}).trim().is_empty()"),
+                        }
+                    })
                     .collect();
                 let ev = format!(
                     "vec![{{ let __aw = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); }} __aw }}]",
@@ -3153,7 +3307,6 @@ impl Render {
                 // the argv-swap call then read __SH_RET (the function's
                 // `return expr` home) — mirrors call_str's fnValue arm
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    let m = self.fn_ident(name);
                     let ws: Vec<String> = args
                         .get(1)
                         .and_then(|a| match a {
@@ -3163,6 +3316,12 @@ impl Render {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    // pass-3: direct call, value wrapped for word context
+                    if let Some(sig) = self.fn_sigs.get(name).cloned() {
+                        let v = self.fn_call_value(name, ws, &sig, false);
+                        return format!("vec![{v}]");
+                    }
+                    let m = self.fn_ident(name);
                     format!(
                         "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
                         ws.join(", "),
@@ -3298,6 +3457,7 @@ impl Render {
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "i64::MIN".to_string(),
                     Some(x) => self.slice_index_expr(x),
                 };
+                self.probe_wild();
                 return format!(
                     "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
                      let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
@@ -3306,6 +3466,7 @@ impl Render {
                      __v[__o..__e].to_vec() }}"
                 );
             }
+            self.probe_wild();
             return "__SH_ARGV.lock().unwrap().clone()".to_string();
         }
         if (name_at || idx_at || off_num) && !name.is_empty() {
@@ -3344,6 +3505,7 @@ impl Render {
                 return self.read_arr(var);
             }
             if var == "@" || var == "*" {
+                self.probe_wild();
                 return "__SH_ARGV.lock().unwrap().clone()".to_string();
             }
         }
@@ -3353,7 +3515,10 @@ impl Render {
     /// listVar: the positional args or an array's elements.
     fn listvar_words(&mut self, name: &str) -> String {
         match name {
-            "@" | "*" => "__SH_ARGV.lock().unwrap().clone()".to_string(),
+            "@" | "*" => {
+                self.probe_wild();
+                "__SH_ARGV.lock().unwrap().clone()".to_string()
+            }
             _ => {
                 self.mark_written(name);
                 if self.is_assoc(name) {
@@ -3368,7 +3533,10 @@ impl Render {
     fn listvar_joined(&mut self, args: &[IrExpr]) -> String {
         if let Some(IrExpr::Str(name, _)) = args.first() {
             match name.as_str() {
-                "@" | "*" => "__SH_ARGV.lock().unwrap().join(\" \")".to_string(),
+                "@" | "*" => {
+                    self.probe_wild();
+                    "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
+                }
                 _ => {
                     self.mark_written(name);
                     if self.is_assoc(name) {
@@ -4499,9 +4667,11 @@ impl Render {
             for p in &pre {
                 self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
             }
+            self.in_closure += 1;
             for s in inner {
                 self.stmt(s);
             }
+            self.in_closure -= 1;
             for p in &post {
                 self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
             }
@@ -4545,8 +4715,84 @@ impl Render {
 
     // ── functions ────────────────────────────────────────────────────
 
+    /// Pass-3 direct call, value form: `f()` or `{ let __a..; f(..) }`
+    /// (evaluates to the function's `String` value). `cat` selects the
+    /// argv construction (`__sh_cat(&[..])` for statement-shaped calls,
+    /// `vec![..]` for value-shaped calls) — identical to what the legacy
+    /// dance installed, only indexed instead of swapped.
+    fn fn_call_value(
+        &mut self,
+        name: &str,
+        ws: Vec<String>,
+        sig: &FnSig,
+        cat: bool,
+    ) -> String {
+        let m = self.fn_ident(name);
+        if sig.arity == 0 {
+            return format!("{m}()");
+        }
+        if cat {
+            self.add_helper("cat");
+        }
+        let constr = if cat {
+            format!("__sh_cat(&[{}])", ws.join(", "))
+        } else {
+            format!("vec![{}]", ws.join(", "))
+        };
+        let args = Self::fn_call_args(sig);
+        format!("{{ let __a: Vec<String> = {constr}; {m}({args}) }}")
+    }
+
+    /// Pass-3 direct call, exec form: `{ [let __a..;] f(..); [tail] }`
+    /// (`tail` is the block's final expression; None discards).
+    fn fn_call_exec(
+        &mut self,
+        name: &str,
+        ws: Vec<String>,
+        sig: &FnSig,
+        cat: bool,
+        tail: Option<&str>,
+    ) -> String {
+        let m = self.fn_ident(name);
+        let args = Self::fn_call_args(sig);
+        let call = format!("{m}({args})");
+        let mut inner = String::new();
+        if sig.arity > 0 {
+            if cat {
+                self.add_helper("cat");
+            }
+            let constr = if cat {
+                format!("__sh_cat(&[{}])", ws.join(", "))
+            } else {
+                format!("vec![{}]", ws.join(", "))
+            };
+            inner.push_str(&format!("let __a: Vec<String> = {constr}; "));
+        }
+        match tail {
+            Some(t) => format!("{{ {inner}{call}; {t} }}"),
+            None => format!("{{ {inner}{call}; }}"),
+        }
+    }
+
+    /// Positional arg exprs for a signature (`""` / parsed-`0` defaults
+    /// are the `__sh_arg` contract for missing positionals).
+    fn fn_call_args(sig: &FnSig) -> String {
+        (0..sig.arity)
+            .map(|i| match sig.tys[i] {
+                FnParamTy::Str => format!("__a.get({i}).cloned().unwrap_or_default()"),
+                FnParamTy::Num => format!(
+                    "__a.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn fn_call_stmt(&mut self, name: &str, words: &[&IrExpr]) -> String {
         let ws: Vec<String> = words.iter().map(|w| self.words_expr(w)).collect();
+        if let Some(sig) = self.fn_sigs.get(name).cloned() {
+            return self.fn_call_exec(name, ws, &sig, true, None);
+        }
         self.add_helper("cat");
         format!(
             "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; }}",
@@ -4557,6 +4803,15 @@ impl Render {
 
     fn fn_call_bool(&mut self, name: &str, words: &[&IrExpr]) -> String {
         let ws: Vec<String> = words.iter().map(|w| self.words_expr(w)).collect();
+        if let Some(sig) = self.fn_sigs.get(name).cloned() {
+            return self.fn_call_exec(
+                name,
+                ws,
+                &sig,
+                true,
+                Some("__SH_RC.load(Ordering::SeqCst) == 0"),
+            );
+        }
         self.add_helper("cat");
         format!(
             "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::SeqCst) == 0 }}",
@@ -4926,8 +5181,10 @@ impl Render {
         let var_expr = if name.is_empty() {
             "String::new()".to_string()
         } else if name == "#" {
+            self.probe_wild();
             "__SH_ARGV.lock().unwrap().len().to_string()".to_string()
         } else if name == "@" || name == "*" {
+            self.probe_wild();
             "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
         } else if self.declared(name) || self.captured.contains_key(name) {
             self.getvar_str(name)
@@ -5012,6 +5269,7 @@ impl Render {
                 };
                 if name == "@" || name == "*" {
                     // `${@:off:len}` — the positional params (1-based off)
+                    self.probe_wild();
                     return format!(
                         "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
                          let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
@@ -5067,7 +5325,6 @@ impl Render {
                 // value-returning user-function call: the argv-swap call
                 // then read __SH_RET (the function's `return expr` home)
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    let m = self.fn_ident(name);
                     let ws: Vec<String> = args
                         .get(1)
                         .and_then(|a| match a {
@@ -5077,6 +5334,12 @@ impl Render {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    // pass-3: a probed signature calls directly (the
+                    // value IS the return, no __SH_RET re-read)
+                    if let Some(sig) = self.fn_sigs.get(name).cloned() {
+                        return self.fn_call_value(name, ws, &sig, false);
+                    }
+                    let m = self.fn_ident(name);
                     return format!(
                         "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
                         ws.join(", "),
@@ -5506,6 +5769,13 @@ impl Render {
                         return;
                     }
                 }
+                // pass-3: writing a positional poisons the signature
+                for t in targets {
+                    let base = t.var.split('[').next().unwrap_or(&t.var);
+                    if !base.is_empty() && base.chars().all(|c| c.is_ascii_digit()) {
+                        self.probe_wild();
+                    }
+                }
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -5878,18 +6148,35 @@ impl Render {
                     // model; numeric contexts coerce via __sh_atoi). A bare
                     // `return` keeps the current __SH_RET value, so it is a
                     // plain early exit — never an empty assignment.
+                    if self.in_closure > 0 || self.active_fn.is_none() {
+                        // thread/procsub body (`return` exits the closure)
+                        // or a legacy-convention function: keep the legacy
+                        // shape (the value stays in __SH_RET)
+                        if let Some(x) = e {
+                            let r = self.expr_str(x);
+                            // evaluate BEFORE locking __SH_RET — a value that
+                            // is itself a fnValue call (recursive param/…
+                            // dispatch) would re-lock __SH_RET while the
+                            // outer assignment holds it (Mutex re-entrancy
+                            // deadlock — polyfills brace/param)
+                            self.emit(&format!(
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                            ));
+                        } else {
+                            self.emit("return;");
+                        }
+                        return;
+                    }
+                    // pass-3: the sticky __SH_RET cell becomes the return
+                    // value (nested calls observe identical state: stores
+                    // still land in the cell, bare returns re-read it)
                     if let Some(x) = e {
                         let r = self.expr_str(x);
-                        // evaluate BEFORE locking __SH_RET — a value that
-                        // is itself a fnValue call (recursive param/…
-                        // dispatch) would re-lock __SH_RET while the
-                        // outer assignment holds it (Mutex re-entrancy
-                        // deadlock — polyfills brace/param)
                         self.emit(&format!(
-                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
                         ));
                     } else {
-                        self.emit("return;");
+                        self.emit("return __SH_RET.lock().unwrap().clone();");
                     }
                     return;
                 }
@@ -6185,9 +6472,11 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 1;
         let old_captured = std::mem::replace(&mut self.captured, captured);
+        self.in_closure += 1;
         for s in body {
             self.stmt(s);
         }
+        self.in_closure -= 1;
         let body_src = self.out.join("\n");
         self.captured = old_captured;
         self.out = saved;
@@ -6248,6 +6537,92 @@ impl Render {
             collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            if stmts_have_huge(&prog.stmts) { collect_all_assign_targets(&prog.stmts, &mut big); }            self.bigint_vars = big;
         }
 
+        // Pass 3a: probe every function body (positional reads + wildness)
+        // BEFORE rendering main, so main's call sites already know the
+        // signatures. The probe renders with the legacy argv convention
+        // into a throwaway buffer; only the recording survives (todo
+        // count restored — the commit render re-adds each marker once).
+        {
+            let mut pfns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
+            collect_fn_defs(&prog.stmts, &mut pfns);
+            for (name, body, _named) in &pfns {
+                let saved_out = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                let saved_todo = self.todo;
+                // pass-2 deferred `let`s: the probe consumes them — restore
+                // so the commit render emits them again
+                let saved_init = std::mem::take(&mut self.local_init);
+                self.probe = Some(FnProbe::default());
+                self.in_function = true;
+                self.depth = 1;
+                {
+                    let mut cached = BTreeSet::new();
+                    collect_numeric_positionals(body, &mut cached);
+                    self.num_param_cache = cached;
+                }
+                for st in body {
+                    self.stmt(st);
+                }
+                self.num_param_cache.clear();
+                self.in_function = false;
+                let probe = self.probe.take().unwrap_or_default();
+                self.out = saved_out;
+                self.depth = saved_depth;
+                self.todo = saved_todo;
+                self.local_init = saved_init;
+                if probe.wild {
+                    continue;
+                }
+                let arity = probe
+                    .num
+                    .iter()
+                    .chain(probe.str_.iter())
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                let mut tys = Vec::new();
+                let mut used = Vec::new();
+                for i in 0..arity {
+                    tys.push(if probe.num.contains(&i) && !probe.str_.contains(&i) {
+                        FnParamTy::Num
+                    } else {
+                        FnParamTy::Str
+                    });
+                    used.push(probe.num.contains(&i) || probe.str_.contains(&i));
+                }
+                // a param name must not collide with a pass-2 local of the
+                // same function scope (the local would shadow it): `p7`
+                // vs a user var literally named `p7`
+                let scope = crate::shir_passes::list_profile::Scope::Func(name.clone());
+                let scoped: Vec<String> = self
+                    .local_vars
+                    .iter()
+                    .filter(|(_, s)| **s == scope)
+                    .map(|(v, _)| v.clone())
+                    .collect();
+                let mut collision = false;
+                for v in &scoped {
+                    let base = self.ident_base(v);
+                    for i in 0..arity {
+                        if base == format!("p{i}") || base == format!("_p{i}") {
+                            collision = true;
+                            break;
+                        }
+                    }
+                    if collision {
+                        break;
+                    }
+                }
+                if collision {
+                    continue;
+                }
+                self.fn_sigs.insert(
+                    name.clone(),
+                    FnSig { arity, tys, used },
+                );
+            }
+        }
+
         // Pass 2: render the body first (helper flags known before preamble).
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
@@ -6305,11 +6680,31 @@ impl Render {
                 self.mark_todo(&format!("function {name} named blocks"));
             }
             let m = self.fn_ident(name);
-            self.emit(&format!("fn {m}() {{"));
+            // pass-3: a probed signature becomes real params + `-> String`
+            // (the sticky __SH_RET cell is the return value); otherwise
+            // the legacy zero-arg argv convention
+            let sig = self.fn_sigs.get(name).cloned();
+            if let Some(s) = &sig {
+                let params: Vec<String> = (0..s.arity)
+                    .map(|i| {
+                        let pn = if s.used[i] {
+                            format!("p{i}")
+                        } else {
+                            format!("_p{i}")
+                        };
+                        let ty = if s.tys[i] == FnParamTy::Num { "i64" } else { "String" };
+                        format!("{pn}: {ty}")
+                    })
+                    .collect();
+                self.emit(&format!("fn {m}({}) -> String {{", params.join(", ")));
+            } else {
+                self.emit(&format!("fn {m}() {{"));
+            }
             self.depth += 1;
             // user-function bodies return VALUES via __SH_RET (the C
             // frontend's `return expr;` — strings are the value model)
             self.in_function = true;
+            self.active_fn = sig.as_ref().map(|_| name.clone());
             // numeric positional cache (entry-bound i64 locals; avoids
             // per-op parse+alloc in loops — t86).
             {
@@ -6317,6 +6712,12 @@ impl Render {
                 collect_numeric_positionals(body, &mut cached);
                 self.num_param_cache = cached;
                 for n in &self.num_param_cache.clone() {
+                    // pass-3: params arrive typed — a numeric param IS the
+                    // binding; a string param parses on demand
+                    let pi = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    if self.fn_param(pi).is_some() {
+                        continue;
+                    }
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
                     self.add_helper("arg");
                     self.emit(&format!(
@@ -6328,7 +6729,19 @@ impl Render {
                 self.stmt(st);
             }
             self.num_param_cache.clear();
+            self.active_fn = None;
             self.in_function = false;
+            // value tail: fall-off-the-end yields the sticky cell (what
+            // the legacy convention leaves in it). Skipped after an
+            // unconditional divert (rustc would flag it unreachable).
+            if sig.is_some()
+                && !matches!(
+                    body.last(),
+                    Some(IrStmt::Return(_)) | Some(IrStmt::Exit(_))
+                )
+            {
+                self.emit("__SH_RET.lock().unwrap().clone()");
+            }
             self.depth -= 1;
             self.emit("}");
             self.emit("");
