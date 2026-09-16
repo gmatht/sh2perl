@@ -285,7 +285,116 @@ impl Render {
     }
 
     fn fn_ident(&mut self, name: &str) -> String {
-        format!("{}_fn", self.rust_ident(name))
+        // snake_case + a `__sh_`-prefixed namespace (helper fns live in
+        // `__sh_*`; user fns must not collide with them).
+        format!("__sh_fn_{}", self.ident_base(name))
+    }
+
+    /// Strip one fully-enclosing matched `( … )` pair (safe in any
+    /// function-argument or `if`/`while`-condition position, where the
+    /// expression is delimited by the surrounding syntax).
+    fn unparen(s: &str) -> &str {
+        let b = s.as_bytes();
+        if b.len() < 2 || b[0] != b'(' || b[b.len() - 1] != b')' {
+            return s;
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for (i, &ch) in b.iter().enumerate() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if ch == b'\\' {
+                    esc = true;
+                } else if ch == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match ch {
+                b'"' => in_str = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return if i == b.len() - 1 { &s[1..s.len() - 1] } else { s };
+                    }
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// True when `s` binds tighter than any operator: no top-level infix
+    /// operator, no `as`, no leading unary operator — safe as-is as a
+    /// method receiver / cast operand.
+    fn is_atom(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.is_empty() {
+            return false;
+        }
+        if matches!(b[0], b'-' | b'!' | b'&' | b'*' | b'+') {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut i = 0usize;
+        while i < b.len() {
+            let ch = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if ch == b'\\' {
+                    esc = true;
+                } else if ch == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match ch {
+                b'"' => in_str = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 => {
+                    if matches!(
+                        ch,
+                        b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&'
+                            | b'|' | b'^' | b','
+                    ) {
+                        return false;
+                    }
+                    // `as` cast
+                    if ch == b'a'
+                        && b[i + 1..].starts_with(b"s")
+                        && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                        && !b
+                            .get(i + 2)
+                            .map(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                            .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// `s` if it is already atomic or fully parenthesized, else `(s)`.
+    fn atom_or_paren(s: &str) -> String {
+        if Self::unparen(s) != s {
+            return s.to_string();
+        }
+        if Self::is_atom(s) {
+            return s.to_string();
+        }
+        format!("({s})")
     }
 
     /// Write an i64 value to a var (num cell, str cell or array elem 0).
@@ -293,9 +402,9 @@ impl Render {
         if self.is_num(name) {
             self.write_num(name, e)
         } else if self.is_array(name) {
-            self.array_elem_set(name, "0", &format!("({e}).to_string()"))
+            self.array_elem_set(name, "0", &format!("{}.to_string()", Self::atom_or_paren(e)))
         } else {
-            self.write_str(name, &format!("({e}).to_string()"))
+            self.write_str(name, &format!("{}.to_string()", Self::atom_or_paren(e)))
         }
     }
 
@@ -306,6 +415,14 @@ impl Render {
     /// helper prefixes (`sh2_*`, `_sh2*`, `__sh_*`, `__SH*`) out of user
     /// vars.
     fn rust_ident(&mut self, name: &str) -> String {
+        format!("__SHV_{}", self.ident_base(name))
+    }
+
+    /// Sanitized, de-duplicated *bare* identifier for a var (no static
+    /// prefix). Global storage renders as `__SHV_<base>` (`thread_local!`),
+    /// a pass-2 local renders as the bare base — one name maps to one
+    /// storage class for the whole program, so the two never collide.
+    fn ident_base(&mut self, name: &str) -> String {
         if let Some(m) = self.mangle.get(name) {
             return m.clone();
         }
@@ -327,10 +444,6 @@ impl Render {
         {
             m.push('_');
         }
-        // Every user var becomes a module-level thread_local static named
-        // `__SHV_…` — case-distinct from ALL generated locals (`__sh_*`,
-        // `__sh_tN`), which may never shadow a static (E0530).
-        m = format!("__SHV_{m}");
         // de-dup collisions (e.g. `a-b` and `a.b` both sanitize to `a_b`)
         let base = m.clone();
         let mut n = 1;
@@ -461,22 +574,22 @@ impl Render {
 
     fn write_num(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| v.set({e}));")
+        format!("{m}.with(|v| v.set({}));", Self::unparen(e))
     }
 
     fn write_str(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {e});")
+        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
     }
 
     fn write_arr(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {e});")
+        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
     }
 
     fn push_arr(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow_mut().push({e}));")
+        format!("{m}.with(|v| v.borrow_mut().push({}));", Self::unparen(e))
     }
 
     fn clear_var(&mut self, name: &str) -> String {
@@ -819,7 +932,7 @@ impl Render {
     fn expr_str(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => Self::rust_str_expr(s),
-            IrExpr::Int(i) => format!("({}).to_string()", int_lit(*i)),
+            IrExpr::Int(i) => format!("{}.to_string()", Self::atom_or_paren(&int_lit(*i))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -884,7 +997,7 @@ impl Render {
                 }
             }
             IrExpr::Call { func, args: _ } if func == "arrayLen" => {
-                format!("({}).to_string()", self.expr_num(e))
+                format!("{}.to_string()", Self::atom_or_paren(&self.expr_num(e)))
             }
             IrExpr::Call { func, args } if func == "join" => self.join_str(args),
             IrExpr::Call { func, args } if func == "capture" => self.capture_expr(args),
@@ -989,10 +1102,9 @@ impl Render {
                 .unwrap_or(false);
             if tainted || huge {
                 let b = self.arith_bigint_inner(a);
-                return format!("({b}).to_string()");
+                return format!("{}.to_string()", Self::atom_or_paren(&b));
             }
         }
-        self.add_helper("arith_err");
         format!(
             "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ String::new() }} else {{ __v }} }}",
             self.arith(a)
@@ -1285,7 +1397,7 @@ impl Render {
     fn expr_any(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => Self::rust_str_expr(s),
-            IrExpr::Int(i) => format!("({}).to_string()", int_lit(*i)),
+            IrExpr::Int(i) => format!("{}.to_string()", Self::atom_or_paren(&int_lit(*i))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -1869,7 +1981,7 @@ impl Render {
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
                     self.emit(&format!(
-                        "let _ = {{ let __b = {c}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }};"
+                        "let _ = {{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }};", Self::unparen(&c)
                     ));
                 } else {
                     self.mark_todo("test");
@@ -2039,7 +2151,7 @@ impl Render {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
-                    format!("{{ let __b = {c}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
+                    format!("{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}", Self::unparen(&c))
                 } else {
                     self.mark_todo("test");
                     "true".to_string()
@@ -2805,7 +2917,7 @@ impl Render {
                     format!("vec![{}]", Self::rust_str_expr(s))
                 }
             }
-            IrExpr::Int(i) => format!("vec![({}).to_string()]", int_lit(*i)),
+            IrExpr::Int(i) => format!("vec![{}.to_string()]", Self::atom_or_paren(&int_lit(*i))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
@@ -3582,7 +3694,7 @@ impl Render {
         if let Some(s) = str_arg(args, 0).map(|s| s.to_string()) {
             if let Some(c) = self.test_expr(&s, &style) {
                 return format!(
-                    "{{ let __b = {c}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}"
+                    "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}", Self::unparen(&c)
                 );
             }
         }
@@ -4410,7 +4522,7 @@ impl Render {
                     IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
                     _ => self.expr_bool(c),
                 };
-                self.emit(&format!("if {b} {{"));
+                self.emit(&format!("if {} {{", Self::unparen(&b)));
                 self.depth += 1;
             }
             // push elem
@@ -4985,7 +5097,7 @@ impl Render {
             "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text(&text) {
-                    format!("({e}).to_string()")
+                    format!("{}.to_string()", Self::atom_or_paren(&e))
                 } else {
                     // `$((echo \"test\"))` — bash errors, the result is
                     // unset → an empty string is faithful
@@ -5225,7 +5337,7 @@ impl Render {
                 }
                 IrExpr::BinOp { lhs, op: BinOpKind::And, rhs } => {
                     let l = self.expr_bool(lhs);
-                    self.emit(&format!("if {l} {{"));
+                    self.emit(&format!("if {} {{", Self::unparen(&l)));
                     self.depth += 1;
                     self.expr_stmt_value(rhs);
                     self.depth -= 1;
@@ -5399,8 +5511,7 @@ impl Render {
                             .unwrap_or(false);
                         if tainted || huge {
                             let b = self.arith_bigint(a);
-                            self.add_helper("arith_err");
-                            format!(
+                                                format!(
                                 "{{ let __v = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
                          __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}"
                             )
@@ -5409,8 +5520,7 @@ impl Render {
                     // EMPTY and sets rc 1 on an evaluation error
                     // (division/modulo by zero); the checked div/mod
                     // helpers flag the error via __SH_ARITH_ERR.
-                    self.add_helper("arith_err");
-                    format!(
+                                format!(
                         "{{ let __v = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
                          __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}",
                         self.arith(a)
@@ -5528,7 +5638,7 @@ impl Render {
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 let c = self.expr_bool(cond);
-                self.emit(&format!("if {c} {{"));
+                self.emit(&format!("if {} {{", Self::unparen(&c)));
                 self.depth += 1;
                 for s in then {
                     self.stmt(s);
@@ -5569,7 +5679,7 @@ impl Render {
                 let last = self.gensym("__sh_while_last");
                 self.emit(&format!("let mut {ran} = false;"));
                 self.emit(&format!("let mut {last} = 0;"));
-                self.emit(&format!("while {c} {{"));
+                self.emit(&format!("while {} {{", Self::unparen(&c)));
                 self.loop_depth += 1;
                 self.depth += 1;
                 self.emit(&format!("{ran} = true;"));
@@ -5769,7 +5879,7 @@ impl Render {
                         format!("({alts})")
                     };
                     if first {
-                        self.emit(&format!("if {cond} {{"));
+                        self.emit(&format!("if {} {{", Self::unparen(&cond)));
                         first = false;
                     } else {
                         self.emit(&format!("}} else if {cond} {{"));
@@ -5855,7 +5965,7 @@ impl Render {
                 let last = self.gensym("__sh_forinit_last");
                 self.emit(&format!("let mut {ran} = false;"));
                 self.emit(&format!("let mut {last} = 0;"));
-                self.emit(&format!("while {c} {{"));
+                self.emit(&format!("while {} {{", Self::unparen(&c)));
                 self.loop_depth += 1;
                 self.depth += 1;
                 self.emit(&format!("{ran} = true;"));
@@ -6124,12 +6234,11 @@ impl Render {
         self.depth = 0;
 
         // Preamble: statics + helpers, then main with the rendered body.
-        self.emit("#![allow(unused_imports)]");
-        self.emit("#![allow(non_upper_case_globals)]");
+        // per-item allows (no crate-wide `#![allow]`)
         self.emit("use std::sync::atomic::Ordering;");
-        self.emit("use std::io::Read;");
-        self.emit("use std::io::BufRead;");
-        self.emit("use std::io::Write;");
+        self.emit("#[allow(unused_imports)] use std::io::Read;");
+        self.emit("#[allow(unused_imports)] use std::io::BufRead;");
+        self.emit("#[allow(unused_imports)] use std::io::Write;");
         self.emit("");
         self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARGV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
@@ -6173,27 +6282,31 @@ impl Render {
         // a nameref's own static is still declared (dead but harmless) —
         // `unset ref` etc. may reference it before the binding renders
         let m = self.rust_ident(v);
+        // user var names are lower-case; the allow sits INSIDE the
+        // `thread_local!` block so it applies to the generated static
+        // (a per-item allow, no crate-wide suppression).
+        let a = "#[allow(non_upper_case_globals)] ";
         if self.is_assoc(v) {
             format!(
-                "thread_local! {{ static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
             )
         } else if self.is_array(v) {
             format!(
-                "thread_local! {{ static {m}: std::cell::RefCell<Vec<String>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<String>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
             )
         } else if self.bigint_vars.contains(v) {
             // BigInt-tainted: decimal string holder (ops parse per use;
             // tier-0 string-BigInt). Looks like Str (RefCell<String>).
             format!(
-                "thread_local! {{ static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
             )
         } else if self.is_num(v) {
             format!(
-                "thread_local! {{ static {m}: std::cell::Cell<i64> = const {{ std::cell::Cell::new(0) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::Cell<i64> = const {{ std::cell::Cell::new(0) }}; }}"
             )
         } else {
             format!(
-                "thread_local! {{ static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
             )
         }
     }
@@ -6254,7 +6367,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
-    "div", "mod", "arith_err", "capture", "run_traps", "lines",
+    "div", "mod", "capture", "run_traps", "lines",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -6409,7 +6522,6 @@ fn helper_source(h: &str) -> &'static str {
     if bv == BigInt::from(0) { __SH_ARITH_ERR.store(true, Ordering::SeqCst); return false; }
     (av % bv) == BigInt::from(0)
 }"#,
-        "arith_err" => r#"#[allow(dead_code)] fn __sh_arith_err() -> bool { __SH_ARITH_ERR.swap(false, Ordering::SeqCst) }"#,
         "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
     let mut o = String::new();
     let ch: Vec<char> = s.chars().collect();
@@ -8369,7 +8481,7 @@ impl Render {
                             // the `:-0` default)
                             let norm = normalize_arith_vars(&body);
                             if let Some(e) = self.arith_text(&norm) {
-                                args.push(format!("({e}).to_string()"));
+                                args.push(format!("{}.to_string()", Self::atom_or_paren(&e)));
                             } else {
                                 // `$(( $(cmd) + $(cmd) ))` — nested
                                 // command substitutions the arith parser
@@ -10590,7 +10702,10 @@ mod tests {
     fn assigns_and_echo() {
         let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
-        assert!(out.contains("thread_local! { static __SHV_x: std::cell::Cell<i64>"), "{out}");
+        assert!(
+            out.contains("thread_local! { #[allow(non_upper_case_globals)] static __SHV_x: std::cell::Cell<i64>"),
+            "{out}"
+        );
         assert!(out.contains("x.with(|v| v.set(5));"), "{out}");
         assert!(out.contains("__sh_print_words"), "{out}");
     }
