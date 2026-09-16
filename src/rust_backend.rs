@@ -261,6 +261,132 @@ fn str_forced_vars(prog: &IrProgram) -> BTreeSet<String> {
 }
 
 /// Render an `IrProgram` to Rust source (fn main()).
+/// Pass-5 peephole (textual): `__sh_cat` is pure concatenation, so a
+/// single fresh `vec![..]` — or nothing at all — needs no call.
+/// Only exact shapes fire (`__sh_cat(&[])`, `__sh_cat(&[vec![..]])`);
+/// anything else (variables, calls, multi-part) is left alone, since
+/// eliding the call would move a value that may be used later. The
+/// bracket scan skips string/char literals; on any doubt it aborts
+/// (missed opt, never miscompile). Fixpoint: inner cats simplify first.
+fn cat_peephole(text: &str) -> String {
+    /// Copy one char (boundary-safe for UTF-8 in literals).
+    fn push_char(s: &str, out: &mut String, i: &mut usize) {
+        let ch = s[*i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        *i += ch.len_utf8();
+    }
+
+    fn one_pass(s: &str) -> (String, bool) {
+        let mut out = String::with_capacity(s.len());
+        let b = s.as_bytes();
+        let mut i = 0;
+        let mut changed = false;
+        while i < b.len() {
+            // non-ASCII (UTF-8 literals): copy whole chars, never split
+            if b[i] & 0x80 != 0 {
+                push_char(s, &mut out, &mut i);
+                continue;
+            }
+            if s[i..].starts_with("__sh_cat(&[])") {
+                out.push_str("Vec::<String>::new()");
+                i += "__sh_cat(&[])".len();
+                changed = true;
+                continue;
+            }
+            if s[i..].starts_with("__sh_cat(&[vec![") {
+                // scan the vec's [...] with depth, skipping literals
+                let mut j = i + "__sh_cat(&[vec![".len();
+                let mut depth = 1usize;
+                let mut ok = true;
+                while j < b.len() && depth > 0 {
+                    let c = b[j] as char;
+                    if c == '"' {
+                        j += 1;
+                        let mut closed = false;
+                        while j < b.len() {
+                            if b[j] == b'\\' {
+                                j += 2;
+                            } else if b[j] == b'"' {
+                                closed = true;
+                                j += 1;
+                                break;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        if !closed {
+                            ok = false;
+                            break;
+                        }
+                    } else if c == '\'' {
+                        // only exact char shapes; else abort (a lifetime
+                        // `'` would desync the scan)
+                        let rest = &s[j..];
+                        if (rest.len() > 3 && rest.as_bytes()[2] == b'\'')
+                            || (rest.len() > 4
+                                && rest.as_bytes()[1] == b'\\'
+                                && rest.as_bytes()[3] == b'\'')
+                        {
+                            j += if rest.as_bytes()[1] == b'\\' { 4 } else { 3 };
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    } else if c == '[' {
+                        depth += 1;
+                        j += 1;
+                    } else if c == ']' {
+                        depth -= 1;
+                        j += 1;
+                    } else {
+                        j += 1;
+                    }
+                }
+                // expect the `&[` close and the call close: `])`
+                if ok && depth == 0 && s[j..].starts_with("])") {
+                    let inner = &s[i + "__sh_cat(&[vec![".len()..j - 1];
+                    if inner.trim().is_empty() {
+                        out.push_str("Vec::<String>::new()");
+                    } else {
+                        out.push_str("vec![");
+                        out.push_str(inner);
+                        out.push(']');
+                    }
+                    i = j + 2;
+                    changed = true;
+                    continue;
+                }
+                // not the shape (or doubt) — copy one char, move on
+                push_char(s, &mut out, &mut i);
+                continue;
+            }
+            push_char(s, &mut out, &mut i);
+        }
+        (out, changed)
+    }
+    let mut cur = text.to_string();
+    loop {
+        let (next, changed) = one_pass(&cur);
+        cur = next;
+        if !changed {
+            break;
+        }
+    }
+    // collect the helper when the last call collapsed (a def without
+    // calls is dead weight regardless of whether rustc flags it)
+    if !cur.contains("__sh_cat(&") {
+        let def = "fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n";
+        if let Some(pos) = cur.find(def) {
+            let mut end = pos + def.len();
+            while cur[end..].starts_with('\n') {
+                end += 1;
+            }
+            cur.replace_range(pos..end, "");
+        }
+    }
+    cur
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -268,7 +394,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     r.var_types = prog.var_types.iter().cloned().collect();
     r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
-    let text = r.out.join("\n");
+    let text = cat_peephole(&r.out.join("\n"));
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
     // as a confusing rustc error, or silently bind a different static.
@@ -11533,6 +11659,53 @@ mod tests {
         let prog = crate::shir::ast_to_ir(&commands);
         shir_to_rust(&prog)
     }
+
+    #[test]
+    fn cat_peephole_shapes() {
+        // empty and single-literal cats collapse; everything else stays
+        assert_eq!(super::cat_peephole("__sh_cat(&[])"), "Vec::<String>::new()");
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[vec![10.to_string()]])"),
+            "vec![10.to_string()]"
+        );
+        assert_eq!(super::cat_peephole("__sh_cat(&[vec![]])"), "Vec::<String>::new()");
+        // sequential singles both fire in one pass
+        assert_eq!(
+            super::cat_peephole("f(__sh_cat(&[vec![x]]), __sh_cat(&[vec![y]]))"),
+            "f(vec![x], vec![y])"
+        );
+        // an inner single inside a larger well-typed outer (the inner
+        // cat is projected to String so the outer literal stays flat)
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[vec![a, __sh_cat(&[vec![x]]).join(\", \")]])"),
+            "vec![a, vec![x].join(\", \")]"
+        );
+        // brackets inside strings must not confuse the scan
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[vec![format!(\"[{}]\", x)]])"),
+            "vec![format!(\"[{}]\", x)]"
+        );
+        // untouched: variables, calls, multi-part
+        assert_eq!(super::cat_peephole("__sh_cat(&__b)"), "__sh_cat(&__b)");
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[__sh_glob(p)])"),
+            "__sh_cat(&[__sh_glob(p)])"
+        );
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[vec![a], vec![b]])"),
+            "__sh_cat(&[vec![a], vec![b]])"
+        );
+        // UTF-8 passes through unsplit
+        assert_eq!(super::cat_peephole("x = \"caf\u{e9}\";"), "x = \"caf\u{e9}\";");
+        // an orphaned helper is collected with its last call
+        assert_eq!(
+            super::cat_peephole("fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n\nuse x;\n"),
+            "use x;\n"
+        );
+        // ...but kept while any call survives
+        assert!(super::cat_peephole("fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n\n__sh_cat(&[a, b])\n").contains("fn __sh_cat"));
+    }
+
 
     #[test]
     fn assigns_and_echo() {
