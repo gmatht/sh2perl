@@ -2974,16 +2974,17 @@ impl Render {
             "contains" | "strHasPrefix" | "strHasSuffix" => "Vec::new()".to_string(),
             "sum" | "max" | "min" => {
                 // numeric reduction over Vec<String> (t94 `sum(xs)`).
+                // BigInt (t93 mixed i64+bigint; i64 truncates huge).
                 // Empty: sum=0; max/min empty (Python raises; documented).
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
                         let op = if func == "sum" {
-                            "let mut __acc: i64 = 0; for __e in __vv.iter() { __acc += __e.trim().parse::<i64>().unwrap_or(0); } __acc.to_string()"
+                            "let mut __acc = num_bigint::BigInt::from(0); for __e in __vv.iter() { __acc += __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); } __acc.to_string()"
                         } else if func == "max" {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<i64>().unwrap_or(0); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<i64>().unwrap_or(0); if __v > __m { __m = __v; } } __m.to_string() }"
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __v > __m { __m = __v; } } __m.to_string() }"
                         } else {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<i64>().unwrap_or(0); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<i64>().unwrap_or(0); if __v < __m { __m = __v; } } __m.to_string() }"
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __v < __m { __m = __v; } } __m.to_string() }"
                         };
                         let mut s = String::from("vec![{ let __vv = ");
                         s.push_str(&m);
@@ -5024,6 +5025,26 @@ impl Render {
                         } else {
                             format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
                         }
+                    }
+                    None => "String::new()".to_string(),
+                }
+            }
+            // sorted joins as strings (t93 `print(sorted(xs))`; bracketed
+            // here since call_str yields String, not Vec).
+            "sortedIntJoin" => {
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sv.join(\", \") }}")
+                    }
+                    None => "String::new()".to_string(),
+                }
+            }
+            "sortedBigintJoin" => {
+                match str_arg(args, 0) {
+                    Some(name) => {
+                        let m = self.tls(name);
+                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }}); __sv.dedup_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }});  __sv.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
                 }
