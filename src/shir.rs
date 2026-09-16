@@ -9590,8 +9590,11 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
 
 /// Storage widths for one scope's statements: "i32" iff the (hulled)
 /// value range AND every assigned Arith RHS exactly evaluate within
-/// i32; else "i64". Only names present in `ranges` with an
-/// i64-contained range are considered (callers intersect with Int).
+/// i32; "i64" likewise for 64 bits; "i128" when the value fits 128 bits
+/// but not 64 (the __int128 middle tier — Cython has no bigint, so the
+/// .pyx tier rewrites these). Only names present in `ranges` are
+/// considered (callers intersect with Int); beyond-i128 ranges get no
+/// entry (object).
 pub fn analyze_widths(
     stmts: &[crate::ir::IrStmt],
     ranges: &std::collections::HashMap<String, (i128, i128)>,
@@ -9601,6 +9604,8 @@ pub fn analyze_widths(
     const I32MAX: i128 = i32::MAX as i128;
     const I64MIN: i128 = i64::MIN as i128;
     const I64MAX: i128 = i64::MAX as i128;
+    const I128MIN: i128 = i128::MIN;
+    const I128MAX: i128 = i128::MAX;
     fn fits(v: (i128, i128), lo: i128, hi: i128) -> bool {
         v.0 >= lo && v.1 <= hi
     }
@@ -9643,15 +9648,16 @@ pub fn analyze_widths(
     for s in stmts {
         collect_rhs(s, &mut rhs_list);
     }
-    // every subexpression of an assigned RHS must fit: `% M` bounds
-    // the stored VALUE but not the intermediate (`h*31` reaches 31e9
-    // while the stored `h` stays in [0,M-1])
-    fn subexpr_fits_i32(
+    // tier predicate: value range AND every assigned-RHS subexpression
+    // must fit (same subexpression rule as i32, generalized)
+    fn subexpr_fits(
         a: &ArithAst,
         ranges: &std::collections::HashMap<String, (i128, i128)>,
+        lo: i128,
+        hi: i128,
     ) -> bool {
         let ok_here = match arith_range_exact(a, ranges) {
-            Some(rr) => fits(rr, I32MIN, I32MAX),
+            Some(rr) => fits(rr, lo, hi),
             None => false,
         };
         if !ok_here {
@@ -9659,35 +9665,41 @@ pub fn analyze_widths(
         }
         match a {
             ArithAst::Bin { lhs, rhs, .. } => {
-                subexpr_fits_i32(lhs, ranges) && subexpr_fits_i32(rhs, ranges)
+                subexpr_fits(lhs, ranges, lo, hi) && subexpr_fits(rhs, ranges, lo, hi)
             }
-            ArithAst::Un { arg, .. } => subexpr_fits_i32(arg, ranges),
+            ArithAst::Un { arg, .. } => subexpr_fits(arg, ranges, lo, hi),
             ArithAst::Cond { test, then, else_, .. } => {
-                subexpr_fits_i32(test, ranges)
-                    && subexpr_fits_i32(then, ranges)
-                    && subexpr_fits_i32(else_, ranges)
+                subexpr_fits(test, ranges, lo, hi)
+                    && subexpr_fits(then, ranges, lo, hi)
+                    && subexpr_fits(else_, ranges, lo, hi)
             }
-            ArithAst::Assign { rhs, .. } => subexpr_fits_i32(rhs, ranges),
-            ArithAst::Cast { arg, .. } => subexpr_fits_i32(arg, ranges),
-            ArithAst::Index { key, .. } => subexpr_fits_i32(key, ranges),
+            ArithAst::Assign { rhs, .. } => subexpr_fits(rhs, ranges, lo, hi),
+            ArithAst::Cast { arg, .. } => subexpr_fits(arg, ranges, lo, hi),
+            ArithAst::Index { key, .. } => subexpr_fits(key, ranges, lo, hi),
             _ => true,
         }
     }
     let mut out = std::collections::HashMap::new();
     for (n, r) in ranges {
-        if !fits(*r, I64MIN, I64MAX) {
-            continue;
+        // collect this var's assigned RHS once
+        let rhs_of: Vec<&ArithAst> = rhs_list
+            .iter()
+            .filter(|(v, _)| v == n)
+            .map(|(_, a)| a)
+            .collect();
+        let fits_tier = |lo: i128, hi: i128| {
+            fits(*r, lo, hi)
+                && rhs_of
+                    .iter()
+                    .all(|a| subexpr_fits(a, ranges, lo, hi))
+        };
+        if fits_tier(I32MIN, I32MAX) {
+            out.insert(n.clone(), "i32".to_string());
+        } else if fits_tier(I64MIN, I64MAX) {
+            out.insert(n.clone(), "i64".to_string());
+        } else if fits_tier(I128MIN, I128MAX) {
+            out.insert(n.clone(), "i128".to_string());
         }
-        let mut ok32 = fits(*r, I32MIN, I32MAX);
-        if ok32 {
-            for (v, a) in &rhs_list {
-                if v == n && !subexpr_fits_i32(a, ranges) {
-                    ok32 = false;
-                    break;
-                }
-            }
-        }
-        out.insert(n.clone(), if ok32 { "i32".to_string() } else { "i64".to_string() });
     }
     out
 }
@@ -10393,6 +10405,31 @@ pub fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<Stri
         }
         _ => false,
     }
+}
+
+/// Range analysis under parameter hypotheses (the dual-arm analysis):
+/// run the range walk with `assumes` seeded as known entry ranges (e.g.
+/// a guarded parameter `n` in `[0, 2^63)`). Never-assigned names keep
+/// their seed (parameters are not carried, so fixpoints cannot disturb
+/// them); assigned names overwrite normally. Callers propose a hypothesis
+/// (guard bounds) and check whether the body proves i64-contained under
+/// it — that check is the fast-arm gate; emission stays source-side.
+pub fn analyze_var_ranges_with_assumes(
+    stmts: &[crate::ir::IrStmt],
+    assumes: &std::collections::HashMap<String, (i128, i128)>,
+) -> std::collections::HashMap<String, (i128, i128)> {
+    let mut state: std::collections::HashMap<String, Option<(i128, i128)>> =
+        std::collections::HashMap::new();
+    for (n, r) in assumes {
+        state.insert(n.clone(), Some(*r));
+    }
+    for s in stmts {
+        walk_stmt_ranges(s, &mut state);
+    }
+    state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect()
 }
 
 pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
@@ -53471,6 +53508,20 @@ mod py2cy_analysis_tests {
     }
 
     #[test]
+    fn width_i128_tier() {
+        // 65..128-bit values (past i64, within i128) get the __int128
+        // tier; beyond-i128 gets no entry (object)
+        let mut ranges = std::collections::HashMap::new();
+        ranges.insert("w".to_string(), (i64::MAX as i128 + 1, i64::MAX as i128 + 100));
+        ranges.insert("top".to_string(), (0, i128::MAX));
+        ranges.insert("s".to_string(), (0, 10));
+        let w = analyze_widths(&[], &ranges);
+        assert_eq!(w.get("w").map(String::as_str), Some("i128"));
+        assert_eq!(w.get("top").map(String::as_str), Some("i128"), "i128::MAX boundary");
+        assert_eq!(w.get("s").map(String::as_str), Some("i32"));
+    }
+
+    #[test]
     fn trip_bounded_accumulation() {
         // `s=0; for n in 1 2 3; do s=$((s+n)); done`: the 3-trip hint
         // caps the accumulator instead of widening to top (true max 6).
@@ -53558,6 +53609,37 @@ mod bigint_hoist_tests {
             },
         )]);
         assert!(!analyze_bigint_vars(&p).contains("v"));
+    }
+}
+
+#[cfg(test)]
+mod hypothesis_tests {
+    use super::*;
+    use crate::ir::{ArithAst, AssignTarget, IrExpr, IrStmt};
+
+    #[test]
+    fn assumes_seed_params() {
+        // y = x * 2 with x assumed [0,100] proves y = [0,200];
+        // unassumed, y is unknown
+        let stmt = IrStmt::Assign {
+            targets: vec![AssignTarget { var: "y".to_string(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(ArithAst::Var("x".to_string())),
+                rhs: Box::new(ArithAst::Num(2)),
+            })),
+            asm: None,
+        };
+        let mut assumes = std::collections::HashMap::new();
+        assumes.insert("x".to_string(), (0, 100));
+        let r = analyze_var_ranges_with_assumes(&[stmt.clone()], &assumes);
+        assert_eq!(r.get("y"), Some(&(0, 200)));
+        assert_eq!(r.get("x"), Some(&(0, 100)), "seed persists");
+        let r2 = analyze_var_ranges_with_assumes(
+            &[stmt],
+            &std::collections::HashMap::new(),
+        );
+        assert!(!r2.contains_key("y"), "unassumed x proves nothing");
     }
 }
 
