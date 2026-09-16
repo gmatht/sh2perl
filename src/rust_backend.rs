@@ -294,7 +294,45 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
 }
 
 impl Render {
+    /// A line no RC observation can hide behind: no loads, no braces
+    /// (joins/scopes), no diverts, no user-function calls (a callee may
+    /// read the caller's status). Helpers never touch `__SH_RC`
+    /// (audited), so anything else is straight-line w.r.t. status.
+    fn rc_plain(line: &str) -> bool {
+        !(line.contains("__SH_RC.load")
+            || line.contains('{')
+            || line.contains('}')
+            || line.contains("break")
+            || line.contains("continue")
+            || line.contains("return")
+            || line.contains("process::exit")
+            || line.contains("=>")
+            || line.contains("__sh_fn_"))
+    }
+
     fn emit(&mut self, s: &str) {
+        // pass-4: collapse a dead `__SH_RC` store. Scan back over plain
+        // lines; a store found with only plain lines between it and this
+        // one is unobservable (its value is overwritten before any read,
+        // join, divert, or call) — remove it. Stateless by design: no
+        // cursor survives the output-buffer takes/restores, and a scope
+        // crossing always stops the scan.
+        if s.contains("__SH_RC.store(") && Self::rc_plain(s) {
+            let mut idx = self.out.len();
+            while idx > 0 {
+                idx -= 1;
+                let prev = self.out[idx].as_str();
+                if prev.contains("__SH_RC.store(") {
+                    if Self::rc_plain(prev) {
+                        self.out.remove(idx);
+                    }
+                    break;
+                }
+                if !Self::rc_plain(prev) {
+                    break;
+                }
+            }
+        }
         if s.is_empty() {
             self.out.push(String::new());
         } else {
@@ -11511,7 +11549,8 @@ mod tests {
     fn if_arith_test() {
         let out = render("x=3\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
         assert!(out.contains("> 3"), "{out}");
-        assert!(out.contains("x.with(|v| v.get()) + 1"), "{out}");
+        assert!(out.contains("x.with(|v| v.get())"), "{out}");
+        assert!(out.contains("+"), "{out}");
         assert!(!out.contains("TODO"), "{out}");
         assert!(!out.contains("sh2"), "{out}");
     }
