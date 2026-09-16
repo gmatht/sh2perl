@@ -6032,7 +6032,7 @@ impl Render {
         // bigint taint (t87 huge consts/propagations; needs prog.subs).
         {
             let mut big = BTreeSet::new();
-            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            self.bigint_vars = big;
+            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            if stmts_have_huge(&prog.stmts) { collect_all_assign_targets(&prog.stmts, &mut big); }            self.bigint_vars = big;
         }
 
         // Pass 2: render the body first (helper flags known before preamble).
@@ -9424,6 +9424,90 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 /// Fixpoint (max 10 rounds; t87 converges in 1-2).
 /// Mark vars assigned huge literals (t90 `n = 2**64+1` as decimal
 /// text; mods/compares on them need BigInt, not i64).
+/// True if stmts contain any huge Arith/literal (for program-wide
+/// bigint marking; t91 set with 2**100 needs total as BigInt).
+fn stmts_have_huge(stmts: &[IrStmt]) -> bool {
+    use num_bigint::BigInt;
+    fn expr_huge(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Arith(a) => eval_arith_bigint(a)
+                .map(|v| {
+                    v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
+                })
+                .unwrap_or(false),
+            IrExpr::Str(s, _) => {
+                let t = s.trim().trim_start_matches(['+', '-']);
+                if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(v) = t.parse::<BigInt>() {
+                        return v > BigInt::from(i64::MAX)
+                            || v < BigInt::from(i64::MIN);
+                    }
+                }
+                false
+            }
+            IrExpr::Call { args, .. } => args.iter().any(expr_huge),
+            IrExpr::Array(items) => items.iter().any(expr_huge),
+            IrExpr::Arrow(ss) => ss.iter().any(stmt_huge),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| {
+                matches!(p, crate::ir::InterpPart::Expr(x) if expr_huge(x))
+            }),
+            _ => false,
+        }
+    }
+    fn stmt_huge(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Assign { expr, .. } => expr_huge(expr),
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => expr_huge(e),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                expr_huge(cond)
+                    || stmts_have_huge(then)
+                    || elsifs.iter().any(|(c, b)| expr_huge(c) || stmts_have_huge(b))
+                    || stmts_have_huge(else_)
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                expr_huge(cond) || stmts_have_huge(body)
+            }
+            IrStmt::For { iter, body, .. } => expr_huge(iter) || stmts_have_huge(body),
+            IrStmt::Function { body, .. } => stmts_have_huge(body),
+            IrStmt::Block(b) | IrStmt::Subshell(b) => stmts_have_huge(b),
+            IrStmt::Redirect { inner, .. } => stmts_have_huge(inner),
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|st| stmts_have_huge(st)),
+            _ => false,
+        }
+    }
+    stmts.iter().any(stmt_huge)
+}
+
+/// Mark ALL assign targets as bigint when huge present (t91; sound,
+/// per-program so t86 unaffected).
+fn collect_all_assign_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => collect_all_assign_targets(body, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_all_assign_targets(then, out);
+                for (_, b) in elsifs {
+                    collect_all_assign_targets(b, out);
+                }
+                collect_all_assign_targets(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body) => collect_all_assign_targets(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_huge_literal_assigns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     use num_bigint::BigInt;
     fn rhs_huge(e: &IrExpr) -> bool {
