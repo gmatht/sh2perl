@@ -93,6 +93,7 @@ pub mod for_recovery; // counter-while → native For recovery
 pub mod fuse_fill_consume; // fill+consume loop fusion with RHS forwarding
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
 pub mod i32_provable;
+pub mod f32_narrow; // binary32-exact float verdicts (cdef-float proofs)
 pub mod const_capture_fold;
 pub mod const_condition_elim;
 pub mod copy_propagation;
@@ -149,6 +150,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("for-recovery", for_recovery::transform),
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
+        ("f32-narrow", f32_narrow::transform),
         ("text-ops", text_ops::transform),
         ("text-ops-planner", text_ops_planner::transform),
         // core-requests/transforms/done batch merge (12 orphaned submissions)

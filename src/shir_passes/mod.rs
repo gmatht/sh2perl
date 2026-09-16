@@ -68,6 +68,7 @@ pub mod scc; // strongly-connected-component recognition over the call graph (mu
 pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
 pub mod strip;
 pub mod transform;
+pub mod interval; // generic integer intervals (bash wrapping + Python floor-mod)
 pub mod used_before_decl; // use-before-declaration lint (the "definitely uninitialized" dataflow)
 
 pub use context::PassContext;
@@ -296,6 +297,7 @@ impl Pipeline {
                 Box::new(analysis::AsyncRegionLoops),
                 Box::new(analysis::LastExitLiveness),
                 Box::new(analysis::LoopStatusDeadness),
+                Box::new(interval::Interval),
                 // use-before-declaration: the "definitely uninitialized"
                 // dataflow — independent of the lifts; a lint every backend
                 // (and the PowerShell/ESTree frontends) can surface, and a

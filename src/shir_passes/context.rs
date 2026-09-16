@@ -118,6 +118,12 @@ pub struct PassContext {
     /// producer/consumer binding would be lost).
     pub async_region_loops: HashSet<*const IrStmt>,
 
+    // ── Generic interval ranges (bash + Python) ──────────────────────
+    /// Provable integer intervals per variable (generic `IntervalConfig`
+    /// lattice — `shir::analyze_var_ranges` for bash, floor-mod for
+    /// Python). Populated by `shir_passes::interval::{Interval,PyInterval}`.
+    pub var_ranges: std::collections::HashMap<String, (i128, i128)>,
+
     // ── Use-before-declaration (the use-before-decl lint) ─────────
     /// Variables read at a statement position on a control-flow path that
     /// has no prior definition (the static check behind PowerShell's
