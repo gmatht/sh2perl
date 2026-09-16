@@ -76,6 +76,10 @@ pub struct Render {
     /// bigint-tainted vars (assigned huge consts or BigInt results;
     /// rendered as num-bigint BigInt, not i64 — t87).
     bigint_vars: BTreeSet<String>,
+    /// numeric positional cache for current body (`$N` used in Arith →
+    /// `__pn_N` i64 local bound at entry; avoids per-op parse+alloc).
+    /// Set per function/main body before rendering (cleared after).
+    num_param_cache: BTreeSet<String>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -1441,7 +1445,18 @@ impl Render {
             // 67108847*67108837). Small literals stay unsuffixed (zero
             // blast radius on inferred i32 contexts).
             ArithAst::Num(n) => int_lit(*n),
-            ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                // cached numeric positional (entry-bound; avoids per-op
+                // parse+alloc — t86).
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_digit())
+                    && self.num_param_cache.contains(name)
+                {
+                    format!("__pn_{name}")
+                } else {
+                    self.getvar_num(name)
+                }
+            }
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 if (self.is_array(var) || self.is_assoc(var)) && self.declared(var) {
@@ -5961,9 +5976,24 @@ impl Render {
             // user-function bodies return VALUES via __SH_RET (the C
             // frontend's `return expr;` — strings are the value model)
             self.in_function = true;
+            // numeric positional cache (entry-bound i64 locals; avoids
+            // per-op parse+alloc in loops — t86).
+            {
+                let mut cached = BTreeSet::new();
+                collect_numeric_positionals(body, &mut cached);
+                self.num_param_cache = cached;
+                for n in &self.num_param_cache.clone() {
+                    let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    self.add_helper("arg");
+                    self.emit(&format!(
+                        "let __pn_{n}: i64 = __sh_arg({i}).trim().parse::<i64>().unwrap_or(0);"
+                    ));
+                }
+            }
             for st in body {
                 self.stmt(st);
             }
+            self.num_param_cache.clear();
             self.in_function = false;
             self.depth -= 1;
             self.emit("}");
@@ -8810,6 +8840,91 @@ fn split_ident_rest(t: &str) -> Option<(&str, &str)> {
 
 /// Collect every variable written by statements (assign targets, declare
 /// lists, For loop vars, read targets, array calls) — the hoisted set.
+/// Collect positional digits (`$N`) used in Arith (numeric context)
+/// anywhere in stmts (for entry caching; t86 67M parses).
+fn collect_numeric_positionals(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    fn walk_e(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Arith(a) => walk_a(a, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_e(a, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    walk_e(a, out);
+                }
+            }
+            IrExpr::Arrow(ss) => collect_numeric_positionals(ss, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_e(x, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_a(a: &ArithAst, out: &mut BTreeSet<String>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    out.insert(n.clone());
+                }
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_a(lhs, out);
+                walk_a(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => walk_a(arg, out),
+            ArithAst::Cond { test, then, else_, .. } => {
+                walk_a(test, out);
+                walk_a(then, out);
+                walk_a(else_, out);
+            }
+            ArithAst::Index { key, .. } => walk_a(key, out),
+            ArithAst::Cast { arg, .. } => walk_a(arg, out),
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Assign { expr, .. } => walk_e(expr, out),
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_e(e, out),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_e(cond, out);
+                collect_numeric_positionals(then, out);
+                for (c, b) in elsifs {
+                    walk_e(c, out);
+                    collect_numeric_positionals(b, out);
+                }
+                collect_numeric_positionals(else_, out);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_e(cond, out);
+                collect_numeric_positionals(body, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_e(iter, out);
+                collect_numeric_positionals(body, out);
+            }
+            IrStmt::Function { body, .. } => collect_numeric_positionals(body, out),
+            IrStmt::Block(body) | IrStmt::Subshell(body) => {
+                collect_numeric_positionals(body, out);
+            }
+            IrStmt::Redirect { inner, .. } => collect_numeric_positionals(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_numeric_positionals(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
