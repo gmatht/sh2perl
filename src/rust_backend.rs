@@ -11549,8 +11549,14 @@ mod tests {
     fn if_arith_test() {
         let out = render("x=3\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
         assert!(out.contains("> 3"), "{out}");
-        assert!(out.contains("x.with(|v| v.get())"), "{out}");
-        assert!(out.contains("+"), "{out}");
+        // explicit i64 casts (bigint-era shape): the arith lowering
+        // must read x numerically and add 1 — exact shape, not a weak
+        // substring (see pass-4 commit: a concurrently-saved weakening
+        // rode along; this restores a precise expectation)
+        assert!(
+            out.contains("(__SHV_x.with(|v| v.get()) as i64) + (1 as i64)"),
+            "{out}"
+        );
         assert!(!out.contains("TODO"), "{out}");
         assert!(!out.contains("sh2"), "{out}");
     }
