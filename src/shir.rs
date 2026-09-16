@@ -9692,6 +9692,709 @@ pub fn analyze_widths(
     out
 }
 
+/// True when an arith tree reads a bigint-homed var (or a sized-int
+/// cast) — shared by the C/Zig exact-int lowerings.
+
+/// True when an arith tree reads a bigint-homed var (or a sized-int
+/// cast) — shared by the C/Zig exact-int lowerings.
+pub fn arith_refs_bigint(a: &crate::ir::ArithAst, vars: &std::collections::BTreeSet<String>) -> bool {
+    match a {
+        crate::ir::ArithAst::Num(_) => false,
+        crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => vars.contains(n),
+        crate::ir::ArithAst::Index { key, .. } => arith_refs_bigint(key, vars),
+        crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+            arith_refs_bigint(lhs, vars) || arith_refs_bigint(rhs, vars)
+        }
+        crate::ir::ArithAst::Un { arg, .. } => arith_refs_bigint(arg, vars),
+        crate::ir::ArithAst::Cond { test, then, else_ } => {
+            arith_refs_bigint(test, vars)
+                || arith_refs_bigint(then, vars)
+                || arith_refs_bigint(else_, vars)
+        }
+        crate::ir::ArithAst::Assign { rhs, .. } => arith_refs_bigint(rhs, vars),
+        crate::ir::ArithAst::IncDec { var, .. } => vars.contains(var),
+        crate::ir::ArithAst::Sizeof(_) => false,
+        crate::ir::ArithAst::Cast { ty, .. } => matches!(
+            ty,
+            crate::ir::IrType::Int64 | crate::ir::IrType::UInt64 | crate::ir::IrType::Int32 | crate::ir::IrType::UInt32
+        ),
+    }
+}
+
+/// SH2_PROFILE_WIDE candidates: scalar vars that look like unbounded
+/// *growers* — a self-RMW arithmetic assignment using `*`, `**` or `<<`
+/// (`x = x * 2`), and never read in a loop/if condition. Homing these in
+/// GMP for the instrumented build lets the wide probe measure the true
+/// magnitude instead of the wrapped `long long` (which saturates the
+/// bucket at 8 and hides the difference between 64 and 128 bits).
+
+/// Vars homed in bigint storage: every arithmetic assignment recorded
+/// (not just the first — a mixed accumulator typed plain once and
+/// `Cast(Int64)` later is bigint; first-wins left `long long` decls
+/// feeding `mpz_add`). Fixpoint over the recorded trees.
+pub fn analyze_bigint_vars(prog: &crate::ir::IrProgram) -> std::collections::BTreeSet<String> {
+    fn harvest(stmts: &[IrStmt], out: &mut Vec<(String, crate::ir::ArithAst)>) {
+        for s in stmts {
+            match s {
+                crate::ir::IrStmt::Assign { targets, expr, .. } => {
+                    if let (Some(t), crate::ir::IrExpr::Arith(a)) = (targets.first(), expr) {
+                        // Record EVERY arithmetic assignment, not just the
+                        // first: a var assigned a plain arith once and a
+                        // `Cast(Int64)`-wrapped arith later (a mixed
+                        // accumulator) is bigint, and the old “first wins”
+                        // dedup missed it — leaving `long long v` declared
+                        // while the later assign rendered `mpz_add(v, …)`.
+                        if t.indices.is_empty() {
+                            out.push((t.var.clone(), (**a).clone()));
+                        }
+                    }
+                }
+                crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                    harvest(then, out);
+                    for (_, b) in elsifs {
+                        harvest(b, out);
+                    }
+                    harvest(else_, out);
+                }
+                crate::ir::IrStmt::While { body, .. }
+                | crate::ir::IrStmt::DoWhile { body, .. }
+                | crate::ir::IrStmt::For { body, .. }
+                | crate::ir::IrStmt::Function { body, .. }
+                | crate::ir::IrStmt::Subshell(body)
+                | crate::ir::IrStmt::Background(body)
+                | crate::ir::IrStmt::Block(body) => harvest(body, out),
+                crate::ir::IrStmt::ForInit { init, step, body, .. } => {
+                    harvest(init, out);
+                    harvest(step, out);
+                    harvest(body, out);
+                }
+                crate::ir::IrStmt::Try { body, else_body, finally_body, .. } => {
+                    harvest(body, out);
+                    harvest(else_body, out);
+                    harvest(finally_body, out);
+                }
+                crate::ir::IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        harvest(&c.body, out);
+                    }
+                }
+                crate::ir::IrStmt::Redirect { inner, .. } => harvest(inner, out),
+                _ => {}
+            }
+        }
+    }
+    let mut pairs = Vec::new();
+    harvest(&prog.stmts, &mut pairs);
+    for sub in &prog.subs {
+        harvest(&sub.body, &mut pairs);
+    }
+    let mut vars = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (v, a) in &pairs {
+            if !vars.contains(v) && arith_refs_bigint(a, &vars) {
+                vars.insert(v.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vars
+}
+
+// ── int-array facts (hoisted from the C backend verbatim — the list-tier
+// verdicts every consumer reads: homed native int stores, reductions).
+// Behavior-identical move; the C backend calls these.
+
+pub fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
+    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    let bigint_vars = analyze_bigint_vars(prog);
+    let mut all_arrays: HashSet<String> = HashSet::new();
+    let mut int_consumed: HashSet<String> = HashSet::new();
+    let mut non_int_write: HashSet<String> = HashSet::new();
+    let mut string_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        walk_int_array_stmt(
+            s,
+            &mut all_arrays,
+            &mut int_consumed,
+            &mut non_int_write,
+            &mut string_read,
+            &vt,
+            &bigint_vars,
+        );
+    }
+    // Pass 2: every array READ anywhere (not just the known string
+    // reads). A write-only int list may be homed natively; one that is
+    // read by an unhandled consumer (slice/join/…) falls back to the old
+    // int-consumer requirement, so no string consumer can be surprised by
+    // a native representation.
+    let mut any_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        mark_reads_stmt(s, &all_arrays, &mut any_read);
+    }
+    all_arrays
+        .into_iter()
+        .filter(|a| {
+            // Home as a native int store when EVERY write is int-domain,
+            // no element is read as text, and the array is either an int
+            // consumer or never read at all (docs/PY_BENCH.md finding C:
+            // an explicit accumulator instead of `sum(xs)` used to force
+            // snprintf+strdup per element).
+            !non_int_write.contains(a)
+                && !string_read.contains(a)
+                && (int_consumed.contains(a) || !any_read.contains(a))
+        })
+        .collect()
+}
+
+pub fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
+    let int_arrays = analyze_int_arrays(prog);
+    let mut reduce: HashSet<String> = HashSet::new();
+    fn walk(stmts: &[IrStmt], reduce: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, reduce),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, reduce),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    for b in then { walk(std::slice::from_ref(b), reduce); }
+                    for (_, b) in elsifs { walk(b, reduce); }
+                    for b in else_ { walk(std::slice::from_ref(b), reduce); }
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body, reduce),
+                IrStmt::For { body, .. } => walk(body, reduce),
+                IrStmt::Function { body, .. } => walk(body, reduce),
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    walk(body, reduce)
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages.iter().flatten() { walk(std::slice::from_ref(st), reduce); }
+                }
+                IrStmt::Ext(n) => {
+                    for c in n.children() { walk(std::slice::from_ref(c), reduce); }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, reduce: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if matches!(func.as_str(), "max" | "min" | "sum") {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        reduce.insert(name.clone());
+                    }
+                }
+                for a in args { walk_expr(a, reduce); }
+            }
+            IrExpr::Array(items) => {
+                for it in items { walk_expr(it, reduce); }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, reduce);
+                walk_expr(rhs, reduce);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p { walk_expr(x, reduce); }
+                }
+            }
+            IrExpr::Ext(n) => {
+                for c in n.children() { walk_expr(c, reduce); }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut reduce);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut reduce);
+    }
+    // only int arrays (the aggregate is a plain i64)
+    reduce.retain(|a| int_arrays.contains(a));
+    reduce
+}
+
+pub fn walk_int_array_stmt(
+    s: &IrStmt,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) {
+    match s {
+        IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt, big),
+        IrStmt::Assign { targets, expr, .. } => {
+            // direct index-assigns `a[k]=v` register the array (the
+            // bulk-oriented arms below never see them): int values
+            // consume-int, anything else poisons — same rule as
+            // setArray items. Reads of the index/key stay invisible
+            // (arith-context reads never stringify).
+            for t in targets {
+                if !t.indices.is_empty() || t.var.contains('[') {
+                    let base = t.var.split('[').next().unwrap_or(&t.var);
+                    if !base.is_empty() {
+                        all.insert(base.to_string());
+                        if is_int_expr(expr, vt, big) {
+                            consumed.insert(base.to_string());
+                        } else {
+                            non_int.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            walk_int_array_expr(expr, all, consumed, non_int, str_read, vt, big);
+        }
+        IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt, big),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for b in then { walk_int_array_stmt(b, all, consumed, non_int, str_read, vt, big); }
+            for (c, b) in elsifs {
+                walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big);
+                for st in b { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            }
+            for st in else_ { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::While { cond, body, .. } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is a `slice` read of
+            // the array; walking only the body missed it, so an array
+            // iterated as strings could still home natively.
+            walk_int_array_expr(iter, all, consumed, non_int, str_read, vt, big);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            // C-style loops were invisible to homing (no arm): counted
+            // fills like `for ((i=0;i<n;i++)) a[$i]=...` stayed char*
+            // with a strdup per store. Walk every part.
+            for st in init { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in step { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Function { body, .. } => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Block(body) => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() { walk_int_array_stmt(c, all, consumed, non_int, str_read, vt, big); }
+        }
+        _ => {}
+    }
+}
+
+pub fn walk_int_array_expr(
+    e: &IrExpr,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "setArray" | "setArrayAppend" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    // the values are args[1] (an Array of items)
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            if !is_int_expr(it, vt, big) {
+                                non_int.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "sortedIntJoin" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "max" | "min" | "sum" => {
+                // a typed reduction over the array — an int consumer
+                // (keeps the array on the long long[] fast path)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "sortedBigintJoin" => {
+                // arbitrary-precision elements CANNOT live in long long[] —
+                // force char* (exact decimal text, mpz order).
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    non_int.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "exec" | "builtin" => {
+                // the array may appear in the argv (a string context)
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "slice" => {
+                // `${arr[@]}` / `${arr[@]:a:b}` — a string-element read:
+                // args[0] is the literal "slice", args[1] the array.
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "arrayIndex" | "arrayItems" => {
+                // reading elements as values — if used in a string
+                // context this is a string read; conservatively mark it.
+                // (arrayLen is NOT here: `${#xs[@]}` reads only the
+                // count, never the elements, so it can't force string
+                // storage.)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    str_read.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "arrayLen" => {
+                // `${#xs[@]}` — the element count only; never reads
+                // (and never stringifies) elements.
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "getVar" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
+            }
+            _ => {
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+        },
+        IrExpr::Array(items) => {
+            for it in items { walk_int_array_expr(it, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_int_array_expr(x, all, consumed, non_int, str_read, vt, big);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_int_array_expr(lhs, all, consumed, non_int, str_read, vt, big);
+            walk_int_array_expr(rhs, all, consumed, non_int, str_read, vt, big);
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big); }
+        }
+        _ => {}
+    }
+}
+
+pub fn mark_reads_stmt(s: &IrStmt, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match s {
+        IrStmt::Expr(e) => mark_reads_expr(e, all, out),
+        IrStmt::Output { value, .. } => mark_reads_expr(value, all, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            mark_reads_expr(path, all, out);
+            mark_reads_expr(content, all, out);
+        }
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets {
+                for ix in &t.indices {
+                    mark_reads_expr(ix, all, out);
+                }
+            }
+            mark_reads_expr(expr, all, out);
+        }
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            mark_reads_expr(cond, all, out);
+            for b in then.iter().chain(else_) {
+                mark_reads_stmt(b, all, out);
+            }
+            for (c, b) in elsifs {
+                mark_reads_expr(c, all, out);
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for b in body.iter().chain(else_body).chain(finally_body) {
+                mark_reads_stmt(b, all, out);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    mark_reads_expr(m, all, out);
+                }
+                for b in &e.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is the read.
+            mark_reads_expr(iter, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for st in init.iter().chain(step).chain(body) {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Continue | IrStmt::Break => {}
+        IrStmt::While { cond, body } => {
+            mark_reads_expr(cond, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => mark_reads_expr(expr, all, out),
+        IrStmt::Exec { cmd, args, redirects, .. } => {
+            mark_reads_expr(cmd, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(r, all, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                mark_reads_expr(x, all, out);
+            }
+        }
+        IrStmt::SetChildError(e) => mark_reads_expr(e, all, out),
+        IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Label(_) | IrStmt::Goto(_) => {}
+        IrStmt::Case { discriminant, clauses } => {
+            mark_reads_expr(discriminant, all, out);
+            for c in clauses {
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                mark_reads_stmt(b, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(&r.target, all, out);
+            }
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+            for (_, b) in named_blocks {
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    mark_reads_expr(ch, all, out);
+                }
+                if let Some(v) = &c.value {
+                    mark_reads_expr(v, all, out);
+                }
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs) {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::Shaderize { body, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() {
+                mark_reads_stmt(c, all, out);
+            }
+        }
+    }
+}
+
+pub fn mark_reads_expr(e: &IrExpr, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "setArray" || func == "setArrayAppend" {
+                // args[0] is the WRITE target — recurse the rest only.
+                for a in args.iter().skip(1) {
+                    mark_reads_expr(a, all, out);
+                }
+                return;
+            }
+            if func == "arrayLen" {
+                // `${#xs[@]}` / `len(xs)` — the element COUNT only, never
+                // an element: a count read must not defeat native homing.
+                return;
+            }
+            // Any string argument naming an array is a conservative READ:
+            // consumers that reference the array by name (a slice's
+            // `slice("arr", …)`, a join, an echo) must not be handed a
+            // native int store.
+            for a in args {
+                if let IrExpr::Str(name, _) = a {
+                    if all.contains(name) {
+                        out.insert(name.clone());
+                    }
+                }
+                mark_reads_expr(a, all, out);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            mark_reads_expr(obj, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+        }
+        // A direct element read (`x[0]`, `IrExpr::Index`, distinct from
+        // the `arrayIndex` call) is a read. Marking it here (rather than
+        // in `string_read`) keeps the relaxation narrow: an array that is
+        // also an int consumer (`sum(xs)`) still homes as before, while a
+        // pure index-read array is not newly homed.
+        IrExpr::Index { var, key } => {
+            if all.contains(var) {
+                out.insert(var.clone());
+            }
+            mark_reads_expr(key, all, out);
+        }
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+            if all.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            mark_reads_expr(lhs, all, out);
+            mark_reads_expr(rhs, all, out);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            mark_reads_expr(cond, all, out);
+            mark_reads_expr(then, all, out);
+            mark_reads_expr(else_, all, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            mark_reads_expr(expr, all, out);
+            mark_reads_expr(default, all, out);
+        }
+        IrExpr::Capture { expr, .. } => mark_reads_expr(expr, all, out),
+        IrExpr::Array(items) => {
+            for it in items {
+                mark_reads_expr(it, all, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            mark_reads_expr(iter, all, out);
+            mark_reads_expr(elem, all, out);
+            if let Some(c) = cond {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        IrExpr::Arrow(body) | IrExpr::Lambda { body, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrExpr::Object(vals) => {
+            for (_, v) in vals {
+                mark_reads_expr(v, all, out);
+            }
+        }
+        IrExpr::Splice(x) => mark_reads_expr(x, all, out),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    mark_reads_expr(x, all, out);
+                }
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        // a string literal that parses as a 64-bit integer (the
+        // frontend emits list literals as Str)
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+        IrExpr::Arith(a) => !arith_refs_bigint(a, big),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
+            vt.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        ) && !big.contains(name),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                matches!(
+                    vt.get(name),
+                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+                ) && !big.contains(name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
     if lo >= 0 && hi <= u8::MAX as i128 {
         "u8"
@@ -52791,6 +53494,70 @@ mod py2cy_analysis_tests {
         let env = analyze_var_ranges(&prog);
         let w = analyze_widths(&prog.stmts, &env);
         assert_eq!(w.get("h").map(String::as_str), Some("i64"), "h*31: {w:?} env: {env:?}");
+    }
+}
+
+#[cfg(test)]
+mod bigint_hoist_tests {
+    use super::*;
+    use crate::ir::{ArithAst, AssignTarget, IrExpr, IrProgram, IrStmt};
+
+    fn assign(var: &str, rhs: ArithAst) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget { var: var.to_string(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(rhs)),
+            asm: None,
+        }
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn mixed_accumulator_is_bigint() {
+        // the every-assign fixpoint (hoisted from the C backend): a var
+        // assigned plain arith once and Int64-cast arith later is bigint
+        // (first-wins missed the later tree and left `long long` decls
+        // feeding mpz ops)
+        let p = prog(vec![
+            assign("v", ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("a".to_string())),
+                rhs: Box::new(ArithAst::Num(1)),
+            }),
+            assign("v", ArithAst::Cast {
+                ty: crate::ir::IrType::Int64,
+                arg: Box::new(ArithAst::Var("b".to_string())),
+            }),
+        ]);
+        assert!(analyze_bigint_vars(&p).contains("v"));
+    }
+
+    #[test]
+    fn plain_only_stays_out() {
+        let p = prog(vec![assign(
+            "v",
+            ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("a".to_string())),
+                rhs: Box::new(ArithAst::Num(1)),
+            },
+        )]);
+        assert!(!analyze_bigint_vars(&p).contains("v"));
     }
 }
 
