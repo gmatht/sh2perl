@@ -9588,6 +9588,134 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
     out
 }
 
+/// One scope's final declare decisions for annotation consumers.
+/// Computed here (not in consumers) so the policy lives in exactly
+/// one place: this function is the `decide()` that harness/py2cy.js
+/// used to reimplement, byte-identical by gate.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeDeclares {
+    /// scope name ("<top>" or the function name)
+    pub name: String,
+    /// decided declarations, sorted by name
+    pub declares: Vec<VarDeclare>,
+}
+
+/// A single decided declaration: the Cython type is determined by
+/// kind+width (`int`+`i32` -> `cython.int`, `int`+other ->
+/// `cython.longlong`, `float` -> `cython.double`).
+#[derive(Clone, Debug)]
+pub struct VarDeclare {
+    /// variable name
+    pub name: String,
+    /// "int" or "float"
+    pub kind: String,
+    /// Some("i32") iff the evidence width is i32 (else longlong)
+    pub width: Option<String>,
+}
+
+/// Final declare decisions per scope: the policy harness/py2cy.js
+/// `decide()` encoded (moved here so consumers render, never analyze).
+///
+/// Per scope S, per assigned name V (sorted), excluding parameters and
+/// `global`/`nonlocal` names (a C local would shadow the outer binding):
+/// - float iff the frontend typed V float (its float domain is
+///   authoritative — no veto/range/width checks, exactly as before);
+/// - int V iff the type is int-like, the range is i64-contained, V is
+///   neither vetoed nor bigint-homed. Module candidates additionally
+///   require no veto of V in ANY scope (a function may `global`-write
+///   V — invisible in A1 — so the union vetoes).
+///
+/// `var_types` maps names to frontend type strings ("int", "float",
+/// "str", "any", "int32", ...; missing means "any"). `bigint` is the
+/// union of bigint-homed and i53 names. `params`/`scope_globals` map
+/// scope names to their parameter and (globals, nonlocals) lists.
+pub fn analyze_declares(
+    scopes: &[ScopeFacts],
+    var_types: &std::collections::HashMap<String, String>,
+    bigint: &std::collections::HashSet<String>,
+    params: &std::collections::HashMap<String, Vec<String>>,
+    scope_globals: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+) -> Vec<ScopeDeclares> {
+    const I64MIN: i128 = -(1i128 << 63);
+    const I64MAX: i128 = (1i128 << 63) - 1;
+    fn is_int_kind(t: Option<&String>) -> bool {
+        matches!(
+            t.map(String::as_str),
+            Some("int" | "int32" | "int64" | "uint32" | "uint64")
+        )
+    }
+    // union vetoes across scopes by name (global-write invisibility)
+    let mut veto_union: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for s in scopes {
+        for n in s.vetoed.iter() {
+            veto_union.insert(n.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for s in scopes {
+        let is_top = s.name == "<top>";
+        let param_set: std::collections::HashSet<&String> = params
+            .get(&s.name)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        let (globs, nonlocs): (
+            std::collections::HashSet<&String>,
+            std::collections::HashSet<&String>,
+        ) = match scope_globals.get(&s.name) {
+            Some((g, n)) => (g.iter().collect(), n.iter().collect()),
+            None => Default::default(),
+        };
+        let mut names: Vec<&String> = s.assigned.iter().collect();
+        names.sort();
+        let mut declares = Vec::new();
+        for n in names {
+            if param_set.contains(n) || globs.contains(n) || nonlocs.contains(n) {
+                continue;
+            }
+            let ty = var_types.get(n).cloned().unwrap_or_else(|| "any".to_string());
+            if ty == "float" {
+                declares.push(VarDeclare {
+                    name: (*n).clone(),
+                    kind: "float".to_string(),
+                    width: None,
+                });
+                continue;
+            }
+            if !is_int_kind(var_types.get(n)) {
+                continue;
+            }
+            let in_i64 = match s.ranges.get(n) {
+                Some((lo, hi)) => *lo >= I64MIN && *hi <= I64MAX,
+                None => false,
+            };
+            if !in_i64 {
+                continue;
+            }
+            if s.vetoed.contains(n) || bigint.contains(n) {
+                continue;
+            }
+            if is_top && veto_union.contains(n) {
+                continue;
+            }
+            let width = match s.widths.get(n).map(String::as_str) {
+                Some("i32") => Some("i32".to_string()),
+                _ => None,
+            };
+            declares.push(VarDeclare {
+                name: (*n).clone(),
+                kind: "int".to_string(),
+                width,
+            });
+        }
+        out.push(ScopeDeclares {
+            name: s.name.clone(),
+            declares,
+        });
+    }
+    out
+}
+
 /// Storage widths for one scope's statements: "i32" iff the (hulled)
 /// value range AND every assigned Arith RHS exactly evaluate within
 /// i32; "i64" likewise for 64 bits; "i128" when the value fits 128 bits
@@ -54055,5 +54183,207 @@ mod dual_loop_tests {
         let json = shir_to_estree_json(&prog).expect("render");
         set_dual_loops(None);
         assert!(!json.contains("isSafeInteger"), "must refuse:\n{json}");
+    }
+}
+
+#[cfg(test)]
+mod declare_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn facts(
+        name: &str,
+        assigned: &[&str],
+        ranges: &[(&str, i128, i128)],
+        vetoed: &[&str],
+        widths: &[(&str, &str)],
+    ) -> ScopeFacts {
+        ScopeFacts {
+            name: name.to_string(),
+            assigned: assigned.iter().map(|s| s.to_string()).collect(),
+            ranges: ranges
+                .iter()
+                .map(|(n, lo, hi)| (n.to_string(), (*lo, *hi)))
+                .collect(),
+            vetoed: vetoed.iter().map(|s| s.to_string()).collect(),
+            widths: widths
+                .iter()
+                .map(|(n, w)| (n.to_string(), w.to_string()))
+                .collect(),
+        }
+    }
+
+    fn decide(
+        scopes: &[ScopeFacts],
+        types: &[(&str, &str)],
+        bigint: &[&str],
+        params: &[(&str, &[&str])],
+        globals: &[(&str, &[&str], &[&str])],
+    ) -> HashMap<String, HashMap<String, (String, Option<String>)>> {
+        let vt: HashMap<String, String> = types
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        let bi: HashSet<String> = bigint.iter().map(|s| s.to_string()).collect();
+        let pm: HashMap<String, Vec<String>> = params
+            .iter()
+            .map(|(s, v)| (s.to_string(), v.iter().map(|x| x.to_string()).collect()))
+            .collect();
+        let gm: HashMap<String, (Vec<String>, Vec<String>)> = globals
+            .iter()
+            .map(|(s, g, n)| {
+                (
+                    s.to_string(),
+                    (
+                        g.iter().map(|x| x.to_string()).collect(),
+                        n.iter().map(|x| x.to_string()).collect(),
+                    ),
+                )
+            })
+            .collect();
+        let mut out: HashMap<String, HashMap<String, (String, Option<String>)>> =
+            HashMap::new();
+        for sd in analyze_declares(scopes, &vt, &bi, &pm, &gm) {
+            let mut m = HashMap::new();
+            for v in sd.declares {
+                m.insert(v.name.clone(), (v.kind.clone(), v.width.clone()));
+            }
+            out.insert(sd.name.clone(), m);
+        }
+        out
+    }
+
+    #[test]
+    fn int_widths_and_float_passthrough() {
+        let scopes = vec![facts(
+            "<top>",
+            &["a", "b", "c", "d"],
+            &[("a", 0, 5), ("b", 0, 1 << 40), ("c", 0, 0)],
+            &[],
+            &[("a", "i32"), ("b", "i64")],
+        )];
+        let d = decide(
+            &scopes,
+            &[("a", "int"), ("b", "int"), ("c", "float"), ("d", "int")],
+            &[],
+            &[],
+            &[],
+        );
+        let top = &d["<top>"];
+        assert_eq!(
+            top["a"],
+            ("int".to_string(), Some("i32".to_string())),
+            "i32 evidence -> cython.int"
+        );
+        assert_eq!(
+            top["b"],
+            ("int".to_string(), None),
+            "i64 evidence -> cython.longlong"
+        );
+        assert_eq!(
+            top["c"],
+            ("float".to_string(), None),
+            "float passes with no checks"
+        );
+        assert!(!top.contains_key("d"), "unranged int never declares");
+    }
+
+    #[test]
+    fn veto_bigint_and_kind_gates() {
+        let scopes = vec![facts(
+            "<top>",
+            &["v", "b", "s", "big", "o"],
+            &[
+                ("v", 0, 1),
+                ("b", 0, 1),
+                ("s", 0, 1),
+                ("big", 0, 1),
+                ("o", 0, 1),
+            ],
+            &["v"],
+            &[],
+        )];
+        let d = decide(
+            &scopes,
+            &[
+                ("v", "int"),
+                ("b", "int"),
+                ("s", "str"),
+                ("big", "int"),
+                ("o", "int"),
+            ],
+            &["big"],
+            &[],
+            &[],
+        );
+        let top = &d["<top>"];
+        assert!(!top.contains_key("v"), "vetoed refutes");
+        assert!(!top.contains_key("big"), "bigint-homed refutes");
+        assert!(!top.contains_key("s"), "non-int kinds never declare");
+        assert!(top.contains_key("o"), "plain int declares");
+    }
+
+    #[test]
+    fn params_globals_nonlocals_excluded() {
+        let scopes = vec![
+            facts("<top>", &["g"], &[], &[], &[]),
+            facts("f", &["g", "p", "q", "r"], &[], &[], &[]),
+        ];
+        let d = decide(
+            &scopes,
+            &[("g", "int"), ("p", "int"), ("q", "int"), ("r", "int")],
+            &[],
+            &[("f", &["p"])],
+            &[("f", &["g"], &["q"])],
+        );
+        assert!(
+            d["f"].is_empty(),
+            "params + global + nonlocal all excluded: {:?}",
+            d["f"]
+        );
+    }
+
+    #[test]
+    fn union_veto_hits_top_only() {
+        // a veto anywhere refuses the MODULE declare (global-write
+        // invisibility); unvetoed function scopes keep their own.
+        let scopes = vec![
+            facts("<top>", &["x"], &[("x", 0, 0)], &[], &[("x", "i32")]),
+            facts("f", &["x"], &[("x", 0, 5)], &[], &[("x", "i32")]),
+            facts("g", &["x"], &[("x", 0, 7)], &["x"], &[]),
+        ];
+        let d = decide(&scopes, &[("x", "int")], &[], &[], &[]);
+        assert!(
+            !d["<top>"].contains_key("x"),
+            "union veto refuses module x"
+        );
+        assert!(
+            d["f"].contains_key("x"),
+            "unvetoed function scope keeps its declare"
+        );
+        assert!(
+            !d["g"].contains_key("x"),
+            "own veto refuses its own scope"
+        );
+    }
+
+    #[test]
+    fn missing_range_or_width_is_safe() {
+        // unranged ints never declare; missing width evidence falls
+        // back to longlong (never int).
+        let scopes = vec![facts(
+            "<top>",
+            &["u", "w"],
+            &[("w", 0, 3)],
+            &[],
+            &[],
+        )];
+        let d = decide(&scopes, &[("u", "int"), ("w", "int")], &[], &[], &[]);
+        assert!(!d["<top>"].contains_key("u"));
+        assert_eq!(
+            d["<top>"]["w"],
+            ("int".to_string(), None),
+            "missing width -> longlong"
+        );
     }
 }

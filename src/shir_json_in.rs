@@ -313,7 +313,26 @@ fn stmts_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrStmt>, String> {
         Some(x) => arr(Some(x), where_)?
             .iter()
             .enumerate()
-            .map(|(i, s)| stmt_from(s, &format!("{where_}[{i}]")))
+            .filter_map(|(i, s)| {
+                // `Global`/`Nonlocal` (py-sh-go scope bindings): validated
+                // here, dropped from the IR — no backend renders them
+                // (the Go frontend used to drop them itself; the names
+                // now travel to `--analyze` via the raw JSON, like
+                // Function `params`). See shir::analyze_declares.
+                if let Some(o) = s.as_object() {
+                    if let Some(t) = o.get("type").and_then(|t| t.as_str()) {
+                        if t == "Global" || t == "Nonlocal" {
+                            return match o.get("names").and_then(|n| n.as_array()) {
+                                Some(a) if a.iter().all(|e| e.is_string()) => None,
+                                _ => Some(Err(format!(
+                                    "{where_}[{i}].names: expected array of strings"
+                                ))),
+                            };
+                        }
+                    }
+                }
+                Some(stmt_from(s, &format!("{where_}[{i}]")))
+            })
             .collect(),
     }
 }
