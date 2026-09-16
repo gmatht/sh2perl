@@ -35,6 +35,13 @@ pub enum Scope {
 pub struct Use {
     pub scope: Scope,
     pub risky: bool,
+    /// The mention is a *write* (an assignment target / capture target /
+    /// `VAR=x` envar / builtin `name=value` head) rather than a read.
+    pub write: bool,
+    /// The mention sits in a top-level statement of its scope (not inside
+    /// an if/loop/block/pipeline body). Pass-2 locals defer their `let`
+    /// to the first write, which is only sound for a top-level write.
+    pub top: bool,
 }
 
 /// All mentions per name (defs, reads, name-arg positions, `$` refs).
@@ -49,9 +56,15 @@ pub fn use_scopes(prog: &IrProgram) -> HashMap<String, Vec<Use>> {
     for sub in &prog.subs {
         defined.insert(sub.name.clone());
     }
-    let mut w = Walker { out: &mut out, defined: &defined, scope: Scope::Main, risky: false };
+    let mut w = Walker {
+        out: &mut out,
+        defined: &defined,
+        scope: Scope::Main,
+        risky: false,
+        top: true,
+    };
     for st in &prog.stmts {
-        w.stmt(st);
+        w.top_stmt(st);
     }
     for sub in &prog.subs {
         // subs are their own scope (whether or not the backend renders
@@ -60,7 +73,7 @@ pub fn use_scopes(prog: &IrProgram) -> HashMap<String, Vec<Use>> {
         let save = w.scope.clone();
         w.scope = Scope::Func(sub.name.clone());
         for st in &sub.body {
-            w.stmt(st);
+            w.top_stmt(st);
         }
         w.scope = save;
     }
@@ -72,15 +85,27 @@ struct Walker<'a> {
     defined: &'a HashSet<String>,
     scope: Scope,
     risky: bool,
+    top: bool,
 }
 
 impl<'a> Walker<'a> {
     fn mention(&mut self, name: &str) {
+        self.push(name, false);
+    }
+
+    /// A write mention (assignment target / capture / `VAR=x` word).
+    fn mention_write(&mut self, name: &str) {
+        self.push(name, true);
+    }
+
+    fn push(&mut self, name: &str, write: bool) {
         // binding positions never reach here (callers skip them);
         // everything recorded is a genuine mention
         self.out.entry(name.to_string()).or_default().push(Use {
             scope: self.scope.clone(),
             risky: self.risky,
+            write,
+            top: self.top,
         });
     }
 
@@ -107,7 +132,24 @@ impl<'a> Walker<'a> {
         self.risky = save;
     }
 
+    /// A nested statement (inside an if/loop/block/…): mentions are not
+    /// top-level for the enclosing scope.
     fn stmt(&mut self, st: &IrStmt) {
+        let save = self.top;
+        self.top = false;
+        self.stmt_inner(st);
+        self.top = save;
+    }
+
+    /// A top-level statement of the current scope.
+    fn top_stmt(&mut self, st: &IrStmt) {
+        let save = self.top;
+        self.top = true;
+        self.stmt_inner(st);
+        self.top = save;
+    }
+
+    fn stmt_inner(&mut self, st: &IrStmt) {
         match st {
             IrStmt::Ext(n) => {
                 // opaque payload: assume a mention is hidden (forces
@@ -122,19 +164,26 @@ impl<'a> Walker<'a> {
                 self.expr(content);
             }
             IrStmt::Assign { targets, expr, .. } => {
+                // RHS first: `x = <expr reading x>` (e.g. an env default)
+                // reads the OLD value, so the read must precede the write
+                // mention (pass-2 deferral relies on this order).
+                self.expr(expr);
                 for t in targets {
                     // baked subscript (`arr[$i]`): the base is written,
                     // `$i` inside is read
                     let base = t.var.split('[').next().unwrap_or(&t.var);
                     if !base.is_empty() {
-                        self.mention(base);
+                        self.mention_write(base);
                     }
-                    self.mentions_str(&t.var);
+                    // a baked subscript (`arr[$i]`) reads `$i`; a plain
+                    // name was already recorded above
+                    if t.var != base {
+                        self.mentions_str(&t.var);
+                    }
                     for ix in &t.indices {
                         self.expr(ix);
                     }
                 }
-                self.expr(expr);
             }
             IrStmt::Declare { vars, init, .. } => {
                 // `vars` are bindings, not mentions — skip
@@ -242,7 +291,7 @@ impl<'a> Walker<'a> {
                 }
                 for (v, e) in env {
                     // `VAR=x cmd`: V is written in this scope
-                    self.mention(v);
+                    self.mention_write(v);
                     self.expr(e);
                 }
             }
@@ -292,11 +341,11 @@ impl<'a> Walker<'a> {
                 // merging would only ever widen toward global, sound)
                 self.with_scope(Scope::Func(name.clone()), |w| {
                     for b in body {
-                        w.stmt(b);
+                        w.top_stmt(b);
                     }
                     for (_, b) in named_blocks {
                         for st in b {
-                            w.stmt(st);
+                            w.top_stmt(st);
                         }
                     }
                 });
@@ -812,6 +861,25 @@ pub fn local_owner(uses: &[Use]) -> Option<String> {
     None
 }
 
+/// Pass-2 variant of [`local_owner`]: the single non-risky scope that
+/// owns a name, **including** top-level `Main` (whose owner is Rust's
+/// `fn main`). Anything multi-scope or risky yields `None` (global
+/// storage stays the only sound choice).
+pub fn local_scope(uses: &[Use]) -> Option<Scope> {
+    use std::collections::BTreeSet;
+    let mut scopes: BTreeSet<Scope> = BTreeSet::new();
+    for u in uses {
+        if u.risky {
+            return None;
+        }
+        scopes.insert(u.scope.clone());
+    }
+    if scopes.len() == 1 {
+        return scopes.into_iter().next();
+    }
+    None
+}
+
 #[cfg(test)]
 mod owner_tests {
     use super::*;
@@ -819,8 +887,8 @@ mod owner_tests {
     #[test]
     fn single_safe_function_scope_has_owner() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false },
-            Use { scope: Scope::Func("f".to_string()), risky: false },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
         ];
         assert_eq!(local_owner(&uses), Some("f".to_string()));
     }
@@ -828,15 +896,25 @@ mod owner_tests {
     #[test]
     fn risky_use_forces_global() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false },
-            Use { scope: Scope::Func("f".to_string()), risky: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: true, write: false, top: true },
         ];
         assert_eq!(local_owner(&uses), None);
     }
 
     #[test]
+    fn local_scope_includes_main() {
+        let uses = vec![
+            Use { scope: Scope::Main, risky: false, write: false, top: true },
+            Use { scope: Scope::Main, risky: false, write: false, top: true },
+        ];
+        assert_eq!(local_scope(&uses), Some(Scope::Main));
+        assert_eq!(local_owner(&uses), None);
+    }
+
+    #[test]
     fn main_scope_stays_global() {
-        let uses = vec![Use { scope: Scope::Main, risky: false }];
+        let uses = vec![Use { scope: Scope::Main, risky: false, write: false, top: true }];
         assert_eq!(local_owner(&uses), None);
     }
 }

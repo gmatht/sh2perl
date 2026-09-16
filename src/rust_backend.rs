@@ -41,10 +41,16 @@ const GLOB_SENTINEL: &str = "\u{1}SH2GLOB\u{1}";
 /// Rust keywords (edition 2021) — identifiers mangled against these, plus
 /// the `sh2_`/`_sh2`/`__sh_`/`__SH` helper prefixes the renderer owns.
 const RUST_RESERVED: &[&str] = &[
+    // strict keywords
     "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
     "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
     "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
     "use", "where", "while", "async", "await",
+    // reserved for future use (valid identifiers in no edition)
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized",
+    "virtual", "yield",
+    // 2018/2024 edition keywords
+    "try", "gen", "union",
 ];
 
 /// Native (no shell-out) exec builtins — pipeline stages containing only
@@ -80,6 +86,20 @@ pub struct Render {
     /// `__pn_N` i64 local bound at entry; avoids per-op parse+alloc).
     /// Set per function/main body before rendering (cleared after).
     num_param_cache: BTreeSet<String>,
+    /// pass-2 locals: var -> owning scope. A scalar var whose every
+    /// mention sits in one non-risky scope renders as a real Rust `let`
+    /// in that scope instead of a `thread_local!` static.
+    local_vars: HashMap<String, crate::shir_passes::list_profile::Scope>,
+    /// vars assigned somewhere (drives `let`/`let mut` for locals)
+    assigned: BTreeSet<String>,
+    /// pass-2 locals whose deferred `let` has already been emitted
+    local_init: BTreeSet<String>,
+    /// pass-2 locals written more than once (need `mut`)
+    local_mut: BTreeSet<String>,
+    /// pass-2 locals whose FIRST write is overwritten before any read
+    /// (`x=1; x=2; echo $x`): the deferred `let` needs
+    /// `#[allow(unused_assignments)]` so we stay warning-clean
+    local_dead_init: BTreeSet<String>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -211,7 +231,29 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     r.var_types = prog.var_types.iter().cloned().collect();
     r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
-    r.out.join("\n")
+    let text = r.out.join("\n");
+    // Post-render guard: a pass-2 local must never be referenced through
+    // its (undeclared) static name — the failure would otherwise surface
+    // as a confusing rustc error, or silently bind a different static.
+    if !r.local_vars.is_empty() {
+        for (name, base) in &r.mangle {
+            if !r.local_vars.contains_key(name) {
+                continue;
+            }
+            let static_name = format!("__SHV_{base}");
+            let hit = text
+                .match_indices(&static_name)
+                .any(|(i, _)| {
+                    let after = text[i + static_name.len()..].chars().next();
+                    !after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+                });
+            assert!(
+                !hit,
+                "rust_backend: pass-2 local `{name}` leaked as static `{static_name}`"
+            );
+        }
+    }
+    text
 }
 
 impl Render {
@@ -534,6 +576,24 @@ impl Render {
         self.rust_ident(name)
     }
 
+    /// Pass-2: does this name render as a plain Rust local?
+    fn is_local(&self, name: &str) -> bool {
+        self.local_vars.contains_key(name)
+    }
+
+    /// Storage identifier for a var (nameref-resolved): the bare local
+    /// base for a pass-2 local, else the `__SHV_` static name.
+    fn var_ident(&mut self, name: &str) -> String {
+        if let Some(t) = self.namerefs.get(name).cloned() {
+            return self.var_ident(&t);
+        }
+        if self.local_vars.contains_key(name) {
+            self.ident_base(name)
+        } else {
+            self.rust_ident(name)
+        }
+    }
+
     // ── var reads/writes ─────────────────────────────────────────────
 
     fn read_num(&mut self, name: &str) -> String {
@@ -545,6 +605,9 @@ impl Render {
             self.add_helper("arg");
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
             return format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)");
+        }
+        if self.local_vars.contains_key(name) {
+            return self.var_ident(name);
         }
         let m = self.tls(name);
         format!("{m}.with(|v| v.get())")
@@ -559,6 +622,9 @@ impl Render {
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
             return format!("__sh_arg({i})");
         }
+        if self.local_vars.contains_key(name) {
+            return format!("{}.clone()", self.var_ident(name));
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().clone())")
     }
@@ -572,12 +638,38 @@ impl Render {
         format!("{m}.with(|v| v.borrow().clone())")
     }
 
+    /// A pass-2 local write: the FIRST write *is* the `let` (so there is
+    /// no dead default value for rustc to flag); later ones are plain
+    /// assignments. `mut` only when the var is written again later.
+    fn local_write_stmt(&mut self, name: &str, e: &str) -> String {
+        let m = self.var_ident(name);
+        let e = Self::unparen(e).to_string();
+        if self.local_init.insert(name.to_string()) {
+            let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
+            let mut attr = String::new();
+            if self.local_dead_init.contains(name) {
+                attr.push_str("#[allow(unused_assignments)] ");
+            }
+            if m.chars().any(|c| c.is_ascii_uppercase()) {
+                attr.push_str("#[allow(non_snake_case)] ");
+            }
+            return format!("{attr}{kw} {m} = {e};");
+        }
+        format!("{m} = {e};")
+    }
+
     fn write_num(&mut self, name: &str, e: &str) -> String {
+        if self.local_vars.contains_key(name) {
+            return self.local_write_stmt(name, e);
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.set({}));", Self::unparen(e))
     }
 
     fn write_str(&mut self, name: &str, e: &str) -> String {
+        if self.local_vars.contains_key(name) {
+            return self.local_write_stmt(name, e);
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
     }
@@ -6138,6 +6230,17 @@ impl Render {
         for a in &self.assoc {
             written.insert(a.clone());
         }
+        // Pass 2: pick the pass-2 locals (scalar vars confined to one
+        // non-risky scope) and the assigned set (drives `let`/`let mut`).
+        let (locals, local_mut, dead_init) =
+            compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written);
+        self.local_vars = locals;
+        self.local_mut = local_mut;
+        self.local_dead_init = dead_init;
+        collect_written(&prog.stmts, &mut self.assigned);
+        for l in &self.local_vars {
+            written.insert(l.0.clone());
+        }
         self.written = written.clone();
         // bigint taint (t87 huge consts/propagations; needs prog.subs).
         {
@@ -6279,6 +6382,10 @@ impl Render {
 
     /// The thread_local declaration for one var.
     fn decl_stmt(&mut self, v: &str) -> String {
+        // pass-2 local: declared inline at the top of its owning scope
+        if self.local_vars.contains_key(v) {
+            return String::new();
+        }
         // a nameref's own static is still declared (dead but harmless) —
         // `unset ref` etc. may reference it before the binding renders
         let m = self.rust_ident(v);
@@ -10385,6 +10492,284 @@ fn collect_arrays_arith(a: &ArithAst, arrays: &mut BTreeSet<String>, assoc: &mut
     }
 }
 
+/// Is `s` a bare identifier word (`name`, not `name=value` / `-flag`)?
+fn is_ident_word(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The head of a `name=value` word, when it is an identifier.
+fn assign_word_head(s: &str) -> Option<&str> {
+    let (head, _) = s.split_once('=')?;
+    if is_ident_word(head) { Some(head) } else { None }
+}
+
+/// All identifier tokens in a code-ish word (`eval`/`let` payloads).
+fn ident_tokens(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.push(s[start..i].to_string());
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Names a *dynamic* construct may read/write. `None` = "give up, no
+/// locals anywhere" (an opaque payload, a computed `getVar` name, `${!x}`,
+/// or a `source` that can write anything).
+fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    fn walk_expr(e: &IrExpr, out: &mut BTreeSet<String>) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                // a computed var name defeats static reasoning entirely
+                if (func == "getVar" || func == "setVar")
+                    && !matches!(args.first(), Some(IrExpr::Str(_, _)))
+                {
+                    return false;
+                }
+                for a in args {
+                    if !walk_expr(a, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+            IrExpr::Array(items) => items.iter().all(|a| walk_expr(a, out)),
+            IrExpr::Arrow(ss) => ss.iter().all(|s| walk_stmt(s, out)),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                crate::ir::InterpPart::Expr(x) => walk_expr(x, out),
+                _ => true,
+            }),
+            _ => true,
+        }
+    }
+    fn walk_stmt(s: &IrStmt, out: &mut BTreeSet<String>) -> bool {
+        match s {
+            // opaque payload: unknown name access
+            IrStmt::Ext(_) => false,
+            IrStmt::Exec { cmd, args, capture, .. } => {
+                let head = match cmd {
+                    IrExpr::Str(c, _) => Some(c.as_str()),
+                    _ => {
+                        if !walk_expr(cmd, out) {
+                            return false;
+                        }
+                        None
+                    }
+                };
+                match head {
+                    // can write any name at all
+                    Some("source") | Some(".") => return false,
+                    Some(c) if matches!(c, "eval" | "let") => {
+                        for a in args {
+                            if let IrExpr::Str(t, _) = a {
+                                for v in ident_tokens(t) {
+                                    out.insert(v);
+                                }
+                            } else if !walk_expr(a, out) {
+                                return false;
+                            }
+                        }
+                    }
+                    Some(c)
+                        if matches!(
+                            c,
+                            "unset" | "read" | "mapfile" | "readarray" | "getopts" | "set"
+                                | "declare" | "typeset" | "local" | "export" | "readonly"
+                                | "trap"
+                        ) =>
+                    {
+                        let mut printf_v = false;
+                        for a in args {
+                            if let IrExpr::Str(t, _) = a {
+                                if c == "printf" {
+                                    printf_v = t == "-v";
+                                } else if let Some(h) = assign_word_head(t) {
+                                    out.insert(h.to_string());
+                                } else if is_ident_word(t) {
+                                    out.insert(t.clone());
+                                }
+                            } else if !walk_expr(a, out) {
+                                return false;
+                            }
+                        }
+                        let _ = printf_v;
+                    }
+                    Some("printf") => {
+                        // `printf -v NAME fmt …` writes NAME
+                        let mut prev_v = false;
+                        for a in args {
+                            if let IrExpr::Str(t, _) = a {
+                                if prev_v {
+                                    if let Some(h) = assign_word_head(t) {
+                                        out.insert(h.to_string());
+                                    } else if is_ident_word(t) {
+                                        out.insert(t.clone());
+                                    }
+                                    prev_v = false;
+                                } else if t == "-v" || t == "-vT" {
+                                    prev_v = true;
+                                }
+                            } else if !walk_expr(a, out) {
+                                return false;
+                            }
+                        }
+                    }
+                    _ => {
+                        for a in args {
+                            if !walk_expr(a, out) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = capture {
+                    out.insert(c.clone());
+                }
+                true
+            }
+            IrStmt::Assign { expr, .. } => walk_expr(expr, out),
+            IrStmt::Expr(e) => walk_expr(e, out),
+            IrStmt::Output { value, .. } => walk_expr(value, out),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, out) && walk_expr(content, out)
+            }
+            IrStmt::Exit(e) => match e {
+                Some(x) => walk_expr(x, out),
+                None => true,
+            },
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, out)
+                    && then.iter().all(|s| walk_stmt(s, out))
+                    && elsifs
+                        .iter()
+                        .all(|(c, b)| walk_expr(c, out) && b.iter().all(|s| walk_stmt(s, out)))
+                    && else_.iter().all(|s| walk_stmt(s, out))
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, out) && body.iter().all(|s| walk_stmt(s, out))
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, out) && body.iter().all(|s| walk_stmt(s, out))
+            }
+            IrStmt::Function { body, .. } => body.iter().all(|s| walk_stmt(s, out)),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                b.iter().all(|s| walk_stmt(s, out))
+            }
+            IrStmt::Redirect { inner, .. } => inner.iter().all(|s| walk_stmt(s, out)),
+            IrStmt::Pipeline { stages, .. } => stages.iter().all(|st| st.iter().all(|s| walk_stmt(s, out))),
+            IrStmt::Case { .. } => true,
+            _ => true,
+        }
+    }
+    for s in &prog.stmts {
+        if !walk_stmt(s, &mut out) {
+            return None;
+        }
+    }
+    for sub in &prog.subs {
+        for s in &sub.body {
+            if !walk_stmt(s, &mut out) {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Pass-2 locals: scalar vars whose every mention sits in a single
+/// non-risky scope (main or one user function). Arrays/assoc keep global
+/// storage (the list lowering owns them), and anything a dynamic-name
+/// builtin can reach stays global too.
+fn compute_local_vars(
+    prog: &IrProgram,
+    arrays: &BTreeSet<String>,
+    assoc: &BTreeSet<String>,
+    functions: &BTreeSet<String>,
+    declared: &BTreeSet<String>,
+) -> (
+    HashMap<String, crate::shir_passes::list_profile::Scope>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+) {
+    use crate::shir_passes::list_profile::{local_scope, use_scopes, Scope};
+    let mut need_mut: BTreeSet<String> = BTreeSet::new();
+    let mut dead_init: BTreeSet<String> = BTreeSet::new();
+    let Some(dyns) = dynamic_var_names(prog) else {
+        return (HashMap::new(), need_mut, dead_init);
+    };
+    let mut out: HashMap<String, Scope> = HashMap::new();
+    for (name, us) in use_scopes(prog) {
+        // *declared* vars only (an undeclared name reads the process
+        // environment; a `let` would shadow it with ""), and only names
+        // whose FIRST mention is a top-level write in the owning scope
+        // (that is where the `let` lands) which is read at least once
+        // (a never-read local would be dead-store dead weight).
+        if !declared.contains(&name)
+            || !us.first().map(|u| u.write && u.top).unwrap_or(false)
+            || !us.iter().any(|u| !u.write)
+            || is_special_var(&name)
+            || arrays.contains(&name)
+            || assoc.contains(&name)
+            || dyns.contains(&name)
+        {
+            continue;
+        }
+        // a local is written more than once => needs `mut`
+        if us.iter().filter(|u| u.write).count() > 1 {
+            need_mut.insert(name.clone());
+            // first write dead when no read sits between it and the
+            // second write (`x=1; x=2; echo $x`: the `1` is never read)
+            let mut seen_first = false;
+            let mut read_before_second = false;
+            for u in &us {
+                if u.write {
+                    if seen_first {
+                        break;
+                    }
+                    seen_first = true;
+                } else if seen_first {
+                    read_before_second = true;
+                    break;
+                }
+            }
+            if seen_first && !read_before_second {
+                dead_init.insert(name.clone());
+            }
+        }
+        match local_scope(&us) {
+            Some(Scope::Main) => {
+                out.insert(name, Scope::Main);
+            }
+            Some(Scope::Func(f)) if functions.contains(&f) => {
+                out.insert(name, Scope::Func(f));
+            }
+            _ => {}
+        }
+    }
+    (out, need_mut, dead_init)
+}
+
+/// Shell specials / positionals — never plain locals.
+fn is_special_var(name: &str) -> bool {
+    name.is_empty()
+        || name.chars().all(|c| c.is_ascii_digit())
+        || matches!(name, "@" | "*" | "#" | "?" | "$" | "!" | "-" | "_" | "PPID" | "BASHPID")
+}
+
 fn collect_functions(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -10700,13 +11085,12 @@ mod tests {
 
     #[test]
     fn assigns_and_echo() {
+        // pass 2: single-scope x is a plain local (`let` at first write)
         let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
-        assert!(
-            out.contains("thread_local! { #[allow(non_upper_case_globals)] static __SHV_x: std::cell::Cell<i64>"),
-            "{out}"
-        );
-        assert!(out.contains("x.with(|v| v.set(5));"), "{out}");
+        assert!(out.contains("let mut x = 5;"), "{out}");
+        assert!(out.contains("x = 6;"), "{out}");
+        assert!(!out.contains("__SHV_x"), "{out}");
         assert!(out.contains("__sh_print_words"), "{out}");
     }
 
@@ -10730,10 +11114,11 @@ mod tests {
     fn rust_keyword_mangled() {
         // a keyword-named var with a surviving store gets a mangled name
         // (a single-literal def like `type=1` folds away entirely under
-        // copy-propagation, so the mangling needs a dynamic def to observe)
+        // copy-propagation, so the mangling needs a dynamic def to observe;
+        // pass 2: single-scope `type` is a plain local, not a static)
         let out = render("type=$1\necho \"$type\"\n");
-        assert!(out.contains("__SHV_type_"), "{out}");
-        assert!(!out.contains("static __SHV_type:"), "{out}");
+        assert!(out.contains("type_"), "{out}");
+        assert!(!out.contains("__SHV_type"), "{out}");
     }
 }
 
