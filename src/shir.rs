@@ -6088,7 +6088,11 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     ) -> Option<u64> {
         let (v, c, n) = bound?;
         let (blo, bhi) = ranges.get(&v).copied()?;
-        let (mn, _) = body_step_bounds(body, &v)?;
+        let mut carried = HashSet::new();
+        for s in body {
+            collect_assigned(s, &mut carried);
+        }
+        let (mn, _) = body_step_bounds(body, &v, ranges, &carried)?;
         while_iterations(c, n, blo, bhi, mn as i128)
     }
 
@@ -10890,27 +10894,98 @@ fn plus_step(expr: &IrExpr, v: &str) -> Option<i64> {
     }
 }
 
+/// Vars read in an arith tree (for step-operand carried checks).
+fn arith_operand_vars(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            out.insert(n.clone());
+        }
+        ArithAst::Index { key, .. } => arith_operand_vars(key, out),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_operand_vars(lhs, out);
+            arith_operand_vars(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => arith_operand_vars(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_operand_vars(test, out);
+            arith_operand_vars(then, out);
+            arith_operand_vars(else_, out);
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            arith_operand_vars(rhs, out);
+        }
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        ArithAst::Cast { arg, .. } => arith_operand_vars(arg, out),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+    }
+}
+
 /// The per-iteration step bounds of var v in a loop body — provable only
 /// when EVERY write to v (on every path) is `v = v + k` / `v += k` with
-/// literal k ≥ 1. Returns (min_step, max_step); None → not a provable
-/// counter (the widening stands alone). min drives the trip count (fewer
-/// iterations when the body may add more); max drives the other vars'
-/// trip caps.
-fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
+/// literal k ≥ 1, or `v = v + e` with e exactly evaluable to [lo,hi],
+/// lo ≥ 1, over loop-invariant operands (no operand carried by the loop
+/// — `carried` — since their ranges shift per iteration). Returns
+/// (min_step, max_step); None → not a provable counter (the widening
+/// stands alone). min drives the trip count (fewer iterations when the
+/// body may add more); max drives the other vars' trip caps.
+fn body_step_bounds(
+    stmts: &[IrStmt],
+    v: &str,
+    env: &HashMap<String, (i128, i128)>,
+    carried: &HashSet<String>,
+) -> Option<(i64, i64)> {
+    // steps evaluate in the exact reading (bash wrap would understate a
+    // step and over-tighten the cap — steps need the true magnitudes)
+    let exact_env = env;
     let mut mn: Option<i64> = None;
     let mut mx: Option<i64> = None;
     for s in stmts {
         let r: Option<(i64, i64)> = match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if targets.iter().any(|t| t.indices.is_empty() && t.var == v) {
-                    return plus_step(expr, v).map(|k| (k, k));
+                    if let Some(k) = plus_step(expr, v) {
+                        return Some((k, k));
+                    }
+                    // range-bounded step: `v = v + e` / `v = e + v`
+                    if let IrExpr::Arith(a) = expr {
+                        if let ArithAst::Bin { op, lhs, rhs } = a.as_ref() {
+                            if op == "+" {
+                                let e = if matches!(lhs.as_ref(), ArithAst::Var(n) | ArithAst::Ident(n) if n == v) {
+                                    Some(rhs.as_ref())
+                                } else if matches!(rhs.as_ref(), ArithAst::Var(n) | ArithAst::Ident(n) if n == v) {
+                                    Some(lhs.as_ref())
+                                } else {
+                                    None
+                                };
+                                if let Some(step) = e {
+                                    let mut vs = HashSet::new();
+                                    arith_operand_vars(step, &mut vs);
+                                    if vs.iter().all(|n| !carried.contains(n)) {
+                                        if let Some((lo, hi)) = arith_range_exact(step, &exact_env) {
+                                            if lo >= 1 {
+                                                if let (Ok(lo), Ok(hi)) =
+                                                    (i64::try_from(lo), i64::try_from(hi))
+                                                {
+                                                    return Some((lo, hi));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return None;
                 }
                 None
             }
             IrStmt::Block(b)
             | IrStmt::Subshell(b)
             | IrStmt::Background(b)
-            | IrStmt::Redirect { inner: b, .. } => body_step_bounds(b, v),
+            | IrStmt::Redirect { inner: b, .. } => body_step_bounds(b, v, env, carried),
             IrStmt::If {
                 then,
                 elsifs,
@@ -10918,15 +10993,15 @@ fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
                 ..
             } => {
                 // every path through the body must increase v
-                let (a, b) = body_step_bounds(then, v)?;
+                let (a, b) = body_step_bounds(then, v, env, carried)?;
                 let mut lo = a;
                 let mut hi = b;
                 for (_, arm) in elsifs {
-                    let (x, y) = body_step_bounds(arm, v)?;
+                    let (x, y) = body_step_bounds(arm, v, env, carried)?;
                     lo = lo.min(x);
                     hi = hi.max(y);
                 }
-                let (x, y) = body_step_bounds(else_, v)?;
+                let (x, y) = body_step_bounds(else_, v, env, carried)?;
                 Some((lo.min(x), hi.max(y)))
             }
             // statements that don't write v impose no constraint
@@ -10997,6 +11072,7 @@ fn loop_fixpoint(
     body: &[IrStmt],
     skip_var: Option<&str>,
     bound: Option<(String, Cmp, i128)>,
+    trip_hint: Option<u64>,
 ) {
     let pre = state.clone();
     let mut carried: HashSet<String> = HashSet::new();
@@ -11009,6 +11085,12 @@ fn loop_fixpoint(
     if carried.is_empty() {
         return; // the loop cannot change any variable's range
     }
+    // entry ranges, flattened, for range-bounded step operands
+    // (non-carried vars are loop-invariant, so pre-state is exact)
+    let exact_pre: HashMap<String, (i128, i128)> = pre
+        .iter()
+        .filter_map(|(n, r)| r.map(|r| (n.clone(), r)))
+        .collect();
 
     // the cond variable's entry range (for the trip count)
     let (cond_var, cmp, n) = match &bound {
@@ -11020,14 +11102,16 @@ fn loop_fixpoint(
         .and_then(|v| pre.get(v).copied().flatten());
 
     // trip: how many times can the loop run? Requires the cond var to be
-    // a provable counter with a known entry lower bound.
+    // a provable counter with a known entry lower bound — or an explicit
+    // hint (a For iterable's exact length).
     let trip: Option<u64> = match (&cond_var, cond_pre) {
-        (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v) {
+        (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v, &exact_pre, &carried) {
             Some((mn, _)) => while_iterations(cmp, n, blo, bhi, mn as i128),
             None => None,
         },
         _ => None,
-    };
+    }
+    .or(trip_hint);
 
     // entry-invariant state (widening + caps)
     let mut ls = pre.clone();
@@ -11063,7 +11147,7 @@ fn loop_fixpoint(
             }
             // trip cap: a carried counter can move at most trip·step
             if let (Some(t), Some(r)) = (trip, joined) {
-                if let Some((_, max_step)) = body_step_bounds(body, v) {
+                if let Some((_, max_step)) = body_step_bounds(body, v, &exact_pre, &carried) {
                     let t = t.saturating_mul(max_step as u64);
                     let lo0 = pre.get(v).copied().flatten().map_or(INT_DOMAIN.0, |r| r.0);
                     let hi0 = pre.get(v).copied().flatten().map_or(INT_DOMAIN.1, |r| r.1);
@@ -11249,7 +11333,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             for s in body {
                 collect_assigned(s, &mut carried);
             }
-            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried), None);
         }
         IrStmt::ForInit { init, cond, step, body } => {
             for i in init {
@@ -11262,7 +11346,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             for s in body {
                 collect_assigned(s, &mut carried);
             }
-            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried), None);
         }
         IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, until } => {
@@ -11276,7 +11360,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             } else {
                 b
             };
-            loop_fixpoint(state, body, None, b);
+            loop_fixpoint(state, body, None, b, None);
         }
         IrStmt::For { var, iter, body } => {
             // the loop variable is re-set from the item list every
@@ -11284,7 +11368,10 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             if let Some(r) = for_iter_range(iter) {
                 state.insert(var.clone(), Some(r));
             }
-            loop_fixpoint(state, body, Some(var), None);
+            // trip hint: a literal iterable runs exactly len/span times
+            // (bash expands the words once), so carried accumulators get
+            // trip-bounded instead of widened (t48's `s += n` over 3 items)
+            loop_fixpoint(state, body, Some(var), None, for_iter_trip(iter));
         }
         // Subshell / Background / Function: definitions or child scopes —
         // they cannot change the parent's ranges.
@@ -52678,6 +52765,22 @@ mod py2cy_analysis_tests {
         assert_eq!(env.get("big"), Some(&(0, 0)), "bash wrap precondition");
         let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
         assert!(vetoed.contains("big"), "wrap artifact vetoed: {vetoed:?}");
+    }
+
+    #[test]
+    fn trip_bounded_accumulation() {
+        // `s=0; for n in 1 2 3; do s=$((s+n)); done`: the 3-trip hint
+        // caps the accumulator instead of widening to top (true max 6).
+        // Post-loop single re-walk lands one unrolling past the cap —
+        // a deterministic superset, pinned here, not exactness.
+        let cmds = crate::Parser::new("s=0\nfor n in 1 2 3; do s=$((s + n)); done").parse().expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let env = analyze_var_ranges(&prog);
+        let (lo, hi) = env.get("s").copied().expect("s has a range");
+        assert!(lo <= 0 && 0 <= hi, "covers pre-loop 0: [{lo},{hi}]");
+        assert!(6 <= hi && hi <= 12, "covers true max 6, trip-capped: [{lo},{hi}]");
+        let (nlo, nhi) = env.get("n").copied().expect("n has a range");
+        assert_eq!((nlo, nhi), (1, 3));
     }
 
     #[test]
