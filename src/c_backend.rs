@@ -7837,7 +7837,7 @@ impl Render {
         self.emit("");
         if self.need_sh {
             self.runtime_start = self.out.len();
-            self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
+            self.emit("/* sh2 runtime: exit-status register + shell-out helpers */");
             self.emit("static int _sh_rc = 0;");
             // return-echo gate (BASHC_FIX §2.2): statement/condition
             // callers bump this around the call so `return N` sets
@@ -9363,16 +9363,36 @@ impl Render {
     /// The reads are the `$?` lowering, the shell-out helpers' own
     /// `return _sh_rc;`, and the fn-call status `(f(), …, _sh_rc)` —
     /// all of which bail this cleanup out entirely.
+    ///
+    /// EXIT-CODE case: even when nothing statically reads `$?`, bash's
+    /// exit status is the LAST command's status, which the C `return
+    /// _sh_rc;` models — so a live register normally stays. But when
+    /// every emitted store is the literal `_sh_rc = 0` (init included)
+    /// and no helper writes it from a wait status, the register can only
+    /// ever hold 0: the exit status is provably 0, `return _sh_rc;` is
+    /// `return 0;`, and the whole register (declaration, status stores,
+    /// the shell-out-runtime comment) drops out. A single nonzero-capable
+    /// store (test/cd/false/let/shell-out) keeps everything.
     fn strip_dead_rc(&mut self) {
-        // NOTE: currently best-effort — prelude helpers always contain
-        // `return _sh_rc` (shell-out protocol) and main ends with
-        // `return _sh_rc` (exit code), so rc_is_read usually bails and
-        // per-iteration cond stores survive. Killing those needs an IR
-        // pre-pass (program-level $?-read info + exit-code care), not
-        // string surgery — tracked as follow-up, not attempted here.
         let full = self.out.join("\n");
-        if rc_is_read(&full) {
+        let exit_only = !rc_is_read(&full) || rc_exit_only(&full);
+        if rc_is_read(&full) && !exit_only {
             return;
+        }
+        if exit_only && rc_may_be_nonzero(&full) {
+            // the register IS the exit status and can be nonzero —
+            // keep it (nothing else reads it, but the caller does).
+            return;
+        }
+        if exit_only {
+            // every store is a literal 0 → the register is provably 0,
+            // so the exit reads fold to the constant.
+            for line in self.out.iter_mut() {
+                let indent_len = line.len() - line.trim_start().len();
+                if line.trim() == "return _sh_rc;" {
+                    *line = format!("{}return 0;", &line[..indent_len]);
+                }
+            }
         }
         let mut out = Vec::with_capacity(self.out.len());
         for line in &self.out {
@@ -31549,6 +31569,89 @@ fn rc_is_read(s: &str) -> bool {
     false
 }
 
+/// `_sh_rc` reads that are NOT the main exit-status `return _sh_rc;`?
+/// Used by the exit-code fold in strip_dead_rc: when the ONLY reads are
+/// the process epilogue, the register has no in-program consumer and the
+/// remaining question is whether it can be nonzero (rc_may_be_nonzero).
+/// `_sh_rc ==`/`!=` comparisons, `, _sh_rc)` sequence tails and
+/// `q = _sh_rc;` pulls are in-program reads → true. A line whose trimmed
+/// form is exactly `return _sh_rc;` is the exit read → skipped.
+fn rc_exit_only(s: &str) -> bool {
+    for line in s.lines() {
+        let t = line.trim();
+        if t == "return _sh_rc;" {
+            continue;
+        }
+        // any other mention that is a read?
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'_'
+                && line[i..].starts_with("_sh_rc")
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            {
+                let mut j = i + 6;
+                while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                    j += 1;
+                }
+                // `_sh_rc =` (not `==`) is a store; everything else is a
+                // read → not exit-only.
+                let is_store = b.get(j) == Some(&b'=') && b.get(j + 1) != Some(&b'=');
+                // `!(_sh_rc = …)` is a read-shaped assignment expression
+                if i >= 2 && b[i - 1] == b'(' && b[i - 2] == b'!' {
+                    return false;
+                }
+                if !is_store {
+                    return false;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    true
+}
+
+/// Can any emitted `_sh_rc` store leave the register nonzero? Scans every
+/// `_sh_rc = X` store and checks X's first token: exactly `0` (delimiter
+/// or end next) is a zero store; anything else (`1`, `(…)`, `_sh_...`,
+/// `(cond ? 0 : 1)`) may be nonzero. The `static int _sh_rc = 0;`
+/// declaration counts as a zero store (file-scope zero-init is also
+/// safe). No stores at all → false.
+fn rc_may_be_nonzero(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'_'
+            && s[i..].starts_with("_sh_rc")
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 6;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'=') && b.get(j + 1) != Some(&b'=') {
+                // store: examine the RHS's first non-space char
+                let mut k = j + 1;
+                while k < b.len() && (b[k] == b' ' || b[k] == b'\t') {
+                    k += 1;
+                }
+                let zero = b.get(k) == Some(&b'0')
+                    && !matches!(b.get(k + 1), Some(c2) if c2.is_ascii_alphanumeric() || *c2 == b'_');
+                if !zero {
+                    return true;
+                }
+                j = k + 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// One line of the dead-rc cleanup (called only when nothing reads
 /// `_sh_rc`). Drops whole-line definitions/status stores, rewrites
 /// `(_sh_rc = N, X)` sequence wrappers to `X` (the store was the only
@@ -31559,7 +31662,7 @@ fn rc_is_read(s: &str) -> bool {
 fn strip_rc_line(line: &str) -> Option<String> {
     let t = line.trim_start();
     if t == "static int _sh_rc = 0;"
-        || t == "/* shell-out runtime: build a command line, run it via bash -c */"
+        || t == "/* sh2 runtime: exit-status register + shell-out helpers */"
         || (t.starts_with("_sh_rc ") && t.trim_end().ends_with(';'))
     {
         return None;
@@ -38659,6 +38762,93 @@ mod tests {
         }
     }
 
+    /// Minimal IrProgram carrying the given statements (empty analyses —
+    /// shir_to_c recomputes them).
+    fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    /// Builtin call statement `name(args…)` — the words live in the
+    /// trailing Array, as the frontends emit them.
+    fn builtin(name: &str, words: Vec<IrExpr>) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(words),
+            ],
+        })
+    }
+
+    #[test]
+    fn rc_exit_only_and_nonzero_scans() {
+        // The exit-only predicate skips the process epilogue read but
+        // sees every in-program read.
+        assert!(rc_exit_only("int main(void) {\n    return _sh_rc;\n}"));
+        assert!(!rc_exit_only("  printf(\"%d\", _sh_rc);"));
+        assert!(!rc_exit_only("  long long q = _sh_rc;"));
+        assert!(!rc_exit_only("  if (_sh_rc == 0) return 1;"));
+        assert!(!rc_exit_only("  x = _sh_rc != 0;"));
+        // Store classification: literal `0` is the only zero store.
+        assert!(!rc_may_be_nonzero("static int _sh_rc; _sh_rc = 0;"));
+        assert!(!rc_may_be_nonzero("(_sh_rc = 0, fputs(\"x\", stdout));"));
+        assert!(rc_may_be_nonzero("_sh_rc = 1;"));
+        assert!(rc_may_be_nonzero("_sh_rc = (rc == -1) ? 127 : 1;"));
+        assert!(rc_may_be_nonzero("_sh_rc = (_r == 0 ? 0 : 1);"));
+        assert!(!rc_may_be_nonzero("/* nothing here */"));
+    }
+
+    #[test]
+    fn pure_native_echo_drops_sh_rc() {
+        // A pure-native `echo`: every status store is a literal 0 and
+        // nothing reads $?, so the exit status is provably 0 — no
+        // exit-status register, no shell-out-runtime comment.
+        let p = prog_of(vec![builtin(
+            "echo",
+            vec![IrExpr::Str(
+                "hello".to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        )]);
+        let c = shir_to_c(&p);
+        assert!(!c.contains("_sh_rc"), "rc leaked:\n{c}");
+        assert!(!c.contains("shell-out"), "runtime comment leaked:\n{c}");
+        assert!(c.contains("return 0;"), "no constant exit:\n{c}");
+        assert!(c.contains("hello"), "body missing:\n{c}");
+    }
+
+    #[test]
+    fn nonzero_status_keeps_sh_rc() {
+        // `false` stores a nonzero status: the register IS the exit
+        // code, so it must stay even though nothing reads $?.
+        let p = prog_of(vec![
+            builtin("false", vec![]),
+            builtin(
+                "echo",
+                vec![IrExpr::Str(
+                    "hi".to_string(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )],
+            ),
+        ]);
+        let c = shir_to_c(&p);
+        assert!(c.contains("_sh_rc"), "rc wrongly dropped:\n{c}");
+        assert!(c.contains("return _sh_rc;"), "exit not via rc:\n{c}");
+    }
+
     #[test]
     fn shell_fn_prototype_kept_when_referenced_early() {
         // g's body mentions tfn_a (even as a mere string): the prototype
@@ -42222,15 +42412,30 @@ mod tests {
 
     #[test]
     fn lean_assign_keeps_rc_top_level() {
-        // Top-level assigns keep their rc store (exit codes observe the
-        // last one) even with no `$?` reads.
-        let out = shir_to_c(&lic_while_text("i<n", vec![lic_incr("i")]));
-        // the init `i = 0` is top-level (lic_while_text has no init, so
-        // use a prog with a trailing top-level assign instead)
+        // A top-level assign's status store is a literal 0 and nothing
+        // reads `$?` — the exit status is provably 0, so the register
+        // folds away rather than being modeled (see strip_dead_rc's
+        // exit-code case).
         let mut prog = lic_while_text("i<n", vec![lic_incr("i")]);
         prog.stmts.push(unsigned_assign("z", 42));
         let out = shir_to_c(&prog);
-        assert!(out.contains("_sh_rc"), "top-level rc modeling gone:\n{out}");
+        assert!(
+            !out.contains("_sh_rc"),
+            "provably-zero rc register survives:\n{out}"
+        );
+        assert!(out.contains("return 0;"), "no constant exit:\n{out}");
+    }
+
+    #[test]
+    fn failing_top_level_command_keeps_rc() {
+        // A command that can fail (here `false`, a native nonzero store)
+        // makes the exit status data-dependent: the register must stay
+        // even though nothing reads `$?` statically.
+        let mut prog = lic_while_text("i<n", vec![lic_incr("i")]);
+        prog.stmts.push(builtin("false", vec![]));
+        let out = shir_to_c(&prog);
+        assert!(out.contains("_sh_rc"), "exit-status register dropped:\n{out}");
+        assert!(out.contains("return _sh_rc;"), "exit not via rc:\n{out}");
     }
 
     #[test]
