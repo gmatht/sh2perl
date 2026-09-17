@@ -5139,14 +5139,144 @@ impl Render {
         }
         let mut parts = Vec::new();
         for w in items {
+            // a compile-time-constant word (a bare literal, or a quoted
+            // string whose only part is a literal) is needed as Part::Lit
+            // by the constant-echo fast path.
+            if let Some(t) = Self::const_word_text(w) {
+                parts.push(Part::Lit(t));
+                continue;
+            }
             parts.push(Part::Words(self.words_expr(w)));
         }
         (parts, nl, esc)
     }
 
+    /// The compile-time text of a word, or `None` when it involves any
+    /// expansion/glob. Bare `Str` (not the glob sentinel) and an
+    /// `Interpolate` whose parts are ALL literals both fold to a
+    /// constant (quoted `"s1"` arrives as a one-part Interpolate).
+    fn const_word_text(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) if !s.starts_with(GLOB_SENTINEL) => Some(s.clone()),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(t) => out.push_str(t),
+                        InterpPart::Expr(_) => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Compile-time `echo` evaluation: when every word is a literal, the
+    /// output is a constant. Mirrors `__sh_print_words`' join + `-e`
+    /// unescape (via [`Self::echo_esc_lit`], a Rust twin of the runtime
+    /// `__sh_echo_esc`) + trailing newline. `None` when any word is not
+    /// a literal (so the caller keeps the general path).
+    fn const_echo_text(parts: &[Part], nl: bool, esc: bool) -> Option<String> {
+        let mut s = String::new();
+        let mut first = true;
+        for p in parts {
+            match p {
+                Part::Lit(t) => {
+                    if !first {
+                        s.push(' ');
+                    }
+                    first = false;
+                    s.push_str(t);
+                }
+                Part::Words(_) => return None,
+            }
+        }
+        if esc {
+            s = Self::echo_esc_lit(&s);
+        }
+        if nl {
+            s.push('\n');
+        }
+        Some(s)
+    }
+
+    /// Compile-time twin of `__sh_echo_esc` (bash `echo -e`). Keep the
+    /// two in lockstep: this is the same state machine run on a literal.
+    fn echo_esc_lit(s: &str) -> String {
+        let mut o = String::new();
+        let ch: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < ch.len() {
+            if ch[i] == '\\' && i + 1 < ch.len() {
+                i += 1;
+                match ch[i] {
+                    'n' => o.push('\n'),
+                    't' => o.push('\t'),
+                    'r' => o.push('\r'),
+                    'a' => o.push('\x07'),
+                    'b' => o.push('\x08'),
+                    'f' => o.push('\x0c'),
+                    'v' => o.push('\x0b'),
+                    'e' => o.push('\x1b'),
+                    '\\' => o.push('\\'),
+                    'c' => return o,
+                    '0'..='7' => {
+                        let mut n = 0;
+                        let mut k = 0;
+                        while k < 3 && i + k < ch.len() && ch[i + k].is_ascii_digit() && ch[i + k] <= '7' {
+                            n = n * 8 + (ch[i + k] as u32 - '0' as u32);
+                            k += 1;
+                        }
+                        o.push(char::from_u32(n & 0xff).unwrap_or('\0'));
+                        i += k - 1;
+                    }
+                    'x' => {
+                        let mut n = 0;
+                        let mut k = 0;
+                        while k < 2 && i + 1 + k < ch.len() && ch[i + 1 + k].is_ascii_hexdigit() {
+                            n = n * 16 + ch[i + 1 + k].to_digit(16).unwrap();
+                            k += 1;
+                        }
+                        if k > 0 {
+                            o.push(char::from_u32(n).unwrap_or('\0'));
+                            i += k;
+                        } else {
+                            o.push('x');
+                        }
+                    }
+                    c => {
+                        o.push('\\');
+                        o.push(c);
+                    }
+                }
+                i += 1;
+            } else {
+                o.push(ch[i]);
+                i += 1;
+            }
+        }
+        o
+    }
+
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
         self.word_fail_guard = false;
         let (parts, nl, esc) = self.echo_parts(words);
+        // Constant-echo fast path: when every word is a compile-time
+        // literal (no expansion, no glob, no arith guard), the whole
+        // output — the space-joined words, `-e` unescaping and the
+        // trailing newline — is known at render time, so skip the
+        // Vec<Vec<String>> construction and the join loop and emit a
+        // single precomputed string. `__sh_puts` still honours the
+        // active redirect file / capture buffer sinks.
+        if !self.word_fail_guard {
+            if let Some(text) = Self::const_echo_text(&parts, nl, esc) {
+                self.add_helper("puts");
+                self.emit(&format!("__sh_puts({});", Self::rust_str(&text)));
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                return;
+            }
+        }
         let ws: Vec<String> = parts
             .into_iter()
             .map(|p| match p {
@@ -7115,7 +7245,7 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "printf",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "puts", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
@@ -7344,6 +7474,19 @@ fn helper_source(h: &str) -> &'static str {
     }
     if esc { s = __sh_echo_esc(&s); }
     if nl { s.push('\n'); }
+    let mut used = false;
+    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
+    if used { return; }
+    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
+        b.extend_from_slice(s.as_bytes());
+        return;
+    }
+    print!("{}", s);
+}"#,
+        "puts" => r#"fn __sh_puts(s: &str) {
+    // constant-echo fast path: the caller has already joined the words
+    // and applied -n/-e, so this only honours the active sinks (redirect
+    // file, capture buffer) before falling back to stdout.
     let mut used = false;
     __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
     if used { return; }
@@ -12169,6 +12312,33 @@ mod tests {
         let commands = Parser::new(src).parse().expect("parse");
         let prog = crate::shir::ast_to_ir(&commands);
         shir_to_rust(&prog)
+    }
+
+    #[test]
+    fn const_echo_uses_puts() {
+        // a literal-only echo is folded to a single precomputed string
+        let out = render("echo \"s1\"\necho one two three\n");
+        assert!(out.contains("__sh_puts(\"s1\\n\")"), "{out}");
+        assert!(out.contains("__sh_puts(\"one two three\\n\")"), "{out}");
+        assert!(!out.contains("__sh_print_words(&[vec![\"s1\""), "{out}");
+    }
+
+    #[test]
+    fn const_echo_flag_and_escapes() {
+        // -n drops the newline; -e unescapes at render time (mirror of
+        // the runtime __sh_echo_esc)
+        let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
+        assert!(out.contains("__sh_puts(\"a\")"), "{out}");
+        assert!(out.contains("__sh_puts(\"x\\ty\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn dynamic_echo_keeps_print_words() {
+        // an expansion word keeps the general path (no __sh_puts).
+        // `$1` is a runtime positional (shIR cannot fold it).
+        let out = render("echo \"$1\"\n");
+        assert!(out.contains("__sh_print_words("), "{out}");
+        assert!(!out.contains("__sh_puts("), "{out}");
     }
 
     #[test]
