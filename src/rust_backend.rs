@@ -192,6 +192,9 @@ pub struct Render {
     /// an echo word's expansion is failure-guarded (an arith parse
     /// error or a bad substitution suppresses the print and sets rc 1)
     word_fail_guard: bool,
+    /// some echo used `-e`, so `__sh_print_words` must keep its `esc`
+    /// branch (and its `__sh_echo_esc` dependency). Set by `echo_parts`.
+    print_words_esc: bool,
     /// the shared `RuntimeFootprint` verdict: this program uses no
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
@@ -435,6 +438,66 @@ fn inline_sinks_when_unused(text: String, runtime_free: bool) -> String {
     out
 }
 
+/// Drop a helper definition whose function is never CALLED. `echo_esc`
+/// is registered as a dependency of `print_words`/`printf` at helper-add
+/// time, before the renderer knows whether the program actually needs
+/// it (an `-e` echo, or a `printf` with `%b`). When it ends up
+/// unreferenced — the common case: 441 programs use print_words but only
+/// 14 use `-e` — the 19-line unescaper is dead weight.
+///
+/// A helper is "called" when its name appears on a line OTHER than its
+/// own signature line. Comments mentioning the name don't count, so the
+/// definition's doc/comments are ignored.
+fn prune_unused_helpers(text: String) -> String {
+    const HELPERS: &[&str] = &["__sh_echo_esc", "__sh_printf_b", "__sh_puts", "__sh_print_words", "__sh_cat"];
+    let lines: Vec<&str> = text.lines().collect();
+    let mut drop: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let Some(name) = HELPERS.iter().find(|n| t.starts_with(&format!("fn {n}("))) else {
+            continue;
+        };
+        // is the name mentioned on any other non-comment line?
+        let called = lines.iter().enumerate().any(|(j, l)| {
+            if j == i {
+                return false;
+            }
+            let lt = l.trim_start();
+            if lt.starts_with("//") {
+                return false;
+            }
+            l.contains(*name)
+        });
+        if !called {
+            // drop the whole definition: the signature line + body until
+            // the matching closing brace at column 0
+            let mut j = i + 1;
+            while j < lines.len() && lines[j] != "}" {
+                j += 1;
+            }
+            for k in i..=j.min(lines.len().saturating_sub(1)) {
+                drop.push(k);
+            }
+        }
+    }
+    if drop.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if !drop.contains(&i) {
+            out.push_str(line);
+        }
+    }
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out
+}
+
 /// Drop the module-level runtime statics a program never uses. The 14
 /// `__SH_*` statics are emitted unconditionally (some helper, function
 /// body or statement may need any of them), but for a program that
@@ -521,6 +584,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
     let text = inline_sinks_when_unused(text, r.runtime_free);
+    let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
@@ -2769,6 +2833,8 @@ impl Render {
                 let arg_exprs: Vec<String> =
                     words.iter().skip(1).map(|w| self.expr_str(w)).collect();
                 self.add_helper("printf");
+                // see printf_stmt: __sh_printf always references __sh_printf_b
+                self.add_helper("printf_b");
                 format!("__sh_printf(&{fmt}, &[{}])", arg_exprs.join(", "))
             }
             _ => {
@@ -5270,6 +5336,12 @@ impl Render {
             }
             parts.push(Part::Words(self.words_expr(w)));
         }
+        if esc {
+            // the `-e` unescape is a runtime branch in __sh_print_words;
+            // record that this program needs it (so the helper keeps its
+            // esc arm and its __sh_echo_esc dependency)
+            self.print_words_esc = true;
+        }
         (parts, nl, esc)
     }
 
@@ -5472,6 +5544,10 @@ impl Render {
             })
             .collect();
         self.add_helper("printf");
+        // `__sh_printf`'s body calls __sh_printf_b unconditionally (the
+        // `%b` arm is a runtime branch), so it must be emitted whenever
+        // printf is; when no printf survives, the helper prune drops it.
+        self.add_helper("printf_b");
         self.add_helper("cat");
         let call = if arg_exprs.is_empty() {
             format!("__sh_printf(&{fmt}, &[])")
@@ -7295,6 +7371,19 @@ impl Render {
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
+            // `print_words` has a no-`esc` twin: when no echo used `-e`,
+            // emit the variant that never references __sh_echo_esc and
+            // skip the `print_words` entry (so the 19-line unescaper is
+            // not dragged in).
+            if *h == "print_words" && self.helpers.contains("print_words") && !self.print_words_esc {
+                let src = helper_source("print_words_noesc");
+                self.emit(src);
+                self.emit("");
+                continue;
+            }
+            if *h == "print_words_noesc" {
+                continue;
+            }
             if self.helpers.contains(*h) {
                 let src = helper_source(h);
                 self.emit(src);
@@ -7402,7 +7491,7 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "puts", "printf",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
@@ -7467,8 +7556,15 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
         "print_words" => &["echo_esc"],
+        // the no-`esc` variant never calls __sh_echo_esc — the `-e`
+        // support is compiled out of the helper when no echo used it
+        "print_words_noesc" => &[],
         "lines" => &[],
-        "printf" => &["q", "q_printf", "echo_esc", "atoi", "atou", "atof"],
+        "printf" => &["q", "q_printf", "atoi", "atou", "atof"],
+        // printf's `%b` unescape, split out so a `%s`-only printf does not
+        // drag in __sh_echo_esc (the printf body then references only
+        // __sh_printf_b, which the helper prune can drop)
+        "printf_b" => &["echo_esc"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
         "run_traps" => &["spawn"],
@@ -7563,6 +7659,11 @@ fn helper_source(h: &str) -> &'static str {
     if bv == BigInt::from(0) { __SH_ARITH_ERR.store(true, Ordering::SeqCst); return false; }
     (av % bv) == BigInt::from(0)
 }"#,
+        // printf's `%b` conversion — the backslash-escape expansion.
+        // Split from __sh_printf so a `%s`-only printf need not carry
+        // __sh_echo_esc (the printf body calls __sh_printf_b, which the
+        // helper prune drops when unreferenced).
+        "printf_b" => r#"fn __sh_printf_b(s: &str) -> String { __sh_echo_esc(s) }"#,
         "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
     let mut o = String::new();
     let ch: Vec<char> = s.chars().collect();
@@ -7630,6 +7731,38 @@ fn helper_source(h: &str) -> &'static str {
         }
     }
     if esc { s = __sh_echo_esc(&s); }
+    if nl { s.push('\n'); }
+    let mut used = false;
+    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
+    if used { return; }
+    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
+        b.extend_from_slice(s.as_bytes());
+        return;
+    }
+    print!("{}", s);
+}"#,
+        // Same signature and call sites as `print_words`, but with the
+        // `-e` branch compiled out: emitted when no echo in the program
+        // used `-e`, so the 19-line `__sh_echo_esc` need not be dragged
+        // in. `esc` stays a parameter (call sites pass `false`) so the
+        // two variants are drop-in interchangeable.
+        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+    // no echo in this program used -e, so `esc` is always false — the
+    // unescape arm (and its __sh_echo_esc dependency) is compiled out.
+    let _ = esc;
+    // a word's `$((…))` arith expansion FAILED (an empty positional
+    // makes the expanded text a syntax error) — bash suppresses the
+    // WHOLE simple command, not just the word
+    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst) { return; }
+    let mut s = String::new();
+    let mut first = true;
+    for w in ws {
+        for x in w {
+            if !first { s.push(' '); }
+            first = false;
+            s.push_str(x);
+        }
+    }
     if nl { s.push('\n'); }
     let mut used = false;
     __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
@@ -7726,7 +7859,7 @@ fn helper_source(h: &str) -> &'static str {
                         if p >= 0 { piece = piece.chars().take(p as usize).collect(); }
                     }
                     'b' => {
-                        piece = __sh_echo_esc(&arg);
+                        piece = __sh_printf_b(&arg);
                         if p >= 0 { piece = piece.chars().take(p as usize).collect(); }
                     }
                     'q' => { piece = __sh_q_printf(&arg); }
@@ -12533,6 +12666,23 @@ mod tests {
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
         assert!(out.contains("__sh_puts(\"hi\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn echo_esc_omitted_without_dash_e() {
+        // a dynamic echo with no `-e` anywhere drops the 19-line
+        // __sh_echo_esc (and the print_words esc arm)
+        let out = render("echo \"$1\"\n");
+        assert!(!out.contains("fn __sh_echo_esc"), "{out}");
+        assert!(out.contains("compiled out"), "no-esc variant expected:\n{out}");
+    }
+
+    #[test]
+    fn echo_esc_kept_with_dash_e() {
+        // `-e` needs the runtime unescaper
+        let out = render("echo -e \"$1\"\n");
+        assert!(out.contains("fn __sh_echo_esc"), "{out}");
+        assert!(out.contains("if esc { s = __sh_echo_esc"), "{out}");
     }
 
     #[test]
