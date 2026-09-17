@@ -69,6 +69,7 @@ pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
 pub mod strip;
 pub mod transform;
 pub mod interval; // generic integer intervals (bash wrapping + Python floor-mod)
+pub mod bigint_range; // exact unbounded intervals for the Python reading (past i128, no wrapping)
 pub mod used_before_decl; // use-before-declaration lint (the "definitely uninitialized" dataflow)
 
 pub use context::PassContext;
@@ -294,6 +295,11 @@ impl Pipeline {
                 Box::new(analysis::FunctionScc),
                 Box::new(analysis::SyncFnCalls),
                 Box::new(analysis::NativeEchoFns),
+                // whole-program "needs the shell runtime at all" verdict —
+                // a `false` licences a renderer to emit plain host code
+                // (the rust backend inlines print! and drops the sink
+                // statics on this signal).
+                Box::new(analysis::RuntimeFootprint),
                 Box::new(analysis::AsyncRegionLoops),
                 Box::new(analysis::LastExitLiveness),
                 Box::new(analysis::LoopStatusDeadness),
@@ -501,5 +507,59 @@ mod tests {
         );
         // the input is untouched — the pipeline is pure
         assert!(prog.var_const.is_empty());
+    }
+
+    /// RuntimeFootprint: a constant echo is runtime-free; anything with a
+    /// redirect/capture/pipeline needs the runtime.
+    #[test]
+    fn runtime_footprint_verdict() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                var_storage: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+            }
+        }
+        // `echo "hi"` — builtin with a literal arg array
+        let hello = prog(vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+            ],
+        })]);
+        assert!(!super::analysis::needs_runtime(&hello));
+        let (ctx, _o, _m) = Pipeline::canonical().run(&hello);
+        assert!(!ctx.needs_runtime);
+
+        // a redirect (`echo hi > f`)
+        let redir = prog(vec![IrStmt::Redirect {
+            inner: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })],
+            redirects: vec![],
+        }]);
+        assert!(super::analysis::needs_runtime(&redir));
+
+        // a capture
+        let cap = prog(vec![IrStmt::Expr(IrExpr::Capture {
+            expr: Box::new(IrExpr::Arrow(vec![])),
+            native: false,
+        })]);
+        assert!(super::analysis::needs_runtime(&cap));
     }
 }

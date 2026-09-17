@@ -75,6 +75,14 @@ pub struct PassContext {
     /// the native-echo lowering.
     pub persist_fd1: bool,
 
+    /// The program needs the shell runtime (redirects, captures,
+    /// pipelines, subshells, functions, globs, background jobs, traps,
+    /// shell-outs, … — see [`crate::shir_passes::analysis::needs_runtime`]).
+    /// `false` licences a renderer to emit plain host code with no
+    /// `sh2.*`/runtime shims; it is a conservative over-approximation, so
+    /// `false` is trustworthy and `true` merely means "keep the runtime".
+    pub needs_runtime: bool,
+
     // ── Function analysis (M6 + M8) ──────────────────────────────
     /// Every function name defined in the program.
     pub program_functions: HashSet<String>,

@@ -398,16 +398,22 @@ fn cat_peephole(text: &str) -> String {
 /// to stdout (a Python `print()` script, a plain `echo` script) then
 /// looks like handwriting instead of a runtime shim.
 ///
-/// Detection: the sink SET forms (`*__SH_OUT.lock().unwrap() = Some(…)`
-/// and `__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(…)`) appear
-/// nowhere in the output. Then at every print both sinks are None.
+/// Two independent signals must agree:
+///  * `runtime_free` — the shared `shir_passes` verdict
+///    ([`crate::shir_passes::analysis::needs_runtime`]) says the program
+///    uses no redirect/capture/pipeline/shell-out construct at all;
+///  * the SET forms (`*__SH_OUT.lock().unwrap() = Some(…)`,
+///    `__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(…)`) appear
+///    nowhere in the rendered output — the renderer's own confirmation
+///    that it emitted no sink write (a renderer bug or a construct the
+///    verdict under-approximated would show up here and veto the edit).
 ///
 /// Only the helper bodies are touched: they are the sole readers of the
 /// sinks in this case, and the callers are unchanged.
-fn inline_sinks_when_unused(text: String) -> String {
+fn inline_sinks_when_unused(text: String, runtime_free: bool) -> String {
     let sets_out = text.contains("*__SH_OUT.lock().unwrap() = Some");
     let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some");
-    if sets_out || sets_file {
+    if !runtime_free || sets_out || sets_file {
         return text;
     }
     // __sh_puts / __sh_print_words share this sink-check tail; replacing
@@ -498,7 +504,13 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
     let text = cat_peephole(&r.out.join("\n"));
-    let text = inline_sinks_when_unused(text);
+    // The shared pipeline verdict: does this program need the shell
+    // runtime at all? (`false` = straight-line host code — no redirects,
+    // captures, pipelines, shell-outs.) The rust backend uses it as the
+    // licence to inline its sink checks; the text scan below is the
+    // belt-and-braces confirmation.
+    let runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    let text = inline_sinks_when_unused(text, runtime_free);
     let text = prune_unused_statics(text);
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
