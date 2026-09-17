@@ -6614,9 +6614,9 @@ impl Render {
                 let iter = match &fl.limit {
                     Some(lim) => {
                         let lim_r = self.expr_num(lim);
-                        format!("std::io::BufReader::new(__sh_f).lines().take(({}) as usize)", lim_r)
+                        format!("std::io::BufRead::lines(std::io::BufReader::new(__sh_f)).take(({}) as usize)", lim_r)
                     }
-                    None => "std::io::BufReader::new(__sh_f).lines()".to_string(),
+                    None => "std::io::BufRead::lines(std::io::BufReader::new(__sh_f))".to_string(),
                 };
                 self.emit(&format!("match std::fs::File::open({}) {{", src));
                 self.depth += 1;
@@ -6982,11 +6982,11 @@ impl Render {
         self.depth = 0;
 
         // Preamble: statics + helpers, then main with the rendered body.
-        // per-item allows (no crate-wide `#![allow]`)
+        // No crate-wide `#![allow]` and no dead-code/unused suppression:
+        // every helper and trait method is self-contained (traits are
+        // called fully-qualified), so unused items would be a real bug
+        // that rustc can flag.
         self.emit("use std::sync::atomic::Ordering;");
-        self.emit("#[allow(unused_imports)] use std::io::Read;");
-        self.emit("#[allow(unused_imports)] use std::io::BufRead;");
-        self.emit("#[allow(unused_imports)] use std::io::Write;");
         self.emit("");
         self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARGV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
@@ -7012,7 +7012,6 @@ impl Render {
             }
         }
         self.emit("#[allow(non_upper_case_globals)]");
-        self.emit("#[allow(dead_code)]");
         self.emit("fn main() {");
         self.out.extend(body_out.iter().cloned());
         self.emit("}");
@@ -7343,7 +7342,7 @@ fn helper_source(h: &str) -> &'static str {
     if esc { s = __sh_echo_esc(&s); }
     if nl { s.push('\n'); }
     let mut used = false;
-    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = f.write_all(s.as_bytes()); used = true; } });
+    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
     if used { return; }
     if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
         b.extend_from_slice(s.as_bytes());
@@ -7482,11 +7481,11 @@ fn helper_source(h: &str) -> &'static str {
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return Vec::new() };
     if let Some(data) = input {
-        if let Some(mut si) = ch.stdin.take() { let _ = si.write_all(data); }
+        if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, data); }
     }
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
-        let _ = so.read_to_end(&mut out);
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
     }
     let _ = ch.wait();
     out
@@ -7499,7 +7498,7 @@ fn helper_source(h: &str) -> &'static str {
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
-        let _ = so.read_to_end(&mut out);
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
     }
     let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
     let mut s = String::from_utf8_lossy(&out).to_string();
@@ -7514,7 +7513,7 @@ fn helper_source(h: &str) -> &'static str {
     if input.is_none() && stdin_path.is_none() {
         if let Some(mut r) = __SH_STDIN.lock().unwrap().take() {
             let mut d = Vec::new();
-            let _ = r.read_to_end(&mut d);
+            let _ = std::io::Read::read_to_end(&mut r, &mut d);
             input = Some(d);
         }
     }
@@ -7524,7 +7523,7 @@ fn helper_source(h: &str) -> &'static str {
     if !want_out {
         // the child inherits fd 1 raw — flush Rust's buffered stdout
         // first so prints BEFORE the child hit the pipe first
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     if want_out { c.stdout(std::process::Stdio::piped()); }
     if input.is_none() {
@@ -7539,21 +7538,21 @@ fn helper_source(h: &str) -> &'static str {
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
     if let Some(data) = input {
-        if let Some(mut si) = ch.stdin.take() { let _ = si.write_all(&data); }
+        if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
     }
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
-        let _ = so.read_to_end(&mut out);
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
     }
     let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
     if !out.is_empty() {
         let mut used = false;
-        __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = f.write_all(&out); used = true; } });
+        __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
         if !used {
             if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
                 b.extend_from_slice(&out);
             } else {
-                let _ = std::io::stdout().write_all(&out);
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
             }
         }
     }
@@ -7967,7 +7966,7 @@ fn helper_source(h: &str) -> &'static str {
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
-        let _ = so.read_to_end(&mut out);
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
     }
     let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
     let mut s = String::from_utf8_lossy(&out).to_string();
