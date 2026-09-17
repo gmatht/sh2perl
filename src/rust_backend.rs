@@ -192,6 +192,10 @@ pub struct Render {
     /// an echo word's expansion is failure-guarded (an arith parse
     /// error or a bad substitution suppresses the print and sets rc 1)
     word_fail_guard: bool,
+    /// the shared `RuntimeFootprint` verdict: this program uses no
+    /// redirect/capture/pipeline construct, so prints can go straight to
+    /// `print!` (set once before rendering).
+    runtime_free: bool,
     todo: usize,
 }
 
@@ -398,6 +402,11 @@ fn cat_peephole(text: &str) -> String {
 /// to stdout (a Python `print()` script, a plain `echo` script) then
 /// looks like handwriting instead of a runtime shim.
 ///
+/// With `print!` emitted directly at constant-echo call sites, the only
+/// sink-checking helper left in a runtime-free program is the general
+/// `__sh_print_words` (used by dynamic echoes). This rewrites its
+/// redirect/capture tail to a bare `print!`.
+///
 /// Two independent signals must agree:
 ///  * `runtime_free` — the shared `shir_passes` verdict
 ///    ([`crate::shir_passes::analysis::needs_runtime`]) says the program
@@ -408,16 +417,15 @@ fn cat_peephole(text: &str) -> String {
 ///    that it emitted no sink write (a renderer bug or a construct the
 ///    verdict under-approximated would show up here and veto the edit).
 ///
-/// Only the helper bodies are touched: they are the sole readers of the
-/// sinks in this case, and the callers are unchanged.
+/// Only the helper body is touched: it is the sole reader of the sinks
+/// in this case, and the callers are unchanged.
 fn inline_sinks_when_unused(text: String, runtime_free: bool) -> String {
     let sets_out = text.contains("*__SH_OUT.lock().unwrap() = Some");
     let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some");
     if !runtime_free || sets_out || sets_file {
         return text;
     }
-    // __sh_puts / __sh_print_words share this sink-check tail; replacing
-    // it handles every helper that has it (both print paths end the same
+    // __sh_print_words' sink-check tail (both print paths end the same
     // way: sinks first, then print!).
     let sink_check = "    let mut used = false;\n    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });\n    if used { return; }\n    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {\n        b.extend_from_slice(s.as_bytes());\n        return;\n    }\n    print!(\"{}\", s);";
     let mut out = text;
@@ -502,15 +510,17 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.str_forced = str_forced_vars(&prog);
-    r.program(&prog);
-    let text = cat_peephole(&r.out.join("\n"));
     // The shared pipeline verdict: does this program need the shell
     // runtime at all? (`false` = straight-line host code — no redirects,
-    // captures, pipelines, shell-outs.) The rust backend uses it as the
-    // licence to inline its sink checks; the text scan below is the
-    // belt-and-braces confirmation.
-    let runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
-    let text = inline_sinks_when_unused(text, runtime_free);
+    // captures, pipelines, shell-outs.) Decided BEFORE rendering so the
+    // echo lowering can emit a bare `print!` directly.
+    r.runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    r.program(&prog);
+    let text = cat_peephole(&r.out.join("\n"));
+    // Belt-and-braces: confirm in the rendered output that no sink was
+    // ever written (a renderer bug or an under-approximated construct
+    // shows up here and vetoes the edit).
+    let text = inline_sinks_when_unused(text, r.runtime_free);
     let text = prune_unused_statics(text);
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
@@ -5379,12 +5389,19 @@ impl Render {
         // output — the space-joined words, `-e` unescaping and the
         // trailing newline — is known at render time, so skip the
         // Vec<Vec<String>> construction and the join loop and emit a
-        // single precomputed string. `__sh_puts` still honours the
-        // active redirect file / capture buffer sinks.
+        // single precomputed string. With no runtime (no redirect/
+        // capture anywhere) that is a bare `print!`; otherwise route
+        // through `__sh_puts`, which honours the active sinks.
         if !self.word_fail_guard {
             if let Some(text) = Self::const_echo_text(&parts, nl, esc) {
-                self.add_helper("puts");
-                self.emit(&format!("__sh_puts({});", Self::rust_str(&text)));
+                if self.runtime_free {
+                    // `print!("…")` — the string is a Rust literal, so the
+                    // `{}` placeholder is unnecessary
+                    self.emit(&format!("print!({});", Self::rust_str(&text)));
+                } else {
+                    self.add_helper("puts");
+                    self.emit(&format!("__sh_puts({});", Self::rust_str(&text)));
+                }
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 return;
             }
@@ -7624,9 +7641,11 @@ fn helper_source(h: &str) -> &'static str {
     print!("{}", s);
 }"#,
         "puts" => r#"fn __sh_puts(s: &str) {
-    // constant-echo fast path: the caller has already joined the words
-    // and applied -n/-e, so this only honours the active sinks (redirect
-    // file, capture buffer) before falling back to stdout.
+    // constant-echo path for a program that DOES use a redirect/capture
+    // sink: the caller has already joined the words and applied -n/-e,
+    // so this only routes to the active sink before stdout. (A
+    // runtime-free program emits a bare print! instead and never calls
+    // this.)
     let mut used = false;
     __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
     if used { return; }
@@ -12455,11 +12474,13 @@ mod tests {
     }
 
     #[test]
-    fn const_echo_uses_puts() {
-        // a literal-only echo is folded to a single precomputed string
+    fn const_echo_prints_directly() {
+        // a literal-only echo in a runtime-free program is folded to a
+        // single precomputed string and emitted as a bare print!
         let out = render("echo \"s1\"\necho one two three\n");
-        assert!(out.contains("__sh_puts(\"s1\\n\")"), "{out}");
-        assert!(out.contains("__sh_puts(\"one two three\\n\")"), "{out}");
+        assert!(out.contains("print!(\"s1\\n\")"), "{out}");
+        assert!(out.contains("print!(\"one two three\\n\")"), "{out}");
+        assert!(!out.contains("__sh_puts"), "no runtime helper needed:\n{out}");
         assert!(!out.contains("__sh_print_words(&[vec![\"s1\""), "{out}");
     }
 
@@ -12468,8 +12489,8 @@ mod tests {
         // -n drops the newline; -e unescapes at render time (mirror of
         // the runtime __sh_echo_esc)
         let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
-        assert!(out.contains("__sh_puts(\"a\")"), "{out}");
-        assert!(out.contains("__sh_puts(\"x\\ty\\n\")"), "{out}");
+        assert!(out.contains("print!(\"a\")"), "{out}");
+        assert!(out.contains("print!(\"x\\ty\\n\")"), "{out}");
     }
 
     #[test]
@@ -12497,20 +12518,21 @@ mod tests {
 
     #[test]
     fn sinks_inlined_when_unused() {
-        // no redirect/capture anywhere → the print helper has no sink
-        // checks left, just a print!
+        // no redirect/capture anywhere → no helper at all, just print!
         let out = render("echo \"hi\"\n");
         assert!(!out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(!out.contains("let mut used = false"), "{out}");
-        assert!(out.contains("print!(\"{}\", s);"), "{out}");
+        assert!(!out.contains("__sh_puts"), "{out}");
+        assert!(out.contains("print!(\"hi\\n\")"), "{out}");
     }
 
     #[test]
     fn sinks_kept_when_used() {
-        // a redirect must keep the runtime sink
+        // a redirect must keep the runtime sink (and its __sh_puts host)
         let out = render("echo hi > /tmp/sh2_probe.txt\n");
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
+        assert!(out.contains("__sh_puts(\"hi\\n\")"), "{out}");
     }
 
     #[test]
