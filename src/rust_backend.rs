@@ -6863,14 +6863,17 @@ impl Render {
             self.stmt(s);
         }
         // the script's exit code is the LAST statement's rc (bash's final
-        // status = the last command's) — saved BEFORE the EXIT traps run
-        // (their __sh_spawn calls would clobber __SH_RC)
-        self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
-        if !self.trap_exit.is_empty() {
+        // status = the last command's). With EXIT traps it must be saved
+        // BEFORE they run (their __sh_spawn calls clobber __SH_RC); with
+        // no traps the load can be passed straight to exit().
+        if self.trap_exit.is_empty() {
+            self.emit("std::process::exit(__SH_RC.load(Ordering::SeqCst));");
+        } else {
+            self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
             self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
+            self.emit("std::process::exit(__sh_final);");
         }
-        self.emit("std::process::exit(__sh_final);");
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
