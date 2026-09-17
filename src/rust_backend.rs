@@ -6925,6 +6925,21 @@ impl Render {
 
     // ── program ──────────────────────────────────────────────────────
 
+    /// True when the rendered body ends with a statically-zero status —
+    /// i.e. the last meaningful line stores 0 to `__SH_RC` (every
+    /// statement the renderer knows to be status-0 emits that store).
+    /// The final status is then 0 regardless of the path taken.
+    fn body_rc_is_zero(body_out: &[String]) -> bool {
+        for line in body_out.iter().rev() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            return t == "__SH_RC.store(0, Ordering::SeqCst);";
+        }
+        false
+    }
+
     fn program(&mut self, prog: &IrProgram) {
         // Pass 1: collect written vars + arrays + assoc + functions
         let mut written: BTreeSet<String> = BTreeSet::new();
@@ -7063,10 +7078,23 @@ impl Render {
             self.stmt(s);
         }
         // the script's exit code is the LAST statement's rc (bash's final
-        // status = the last command's). With EXIT traps it must be saved
-        // BEFORE they run (their __sh_spawn calls clobber __SH_RC); with
-        // no traps the load can be passed straight to exit().
-        if self.trap_exit.is_empty() {
+        // status = the last command's). When the final status is
+        // statically 0 (the body ends in a `__SH_RC.store(0, …)`), the
+        // whole epilogue is redundant: falling off the end of `fn main`
+        // exits 0 and the runtime flushes stdout just the same. With EXIT
+        // traps the rc must be saved BEFORE they run (their __sh_spawn
+        // calls clobber __SH_RC).
+        let rc_zero = Self::body_rc_is_zero(&self.out);
+        if rc_zero && self.trap_exit.is_empty() {
+            // the trailing store is now dead (nothing reads __SH_RC)
+            while let Some(last) = self.out.last() {
+                if last.trim().is_empty() || last.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                    self.out.pop();
+                } else {
+                    break;
+                }
+            }
+        } else if self.trap_exit.is_empty() {
             self.emit("std::process::exit(__SH_RC.load(Ordering::SeqCst));");
         } else {
             self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
@@ -12412,7 +12440,19 @@ mod tests {
         assert!(!out.contains("__SH_TRAPS"), "unused static kept:\n{out}");
         // used by __sh_puts' sink checks
         assert!(out.contains("__SH_OUT"), "used static dropped:\n{out}");
-        assert!(out.contains("__SH_RC"), "used static dropped:\n{out}");
+        assert!(out.contains("__SH_OUTFILE_TL"), "used static dropped:\n{out}");
+        // __SH_RC is unused once the zero-status epilogue is elided
+        assert!(!out.contains("__SH_RC"), "dead rc static kept:\n{out}");
+    }
+
+    #[test]
+    fn exit_epilogue_elided_when_rc_zero() {
+        // a constant echo leaves status 0, so the whole epilogue
+        // (__SH_RC store + process::exit) is dropped and main falls off
+        // the end
+        let out = render("echo \"hi\"\n");
+        assert!(!out.contains("process::exit"), "{out}");
+        assert!(!out.contains("__SH_RC"), "dead rc store kept:\n{out}");
     }
 
     #[test]
