@@ -392,6 +392,75 @@ fn cat_peephole(text: &str) -> String {
     cur
 }
 
+/// Drop the module-level runtime statics a program never uses. The 14
+/// `__SH_*` statics are emitted unconditionally (some helper, function
+/// body or statement may need any of them), but for a program that
+/// touches only a few — e.g. a constant `print()` — the rest are dead
+/// weight that makes the output look nothing like handwriting. Each is
+/// declared on exactly one line; if the identifier appears on no other
+/// line, the declaration goes.
+///
+/// Soundness: a static is only removed when its NAME is absent from the
+/// rest of the file, so no reference can dangle. (Helper bodies are
+/// self-contained and only reach a static by name.)
+fn prune_unused_statics(text: String) -> String {
+    const STATICS: &[&str] = &[
+        "__SH_RC", "__SH_ARGV", "__SH_OUT", "__SH_OUTFILE_TL", "__SH_STDIN",
+        "__SH_STDIN_PATH", "__SH_BG", "__SH_BGTHREADS", "__SH_PIPESTATUS",
+        "__SH_TRAPS", "__SH_BGPID", "__SH_ARITH_ERR", "__SH_ARITH_WORD_FAIL",
+        "__SH_RET",
+    ];
+    let lines: Vec<&str> = text.lines().collect();
+    let mut drop: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        // only the declaration line itself (`static NAME: …` or the
+        // `thread_local! { static NAME: … }` wrapper)
+        let t = line.trim_start();
+        let name = STATICS.iter().find(|n| {
+            t.starts_with(&format!("static {n}:"))
+                || t.starts_with(&format!("thread_local! {{ static {n}:"))
+        });
+        let Some(name) = name else { continue };
+        // the identifier must not appear on any OTHER line (word-bounded,
+        // so `__SH_OUT` is not matched by `__SH_OUTFILE_TL`)
+        let used = lines.iter().enumerate().any(|(j, l)| {
+            j != i
+                && l.match_indices(name).any(|(k, _)| {
+                    let before = l[..k].chars().last();
+                    let after = l[k + name.len()..].chars().next();
+                    !before.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+                        && !after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+                })
+        });
+        if !used {
+            drop.push(i);
+        }
+    }
+    if drop.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if !drop.contains(&i) {
+            out.push_str(line);
+        }
+    }
+    // collapse the blank runs left by removed declarations (a declaration
+    // was followed by a blank separator; removing one leaves a gap)
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    // the Ordering import is only needed when an atomic is used
+    if !out.replace("use std::sync::atomic::Ordering;", "").contains("Ordering::") {
+        out = out.replace("use std::sync::atomic::Ordering;\n\n", "");
+        out = out.replace("use std::sync::atomic::Ordering;\n", "");
+    }
+    out
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -400,6 +469,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
     let text = cat_peephole(&r.out.join("\n"));
+    let text = prune_unused_statics(text);
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
     // as a confusing rustc error, or silently bind a different static.
@@ -12330,6 +12400,19 @@ mod tests {
         let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
         assert!(out.contains("__sh_puts(\"a\")"), "{out}");
         assert!(out.contains("__sh_puts(\"x\\ty\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn unused_statics_pruned() {
+        // a constant-only program drops the runtime statics it never
+        // touches, but keeps the ones its helpers reference
+        let out = render("echo \"hi\"\n");
+        assert!(!out.contains("__SH_ARGV"), "unused static kept:\n{out}");
+        assert!(!out.contains("__SH_BG"), "unused static kept:\n{out}");
+        assert!(!out.contains("__SH_TRAPS"), "unused static kept:\n{out}");
+        // used by __sh_puts' sink checks
+        assert!(out.contains("__SH_OUT"), "used static dropped:\n{out}");
+        assert!(out.contains("__SH_RC"), "used static dropped:\n{out}");
     }
 
     #[test]
