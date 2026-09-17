@@ -392,6 +392,35 @@ fn cat_peephole(text: &str) -> String {
     cur
 }
 
+/// No sink is ever activated, so the redirect/capture checks inside the
+/// print helpers are dead: rewrite them to a bare `print!`. This is the
+/// "no shell features" case — a program whose output all goes straight
+/// to stdout (a Python `print()` script, a plain `echo` script) then
+/// looks like handwriting instead of a runtime shim.
+///
+/// Detection: the sink SET forms (`*__SH_OUT.lock().unwrap() = Some(…)`
+/// and `__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(…)`) appear
+/// nowhere in the output. Then at every print both sinks are None.
+///
+/// Only the helper bodies are touched: they are the sole readers of the
+/// sinks in this case, and the callers are unchanged.
+fn inline_sinks_when_unused(text: String) -> String {
+    let sets_out = text.contains("*__SH_OUT.lock().unwrap() = Some");
+    let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some");
+    if sets_out || sets_file {
+        return text;
+    }
+    // __sh_puts / __sh_print_words share this sink-check tail; replacing
+    // it handles every helper that has it (both print paths end the same
+    // way: sinks first, then print!).
+    let sink_check = "    let mut used = false;\n    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });\n    if used { return; }\n    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {\n        b.extend_from_slice(s.as_bytes());\n        return;\n    }\n    print!(\"{}\", s);";
+    let mut out = text;
+    if out.contains(sink_check) {
+        out = out.replace(sink_check, "    print!(\"{}\", s);");
+    }
+    out
+}
+
 /// Drop the module-level runtime statics a program never uses. The 14
 /// `__SH_*` statics are emitted unconditionally (some helper, function
 /// body or statement may need any of them), but for a program that
@@ -469,6 +498,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
     let text = cat_peephole(&r.out.join("\n"));
+    let text = inline_sinks_when_unused(text);
     let text = prune_unused_statics(text);
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
@@ -12433,15 +12463,13 @@ mod tests {
     #[test]
     fn unused_statics_pruned() {
         // a constant-only program drops the runtime statics it never
-        // touches, but keeps the ones its helpers reference
+        // touches (sinks are inlined away too, so nothing references
+        // __SH_OUT/__SH_OUTFILE_TL)
         let out = render("echo \"hi\"\n");
         assert!(!out.contains("__SH_ARGV"), "unused static kept:\n{out}");
         assert!(!out.contains("__SH_BG"), "unused static kept:\n{out}");
         assert!(!out.contains("__SH_TRAPS"), "unused static kept:\n{out}");
-        // used by __sh_puts' sink checks
-        assert!(out.contains("__SH_OUT"), "used static dropped:\n{out}");
-        assert!(out.contains("__SH_OUTFILE_TL"), "used static dropped:\n{out}");
-        // __SH_RC is unused once the zero-status epilogue is elided
+        assert!(!out.contains("__SH_OUT"), "dead sink static kept:\n{out}");
         assert!(!out.contains("__SH_RC"), "dead rc static kept:\n{out}");
     }
 
@@ -12453,6 +12481,24 @@ mod tests {
         let out = render("echo \"hi\"\n");
         assert!(!out.contains("process::exit"), "{out}");
         assert!(!out.contains("__SH_RC"), "dead rc store kept:\n{out}");
+    }
+
+    #[test]
+    fn sinks_inlined_when_unused() {
+        // no redirect/capture anywhere → the print helper has no sink
+        // checks left, just a print!
+        let out = render("echo \"hi\"\n");
+        assert!(!out.contains("__SH_OUTFILE_TL"), "{out}");
+        assert!(!out.contains("let mut used = false"), "{out}");
+        assert!(out.contains("print!(\"{}\", s);"), "{out}");
+    }
+
+    #[test]
+    fn sinks_kept_when_used() {
+        // a redirect must keep the runtime sink
+        let out = render("echo hi > /tmp/sh2_probe.txt\n");
+        assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
+        assert!(out.contains("let mut used = false"), "{out}");
     }
 
     #[test]
