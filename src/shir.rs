@@ -100,6 +100,22 @@ pub fn shaderize_enabled() -> bool {
     SHADERIZE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `-Os`: optimise for output SIZE. Unlike `-O3` (speed) this trades a
+/// faithful expression for a shorter one, so it turns on the purely
+/// literal arithmetic fold (`shir_passes::optimize::fold_arith_literals`:
+/// `1 + 2` → `3`). Off at `-Og` (the default), whose contract is that the
+/// output resembles the input — a human should see `1 + 2` there.
+static SIZE_OPT: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable `-Os` size-oriented lowering (default off).
+pub fn set_size_opt(on: bool) {
+    SIZE_OPT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn size_opt_enabled() -> bool {
+    SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
 /// lowering)?
 pub fn slot_var_index(name: &str) -> Option<usize> {

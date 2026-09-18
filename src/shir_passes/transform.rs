@@ -413,10 +413,12 @@ impl super::Transform for ConstantFold {
         "constant_fold"
     }
     fn run(&self, prog: &mut IrProgram, _ctx: &PassContext) {
-        // Stage 0: the real fold is still in `ir::optimize_stmts`, called
-        // from `shir_to_perl` and from `shir::ast_to_ir`. The M3 guardrail
-        // proves the output is unchanged when the migration lands.
-        let _ = prog;
+        // Size-oriented fold: `1 + 2` → `3` (see `fold_arith_literals`).
+        // Gated on `-Os`: at the `-Og` default the output must resemble
+        // the input, so a faithful `1 + 2` stays as written.
+        if crate::shir::size_opt_enabled() {
+            crate::shir_passes::optimize::fold_arith_literals(prog);
+        }
     }
 }
 

@@ -586,6 +586,9 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     {
         use crate::shir_passes::Transform;
         let ctx = crate::shir_passes::PassContext::default();
+        // -Os size fold first (`1 + 2` -> `3`; a no-op at -Og), then the
+        // constant-echo lowering on the folded shapes.
+        crate::shir_passes::transform::ConstantFold.run(&mut prog, &ctx);
         crate::shir_passes::echo_fold::EchoFold.run(&mut prog, &ctx);
     }
     r.program(&prog);

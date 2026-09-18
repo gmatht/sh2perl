@@ -1256,6 +1256,151 @@ fn const_prop_recurse(list: &mut Vec<IrStmt>, consts: &HashSet<String>, st: &Fol
     changed
 }
 
+/// Fold arithmetic subtrees that are PURE LITERALS (`Num` leaves only, no
+/// variable reads) to a single `Num`, at i64 precision (bash's integer
+/// width). Returns true when anything changed.
+///
+/// This is the size-oriented fold (`-Os`): `1 + 2` becomes `3`, shrinking
+/// both the emitted expression and any const-pool entry derived from it.
+/// It is deliberately NOT run at `-Og`, whose contract is that the output
+/// resembles the input (a human reading `x = 1 + 2` should see `1 + 2`).
+/// Being purely literal, it cannot change behaviour: the operands are
+/// constants, so an overflowed intermediate is the one bash would also
+/// produce (wrapping i64 — `checked_*` refuses and leaves the tree
+/// alone, which is the safe direction).
+///
+/// Only `Bin`/`Un` over `Num` fold. A `Var`/`Ident`/`Index`/`Assign`/
+/// `IncDec`/`Cond` operand stops the fold at that node (its value is a
+/// runtime read), so the surrounding expression keeps its shape.
+pub fn fold_arith_literals(prog: &mut IrProgram) -> bool {
+    let mut changed = false;
+    /// Fold `a` in place; returns its constant value when the whole
+    /// subtree is a literal. `changed` records that SOMETHING folded —
+    /// including a literal child of an unfoldable parent.
+    fn fold(a: &mut ArithAst, changed: &mut bool) -> Option<i64> {
+        match a {
+            ArithAst::Num(n) => Some(*n),
+            ArithAst::Bin { op, lhs, rhs } => {
+                // recurse first so an unfoldable parent still folds its
+                // literal children (`(1 + 2) * a` -> `3 * a`)
+                let l = fold(lhs, changed);
+                let r = fold(rhs, changed);
+                let (l, r) = (l?, r?);
+                let v = match op.as_str() {
+                    "+" => l.checked_add(r),
+                    "-" => l.checked_sub(r),
+                    "*" => l.checked_mul(r),
+                    "/" => (r != 0).then(|| l.checked_div(r)).flatten(),
+                    "%" => (r != 0).then(|| l.checked_rem(r)).flatten(),
+                    "<<" => (0..64).contains(&r).then(|| l.checked_shl(r as u32)).flatten(),
+                    ">>" => (0..64).contains(&r).then(|| l.checked_shr(r as u32)).flatten(),
+                    // `**` is the pow helper's job (and `-O`-dependent);
+                    // comparisons/logicals follow the runtime's exact
+                    // rules, so leave them
+                    _ => None,
+                };
+                let v = v?;
+                *a = ArithAst::Num(v);
+                *changed = true;
+                Some(v)
+            }
+            ArithAst::Un { op, arg } => {
+                let v = fold(arg, changed)?;
+                let nv = match op.as_str() {
+                    "-" => v.checked_neg(),
+                    "!" => Some(if v == 0 { 1 } else { 0 }),
+                    "~" => Some(!v),
+                    _ => None,
+                };
+                let nv = nv?;
+                *a = ArithAst::Num(nv);
+                *changed = true;
+                Some(nv)
+            }
+            // a runtime read / assignment / ternary: not a literal
+            _ => None,
+        }
+    }
+    fn walk_expr(e: &mut IrExpr, changed: &mut bool) {
+        match e {
+            IrExpr::Arith(a) => {
+                fold(a, changed);
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, changed);
+                walk_expr(rhs, changed);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, changed);
+                walk_expr(then, changed);
+                walk_expr(else_, changed);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, changed);
+                    }
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, changed);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, changed),
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_expr(it, changed);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmts(stmts: &mut [IrStmt], changed: &mut bool) {
+        for s in stmts.iter_mut() {
+            match s {
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, changed),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, changed),
+                IrStmt::Declare { init: Some(i), .. } => walk_expr(i, changed),
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        walk_expr(e, changed);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    walk_expr(cond, changed);
+                    walk_stmts(then, changed);
+                    for (c, b) in elsifs {
+                        walk_expr(c, changed);
+                        walk_stmts(b, changed);
+                    }
+                    walk_stmts(else_, changed);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, changed);
+                    walk_stmts(body, changed);
+                }
+                IrStmt::While { cond, body } => {
+                    walk_expr(cond, changed);
+                    walk_stmts(body, changed);
+                }
+                IrStmt::DoWhile { body, cond, .. } => {
+                    walk_stmts(body, changed);
+                    walk_expr(cond, changed);
+                }
+                IrStmt::Block(b) => walk_stmts(b, changed),
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, changed),
+                _ => {}
+            }
+        }
+    }
+    walk_stmts(&mut prog.stmts, &mut changed);
+    for sub in &mut prog.subs {
+        walk_stmts(&mut sub.body, &mut changed);
+    }
+    changed
+}
+
 /// `shir_passes::const_prop(&mut IrProgram) -> bool` — the A1 SSA-style
 /// const/copy propagation + dead-store elimination over the `Const`
 /// verdict pool (estree-20260813-183713, honesty rules:
@@ -1996,6 +2141,127 @@ mod tests {
     use super::*;
     use crate::ir::{ArithAst, StrStyle};
     use crate::shir::index_name_refs;
+
+    #[test]
+    fn fold_arith_literals_shrinks_constant_exprs() {
+        // x = 1 + 2  ->  x = 3
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Num(1)),
+                    rhs: Box::new(ArithAst::Num(2)),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        assert_eq!(*expr, IrExpr::Arith(Box::new(ArithAst::Num(3))));
+    }
+
+    #[test]
+    fn fold_arith_literals_leaves_vars_alone() {
+        // x = a + 1 — a runtime read stops the fold
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("a".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(!fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        assert!(matches!(expr, IrExpr::Arith(_)));
+    }
+
+    #[test]
+    fn fold_arith_literals_partial_subtree() {
+        // (1 + 2) * a — the literal subtree folds, the var keeps the mul
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(ArithAst::Bin {
+                        op: "+".to_string(),
+                        lhs: Box::new(ArithAst::Num(1)),
+                        rhs: Box::new(ArithAst::Num(2)),
+                    }),
+                    rhs: Box::new(ArithAst::Var("a".to_string())),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        let IrExpr::Arith(a) = expr else {
+            panic!("arith expected")
+        };
+        match a.as_ref() {
+            ArithAst::Bin { op, lhs, .. } => {
+                assert_eq!(op, "*");
+                assert_eq!(**lhs, ArithAst::Num(3));
+            }
+            other => panic!("bin expected, got {other:?}"),
+        }
+    }
 
     fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
