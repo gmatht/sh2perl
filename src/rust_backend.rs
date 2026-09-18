@@ -5412,6 +5412,40 @@ impl Render {
         crate::shir_passes::echo_fold::echo_esc(s)
     }
 
+    /// Peel `vec![EXPR]` from a one-word `words_expr` result, returning
+    /// `EXPR`. The join loop in `__sh_print_words` is a no-op for a
+    /// single word, so a runtime-free program can print `EXPR` directly.
+    /// `None` for anything else (multi-element vecs, `split(...)`,
+    /// arbitrary expressions).
+    fn vec_of_one(expr: &str) -> Option<&str> {
+        let t = expr.trim();
+        let inner = t.strip_prefix("vec![")?.strip_suffix(']')?;
+        // no top-level comma (would be a multi-element vec)
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for c in inner.chars() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        Some(inner)
+    }
+
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
         self.word_fail_guard = false;
         let (parts, nl, esc) = self.echo_parts(words);
@@ -5458,6 +5492,38 @@ impl Render {
                 ws.join(", "), nl, esc
             ));
         } else {
+            // Runtime-free program printing words that are each a SINGLE
+            // element: the join loop is a no-op, so print them directly
+            // (no helper). This is the common `echo "$x"` shape. NOT
+            // taken for `-e` (esc): the escapes must still be expanded at
+            // runtime, which only __sh_print_words does.
+            let direct = if self.runtime_free && !esc {
+                ws.iter().map(|w| Self::vec_of_one(w)).collect::<Option<Vec<_>>>()
+            } else {
+                None
+            };
+            if let Some(parts_inner) = direct {
+                // all words are one-element vecs; join with a space
+                // (bash's word separator). Print through ONE format call
+                // rather than build an intermediate String.
+                let mac = if nl { "println!" } else { "print!" };
+                if parts_inner.len() == 1 {
+                    self.emit(&format!("{mac}(\"{{}}\", {});", parts_inner[0]));
+                } else {
+                    let f: String = parts_inner
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| if i == 0 { "{}".to_string() } else { " {}".to_string() })
+                        .collect();
+                    self.emit(&format!(
+                        "{mac}({}, {});",
+                        Self::rust_str(&f),
+                        parts_inner.join(", ")
+                    ));
+                }
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                return;
+            }
             self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
             self.emit("__SH_RC.store(0, Ordering::SeqCst);");
         }
@@ -6451,10 +6517,9 @@ impl Render {
                     return;
                 }
                 // A constant `echo` lowered by the shared EchoFold pass
-                // arrives as `Output { value: Str(text), newline }` with
-                // the newline already baked into `text`. Emit the native
-                // print directly (no __sh_print_words / __sh_puts helper),
-                // unless a redirect/capture sink is active.
+                // arrives as `Output { value: Str(text), newline }`. Emit
+                // the native print directly (no helper), unless a
+                // redirect/capture sink is active.
                 if let IrExpr::Str(s, _) = value {
                     if self.runtime_free {
                         // `Output.newline` carries the trailing newline
@@ -7196,9 +7261,19 @@ impl Render {
         // calls clobber __SH_RC).
         let rc_zero = Self::body_rc_is_zero(&self.out);
         if rc_zero && self.trap_exit.is_empty() {
-            // the trailing store is now dead (nothing reads __SH_RC)
+            // The final status is statically 0, so nothing reads __SH_RC
+            // after the body. In a runtime-free program there is no
+            // `$?`/error path that could either, so every remaining
+            // `__SH_RC.store(0, …)` in the body is dead — drop them all
+            // (the last statement's store survives the pop below when it
+            // is trailing; earlier ones are stranded by the constant-echo
+            // fast path emitting its own store).
+            let no_rc_read = !self.out.iter().any(|l| l.contains("__SH_RC.load"));
+            self.out.retain(|l| {
+                !(no_rc_read && l.trim() == "__SH_RC.store(0, Ordering::SeqCst);")
+            });
             while let Some(last) = self.out.last() {
-                if last.trim().is_empty() || last.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                if last.trim().is_empty() {
                     self.out.pop();
                 } else {
                     break;
@@ -12649,28 +12724,39 @@ mod tests {
 
     #[test]
     fn echo_esc_omitted_without_dash_e() {
-        // a dynamic echo with no `-e` anywhere drops the 19-line
-        // __sh_echo_esc (and the print_words esc arm)
+        // no `-e` anywhere: the single-word fast path prints directly and
+        // the unescaper (and print_words) never come in
         let out = render("echo \"$1\"\n");
         assert!(!out.contains("fn __sh_echo_esc"), "{out}");
-        assert!(out.contains("compiled out"), "no-esc variant expected:\n{out}");
+        assert!(!out.contains("__sh_print_words"), "helper should be gone:\n{out}");
+        assert!(out.contains("println!(\"{}\""), "direct print expected:\n{out}");
     }
 
     #[test]
     fn echo_esc_kept_with_dash_e() {
-        // `-e` needs the runtime unescaper
+        // `-e` needs the runtime unescaper (this word may carry escapes,
+        // so the fast path must NOT fire)
         let out = render("echo -e \"$1\"\n");
         assert!(out.contains("fn __sh_echo_esc"), "{out}");
-        assert!(out.contains("if esc { s = __sh_echo_esc"), "{out}");
+        assert!(out.contains("__sh_print_words"), "{out}");
     }
 
     #[test]
     fn dynamic_echo_keeps_print_words() {
-        // an expansion word keeps the general path (no __sh_puts).
-        // `$1` is a runtime positional (shIR cannot fold it).
-        let out = render("echo \"$1\"\n");
+        // a genuinely multi-word word (`$@` splits) keeps the join helper
+        // an UNQUOTED variable field-splits ($IFS), so its word is a
+        // genuine multi-element Vec — the join helper is needed
+        let out = render("echo $x\n");
         assert!(out.contains("__sh_print_words("), "{out}");
-        assert!(!out.contains("__sh_puts("), "{out}");
+        assert!(out.contains("__sh_split_ifs("), "{out}");
+    }
+
+    #[test]
+    fn single_word_echo_prints_directly() {
+        // one dynamic word: the join loop is a no-op, so print it
+        let out = render("echo \"$1\"\n");
+        assert!(out.contains("println!(\"{}\", "), "{out}");
+        assert!(!out.contains("__sh_print_words"), "{out}");
     }
 
     #[test]
@@ -12749,7 +12835,10 @@ mod tests {
         assert!(out.contains("let mut x = 5;"), "{out}");
         assert!(out.contains("x = 6;"), "{out}");
         assert!(!out.contains("__SHV_x"), "{out}");
-        assert!(out.contains("__sh_print_words"), "{out}");
+        // single-word dynamic echo prints directly (no helper)
+        assert!(!out.contains("__sh_print_words"), "{out}");
+        assert!(out.contains("println!(\"{}\", x.to_string())"), "{out}");
+        assert!(out.contains("format!(\"x is {}\", x.to_string())"), "{out}");
     }
 
     #[test]
