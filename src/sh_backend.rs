@@ -4398,36 +4398,32 @@ fn brace_groups(args: &[IrExpr], idx: usize) -> Result<Vec<Vec<String>>, String>
         };
         let single_range = items.len() == 1
             && matches!(items[0], serde_json::Value::Object(ref o) if o.contains_key("range"));
-        if !single_range {
-            // a LIST: bash expands the braces but treats every item as a
-            // LITERAL — ranges only expand in a pure `{x..y}` sequence
-            // (`{1..10,20,30..40}` -> `1..10 20 30..40`)
-            let mut alts = Vec::new();
-            for it in items {
-                match it {
-                    serde_json::Value::String(s) => alts.push(s.clone()),
-                    serde_json::Value::Object(o) => {
-                        if let Some(serde_json::Value::Array(r)) = o.get("range") {
-                            let s0 = r[0].as_str().unwrap_or("");
-                            let s1 = r[1].as_str().unwrap_or("");
-                            let step = r.get(2).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-                            match step {
-                                Some(st) => alts.push(format!("{s0}..{s1}..{st}")),
-                                None => alts.push(format!("{s0}..{s1}")),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            out.push(alts);
-            continue;
-        }
-        let mut expanded = Vec::new();
+        // Every item is an ALTERNATIVE: a literal string, a nested group
+        // (`{a,{b,c}}` → the nested alternatives), a `product` compound,
+        // or a range. Ranges are the one exception — in a comma list bash
+        // keeps them LITERAL (`{1..3,7..9}` → `1..3 7..9`), only a lone
+        // range expands.
+        let mut alts = Vec::new();
         for it in items {
-            expanded.extend(brace_item(it)?);
+            let is_range = matches!(it, serde_json::Value::Object(o) if o.contains_key("range"));
+            if is_range && !single_range {
+                let serde_json::Value::Object(o) = it else {
+                    unreachable!()
+                };
+                if let Some(serde_json::Value::Array(r)) = o.get("range") {
+                    let s0 = r[0].as_str().unwrap_or("");
+                    let s1 = r[1].as_str().unwrap_or("");
+                    let step = r.get(2).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                    match step {
+                        Some(st) => alts.push(format!("{s0}..{s1}..{st}")),
+                        None => alts.push(format!("{s0}..{s1}")),
+                    }
+                }
+                continue;
+            }
+            alts.extend(brace_item(it)?);
         }
-        out.push(expanded);
+        out.push(alts);
     }
     Ok(out)
 }
@@ -4537,6 +4533,30 @@ fn brace_item(it: &serde_json::Value) -> Result<Vec<String>, String> {
                     out.extend(brace_item(el)?);
                 }
                 Ok(out)
+            } else if let Some(serde_json::Value::Array(subs)) = o.get("product") {
+                // A Compound alternative: cartesian concatenation of the
+                // sub-groups (`x/{p,q}` → `x/p`, `x/q`).
+                let mut combos = vec![String::new()];
+                for sub in subs {
+                    let alts = match sub {
+                        serde_json::Value::Array(items) => {
+                            let mut a = Vec::new();
+                            for el in items {
+                                a.extend(brace_item(el)?);
+                            }
+                            a
+                        }
+                        other => brace_item(other)?,
+                    };
+                    let mut next = Vec::new();
+                    for c in &combos {
+                        for a in &alts {
+                            next.push(format!("{c}{a}"));
+                        }
+                    }
+                    combos = next;
+                }
+                Ok(combos)
             } else {
                 Err(format!("brace item not understood: {it:?}"))
             }

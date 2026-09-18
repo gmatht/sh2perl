@@ -6593,12 +6593,14 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         r.out.splice(pos..pos, pre);
     }
     // Only keep `#include`s whose symbols actually appear in the
-    // emitted program (after the runtime trim removed helpers).
-    r.trim_includes();
-    // main()'s prologue: drop the lines a native-only program doesn't
-    // need (a stderr /dev/null redirect that silences child processes
-    // that no longer exist; HOSTNAME/BASH_VERSION seeding no read sees).
+    // emitted program. Runs AFTER trim_sh_runtime AND trim_main_prologue:
+    // a header whose only trigger was a trimmed-away runtime helper
+    // (fnmatch.h for a dropped ${s#pat} helper, stdlib.h for the
+    // HOSTNAME/BASH_VERSION seeding no read sees) disappears too. Also
+    // after strip_dead_rc so dead `_sh_rc`/`exit(` mentions don't keep
+    // <stdlib.h> alive.
     r.trim_main_prologue();
+    r.trim_includes();
     // A stripped runtime block can leave blank-line runs — keep at most
     // two (the C convention between declarations/functions).
     let mut blanks = 0usize;
@@ -10712,6 +10714,32 @@ impl Render {
                     "isxdigit(",
                 ],
             ),
+            (
+                "<limits.h>",
+                &[
+                    "LLONG_MAX", "LLONG_MIN", "ULLONG_MAX", "LONG_MAX", "LONG_MIN",
+                    "INT_MAX", "INT_MIN", "CHAR_BIT", "CHAR_MAX", "CHAR_MIN",
+                    "UCHAR_MAX", "SCHAR_MAX", "SCHAR_MIN", "SHRT_MAX", "SHRT_MIN",
+                    "USHRT_MAX", "UINT_MAX", "PATH_MAX", "NAME_MAX",
+                ],
+            ),
+            (
+                "<stdint.h>",
+                &[
+                    "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+                    "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "intmax_t",
+                    "uintmax_t", "SIZE_MAX", "INT64_MAX", "INT64_MIN",
+                    "INT32_MAX", "INT32_MIN", "UINT64_MAX", "UINT32_MAX",
+                ],
+            ),
+            (
+                "<errno.h>",
+                &[
+                    "errno", "EINTR", "EEXIST", "ERANGE", "ENOENT", "EACCES",
+                    "EAGAIN", "EINVAL", "ENOMEM", "ENOSPC", "EPIPE", "ENOTDIR",
+                    "EISDIR", "ELOOP", "EBADF", "ENAMETOOLONG", "ERFKILL",
+                ],
+            ),
             ("<fnmatch.h>", &["fnmatch("]),
             ("<regex.h>", &["regcomp(", "regexec(", "regfree(", "regmatch_t"]),
             (
@@ -10739,7 +10767,17 @@ impl Render {
             ("<assert.h>", &["assert("]),
             ("<signal.h>", &["kill(", "SIGTERM"]),
         ];
-        let full = self.out.join("\n");
+        // Trigger scan over the emitted text WITHOUT the `#include` lines:
+        // otherwise a header whose trigger is a substring of its own name
+        // (`errno` in `#include <errno.h>`, `time(` in `<time.h>`) keeps
+        // itself alive forever.
+        let full: String = self
+            .out
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("#include "))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         self.out.retain(|l| {
             let t = l.trim_start();
             if !t.starts_with("#include ") {
@@ -10754,7 +10792,7 @@ impl Render {
                 // identifier char (`sqrt(` must not match `_sh_isqrt(`;
                 // `stat(` must not match `fstat(` — those have their own
                 // entries). Plain substring matching kept headers alive
-                // on helper-nameocurrences alone.
+                // on helper-name occurrences alone.
                 Some((_, trigs)) => trigs.iter().any(|tr| trigger_used(&full, tr)),
                 None => true, // unknown header — keep
             }
@@ -29194,9 +29232,15 @@ fn param_copy_alias(
         if !vars.is_empty() {
             // DEBUG-ONLY length invariants at the function boundary
             // (assert() compiles out under NDEBUG) — STATEMENTS, so they
-            // live in main, not the file-scope decl block
+            // live in main, not the file-scope decl block. The separator
+            // is emitted only when a line actually landed (a set of
+            // const-lifted/bound-less vars would otherwise leave a blank
+            // line right after `int main(void) {`).
+            let before = self.out.len();
             self.emit_bound_asserts(&vars);
-            self.emit("");
+            if self.out.len() > before {
+                self.emit("");
+            }
         }
         for s in &prog.stmts {
             self.stmt(s);
@@ -38564,9 +38608,51 @@ fn brace_group_items(entry: &serde_json::Value) -> Vec<String> {
         }
     } else if let Some(s) = entry.as_str() {
         vec![s.to_string()]
+    } else if let Some(n) = entry.get("nested") {
+        // a nested `{…}`: the union of its alternatives
+        brace_nested_items(n)
+    } else if let Some(sub) = entry.get("product").and_then(|p| p.as_array()) {
+        // a Compound alternative: cartesian concatenation of the
+        // sub-groups (`x/{p,q}` → `x/p`, `x/q`)
+        let mut combos = vec![String::new()];
+        for g in sub {
+            let alts = brace_nested_items(g);
+            let mut next = Vec::new();
+            for c in &combos {
+                for a in &alts {
+                    next.push(format!("{c}{a}"));
+                }
+            }
+            combos = next;
+        }
+        combos
     } else {
         Vec::new()
     }
+}
+
+/// Expand the alternatives of a nested group (`{"nested":[…]}` or a bare
+/// array): each element is an alternative — literal, range, nested group,
+/// or product compound.
+fn brace_nested_items(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = v.as_array() {
+        // a range is literal in a comma list; only a lone range expands
+        let lone_range = arr.len() == 1
+            && arr[0].get("range").is_some();
+        for e in arr {
+            if !lone_range {
+                if let Some(r) = e.get("range").and_then(|r| r.as_array()) {
+                    let a = r.first().and_then(|x| x.as_str()).unwrap_or("");
+                    let b = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                    out.push(format!("{a}..{b}"));
+                    continue;
+                }
+            }
+            out.extend(brace_group_items(e));
+        }
+    }
+    out
 }
 
 /// Expand a `brace` Call: prefix + product(groups) + suffix.

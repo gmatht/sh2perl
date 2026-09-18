@@ -3484,46 +3484,22 @@ fn bash_word_for(w: &IrExpr) -> String {
 /// Rebuild bash brace syntax from a parsed `brace` Call:
 /// prefix + {range/list}{range/list}… + suffix (bash expands it).
 fn bash_brace_syntax(args: &[IrExpr]) -> String {
-    let prefix = args.first().and_then(call_arg_str).unwrap_or_default();
-    let suffix = args.get(3).and_then(call_arg_str).unwrap_or_default();
-    let v = match brace_json_arg(args) {
-        Some(v) => v,
-        None => return format!("'{}{}'", prefix, suffix),
-    };
-    let mut out = prefix;
-    if let Some(groups) = v.as_array() {
-        for g in groups {
-            let items = match g.as_array() {
-                Some(i) => i,
-                None => continue,
-            };
-            out.push('{');
-            let mut first = true;
-            for it in items {
-                if !first {
-                    out.push(',');
-                }
-                first = false;
-                if let Some(s) = it.as_str() {
-                    out.push_str(s);
-                } else if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
-                    let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
-                    let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
-                    let step = range_arr.get(2).and_then(|x| x.as_str()).unwrap_or("");
-                    out.push_str(a);
-                    out.push_str("..");
-                    out.push_str(b);
-                    if !step.is_empty() {
-                        out.push_str("..");
-                        out.push_str(step);
-                    }
-                }
-            }
-            out.push('}');
-        }
+    // A brace word inside a `bash -c` command text: emit the EXPANDED
+    // words (shell-quoted, space-joined) so nested/product alternatives
+    // and the between-group middles are all exact. Reconstructing `{…}`
+    // text cannot express a Compound alternative (`x/{p,q}` needs the
+    // surrounding text repeated per value) nor the middles.
+    let items = brace_expand(args);
+    if items.is_empty() {
+        let prefix = args.first().and_then(call_arg_str).unwrap_or_default();
+        let suffix = args.get(3).and_then(call_arg_str).unwrap_or_default();
+        return format!("'{}{}'", prefix, suffix);
     }
-    out.push_str(&suffix);
-    out
+    items
+        .iter()
+        .map(|s| bash_quote_word(s))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn bash_quote_word(s: &str) -> String {
@@ -3754,6 +3730,65 @@ fn expand_range(start: &str, end: &str, step: i64) -> Vec<String> {
     out
 }
 
+/// One alternative JSON node → its expanded item list. A String is a
+/// literal; a `range` expands (a lone range); a `nested` group is the
+/// union of its alternatives; a `product` is the cartesian concatenation
+/// of its sub-groups (a Compound alternative such as `x/{p,q}`).
+fn expand_brace_item(it: &serde_json::Value) -> Vec<String> {
+    if let Some(s) = it.as_str() {
+        return vec![s.to_string()];
+    }
+    if let Some(n) = it.get("nested") {
+        return brace_nested_items(n);
+    }
+    if let Some(p) = it.get("product").and_then(|p| p.as_array()) {
+        let mut combos = vec![String::new()];
+        for g in p {
+            let alts = brace_nested_items(g);
+            let mut next = Vec::new();
+            for c in &combos {
+                for a in &alts {
+                    next.push(format!("{c}{a}"));
+                }
+            }
+            combos = next;
+        }
+        return combos;
+    }
+    Vec::new()
+}
+
+/// The alternatives of a nested group (`{"nested":[…]}` or a bare array).
+/// A range inside a comma list stays LITERAL (`{1..3,7..9}` → `1..3`);
+/// only a lone range expands.
+fn brace_nested_items(v: &serde_json::Value) -> Vec<String> {
+    let items = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let lone_range = items.len() == 1 && items[0].get("range").is_some();
+    let mut out = Vec::new();
+    for it in items {
+        if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
+            let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
+            let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+            if lone_range {
+                let step = range_arr
+                    .get(2)
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1);
+                out.extend(expand_range(a, b, step));
+            } else {
+                out.push(format!("{a}..{b}"));
+            }
+            continue;
+        }
+        out.extend(expand_brace_item(it));
+    }
+    out
+}
+
 /// Expand the brace groups Json to one item-list per group (each range
 /// entry expanded).
 fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
@@ -3772,6 +3807,13 @@ fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
             if let Some(s) = it.as_str() {
                 expanded.push(s.to_string());
             } else if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
+                if items.len() > 1 {
+                    // bash: a range in a comma list stays LITERAL
+                    let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
+                    let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                    expanded.push(format!("{a}..{b}"));
+                    continue;
+                }
                 let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
                 let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
                 let step = range_arr
@@ -3780,6 +3822,8 @@ fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1);
                 expanded.extend(expand_range(a, b, step));
+            } else {
+                expanded.extend(expand_brace_item(it));
             }
         }
         if !expanded.is_empty() {
@@ -3797,19 +3841,32 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
         Some(v) => v,
         None => return Vec::new(),
     };
+    // the MIDDLES are the literal text between consecutive groups
+    // (`{a,b}/{c,d}` — "/" joins group 0→1)
+    let middles: Vec<String> = match args.get(2) {
+        Some(IrExpr::Json(serde_json::Value::Array(xs))) => xs
+            .iter()
+            .map(|x| x.as_str().unwrap_or("").to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
     let groups = brace_groups(v);
     if groups.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    // Cross-product of the groups.
+    // Cross-product of the groups, splicing each middle after its group.
     let mut stack: Vec<String> = vec![prefix];
-    for group in &groups {
+    for (gi, group) in groups.iter().enumerate() {
+        let mid = middles.get(gi).cloned().unwrap_or_default();
         let mut next = Vec::new();
         for acc in &stack {
             for item in group {
                 let mut s = acc.clone();
                 s.push_str(item);
+                if gi + 1 < groups.len() {
+                    s.push_str(&mid);
+                }
                 next.push(s);
                 if next.len() > 4096 {
                     break;

@@ -3498,6 +3498,22 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
             seq.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
         } else if let Some(n) = it.get("nested") {
             expand_group(n)?
+        } else if let Some(p) = it.get("product") {
+            // a Compound alternative: cartesian concatenation of the
+            // sub-groups (`x/{p,q}` -> `x/p`, `x/q`)
+            let subs = p.as_array().ok_or("product not array")?;
+            let mut combos: Vec<String> = vec![String::new()];
+            for g in subs {
+                let alts = expand_group(g)?;
+                let mut next = Vec::new();
+                for c in &combos {
+                    for a in &alts {
+                        next.push(format!("{c}{a}"));
+                    }
+                }
+                combos = next;
+            }
+            combos
         } else {
             return Err("unknown brace item".into());
         };

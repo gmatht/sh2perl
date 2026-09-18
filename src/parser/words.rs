@@ -4763,20 +4763,39 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     }
     lexer.next(); // consume '{'
 
+    // `items` holds the COMMA-SEPARATED ALTERNATIVES of this brace level.
+    // `part` accumulates the parts of the CURRENT alternative: literal
+    // text, nested braces, ranges. A comma ends the current alternative
+    // (`part`), and each non-empty part is appended as one alternate —
+    // a single element as-is, several as a Compound (a cartesian
+    // concatenation). Without this grouping, `a{x/{p,q},y}z` flattened
+    // to the siblings `x/`, `{p,q}`, `y` and lost the nesting.
     let mut items: Vec<BraceItem> = Vec::new();
+    let mut part: Vec<BraceItem> = Vec::new();
 
-    // Accumulator for consecutive literal text between commas.
-    // In a brace expansion like {file.txt,file.bak}, the items between commas
-    // can consist of multiple tokens (Identifier, Dot, Identifier, etc.) that
-    // should be merged into a single BraceItem::Literal.
+    // Accumulator for consecutive literal text within one alternative.
+    // In a brace expansion like {file.txt,file.bak}, the text between
+    // commas can consist of multiple tokens (Identifier, Dot,
+    // Identifier, ...) that merge into a single BraceItem::Literal.
     let mut acc: Option<String> = None;
 
-    /// Helper: flush the accumulator as a BraceItem::Literal.
-    fn flush_acc(items: &mut Vec<BraceItem>, acc: &mut Option<String>) {
+    /// Flush the literal accumulator into the current alternative.
+    fn flush_acc(part: &mut Vec<BraceItem>, acc: &mut Option<String>) {
         if let Some(text) = acc.take() {
             if !text.is_empty() {
-                items.push(BraceItem::Literal(text));
+                part.push(BraceItem::Literal(text));
             }
+        }
+    }
+
+    /// End the current alternative: a one-part alternative stays that
+    /// part, a multi-part one becomes a Compound (its cartesian product
+    /// is the alternative's expansion).
+    fn flush_alt(items: &mut Vec<BraceItem>, part: &mut Vec<BraceItem>) {
+        match part.len() {
+            0 => {}
+            1 => items.push(part.pop().unwrap()),
+            _ => items.push(BraceItem::Compound(std::mem::take(part))),
         }
     }
 
@@ -4784,7 +4803,8 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     loop {
         match lexer.peek() {
             Some(Token::BraceClose) => {
-                flush_acc(&mut items, &mut acc);
+                flush_acc(&mut part, &mut acc);
+                flush_alt(&mut items, &mut part);
                 lexer.next(); // consume '}'
                 break;
             }
@@ -4793,7 +4813,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut items, &mut acc);
+                    flush_acc(&mut part, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
@@ -4805,7 +4825,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                items.push(BraceItem::Range(BraceRange {
+                                part.push(BraceItem::Range(BraceRange {
                                     start,
                                     end,
                                     step: Some(step),
@@ -4818,7 +4838,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            items.push(BraceItem::Range(BraceRange {
+                            part.push(BraceItem::Range(BraceRange {
                                 start,
                                 end,
                                 step: None,
@@ -4841,7 +4861,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut items, &mut acc);
+                    flush_acc(&mut part, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Identifier) = lexer.peek() {
@@ -4853,7 +4873,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                items.push(BraceItem::Range(BraceRange {
+                                part.push(BraceItem::Range(BraceRange {
                                     start: text,
                                     end,
                                     step: Some(step),
@@ -4867,7 +4887,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            items.push(BraceItem::Range(BraceRange {
+                            part.push(BraceItem::Range(BraceRange {
                                 start: text,
                                 end,
                                 step: None,
@@ -4886,10 +4906,10 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::BraceOpen) => {
-                flush_acc(&mut items, &mut acc);
+                flush_acc(&mut part, &mut acc);
                 let nested = parse_brace_expansion(lexer)?;
                 if let Word::BraceExpansion(be, _) = nested {
-                    items.push(BraceItem::Nested(Box::new(be)));
+                    part.push(BraceItem::Nested(Box::new(be)));
                 } else {
                     return Err(ParserError::InvalidSyntax(
                         "Expected brace expansion from nested brace".to_string(),
@@ -4897,8 +4917,11 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::Comma) => {
-                // Comma terminates the current accumulated item.
-                flush_acc(&mut items, &mut acc);
+                // Comma ends the current alternative: its parts form one
+                // expanded value (Compound when >1), and the next
+                // alternative starts empty.
+                flush_acc(&mut part, &mut acc);
+                flush_alt(&mut items, &mut part);
                 lexer.next(); // consume ','
             }
             Some(
@@ -4933,7 +4956,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 acc.get_or_insert_with(String::new).push_str(&text);
             }
             None => {
-                flush_acc(&mut items, &mut acc);
+                flush_acc(&mut part, &mut acc);
                 break;
             }
             _ => {
@@ -4942,24 +4965,26 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     acc.get_or_insert_with(String::new).push_str(&text);
                     lexer.next();
                 } else {
-                    flush_acc(&mut items, &mut acc);
+                    flush_acc(&mut part, &mut acc);
                     break;
                 }
             }
         }
     }
 
-    // Flush any remaining accumulated text
-    flush_acc(&mut items, &mut acc);
+    // Flush any remaining accumulated text and the final alternative.
+    flush_acc(&mut part, &mut acc);
+    flush_alt(&mut items, &mut part);
 
     // bash: a RANGE is only expanded when it is the ENTIRE brace content
     // (`{1..5}` → 1..5). A brace with a top-level comma (`{1..3,7..9}`)
     // expands as ALTERNATION OF LITERALS — each part stays the literal
     // text `1..3` / `7..9` (bash prints "1..3 7..9", never 1 2 3 7 8 9).
+    // A range nested inside a Compound alternative (`{x{1..3},y}`) stays
+    // literal for the same reason.
     if items.len() > 1 {
-        items = items
-            .into_iter()
-            .map(|it| match it {
+        fn as_literal(it: BraceItem) -> BraceItem {
+            match it {
                 BraceItem::Range(r) => {
                     let mut text = format!("{}..{}", r.start, r.end);
                     if let Some(st) = r.step {
@@ -4968,6 +4993,15 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     BraceItem::Literal(text)
                 }
                 other => other,
+            }
+        }
+        items = items
+            .into_iter()
+            .map(|it| match it {
+                BraceItem::Compound(parts) => {
+                    BraceItem::Compound(parts.into_iter().map(as_literal).collect())
+                }
+                other => as_literal(other),
             })
             .collect();
     }

@@ -3037,6 +3037,9 @@ fn brace_group(g: &serde_json::Value) -> Vec<String> {
             o if o.is_object() && o.get("nested").is_some() => {
                 out.extend(brace_nested(o.get("nested").unwrap()));
             }
+            o if o.is_object() && o.get("product").is_some() => {
+                out.extend(brace_product(o.get("product").unwrap()));
+            }
             serde_json::Value::Array(sub) => {
                 out.extend(brace_nested(&serde_json::Value::Array(sub.clone())))
             }
@@ -3044,6 +3047,27 @@ fn brace_group(g: &serde_json::Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// A `{product:[g0,g1,…]}` Compound alternative: the cartesian
+/// concatenation of its sub-groups (`x/{p,q}` -> `x/p`, `x/q`).
+fn brace_product(sub: &serde_json::Value) -> Vec<String> {
+    let subs = match sub.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut combos = vec![String::new()];
+    for g in subs {
+        let alts = brace_nested(g);
+        let mut next = Vec::new();
+        for c in &combos {
+            for a in &alts {
+                next.push(format!("{c}{a}"));
+            }
+        }
+        combos = next;
+    }
+    combos
 }
 
 fn brace_nested(items: &serde_json::Value) -> Vec<String> {
@@ -3060,6 +3084,9 @@ fn brace_nested(items: &serde_json::Value) -> Vec<String> {
             }
             o if o.is_object() && o.get("nested").is_some() => {
                 out.extend(brace_nested(o.get("nested").unwrap()));
+            }
+            o if o.is_object() && o.get("product").is_some() => {
+                out.extend(brace_product(o.get("product").unwrap()));
             }
             serde_json::Value::Array(sub) => {
                 out.extend(brace_nested(&serde_json::Value::Array(sub.clone())))

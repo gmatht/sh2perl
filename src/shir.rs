@@ -11,6 +11,7 @@ use crate::ast::*;
 use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
+use num_bigint::BigInt;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -3749,7 +3750,7 @@ fn collect_named_block_fns(stmts: &[IrStmt], out: &mut HashSet<String>) {
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
-fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
+pub(crate) fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
     fn walk_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
         for st in stmts {
             match st {
@@ -8483,7 +8484,7 @@ pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
     for body in fn_bodies {
         let mut state: State = HashMap::new();
         for s in body {
-            walk_stmt_ranges(s, &mut state);
+            walk_stmt_ranges(s, &mut state, true);
         }
         let nz = scope_nonzero(state.clone());
         let mut mentions = HashSet::new();
@@ -8544,7 +8545,7 @@ pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
 pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
     let mut state: HashMap<String, Option<(i128, i128)>> = HashMap::new();
     for s in &prog.stmts {
-        walk_stmt_ranges(s, &mut state);
+        walk_stmt_ranges(s, &mut state, true);
     }
     state
         .into_iter()
@@ -8833,10 +8834,26 @@ fn floor_div_exact(a: i128, b: i128) -> Option<i128> {
 /// artifacts). Quarantine is for unbounded-int readings (Python); bash
 /// wrapping is exact, so bash callers pass `false`. Nested `Function`
 /// bodies are NOT descended (each scope runs this itself).
+/// `bigenv`: exact-BigInt ranges for the scope (empty for bash) — lets
+/// the quarantine tell a proven-huge value from a wrap artifact (see
+/// `quarantine_stmt`).
 pub fn analyze_use_safety_stmts(
     stmts: &[crate::ir::IrStmt],
     env: &std::collections::HashMap<String, (i128, i128)>,
     quarantine: bool,
+    bigenv: &std::collections::HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+) -> std::collections::HashSet<String> {
+    analyze_use_safety_stmts_big(stmts, env, quarantine, bigenv)
+}
+
+/// `analyze_use_safety_stmts` with exact-BigInt ranges for the quarantine
+/// (see `quarantine_stmt`): pass the scope's BigInt map where one exists
+/// (the analyze path); empty for bash, which has no BigInt walk.
+pub fn analyze_use_safety_stmts_big(
+    stmts: &[crate::ir::IrStmt],
+    env: &std::collections::HashMap<String, (i128, i128)>,
+    quarantine: bool,
+    bigenv: &std::collections::HashMap<String, (BigInt, BigInt)>,
 ) -> std::collections::HashSet<String> {
     use crate::ir::{ArithAst, IrExpr, IrStmt};
     use std::collections::{HashMap, HashSet};
@@ -9175,16 +9192,83 @@ pub fn analyze_use_safety_stmts(
             | IrStmt::DeclareArray { .. } => {}
         }
     }
+    // merged exact claim for a var (BigInt preferred, else i128 widened)
+    fn merged_claim(
+        name: &str,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        env: &HashMap<String, (i128, i128)>,
+    ) -> Option<(num_bigint::BigInt, num_bigint::BigInt)> {
+        if let Some((lo, hi)) = bigenv.get(name) {
+            return Some((lo.clone(), hi.clone()));
+        }
+        env.get(name)
+            .map(|(lo, hi)| (num_bigint::BigInt::from(*lo), num_bigint::BigInt::from(*hi)))
+    }
     // quarantine helper (see rhs_exact_ok): narrow claimed ranges are
-    // distrusted wherever an assigned RHS is not exactly evaluable
+    // distrusted wherever an assigned RHS is not exactly evaluable.
+    // BigInt-exact RHS whose merged claim covers it exactly is NOT a
+    // wrap artifact (exact evaluation cannot mislead), so it is
+    // skipped — otherwise every proven-huge literal (u64 and up) would
+    // stay vetoed and no wide tier could ever emit.
+    #[allow(clippy::too_many_arguments)]
+    // BigInt-exact CONSTANT RHS (no variables) whose merged claim covers
+    // it: exact evaluation of literals cannot be a wrap artifact, so the
+    // quarantine skips it. Anything mentioning a variable keeps the
+    // legacy rule — subexpression C-safety there is what veto_arith and
+    // the quarantine exist for (a fitting exact value beside wrapping
+    // participants, e.g. `z = y + y + y`, must stay vetoed).
+    fn big_exact_covered(
+        a: &ArithAst,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        env: &HashMap<String, (i128, i128)>,
+        targets: &[crate::ir::AssignTarget],
+    ) -> bool {
+        fn var_free(x: &ArithAst) -> bool {
+            match x {
+                ArithAst::Var(_) | ArithAst::Ident(_) => false,
+                ArithAst::Bin { lhs, rhs, .. } => var_free(lhs) && var_free(rhs),
+                ArithAst::Un { arg, .. } => var_free(arg),
+                ArithAst::Cond { test, then, else_, .. } => {
+                    var_free(test) && var_free(then) && var_free(else_)
+                }
+                // an in-expression write mentions its target: not free
+                ArithAst::Assign { .. } | ArithAst::IncDec { .. } => false,
+                ArithAst::Cast { arg, .. } => var_free(arg),
+                ArithAst::Index { key, .. } => var_free(key),
+                ArithAst::Num(_) | ArithAst::Sizeof(_) => true,
+            }
+        }
+        if !var_free(a) {
+            return false;
+        }
+        let empty: HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)> =
+            HashMap::new();
+        let exact = match crate::shir_passes::bigint_range::big_arith_range(a, &empty) {
+            Some(r) => r,
+            None => return false,
+        };
+        targets.iter().all(|t| {
+            if !t.indices.is_empty() {
+                return false;
+            }
+            match merged_claim(&t.var, bigenv, env) {
+                Some((lo, hi)) => lo <= exact.0 && exact.1 <= hi,
+                None => false,
+            }
+        })
+    }
     fn quarantine_stmt(
         s: &crate::ir::IrStmt,
         env: &HashMap<String, (i128, i128)>,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
         out: &mut HashSet<String>,
     ) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if let IrExpr::Arith(a) = expr {
+                    if big_exact_covered(a, bigenv, env, targets) {
+                        return;
+                    }
                     // quarantine: the RHS is not exactly i64-contained
                     // (unknown OR provably huge) yet the claimed range is
                     // narrow — the narrow claim may be a wrap artifact
@@ -9214,29 +9298,30 @@ pub fn analyze_use_safety_stmts(
     fn quarantine_walk(
         s: &crate::ir::IrStmt,
         env: &HashMap<String, (i128, i128)>,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
         out: &mut HashSet<String>,
     ) {
-        quarantine_stmt(s, env, out);
+        quarantine_stmt(s, env, bigenv, out);
         // recurse into inline nesting (never into nested Function bodies
         // — the caller runs each scope separately)
         match s {
             IrStmt::If { then, elsifs, else_, .. } => {
                 for b in then.iter().chain(else_) {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
                 for (_, b) in elsifs {
                     for x in b {
-                        quarantine_walk(x, env, out);
+                        quarantine_walk(x, env, bigenv, out);
                     }
                 }
             }
             IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
                 for b in body.iter().chain(else_body).chain(finally_body) {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
                 for e in excepts {
                     for b in &e.body {
-                        quarantine_walk(b, env, out);
+                        quarantine_walk(b, env, bigenv, out);
                     }
                 }
             }
@@ -9244,48 +9329,48 @@ pub fn analyze_use_safety_stmts(
             | IrStmt::DoWhile { body, .. }
             | IrStmt::For { body, .. } => {
                 for b in body {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
             }
             IrStmt::ForInit { init, step, body, .. } => {
                 for b in init.iter().chain(step).chain(body) {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
             }
             IrStmt::Case { clauses, .. } => {
                 for c in clauses {
                     for b in &c.body {
-                        quarantine_walk(b, env, out);
+                        quarantine_walk(b, env, bigenv, out);
                     }
                 }
             }
             IrStmt::Redirect { inner, .. } => {
                 for b in inner {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
                 for stage in stages {
                     for b in stage {
-                        quarantine_walk(b, env, out);
+                        quarantine_walk(b, env, bigenv, out);
                     }
                 }
             }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 for x in b {
-                    quarantine_walk(x, env, out);
+                    quarantine_walk(x, env, bigenv, out);
                 }
             }
             IrStmt::Select { clauses, .. } => {
                 for c in clauses {
                     for b in &c.body {
-                        quarantine_walk(b, env, out);
+                        quarantine_walk(b, env, bigenv, out);
                     }
                 }
             }
             IrStmt::Shaderize { body, .. } => {
                 for b in body {
-                    quarantine_walk(b, env, out);
+                    quarantine_walk(b, env, bigenv, out);
                 }
             }
             _ => {}
@@ -9295,7 +9380,7 @@ pub fn analyze_use_safety_stmts(
     for s in stmts {
         veto_stmt(s, env, &mut out);
         if quarantine {
-            quarantine_walk(s, env, &mut out);
+            quarantine_walk(s, env, bigenv, &mut out);
         }
     }
     out
@@ -9306,7 +9391,7 @@ pub fn analyze_use_safety_stmts(
 /// as env (callers with python() ranges should use the stmts entry).
 pub fn analyze_use_safety(prog: &crate::ir::IrProgram) -> std::collections::HashSet<String> {
     let env = analyze_var_ranges(prog);
-    analyze_use_safety_stmts(&prog.stmts, &env, true)
+    analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new())
 }
 
 // ── per-scope facts for annotation consumers (py2cy.js) ──
@@ -9321,7 +9406,7 @@ pub fn analyze_var_ranges_stmts(
     let mut state: std::collections::HashMap<String, Option<(i128, i128)>> =
         std::collections::HashMap::new();
     for s in stmts {
-        walk_stmt_ranges(s, &mut state);
+        walk_stmt_ranges(s, &mut state, true);
     }
     state
         .into_iter()
@@ -9460,6 +9545,11 @@ pub struct ScopeFacts {
     pub assigned: Vec<String>,
     /// proved ranges in this scope
     pub ranges: std::collections::HashMap<String, (i128, i128)>,
+    /// exact unbounded ranges in this scope (Python reading only;
+    /// empty for bash) — preferred over `ranges` wherever present
+    /// (the i128 walk wraps past i64, which once presented 1e19 as
+    /// -8446744073709551616)
+    pub bigranges: std::collections::HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
     /// use-safety + quarantine vetoes in this scope
     pub vetoed: std::collections::HashSet<String>,
     /// storage widths ("i32"/"i64") for Int vars with i64-contained ranges
@@ -9485,8 +9575,15 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
         .cloned()
         .collect();
     let top_ranges = analyze_var_ranges_stmts(&top_only);
+    // exact unbounded ranges (Python reading only) — preferred over
+    // `top_ranges` wherever present (see bigint_range.rs).
+    let top_big = if python {
+        crate::shir_passes::bigint_range::analyze_var_ranges_big(&top_only)
+    } else {
+        std::collections::HashMap::new()
+    };
     let top_assigned = assigned_names(&prog.stmts, false);
-    let top_vetoed = analyze_use_safety_stmts(&top_only, &top_ranges, python);
+    let top_vetoed = analyze_use_safety_stmts(&top_only, &top_ranges, python, &top_big);
     // function scopes
     let mut fn_scopes: Vec<(String, Vec<IrStmt>)> = Vec::new();
     for s in &prog.stmts {
@@ -9497,7 +9594,12 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
     let mut fn_facts: Vec<ScopeFacts> = Vec::new();
     for (name, body) in &fn_scopes {
         let ranges = analyze_var_ranges_stmts(body);
-        let vetoed = analyze_use_safety_stmts(body, &ranges, python);
+        let big = if python {
+            crate::shir_passes::bigint_range::analyze_var_ranges_big(body)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let vetoed = analyze_use_safety_stmts(body, &ranges, python, &big);
         let assigned: Vec<String> = {
             let mut v: Vec<String> = assigned_names(body, false).into_iter().collect();
             v.sort();
@@ -9510,6 +9612,7 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
             ranges,
             vetoed,
             widths,
+            bigranges: big,
         });
     }
     // module hull: same-named function writes widen top ranges (global
@@ -9524,6 +9627,23 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
                     e.1 = e.1.max(*hi);
                 })
                 .or_insert((*lo, *hi));
+        }
+    }
+    // same hull over the exact ranges (BigInt union)
+    let mut top_big_hulled = top_big.clone();
+    for f in &fn_facts {
+        for (n, (lo, hi)) in &f.bigranges {
+            top_big_hulled
+                .entry(n.clone())
+                .and_modify(|e| {
+                    if lo < &e.0 {
+                        e.0 = lo.clone();
+                    }
+                    if hi > &e.1 {
+                        e.1 = hi.clone();
+                    }
+                })
+                .or_insert((lo.clone(), hi.clone()));
         }
     }
     // Python-only nested-loop-var fill: the shared walk drops an inner
@@ -9598,6 +9718,7 @@ pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFac
         assigned: top_assigned,
         ranges: top_hulled,
         vetoed: top_vetoed,
+        bigranges: top_big_hulled,
         widths: top_widths,
     }];
     out.extend(fn_facts);
@@ -9701,22 +9822,63 @@ pub fn analyze_declares(
             if !is_int_kind(var_types.get(n)) {
                 continue;
             }
-            let in_i64 = match s.ranges.get(n) {
-                Some((lo, hi)) => *lo >= I64MIN && *hi <= I64MAX,
+            // merged exact range (BigInt preferred — the i128 walk wraps
+            // past i64, which once presented 1e19 as -8446744073709551616)
+            let merged: Option<(BigInt, BigInt)> = match s.bigranges.get(n) {
+                Some((lo, hi)) => Some((lo.clone(), hi.clone())),
+                None => s
+                    .ranges
+                    .get(n)
+                    .map(|(lo, hi)| (BigInt::from(*lo), BigInt::from(*hi))),
+            };
+            let in_i64 = match &merged {
+                Some((lo, hi)) => *lo >= BigInt::from(I64MIN) && *hi <= BigInt::from(I64MAX),
                 None => false,
             };
-            if !in_i64 {
+            // u64 tier: non-negative past i64, within one machine word.
+            // Subexpression safety comes from the vetoes below (any
+            // wrapping use vetoes the var first) — the width only ever
+            // names the value's own range.
+            let in_u64 = match &merged {
+                Some((lo, hi)) => *lo >= BigInt::from(0) && *hi < BigInt::from(1u128 << 64),
+                None => false,
+            };
+            if !in_i64 && !in_u64 {
                 continue;
             }
-            if s.vetoed.contains(n) || bigint.contains(n) {
+            if s.vetoed.contains(n) {
                 continue;
             }
+            // Homed/i53 bigints stay out — UNLESS the value is BigInt-proven
+            // to need exactly the u64 tier (past i64, within one machine
+            // word): a non-negative sub-2^64 exact value has a sound C
+            // word, so "needs GMP somewhere" must not block it. The
+            // re-admit requires a BigInt-exact range (i128-only claims
+            // stay homed — wrap-lies must never re-enter here).
+            let big_exact_u64 = match s.bigranges.get(n) {
+                Some((lo, hi)) => {
+                    *hi > BigInt::from(I64MAX)
+                        && *lo >= BigInt::from(0)
+                        && *hi < BigInt::from(1u128 << 64)
+                }
+                None => false,
+            };
+            if bigint.contains(n) && !big_exact_u64 {
+                continue;
+            }
+            // NOTE: no separate range-derived-bigint check is needed —
+            // anything beyond u64 (or below the i64 floor) already fails
+            // both gates above, and the homed set covers the rest.
             if is_top && veto_union.contains(n) {
                 continue;
             }
-            let width = match s.widths.get(n).map(String::as_str) {
-                Some("i32") => Some("i32".to_string()),
-                _ => None,
+            let width = if in_u64 && !in_i64 {
+                Some("u64".to_string())
+            } else {
+                match s.widths.get(n).map(String::as_str) {
+                    Some("i32") => Some("i32".to_string()),
+                    _ => None,
+                }
             };
             declares.push(VarDeclare {
                 name: (*n).clone(),
@@ -10568,7 +10730,7 @@ pub fn analyze_var_ranges_with_assumes(
         state.insert(n.clone(), Some(*r));
     }
     for s in stmts {
-        walk_stmt_ranges(s, &mut state);
+        walk_stmt_ranges(s, &mut state, true);
     }
     state
         .into_iter()
@@ -11706,7 +11868,7 @@ fn arith_text_bound(text: &str) -> Option<(String, Cmp, i128)> {
 /// The for-loop variable's range from its iterable: min/max over integer
 /// items (`for i in 1 2 3`), a Range node (`for i in $(seq 1 100)` after
 /// the seq_range_for transform), or None (a non-numeric item → Any).
-fn for_iter_range(iter: &IrExpr) -> Range {
+pub(crate) fn for_iter_range(iter: &IrExpr) -> Range {
     match iter {
         IrExpr::Array(items) => {
             let mut lo = i128::MAX;
@@ -12002,7 +12164,7 @@ fn loop_fixpoint(
     for _ in 0..FIXPOINT_ITER_LIMIT {
         let mut ns = ls.clone();
         for s in body {
-            walk_stmt_ranges(s, &mut ns);
+            walk_stmt_ranges(s, &mut ns, false);
         }
         if let Some(sk) = skip_var {
             // the for-loop variable is re-set from the item list
@@ -12060,8 +12222,14 @@ fn loop_fixpoint(
         // write from `pre` alone would be unsound)
         post.insert(v.clone(), ls.get(v).copied().flatten());
     }
+    // NOTE: overwrite (not join) here — the re-walk must preserve the
+    // fixpoint's narrowing (modulo caps, entry invariants); joining would
+    // union one more unrolling into converged state and widen it back
+    // out (rolling-hash h regressed i64→i128). Multi-writes inside
+    // a loop body therefore still collapse to the last write — the
+    // pre-existing residual hole, same as before this change.
     for s in body {
-        walk_stmt_ranges(s, &mut post);
+        walk_stmt_ranges(s, &mut post, false);
     }
     // join the pre-loop values back (the loop may never run)
     for v in &carried {
@@ -12070,30 +12238,58 @@ fn loop_fixpoint(
         post.insert(v.clone(), join(a, b));
     }
     // the for-loop variable: the item range (bash re-sets it per
-    // iteration; an empty list keeps the pre-loop value)
+    // iteration; an empty list keeps the pre-loop value). Join (not
+    // overwrite) so a pre-loop value or body write stays covered.
     if let Some(sk) = skip_var {
         if let Some(r) = pre.get(sk).copied().flatten() {
-            post.insert(sk.to_string(), Some(r));
+            let cur = post.get(sk).copied().flatten();
+            post.insert(sk.to_string(), join(Some(r), cur));
         }
     }
     *state = post;
 }
 
-fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
+/// Bind a written range: JOIN with any previous range, never overwrite.
+/// Every written value exists at runtime — straight-line redefinition
+/// (`x=3000000000` then `x=1`), sibling branches, and loop bodies all
+/// execute their writes — so the reported range must cover the whole
+/// life. Last-write-wins emits a C type that wraps or raises on the
+/// earlier values (py2cy.js `put()` rule, same hazard); `join` with
+/// unknown stays unknown.
+fn bind(state: &mut HashMap<String, Range>, name: String, r: Range, join_binds: bool) {
+    if join_binds {
+        let next = match state.get(&name) {
+            Some(prev) => join(*prev, r),
+            None => r,
+        };
+        state.insert(name, next);
+    } else {
+        state.insert(name, r);
+    }
+}
+
+/// `join_binds`: straight-line contexts (top level, branch arms, the
+/// post-loop re-walk) JOIN every write into the state — the reported
+/// range covers the variable's whole life. Fixpoint round bodies pass
+/// `false`: recompute-then-overwrite lets narrowing transfer functions
+/// (modulo caps, entry invariants) converge across rounds; the round
+/// merge joins explicitly, so whole-life coverage across iterations is
+/// kept there.
+fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>, join_binds: bool) {
     match s {
-        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state); } }
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state, join_binds); } }
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
         // inline asm operands are runtime exprs — no static range
         IrStmt::Asm { .. } => {}
         IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
-            state.insert(name, ir_range(expr, state));
+            bind(state, name, ir_range(expr, state), join_binds);
             // in-expression arith writes (`x=$((x++))`, `((x+=1))` — the
             // Assign's RANGE is the expression's VALUE; the write updates
             // the var's post-statement state (the IncDec postfix value is
             // the OLD value, the var's own state the NEW one)
             if let IrExpr::Arith(a) = expr {
-                arith_stmt_writes(a, state);
+                arith_stmt_writes(a, state, join_binds);
             }
         }
         // multi-target / indexed assignments — no single-variable range
@@ -12105,16 +12301,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         // range would masquerade as a proof — i in t86 looked like [1,1]
         // forever).
         IrStmt::Expr(IrExpr::Arith(a)) => {
-            arith_stmt_writes(a, state);
+            arith_stmt_writes(a, state, join_binds);
         }
         // setVar(name, v) — the plain write; `assign(name, op, v)` — the
         // runtime compound form (v+=1, a && v=x): both name the target
         // first and store the ARITHMETIC result (always an integer).
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
             if let [IrExpr::Str(name, _), ..] = args.as_slice() {
-                state.insert(name.clone(), ir_range(args.last().unwrap(), state));
+                bind(state, name.clone(), ir_range(args.last().unwrap(), state), join_binds);
                 if let Some(IrExpr::Arith(a)) = args.last() {
-                    arith_stmt_writes(a, state);
+                    arith_stmt_writes(a, state, join_binds);
                 }
             }
         }
@@ -12135,7 +12331,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
                                         })
                                         && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                                     {
-                                        state.insert(n.to_string(), Some((nv as i128, nv as i128)));
+                                        bind(state, n.to_string(), Some((nv as i128, nv as i128)), join_binds);
                                     }
                                 }
                             }
@@ -12150,26 +12346,26 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Declare { vars, init, .. } => {
             if let Some(init) = init {
                 if vars.len() == 1 {
-                    state.insert(vars[0].name.clone(), ir_range(init, state));
+                    bind(state, vars[0].name.clone(), ir_range(init, state), join_binds);
                 }
             }
         }
         IrStmt::Block(stmts) => {
             for s in stmts {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         // Select comm clause bodies may hold range-tracking statements.
         IrStmt::Select { clauses } => {
             for c in clauses {
                 for s in &c.body {
-                    walk_stmt_ranges(s, state);
+                    walk_stmt_ranges(s, state, join_binds);
                 }
             }
         }
         IrStmt::Redirect { inner, .. } => {
             for s in inner {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         IrStmt::If {
@@ -12180,16 +12376,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         } => {
             let mut s1 = state.clone();
             for s in then {
-                walk_stmt_ranges(s, &mut s1);
+                walk_stmt_ranges(s, &mut s1, join_binds);
             }
             let mut s2 = state.clone();
             for (_, b) in elsifs {
                 for s in b {
-                    walk_stmt_ranges(s, &mut s2);
+                    walk_stmt_ranges(s, &mut s2, join_binds);
                 }
             }
             for s in else_ {
-                walk_stmt_ranges(s, &mut s2);
+                walk_stmt_ranges(s, &mut s2, join_binds);
             }
             // meet (join): a var's range after the if is the union of what
             // each branch (or the pre-state, when a branch didn't assign it)
@@ -12221,10 +12417,10 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         }
         IrStmt::ForInit { init, cond, step, body } => {
             for i in init {
-                walk_stmt_ranges(i, state);
+                walk_stmt_ranges(i, state, join_binds);
             }
             for st in step {
-                walk_stmt_ranges(st, state);
+                walk_stmt_ranges(st, state, join_binds);
             }
             let mut carried = HashSet::new();
             for s in body {
@@ -12248,9 +12444,11 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         }
         IrStmt::For { var, iter, body } => {
             // the loop variable is re-set from the item list every
-            // iteration (bash semantics — body writes to it are lost)
+            // iteration (bash semantics — body writes to it are lost);
+            // join (not overwrite) so the range still covers a pre-loop
+            // value and any body write, which both exist at runtime.
             if let Some(r) = for_iter_range(iter) {
-                state.insert(var.clone(), Some(r));
+                bind(state, var.clone(), Some(r), join_binds);
             }
             // trip hint: a literal iterable runs exactly len/span times
             // (bash expands the words once), so carried accumulators get
@@ -12272,18 +12470,18 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             // string-length verdicts, where widening is safe).
             let pre = state.clone();
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             for e in excepts {
                 for s in &e.body {
-                    walk_stmt_ranges(s, state);
+                    walk_stmt_ranges(s, state, join_binds);
                 }
             }
             for s in else_body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             for s in finally_body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             let mut post = state.clone();
             for (k, v) in pre {
@@ -12295,7 +12493,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         // (the global map over-approximates across functions — safe).
         IrStmt::Function { body, .. } => {
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         IrStmt::Subshell(_)
@@ -12317,13 +12515,13 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         | IrStmt::Expr(_) => {}
         IrStmt::Shaderize { body, .. } => {
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
     }
 }
 
-fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
+pub(crate) fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
     match s {
         IrStmt::Assign { targets, .. } => {
             for t in targets {
@@ -12411,6 +12609,10 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
             _ => None,
         },
         IrExpr::Arith(a) => arith_range(a, state),
+        // Boolean literals are NOT integers for typing: Python `True`
+        // prints as "True", not "1" — a native-int declaration would
+        // change output (the py-sh-go frontend lowers True to Bool).
+        IrExpr::Bool(_) => None,
         _ => None,
     }
 }
@@ -12732,7 +12934,7 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
 /// may read a var an inner write changes, but the common shapes are
 /// sequential). The expression's own VALUE is arith_range's job; this is
 /// the var's post-statement state.
-fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    match a {
+fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>, join_binds: bool) {    match a {
         ArithAst::Assign { var, op, rhs } => {
             let r = arith_range(rhs, state);
             let next: Range = match op.as_str() {
@@ -12758,31 +12960,31 @@ fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    matc
                 _ => None,
             };
             if let Some(nv) = next {
-                state.insert(var.clone(), Some(nv));
+                bind(state, var.clone(), Some(nv), join_binds);
             } else {
-                state.insert(var.clone(), None);
+                bind(state, var.clone(), None, join_binds);
             }
-            arith_stmt_writes(rhs, state);
+            arith_stmt_writes(rhs, state, join_binds);
         }
         ArithAst::IncDec { var, delta, .. } => {
             let next = match state.get(var).copied().flatten() {
                 Some((lo, hi)) => Some(wrap_interval(lo + *delta as i128, hi + *delta as i128)),
                 None => None,
             };
-            state.insert(var.clone(), next);
+            bind(state, var.clone(), next, join_binds);
         }
         ArithAst::Bin { lhs, rhs, .. } => {
-            arith_stmt_writes(lhs, state);
-            arith_stmt_writes(rhs, state);
+            arith_stmt_writes(lhs, state, join_binds);
+            arith_stmt_writes(rhs, state, join_binds);
         }
-        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state, join_binds),
         ArithAst::Cond { test, then, else_ } => {
-            arith_stmt_writes(test, state);
-            arith_stmt_writes(then, state);
-            arith_stmt_writes(else_, state);
+            arith_stmt_writes(test, state, join_binds);
+            arith_stmt_writes(then, state, join_binds);
+            arith_stmt_writes(else_, state, join_binds);
         }
-        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state),
-        ArithAst::Index { key, .. } => arith_stmt_writes(key, state),
+        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state, join_binds),
+        ArithAst::Index { key, .. } => arith_stmt_writes(key, state, join_binds),
         _ => {}
     }
 }
@@ -12790,7 +12992,7 @@ fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    matc
 /// The var names a bare-arith statement writes (the IncDec/Assign
 /// targets) — the `collect_assigned` counterpart of
 /// `arith_stmt_writes`.
-fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
+pub(crate) fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
     match a {
         ArithAst::Assign { var, rhs, .. } => {
             out.insert(var.clone());
@@ -13207,28 +13409,16 @@ fn merged_words_ir(words: &[Word], single: &dyn Fn(&Word) -> IrExpr) -> Vec<IrEx
     let mut out: Vec<IrExpr> = Vec::new();
     let mut i = 0;
     while i < words.len() {
-        // A plain LITERAL immediately before a brace is the brace's
-        // prefix: `source.{bat,c}` is ONE bash word → `source.bat
-        // source.c` (the parser splits it into Literal("source.") +
-        // BraceExpansion, exactly like `{a,b}{1,2}` splits into two
-        // braces — the merge below re-joins it).
-        let mut pending_prefix: Option<String> = None;
-        if let Word::Literal(s, _) = &words[i] {
-            if i + 1 < words.len() {
-                if matches!(words[i + 1], Word::BraceExpansion(..)) {
-                    pending_prefix = Some(s.clone());
-                    i += 1;
-                }
-            }
-        }
+        // NOTE: a literal that is part of the SAME source word as the
+        // brace (`source.{bat,c}`) is already folded into the brace's
+        // `prefix` by the parser — do NOT re-merge a preceding word's
+        // literal here: `mkdir -p a/{x,y}` is two argv words (`-p`,
+        // `a/x`, `a/y`) and the old merge glued them into `-pa/x`.
         if let Word::BraceExpansion(be, _) = &words[i] {
             let mut groups = vec![brace_items_json(&be.items)];
             let mut middles: Vec<serde_json::Value> = Vec::new();
             let mut suffix = be.suffix.clone().unwrap_or_default();
-            let prefix = match &pending_prefix {
-                Some(p) => format!("{}{}", p, be.prefix.as_deref().unwrap_or("")),
-                None => be.prefix.clone().unwrap_or_default(),
-            };
+            let prefix = be.prefix.clone().unwrap_or_default();
             i += 1;
             while i < words.len() {
                 if let Word::BraceExpansion(be2, _) = &words[i] {
@@ -14172,25 +14362,40 @@ fn brace_ir(be: &BraceExpansion) -> IrExpr {
     )
 }
 
+/// JSON encoding of one level's comma-separated alternatives. An
+/// alternative is a String, a `{range:[…]}`, a `{nested:[…]}` group, or
+/// a `{product:[[…],…]}` — the cartesian concatenation of sub-groups
+/// (each sub-group a list of alternatives). `{a,{b,c}}d` and
+/// `a{x/{p,q},y}z` need `product`: the nested brace there is a FACTOR of
+/// one alternative, not a sibling alternative, so its values must be
+/// concatenated with the surrounding text rather than unioned with the
+/// other alternatives.
 fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
-    serde_json::Value::Array(
-        items
-            .iter()
-            .map(|it| match it {
-                BraceItem::Literal(s) => serde_json::Value::String(s.clone()),
-                BraceItem::Range(r) => serde_json::json!({
-                    "range": [r.start, r.end, r.step, r.format]
-                }),
-                BraceItem::Sequence(seq) => serde_json::Value::Array(
-                    seq.iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-                BraceItem::Nested(n) => serde_json::json!({ "nested": brace_items_json(&n.items) }),
-                BraceItem::Compound(c) => serde_json::json!({ "nested": brace_items_json(c) }),
-            })
-            .collect(),
-    )
+    serde_json::Value::Array(items.iter().map(brace_item_json).collect())
+}
+
+/// One alternative part → its JSON encoding (the body of
+/// `brace_items_json`'s match, shared so Compound sub-groups agree).
+fn brace_item_json(it: &BraceItem) -> serde_json::Value {
+    match it {
+        BraceItem::Literal(s) => serde_json::Value::String(s.clone()),
+        BraceItem::Range(r) => serde_json::json!({
+            "range": [r.start, r.end, r.step, r.format]
+        }),
+        BraceItem::Sequence(seq) => serde_json::Value::Array(
+            seq.iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
+        BraceItem::Nested(n) => serde_json::json!({ "nested": brace_items_json(&n.items) }),
+        BraceItem::Compound(c) => {
+            let sub: Vec<serde_json::Value> = c
+                .iter()
+                .map(|p| serde_json::Value::Array(vec![brace_item_json(p)]))
+                .collect();
+            serde_json::json!({ "product": sub })
+        }
+    }
 }
 
 /// Emit-time evaluation of `sh2.brace(prefix, groups, middles, suffix)` —
@@ -14398,12 +14603,33 @@ fn brace_expand(
                     out.extend(brace_range_value(r));
                 } else if let Some(n) = it.get("nested") {
                     out.extend(brace_nested(n));
+                } else if let Some(p) = it.get("product") {
+                    out.extend(brace_product(p));
                 } else if it.is_array() {
                     out.extend(brace_nested(it));
                 }
             }
         }
         out
+    }
+    /// A `{product:[g0,g1,…]}`: the cartesian concatenation of the
+    /// sub-groups — a Compound alternative's value set (`x/{p,q}` →
+    /// `x/p`, `x/q`). Each sub-group is a list of alternatives.
+    fn brace_product(sub: &serde_json::Value) -> Vec<String> {
+        let mut combos = vec![String::new()];
+        if let Some(gs) = sub.as_array() {
+            for g in gs {
+                let alts = brace_group(g);
+                let mut next = Vec::new();
+                for c in &combos {
+                    for a in &alts {
+                        next.push(format!("{c}{a}"));
+                    }
+                }
+                combos = next;
+            }
+        }
+        combos
     }
     /// `expandBraceGroup(g)` — a range inside a comma-separated group stays
     /// LITERAL (`{1..3,7..9}`); only a lone range expands.
@@ -14421,6 +14647,8 @@ fn brace_expand(
                     }
                 } else if let Some(n) = it.get("nested") {
                     out.extend(brace_nested(n));
+                } else if let Some(p) = it.get("product") {
+                    out.extend(brace_product(p));
                 } else if it.is_array() {
                     out.extend(brace_nested(it));
                 }
@@ -28778,7 +29006,7 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
 /// programs that provably never enable it. Conservative: a dynamic command
 /// name (`$cmd ...` may be `set`), a non-literal set argument (may be
 /// `-e`), or `-e` in any flag cluster all keep the guards.
-fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
+pub(crate) fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     /// A literal `exec("set", [...])` call — the runtime's set builtin
     /// parses (see sh2-namespace.mjs): `--` first or a first arg without a
     /// `-`/`+` prefix means positional assignment (no flags); otherwise
@@ -28969,7 +29197,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
 /// runtime's case/test matching is case-insensitive once enabled, so a
 /// native substring lift must lowercase to stay exact. `shopt -u` after a
 /// `-s` still counts (a static scan cannot prove the runtime state).
-fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
+pub(crate) fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
     ir_nocase_shopt_mask(prog) & 1 != 0
 }
 
@@ -29196,7 +29424,7 @@ const CASE_VALUE_TMP: &str = "$sh_case_v";
 /// dispatch mandatory. Walks the whole ShIR (stmt + expression forms); the
 /// estree path only constructs the subset matched below, so `_ => false`
 /// is exact for it. Conservative direction: any doubt resolves to `true`.
-fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
+pub(crate) fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
     fn stmt_has(s: &IrStmt) -> bool {
         match s {
             // statement-form redirect: persist = inner is a bare literal
@@ -52996,6 +53224,49 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// A brace level's comma alternatives may contain nested braces. The
+    /// parser must group each alternative's parts into a Compound (a
+    /// cartesian factor), not flatten them into sibling alternatives —
+    /// `a{x/{p,q},y}z` expands to `ax/pz ax/qz ayz`, not `ax/z ayz`.
+    #[test]
+    fn nested_brace_alternatives_are_compound_groups() {
+        let src = "echo a{x/{p,q},y}z\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let c = crate::c_backend::shir_to_c(&prog);
+        for want in ["ax/pz", "ax/qz", "ayz"] {
+            assert!(c.contains(want), "missing {want:?} in C:\n{c}");
+        }
+        assert!(!c.contains("ax/z"), "flattened alternative in C:\n{c}");
+
+        // `{a,{b,c}}d` → ad bd cd (the nested brace is one alternative).
+        let src2 = "echo {a,{b,c}}d\n";
+        let cmds2 = crate::Parser::new(src2).parse().expect("parse");
+        let prog2 = ast_to_ir(&cmds2);
+        let c2 = crate::c_backend::shir_to_c(&prog2);
+        for want in ["ad", "bd", "cd"] {
+            assert!(c2.contains(want), "missing {want:?} in C:\n{c2}");
+        }
+    }
+
+    /// A literal before a brace on a SEPARATE source word stays a separate
+    /// argv word: `mkdir -p a/{x,y}` is `-p a/x a/y`, never `-pa/x`.
+    #[test]
+    fn brace_prefix_does_not_glue_a_separate_word() {
+        let src = "mkdir -p a/{x,y}\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("-p") && perl.contains("a/x") && perl.contains("a/y"),
+            "separate `-p` word must stay separate: {perl}"
+        );
+        assert!(
+            !perl.contains("-pa/x"),
+            "`-p` must not glue to the brace prefix: {perl}"
+        );
+    }
+
     /// `cat <<'EOF' … EOF` (the print-heredoc idiom) lowers to a native
     /// `print` with no bash -c.
     #[test]
@@ -53311,7 +53582,8 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
 
     #[test]
     fn for_loop_ranges() {
-        // integer item list → the loop var's range; body writes are lost
+        // integer item list → the loop var's range (joined with any
+        // pre-loop value or body write, which both exist at runtime)
         let r = ranges_of("for i in 1 2 3; do echo $i; done");
         assert_eq!(r.get("i"), Some(&(1, 3)));
         // non-numeric item → Any
@@ -53327,6 +53599,46 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         }
         let r3 = analyze_var_ranges(&prog);
         assert_eq!(r3.get("i"), Some(&(1, 5)));
+    }
+
+    /// Straight-line redefinition joins (whole-life range): `x=3000000000`
+    /// then `x=1` must report [1,3000000000], not [1,1] — last-write-wins
+    /// emits a C type that wraps on the earlier value (py2cy.js `put()`
+    /// rule, same hazard).
+    #[test]
+    fn straight_line_redefinition_joins() {
+        let r = ranges_of("x=3000000000; echo $x; x=1");
+        assert_eq!(r.get("x"), Some(&(1, 3000000000)));
+    }
+
+    /// Boolean literals are not integers: Python `True` prints as "True",
+    /// not "1" — a native-int declaration would change output. The
+    /// py-sh-go frontend lowers True to `IrExpr::Bool`, which carries no
+    /// integer range and never lifts.
+    #[test]
+    fn bool_assign_has_no_range_and_no_lift() {
+        use crate::ir::{AssignTarget, IrExpr, IrProgram, IrStmt};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![AssignTarget { var: "flag".into(), sigil: None, indices: vec![] }],
+                expr: IrExpr::Bool(true),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let r = analyze_var_ranges(&prog);
+        assert!(!r.contains_key("flag"));
+        assert!(!numeric_lift_vars(&prog).contains("flag"));
     }
 
     #[test]
@@ -53369,15 +53681,26 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
     fn arith_assign_incdec_cond_ranges() {
         let r = ranges_of("x=5\ny=$((x++))\nz=$((x+=10))\nw=$((1 ? 7 : 100))");
         // x++: value 5 (the OLD value), x becomes 6 — the RANGE walker
-        // tracks x's final value from the last write
+        // tracks x's whole life (every held value), not the last write:
+        // a C type sized for the last write alone wraps on the earlier
+        // values (py2cy.js `put()` rule, same hazard).
         assert_eq!(r.get("y"), Some(&(5, 5)));
-        assert_eq!(r.get("x"), Some(&(16, 16)));
-        assert_eq!(r.get("z"), Some(&(16, 16)));
+        assert_eq!(r.get("x"), Some(&(5, 16)));
+        // `z=$((x+=10))` widens with x's whole life ([5,6]+10 — the
+        // flow-exact answer is 16, but x's joined range is the honest
+        // input; same C width either way).
+        assert_eq!(r.get("z"), Some(&(15, 16)));
         assert_eq!(r.get("w"), Some(&(7, 7)));
         // an IncDec past the domain wraps exactly (bash: i++ at MAX → MIN)
         let r2 = ranges_of("i=9223372036854775807\nj=$((i++))");
         assert_eq!(r2.get("j"), Some(&(9223372036854775807, 9223372036854775807)));
-        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, -9223372036854775808)));
+        // the wrap straddles the fold, so the whole-life hull is the full
+        // domain (an interval cannot name {MAX, MIN} tighter than that).
+        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, 9223372036854775807)));
+        // width-straddling redefinition: the old last-write-wins rule
+        // reported [1,1] here and a C int wrapped the 3e9 write.
+        let r3 = ranges_of("x=3000000000\nx=$((x-2999999999))");
+        assert_eq!(r3.get("x"), Some(&(1, 3000000000)));
     }
 
     /// The i53 escalation set: proven out-of-±2^53 vars with all-integer
@@ -53615,7 +53938,7 @@ mod py2cy_analysis_tests {
         // Go pin: x = 2**63-1; y = x + 1 leaves BOTH untyped
         let prog = prog_of("x=$((2**63-1))\ny=$((x + 1))\necho $y");
         let env = analyze_var_ranges(&prog);
-        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
         assert!(vetoed.contains("x"), "x feeds overflowing +1: {vetoed:?}");
         assert!(vetoed.contains("y"), "y is the overflowing store: {vetoed:?}");
     }
@@ -53626,7 +53949,7 @@ mod py2cy_analysis_tests {
         for src in ["y=$((x & 255))\necho $y", "y=$((x << 2))\necho $y"] {
             let prog = prog_of(src);
             let env = analyze_var_ranges(&prog);
-            let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+            let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
             assert!(vetoed.contains("x"), "{src}: {vetoed:?}");
         }
     }
@@ -53636,7 +53959,7 @@ mod py2cy_analysis_tests {
         // comparisons and cdivision ops never veto
         let prog = prog_of("x=5\nif [ $x -lt 10 ]; then y=$((x % 3)); echo $y; fi");
         let env = analyze_var_ranges(&prog);
-        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
         assert!(!vetoed.contains("x"), "comparison/mod use is safe: {vetoed:?}");
     }
 
@@ -53647,7 +53970,7 @@ mod py2cy_analysis_tests {
         let prog = prog_of("big=$((2**100))\necho $big");
         let env = analyze_var_ranges(&prog);
         assert_eq!(env.get("big"), Some(&(0, 0)), "bash wrap precondition");
-        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
         assert!(vetoed.contains("big"), "wrap artifact vetoed: {vetoed:?}");
     }
 
@@ -54226,6 +54549,7 @@ mod declare_tests {
                 .iter()
                 .map(|(n, w)| (n.to_string(), w.to_string()))
                 .collect(),
+            bigranges: std::collections::HashMap::new(),
         }
     }
 
@@ -54337,6 +54661,86 @@ mod declare_tests {
         assert!(!top.contains_key("big"), "bigint-homed refutes");
         assert!(!top.contains_key("s"), "non-int kinds never declare");
         assert!(top.contains_key("o"), "plain int declares");
+    }
+
+    /// u64 tier: a non-negative value past i64 but within one machine
+    /// word declares with width "u64" (the harness renders
+    /// `cython.ulonglong`) — provided no veto.
+    #[test]
+    fn u64_literal_declares_u64_width() {
+        let cmds = crate::Parser::new("big=10000000000000000000")
+            .parse()
+            .expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let scopes = analyze_scopes(&prog, true);
+        let d = decide(&scopes, &[("big", "int")], &[], &[], &[]);
+        assert_eq!(
+            d["<top>"]["big"],
+            ("int".to_string(), Some("u64".to_string())),
+            "u64 value, no veto → ulonglong"
+        );
+    }
+
+    /// A vetoed u64 still declines: `y + y + y` wraps i64, so
+    /// use-safety vetoes y and z even though z's value fits u64.
+    #[test]
+    fn vetoed_u64_still_declines() {
+        let cmds = crate::Parser::new("y=4611686018427387904\nz=$((y + y + y))")
+            .parse()
+            .expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let scopes = analyze_scopes(&prog, true);
+        let d = decide(&scopes, &[("y", "int"), ("z", "int")], &[], &[], &[]);
+        assert!(
+            !d["<top>"].contains_key("y") && !d["<top>"].contains_key("z"),
+            "wrapping use vetoes both: {:?}",
+            d["<top>"]
+        );
+    }
+
+    #[test]
+    fn quarantine_skips_bigexact_assign() {
+        // Horner conveyance ((0*10+1)*10+0): BigInt-exact [100], merged
+        // claim covers it — no wrap artifact, so no quarantine veto.
+        use crate::ir::{ArithAst, AssignTarget, IrExpr, IrStmt, IrType};
+        use std::collections::{HashMap, HashSet};
+        fn num(n: i64) -> ArithAst { ArithAst::Num(n) }
+        fn cst(e: ArithAst) -> ArithAst {
+            ArithAst::Cast { ty: IrType::Int64, arg: Box::new(e) }
+        }
+        fn bin(op: &str, l: ArithAst, r: ArithAst) -> ArithAst {
+            ArithAst::Bin { op: op.to_string(), lhs: Box::new(l), rhs: Box::new(r) }
+        }
+        let tree = bin("+", bin("*", cst(bin("+", bin("*", cst(num(0)), cst(num(10))), cst(num(1)))), cst(num(10))), cst(num(0)));
+        let stmts = vec![IrStmt::Assign {
+            targets: vec![AssignTarget { var: "v".into(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(tree)),
+            asm: None,
+        }];
+        let big = crate::shir_passes::bigint_range::analyze_var_ranges_big(&stmts);
+        assert!(big.contains_key("v"));
+        let env: HashMap<String, (i128, i128)> = HashMap::new();
+        let out = analyze_use_safety_stmts_big(&stmts, &env, true, &big);
+        assert!(!out.contains("v"), "big-exact assign must not quarantine: {:?}", out);
+    }
+
+    /// A homed bigint with a u64 range still declares: the homed set is
+    /// shared with backend homing, but a non-negative sub-2^64 value has
+    /// an exact C word — "needs GMP somewhere" must not block it.
+    #[test]
+    fn homed_u64_readmits() {
+        use num_bigint::BigInt;
+        let mut scopes = vec![facts("<top>", &["w"], &[], &[], &[])];
+        scopes[0].bigranges.insert(
+            "w".to_string(),
+            (BigInt::from(0), BigInt::from(1u128 << 64) - 1u32),
+        );
+        let d = decide(&scopes, &[("w", "int")], &["w"], &[], &[]);
+        assert_eq!(
+            d["<top>"]["w"],
+            ("int".to_string(), Some("u64".to_string())),
+            "homed but u64-ranged → ulonglong"
+        );
     }
 
     #[test]

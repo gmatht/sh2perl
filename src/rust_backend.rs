@@ -4233,8 +4233,28 @@ impl Render {
                     } else {
                         items.push(start.to_string());
                     }
+                } else if let Some(n) = e.get("nested") {
+                    // a nested `{…}` alternative: the union of its items
+                    items.extend(self.brace_group(n));
+                } else if let Some(p) = e.get("product") {
+                    // a Compound alternative: cartesian concatenation of
+                    // the sub-groups (`x/{p,q}` -> `x/p`, `x/q`)
+                    let mut combos: Vec<String> = vec![String::new()];
+                    if let Some(subs) = p.as_array() {
+                        for g in subs {
+                            let alts = self.brace_group(g);
+                            let mut next = Vec::new();
+                            for c in &combos {
+                                for a in &alts {
+                                    next.push(format!("{c}{a}"));
+                                }
+                            }
+                            combos = next;
+                        }
+                    }
+                    items.extend(combos);
                 }
-                // nested braces / objects: skipped (mirrors the C backend)
+                // other objects: skipped
             }
         }
         items
