@@ -16852,6 +16852,16 @@ fn param_copy_alias(
                         }
                     }
                 }
+                IrStmt::Output { value, newline, target: None } => {
+                    // A native Output (EchoFold turns a constant `echo`
+                    // into one): reconstruct `printf '%s[\\n]' <word>`.
+                    // sh_word single-quotes the value, so the child
+                    // prints the exact bytes (no re-expansion) — the
+                    // same contract the `echo` word lowering uses.
+                    self.sh_raw(buf, "printf");
+                    self.sh_raw(buf, if *newline { "'%s\\n'" } else { "'%s'" });
+                    self.sh_word(buf, value);
+                }
                 IrStmt::Pipeline { stages, capture: None, .. }
                 if stages.iter().any(|s2| {
                     let j = format!("{s2:?}");
@@ -27181,6 +27191,9 @@ fn param_copy_alias(
                     } else {
                         self.emit(&format!("fputs({t}, stdout);"));
                     }
+                    // echo always succeeds (status 0) — the shared
+                    // EchoFold contract; a later `$?` must see 0.
+                    self.emit("_sh_rc = 0;");
                     return;
                 }
                 let v = self.value_c(value);
@@ -27189,6 +27202,10 @@ fn param_copy_alias(
                 } else {
                     self.emit(&format!("fputs((char*)({v}), stdout);"));
                 }
+                // echo always succeeds (status 0) — EchoFold lowers a
+                // constant `echo` to this node, so the status write that
+                // the old `exec` path emitted must survive the fold.
+                self.emit("_sh_rc = 0;");
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 self.in_cond += 1;
@@ -29196,6 +29213,11 @@ fn param_copy_alias(
         }
         // EXIT trap: run the registered cleanup body before returning
         if let Some(body) = &self.exit_trap_body {
+            // the epilogue calls the `_sh_wrap_cmd`/`_sh_wrap` runtime
+            // helpers directly — request the runtime block here (the body
+            // used to set it via the constant-echo path; EchoFold's
+            // IrStmt::Output no longer does).
+            self.need_sh = true;
             self.emit(&format!(
                 "_sh_wrap_cmd({}); system(_sh_wrap);",
                 Self::cstr(body)
@@ -38847,6 +38869,80 @@ mod tests {
         let c = shir_to_c(&p);
         assert!(c.contains("_sh_rc"), "rc wrongly dropped:\n{c}");
         assert!(c.contains("return _sh_rc;"), "exit not via rc:\n{c}");
+    }
+
+    #[test]
+    fn folded_output_resets_status() {
+        // EchoFold lowers `echo X` to IrStmt::Output and documents that
+        // the node carries status 0 (echo always succeeds). The C
+        // renderer must therefore write `_sh_rc = 0` — otherwise a
+        // preceding failing command leaks its status into a later `$?`
+        // (064_12: mkdir's rc showed up in `echo "done: $?"`).
+        let p = prog_of(vec![
+            builtin("false", vec![]),
+            IrStmt::Output {
+                value: IrExpr::Str("done".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                newline: true,
+                target: None,
+            },
+        ]);
+        let c = shir_to_c(&p);
+        assert!(c.contains("_sh_rc = 0;"), "Output did not reset status:\n{c}");
+    }
+
+    #[test]
+    fn folded_output_in_redirect_site_renders_printf_text() {
+        // EchoFold lowers a constant `echo` to IrStmt::Output. When that
+        // Output sits inside a redirect (`echo "content" > f.txt`), the
+        // shell-text reconstruction (sh_stage) must render it — before it
+        // fell through to a `TODO(unsupported): capture body stmt` marker,
+        // so f.txt was never created and the program printed nothing.
+        let out_stmt = IrStmt::Output {
+            value: IrExpr::Str("content".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            newline: true,
+            target: None,
+        };
+        let p = prog_of(vec![IrStmt::Redirect {
+            inner: vec![out_stmt],
+            redirects: vec![crate::ir::IrRedirect {
+                fd: Some(1),
+                mode: "w".to_string(),
+                target: IrExpr::Str("f.txt".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                interpolate: true,
+            }],
+        }]);
+        let c = shir_to_c(&p);
+        assert!(
+            !c.contains("TODO(unsupported)"),
+            "folded Output left a TODO stub:\n{c}"
+        );
+        // the site runs `printf '%s\n' 'content' > 'f.txt'`
+        assert!(c.contains("_sh_addraw(\"printf\")"), "missing printf:\n{c}");
+        assert!(
+            c.contains("_sh_addraw(\"'%s\\\\n'\")"),
+            "missing newline format:\n{c}"
+        );
+        assert!(c.contains("_sh_word(\"content\")"), "missing word:\n{c}");
+
+        // `-n` (newline=false) must render `printf '%s'` — no newline.
+        let p2 = prog_of(vec![IrStmt::Redirect {
+            inner: vec![IrStmt::Output {
+                value: IrExpr::Str("hi".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                newline: false,
+                target: None,
+            }],
+            redirects: vec![crate::ir::IrRedirect {
+                fd: Some(1),
+                mode: "w".to_string(),
+                target: IrExpr::Str("f.txt".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                interpolate: true,
+            }],
+        }]);
+        let c2 = shir_to_c(&p2);
+        assert!(
+            c2.contains("_sh_addraw(\"'%s'\")"),
+            "no-newline format missing:\n{c2}"
+        );
     }
 
     #[test]
