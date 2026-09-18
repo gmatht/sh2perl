@@ -137,11 +137,13 @@ pub struct Render {
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
-    /// pass-6 native loop binding in scope: (var, binding). Reads of a
-    /// numeric loop var render as the register-held binding instead of
-    /// the static (the static still gets a writeback per iteration, so
-    /// all other observers see identical values)
-    active_loop: Option<(String, String)>,
+    /// pass-6 native loop binding in scope: (var, binding, kind). Reads
+    /// of the loop var render as the held binding instead of the static
+    /// (the static still gets a writeback per iteration, so all other
+    /// observers see identical values). `kind` says how the binding may
+    /// be read: a numeric register is used as-is; a `&str` element is
+    /// borrowed (`.to_string()` only where an owned String is required).
+    active_loop: Option<(String, String, LoopBind)>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -206,6 +208,14 @@ pub struct Render {
     static_arrays: Option<std::collections::HashMap<String, Vec<String>>>,
     /// The subset of `static_arrays` consumed as a list.
     static_list_used: std::collections::HashSet<String>,
+    /// LOOP-VAR ESCAPE VERDICT (shared `analyze_loop_var_escapes`): per
+    /// pre-order `For` position, whether the loop variable is read
+    /// outside that loop. When not, the per-iteration write-back is
+    /// unobservable and is dropped.
+    loop_var_escapes: Option<std::collections::HashMap<usize, bool>>,
+    /// pre-order `For` counter: must advance in the SAME order as
+    /// `analyze_loop_var_escapes`' walk (both are source order).
+    for_seq: usize,
     todo: usize,
 }
 
@@ -588,6 +598,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // STATIC ARRAY VERDICT (shared analysis): literal-list arrays that are
     // only read as a whole list can use a borrowed representation.
     r.static_arrays = Some(crate::shir::analyze_static_arrays(&prog));
+    r.loop_var_escapes = Some(crate::shir::analyze_loop_var_escapes(&prog));
     // Run the shared constant-echo lowering here too: this entry point
     // renders from IR without running `Pipeline::canonical`, so the
     // transform is applied directly (it is cheap and idempotent). A
@@ -1064,7 +1075,7 @@ impl Render {
             return l.clone();
         }
         // pass-6: a native loop binding holds the current value
-        if let Some((v, b)) = self.active_loop.clone() {
+        if let Some((v, b, _)) = self.active_loop.clone() {
             if v == name {
                 return b;
             }
@@ -1093,6 +1104,13 @@ impl Render {
     fn read_str(&mut self, name: &str) -> String {
         if let Some(l) = self.captured.get(name) {
             return l.clone();
+        }
+        // a native `&str` loop binding: borrow the element directly —
+        // no thread-local store/load round-trip for the value
+        if let Some((v, b, LoopBind::Str)) = self.active_loop.clone() {
+            if v == name {
+                return format!("{b}.to_string()");
+            }
         }
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
@@ -6807,6 +6825,8 @@ impl Render {
                 self.emit(&format!("__SH_RC.store({last}, Ordering::SeqCst);"));
             }
             IrStmt::For { var, iter, body } => {
+                let for_id = self.for_seq;
+                self.for_seq += 1;
                 self.mark_written(var);
                 match iter {
                     IrExpr::Range { start, end } if self.is_num(var) => {
@@ -6856,8 +6876,9 @@ impl Render {
                                 .trim_end_matches(';')
                                 .to_string();
                             self.emit(&format!("{wb};"));
-                            let old_loop =
-                                self.active_loop.replace((var.to_string(), binding));
+                            let old_loop = self
+                                .active_loop
+                                .replace((var.to_string(), binding, LoopBind::Num));
                             for s in body {
                                 self.stmt(s);
                             }
@@ -6919,21 +6940,100 @@ impl Render {
                             } else {
                                 format!("[{}]", lits.join(", "))
                             };
-                            self.emit(&format!("for {elem_g} in {iter} {{"));
+                            // NATIVE binding: when the loop var is only
+                            // read (no own-flow write, no shadowing
+                            // binder, no name-taking builtin, no closure
+                            // capture), reads render as the bound element
+                            // directly — the per-iteration store AND the
+                            // read-back clone both vanish. The writeback
+                            // prologue keeps the variable correct for
+                            // every OTHER observer (a later read, a
+                            // thread/subshell snapshot).
+                            let mut native = self.declared(var)
+                                && !self.is_array(var)
+                                && !self.is_assoc(var)
+                                && !is_special_var(var)
+                                && !self.bigint_vars.contains(var)
+                                && !self.str_forced.contains(var)
+                                && !self.local_vars.contains_key(var)
+                                && !self.captured.contains_key(var)
+                                && !self.namerefs.contains_key(var)
+                                && !self.namerefs.values().any(|t| t == var);
+                            if native {
+                                let mut u = LoopVarUse::default();
+                                loop_var_scan(body, var, &mut u);
+                                native = !u.bad && u.reads;
+                            }
+                            let is_num = self.is_num(var);
+                            // A numeric loop var must bind the PARSED
+                            // value (a `&str` element cannot enter
+                            // arithmetic); a string var borrows the
+                            // element and owns it only where required.
+                            let binding = if native {
+                                Some(self.gensym("__sh_lv"))
+                            } else {
+                                None
+                            };
+                            match (&binding, is_num) {
+                                (Some(b), true) => self.emit(&format!(
+                                    "for {b} in {iter}.iter().map(|__s| __s.trim().parse::<i64>().unwrap_or(0)) {{"
+                                )),
+                                (Some(b), false) => {
+                                    self.emit(&format!("for {b} in {iter} {{"))
+                                }
+                                (None, _) => self.emit(&format!("for {elem_g} in {iter} {{")),
+                            }
+                            let kind = if is_num { LoopBind::Num } else { LoopBind::Str };
                             self.loop_depth += 1;
                             self.depth += 1;
-                            if self.is_num(var) {
-                                let st = self.write_num(
-                                    var,
-                                    &format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)"),
-                                );
-                                self.emit(&st);
+                            // the value handed to the shell variable's
+                            // storage (only needed when it escapes)
+                            let elem_expr = if is_num {
+                                format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)")
                             } else {
-                                let st = self.write_str(var, &format!("{elem_g}.to_string()"));
+                                format!("{elem_g}.to_string()")
+                            };
+                            // The per-iteration write-back keeps the shell
+                            // variable's value (bash leaves the loop var
+                            // set after the loop). It is only needed when
+                            // something OUTSIDE the loop reads the var —
+                            // the shared escape verdict says whether that
+                            // is possible.
+                            let var_escapes = self
+                                .loop_var_escapes
+                                .as_ref()
+                                .and_then(|m| m.get(&for_id).copied())
+                                .unwrap_or(true);
+                            if let Some(b) = &binding {
+                                if var_escapes {
+                                    // the binding is a `&str` element (or
+                                    // a numeric register): own it for the
+                                    // variable's storage
+                                    let wb = if is_num {
+                                        self.write_num(var, b)
+                                    } else {
+                                        self.write_str(var, &format!("{b}.to_string()"))
+                                    };
+                                    self.emit(&wb);
+                                }
+                            } else {
+                                let st = if is_num {
+                                    self.write_num(var, &elem_expr)
+                                } else {
+                                    self.write_str(var, &elem_expr)
+                                };
                                 self.emit(&st);
                             }
+                            let b = binding.clone();
+                            let old_loop = b.map(|b| {
+                                self.active_loop
+                                    .replace((var.to_string(), b, kind))
+                            });
                             for s in body {
                                 self.stmt(s);
+                            }
+                            if let Some(prev) = old_loop {
+                                self.active_loop = prev;
                             }
                             self.depth -= 1;
                             self.loop_depth -= 1;
@@ -12070,6 +12170,14 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
     Some(out)
 }
 
+/// How a native loop binding may be read: a numeric register (used
+/// as-is) or a borrowed `&str` element of a static list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopBind {
+    Num,
+    Str,
+}
+
 /// Pass-6 verdict use-record for one loop body scan.
 #[derive(Default)]
 struct LoopVarUse {
@@ -13008,11 +13116,43 @@ mod tests {
         // literal directly.
         let out = render("for n in a b c; do echo \"$n\"; done\n");
         assert!(
-            out.contains("for __sh_w0 in [\"a\", \"b\", \"c\"]"),
-            "no borrowed literal iteration:\n{out}"
+            out.contains("for __sh_lv1 in [\"a\", \"b\", \"c\"]"),
+            "no native-borrow loop binding:\n{out}"
         );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
         assert!(!out.contains("Vec<String>"), "owned list kept:\n{out}");
+        // the loop var does not escape, so no store and no read-back
+        assert!(
+            !out.contains("__SHV_n.with(|v| *v.borrow_mut() = __sh_lv1)"),
+            "dead write-back kept:\n{out}"
+        );
+        assert!(
+            out.contains("println!(\"{}\", __sh_lv1.to_string())"),
+            "read not bound to the element:\n{out}"
+        );
+    }
+
+    #[test]
+    fn escaping_loop_var_keeps_its_store() {
+        // Reading the loop var AFTER the loop (bash leaves it set) must
+        // keep the per-iteration write-back — the shared escape verdict
+        // vetoes the elision.
+        let out = render("for n in a b c; do echo \"$n\"; done\necho \"last=$n\"\n");
+        assert!(
+            out.contains("__SHV_n.with(|v| *v.borrow_mut() = __sh_lv1.to_string())"),
+            "escaping var lost its write-back:\n{out}"
+        );
+    }
+
+    #[test]
+    fn loop_var_write_in_body_keeps_the_store() {
+        // A body write to the var means the binding is not a pure read —
+        // the store must stay.
+        let out = render("for n in a b c; do n=\"$n!\"; echo \"$n\"; done\n");
+        assert!(
+            !out.contains("for __sh_lv1 in [\"a\", \"b\", \"c\"]"),
+            "unsound native binding for a written loop var:\n{out}"
+        );
     }
 
     #[test]
@@ -13027,7 +13167,7 @@ mod tests {
             "array init not a literal vec:\n{out}"
         );
         assert!(
-            out.contains("for __sh_w0 in [\"a\", \"b\", \"c\"]"),
+            out.contains("for __sh_lv") && out.contains("[\"a\", \"b\", \"c\"]"),
             "loop did not iterate the literal list:\n{out}"
         );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");

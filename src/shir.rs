@@ -10556,6 +10556,137 @@ pub fn analyze_static_arrays(prog: &IrProgram) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
+/// Loop-variable escape facts: for each `For` in the program (pre-order
+/// position), whether its loop variable is READ anywhere outside that
+/// loop's own body. When it is not, the loop's per-iteration write-back
+/// of the variable (the store a shell-typed backend must otherwise keep,
+/// so a later `$var` sees the last element — bash leaves the loop var set
+/// after the loop) is unobservable and may be dropped.
+///
+/// This is the shared half of the "bind the element natively" decision:
+/// the backend supplies the other half (the body must not write the var,
+/// shadow it, or hand its NAME to a name-taking builtin — see the Rust
+/// backend's `loop_var_scan`).
+///
+/// Keyed by pre-order `For` position, like the other iterator facts.
+/// Conservative: a name appearing as a FUNCTION parameter, in another
+/// function body, or in a subshell counts as a read (over-approximate —
+/// a missed escape would drop a live store).
+pub fn analyze_loop_var_escapes(prog: &IrProgram) -> HashMap<usize, bool> {
+    use crate::ir::IrStmt;
+    use crate::shir_passes::optimize::{stmt_reads, stmts_read};
+
+    fn walk(stmts: &[IrStmt], seq: &mut usize, out: &mut HashMap<usize, bool>) {
+        for (i, s) in stmts.iter().enumerate() {
+            if let IrStmt::For { var, body, .. } = s {
+                let here = *seq;
+                *seq += 1;
+                // read OUTSIDE this loop = sibling statements at this
+                // level (before and after) + the rest of the program
+                let mut escapes = false;
+                for (j, other) in stmts.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    if stmt_reads(var, other) {
+                        escapes = true;
+                        break;
+                    }
+                }
+                out.insert(here, escapes);
+                walk(body, seq, out);
+                continue;
+            }
+            // nested containers: their For loops are still visited
+            walk_children(s, seq, out);
+        }
+    }
+
+    fn walk_children(s: &IrStmt, seq: &mut usize, out: &mut HashMap<usize, bool>) {
+        match s {
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                walk(then, seq, out);
+                for (_, b) in elsifs {
+                    walk(b, seq, out);
+                }
+                walk(else_, seq, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => walk(body, seq, out),
+            IrStmt::ForInit {
+                init,
+                step,
+                body,
+                ..
+            } => {
+                walk(init, seq, out);
+                walk(step, seq, out);
+                walk(body, seq, out);
+            }
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                walk(body, seq, out);
+                for (_, b) in named_blocks {
+                    walk(b, seq, out);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                walk(body, seq, out);
+                for e in excepts {
+                    walk(&e.body, seq, out);
+                }
+                walk(else_body, seq, out);
+                walk(finally_body, seq, out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    walk(&c.body, seq, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    walk(&c.body, seq, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => walk(inner, seq, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk(st, seq, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut seq = 0usize;
+    let mut out = HashMap::new();
+    walk(&prog.stmts, &mut seq, &mut out);
+    // A subroutine is a separate scope but may still observe a top-level
+    // loop variable; scan its body conservatively.
+    for sub in &prog.subs {
+        let mut sub_stmts = sub.body.clone();
+        walk(&mut sub_stmts, &mut seq, &mut out);
+    }
+    let _ = stmts_read;
+    out
+}
+
 // ── int-array facts (hoisted from the C backend verbatim — the list-tier
 // verdicts every consumer reads: homed native int stores, reductions).
 // Behavior-identical move; the C backend calls these.
@@ -55279,6 +55410,47 @@ mod static_word_list_tests {
             IrExpr::Var("x".to_string(), None),
         ))]);
         assert_eq!(static_word_list(&[e]), None);
+    }
+
+    #[test]
+    fn loop_var_escape_verdict() {
+        // `for n in a b c; do echo "$n"; done` — n is not read after the
+        // loop, so its write-back is droppable.
+        let mk = |tail: Vec<crate::ir::IrStmt>| {
+            let mut stmts = vec![IrStmt::For {
+                var: "n".to_string(),
+                iter: IrExpr::Array(vec![s("a"), s("b")]),
+                body: vec![crate::ir::IrStmt::Expr(IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![s("n")],
+                })],
+            }];
+            stmts.extend(tail);
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        };
+        let v = analyze_loop_var_escapes(&mk(vec![]));
+        assert_eq!(v.get(&0), Some(&false), "no escape expected: {v:?}");
+
+        // a read AFTER the loop is an escape (bash leaves the var set)
+        let after = crate::ir::IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s("n")],
+        });
+        let v2 = analyze_loop_var_escapes(&mk(vec![after]));
+        assert_eq!(v2.get(&0), Some(&true), "escape expected: {v2:?}");
     }
 
     #[test]
