@@ -7179,15 +7179,38 @@ impl Render {
     /// i.e. the last meaningful line stores 0 to `__SH_RC` (every
     /// statement the renderer knows to be status-0 emits that store).
     /// The final status is then 0 regardless of the path taken.
+    ///
+    /// A control-flow ending (`}` of an if/else) hides the last store, so
+    /// fall back to scanning the WHOLE body: when every store is the
+    /// literal `0` and nothing loads the register, the status is zero on
+    /// every path. Stores that can be nonzero (`__SH_RC.store(1, …)`, a
+    /// `if cond {0} else {1}` arm, a captured `__r`, a shell-out) keep
+    /// the register so a data-dependent exit status survives.
     fn body_rc_is_zero(body_out: &[String]) -> bool {
         for line in body_out.iter().rev() {
             let t = line.trim();
             if t.is_empty() {
                 continue;
             }
-            return t == "__SH_RC.store(0, Ordering::SeqCst);";
+            if t == "__SH_RC.store(0, Ordering::SeqCst);" {
+                return true;
+            }
+            break;
         }
-        false
+        // Control-flow ending: every store must be the literal 0 (the
+        // register is never left holding anything else).
+        let mut saw_store = false;
+        for line in body_out {
+            let t = line.trim();
+            if !t.contains("__SH_RC.store(") {
+                continue;
+            }
+            saw_store = true;
+            if t != "__SH_RC.store(0, Ordering::SeqCst);" {
+                return false;
+            }
+        }
+        saw_store
     }
 
     fn program(&mut self, prog: &IrProgram) {
@@ -12772,6 +12795,75 @@ mod tests {
         let out = render("echo \"hi\"\n");
         assert!(!out.contains("process::exit"), "{out}");
         assert!(!out.contains("__SH_RC"), "dead rc store kept:\n{out}");
+    }
+
+    #[test]
+    fn exit_epilogue_elided_when_body_ends_in_control_flow() {
+        // A body ending in an if/else closes on `}`, so the "last line is
+        // a store" probe cannot see the status — but when every store is
+        // the literal 0 and nothing loads the register the exit status is
+        // statically 0 too. This is the shape the PYTHON frontend emits:
+        // its condition is a plain boolean expression with no status
+        // store, so the whole body is status-free.
+        let cond = IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Var("x".to_string(), None)),
+            op: crate::ir::BinOpKind::Eq,
+            rhs: Box::new(IrExpr::Int(1)),
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(1),
+                    asm: None,
+                },
+                IrStmt::If {
+                    cond,
+                    then: vec![IrStmt::Output {
+                        value: IrExpr::Str("one".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        newline: true,
+                        target: None,
+                    }],
+                    elsifs: vec![],
+                    else_: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![("x".to_string(), crate::ir::IrType::Int)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_rust(&prog);
+        assert!(!out.contains("__SH_RC"), "dead rc kept:\n{out}");
+        assert!(!out.contains("process::exit"), "epilogue kept:\n{out}");
+        assert!(out.contains("one"), "body lost:\n{out}");
+    }
+
+    #[test]
+    fn exit_status_kept_when_a_store_can_be_nonzero() {
+        // `false` stores 1 and can be the final status, so the register
+        // and the exit epilogue must survive even with no `$?` read.
+        let out = render("echo hi\nfalse\n");
+        assert!(out.contains("__SH_RC.store(1"), "{out}");
+        assert!(out.contains("process::exit(__SH_RC.load"), "{out}");
+    }
+
+    #[test]
+    fn exit_status_kept_when_status_is_read() {
+        // A `$?` read keeps the register regardless of the store values.
+        let out = render("false\necho \"x$?\"\n");
+        assert!(out.contains("__SH_RC.load"), "{out}");
     }
 
     #[test]
