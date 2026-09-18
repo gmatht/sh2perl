@@ -59,6 +59,10 @@ pub mod list_profile;
 pub mod loop_opt; // LICM-lite (estree-20260813-182436/201235): hoist loop-invariant runs into loop prologues
 pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
+/// Constant-echo lowering: `echo <literals>` → native `IrStmt::Output`,
+/// so every backend emits its host language's print instead of a
+/// runtime word-printing helper.
+pub mod echo_fold;
 pub mod pattern;
 pub mod restructure;
 pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
@@ -316,6 +320,12 @@ impl Pipeline {
                 Box::new(transform::ImportMinimize),
                 Box::new(transform::StoreToNative),
                 Box::new(transform::ConstMarkup),
+                // constant-echo lowering: `echo <literals>` → native
+                // `IrStmt::Output`. After ConstantFold so propagated
+                // literals are visible; before the renderers, so every
+                // backend emits its host print instead of a word-printing
+                // runtime helper.
+                Box::new(echo_fold::EchoFold),
                 // goto elimination: frontends may emit Label/Goto (C goto,
                 // labeled-break families); shell has no goto, so this runs
                 // for EVERY backend via the shared pipeline.
@@ -561,5 +571,47 @@ mod tests {
             native: false,
         })]);
         assert!(super::analysis::needs_runtime(&cap));
+    }
+
+    /// The canonical pipeline lowers a constant echo to a native Output
+    /// (the EchoFold transform), so every backend sees `print`-shaped IR
+    /// rather than an `exec echo` call.
+    #[test]
+    fn pipeline_folds_constant_echo() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        let prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        let (_ctx, out, _m) = Pipeline::canonical().run(&prog);
+        match &out.stmts[0] {
+            IrStmt::Output { value, newline, target } => {
+                assert!(*newline);
+                assert_eq!(*target, None);
+                assert_eq!(
+                    *value,
+                    IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)
+                );
+            }
+            other => panic!("echo not folded to Output: {other:?}"),
+        }
+        // the input is untouched — the pipeline is pure
+        assert!(matches!(prog.stmts[0], IrStmt::Expr(_)));
     }
 }

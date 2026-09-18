@@ -578,6 +578,16 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // captures, pipelines, shell-outs.) Decided BEFORE rendering so the
     // echo lowering can emit a bare `print!` directly.
     r.runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    // Run the shared constant-echo lowering here too: this entry point
+    // renders from IR without running `Pipeline::canonical`, so the
+    // transform is applied directly (it is cheap and idempotent). A
+    // folded `echo <literals>` becomes `Output { Str(text), newline }`,
+    // which the Output arm above prints natively.
+    {
+        use crate::shir_passes::Transform;
+        let ctx = crate::shir_passes::PassContext::default();
+        crate::shir_passes::echo_fold::EchoFold.run(&mut prog, &ctx);
+    }
     r.program(&prog);
     let text = cat_peephole(&r.out.join("\n"));
     // Belt-and-braces: confirm in the rendered output that no sink was
@@ -5395,62 +5405,11 @@ impl Render {
         Some(s)
     }
 
-    /// Compile-time twin of `__sh_echo_esc` (bash `echo -e`). Keep the
-    /// two in lockstep: this is the same state machine run on a literal.
+    /// Compile-time `-e` unescape — delegates to the SHARED definition
+    /// ([`crate::shir_passes::echo_fold::echo_esc`]) so the renderer and
+    /// the `--shir` contract can never drift.
     fn echo_esc_lit(s: &str) -> String {
-        let mut o = String::new();
-        let ch: Vec<char> = s.chars().collect();
-        let mut i = 0;
-        while i < ch.len() {
-            if ch[i] == '\\' && i + 1 < ch.len() {
-                i += 1;
-                match ch[i] {
-                    'n' => o.push('\n'),
-                    't' => o.push('\t'),
-                    'r' => o.push('\r'),
-                    'a' => o.push('\x07'),
-                    'b' => o.push('\x08'),
-                    'f' => o.push('\x0c'),
-                    'v' => o.push('\x0b'),
-                    'e' => o.push('\x1b'),
-                    '\\' => o.push('\\'),
-                    'c' => return o,
-                    '0'..='7' => {
-                        let mut n = 0;
-                        let mut k = 0;
-                        while k < 3 && i + k < ch.len() && ch[i + k].is_ascii_digit() && ch[i + k] <= '7' {
-                            n = n * 8 + (ch[i + k] as u32 - '0' as u32);
-                            k += 1;
-                        }
-                        o.push(char::from_u32(n & 0xff).unwrap_or('\0'));
-                        i += k - 1;
-                    }
-                    'x' => {
-                        let mut n = 0;
-                        let mut k = 0;
-                        while k < 2 && i + 1 + k < ch.len() && ch[i + 1 + k].is_ascii_hexdigit() {
-                            n = n * 16 + ch[i + 1 + k].to_digit(16).unwrap();
-                            k += 1;
-                        }
-                        if k > 0 {
-                            o.push(char::from_u32(n).unwrap_or('\0'));
-                            i += k;
-                        } else {
-                            o.push('x');
-                        }
-                    }
-                    c => {
-                        o.push('\\');
-                        o.push(c);
-                    }
-                }
-                i += 1;
-            } else {
-                o.push(ch[i]);
-                i += 1;
-            }
-        }
-        o
+        crate::shir_passes::echo_fold::echo_esc(s)
     }
 
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
@@ -6490,6 +6449,22 @@ impl Render {
                 if target.is_some() {
                     self.mark_todo("Output to filehandle");
                     return;
+                }
+                // A constant `echo` lowered by the shared EchoFold pass
+                // arrives as `Output { value: Str(text), newline }` with
+                // the newline already baked into `text`. Emit the native
+                // print directly (no __sh_print_words / __sh_puts helper),
+                // unless a redirect/capture sink is active.
+                if let IrExpr::Str(s, _) = value {
+                    if self.runtime_free {
+                        // `Output.newline` carries the trailing newline
+                        self.emit(&format!(
+                            "print!({});",
+                            Self::rust_str(&format!("{s}{}", if *newline { "\n" } else { "" }))
+                        ));
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        return;
+                    }
                 }
                 let w = self.words_expr(value);
                 self.add_helper("print_words");
@@ -12661,11 +12636,15 @@ mod tests {
 
     #[test]
     fn sinks_kept_when_used() {
-        // a redirect must keep the runtime sink (and its __sh_puts host)
+        // a redirect must keep the runtime sink: the folded constant echo
+        // goes through the sink-aware print helper, not a bare print!
         let out = render("echo hi > /tmp/sh2_probe.txt\n");
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
-        assert!(out.contains("__sh_puts(\"hi\\n\")"), "{out}");
+        assert!(
+            out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
+            "{out}"
+        );
     }
 
     #[test]
