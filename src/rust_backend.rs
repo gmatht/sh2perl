@@ -199,6 +199,13 @@ pub struct Render {
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
     runtime_free: bool,
+    /// STATIC ARRAY VERDICT (shared `analyze_static_arrays`): arrays whose
+    /// value is a compile-time literal list and which are only ever read
+    /// as a whole list. Their init renders from literals (no `__sh_cat`),
+    /// and a consumer iterates the literal list directly.
+    static_arrays: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// The subset of `static_arrays` consumed as a list.
+    static_list_used: std::collections::HashSet<String>,
     todo: usize,
 }
 
@@ -578,6 +585,9 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // captures, pipelines, shell-outs.) Decided BEFORE rendering so the
     // echo lowering can emit a bare `print!` directly.
     r.runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    // STATIC ARRAY VERDICT (shared analysis): literal-list arrays that are
+    // only read as a whole list can use a borrowed representation.
+    r.static_arrays = Some(crate::shir::analyze_static_arrays(&prog));
     // Run the shared constant-echo lowering here too: this entry point
     // renders from IR without running `Pipeline::canonical`, so the
     // transform is applied directly (it is cheap and idempotent). A
@@ -5399,6 +5409,26 @@ impl Render {
             return;
         }
         self.arrays.insert(name.to_string());
+        // STATIC ARRAY: every element is a compile-time literal and the
+        // array is only read as a whole list, so the init is a literal
+        // slice — no `__sh_cat`, no per-element `vec![…]` wrapper.
+        if let Some(texts) = self
+            .static_arrays
+            .as_ref()
+            .and_then(|m| m.get(name).cloned())
+        {
+            // the array home is `Vec<String>` (shell arrays hold text),
+            // so the literal elements need owning Strings — but no
+            // `__sh_cat` field-list machinery.
+            let lits: Vec<String> = texts
+                .iter()
+                .map(|t| format!("{}.to_string()", Self::rust_str(t)))
+                .collect();
+            self.add_helper("cat");
+            let stmt = self.write_arr(name, &format!("vec![{}]", lits.join(", ")));
+            self.emit(&stmt);
+            return;
+        }
         let items: Vec<String> = match args.get(1) {
             Some(IrExpr::Array(items)) => items.iter().map(|i| self.words_expr(i)).collect(),
             _ => vec![],
@@ -6858,52 +6888,57 @@ impl Render {
                         self.emit("}");
                     }
                     other => {
-                        // STATIC word list (`for n in ["a","b","c"]`): the
-                        // shared analysis proves every element is a
-                        // compile-time literal, so nothing allocates and
-                        // each element can be BORROWED as `&str` — emit a
-                        // `&[&str]` slice in static-ish storage and bind
-                        // the loop var to `&str` (no Vec, no clone).
-                        if let IrExpr::Array(elems) = other {
-                            if let Some(texts) = crate::shir::static_word_list(elems) {
-                                let n = texts.len();
-                                let lits: Vec<String> =
-                                    texts.iter().map(|t| Self::rust_str(t)).collect();
-                                let items_g = self.gensym("__sh_items");
-                                let idx_g = self.gensym("__sh_i");
-                                self.emit(&format!(
-                                    "let {items_g}: [&str; {n}] = [{}];",
-                                    lits.join(", ")
-                                ));
-                                self.emit(&format!("let mut {idx_g}: usize = 0;"));
-                                self.emit("loop {");
-                                self.emit(&format!(
-                                    "if !({idx_g} < {items_g}.len()) {{ break; }}"
-                                ));
-                                self.loop_depth += 1;
-                                self.depth += 1;
-                                if self.is_num(var) {
-                                    let st = self.write_num(
-                                        var,
-                                        &format!("{items_g}[{idx_g}].trim().parse::<i64>().unwrap_or(0)"),
-                                    );
-                                    self.emit(&st);
-                                } else {
-                                    // borrow: no allocation, no clone
-                                    let b = self.bind_str_borrow(var, &items_g, &idx_g);
-                                    self.emit(&b);
-                                }
-                                let old_for = self.for_index.replace(idx_g.clone());
-                                for s in body {
-                                    self.stmt(s);
-                                }
-                                self.for_index = old_for;
-                                self.depth -= 1;
-                                self.loop_depth -= 1;
-                                self.emit(&format!("{idx_g} += 1;"));
-                                self.emit("}");
-                                return;
+                        // STATIC list: either an INLINE literal list
+                        // (`for n in ["a","b","c"]`) or a NAMED array the
+                        // shared analysis proved is a compile-time literal
+                        // list only ever read whole (`xs = ["a","b","c"]`,
+                        // then `for x in xs`). Both iterate a literal
+                        // `[&str; N]` directly — no Vec, no `__sh_cat`,
+                        // and no clone of the whole vector per iteration.
+                        // A whole-list READ of a named static array takes
+                        // priority: `for x in "${xs[@]}"` arrives as
+                        // `Array([param("slice","xs","@","")])`, so the
+                        // inline-literal test below would miss it.
+                        let named = crate::shir::static_list_read(other);
+                        let texts: Option<Vec<String>> = named
+                            .as_ref()
+                            .and_then(|n| self.static_arrays.as_ref().and_then(|m| m.get(n).cloned()))
+                            .or_else(|| match other {
+                                IrExpr::Array(elems) => crate::shir::static_word_list(elems),
+                                _ => None,
+                            });
+                        if let Some(texts) = texts {
+                            if let Some(n) = &named {
+                                self.static_list_used.insert(n.clone());
                             }
+                            let elem_g = self.gensym("__sh_w");
+                            let lits: Vec<String> =
+                                texts.iter().map(|t| Self::rust_str(t)).collect();
+                            let iter = if lits.is_empty() {
+                                "[] as [&str; 0]".to_string()
+                            } else {
+                                format!("[{}]", lits.join(", "))
+                            };
+                            self.emit(&format!("for {elem_g} in {iter} {{"));
+                            self.loop_depth += 1;
+                            self.depth += 1;
+                            if self.is_num(var) {
+                                let st = self.write_num(
+                                    var,
+                                    &format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)"),
+                                );
+                                self.emit(&st);
+                            } else {
+                                let st = self.write_str(var, &format!("{elem_g}.to_string()"));
+                                self.emit(&st);
+                            }
+                            for s in body {
+                                self.stmt(s);
+                            }
+                            self.depth -= 1;
+                            self.loop_depth -= 1;
+                            self.emit("}");
+                            return;
                         }
                         let items = self.words_expr(other);
                         let items_g = self.gensym("__sh_items");
@@ -12967,14 +13002,44 @@ mod tests {
 
     #[test]
     fn static_for_list_borrows_str_slices() {
-        // A literal list (`for n in ["a","b","c"]`) needs no Vec and no
+        // A literal list (`for n in a b c`) needs no Vec and no
         // per-element clone: the shared analysis proves every element is
-        // compile-time text, so the loop walks a `[&str; N]` borrowed
-        // static array.
+        // compile-time text, so the loop iterates a borrowed `[&str; 3]`
+        // literal directly.
         let out = render("for n in a b c; do echo \"$n\"; done\n");
-        assert!(out.contains("[&str; 3]"), "no borrowed static array:\n{out}");
+        assert!(
+            out.contains("for __sh_w0 in [\"a\", \"b\", \"c\"]"),
+            "no borrowed literal iteration:\n{out}"
+        );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
         assert!(!out.contains("Vec<String>"), "owned list kept:\n{out}");
+    }
+
+    #[test]
+    fn static_array_value_builds_without_cat() {
+        // `xs = ["a","b","c"]` then `for x in xs`: the shared
+        // analyze_static_arrays proves the array is a literal list only
+        // read whole, so the init is a literal vec (no `__sh_cat`
+        // field-list machinery) AND the loop iterates the literals.
+        let out = render("xs=(a b c)\nfor x in \"${xs[@]}\"; do echo \"$x\"; done\n");
+        assert!(
+            out.contains("vec![\"a\".to_string(), \"b\".to_string(), \"c\".to_string()]"),
+            "array init not a literal vec:\n{out}"
+        );
+        assert!(
+            out.contains("for __sh_w0 in [\"a\", \"b\", \"c\"]"),
+            "loop did not iterate the literal list:\n{out}"
+        );
+        assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
+    }
+
+    #[test]
+    fn mutated_array_keeps_owned_path() {
+        // An appended/mutated array is not a static list: it must keep
+        // the owned representation (the analysis vetoes any non-whole
+        // read or extra write).
+        let out = render("xs=(a b)\nxs+=(c)\nfor x in \"${xs[@]}\"; do echo \"$x\"; done\n");
+        assert!(out.contains("__sh_cat"), "owned path dropped:\n{out}");
     }
 
     #[test]

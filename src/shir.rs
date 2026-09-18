@@ -10167,59 +10167,316 @@ pub fn static_word_list(items: &[crate::ir::IrExpr]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Program-wide verdict: the `For` iterators whose list is static (the
-/// `for n in ["a","b","c"]` shape). Backends key static-array storage on
-/// this so the decision is made ONCE, in the shared core, instead of each
-/// renderer re-deriving it from the IR shape.
+/// The whole-list READ of an array: `${arr[@]}` (a slice with no
+/// bounds), `listVar("arr")`, or a bare `Var`/`Ident` read. Returns the
+/// array name when the expression reads the WHOLE list (a bounded slice
+/// or a single-element read is not a whole-list consumer and keeps the
+/// owned path).
+pub fn static_list_read(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(n.clone()),
+        IrExpr::Call { func, args } if func == "listVar" => match args.first() {
+            Some(IrExpr::Str(n, _)) => Some(n.clone()),
+            _ => None,
+        },
+        IrExpr::Call { func, args } if func == "param" => {
+            // param("slice", name, "@", "") — the whole array, no bounds
+            let arg_str = |i: usize| match args.get(i) {
+                Some(IrExpr::Str(s, _)) => Some(s.clone()),
+                _ => None,
+            };
+            let op = arg_str(0)?;
+            let name = arg_str(1)?;
+            let at = arg_str(2)?;
+            let len = arg_str(3)?;
+            if op == "slice" && at == "@" && len.is_empty() && is_ident_name(&name) {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        // A word-list wrapper around exactly one whole-list read.
+        IrExpr::Array(items) if items.len() == 1 => static_list_read(&items[0]),
+        _ => None,
+    }
+}
+
+fn is_ident_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Program-wide verdict: the ARRAYS whose value is a compile-time literal
+/// list. An array qualifies when every write is a single, loop-free
+/// all-literal `setArray`/`DeclareArray`/`Array`-assign and the array is
+/// only consumed as a whole list (iterated, `listVar`-ed) — never
+/// index-written, appended, sliced, or passed to a mutating builtin.
 ///
-/// Keyed by the iterator expression's position (a pre-order walk index),
-/// since an iterator is not name-addressed like a variable. The value is
-/// the element texts.
-pub fn analyze_static_for_lists(prog: &IrProgram) -> HashMap<usize, Vec<String>> {
+/// This is the `xs = ["a","b","c"]` shape a Python frontend emits for
+/// `for x in xs:` (the iterable is `param("slice", "xs", "@", "")`).
+/// Every statically-typed backend can then materialize the list once from
+/// literals and BORROW the elements instead of allocating an owned
+/// container (and, in the Rust backend's case, cloning the whole vector
+/// per loop iteration).
+pub fn analyze_static_arrays(prog: &IrProgram) -> HashMap<String, Vec<String>> {
     use crate::ir::{IrExpr, IrStmt};
-    fn walk(stmts: &[IrStmt], seq: &mut usize, out: &mut HashMap<usize, Vec<String>>) {
+
+    #[derive(Default)]
+    struct Acc {
+        /// name -> the literal element texts of its (only) init
+        init: HashMap<String, Vec<String>>,
+        /// arrays written more than once, or by a non-literal source
+        veto: std::collections::HashSet<String>,
+        /// arrays read as anything other than the whole list
+        used_otherwise: std::collections::HashSet<String>,
+    }
+
+    fn elements_of(e: &IrExpr) -> Option<&Vec<IrExpr>> {
+        match e {
+            IrExpr::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Record a write to `name`: a literal init first, a veto after.
+    fn write_init(acc: &mut Acc, name: &str, texts: Option<Vec<String>>) {
+        if acc.veto.contains(name) {
+            return;
+        }
+        match texts {
+            Some(t) => {
+                if acc.init.insert(name.to_string(), t).is_some() {
+                    // a second init: not a single static definition
+                    acc.init.remove(name);
+                    acc.veto.insert(name.to_string());
+                }
+            }
+            None => {
+                acc.init.remove(name);
+                acc.veto.insert(name.to_string());
+            }
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) if is_ident_name(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Any whole-list read of `e` is fine; every other mention of an array
+    /// name is a veto. Conservative: an unknown call mentioning a name
+    /// counts as "used otherwise".
+    fn scan_expr_reads(e: &IrExpr, acc: &mut Acc) {
+        if static_list_read(e).is_some() {
+            return;
+        }
+        match e {
+            IrExpr::Call { func, args } => {
+                // a mutating/partial consumer of any array name in the args
+                if matches!(
+                    func.as_str(),
+                    "setArray"
+                        | "setArrayAppend"
+                        | "arrayIndex"
+                        | "arrayStore"
+                        | "join"
+                        | "arrayLen"
+                        | "arrayItems"
+                        | "split"
+                ) {
+                    for a in args {
+                        if let Some(n) = name_arg(a) {
+                            acc.used_otherwise.insert(n);
+                        }
+                        scan_expr_reads(a, acc);
+                    }
+                    return;
+                }
+                for a in args {
+                    scan_expr_reads(a, acc);
+                }
+            }
+            IrExpr::Array(items) => {
+                // a multi-element Array is a word list, not a whole-array
+                // read of one name — scan the parts
+                for it in items {
+                    scan_expr_reads(it, acc);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        scan_expr_reads(x, acc);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                scan_expr_reads(lhs, acc);
+                scan_expr_reads(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr_reads(cond, acc);
+                scan_expr_reads(then, acc);
+                scan_expr_reads(else_, acc);
+            }
+            IrExpr::Capture { expr, .. } => scan_expr_reads(expr, acc),
+            IrExpr::Index { var, key } => {
+                acc.used_otherwise.insert(var.clone());
+                scan_expr_reads(key, acc);
+            }
+            IrExpr::Arith(a) => scan_arith_reads(a, acc),
+            IrExpr::DefinedOr { expr, default } => {
+                scan_expr_reads(expr, acc);
+                scan_expr_reads(default, acc);
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    scan_expr_reads(v, acc);
+                }
+            }
+            IrExpr::Splice(x) => scan_expr_reads(x, acc),
+            _ => {}
+        }
+    }
+
+    fn scan_arith_reads(a: &ArithAst, acc: &mut Acc) {
+        match a {
+            ArithAst::Index { var, key } => {
+                acc.used_otherwise.insert(var.clone());
+                scan_arith_reads(key, acc);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith_reads(lhs, acc);
+                scan_arith_reads(rhs, acc);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => scan_arith_reads(arg, acc),
+            ArithAst::Assign { rhs, .. } => scan_arith_reads(rhs, acc),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith_reads(test, acc);
+                scan_arith_reads(then, acc);
+                scan_arith_reads(else_, acc);
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a statement: record array writes, scan reads. `in_loop` marks
+    /// a write that runs 0..N times (never a single static init).
+    fn walk(stmts: &[IrStmt], acc: &mut Acc, in_loop: bool) {
         for s in stmts {
             match s {
-                IrStmt::For { iter, body, .. } => {
-                    let here = *seq;
-                    *seq += 1;
-                    if let IrExpr::Array(items) = iter {
-                        if let Some(texts) = static_word_list(items) {
-                            out.insert(here, texts);
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if (func == "setArray" || func == "setArrayAppend") && args.len() >= 2 =>
+                {
+                    if let Some(n) = name_arg(&args[0]) {
+                        if func == "setArrayAppend" || in_loop {
+                            write_init(acc, &n, None);
+                        } else {
+                            let texts = elements_of(&args[1])
+                                .and_then(|items| static_word_list(items));
+                            write_init(acc, &n, texts);
                         }
                     }
-                    walk(body, seq, out);
+                    scan_expr_reads(&args[1], acc);
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let texts = static_word_list(elements);
+                    if in_loop {
+                        write_init(acc, var, None);
+                    } else {
+                        write_init(acc, var, texts);
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    // `xs = ["a","b","c"]` arrives as Assign with a
+                    // `setArray("xs", Array[...])` RHS (the frontend's
+                    // array-init form), or directly as an Array RHS.
+                    let set_array_elems = match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            elements_of(&args[1])
+                        }
+                        _ => None,
+                    };
+                    for t in targets {
+                        if t.indices.is_empty() && is_ident_name(&t.var) {
+                            if let Some(items) = set_array_elems.or_else(|| elements_of(expr)) {
+                                if !in_loop {
+                                    let texts = static_word_list(items);
+                                    write_init(acc, &t.var, texts);
+                                    continue;
+                                }
+                            }
+                            // any other assignment to the name vetoes it
+                            write_init(acc, &t.var, None);
+                        } else if !t.indices.is_empty() {
+                            acc.used_otherwise.insert(t.var.clone());
+                        }
+                    }
+                    // the init's OWN setArray must not be read as a
+                    // "partial consumer" — re-scan the element exprs only.
+                    match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            scan_expr_reads(&args[1], acc);
+                        }
+                        _ => scan_expr_reads(expr, acc),
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    scan_expr_reads(iter, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    scan_expr_reads(cond, acc);
+                    walk(body, acc, true);
                 }
                 IrStmt::If {
+                    cond,
                     then,
                     elsifs,
                     else_,
-                    ..
                 } => {
-                    walk(then, seq, out);
-                    for (_, b) in elsifs {
-                        walk(b, seq, out);
+                    scan_expr_reads(cond, acc);
+                    walk(then, acc, in_loop);
+                    for (c, b) in elsifs {
+                        scan_expr_reads(c, acc);
+                        walk(b, acc, in_loop);
                     }
-                    walk(else_, seq, out);
+                    walk(else_, acc, in_loop);
                 }
-                IrStmt::While { body, .. }
-                | IrStmt::DoWhile { body, .. }
-                | IrStmt::Subshell(body)
-                | IrStmt::Background(body)
-                | IrStmt::Block(body) => walk(body, seq, out),
-                IrStmt::ForInit { init, step, body, .. } => {
-                    walk(init, seq, out);
-                    walk(step, seq, out);
-                    walk(body, seq, out);
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    walk(init, acc, in_loop);
+                    scan_expr_reads(cond, acc);
+                    walk(step, acc, in_loop);
+                    walk(body, acc, true);
                 }
                 IrStmt::Function {
                     body,
                     named_blocks,
                     ..
                 } => {
-                    walk(body, seq, out);
+                    walk(body, acc, in_loop);
                     for (_, b) in named_blocks {
-                        walk(b, seq, out);
+                        walk(b, acc, in_loop);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, acc, in_loop)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, acc, in_loop),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc, in_loop);
                     }
                 }
                 IrStmt::Try {
@@ -10228,40 +10485,75 @@ pub fn analyze_static_for_lists(prog: &IrProgram) -> HashMap<usize, Vec<String>>
                     else_body,
                     finally_body,
                 } => {
-                    walk(body, seq, out);
+                    walk(body, acc, in_loop);
                     for e in excepts {
-                        walk(&e.body, seq, out);
+                        walk(&e.body, acc, in_loop);
                     }
-                    walk(else_body, seq, out);
-                    walk(finally_body, seq, out);
+                    walk(else_body, acc, in_loop);
+                    walk(finally_body, acc, in_loop);
                 }
-                IrStmt::Case { clauses, .. } => {
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                } => {
+                    scan_expr_reads(discriminant, acc);
                     for c in clauses {
-                        walk(&c.body, seq, out);
+                        walk(&c.body, acc, in_loop);
                     }
                 }
                 IrStmt::Select { clauses } => {
                     for c in clauses {
-                        walk(&c.body, seq, out);
+                        walk(&c.body, acc, in_loop);
                     }
                 }
-                IrStmt::Redirect { inner, .. } => walk(inner, seq, out),
-                IrStmt::Pipeline { stages, .. } => {
-                    for st in stages {
-                        walk(st, seq, out);
+                IrStmt::Output { value, .. } => scan_expr_reads(value, acc),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        scan_expr_reads(e, acc);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    scan_expr_reads(path, acc);
+                    scan_expr_reads(content, acc);
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr_reads(expr, acc),
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    env,
+                    ..
+                } => {
+                    scan_expr_reads(cmd, acc);
+                    for a in args {
+                        scan_expr_reads(a, acc);
+                    }
+                    for r in redirects {
+                        scan_expr_reads(r, acc);
+                    }
+                    for (_, e) in env {
+                        scan_expr_reads(e, acc);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        scan_expr_reads(x, acc);
                     }
                 }
                 _ => {}
             }
         }
     }
-    let mut seq = 0usize;
-    let mut out = HashMap::new();
-    walk(&prog.stmts, &mut seq, &mut out);
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc, false);
     for sub in &prog.subs {
-        walk(&sub.body, &mut seq, &mut out);
+        walk(&sub.body, &mut acc, true);
     }
-    out
+    acc.init
+        .into_iter()
+        .filter(|(n, _)| !acc.used_otherwise.contains(n))
+        .collect()
 }
 
 // ── int-array facts (hoisted from the C backend verbatim — the list-tier
@@ -54990,6 +55282,102 @@ mod static_word_list_tests {
     }
 
     #[test]
+    fn named_literal_array_is_static() {
+        // `xs = ["a","b","c"]` (frontend setArray-assign) then a
+        // whole-list read: the array is a static literal list.
+        let set = IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![
+                s("xs"),
+                IrExpr::Array(vec![s("a"), s("b"), s("c")]),
+            ],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "xs".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: set,
+                    asm: None,
+                },
+                IrStmt::For {
+                    var: "x".to_string(),
+                    iter: IrExpr::Array(vec![IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![
+                            s("slice"),
+                            s("xs"),
+                            s("@"),
+                            s(""),
+                        ],
+                    }]),
+                    body: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let v = analyze_static_arrays(&prog);
+        assert_eq!(
+            v.get("xs"),
+            Some(&vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            "named literal array not static: {v:?}"
+        );
+    }
+
+    #[test]
+    fn mutated_array_is_not_static() {
+        // An append (or any non-whole read) vetoes the static verdict.
+        let set = IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![s("xs"), IrExpr::Array(vec![s("a"), s("b")])],
+        };
+        let append = IrExpr::Call {
+            func: "setArrayAppend".to_string(),
+            args: vec![s("xs"), IrExpr::Array(vec![s("c")])],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "xs".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: set,
+                    asm: None,
+                },
+                IrStmt::Expr(append),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let v = analyze_static_arrays(&prog);
+        assert!(v.get("xs").is_none(), "appended array marked static: {v:?}");
+    }
+
+    #[test]
     fn for_list_verdict_is_program_wide() {
         let prog = IrProgram {
             imports: vec![],
@@ -55017,8 +55405,13 @@ mod static_word_list_tests {
             var_storage: vec![],
             var_bash_env: vec![],
         };
-        let verdicts = analyze_static_for_lists(&prog);
-        assert_eq!(verdicts.len(), 1, "only the literal list is static: {verdicts:?}");
-        assert_eq!(verdicts.get(&0), Some(&vec!["a".to_string(), "b".to_string()]));
+        // the old position-keyed verdict is gone; a For over a NAMED
+        // static array is covered by analyze_static_arrays (below). This
+        // test now pins the inline-list path through static_word_list.
+        let _ = analyze_static_arrays(&prog);
+        assert_eq!(
+            static_word_list(&[s("a"), s("b")]),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
     }
 }
