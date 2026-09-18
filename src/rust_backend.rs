@@ -1150,6 +1150,15 @@ impl Render {
         format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
     }
 
+    /// Bind a string loop variable from a STATIC word list: the element
+    /// is a `&str` borrowed from the static array (no Vec, no clone of a
+    /// temporary). The variable itself keeps its shell storage (a
+    /// thread-local `String`), so the value is owned once — but nothing
+    /// builds an intermediate `Vec<String>` for the list.
+    fn bind_str_borrow(&mut self, name: &str, items_g: &str, idx_g: &str) -> String {
+        self.write_str(name, &format!("{items_g}[{idx_g}].to_string()"))
+    }
+
     fn write_arr(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
         format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
@@ -1726,6 +1735,65 @@ impl Render {
         norm.replace('{', " ").replace('}', " ")
     }
 
+    /// Render an arith AST as a bool-typed condition (no `as i64`
+    /// round-trip: a comparison already IS bool, so `if ((x == 1) as
+    /// i64) != 0` collapses to `if (x == 1)`). Comparison operands
+    /// stay i64 (via `arith`, including the BigInt-numeric path);
+    /// `&&`/`||`/`!`/ternary recurse so nested conditions never
+    /// detour through 1/0 either. Everything else (plain values,
+    /// assigns, incdecs) keeps the `!= 0` truth test.
+    fn arith_bool(&mut self, a: &ArithAst) -> String {
+        match a {
+            ArithAst::Bin { op, lhs, rhs }
+                if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") =>
+            {
+                // BigInt compare (mirrors `arith`: t89 huge `%`/`//`
+                // results compare numerically, not as strings).
+                {
+                    use num_bigint::BigInt;
+                    fn side_big(x: &ArithAst, big: &BTreeSet<String>) -> bool {
+                        if arith_uses_bigint(x, big) {
+                            return true;
+                        }
+                        eval_arith_bigint(x)
+                            .map(|v| {
+                                v > BigInt::from(i64::MAX)
+                                    || v < BigInt::from(i64::MIN)
+                            })
+                            .unwrap_or(false)
+                    }
+                    if side_big(lhs, &self.bigint_vars)
+                        || side_big(rhs, &self.bigint_vars)
+                    {
+                        let lb = self.arith_bigint(lhs);
+                        let rb = self.arith_bigint(rhs);
+                        return format!("({lb} {op} {rb})");
+                    }
+                }
+                let l = self.arith(lhs);
+                let r = self.arith(rhs);
+                format!("({l} {op} {r})")
+            }
+            ArithAst::Bin { op, lhs, rhs } if op == "&&" || op == "||" => {
+                let l = self.arith_bool(lhs);
+                let r = self.arith_bool(rhs);
+                let rop = if op == "&&" { "&&" } else { "||" };
+                format!("({l} {rop} {r})")
+            }
+            ArithAst::Un { op, arg } if op == "!" => {
+                format!("(!{})", self.arith_bool(arg))
+            }
+            ArithAst::Cond { test, then, else_ } => format!(
+                "(if {} {{ {} }} else {{ {} }})",
+                self.arith_bool(test),
+                self.arith_bool(then),
+                self.arith_bool(else_)
+            ),
+            ArithAst::Cast { arg, .. } => self.arith_bool(arg),
+            _ => format!("({} != 0)", self.arith(a)),
+        }
+    }
+
     fn expr_bool(&mut self, e: &IrExpr) -> String {
         match e {
             // test/testArith/arith condition calls — the C frontend's
@@ -1836,7 +1904,7 @@ impl Render {
                 }
                 _other => format!("({} != 0)", self.expr_num(e)),
             },
-            IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
+            IrExpr::Arith(a) => self.arith_bool(a),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
             // `caseMatch(value, [patterns])` (py startswith/in, t68):
             // true if ANY pattern fnmatches (shared glob helper).
@@ -6790,6 +6858,53 @@ impl Render {
                         self.emit("}");
                     }
                     other => {
+                        // STATIC word list (`for n in ["a","b","c"]`): the
+                        // shared analysis proves every element is a
+                        // compile-time literal, so nothing allocates and
+                        // each element can be BORROWED as `&str` — emit a
+                        // `&[&str]` slice in static-ish storage and bind
+                        // the loop var to `&str` (no Vec, no clone).
+                        if let IrExpr::Array(elems) = other {
+                            if let Some(texts) = crate::shir::static_word_list(elems) {
+                                let n = texts.len();
+                                let lits: Vec<String> =
+                                    texts.iter().map(|t| Self::rust_str(t)).collect();
+                                let items_g = self.gensym("__sh_items");
+                                let idx_g = self.gensym("__sh_i");
+                                self.emit(&format!(
+                                    "let {items_g}: [&str; {n}] = [{}];",
+                                    lits.join(", ")
+                                ));
+                                self.emit(&format!("let mut {idx_g}: usize = 0;"));
+                                self.emit("loop {");
+                                self.emit(&format!(
+                                    "if !({idx_g} < {items_g}.len()) {{ break; }}"
+                                ));
+                                self.loop_depth += 1;
+                                self.depth += 1;
+                                if self.is_num(var) {
+                                    let st = self.write_num(
+                                        var,
+                                        &format!("{items_g}[{idx_g}].trim().parse::<i64>().unwrap_or(0)"),
+                                    );
+                                    self.emit(&st);
+                                } else {
+                                    // borrow: no allocation, no clone
+                                    let b = self.bind_str_borrow(var, &items_g, &idx_g);
+                                    self.emit(&b);
+                                }
+                                let old_for = self.for_index.replace(idx_g.clone());
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.for_index = old_for;
+                                self.depth -= 1;
+                                self.loop_depth -= 1;
+                                self.emit(&format!("{idx_g} += 1;"));
+                                self.emit("}");
+                                return;
+                            }
+                        }
                         let items = self.words_expr(other);
                         let items_g = self.gensym("__sh_items");
                         let idx_g = self.gensym("__sh_i");
@@ -12848,6 +12963,25 @@ mod tests {
         assert!(!out.contains("__SH_RC"), "dead rc kept:\n{out}");
         assert!(!out.contains("process::exit"), "epilogue kept:\n{out}");
         assert!(out.contains("one"), "body lost:\n{out}");
+    }
+
+    #[test]
+    fn static_for_list_borrows_str_slices() {
+        // A literal list (`for n in ["a","b","c"]`) needs no Vec and no
+        // per-element clone: the shared analysis proves every element is
+        // compile-time text, so the loop walks a `[&str; N]` borrowed
+        // static array.
+        let out = render("for n in a b c; do echo \"$n\"; done\n");
+        assert!(out.contains("[&str; 3]"), "no borrowed static array:\n{out}");
+        assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
+        assert!(!out.contains("Vec<String>"), "owned list kept:\n{out}");
+    }
+
+    #[test]
+    fn dynamic_for_list_still_owns() {
+        // A list with a non-literal element cannot use static storage.
+        let out = render("for n in a $y; do echo \"$n\"; done\n");
+        assert!(!out.contains("[&str;"), "dynamic list borrowed:\n{out}");
     }
 
     #[test]

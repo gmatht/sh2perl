@@ -10122,6 +10122,148 @@ pub fn analyze_bigint_vars(prog: &crate::ir::IrProgram) -> std::collections::BTr
     vars
 }
 
+// ── static word-list facts (shared; C/C++/Zig/Rust storage selection) ──
+
+/// The compile-time text of a word-list ELEMENT, or `None` when it
+/// involves any expansion/glob. Mirrors `shir_passes::echo_fold`'s
+/// private helper (the fold's own definition of "constant word"): a bare
+/// `Str`, or an `Interpolate` whose parts are ALL literal text.
+///
+/// This is the primitive every static-typed backend needs to decide
+/// whether a word list can live in read-only static storage
+/// (`&[&str]`, `static const char*[]`, `[]const []const u8`,
+/// `std::string_view`) instead of an owned/heap container.
+pub fn static_word_text(w: &IrExpr) -> Option<String> {
+    use crate::ir::InterpPart;
+    match w {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A word list is STATIC when it is an `Array` whose every element is a
+/// compile-time literal (`["a", "b", "c"]` — the Python `for x in [...]`
+/// and constant-arg shapes). Such a list never allocates, never mutates
+/// and never escapes: every backend can materialize it once in read-only
+/// static storage and BORROW each element.
+///
+/// Returns the element texts (in order) so a backend emits the literal
+/// array directly, or `None` when any element is dynamic.
+pub fn static_word_list(items: &[crate::ir::IrExpr]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(static_word_text(it)?);
+    }
+    Some(out)
+}
+
+/// Program-wide verdict: the `For` iterators whose list is static (the
+/// `for n in ["a","b","c"]` shape). Backends key static-array storage on
+/// this so the decision is made ONCE, in the shared core, instead of each
+/// renderer re-deriving it from the IR shape.
+///
+/// Keyed by the iterator expression's position (a pre-order walk index),
+/// since an iterator is not name-addressed like a variable. The value is
+/// the element texts.
+pub fn analyze_static_for_lists(prog: &IrProgram) -> HashMap<usize, Vec<String>> {
+    use crate::ir::{IrExpr, IrStmt};
+    fn walk(stmts: &[IrStmt], seq: &mut usize, out: &mut HashMap<usize, Vec<String>>) {
+        for s in stmts {
+            match s {
+                IrStmt::For { iter, body, .. } => {
+                    let here = *seq;
+                    *seq += 1;
+                    if let IrExpr::Array(items) = iter {
+                        if let Some(texts) = static_word_list(items) {
+                            out.insert(here, texts);
+                        }
+                    }
+                    walk(body, seq, out);
+                }
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk(then, seq, out);
+                    for (_, b) in elsifs {
+                        walk(b, seq, out);
+                    }
+                    walk(else_, seq, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Block(body) => walk(body, seq, out),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, seq, out);
+                    walk(step, seq, out);
+                    walk(body, seq, out);
+                }
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk(body, seq, out);
+                    for (_, b) in named_blocks {
+                        walk(b, seq, out);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, seq, out);
+                    for e in excepts {
+                        walk(&e.body, seq, out);
+                    }
+                    walk(else_body, seq, out);
+                    walk(finally_body, seq, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, seq, out);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, seq, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, seq, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, seq, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seq = 0usize;
+    let mut out = HashMap::new();
+    walk(&prog.stmts, &mut seq, &mut out);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut seq, &mut out);
+    }
+    out
+}
+
 // ── int-array facts (hoisted from the C backend verbatim — the list-tier
 // verdicts every consumer reads: homed native int stores, reductions).
 // Behavior-identical move; the C backend calls these.
@@ -54805,5 +54947,78 @@ mod declare_tests {
             ("int".to_string(), None),
             "missing width -> longlong"
         );
+    }
+}
+
+/// Static word-list facts (the `for n in ["a","b","c"]` shape): the
+/// decision that a list needs no allocation belongs in the SHARED core so
+/// C/C++/Zig/Rust all reach the same verdict from one analysis.
+#[cfg(test)]
+mod static_word_list_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    #[test]
+    fn literal_list_is_static() {
+        let items = vec![s("a"), s("b"), s("c")];
+        assert_eq!(
+            static_word_list(&items),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn all_literal_interpolation_is_static() {
+        // a quoted one-part interpolation is still compile-time text
+        let e = IrExpr::Interpolate(vec![crate::ir::InterpPart::Lit("hi".to_string())]);
+        assert_eq!(static_word_list(&[e]), Some(vec!["hi".to_string()]));
+    }
+
+    #[test]
+    fn dynamic_element_is_not_static() {
+        // a variable read is not a compile-time literal
+        assert_eq!(static_word_list(&[s("a"), IrExpr::Var("y".to_string(), None)]), None);
+        // an interpolation with an expression part is dynamic
+        let e = IrExpr::Interpolate(vec![crate::ir::InterpPart::Expr(Box::new(
+            IrExpr::Var("x".to_string(), None),
+        ))]);
+        assert_eq!(static_word_list(&[e]), None);
+    }
+
+    #[test]
+    fn for_list_verdict_is_program_wide() {
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::For {
+                    var: "n".to_string(),
+                    iter: IrExpr::Array(vec![s("a"), s("b")]),
+                    body: vec![],
+                },
+                // a dynamic list must not be keyed
+                IrStmt::For {
+                    var: "m".to_string(),
+                    iter: IrExpr::Array(vec![IrExpr::Var("y".to_string(), None)]),
+                    body: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let verdicts = analyze_static_for_lists(&prog);
+        assert_eq!(verdicts.len(), 1, "only the literal list is static: {verdicts:?}");
+        assert_eq!(verdicts.get(&0), Some(&vec!["a".to_string(), "b".to_string()]));
     }
 }
