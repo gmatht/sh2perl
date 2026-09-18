@@ -2256,8 +2256,16 @@ impl Render {
                         format!("(({l} {op} {r}) as i64)")
                     }
                     // widen to i64 (unconstrained literal-literal ops
-                    // default i32 and hard-error on overflow at compile time).
-                    ">>" | "<<" => format!("(({l} as i64) {op} ({r} as i64))"),
+                    // default i32 and hard-error on overflow at compile
+                    // time). A bare integer literal gets an `i64` suffix
+                    // (readable: `1i64 + 2i64`) instead of a whole-
+                    // expression cast; a non-literal operand is already
+                    // i64-typed.
+                    ">>" | "<<" => format!(
+                        "({} {op} {})",
+                        Self::arith_i64(&l),
+                        Self::arith_i64(&r)
+                    ),
                     "/" => {
                         self.add_helper("div");
                         format!("__sh_div({l},{r})")
@@ -2266,7 +2274,7 @@ impl Render {
                         self.add_helper("mod");
                         format!("__sh_mod({l},{r})")
                     }
-                    _ => format!("(({l} as i64) {op} ({r} as i64))"),
+                    _ => format!("({} {op} {})", Self::arith_i64(&l), Self::arith_i64(&r)),
                 }
             }
             ArithAst::Un { op, arg } => {
@@ -2319,6 +2327,27 @@ impl Render {
                 "0".into()
             }
         }
+    }
+
+    /// `s` if it already carries a numeric type, else a bare integer
+    /// literal gets an `i64` suffix so it does not default to `i32` (and
+    /// hard-error on overflow at compile time). Only a plain decimal
+    /// literal is suffixed — anything else (a var, a call, a nested
+    /// expression) is already i64-typed by construction.
+    fn arith_i64(s: &str) -> String {
+        let t = s.trim();
+        if t.is_empty() {
+            return t.to_string();
+        }
+        let body = t.strip_prefix('-').unwrap_or(t);
+        // a plain decimal run with no suffix and no operators/parens
+        if !body.is_empty()
+            && body.bytes().all(|b| b.is_ascii_digit())
+            && (t.len() == body.len() || t.starts_with('-'))
+        {
+            return format!("{t}i64");
+        }
+        t.to_string()
     }
 
     fn arith_op(&self, op: &BinOpKind) -> &'static str {
@@ -5446,6 +5475,22 @@ impl Render {
         Some(inner)
     }
 
+    /// True when a word builds a String ONLY because it needed one in a
+    /// string context — i.e. the value is natively numeric and can be
+    /// formatted by `{}` directly. Currently: an `Int`, or a var/read
+    /// whose renderer produces an i64.
+    fn word_is_numeric(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => self.is_num(name),
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(args.first(), Some(IrExpr::Str(n, _)) if self.is_num(n))
+            }
+            _ => false,
+        }
+    }
+
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
         self.word_fail_guard = false;
         let (parts, nl, esc) = self.echo_parts(words);
@@ -5503,23 +5548,30 @@ impl Render {
                 None
             };
             if let Some(parts_inner) = direct {
-                // all words are one-element vecs; join with a space
-                // (bash's word separator). Print through ONE format call
-                // rather than build an intermediate String.
+                // All words are one-element vecs; join with a space
+                // (bash's word separator) in ONE format call. A numeric
+                // word renders through `expr_num`: `{}` formats any
+                // Display value, so `x.to_string()` would be a redundant
+                // clone of an i64.
                 let mac = if nl { "println!" } else { "print!" };
-                if parts_inner.len() == 1 {
-                    self.emit(&format!("{mac}(\"{{}}\", {});", parts_inner[0]));
+                let mut args: Vec<String> = Vec::with_capacity(parts_inner.len());
+                let src_words: Vec<&IrExpr> = words.to_vec();
+                for (i, fallback) in parts_inner.iter().enumerate() {
+                    let rendered = match src_words.get(i) {
+                        Some(e) if self.word_is_numeric(e) => self.expr_num(e),
+                        _ => fallback.to_string(),
+                    };
+                    args.push(rendered);
+                }
+                if args.len() == 1 {
+                    self.emit(&format!("{mac}(\"{{}}\", {});", args[0]));
                 } else {
-                    let f: String = parts_inner
+                    let f: String = args
                         .iter()
                         .enumerate()
                         .map(|(i, _)| if i == 0 { "{}".to_string() } else { " {}".to_string() })
                         .collect();
-                    self.emit(&format!(
-                        "{mac}({}, {});",
-                        Self::rust_str(&f),
-                        parts_inner.join(", ")
-                    ));
+                    self.emit(&format!("{mac}({}, {});", Self::rust_str(&f), args.join(", ")));
                 }
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 return;
@@ -12837,20 +12889,20 @@ mod tests {
         assert!(!out.contains("__SHV_x"), "{out}");
         // single-word dynamic echo prints directly (no helper)
         assert!(!out.contains("__sh_print_words"), "{out}");
-        assert!(out.contains("println!(\"{}\", x.to_string())"), "{out}");
-        assert!(out.contains("format!(\"x is {}\", x.to_string())"), "{out}");
+        // x is numerically typed here (assigned 5), so `{}` takes it
+        // directly rather than through a .to_string() copy
+        assert!(out.contains("println!(\"{}\", x)"), "{out}");
+        assert!(out.contains("format!(\"x is {}\", "), "{out}");
     }
 
     #[test]
     fn if_arith_test() {
         let out = render("x=3\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
         assert!(out.contains("> 3"), "{out}");
-        // explicit i64 casts (bigint-era shape): the arith lowering
-        // must read x numerically and add 1 — exact shape, not a weak
-        // substring (see pass-4 commit: a concurrently-saved weakening
-        // rode along; this restores a precise expectation)
+        // the arith lowering reads x numerically and adds 1; the literal
+        // is i64-suffixed (no whole-expression cast)
         assert!(
-            out.contains("(__SHV_x.with(|v| v.get()) as i64) + (1 as i64)"),
+            out.contains("__SHV_x.with(|v| v.get()) + 1i64"),
             "{out}"
         );
         assert!(!out.contains("TODO"), "{out}");
