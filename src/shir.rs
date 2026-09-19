@@ -9263,6 +9263,23 @@ pub fn analyze_use_safety_stmts_big(
             Some(r) => r,
             None => return false,
         };
+        // The skip exists so a proven-huge literal a wide tier CAN home
+        // (u64 `ulonglong`) is not vetoed as a wrap artifact. But a
+        // value no tier can home (`2**100` exceeds u64) must stay
+        // quarantined: exact evaluation is not the question, homeability
+        // is. Gate the skip on the exact range fitting i64 or u64.
+        let homeable = {
+            use num_bigint::BigInt;
+            let i64_lo = BigInt::from(i64::MIN);
+            let i64_hi = BigInt::from(i64::MAX);
+            let u64_hi = BigInt::from(u64::MAX);
+            let zero = BigInt::from(0);
+            (exact.0 >= i64_lo && exact.1 <= i64_hi)
+                || (exact.0 >= zero && exact.1 <= u64_hi)
+        };
+        if !homeable {
+            return false;
+        }
         targets.iter().all(|t| {
             if !t.indices.is_empty() {
                 return false;
