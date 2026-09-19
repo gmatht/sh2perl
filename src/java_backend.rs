@@ -44,6 +44,29 @@ fn sanitize(name: &str) -> String {
     s
 }
 
+/// A Java method name for a user shell function. Keep the user's name
+/// unless it collides with a Java reserved word or the generated
+/// `sh*`/`__*` helper namespace — `def f()` must render `f()`, not
+/// `fn_f()`.
+fn fn_name(name: &str) -> String {
+    let base = sanitize(name);
+    if JAVA_RESERVED.contains(&base.as_str()) || base.starts_with("__") || base.starts_with("sh") && base.len() > 2 {
+        format!("fn_{base}")
+    } else {
+        base
+    }
+}
+
+const JAVA_RESERVED: &[&str] = &[
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
+    "null", "var", "record", "yield", "sealed", "permits",
+];
+
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
@@ -211,7 +234,7 @@ impl JavaRender {
         collect_fns(&prog.stmts, &mut fn_list, &mut seen_fns);
         let mut fn_buf = String::new();
         for (name, body) in fn_list.iter() {
-                let fname = format!("fn_{}", sanitize(name));
+                let fname = fn_name(name);
                 fn_buf.push_str(&format!("    static boolean {fname}() throws Exception {{\n"));
                 fn_buf.push_str("        List<String> __saved = new ArrayList<>(__SH_ARGV);\n");
                 fn_buf.push_str("        try {\n");
@@ -1214,7 +1237,7 @@ impl JavaRender {
                         self.emit("__SH_ARGV = __callArgv;");
                         self.emit("}");
                     }
-                    self.emit(&format!("fn_{}();", sanitize(other)));
+                    self.emit(&format!("{}();", fn_name(other)));
                     return Ok(());
                 }
                 let mut pieces: Vec<(String, bool)> = Vec::new();
@@ -1390,7 +1413,7 @@ impl JavaRender {
                 if !flat.is_empty() {
                     return Err("function call with args not supported in condition position".into());
                 }
-                Ok(format!("fn_{}()", sanitize(other)))
+                Ok(format!("{}()", fn_name(other)))
             }
             _ => {
                 let words = self.words_to_args(rest)?;

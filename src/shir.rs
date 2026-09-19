@@ -117,6 +117,22 @@ pub fn size_opt_enabled() -> bool {
     SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `-Oz`: golf for output SIZE. `-Os` plus a renderer text pass that
+/// strips what humans need but compilers don't: full-line `//`
+/// comments, indentation/blank lines, and long renderer-owned
+/// identifiers (helpers, statics, gensyms → a `__`-prefixed short
+/// pool). Other backends treat Oz as Os; the Rust backend golfs.
+static GOLF: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable `-Oz` golf lowering (default off).
+pub fn set_golf(on: bool) {
+    GOLF.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn golf_enabled() -> bool {
+    GOLF.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
 /// lowering)?
 pub fn slot_var_index(name: &str) -> Option<usize> {

@@ -137,13 +137,15 @@ pub struct Render {
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
-    /// pass-6 native loop binding in scope: (var, binding, kind). Reads
-    /// of the loop var render as the held binding instead of the static
+    /// pass-6 native loop bindings in scope: a STACK of (var, binding,
+    /// kind) — nested loops push, so an inner loop shadows the outer
+    /// and outer reads still resolve inside the inner body. Reads of a
+    /// loop var render as the held binding instead of the static
     /// (the static still gets a writeback per iteration, so all other
     /// observers see identical values). `kind` says how the binding may
     /// be read: a numeric register is used as-is; a `&str` element is
     /// borrowed (`.to_string()` only where an owned String is required).
-    active_loop: Option<(String, String, LoopBind)>,
+    active_loop: Vec<(String, String, LoopBind)>,
     /// index-array vars (Vec<String>)
     arrays: BTreeSet<String>,
     /// assoc-array vars (BTreeMap<String, String>)
@@ -206,6 +208,15 @@ pub struct Render {
     /// as a whole list. Their init renders from literals (no `__sh_cat`),
     /// and a consumer iterates the literal list directly.
     static_arrays: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// INT ARRAY VERDICT (shared `analyze_int_arrays`, C-proven): index
+    /// arrays with all-integer writes and only int-safe reads (strict
+    /// `Index`, `sum`/`min`/`max`, `arrayLen`). Their home is
+    /// `Vec<i64>` — no per-element stringify/parse round-trip. Checked
+    /// before `static_arrays` at init/decl: a numeric home wins.
+    /// UNIONED with the backend-local element-read verdict below (the
+    /// shared one requires an int *consumer*; a strict element read is
+    /// int-safe in this backend but invisible to it).
+    int_arrays: std::collections::HashSet<String>,
     /// The subset of `static_arrays` consumed as a list.
     static_list_used: std::collections::HashSet<String>,
     /// LOOP-VAR ESCAPE VERDICT (shared `analyze_loop_var_escapes`): per
@@ -231,6 +242,402 @@ fn expr_is_stringy(e: &IrExpr) -> bool {
         IrExpr::Capture { .. } | IrExpr::Array(_) | IrExpr::Interpolate(_) => true,
         _ => false,
     }
+}
+
+/// Backend-local element-read int-array verdict: index arrays with a
+/// single all-integer-literal init whose every read is int-safe in THIS
+/// backend — a strict `Index{var}` (only the Python frontend emits
+/// those; shell reads go through the forgiving paths, which veto), a
+/// `sum`/`min`/`max`/`arrayLen` name read. The shared
+/// `analyze_int_arrays` additionally requires an int *consumer*, so an
+/// element-read list (t21) stays text-homed without this union.
+///
+/// Conservative: any append, element store, whole-list string use
+/// (`join`, interpolation, `listVar`/`slice`/`arrayItems` value reads,
+/// `getVar(name)`, captures, `split`), unknown call mentioning the name,
+/// or array mention inside an index key vetoes. Single top-level init
+/// only (a write inside a loop/body re-arms per iteration — not static).
+fn int_index_arrays(prog: &IrProgram) -> BTreeSet<String> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+
+    #[derive(Default)]
+    struct Acc {
+        init: BTreeSet<String>,
+        bad: BTreeSet<String>,
+    }
+
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !s.chars().next().unwrap().is_ascii_digit()
+    }
+
+    fn int_lit(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+            _ => false,
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<&str> {
+        match e {
+            IrExpr::Str(s, _) if is_ident(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// True when `e` mentions no array at all (a safe index key).
+    fn key_clean(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Index { .. } => false,
+            IrExpr::Call { func, args } => {
+                // any array-shaped call reads array state as values
+                if matches!(
+                    func.as_str(),
+                    "arrayIndex"
+                        | "arrayItems"
+                        | "arrayKeys"
+                        | "listVar"
+                        | "join"
+                        | "split"
+                        | "slice"
+                        | "param"
+                        | "getVar"
+                ) {
+                    return false;
+                }
+                args.iter().all(key_clean)
+            }
+            IrExpr::Array(items) => items.iter().all(key_clean),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                crate::ir::InterpPart::Lit(_) => true,
+                crate::ir::InterpPart::Expr(x) => key_clean(x),
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => key_clean(lhs) && key_clean(rhs),
+            IrExpr::Ternary { cond, then, else_ } => {
+                key_clean(cond) && key_clean(then) && key_clean(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => key_clean(expr) && key_clean(default),
+            IrExpr::Capture { expr, .. } => key_clean(expr),
+            IrExpr::Arith(a) => arith_clean(a),
+            IrExpr::Object(props) => props.iter().all(|(_, v)| key_clean(v)),
+            IrExpr::Splice(x) => key_clean(x),
+            _ => true,
+        }
+    }
+
+    fn arith_clean(a: &ArithAst) -> bool {
+        match a {
+            // the forgiving arith-index reads array state — veto
+            ArithAst::Index { .. } => false,
+            ArithAst::Bin { lhs, rhs, .. } => arith_clean(lhs) && arith_clean(rhs),
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => arith_clean(arg),
+            ArithAst::Assign { rhs, .. } => arith_clean(rhs),
+            ArithAst::Cond { test, then, else_ } => {
+                arith_clean(test) && arith_clean(then) && arith_clean(else_)
+            }
+            _ => true,
+        }
+    }
+
+    fn scan_expr(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            IrExpr::Index { var, key } => {
+                // strict element read — int-safe iff the key is clean
+                if !key_clean(key) {
+                    acc.bad.insert(var.clone());
+                }
+                scan_expr(key, acc);
+            }
+            IrExpr::Call { func, args } => {
+                let int_safe = matches!(func.as_str(), "sum" | "min" | "max" | "arrayLen")
+                    && matches!(args.first(), Some(IrExpr::Str(n, _)) if is_ident(n));
+                if int_safe {
+                    for a in args.iter().skip(1) {
+                        scan_expr(a, acc);
+                    }
+                    return;
+                }
+                // whole-list / string consumers veto any name they touch
+                if matches!(
+                    func.as_str(),
+                    "setArray"
+                        | "setArrayAppend"
+                        | "arrayIndex"
+                        | "arrayStore"
+                        | "join"
+                        | "arrayItems"
+                        | "arrayKeys"
+                        | "listVar"
+                        | "split"
+                        | "slice"
+                        | "param"
+                        | "getVar"
+                        | "capture"
+                        | "captureWords"
+                        | "assocGet"
+                ) {
+                    for a in args {
+                        if let Some(n) = name_arg(a) {
+                            acc.bad.insert(n.to_string());
+                        }
+                        scan_expr(a, acc);
+                    }
+                    return;
+                }
+                for a in args {
+                    scan_expr(a, acc);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    scan_expr(it, acc);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        scan_expr(x, acc);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                scan_expr(lhs, acc);
+                scan_expr(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr(cond, acc);
+                scan_expr(then, acc);
+                scan_expr(else_, acc);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                scan_expr(expr, acc);
+                scan_expr(default, acc);
+            }
+            IrExpr::Capture { expr, .. } => scan_expr(expr, acc),
+            IrExpr::Arith(a) => scan_arith(a, acc),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    scan_expr(v, acc);
+                }
+            }
+            IrExpr::Splice(x) => scan_expr(x, acc),
+            _ => {}
+        }
+    }
+
+    fn scan_arith(a: &ArithAst, acc: &mut Acc) {
+        match a {
+            ArithAst::Index { var, key } => {
+                acc.bad.insert(var.clone());
+                scan_arith(key, acc);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith(lhs, acc);
+                scan_arith(rhs, acc);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => scan_arith(arg, acc),
+            ArithAst::Assign { rhs, .. } => scan_arith(rhs, acc),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith(test, acc);
+                scan_arith(then, acc);
+                scan_arith(else_, acc);
+            }
+            _ => {}
+        }
+    }
+
+    fn note_init(acc: &mut Acc, name: &str, items_ok: bool) {
+        if acc.bad.contains(name) {
+            return;
+        }
+        if items_ok {
+            if !acc.init.insert(name.to_string()) {
+                // second init — not a single static definition
+            } else {
+                return;
+            }
+        }
+        acc.init.remove(name);
+        acc.bad.insert(name.to_string());
+    }
+
+    fn walk(stmts: &[IrStmt], acc: &mut Acc, in_loop: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if (func == "setArray" || func == "setArrayAppend") && args.len() >= 2 =>
+                {
+                    if let Some(n) = name_arg(&args[0]) {
+                        if func == "setArrayAppend" || in_loop {
+                            note_init(acc, n, false);
+                        } else {
+                            let ok = match &args[1] {
+                                IrExpr::Array(items) => items.iter().all(int_lit),
+                                _ => false,
+                            };
+                            note_init(acc, n, ok && !in_loop);
+                        }
+                    }
+                    if !matches!(&args[1], IrExpr::Array(_)) {
+                        scan_expr(&args[1], acc);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    if in_loop {
+                        note_init(acc, var, false);
+                    } else {
+                        note_init(acc, var, elements.iter().all(int_lit));
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    let set_elems: Option<&Vec<IrExpr>> = match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            match &args[1] {
+                                IrExpr::Array(items) => Some(items),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    for t in targets {
+                        if t.indices.is_empty() && is_ident(&t.var) {
+                            let items = set_elems.or_else(|| match expr {
+                                IrExpr::Array(items) => Some(items),
+                                _ => None,
+                            });
+                            if let Some(items) = items {
+                                if !in_loop {
+                                    note_init(acc, &t.var, items.iter().all(int_lit));
+                                    continue;
+                                }
+                            }
+                            note_init(acc, &t.var, false);
+                        } else if !t.indices.is_empty() {
+                            acc.bad.insert(t.var.clone());
+                        }
+                    }
+                    match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            if !matches!(&args[1], IrExpr::Array(_)) {
+                                scan_expr(&args[1], acc);
+                            }
+                        }
+                        _ => scan_expr(expr, acc),
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    scan_expr(iter, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    scan_expr(cond, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    scan_expr(cond, acc);
+                    walk(then, acc, in_loop);
+                    for (c, b) in elsifs {
+                        scan_expr(c, acc);
+                        walk(b, acc, in_loop);
+                    }
+                    walk(else_, acc, in_loop);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    walk(init, acc, in_loop);
+                    scan_expr(cond, acc);
+                    walk(step, acc, in_loop);
+                    walk(body, acc, true);
+                }
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk(body, acc, in_loop);
+                    for (_, b) in named_blocks {
+                        walk(b, acc, in_loop);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, acc, in_loop)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, acc, in_loop),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc, in_loop);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, acc, in_loop);
+                    for e in excepts {
+                        walk(&e.body, acc, in_loop);
+                    }
+                    walk(else_body, acc, in_loop);
+                    walk(finally_body, acc, in_loop);
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                } => {
+                    scan_expr(discriminant, acc);
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Output { value, .. } => scan_expr(value, acc),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        scan_expr(e, acc);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    scan_expr(path, acc);
+                    scan_expr(content, acc);
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr, acc),
+                IrStmt::Expr(e) => scan_expr(e, acc),
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        scan_expr(x, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc, false);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut acc, true);
+    }
+    acc.init
+        .into_iter()
+        .filter(|n| !acc.bad.contains(n))
+        .collect()
 }
 
 /// Vars the type analysis calls Int but that receive a string value
@@ -455,6 +862,245 @@ fn inline_sinks_when_unused(text: String, runtime_free: bool) -> String {
     out
 }
 
+/// Golf a rendered Rust program for minimum bytes (`-Oz`): strip
+/// full-line `//` comments, collapse indentation/blank lines, and
+/// rename every renderer-owned identifier (helpers `__sh_*`, runtime
+/// statics `__SH_*`, user-var statics `__SHV_*`, gensyms `__sh_*`) into
+/// a `__`-prefixed short pool (`__a`…`__z`, `__a0`…).
+///
+/// Soundness, in layers (each stage is semantics-preserving alone):
+///  * comments: only WHOLE lines whose first non-space chars are `//`
+///    are dropped — trailing comments never occur in renderer output,
+///    and `//` inside a string literal never starts a line's code
+///    (a literal containing `\n//` would — the scan tracks `"`).
+///  * whitespace: lines are trimmed and joined with `\n`; blank lines
+///    dropped. String/char literals never contain a raw newline (the
+///    renderer escapes them), so no literal is altered.
+///  * rename: every renamed name is renderer-owned (starts with `__`),
+///    replaced with word boundaries. The short pool CANNOT collide
+///    with user code: user-var statics carry the `__SHV_` prefix
+///    (renamed as a unit), pass-2 locals render bare — and the mangler
+///    appends `_` to any bare base starting with `__` while golf is on
+///    (see `ident_base`), so no bare local can spell a pool name.
+///    `Ordering::SeqCst` and other `PascalCase::names` are untouched
+///    (the pool regex requires a lowercase/digit tail after `__` —
+///    actually it matches any `__[a-zA-Z0-9_]+`: `__SH_RC` etc. ARE the
+///    targets; `std`/`Vec`/`String` don't start with `__`).
+fn golf_rust(text: &str) -> String {
+    // Stage 1+2: drop full-line comments (string-aware), trim, drop
+    // blanks.
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // a `//` comment opener outside a string literal, at line start
+        // (after trim): full-line comment — drop. Scan for the first
+        // `//` outside `"…"`; if nothing but whitespace precedes it,
+        // the line is a comment.
+        let b = t.as_bytes();
+        let mut in_str = false;
+        let mut esc = false;
+        let mut comment_at: Option<usize> = None;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    comment_at = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(pos) = comment_at {
+            if t[..pos].trim().is_empty() {
+                continue;
+            }
+        }
+        lines.push(t.to_string());
+    }
+    // Stage 3: collect renderer-owned identifiers (`__`-prefixed words)
+    // in first-appearance order, skipping string literals.
+    let joined = lines.join("\n");
+    let mut names: Vec<String> = Vec::new();
+    {
+        let b = joined.as_bytes();
+        let mut in_str = false;
+        let mut esc = false;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            if c == b'_' && i + 1 < b.len() && b[i + 1] == b'_' {
+                let mut j = i + 2;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if j > i + 2 {
+                    let name = joined[i..j].to_string();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    // Short pool: `__a`…`__z`, `__a0`… — word-bounded replace, longest
+    // names first (so `__SH_OUTFILE_TL` renames before its prefix
+    // `__SH_OUT` could shadow-match; word bounds make order moot, but
+    // belt-and-braces).
+    // Short pools: statics declared as bare `static NAME:` get an
+    // UPPERCASE pool (`__A`…`__Z`, `__A0`…) — `non_upper_case_globals`
+    // would otherwise warn (thread-local statics carry their own
+    // `#[allow`, and `fn`/locals are snake-case-clean lowercase).
+    // A name is "bare-static" when its declaration line (the line that
+    // first mentions it in a `static NAME:` shape outside
+    // `thread_local!`) says so.
+    let mut bare_static: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines.iter() {
+        let t = line.trim_start();
+        // a bare `static NAME:` line, or a `thread_local!` static
+        // WITHOUT the per-item `#[allow]` user-var statics carry —
+        // both warn unless UPPER_CASE.
+        let rest = if let Some(r) = t.strip_prefix("static ") {
+            Some(r)
+        } else if let Some(r) = t.strip_prefix("thread_local! { static ") {
+            Some(r)
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.starts_with("__") {
+                bare_static.insert(name);
+            }
+        }
+    }
+    names.sort_by(|a, b| b.len().cmp(&a.len()));
+    // The pool must skip shorts already present in the source:
+    // renderer locals (`__s`, `__w`, `__a`, …) already spell short
+    // `__`-names, and minting the same short for a helper would merge
+    // two distinct bindings (t86: `__sh_fn_all_factors` vs local
+    // `__a` both becoming `__p`).
+    let taken: std::collections::HashSet<String> = names.iter().cloned().collect();
+    let mut lo_n = 0usize;
+    let mut hi_n = 0usize;
+    let mut minted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut short_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut next_lo = |minted: &mut std::collections::HashSet<String>| {
+        loop {
+            let s = if lo_n < 26 {
+                format!("__{}", (b'a' + lo_n as u8) as char)
+            } else {
+                format!("__a{}", lo_n - 26)
+            };
+            lo_n += 1;
+            if !taken.contains(&s) && minted.insert(s.clone()) {
+                return s;
+            }
+        }
+    };
+    let mut next_hi = |minted: &mut std::collections::HashSet<String>| {
+        loop {
+            let s = if hi_n < 26 {
+                format!("__{}", (b'A' + hi_n as u8) as char)
+            } else {
+                format!("__A{}", hi_n - 26)
+            };
+            hi_n += 1;
+            if !taken.contains(&s) && minted.insert(s.clone()) {
+                return s;
+            }
+        }
+    };
+    for name in names.iter() {
+        // a name already short enough keeps its spelling when the
+        // spelling is pool-canonical (avoids churn and, critically,
+        // never merges: a taken short is never re-minted above)
+        let short = if name.len() <= 4
+            && name.starts_with("__")
+            && name[2..].chars().all(|c| c.is_ascii_lowercase())
+            && !bare_static.contains(name)
+        {
+            name.clone()
+        } else if bare_static.contains(name) {
+            next_hi(&mut minted)
+        } else {
+            next_lo(&mut minted)
+        };
+        short_of.insert(name.clone(), short);
+    }
+    let mut out = joined;
+    for name in names.iter() {
+        let short = &short_of[name.as_str()];
+        let mut replaced = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        loop {
+            match rest.find(name.as_str()) {
+                None => {
+                    replaced.push_str(rest);
+                    break;
+                }
+                Some(k) => {
+                    let before = rest[..k].chars().last();
+                    let after = rest[k + name.len()..].chars().next();
+                    let bounded = !before
+                        .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                        .unwrap_or(false)
+                        && !after
+                            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                            .unwrap_or(false);
+                    replaced.push_str(&rest[..k]);
+                    if bounded {
+                        replaced.push_str(&short);
+                    } else {
+                        replaced.push_str(name.as_str());
+                    }
+                    rest = &rest[k + name.len()..];
+                }
+            }
+        }
+        out = replaced;
+    }
+    out
+}
+
 /// Drop a helper definition whose function is never CALLED. `echo_esc`
 /// is registered as a dependency of `print_words`/`printf` at helper-add
 /// time, before the renderer knows whether the program actually needs
@@ -521,11 +1167,14 @@ fn prune_unused_helpers(text: String) -> String {
 /// touches only a few — e.g. a constant `print()` — the rest are dead
 /// weight that makes the output look nothing like handwriting. Each is
 /// declared on exactly one line; if the identifier appears on no other
-/// line, the declaration goes.
+/// line, the declaration goes. User-var `__SHV_*` statics orphaned by a
+/// native loop binding (the loop var reads through the binding, no
+/// writeback escaped) go by the same rule.
 ///
 /// Soundness: a static is only removed when its NAME is absent from the
 /// rest of the file, so no reference can dangle. (Helper bodies are
-/// self-contained and only reach a static by name.)
+/// self-contained and only reach a static by name; user-var statics are
+/// only ever referenced by renderer-emitted reads/writes.)
 fn prune_unused_statics(text: String) -> String {
     const STATICS: &[&str] = &[
         "__SH_RC", "__SH_ARGV", "__SH_OUT", "__SH_OUTFILE_TL", "__SH_STDIN",
@@ -533,22 +1182,46 @@ fn prune_unused_statics(text: String) -> String {
         "__SH_TRAPS", "__SH_BGPID", "__SH_ARITH_ERR", "__SH_ARITH_WORD_FAIL",
         "__SH_RET",
     ];
+    /// A user-var declaration line yields its static name: the
+    /// `thread_local! { static __SHV_<base>: … }` shape `decl_stmt`
+    /// emits (never a bare `static`, which is reserved for the runtime
+    /// atomics above).
+    fn user_static(line: &str) -> Option<String> {
+        let mut rest = line
+            .trim_start()
+            .strip_prefix("thread_local! { ")?;
+        // `decl_stmt` puts a per-item allow inside the block
+        if let Some(after) = rest.strip_prefix("#[allow(") {
+            rest = after.split(']').nth(1)?.trim_start();
+        }
+        rest = rest.strip_prefix("static ")?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (name.starts_with("__SHV_") && rest[name.len()..].starts_with(':')).then_some(name)
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut drop: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         // only the declaration line itself (`static NAME: …` or the
         // `thread_local! { static NAME: … }` wrapper)
         let t = line.trim_start();
-        let name = STATICS.iter().find(|n| {
+        let name: String = match STATICS.iter().find(|n| {
             t.starts_with(&format!("static {n}:"))
                 || t.starts_with(&format!("thread_local! {{ static {n}:"))
-        });
-        let Some(name) = name else { continue };
+        }) {
+            Some(n) => n.to_string(),
+            None => match user_static(line) {
+                Some(n) => n,
+                None => continue,
+            },
+        };
         // the identifier must not appear on any OTHER line (word-bounded,
         // so `__SH_OUT` is not matched by `__SH_OUTFILE_TL`)
         let used = lines.iter().enumerate().any(|(j, l)| {
             j != i
-                && l.match_indices(name).any(|(k, _)| {
+                && l.match_indices(name.as_str()).any(|(k, _)| {
                     let before = l[..k].chars().last();
                     let after = l[k + name.len()..].chars().next();
                     !before.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
@@ -598,6 +1271,16 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // STATIC ARRAY VERDICT (shared analysis): literal-list arrays that are
     // only read as a whole list can use a borrowed representation.
     r.static_arrays = Some(crate::shir::analyze_static_arrays(&prog));
+    {
+        // the shared verdict requires an int *consumer* (a reduction or
+        // no read at all); a strict element read is int-safe in this
+        // backend (home-aware strict reader) but invisible to it, so an
+        // element-read int list (t21 `a = [1,2,3]; print(a[1])`) would
+        // stay `Vec<String>`. Union the local element-read verdict in.
+        let mut ints = crate::shir::analyze_int_arrays(&prog);
+        ints.extend(int_index_arrays(&prog));
+        r.int_arrays = ints;
+    }
     r.loop_var_escapes = Some(crate::shir::analyze_loop_var_escapes(&prog));
     // Run the shared constant-echo lowering here too: this entry point
     // renders from IR without running `Pipeline::canonical`, so the
@@ -620,6 +1303,14 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     let text = inline_sinks_when_unused(text, r.runtime_free);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
+    // `-Oz` golf: strip comments/whitespace and shorten every
+    // renderer-owned identifier. Runs LAST (after all pruning passes,
+    // so only live names enter the short pool).
+    let text = if crate::shir::golf_enabled() {
+        golf_rust(&text)
+    } else {
+        text
+    };
     // Post-render guard: a pass-2 local must never be referenced through
     // its (undeclared) static name — the failure would otherwise surface
     // as a confusing rustc error, or silently bind a different static.
@@ -649,8 +1340,8 @@ impl Render {
     /// (joins/scopes), no diverts, no user-function calls (a callee may
     /// read the caller's status). Helpers never touch `__SH_RC`
     /// (audited), so anything else is straight-line w.r.t. status.
-    fn rc_plain(line: &str) -> bool {
-        !(line.contains("__SH_RC.load")
+    fn rc_plain(&self, line: &str) -> bool {
+        if line.contains("__SH_RC.load")
             || line.contains('{')
             || line.contains('}')
             || line.contains("break")
@@ -658,7 +1349,29 @@ impl Render {
             || line.contains("return")
             || line.contains("process::exit")
             || line.contains("=>")
-            || line.contains("__sh_fn_"))
+            || line.contains("__sh_fn_")
+        {
+            return false;
+        }
+        // a user function keeps its own (non-namespaced) name: a call to
+        // it is `f(...)` / `f();` — never plain w.r.t. the status
+        // register (the callee may observe or write it).
+        for f in &self.functions {
+            let mut from = 0;
+            while let Some(i) = line[from..].find(f.as_str()) {
+                let at = from + i;
+                let before_ok = at == 0
+                    || !line.as_bytes()[at - 1].is_ascii_alphanumeric()
+                        && line.as_bytes()[at - 1] != b'_';
+                let after = line[at + f.len()..].chars().next();
+                let after_ok = after == Some('(');
+                if before_ok && after_ok {
+                    return false;
+                }
+                from = at + f.len();
+            }
+        }
+        true
     }
 
     fn emit(&mut self, s: &str) {
@@ -668,18 +1381,18 @@ impl Render {
         // join, divert, or call) — remove it. Stateless by design: no
         // cursor survives the output-buffer takes/restores, and a scope
         // crossing always stops the scan.
-        if s.contains("__SH_RC.store(") && Self::rc_plain(s) {
+        if s.contains("__SH_RC.store(") && self.rc_plain(s) {
             let mut idx = self.out.len();
             while idx > 0 {
                 idx -= 1;
                 let prev = self.out[idx].as_str();
                 if prev.contains("__SH_RC.store(") {
-                    if Self::rc_plain(prev) {
+                    if self.rc_plain(prev) {
                         self.out.remove(idx);
                     }
                     break;
                 }
-                if !Self::rc_plain(prev) {
+                if !self.rc_plain(prev) {
                     break;
                 }
             }
@@ -798,7 +1511,17 @@ impl Render {
     fn fn_ident(&mut self, name: &str) -> String {
         // snake_case + a `__sh_`-prefixed namespace (helper fns live in
         // `__sh_*`; user fns must not collide with them).
-        format!("__sh_fn_{}", self.ident_base(name))
+        let base = self.ident_base(name);
+        // A user function whose (snake_case) name is owned by a renderer
+        // helper (`puts`, `run`, `cat`, `lines`, ...) or by the runtime
+        // statics (`in_function`-style names never land here; these do)
+        // keeps the namespaced form. Everything else is emitted verbatim:
+        // `def f()` renders as `fn f()`, not `fn __sh_fn_f()`.
+        if HELPER_ORDER.contains(&base.as_str()) || RUNTIME_FN_NAMES.contains(&base.as_str()) {
+            format!("__sh_fn_{base}")
+        } else {
+            base
+        }
     }
 
     /// Strip one fully-enclosing matched `( … )` pair (safe in any
@@ -957,6 +1680,10 @@ impl Render {
             || m.starts_with("sh2_")
             || m.starts_with("_sh2")
             || m.to_ascii_lowercase().starts_with("__sh")
+            // golf (`-Oz`) renames every `__`-owned identifier into a
+            // `__`-prefixed short pool: a bare pass-2 local starting
+            // with `__` could spell a pool name, so mangle it away
+            || (crate::shir::golf_enabled() && m.starts_with("__"))
         {
             m.push('_');
         }
@@ -1033,6 +1760,13 @@ impl Render {
         self.arrays.contains(name)
     }
 
+    /// An int-homed index array (`Vec<i64>` storage — the shared
+    /// `analyze_int_arrays` verdict: all-integer writes, int-safe reads
+    /// only). Never an assoc map (separate storage family).
+    fn is_int_array(&self, name: &str) -> bool {
+        self.int_arrays.contains(name) && !self.assoc.contains(name)
+    }
+
     fn is_assoc(&self, name: &str) -> bool {
         self.assoc.contains(name)
     }
@@ -1075,10 +1809,9 @@ impl Render {
             return l.clone();
         }
         // pass-6: a native loop binding holds the current value
-        if let Some((v, b, _)) = self.active_loop.clone() {
-            if v == name {
-                return b;
-            }
+        // (innermost first — a nested loop shadows the outer)
+        if let Some((_, b, _)) = self.active_loop.iter().rev().find(|(v, _, _)| *v == name).cloned() {
+            return b;
         }
         // positionals ($1, ...) read argv (tls undeclared by design).
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
@@ -1106,11 +1839,15 @@ impl Render {
             return l.clone();
         }
         // a native `&str` loop binding: borrow the element directly —
-        // no thread-local store/load round-trip for the value
-        if let Some((v, b, LoopBind::Str)) = self.active_loop.clone() {
-            if v == name {
-                return format!("{b}.to_string()");
+        // no thread-local store/load round-trip for the value. When the
+        // binding IS the loop var's own name, hand it over bare: `{}`
+        // formats `&str` directly, so `.to_string()` would be a
+        // redundant clone.
+        if let Some((v, b, LoopBind::Str)) = self.active_loop.iter().rev().find(|(v, _, k)| *v == name && *k == LoopBind::Str).cloned() {
+            if v == b {
+                return b;
             }
+            return format!("{b}.to_string()");
         }
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
@@ -1139,6 +1876,13 @@ impl Render {
 
     fn read_arr(&mut self, name: &str) -> String {
         let m = self.tls(name);
+        // an int home read into a `Vec<String>` context stringifies per
+        // element (keeps every word-list consumer compiling); the verdict
+        // guarantees no such consumer exists for a homed array, so this
+        // is dead-defensive, never live.
+        if self.is_int_array(name) {
+            return format!("{m}.with(|v| v.borrow().iter().map(|n| n.to_string()).collect::<Vec<String>>())");
+        }
         format!("{m}.with(|v| v.borrow().clone())")
     }
 
@@ -1194,6 +1938,12 @@ impl Render {
 
     fn push_arr(&mut self, name: &str, e: &str) -> String {
         let m = self.tls(name);
+        if self.is_int_array(name) {
+            return format!(
+                "{m}.with(|v| v.borrow_mut().push(({}).trim().parse::<i64>().unwrap_or(0)));",
+                Self::unparen(e)
+            );
+        }
         format!("{m}.with(|v| v.borrow_mut().push({}));", Self::unparen(e))
     }
 
@@ -1215,7 +1965,12 @@ impl Render {
     /// Python-strict index (`xs[i]`): negative wraps (`len+k`), OOB
     /// aborts exit(1) (IndexError; prior output stands). Shell never emits
     /// Index nodes (uses param strings), so this path is Python-only.
+    /// An int-homed array (`Vec<i64>`) reads through `array_index_num`;
+    /// this `String` form stays for text homes.
     fn array_index_strict(&mut self, var: &str, key: &str) -> String {
+        if self.is_int_array(var) {
+            return format!("({}).to_string()", self.array_index_num(var, key));
+        }
         let m = self.tls(var);
         // key is i64 expr (may be negative); len from Vec.
         format!(
@@ -1223,6 +1978,19 @@ impl Render {
                let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
                if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
                {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+        )
+    }
+
+    /// Numeric strict-index read (`Vec<i64>` home): the same
+    /// negative-wrap / OOB-exit(1) semantics as `array_index_strict`,
+    /// yielding the i64 element directly (Copy — no clone, no parse).
+    fn array_index_num(&mut self, var: &str, key: &str) -> String {
+        let m = self.tls(var);
+        format!(
+            "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+               let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+               if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
+               {m}.with(|v| v.borrow()[__idx as usize]) }}"
         )
     }
 
@@ -1241,8 +2009,17 @@ impl Render {
 
     /// Array element write (index arrays; grows as needed). The value is
     /// evaluated BEFORE the borrow (a self-referential read would panic).
+    /// An int home stores the value's numeric reading — the same
+    /// `trim().parse().unwrap_or(0)` rule every int-safe consumer
+    /// applies, so a stored string and its later read agree exactly.
     fn array_elem_set(&mut self, name: &str, key: &str, val: &str) -> String {
         let m = self.tls(name);
+        if self.is_int_array(name) {
+            return format!(
+                "{{ let __val: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+                 if b.len() <= i {{ b.resize(i + 1, 0); }} b[i] = __val; }}); }}"
+            );
+        }
         format!(
             "{{ let __val = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
              if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = __val; }}); }}"
@@ -1486,6 +2263,11 @@ impl Render {
                 self.add_helper("pow");
                 format!("__sh_pow({}, {})", self.expr_num(lhs), self.expr_num(rhs))
             }
+            IrExpr::Index { var, key } if self.is_int_array(var) => {
+                // int home: the element is already i64 (no parse)
+                let k = self.expr_num(key);
+                self.array_index_num(var, &k)
+            }
             IrExpr::BinOp { lhs, op, rhs } => {
                 format!(
                     "({} {} {})",
@@ -1519,6 +2301,17 @@ impl Render {
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
+                        // int home: the elements ARE i64 — no per-element
+                        // parse (t92 `max(xs)` over a literal int list)
+                        if self.is_int_array(name) {
+                            if func == "sum" {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>() }}");
+                            } else if func == "max" {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().unwrap_or(0) }}");
+                            } else {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().unwrap_or(0) }}");
+                            }
+                        }
                         if func == "sum" {
                             format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
                         } else if func == "max" {
@@ -3840,9 +4633,25 @@ impl Render {
                 // numeric reduction over Vec<String> (t94 `sum(xs)`).
                 // BigInt (t93 mixed i64+bigint; i64 truncates huge).
                 // Empty: sum=0; max/min empty (Python raises; documented).
+                // Int home: the elements ARE i64 — reduce natively.
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
+                        if self.is_int_array(name) {
+                            let op = if func == "sum" {
+                                "__vv.iter().copied().sum::<i64>().to_string()"
+                            } else if func == "max" {
+                                "__vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default()"
+                            } else {
+                                "__vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default()"
+                            };
+                            let mut s = String::from("vec![{ let __vv = ");
+                            s.push_str(&m);
+                            s.push_str(".with(|v| v.borrow().clone()); ");
+                            s.push_str(op);
+                            s.push_str(" }] ");
+                            return s;
+                        }
                         let op = if func == "sum" {
                             "let mut __acc = num_bigint::BigInt::from(0); for __e in __vv.iter() { __acc += __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); } __acc.to_string()"
                         } else if func == "max" {
@@ -3865,8 +4674,10 @@ impl Render {
             }
             "sortedIntJoin" => {
                 // sorted int-list print `[1, 2, ...]` (t86 `sorted()`).
-                // Args[0] = Vec<String> var name. Numeric sort (parse;
-                // unparseable sorts as 0 — t86 all numeric).
+                // Args[0] = Vec<String> var name — or Vec<i64> when
+                // int-homed (sort natively, stringify for the join).
+                // Numeric sort (parse; unparseable sorts as 0 — t86 all
+                // numeric).
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
@@ -3875,6 +4686,13 @@ impl Render {
                         // formatted element, matching the print-words shape).
                         let mut s = String::from("vec![{ let mut __sv = ");
                         s.push_str(&m);
+                        if self.is_int_array(name) {
+                            s.push_str(".with(|v| v.borrow().clone()); ");
+                            s.push_str("__sv.sort_unstable(); ");
+                            s.push_str("__sv.dedup(); ");
+                            s.push_str("__sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }] ");
+                            return s;
+                        }
                         s.push_str(".with(|v| v.borrow().clone()); ");
                         s.push_str("__sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); ");
                         // set semantics: dedupe (numeric equality; t88 sqrt
@@ -5427,6 +6245,31 @@ impl Render {
             return;
         }
         self.arrays.insert(name.to_string());
+        // INT ARRAY: every write is integer-domain and every read is
+        // int-safe, so the init is a numeric literal vec — no
+        // `__sh_cat`, no per-element `.to_string()`. Element texts are
+        // parsed here at render time with the verdict's own rule
+        // (`trim().parse::<i64>()`); an unparseable text (impossible —
+        // the verdict proved every element) falls back to 0.
+        if self.is_int_array(name) {
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                let lits: Vec<String> = items
+                    .iter()
+                    .map(|t| match t {
+                        IrExpr::Int(n) => n.to_string(),
+                        IrExpr::Str(s, _) => s
+                            .trim()
+                            .parse::<i64>()
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|_| "0".to_string()),
+                        _ => "0".to_string(),
+                    })
+                    .collect();
+                let stmt = self.write_arr(name, &format!("vec![{}]", lits.join(", ")));
+                self.emit(&stmt);
+                return;
+            }
+        }
         // STATIC ARRAY: every element is a compile-time literal and the
         // array is only read as a whole list, so the init is a literal
         // slice — no `__sh_cat`, no per-element `vec![…]` wrapper.
@@ -5469,6 +6312,14 @@ impl Render {
         };
         self.add_helper("cat");
         let m = self.tls(name);
+        if self.is_int_array(name) {
+            // int home: parse each pushed word once, on the way in
+            self.emit(&format!(
+                "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w.trim().parse::<i64>().unwrap_or(0)); }} }});",
+                items.join(", ")
+            ));
+            return;
+        }
         self.emit(&format!(
             "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w); }} }});",
             items.join(", ")
@@ -6211,6 +7062,15 @@ impl Render {
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
+                        if self.is_int_array(name) {
+                            if func == "sum" {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>().to_string() }}");
+                            } else if func == "max" {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default() }}");
+                            } else {
+                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default() }}");
+                            }
+                        }
                         if func == "sum" {
                             format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
                         } else if func == "max" {
@@ -6228,6 +7088,12 @@ impl Render {
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
+                        // int home: the elements ARE i64 — sort natively
+                        // and stringify only for the join (t86 `sorted()`
+                        // over an int-homed factor list)
+                        if self.is_int_array(name) {
+                            return format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_unstable(); __sv.dedup(); __sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }}");
+                        }
                         format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sv.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
@@ -6876,13 +7742,11 @@ impl Render {
                                 .trim_end_matches(';')
                                 .to_string();
                             self.emit(&format!("{wb};"));
-                            let old_loop = self
-                                .active_loop
-                                .replace((var.to_string(), binding, LoopBind::Num));
+                            self.active_loop.push((var.to_string(), binding, LoopBind::Num));
                             for s in body {
                                 self.stmt(s);
                             }
-                            self.active_loop = old_loop;
+                            self.active_loop.pop();
                             self.depth -= 1;
                             self.loop_depth -= 1;
                             self.emit("}");
@@ -6967,19 +7831,39 @@ impl Render {
                             let is_num = self.is_num(var);
                             // A numeric loop var must bind the PARSED
                             // value (a `&str` element cannot enter
-                            // arithmetic); a string var borrows the
-                            // element and owns it only where required.
+                            // arithmetic). A string var binds under its
+                            // OWN name when that name is a usable Rust
+                            // binding (not a keyword/mangled lookup, not
+                            // a pass-2 local shadowed here, not a
+                            // function param in scope); otherwise a
+                            // gensym with reads routed through it. Either
+                            // way owns the element only where required.
+                            let own_name = !is_num
+                                && native
+                                && self.ident_base(var) == *var
+                                && !self.local_vars.contains_key(var)
+                                && self.active_fn.is_none();
                             let binding = if native {
-                                Some(self.gensym("__sh_lv"))
+                                Some(if own_name {
+                                    var.clone()
+                                } else {
+                                    self.gensym("__sh_lv")
+                                })
                             } else {
                                 None
                             };
+                            let mut attr = String::new();
+                            if binding.as_ref().is_some_and(|b| b == var)
+                                && var.chars().any(|c| c.is_ascii_uppercase())
+                            {
+                                attr.push_str("#[allow(non_snake_case)] ");
+                            }
                             match (&binding, is_num) {
                                 (Some(b), true) => self.emit(&format!(
                                     "for {b} in {iter}.iter().map(|__s| __s.trim().parse::<i64>().unwrap_or(0)) {{"
                                 )),
                                 (Some(b), false) => {
-                                    self.emit(&format!("for {b} in {iter} {{"))
+                                    self.emit(&format!("{attr}for {b} in {iter} {{"))
                                 }
                                 (None, _) => self.emit(&format!("for {elem_g} in {iter} {{")),
                             }
@@ -7025,15 +7909,15 @@ impl Render {
                                 self.emit(&st);
                             }
                             let b = binding.clone();
-                            let old_loop = b.map(|b| {
-                                self.active_loop
-                                    .replace((var.to_string(), b, kind))
-                            });
+                            let pushed = b.is_some();
+                            if let Some(b) = b {
+                                self.active_loop.push((var.to_string(), b, kind));
+                            }
                             for s in body {
                                 self.stmt(s);
                             }
-                            if let Some(prev) = old_loop {
-                                self.active_loop = prev;
+                            if pushed {
+                                self.active_loop.pop();
                             }
                             self.depth -= 1;
                             self.loop_depth -= 1;
@@ -7818,6 +8702,12 @@ impl Render {
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
             )
+        } else if self.is_int_array(v) {
+            // int-homed index array (all-integer writes, int-safe reads
+            // only): native `Vec<i64>` storage, no string round-trip
+            format!(
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<i64>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
+            )
         } else if self.is_array(v) {
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<String>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
@@ -7896,6 +8786,13 @@ const HELPER_ORDER: &[&str] = &[
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "capture", "run_traps", "lines",
+];
+
+/// `__sh_*` names that are NOT in `HELPER_ORDER` but still own an
+/// identifier in the generated file: a user function with one of these
+/// names must keep the `__sh_fn_` namespace (see `fn_ident`).
+const RUNTIME_FN_NAMES: &[&str] = &[
+    "main", "puts", "esc", "unesc", "hexdump", "arg", "args", "argv", "spawn", "bg",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -13046,6 +13943,56 @@ mod tests {
     }
 
     #[test]
+    fn golf_strips_comments_and_shorts_names() {
+        // `-Oz` text pass: no full-line comments, no indentation, no
+        // long renderer-owned identifiers — and the result still
+        // renders the same program.
+        let out = super::golf_rust("fn __sh_print_words(ws: &[Vec<String>]) {\n    // a comment\n    let mut s = String::new();\n    print!(\"{}\", s);\n}\nfn main() {\n    __sh_print_words(&[vec![\"hi\".to_string()]], true, false);\n}\n");
+        assert!(!out.contains("//"), "comment kept:\n{out}");
+        assert!(!out.contains("__sh_print_words"), "long name kept:\n{out}");
+        assert!(!out.contains('\n') || !out.contains("    "), "indent kept:\n{out}");
+        // declaration and use renamed consistently
+        assert!(out.contains("fn __a("), "helper not shortened:\n{out}");
+        assert!(out.contains("__a(&[vec!["), "call site not renamed:\n{out}");
+    }
+
+    #[test]
+    fn golf_keeps_string_contents() {
+        // `//` and `__x` lookalikes INSIDE string literals are data,
+        // not code — the golf pass must not touch them.
+        let out = super::golf_rust("fn main() {\n    print!(\"a // b __sh_x\");\n}\n");
+        assert!(out.contains("\"a // b __sh_x\""), "string literal altered:\n{out}");
+    }
+
+    #[test]
+    fn golf_statics_stay_uppercase() {
+        // bare/`thread_local` statics without `#[allow]` rename into
+        // the UPPERCASE pool (`non_upper_case_globals` stays silent);
+        // `#[allow]`-carrying user statics take the lowercase pool.
+        let out = super::golf_rust("static __SH_RC: i32 = 0;\nthread_local! { static __SH_OUT: i32 = 0; }\nthread_local! { #[allow(non_upper_case_globals)] static __SHV_n: i32 = 0; }\nfn main() { __SH_RC; __SH_OUT; __SHV_n; }\n");
+        assert!(out.contains("static __A:"), "bare static not uppercased:\n{out}");
+        assert!(out.contains("static __B:"), "thread-local static not uppercased:\n{out}");
+        assert!(!out.contains("__SH_RC"), "runtime name kept:\n{out}");
+    }
+
+    #[test]
+    fn golf_never_merges_distinct_bindings() {
+        // t86: a renderer local already spelling a pool name (`__a`)
+        // plus a helper the pool would shorten to the same spelling —
+        // the pool must skip taken shorts so the two never merge (was:
+        // `fn __sh_fn_f` and `let __a` both becoming `__p`).
+        let out = super::golf_rust("fn __sh_fn_f(p0: i64) -> String { p0.to_string() }\nfn main() {\nlet __a: Vec<String> = vec![];\n__sh_fn_f(1);\n}\n");
+        assert!(!out.contains("__sh_fn_f"), "helper not shortened:\n{out}");
+        // count distinct `__`-spellings on the helper's decl + call:
+        // both must agree with each other and differ from the local
+        let decl = out.lines().find(|l| l.starts_with("fn __")).unwrap_or("");
+        let helper: String = decl.split(['(', ' ']).nth(1).unwrap_or("").to_string();
+        assert!(helper.starts_with("__"), "no helper decl:\n{out}");
+        assert!(out.contains(&format!("{helper}(1);")), "call site diverged:\n{out}");
+        assert_ne!(helper, "__a", "helper merged with the local:\n{out}");
+    }
+
+    #[test]
     fn exit_epilogue_elided_when_rc_zero() {
         // a constant echo leaves status 0, so the whole epilogue
         // (__SH_RC store + process::exit) is dropped and main falls off
@@ -13113,21 +14060,23 @@ mod tests {
         // A literal list (`for n in a b c`) needs no Vec and no
         // per-element clone: the shared analysis proves every element is
         // compile-time text, so the loop iterates a borrowed `[&str; 3]`
-        // literal directly.
+        // literal directly — bound under the loop var's OWN name, with
+        // reads handed over bare (`{}` formats `&str` directly).
         let out = render("for n in a b c; do echo \"$n\"; done\n");
         assert!(
-            out.contains("for __sh_lv1 in [\"a\", \"b\", \"c\"]"),
-            "no native-borrow loop binding:\n{out}"
+            out.contains("for n in [\"a\", \"b\", \"c\"]"),
+            "no native loop-var binding:\n{out}"
         );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
         assert!(!out.contains("Vec<String>"), "owned list kept:\n{out}");
-        // the loop var does not escape, so no store and no read-back
+        // the loop var does not escape, so no store and no read-back —
+        // and its static is pruned with its last use
         assert!(
-            !out.contains("__SHV_n.with(|v| *v.borrow_mut() = __sh_lv1)"),
-            "dead write-back kept:\n{out}"
+            !out.contains("__SHV_n"),
+            "dead loop-var static kept:\n{out}"
         );
         assert!(
-            out.contains("println!(\"{}\", __sh_lv1.to_string())"),
+            out.contains("println!(\"{}\", n)"),
             "read not bound to the element:\n{out}"
         );
     }
@@ -13139,7 +14088,7 @@ mod tests {
         // vetoes the elision.
         let out = render("for n in a b c; do echo \"$n\"; done\necho \"last=$n\"\n");
         assert!(
-            out.contains("__SHV_n.with(|v| *v.borrow_mut() = __sh_lv1.to_string())"),
+            out.contains("__SHV_n.with(|v| *v.borrow_mut() = n.to_string())"),
             "escaping var lost its write-back:\n{out}"
         );
     }
@@ -13150,8 +14099,25 @@ mod tests {
         // the store must stay.
         let out = render("for n in a b c; do n=\"$n!\"; echo \"$n\"; done\n");
         assert!(
-            !out.contains("for __sh_lv1 in [\"a\", \"b\", \"c\"]"),
+            !out.contains("for n in [\"a\", \"b\", \"c\"]"),
             "unsound native binding for a written loop var:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_loops_resolve_outer_binding() {
+        // Bindings stack: an inner loop must not shadow the outer
+        // binding for outer-var reads (a single-slot binding read the
+        // never-written static instead — t40 printed `0 1`).
+        let out = render("for i in 1 2; do for j in 1 2; do echo \"$i $j\"; done; done\n");
+        assert!(out.contains("__sh_lv"), "no native binding:\n{out}");
+        assert!(
+            !out.contains("__SHV_i.with(|v| v.get())"),
+            "outer read fell back to the static:\n{out}"
+        );
+        assert!(
+            !out.contains("__SHV_j.with(|v| v.get())"),
+            "inner read fell back to the static:\n{out}"
         );
     }
 
@@ -13167,10 +14133,133 @@ mod tests {
             "array init not a literal vec:\n{out}"
         );
         assert!(
-            out.contains("for __sh_lv") && out.contains("[\"a\", \"b\", \"c\"]"),
+            out.contains("for x in [\"a\", \"b\", \"c\"]"),
             "loop did not iterate the literal list:\n{out}"
         );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
+    }
+
+    #[test]
+    fn int_array_homes_numerically() {
+        // t21's shape (`a = [1,2,3]; print(a[1])` — a setArray int init
+        // with only strict `Index` reads) homes as `Vec<i64>`: numeric
+        // init, direct i64 element read, no per-element stringify/parse.
+        // The shared verdict alone leaves this text-homed (an element
+        // read is not an int *consumer*); the backend-local
+        // element-read verdict unions in. Built by hand: only the Python
+        // frontend emits strict `Index` nodes.
+        let set_array = || IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![
+                IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![
+                    IrExpr::Str("1".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Str("2".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Str("3".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                ]),
+            ],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "a".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: set_array(),
+                    asm: None,
+                },
+                IrStmt::Output {
+                    value: IrExpr::Index {
+                        var: "a".to_string(),
+                        key: Box::new(IrExpr::Int(1)),
+                    },
+                    newline: true,
+                    target: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![("a".to_string(), crate::ir::IrType::Str)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_rust(&prog);
+        assert!(
+            out.contains("RefCell<Vec<i64>>"),
+            "no numeric home:\n{out}"
+        );
+        assert!(
+            out.contains("vec![1, 2, 3]"),
+            "init not numeric:\n{out}"
+        );
+        assert!(
+            !out.contains(".to_string(), \"2\".to_string()"),
+            "stringified init kept:\n{out}"
+        );
+        assert!(
+            !out.contains(".borrow()[__idx as usize].clone()"),
+            "string element read kept:\n{out}"
+        );
+    }
+
+    #[test]
+    fn int_array_vetoes_string_use() {
+        // A whole-list string read (`join`) vetoes the numeric home —
+        // the array stays `Vec<String>`.
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "a".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "setArray".to_string(),
+                        args: vec![
+                            IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![
+                                IrExpr::Str("1".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                                IrExpr::Str("2".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                            ]),
+                        ],
+                    },
+                    asm: None,
+                },
+                IrStmt::Output {
+                    value: IrExpr::Call {
+                        func: "join".to_string(),
+                        args: vec![IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                    },
+                    newline: true,
+                    target: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![("a".to_string(), crate::ir::IrType::Str)],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_rust(&prog);
+        assert!(
+            !out.contains("RefCell<Vec<i64>>"),
+            "string-used array homed numerically:\n{out}"
+        );
     }
 
     #[test]
@@ -13379,6 +14468,41 @@ mod tests {
         let out = render("type=$1\necho \"$type\"\n");
         assert!(out.contains("type_"), "{out}");
         assert!(!out.contains("__SHV_type"), "{out}");
+    }
+
+    /// A user function keeps its own name (`def f()` → `fn f`), not the
+    /// `__sh_fn_` namespace. Regression for the py frontend's t22
+    /// (`def f(): ...` + `f()`), where the emitted Rust read
+    /// `fn __sh_fn_f()`.
+    #[test]
+    fn user_function_name_survives() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[],"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"in-func","style":"DoubleQuoted"}]}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Spawn","args":[{"type":"Str","value":"f","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t22 A1 ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("fn f() -> String"), "verbatim user fn name:\n{out}");
+        assert!(!out.contains("__sh_fn_f"), "no namespace rename:\n{out}");
+        // main is emitted BEFORE the function bodies (rustc needs no
+        // forward declaration; the CALL site is inside main)
+        let main_at = out.find("fn main()").expect("main");
+        let f_at = out.find("fn f() -> String").expect("fn f");
+        assert!(main_at < f_at, "definitions follow main:\n{out}");
+    }
+
+    /// A user function that collides with a renderer helper (`puts`) keeps
+    /// the `__sh_fn_` namespace — otherwise `fn puts` would clash with the
+    /// generated `__sh_puts` *and* the user name.
+    #[test]
+    fn helper_colliding_function_is_namespaced() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"puts","params":[],"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Spawn","args":[{"type":"Str","value":"puts","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("fn __sh_fn_puts"), "collision keeps namespace:\n{out}");
     }
 }
 

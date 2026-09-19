@@ -1352,7 +1352,7 @@ impl Render {
             _ => {
                 if self.funcs.contains(func) {
                     let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                    format!("{}({})", ident(func), a.join(", "))
+                    format!("{}({})", fn_name(func), a.join(", "))
                 } else {
                     self.mark_todo(&format!("call {func}"));
                     "0".into()
@@ -1417,7 +1417,7 @@ impl Render {
         };
         if self.funcs.contains(&cmd) {
             let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
-            return format!("{}({})", ident(&cmd), a.join(", "));
+            return format!("{}({})", fn_name(&cmd), a.join(", "));
         }
         let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
         for w in &words {
@@ -1588,7 +1588,7 @@ impl Render {
             _ => {
                 if self.funcs.contains(&cmd) {
                     let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
-                    self.emit(&format!("{}({});", ident(&cmd), a.join(", ")));
+                    self.emit(&format!("{}({});", fn_name(&cmd), a.join(", ")));
                     return;
                 }
                 let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
@@ -2406,7 +2406,13 @@ impl Render {
                     return;
                 }
                 // `arr=(...)` / `arr+=(...)` arrive as Assign over a
-                // setArray/setArrayAppend call — emit the store directly
+                // setArray/setArrayAppend call — emit the store directly.
+                // setArray / setArrayAppend already render a complete
+                // array statement (`@x = (...)` / `push @x, ...`), so
+                // wrapping it in the scalar target below would emit
+                // `$x = (push @x, ...)` — a scalar `$x` that was never
+                // declared (strict) and an append that returns the new
+                // length, not the array.
                 if let IrExpr::Call { func, args: _ } = expr {
                     if func == "setArray" || func == "setArrayAppend" {
                         let x = self.expr(expr);
@@ -2592,7 +2598,7 @@ impl Render {
                 self.funcs.insert(name.clone());
                 let saved = self.in_func;
                 self.in_func += 1;
-                self.emit(&format!("sub {} {{", ident(name)));
+                self.emit(&format!("sub {} {{", fn_name(name)));
                 self.depth += 1;
                 for s in body {
                     self.stmt(s);
@@ -2798,7 +2804,7 @@ impl Render {
         self.funcs.insert(s.name.clone());
         let saved = self.in_func;
         self.in_func += 1;
-        self.emit(&format!("sub {} {{", ident(&s.name)));
+        self.emit(&format!("sub {} {{", fn_name(&s.name)));
         self.depth += 1;
         for st in &s.body {
             self.stmt(st);
@@ -2903,6 +2909,56 @@ fn ident(name: &str) -> String {
     }
     out
 }
+
+/// A Perl function name. Unlike `ident` (the variable namespace), a
+/// user sub keeps its name unless it collides with a Perl builtin or a
+/// runtime helper (`__sh_*` is reserved by the preamble): `def f()`
+/// renders as `sub f`, not `sub __sh_fn_f`.
+fn fn_name(name: &str) -> String {
+    let base = ident(name);
+    if PERL_RESERVED_SUB.contains(&base.as_str()) || base.starts_with("sh2_") || base.starts_with("__sh") {
+        format!("__sh_fn_{base}")
+    } else {
+        base
+    }
+}
+
+/// Perl builtins / pragma names that would collide with a generated
+/// `sub <name>` (a `sub print` is a hard error, `sub sort`/`sub map`
+/// silently shadow the builtin).
+const PERL_RESERVED_SUB: &[&str] = &[
+    "abs", "accept", "alarm", "and", "atan2", "bind", "binmode", "bless", "break",
+    "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",
+    "closedir", "connect", "continue", "cos", "crypt", "dbmclose", "dbmopen",
+    "defined", "delete", "die", "do", "dump", "each", "else", "elsif", "endgrent",
+    "endhostent", "endnetent", "endprotoent", "endpwent", "endservent", "eof",
+    "eval", "evalbytes", "exec", "exists", "exit", "exp", "fc", "fcntl", "fileno",
+    "flock", "fork", "format", "formline", "getc", "getgrent", "getgrgid",
+    "getgrnam", "gethostbyaddr", "gethostbyname", "gethostent", "getlogin",
+    "getnetbyaddr", "getnetbyname", "getnetent", "getpeername", "getpgrp",
+    "getppid", "getpriority", "getprotobyname", "getprotobynumber", "getprotoent",
+    "getpwent", "getpwnam", "getpwuid", "getservbyname", "getservbyport",
+    "getservent", "getsockname", "getsockopt", "given", "glob", "gmtime", "goto",
+    "grep", "hex", "if", "index", "int", "ioctl", "join", "keys", "kill", "last",
+    "lc", "lcfirst", "length", "link", "listen", "local", "localtime", "lock",
+    "log", "lstat", "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd",
+    "my", "next", "no", "not", "oct", "open", "opendir", "or", "ord", "our",
+    "pack", "package", "pipe", "pop", "pos", "print", "printf", "prototype",
+    "push", "q", "qq", "qr", "quotemeta", "qw", "qx", "rand", "read",
+    "readdir", "readline", "readlink", "readpipe", "recv", "redo", "ref",
+    "rename", "require", "reset", "return", "reverse", "rewinddir", "rindex",
+    "rmdir", "say", "scalar", "seek", "seekdir", "select", "semctl", "semget",
+    "semop", "send", "setgrent", "sethostent", "setnetent", "setpgrp",
+    "setpriority", "setprotoent", "setpwent", "setservent", "setsockopt",
+    "shift", "shmctl", "shmget", "shmread", "shmwrite", "shutdown", "sin",
+    "sleep", "socket", "socketpair", "sort", "splice", "split", "sprintf",
+    "sqrt", "srand", "stat", "state", "study", "sub", "substr", "symlink",
+    "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite", "tell",
+    "telldir", "tie", "tied", "time", "times", "truncate", "uc", "ucfirst",
+    "umask", "undef", "unlink", "unpack", "unshift", "untie", "use", "utime",
+    "values", "vec", "wait", "waitpid", "wantarray", "warn", "when", "while",
+    "write", "x", "xor", "y",
+];
 
 /// Shell single-quote a literal (no Perl interpolation in the qx string).
 fn shell_squote(s: &str) -> String {

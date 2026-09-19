@@ -2191,6 +2191,29 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             return;
                         }
                     }
+                    if func == "setArrayAppend" {
+                        // Array append: arr+=(a b c) → push @arr, ('a','b','c');
+                        // Distinct from setArray: the existing elements must
+                        // SURVIVE. Rendering it through the scalar fallback
+                        // would emit `$arr = setArrayAppend(...)` — a scalar
+                        // that was never declared (strict) and no append.
+                        if let IrExpr::Call { args, .. } = expr {
+                            let elems: Vec<&IrExpr> = if args.len() >= 2 {
+                                if let IrExpr::Array(elems) = &args[1] {
+                                    elems.iter().collect()
+                                } else {
+                                    args[1..].iter().collect()
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let items: Vec<String> =
+                                elems.iter().map(|e| render_word_list(*e)).collect();
+                            emit_indent(out, indent);
+                            out.push_str(&format!("push @{}, ({});\n", var, items.join(", ")));
+                            return;
+                        }
+                    }
                     if func == "capture" {
                         // Modern-IR command substitution: Assign{var, capture(…)}
                         // — rebuild the shell command and capture its stdout.
@@ -2287,7 +2310,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::Declare { vars, init, local } => {
-            let kw = if *local { "local" } else { "my" };
+            // `local` in the A1 is NOT Perl's `local`: it marks the
+            // bash/C `local NAME` declaration of a function-scoped fresh
+            // binding, and the Perl model realizes it as a fresh `my`
+            // (shadows the hoisted top-level lexical for the call).
+            // Emitting Perl `local` here is wrong twice over: it is a
+            // compile error on the `my`-scoped hoisted vars ("Can't
+            // localize lexical variable $x") and it would alias a
+            // package global for vars the backend declares as lexicals.
+            let _ = local;
+            let kw = "my";
             let decls = vars
                 .iter()
                 .map(|d| match d.sigil.unwrap_or(Sigil::Scalar) {
@@ -2300,11 +2332,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             if let Some(init_expr) = init {
                 let rhs = ir_expr_to_perl(init_expr);
                 emit_indent(out, indent);
-                // `local` always uses the `local $var = expr;` form.
-                // `my`: single scalar can omit parentheses: "my $x = expr;"
-                if *local
-                    || (vars.len() == 1 && vars[0].sigil.unwrap_or(Sigil::Scalar) == Sigil::Scalar)
-                {
+                // single scalar can omit parentheses: "my $x = expr;"
+                if vars.len() == 1 && vars[0].sigil.unwrap_or(Sigil::Scalar) == Sigil::Scalar {
                     out.push_str(&format!("{} {} = {};\n", kw, decls, rhs));
                 } else {
                     out.push_str(&format!("{} ({}) = ({});\n", kw, decls, rhs));
@@ -4753,6 +4782,13 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             // inside the sub (shadows the hoisted lexical for the call).
             // The parser may split the assignment: `data_type=` + `$1`
             // (two words) — join them.
+            //
+            // It must be `my`, not `local`: the hoisted top-level
+            // lexicals are `my`-scoped (`my $n;`), and `local $n` on a
+            // lexical is a compile error ("Can't localize lexical
+            // variable $n"). `local` is only valid on package globals
+            // (`local @ARGV`, `local *STDERR`), never on the hoisted
+            // user vars — whose names are surfaced verbatim.
             let mut i = 0;
             while i < words.len() {
                 let Some(word_str) = call_arg_str(words[i]) else {
@@ -8513,6 +8549,63 @@ mod tests {
             r2.refusals.iter().any(|x| x.contains("function")),
             "function def must be refused: {:?}",
             r2.refusals
+        );
+    }
+
+    /// A `def f(): ...` + `f()` call keeps the user's sub name and emits
+    /// the sub BEFORE the call — the py frontend's t22 shape. Regression
+    /// for `sub __sh_fn_f` (the name must be surfaced verbatim) and for
+    /// the `local`/array-append lowering that used to abort the run.
+    #[test]
+    fn py_function_def_keeps_name_and_order() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[],"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"in-func","style":"DoubleQuoted"}]}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Spawn","args":[{"type":"Str","value":"f","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t22 A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(perl.contains("sub f {"), "verbatim sub name:\n{perl}");
+        assert!(!perl.contains("__sh_fn_f"), "no namespace rename:\n{perl}");
+        let sub_at = perl.find("sub f {").expect("sub");
+        let call_at = perl.find("\nf();").expect("call");
+        assert!(sub_at < call_at, "definition precedes the call:\n{perl}");
+    }
+
+    /// An A1 `Declare { local: true }` (the py/C `local NAME` lowering)
+    /// must NOT become Perl `local`: the hoisted vars are `my`-scoped
+    /// lexicals, and `local $x` on a lexical is a compile error
+    /// ("Can't localize lexical variable"). Regression for t86.
+    #[test]
+    fn declare_local_stays_my_scoped() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[],"body":[
+                {"type":"Declare","vars":[{"name":"n","sigil":null}],"init":null,"local":true},
+                {"type":"Assign","targets":[{"var":"n","sigil":null,"indices":[]}],"expr":{"type":"Int","value":1}},
+                {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"n","style":"DoubleQuoted"}]}]}]}}
+            ]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(perl.contains("my $n;"), "local Declare → my:\n{perl}");
+        assert!(!perl.contains("local $n"), "never Perl local on a lexical:\n{perl}");
+    }
+
+    /// `arr+=(x)` arrives as an Assign over `setArrayAppend`: it must
+    /// render as a real Perl `push @arr` (appending), not the scalar
+    /// fallback `$arr = setArrayAppend(...)` (an undeclared scalar under
+    /// strict, and no append). Regression for t86.
+    #[test]
+    fn set_array_append_is_a_push() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"xs","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"xs","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}},
+            {"type":"Assign","targets":[{"var":"xs","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArrayAppend","purity":"Emulable","args":[{"type":"Str","value":"xs","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Int","value":7}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(perl.contains("push @xs, (7);"), "append is a push:\n{perl}");
+        assert!(
+            !perl.contains("$xs = setArrayAppend"),
+            "no scalar fallback:\n{perl}"
         );
     }
 }
