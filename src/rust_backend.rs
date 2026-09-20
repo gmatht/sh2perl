@@ -227,6 +227,13 @@ pub struct Render {
     /// pre-order `For` counter: must advance in the SAME order as
     /// `analyze_loop_var_escapes`' walk (both are source order).
     for_seq: usize,
+    /// A user-var `thread_local!` declaration is emitted at the module
+    /// root, where an explicit `#[allow(non_upper_case_globals)]`
+    /// attribute is legal. A program with NO user var (all locals, or a
+    /// var-free straight-line script) skips it — the drop-in `decl_stmt`
+    /// carries no attribute then (that only matters when the rendered
+    /// statics are wrapped in a `mod`, where the attribute is rejected).
+    attrs_ok: bool,
     todo: usize,
 }
 
@@ -8537,6 +8544,14 @@ impl Render {
         let mut decl_out = Vec::new();
         std::mem::swap(&mut self.out, &mut decl_out);
         self.depth = 0;
+        // A user-var `thread_local!` declaration is a module-root item, so
+        // an explicit `#[allow(non_upper_case_globals)]` on it is legal.
+        // With NO user var (all locals, or a var-free straight-line
+        // script) there is nothing to allow: the attribute would be noise
+        // on `fn main` — and an attribute on a `fn` inside a block is a
+        // hard error, so the flag is threaded into `decl_stmt` (and the
+        // main emission below).
+        self.attrs_ok = !written.is_empty();
         for v in &written {
             let d = self.decl_stmt(v);
             self.emit(&d);
@@ -8672,10 +8687,29 @@ impl Render {
                 self.emit("");
             }
         }
-        self.emit("#[allow(non_upper_case_globals)]");
-        self.emit("fn main() {");
-        self.out.extend(body_out.iter().cloned());
-        self.emit("}");
+        // The body is rendered at depth 1, so `fn main() {` is emitted
+        // here. When the body is a SINGLE statement, the `}` it emitted
+        // sits in the same buffer line as the statement (the buffer is
+        // joined with `\n` afterwards) — splice the opening brace into
+        // that line so the braces stay balanced.
+        let seen_var = body_out.iter().any(|l| {
+            l.contains("__SHV_")
+                || l.contains("__SH_ASSIGN")
+                || (l.contains("fn main(") && !l.contains("fn main()"))
+        });
+        if seen_var {
+            self.emit("#[allow(non_upper_case_globals)]");
+            self.emit("fn main() {");
+            self.out.extend(body_out.iter().cloned());
+            self.emit("}");
+        } else {
+            self.depth = 0;
+            self.emit("fn main() {");
+            let head = body_out.remove(0);
+            self.out.push(format!("    {head}"));
+            self.out.extend(body_out.iter().cloned());
+            self.out.push("}".to_string());
+        }
         if !fn_out.is_empty() {
             self.emit("");
             self.out.extend(fn_out.iter().cloned());
@@ -8694,10 +8728,15 @@ impl Render {
         // a nameref's own static is still declared (dead but harmless) —
         // `unset ref` etc. may reference it before the binding renders
         let m = self.rust_ident(v);
-        // user var names are lower-case; the allow sits INSIDE the
-        // `thread_local!` block so it applies to the generated static
-        // (a per-item allow, no crate-wide suppression).
-        let a = "#[allow(non_upper_case_globals)] ";
+        // User var names are lower-case; the generated name is MANGLEABLE
+        // (`-Oz` golf renames it into a short pool), so the allow must be
+        // an explicit attribute — legal only on a module-root item, which
+        // this declaration is (see `attrs_ok`).
+        let a = if self.attrs_ok {
+            "#[allow(non_upper_case_globals)] "
+        } else {
+            ""
+        };
         if self.is_assoc(v) {
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
@@ -14503,6 +14542,46 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
         let out = shir_to_rust(&prog);
         assert!(out.contains("fn __sh_fn_puts"), "collision keeps namespace:\n{out}");
+    }
+
+    /// A program with NO user variable (a straight-line `print()` /
+    /// `echo` script) must not carry the `#[allow(non_upper_case_globals)]`
+    /// attribute on `fn main`: nothing in it is a non-upper-case global,
+    /// so the attribute is noise (and, once the statics move into a
+    /// `mod`, an attribute on a `fn` inside a block is a hard error).
+    #[test]
+    fn no_user_var_drops_the_allow_attribute() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"hello","style":"DoubleQuoted"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(!out.contains("non_upper_case_globals"), "stray allow:\n{out}");
+        assert!(out.contains("fn main() {"), "main missing:\n{out}");
+        // the braces must balance (a single-statement body shares the
+        // buffer line with its closing brace)
+        assert_eq!(
+            out.matches('{').count(),
+            out.matches('}').count(),
+            "unbalanced braces:\n{out}"
+        );
+    }
+
+    /// A user var keeps the attribute (its `thread_local!` static is
+    /// lower-case), and the declaration stays at the module root.
+    #[test]
+    fn user_var_keeps_the_allow_attribute() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"$a","style":"DoubleQuoted"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(
+            out.contains("thread_local! { #[allow(non_upper_case_globals)] static __SHV_a:"),
+            "user static lost its allow:\n{out}"
+        );
+        assert!(out.contains("fn main() {"), "main missing:\n{out}");
     }
 }
 
