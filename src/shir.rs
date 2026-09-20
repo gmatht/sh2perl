@@ -11114,6 +11114,298 @@ pub fn analyze_loop_var_escapes(prog: &IrProgram) -> HashMap<usize, bool> {
 // verdicts every consumer reads: homed native int stores, reductions).
 // Behavior-identical move; the C backend calls these.
 
+// ── argv shift-offset facts (shared shIR analysis) ────────────────────
+// A shell function that does `local desc="$1"; shift` (a CONSTANT shift,
+// exactly once, at fn top level) re-bases its positionals: post-shift
+// `$i` is pre-shift `$(i+k)` and post-shift `$@` is pre-shift `${@:k+1}`.
+// The verdict maps the function name to its constant shift amount `k`.
+//
+// Qualification is deliberately narrow, because a WRONG offset is a
+// miscompile, not a missed optimization:
+//   * exactly ONE `shift` in the body, with a CONSTANT non-negative
+//     amount (bare `shift` = 1), at the function's top level (not inside
+//     a loop/if — re-execution would shift again);
+//   * no `set --` (rebinds the whole argv), no `$#` read (its value
+//     changes under shift), no positional WRITE, no nested-function
+//     shift of the same argv;
+//   * no dynamic call that could observe argv opaquely (`eval`,
+//     `source`, `command -v`-style probes are reads, not calls — the
+//     call scan below only vetoes EXEC-position callees it cannot see
+//     through).
+// A function with no `shift` at all maps to 0 (callers may pass position
+// 0..n directly). Anything else is ABSENT from the map (conservative:
+// the legacy argv save/restore dance stays).
+pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    fn shift_amount_of(body: &[IrStmt]) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        for s in body {
+            if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+                if func != "builtin" && func != "exec" {
+                    continue;
+                }
+                let (head, words) = match args.as_slice() {
+                    [IrExpr::Str(h, _), IrExpr::Array(w)] => (h.as_str(), w.as_slice()),
+                    _ => continue,
+                };
+                if head != "shift" {
+                    continue;
+                }
+                let n = match words {
+                    [] => 1usize,
+                    [IrExpr::Int(n)] if *n >= 0 => *n as usize,
+                    [IrExpr::Str(t, _)] => match t.trim().parse::<i64>() {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                if found.replace(n).is_some() {
+                    return None; // second shift — dynamic re-base
+                }
+            }
+        }
+        found
+    }
+
+    fn body_vetoes(body: &[IrStmt], defined: &std::collections::HashSet<String>) -> bool {
+        fn walk(stmts: &[IrStmt], defined: &std::collections::HashSet<String>) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Expr(IrExpr::Call { func, args }) => {
+                        if func == "builtin" || func == "exec" {
+                            if let Some(IrExpr::Str(h, _)) = args.first() {
+                                // `set --` rebinds argv; `eval`/`source`
+                                // observe it opaquely
+                                if h == "set" {
+                                    return true;
+                                }
+                                if matches!(h.as_str(), "eval" | "source" | ".") {
+                                    return true;
+                                }
+                            }
+                            // a bare `shift` nested in a loop/if is still
+                            // top-level here (walk only descends into
+                            // bodies below) — the amount scan required
+                            // top-level position already
+                        } else if func == "getVar" {
+                            // `$#` changes under shift
+                            if matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "#") {
+                                return true;
+                            }
+                        } else if defined.contains(func) {
+                            // a nested user-function call re-reads argv
+                            // through the callee's own frame — safe (the
+                            // callee gets its own offset verdict), so do
+                            // NOT veto; just keep walking
+                        }
+                        for a in args {
+                            if expr_vetoes(a) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Assign { targets, expr, .. } => {
+                        for t in targets {
+                            // writing a positional rebinds argv
+                            if t.var.chars().all(|c| c.is_ascii_digit()) && !t.var.is_empty() {
+                                return true;
+                            }
+                        }
+                        if expr_vetoes(expr) {
+                            return true;
+                        }
+                    }
+                    IrStmt::If { cond, then, elsifs, else_ } => {
+                        if expr_vetoes(cond) {
+                            return true;
+                        }
+                        if walk(then, defined) {
+                            return true;
+                        }
+                        for (c, b) in elsifs {
+                            if expr_vetoes(c) || walk(b, defined) {
+                                return true;
+                            }
+                        }
+                        if walk(else_, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                        if expr_vetoes(cond) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { iter, body, .. } => {
+                        if expr_vetoes(iter) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { init, cond, step, body } => {
+                        if walk(init, defined) || expr_vetoes(cond) || walk(step, defined) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        // a NESTED function definition: its own frame —
+                        // walk it separately (its shift is its own)
+                        let _ = (body, named_blocks);
+                    }
+                    IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                        if walk(b, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => {
+                        if walk(inner, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            if walk(st, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body } => {
+                        if walk(body, defined)
+                            || walk(else_body, defined)
+                            || walk(finally_body, defined)
+                        {
+                            return true;
+                        }
+                        for e in excepts {
+                            if walk(&e.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Case { discriminant, clauses } => {
+                        if expr_vetoes(discriminant) {
+                            return true;
+                        }
+                        for c in clauses {
+                            if walk(&c.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            if walk(&c.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Return(e) | IrStmt::Exit(e) => {
+                        if let Some(x) = e {
+                            if expr_vetoes(x) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Output { value, .. } => {
+                        if expr_vetoes(value) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Declare { init, .. } => {
+                        if let Some(e) = init {
+                            if expr_vetoes(e) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::WriteFile { path, content, .. } => {
+                        if expr_vetoes(path) || expr_vetoes(content) {
+                            return true;
+                        }
+                    }
+                    IrStmt::DeclareArray { elements, .. } => {
+                        for e in elements {
+                            if expr_vetoes(e) {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        fn expr_vetoes(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { func, args } => {
+                    if func == "getVar" {
+                        if matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "#") {
+                            return true;
+                        }
+                    }
+                    args.iter().any(expr_vetoes)
+                }
+                IrExpr::Array(items) => items.iter().any(expr_vetoes),
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    crate::ir::InterpPart::Expr(x) => expr_vetoes(x),
+                    _ => false,
+                }),
+                IrExpr::BinOp { lhs, rhs, .. } => expr_vetoes(lhs) || expr_vetoes(rhs),
+                IrExpr::Ternary { cond, then, else_ } => {
+                    expr_vetoes(cond) || expr_vetoes(then) || expr_vetoes(else_)
+                }
+                IrExpr::DefinedOr { expr, default } => expr_vetoes(expr) || expr_vetoes(default),
+                IrExpr::Capture { expr, .. } => expr_vetoes(expr),
+                IrExpr::Arith(_) => false,
+                IrExpr::Index { key, .. } => expr_vetoes(key),
+                IrExpr::Object(props) => props.iter().any(|(_, v)| expr_vetoes(v)),
+                IrExpr::Splice(x) => expr_vetoes(x),
+                _ => false,
+            }
+        }
+        walk(body, defined)
+    }
+
+    let mut defined = std::collections::HashSet::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, .. } = s {
+            defined.insert(name.clone());
+        }
+    }
+    let mut out = HashMap::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            // no shift at all → offset 0 (callers pass positionals
+            // straight through; the renderer already does this via
+            // pass-3 signatures — the map just records it uniformly)
+            let mut has_shift = false;
+            for b in body.iter() {
+                if let IrStmt::Expr(IrExpr::Call { func, args }) = b {
+                    if (func == "builtin" || func == "exec")
+                        && matches!(args.first(), Some(IrExpr::Str(h, _)) if h == "shift")
+                    {
+                        has_shift = true;
+                        break;
+                    }
+                }
+            }
+            if !has_shift {
+                out.insert(name.clone(), 0);
+                continue;
+            }
+            let Some(k) = shift_amount_of(body) else {
+                continue;
+            };
+            if body_vetoes(body, &defined) {
+                continue;
+            }
+            out.insert(name.clone(), k);
+        }
+    }
+    out
+}
+
 pub fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
     let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let bigint_vars = analyze_bigint_vars(prog);
@@ -56166,5 +56458,156 @@ mod const_len_array_tests {
             elem_store("a", IrExpr::Int(1 + 1), "9"),
         ]));
         assert_eq!(v.get("a"), Some(&3));
+    }
+}
+
+#[cfg(test)]
+mod shift_offset_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn shift_fn(name: &str, words: Vec<IrExpr>, rest: Vec<IrStmt>) -> IrStmt {
+        let mut body = vec![IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![s("shift"), IrExpr::Array(words)],
+        })];
+        body.extend(rest);
+        IrStmt::Function {
+            name: name.to_string(),
+            body,
+            named_blocks: vec![],
+        }
+    }
+
+    fn getvar(n: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s(n)],
+        })
+    }
+
+    #[test]
+    fn bare_shift_is_offset_one() {
+        // `f() { local d=$1; shift; echo "$@" }` — const shift 1
+        let p = prog(vec![shift_fn(
+            "f",
+            vec![],
+            vec![getvar("@")],
+        )]);
+        let _ = &p.stmts;
+        assert_eq!(analyze_shift_offsets(&p).get("f"), Some(&1));
+    }
+
+    #[test]
+    fn no_shift_is_offset_zero() {
+        let p = prog(vec![IrStmt::Function {
+            name: "g".to_string(),
+            body: vec![getvar("1")],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("g"), Some(&0));
+    }
+
+    #[test]
+    fn const_shift_two() {
+        let p = prog(vec![shift_fn(
+            "h",
+            vec![IrExpr::Int(2)],
+            vec![getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("h"), Some(&2));
+    }
+
+    #[test]
+    fn dynamic_shift_vetoes() {
+        // `shift $n` — amount unknown at analysis time
+        let p = prog(vec![shift_fn(
+            "d",
+            vec![IrExpr::Var("n".to_string(), None)],
+            vec![getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("d"), None);
+    }
+
+    #[test]
+    fn double_shift_vetoes() {
+        let p = prog(vec![IrStmt::Function {
+            name: "dd".to_string(),
+            body: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+            ],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("dd"), None);
+    }
+
+    #[test]
+    fn hash_read_vetoes() {
+        // `$#` changes under shift — the offset model cannot see it
+        let p = prog(vec![shift_fn("hh", vec![], vec![getvar("#")])]);
+        assert_eq!(analyze_shift_offsets(&p).get("hh"), None);
+    }
+
+    #[test]
+    fn positional_write_vetoes() {
+        let p = prog(vec![IrStmt::Function {
+            name: "w".to_string(),
+            body: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "1".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: s("x"),
+                    asm: None,
+                },
+            ],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("w"), None);
+    }
+
+    #[test]
+    fn plain_digit_and_at_reads_are_fine() {
+        // `local d=$1; shift; cmd "$@"` — the corpus shape
+        let p = prog(vec![shift_fn(
+            "t",
+            vec![],
+            vec![getvar("1"), getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("t"), Some(&1));
     }
 }

@@ -83,6 +83,13 @@ struct FnSig {
     arity: usize,
     tys: Vec<FnParamTy>,
     used: Vec<bool>,
+    /// argv shift-offset verdict for this function (`analyze_shift_offsets`
+    /// value, only recorded when the offset is > 0 and the rest-slice
+    /// rewrite applies): the caller passes the shifted-away words as a
+    /// trailing `Vec<String>` rest param instead of swapping `__SH_ARGV`.
+    /// `arity` counts the params BEFORE the rest; the rest param is the
+    /// `(arity)`-th Rust parameter.
+    rest: Option<usize>,
 }
 
 /// Pass-3 probe record for one function-body render (legacy convention;
@@ -92,6 +99,11 @@ struct FnProbe {
     num: BTreeSet<usize>,
     str_: BTreeSet<usize>,
     wild: bool,
+    /// whole-argv reads (`$@`/`$*`) seen AFTER the const shift — the
+    /// caller supplies them as the trailing rest param.
+    rest_read: bool,
+    /// the probe rendered a shift (its amount is the offset verdict)
+    saw_shift: bool,
 }
 
 #[derive(Default)]
@@ -134,6 +146,17 @@ pub struct Render {
     /// function whose body is commit-rendering (digit reads become its
     /// params); None in main and for legacy-convention functions
     active_fn: Option<String>,
+    /// shift-offset rewrite is ACTIVE for the current function body: the
+    /// body's positionals live in params (pre-shift reads at `i`, post-shift
+    /// at `i + off`) and the whole argv after the shift is the trailing
+    /// `Vec<String>` rest param `active_rest`. Only set when the pass-3
+    /// probe committed a rest-slice signature (see `FnSig::rest`).
+    active_shift: Option<usize>,
+    /// binding name of the active rest param (`__rest`), None otherwise
+    active_rest: Option<String>,
+    /// the active rewrite's shift statement has been emitted (post-shift
+    /// positional reads re-base by the offset)
+    shift_emitted: bool,
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
@@ -203,6 +226,14 @@ pub struct Render {
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
     runtime_free: bool,
+    /// The SOURCE language has no `$?` and the program contains no status
+    /// read (`debashl::shir::exit_status_is_unobservable`): the exit
+    /// status register is unreachable from the source, so the renderer
+    /// emits NO `__SH_RC` at all — not the static, not a store, not a
+    /// load, not the `process::exit` epilogue. Set once before rendering
+    /// (`false` — the `Default` — keeps shell semantics: the historical
+    /// output, bit for bit).
+    rc_disabled: bool,
     /// STATIC ARRAY VERDICT (shared `analyze_static_arrays`): arrays whose
     /// value is a compile-time literal list and which are only ever read
     /// as a whole list. Their init renders from literals (no `__sh_cat`),
@@ -1293,6 +1324,12 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // captures, pipelines, shell-outs.) Decided BEFORE rendering so the
     // echo lowering can emit a bare `print!` directly.
     r.runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    // SOURCE-LANGUAGE STATUS VERDICT (shared): the source has no `$?` and
+    // the program reads no status — so the register this renderer carries
+    // for shell semantics is unreachable and is not emitted at all
+    // (`py -> rs` for a plain Python program: no `static __SH_RC`, no
+    // stores, no `process::exit(__SH_RC…)`). False = shell default.
+    r.rc_disabled = crate::shir::exit_status_is_unobservable(&prog);
     // STATIC ARRAY VERDICT (shared analysis): literal-list arrays that are
     // only read as a whole list can use a borrowed representation.
     r.static_arrays = Some(crate::shir::analyze_static_arrays(&prog));
@@ -1417,7 +1454,83 @@ impl Render {
         true
     }
 
+    /// Remove every reference to the exit-status register from ONE emitted
+    /// unit (`rc_disabled` only). Textual by construction: the register is
+    /// an `AtomicI32` that only ever appears as a `store(…, Ordering::SeqCst)`
+    /// side effect or a `load(Ordering::SeqCst)` value, and the arm that
+    /// emits it always keeps whichever of {the side effect, the value} the
+    /// host expression needs elsewhere (the stored value is never the
+    /// expression's only effect: shell-outs, spawns and captures all have
+    /// their own). A load becomes `0` — the register can hold nothing else
+    /// the source could have observed, and the program has no status read
+    /// by the verdict that set `rc_disabled`.
+    fn rc_strip(&self, s: &str) -> String {
+        if !self.rc_disabled || !s.contains("__SH_RC") {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("__SH_RC") {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            if tail.starts_with("__SH_RC.store(") {
+                // delete the whole call statement, optional ` { `/`;` kept
+                let Some(end) = Self::match_paren(tail, "__SH_RC.store(".len() - 1) else {
+                    out.push_str("__SH_RC");
+                    rest = &tail["__SH_RC".len()..];
+                    continue;
+                };
+                let mut after = end;
+                // swallow the trailing `;` (and any whitespace before it)
+                let bytes = tail.as_bytes();
+                let mut k = end;
+                while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b';' {
+                    after = k + 1;
+                } else {
+                    after = end;
+                }
+                rest = &tail[after..];
+            } else if tail.starts_with("__SH_RC.load(") {
+                let Some(end) = Self::match_paren(tail, "__SH_RC.load(".len() - 1) else {
+                    out.push('0');
+                    rest = &tail["__SH_RC".len()..];
+                    continue;
+                };
+                out.push('0');
+                rest = &tail[end..];
+            } else {
+                out.push_str("__SH_RC");
+                rest = &tail["__SH_RC".len()..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Index just past the `)` matching the `(` at `open` in `s`.
+    fn match_paren(s: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (i, c) in s.char_indices().skip_while(|(i, _)| *i < open) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn emit(&mut self, s: &str) {
+        let s = self.rc_strip(s);
+        let s = s.as_str();
         // pass-4: collapse a dead `__SH_RC` store. Scan back over plain
         // lines; a store found with only plain lines between it and this
         // one is unobservable (its value is overwritten before any read,
@@ -1502,6 +1615,35 @@ impl Render {
         }
     }
 
+    /// The active rewrite's trailing rest param (`Vec<String>`) if a
+    /// whole-argv read can be served from it: requires the shift-offset
+    /// rewrite to be active AND the shift to have been emitted (pre-shift
+    /// `$@` is the untouched caller argv, which the rewrite does not
+    /// model — the probe vetoes such a body before commit).
+    fn rest_param(&self) -> Option<String> {
+        if self.shift_emitted {
+            self.active_rest.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Whole-argv read (`$@`/`$*`) in the active rewrite: the rest param
+    /// when post-shift, else None (caller keeps `__SH_ARGV`). The result
+    /// is a `Vec<String>` so it drops into every word-list context
+    /// (`__sh_cat(&[..])` included).
+    fn argv_read(&mut self) -> Option<String> {
+        if self.active_shift.is_some() {
+            if let Some(r) = self.rest_param() {
+                if let Some(p) = self.probe.as_mut() {
+                    p.rest_read = true;
+                }
+                return Some(format!("{r}.to_vec()"));
+            }
+        }
+        None
+    }
+
     /// Pass-3 commit: `(base name, type)` for positional `i` when a
     /// signature is active. None in main / legacy functions / out of
     /// range (out of range is impossible: the probe saw every read of
@@ -1509,6 +1651,12 @@ impl Render {
     fn fn_param(&self, i: usize) -> Option<(String, FnParamTy)> {
         let name = self.active_fn.as_ref()?;
         let sig = self.fn_sigs.get(name)?;
+        // shift-offset rewrite: a PRE-shift positional read (`$i`) is
+        // caller arg `i` — the probe recorded it as such; a POST-shift
+        // read (`$i` after the shift) is the caller's `i + off`. The
+        // renderer only reaches this with the right index because
+        // `read_str`/`read_num` translate before calling (see
+        // `shifted_param`).
         if i >= sig.arity {
             return None;
         }
@@ -1518,6 +1666,27 @@ impl Render {
             format!("_p{i}")
         };
         Some((base, sig.tys[i]))
+    }
+
+    /// Translate a positional index for the active shift-offset rewrite:
+    /// before the shift statement runs, `$i` is caller arg `i-1` (0-based);
+    /// after it, `$i` is caller arg `i-1+off`. Returns the caller index
+    /// when the rewrite is active for this body, else None.
+    fn shifted_param(&self, i: usize) -> Option<usize> {
+        if self.active_shift.is_none() {
+            return None;
+        }
+        if self.shift_done() {
+            Some(i + self.active_shift.unwrap())
+        } else {
+            Some(i)
+        }
+    }
+
+    /// True once the (single, const) shift of the active rewrite has been
+    /// emitted — post-shift reads re-base.
+    fn shift_done(&self) -> bool {
+        self.shift_emitted
     }
 
     /// Capture the current rc as the enclosing loop's final status (bash's
@@ -1914,15 +2083,18 @@ impl Render {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
-            self.probe_num(i);
-            match self.fn_param(i) {
+            // shift-offset rewrite: translate the shell index to the
+            // caller's arg index (pre-shift: i; post-shift: i + off)
+            let ci = self.shifted_param(i).unwrap_or(i);
+            self.probe_num(ci);
+            match self.fn_param(ci) {
                 Some((b, FnParamTy::Num)) => return b,
                 Some((b, FnParamTy::Str)) => {
                     return format!("{b}.trim().parse::<i64>().unwrap_or(0)")
                 }
                 None => {}
             }
-            return format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)");
+            return format!("__sh_arg({ci}).trim().parse::<i64>().unwrap_or(0)");
         }
         if self.local_vars.contains_key(name) {
             return self.var_ident(name);
@@ -1949,8 +2121,9 @@ impl Render {
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             self.add_helper("arg");
             let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
-            self.probe_str(i);
-            match self.fn_param(i) {
+            let ci = self.shifted_param(i).unwrap_or(i);
+            self.probe_str(ci);
+            match self.fn_param(ci) {
                 Some((b, FnParamTy::Str)) => return format!("{b}.clone()"),
                 // numeric param read as string: impossible (the probe
                 // forces Str on any string read) — canonical form keeps
@@ -1958,7 +2131,7 @@ impl Render {
                 Some((b, FnParamTy::Num)) => return format!("{b}.to_string()"),
                 None => {}
             }
-            return format!("__sh_arg({i})");
+            return format!("__sh_arg({ci})");
         }
         if self.local_vars.contains_key(name) {
             return format!("{}.clone()", self.var_ident(name));
@@ -2311,8 +2484,12 @@ impl Render {
                     "__SH_ARGV.lock().unwrap().len().to_string()".to_string()
                 }
                 "@" | "*" => {
-                    self.probe_wild();
-                    "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
+                    if let Some(r) = self.argv_read() {
+                        format!("{r}.join(\" \")")
+                    } else {
+                        self.probe_wild();
+                        "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
+                    }
                 }
                 "0" => "std::env::args().next().unwrap_or_default()".to_string(),
                 "!" => {
@@ -2347,11 +2524,12 @@ impl Render {
                 n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                     self.add_helper("arg");
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    self.probe_str(i);
-                    match self.fn_param(i) {
+                    let ci = self.shifted_param(i).unwrap_or(i);
+                    self.probe_str(ci);
+                    match self.fn_param(ci) {
                         Some((b, FnParamTy::Str)) => format!("{b}.clone()"),
                         Some((b, FnParamTy::Num)) => format!("{b}.to_string()"),
-                        None => format!("__sh_arg({i})"),
+                        None => format!("__sh_arg({ci})"),
                     }
                 }
                 _ => {
@@ -2390,14 +2568,15 @@ impl Render {
                 n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                     self.add_helper("arg");
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    self.probe_num(i);
-                    match self.fn_param(i) {
+                    let ci = self.shifted_param(i).unwrap_or(i);
+                    self.probe_num(ci);
+                    match self.fn_param(ci) {
                         Some((b, FnParamTy::Num)) => b,
                         Some((b, FnParamTy::Str)) => {
                             format!("{b}.trim().parse::<i64>().unwrap_or(0)")
                         }
                         None => {
-                            format!("__sh_arg({i}).trim().parse::<i64>().unwrap_or(0)")
+                            format!("__sh_arg({ci}).trim().parse::<i64>().unwrap_or(0)")
                         }
                     }
                 }
@@ -2861,8 +3040,8 @@ impl Render {
                     if !is_test_op {
                         let norm = Self::norm_arith_text(sv);
                         if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
-                            let r = self.arith(&ast);
-                            return format!("(({}) != 0)", r);
+                            let r = self.arith_bool(&ast);
+                            return format!("{{ let __b = {r}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}");
                         }
                     }
                 }
@@ -3305,8 +3484,9 @@ impl Render {
                     // cached i64 (entry-bound). Skipped for bigint-tainted
                     // (huge argv would truncate to 0 via i64 parse — t90).
                     let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    self.probe_num(i);
-                    match self.fn_param(i) {
+                    let ci = self.shifted_param(i).unwrap_or(i);
+                    self.probe_num(ci);
+                    match self.fn_param(ci) {
                         // pass-3: a numeric param IS the cache
                         Some((b, FnParamTy::Num)) => b,
                         // a string param parses on demand (its uses
@@ -3585,6 +3765,19 @@ impl Render {
                     Some(w) => self.expr_num(w),
                     None => "1".to_string(),
                 };
+                // shift-offset rewrite (pass-3 probe committed a rest-slice
+                // signature): the shifted-away words were passed as the
+                // caller's leading args — the shift is a no-op here, and
+                // post-shift positional/`$@` reads re-base on the rest
+                // param. Set the flag so subsequent reads translate.
+                if self.active_shift.is_some() && !self.shift_emitted {
+                    self.shift_emitted = true;
+                    if let Some(p) = self.probe.as_mut() {
+                        p.saw_shift = true;
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    return;
+                }
                 // pass-3: rebinding argv poisons the signature verdict
                 self.probe_wild();
                 self.emit(&format!(
@@ -4684,8 +4877,9 @@ impl Render {
                     .iter()
                     .map(|i| {
                         let j = i.saturating_sub(1);
-                        self.probe_str(j);
-                        match self.fn_param(j) {
+                        let cj = self.shifted_param(j).unwrap_or(j);
+                        self.probe_str(cj);
+                        match self.fn_param(cj) {
                             Some((b, FnParamTy::Str)) => {
                                 format!("{b}.trim().is_empty()")
                             }
@@ -4695,7 +4889,7 @@ impl Render {
                                 "unreachable!(\"pass-3: emptiness guard on numeric param\")"
                                     .to_string()
                             }
-                            None => format!("__sh_arg({j}).trim().is_empty()"),
+                            None => format!("__sh_arg({cj}).trim().is_empty()"),
                         }
                     })
                     .collect();
@@ -5121,6 +5315,9 @@ impl Render {
                 return self.read_arr(var);
             }
             if var == "@" || var == "*" {
+                if let Some(r) = self.argv_read() {
+                    return r;
+                }
                 self.probe_wild();
                 return "__SH_ARGV.lock().unwrap().clone()".to_string();
             }
@@ -5132,6 +5329,9 @@ impl Render {
     fn listvar_words(&mut self, name: &str) -> String {
         match name {
             "@" | "*" => {
+                if let Some(r) = self.argv_read() {
+                    return r;
+                }
                 self.probe_wild();
                 "__SH_ARGV.lock().unwrap().clone()".to_string()
             }
@@ -5150,6 +5350,9 @@ impl Render {
         if let Some(IrExpr::Str(name, _)) = args.first() {
             match name.as_str() {
                 "@" | "*" => {
+                    if let Some(r) = self.argv_read() {
+                        return format!("{r}.join(\" \")");
+                    }
                     self.probe_wild();
                     "__SH_ARGV.lock().unwrap().join(\" \")".to_string()
                 }
@@ -6411,17 +6614,28 @@ impl Render {
     }
 
     /// Positional arg exprs for a signature (`""` / parsed-`0` defaults
-    /// are the `__sh_arg` contract for missing positionals).
+    /// are the `__sh_arg` contract for missing positionals). With a
+    /// shift-offset rest signature the caller's words are split: the first
+    /// `arity` become the typed params and the remainder is passed as the
+    /// trailing `&[String]` slice — `__a` holds the caller words.
     fn fn_call_args(sig: &FnSig) -> String {
-        (0..sig.arity)
+        let mut args: Vec<String> = (0..sig.arity)
             .map(|i| match sig.tys[i] {
                 FnParamTy::Str => format!("__a.get({i}).cloned().unwrap_or_default()"),
                 FnParamTy::Num => format!(
                     "__a.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
                 ),
             })
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect();
+        if let Some(off) = sig.rest {
+            // the rest param is the caller's argv from the shift offset
+            // onward (the words the callee's `shift` consumed) — NOT from
+            // `arity`: `arity` covers post-shift reads at `i + off`, so it
+            // can exceed the offset (e.g. `$2` after `shift` ⇒ arity 3,
+            // offset 1 ⇒ rest = caller words 1..).
+            args.push(format!("&__a[({off}).min(__a.len())..]"));
+        }
+        args.join(", ")
     }
 
     fn fn_call_stmt(&mut self, name: &str, words: &[&IrExpr]) -> String {
@@ -8770,6 +8984,9 @@ impl Render {
         {
             let mut pfns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
             collect_fn_defs(&prog.stmts, &mut pfns);
+            // shared shIR verdict: fn name -> constant argv shift offset
+            // (present only for the narrow qualifying shapes)
+            let shift_offsets = crate::shir::analyze_shift_offsets(prog);
             for (name, body, _named) in &pfns {
                 let saved_out = std::mem::take(&mut self.out);
                 let saved_depth = self.depth;
@@ -8780,6 +8997,13 @@ impl Render {
                 self.probe = Some(FnProbe::default());
                 self.in_function = true;
                 self.depth = 1;
+                // the probe runs the rewrite too (so its recorded param
+                // indices are the CALLER indices the commit render will
+                // use); the verdict gates whether it may
+                let off = shift_offsets.get(name).copied().filter(|k| *k > 0);
+                self.active_shift = off;
+                self.active_rest = off.map(|_| "__rest".to_string());
+                self.shift_emitted = false;
                 {
                     let mut cached = BTreeSet::new();
                     collect_numeric_positionals(body, &mut cached);
@@ -8790,6 +9014,9 @@ impl Render {
                 }
                 self.num_param_cache.clear();
                 self.in_function = false;
+                self.active_shift = None;
+                self.active_rest = None;
+                self.shift_emitted = false;
                 let probe = self.probe.take().unwrap_or_default();
                 self.out = saved_out;
                 self.depth = saved_depth;
@@ -8843,7 +9070,16 @@ impl Render {
                 }
                 self.fn_sigs.insert(
                     name.clone(),
-                    FnSig { arity, tys, used },
+                    FnSig {
+                        arity,
+                        tys,
+                        used,
+                        rest: if probe.saw_shift && !probe.wild {
+                            off
+                        } else {
+                            None
+                        },
+                    },
                 );
             }
         }
@@ -8862,8 +9098,27 @@ impl Render {
         // exits 0 and the runtime flushes stdout just the same. With EXIT
         // traps the rc must be saved BEFORE they run (their __sh_spawn
         // calls clobber __SH_RC).
+        //
+        // With the register DISABLED (`rc_disabled` — no source status,
+        // no status read) there is no final status to carry at all: the
+        // exit code is 0 (there is nothing the source language could have
+        // observed), so the epilogue is dropped outright and `fn main`
+        // falls off its end. EXIT traps still run — they are a side
+        // effect, not a status.
         let rc_zero = Self::body_rc_is_zero(&self.out);
-        if rc_zero && self.trap_exit.is_empty() {
+        if self.rc_disabled {
+            if !self.trap_exit.is_empty() {
+                self.add_helper("run_traps");
+                self.emit("__sh_run_traps();");
+            }
+            while let Some(last) = self.out.last() {
+                if last.trim().is_empty() {
+                    self.out.pop();
+                } else {
+                    break;
+                }
+            }
+        } else if rc_zero && self.trap_exit.is_empty() {
             // The final status is statically 0, so nothing reads __SH_RC
             // after the body. In a runtime-free program there is no
             // `$?`/error path that could either, so every remaining
@@ -8944,7 +9199,7 @@ impl Render {
             // the legacy zero-arg argv convention
             let sig = self.fn_sigs.get(name).cloned();
             if let Some(s) = &sig {
-                let params: Vec<String> = (0..s.arity)
+                let mut params: Vec<String> = (0..s.arity)
                     .map(|i| {
                         let pn = if s.used[i] {
                             format!("p{i}")
@@ -8955,6 +9210,13 @@ impl Render {
                         format!("{pn}: {ty}")
                     })
                     .collect();
+                // shift-offset rewrite: the caller passes the shifted-away
+                // words as a trailing rest slice (`&[String]`) — the shift
+                // statement becomes a no-op and post-shift `$@` reads the
+                // slice. The `&` avoids the caller cloning the tail.
+                if s.rest.is_some() {
+                    params.push("__rest: &[String]".to_string());
+                }
                 self.emit(&format!("fn {m}({}) -> String {{", params.join(", ")));
             } else {
                 self.emit(&format!("fn {m}() {{"));
@@ -8964,6 +9226,11 @@ impl Render {
             // frontend's `return expr;` — strings are the value model)
             self.in_function = true;
             self.active_fn = sig.as_ref().map(|_| name.clone());
+            // arm the shift-offset rewrite for this body (the probe
+            // recorded caller indices under the same arming)
+            self.active_shift = sig.as_ref().and_then(|s| s.rest);
+            self.active_rest = self.active_shift.map(|_| "__rest".to_string());
+            self.shift_emitted = false;
             // numeric positional cache (entry-bound i64 locals; avoids
             // per-op parse+alloc in loops — t86).
             {
@@ -8989,6 +9256,9 @@ impl Render {
             }
             self.num_param_cache.clear();
             self.active_fn = None;
+            self.active_shift = None;
+            self.active_rest = None;
+            self.shift_emitted = false;
             self.in_function = false;
             // value tail: fall-off-the-end yields the sticky cell (what
             // the legacy convention leaves in it). Skipped after an
@@ -9015,7 +9285,9 @@ impl Render {
         // that rustc can flag.
         self.emit("use std::sync::atomic::Ordering;");
         self.emit("");
-        self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
+        if !self.rc_disabled {
+            self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
+        }
         self.emit("static __SH_ARGV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_OUT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);");
         self.emit("thread_local! { static __SH_OUTFILE_TL: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) }; }");
@@ -14845,6 +15117,65 @@ mod tests {
     }
 
     #[test]
+    fn shift_offset_rewrite_direct_call() {
+        // `f() { local d=$1; shift; echo "$d:$@"; }` — the shared
+        // shift-offset verdict lets the renderer pass the shifted-away
+        // words as a typed param + rest slice instead of swapping the
+        // whole `__SH_ARGV` at every call site.
+        let out = render("f() { local d=\"$1\"; shift; echo \"$d:$@\"; }\nf a b c\n");
+        assert!(
+            out.contains("__rest: &[String]"),
+            "rest param not emitted:\n{out}"
+        );
+        assert!(
+            !out.contains("let __old = __SH_ARGV"),
+            "legacy argv dance kept:\n{out}"
+        );
+        assert!(
+            !out.contains("__SH_ARGV.lock().unwrap().drain(0.."),
+            "shift still drains the global argv:\n{out}"
+        );
+        assert!(
+            out.contains("__rest.to_vec().join(\" \")"),
+            "post-shift $@ not served from the rest param:\n{out}"
+        );
+    }
+
+    #[test]
+    fn shift_offset_rebases_post_shift_positional() {
+        // `$2` AFTER a `shift` is the caller's third word — the rewrite
+        // must index the param at `i + offset`, not at `i`.
+        let out = render("f() { shift; echo \"$1 $2\"; }\nf a b c\n");
+        assert!(out.contains("__rest: &[String]"), "{out}");
+        assert!(
+            out.contains("&__a[(1).min(__a.len())..]"),
+            "rest slice must start at the shift offset:\n{out}"
+        );
+    }
+
+    #[test]
+    fn shift_offset_vetoes_pre_shift_argv_read() {
+        // a pre-shift `$@` observes the UNshifted argv, which the rest
+        // param does not model — the verdict (and the rewrite) must stay
+        // off, keeping the legacy argv dance.
+        let out = render("f() { echo \"$@\"; shift; echo \"$@\"; }\nf a b\n");
+        assert!(
+            !out.contains("__rest: &[String]"),
+            "rewrite applied over a pre-shift argv read:\n{out}"
+        );
+    }
+
+    #[test]
+    fn shift_offset_vetoes_hash_read() {
+        // `$#` changes under shift — not modelled, so no signature.
+        let out = render("f() { shift; echo \"$#\"; }\nf a b\n");
+        assert!(
+            !out.contains("__rest: &[String]"),
+            "rewrite applied over $#:\n{out}"
+        );
+    }
+
+    #[test]
     fn golf_statics_stay_uppercase() {
         // bare/`thread_local` statics without `#[allow]` rename into
         // the UPPERCASE pool (`non_upper_case_globals` stays silent);
@@ -15525,7 +15856,7 @@ mod tok_tests {
         let toks = arith_tokens("i < ${\u{23}args[@]}").unwrap();
         eprintln!("TOKS: {:?}", toks);
         let mut r = Render::default();
-        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(&mut r, &toks);
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "arith parse failed");
@@ -15542,7 +15873,7 @@ mod tok_tests {
         let toks = arith_tokens("(2*$i)-1").unwrap();
         eprintln!("TOKS: {:?}", toks);
         let mut r = Render::default();
-        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(&mut r, &toks);
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "key arith failed");
@@ -15553,7 +15884,7 @@ mod tok_tests {
         let toks = arith_tokens(" result[i] + $(wc -l < \"${files[i]}\") ").unwrap();
         eprintln!("TOKS: {:?}", toks);
         let mut r = Render::default();
-        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(&mut r, &toks);
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "hard arith failed");
@@ -15564,7 +15895,7 @@ mod tok_tests {
         let toks = arith_tokens(" a[1] + a[2] ").unwrap();
         eprintln!("TOKS: {:?}", toks);
         let mut r = Render::default();
-        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(&mut r, &toks);
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "arith index parse failed");
@@ -15589,7 +15920,7 @@ mod tok_tests {
         let toks = arith_tokens("10#x > 5").unwrap();
         eprintln!("TOKS: {:?}", toks);
         let mut r = Render::default();
-        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(&mut r, &toks);
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "base-N parse failed");
