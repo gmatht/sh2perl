@@ -1292,6 +1292,13 @@ pub struct EmbedResult {
 pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     let mut result = EmbedResult::default();
 
+    // Embed fragments are preamble-free: disable the `__sh_uu_*` seam
+    // (its helpers live in the standalone preamble) so captures render
+    // through the self-contained open-idiom. Restored on exit (single
+    // exit point below; thread-local, so parallel test threads are
+    // unaffected).
+    let prev_seam = UU_SEAM.with(|c| c.replace(false));
+
     // The snippet is its own mini-program: the same lowering + optimize as
     // the standalone renderer (strip_cfor is a no-op for embed inputs but
     // keeps the shared pass honest).
@@ -1402,8 +1409,11 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     if ctx.backtick_newlines {
         // Perl `qx` does NOT strip trailing newlines (bash `$()` does); the
         // standalone's command-substitution chomp is wrong inside a Perl
-        // backtick replacement.
+        // backtick replacement. Both strip shapes go: the s-strip form
+        // (open-idiom value captures) and the `chomp $_r;` form (embed
+        // captures render chomp; see `cmd_str_to_open_perl`).
         out = out.replace("$_r =~ s/\\n+\\z//; ", "");
+        out = out.replace("chomp $_r; ", "");
     }
 
     if !ctx.english_names {
@@ -1412,6 +1422,14 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
             .replace("$OS_ERROR", "$!")
             .replace("$ERRNO", "$!")
             .replace("$EVAL_ERROR", "$@");
+    } else {
+        // Mirror of the normalizer: spell the capture idiom's core vars
+        // with English.pm names (the caller promises `use English` in
+        // the host). Exact idiom markers only — a blind `$!` replace
+        // would rewrite `$!` inside the single-quoted bash -c text and
+        // change the child's semantics.
+        out = out.replace("local $/;", "local $INPUT_RECORD_SEPARATOR;");
+        out = out.replace("cmd failed: $!\\n", "cmd failed: $OS_ERROR\\n");
     }
 
     if out.contains("$CHILD_ERROR") {
@@ -1477,6 +1495,7 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     result.fragment = out;
     result.required_host_bindings.sort();
     result.required_host_bindings.dedup();
+    UU_SEAM.with(|c| c.set(prev_seam));
     result
 }
 
@@ -6917,6 +6936,20 @@ fn perl_word_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+/// Whether command-substitution captures render through the `__sh_uu_*`
+/// external-command seam. The seam needs the standalone preamble helpers
+/// (`sub __sh_uu_capture` / `sub __sh_uu_run`); embed fragments are
+/// preamble-free and splice-clean, so the embed renderer disables it and
+/// uses the self-contained open-idiom instead (which also carries the
+/// `local $/` / `$!` / `chomp` markers the embed flag rewrites govern).
+thread_local! {
+    static UU_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn uu_seam_enabled() -> bool {
+    UU_SEAM.with(|c| c.get())
+}
+
 /// Route a simple command through the `__sh_uu_*` seam (capture form):
 /// `do { my $_r = __sh_uu_capture(…); $CHILD_ERROR = $__sh_uu_rc; chomp
 /// $_r; $_r; }` — byte-identical semantics to the open-idiom it replaces
@@ -6947,9 +6980,12 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // metacharacters — `sh_split_simple_cmd` refuses those) routes through
     // __sh_uu_capture (in-process uu-ffi when the .so is present, guarded
     // fork/exec fallback otherwise). Complex commands keep the bash -c
-    // string path.
-    if let Some(argv) = sh_split_simple_cmd(cmd) {
-        return sh_uu_capture_expr(&argv);
+    // string path. Embed fragments disable the seam (no preamble helpers;
+    // the open-idiom below is self-contained).
+    if uu_seam_enabled() {
+        if let Some(argv) = sh_split_simple_cmd(cmd) {
+            return sh_uu_capture_expr(&argv);
+        }
     }
     let quoted = safe_perl_q_string(cmd);
     // Same env-export prologue as expr_to_open_perl — `$n` inside the
@@ -6967,8 +7003,17 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
         )
     };
     format!(
-        "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }}",
-        exports, quoted
+        "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; {} $CHILD_ERROR = $? >> 8; $_r; }}",
+        exports,
+        quoted,
+        // Embed fragments render the `chomp $_r;` form (the shape the
+        // embed contract's backtick rewrite strips); standalone keeps
+        // the all-trailing-newlines strip (bash `$()` semantics).
+        if uu_seam_enabled() {
+            "$_r =~ s/\\n+\\z//;"
+        } else {
+            "chomp $_r;"
+        },
     )
 }
 
