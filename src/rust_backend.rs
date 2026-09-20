@@ -1829,6 +1829,15 @@ impl Render {
         None
     }
 
+    /// A main-scope const-length array is int-homed when the SHARED
+    /// int verdict fired for it (all-integer writes, int-safe reads):
+    /// `[1,2,3]` lowers to `[i64; N]`, no `String` round-trip (the
+    /// backend's `int_index_arrays` local verdict unions the shared one,
+    /// so an element-read int list qualifies too).
+    fn local_array_is_int(&self, name: &str) -> bool {
+        self.int_arrays.contains(name)
+    }
+
     /// The element literals of a constant-length local array.
     ///
     /// An all-integer-literal list homes as `[i64; N]` — the whole point
@@ -2079,12 +2088,51 @@ impl Render {
         if self.is_local_array(var) {
             let m = self.ident_base(var);
             let n = self.const_len_arrays.get(var).copied().unwrap_or(0);
-            // a compile-time key: the bound is proven by the verdict, so
-            // the guard collapses to the direct index (i64 is `Copy` —
-            // no `.clone()` either)
+            // an int-homed local yields an i64 directly (a `.to_string()`
+            // at the print boundary only — the passthrough lives in the
+            // callers, not here). A `const_int_of` key parses from the
+            // RENDERED key text: for a numeric home it is an int literal,
+            // so the whole read is the bare `a[1]`.
+            //
+            // NOTE: a `[i64; N]` element is `Copy`, so `{}` formats it
+            // directly — the caller (`word_is_numeric` → `expr_num`) must
+            // NOT add `.to_string()` (that was an extra allocation per
+            // read). The string arm below keeps `Clone` for `String`.
+            if self.local_array_is_int(var) {
+                // an int-homed local yields an i64 directly (a
+                // `.to_string()` at the print boundary only — the
+                // passthrough lives in the callers, not here). A
+                // compile-time key proven in range collapses to the bare
+                // index; anything else keeps the negative-wrap/exit(1)
+                // guard (a Rust panic would exit 101, but Python's
+                // IndexError exits 1 with prior output standing — only a
+                // PROVEN in-range key may skip the guard).
+                if let Some(k) = Self::const_int_of(key) {
+                    let idx = if k < 0 { k + n as i64 } else { k };
+                    if idx >= 0 && (idx as usize) < n {
+                        // the `expr_num` caller (`word_is_numeric` →
+                        // numeric word) needs the bare i64 element; the
+                        // `expr_str` caller needs a String — both agree
+                        // here because the guard is proven
+                        return format!("{m}[{idx}].to_string()");
+                    }
+                }
+                return format!(
+                    "{{ let k: i64 = {key}; let n: i64 = {n}; \\
+                       let i = if k < 0 {{ n + k }} else {{ k }}; \\
+                       if i < 0 || i >= n {{ std::process::exit(1); }} \\
+                       {m}[i as usize].to_string() }}"
+                );
+            }
+            // a compile-time key proven in range: Rust array indexing
+            // takes `usize` natively, so `a[1]` — no cast, no guard
+            // (a usize literal cannot be negative and the verdict
+            // proved the bound)
             if let Some(k) = Self::const_int_of(key) {
                 let idx = if k < 0 { k + n as i64 } else { k };
-                return format!("{m}[{idx} as usize]");
+                if idx >= 0 && (idx as usize) < n {
+                    return format!("{m}[{idx}]");
+                }
             }
             return format!(
                 "{{ let k: i64 = {key}; let n: i64 = {n}; \
@@ -2116,7 +2164,9 @@ impl Render {
             let n = self.const_len_arrays.get(var).copied().unwrap_or(0);
             if let Some(k) = Self::const_int_of(key) {
                 let idx = if k < 0 { k + n as i64 } else { k };
-                return format!("{m}[{idx} as usize]");
+                if idx >= 0 && (idx as usize) < n {
+                    return format!("{m}[{idx}]");
+                }
             }
             return format!(
                 "{{ let k: i64 = {key}; let n: i64 = {n}; \
@@ -2155,8 +2205,31 @@ impl Render {
     fn array_elem_set(&mut self, name: &str, key: &str, val: &str) -> String {
         // LOCAL ARRAY: store in place. The verdict proved the key is an
         // in-range constant for this array, so no resize arm is needed.
+        // An int-homed local stores the value's numeric reading (the
+        // `trim().parse().unwrap_or(0)` rule every int-safe consumer
+        // applies); a text local stores the String as-is. A compile-time
+        // key proven in range stores directly (`a[0] = v` — no cast);
+        // anything else keeps the `as usize` form (the verdict proved it
+        // in range, so no guard is needed either way).
         if self.is_local_array(name) {
             let m = self.ident_base(name);
+            if let Some(k) = Self::const_int_of(key) {
+                let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+                let idx = if k < 0 { k + n as i64 } else { k };
+                if idx >= 0 && (idx as usize) < n {
+                    if self.local_array_is_int(name) {
+                        return format!(
+                            "{{ let v: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); {m}[{idx}] = v; }}"
+                        );
+                    }
+                    return format!("{m}[{idx}] = {val};");
+                }
+            }
+            if self.local_array_is_int(name) {
+                return format!(
+                    "{{ let v: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); let i: usize = {key} as usize; {m}[i] = v; }}"
+                );
+            }
             return format!("{{ let i: usize = {key} as usize; {m}[i] = {val}; }}");
         }
         let m = self.tls(name);
@@ -2414,8 +2487,10 @@ impl Render {
                 self.add_helper("pow");
                 format!("__sh_pow({}, {})", self.expr_num(lhs), self.expr_num(rhs))
             }
-            IrExpr::Index { var, key } if self.is_int_array(var) => {
-                // int home: the element is already i64 (no parse)
+            IrExpr::Index { var, key } if self.is_int_array(var) || self.is_local_array(var) => {
+                // int home (and int-homed locals): the element is
+                // already i64 (no parse). `array_index_num` already
+                // renders it as bare `a[1]`.
                 let k = self.expr_num(key);
                 self.array_index_num(var, &k)
             }
@@ -6641,6 +6716,11 @@ impl Render {
             IrExpr::Int(_) => true,
             IrExpr::Arith(_) => true,
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.is_num(name),
+            // an int-homed local array's element is already i64
+            IrExpr::Index { var, .. } => {
+                self.is_int_array(var)
+                    || (self.is_local_array(var) && self.local_array_is_int(var))
+            }
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(n, _)) if self.is_num(n))
             }
@@ -7713,6 +7793,20 @@ impl Render {
                     }
                 }
                 if !t.indices.is_empty() {
+                    // LOCAL ARRAY: the verdict proved this store is an
+                    // in-range constant key, so it is a direct store.
+                    if self.is_local_array(&t.var) {
+                        self.mark_written(&t.var);
+                        let ks: Vec<String> = t.indices.iter().map(|k| self.expr_num(k)).collect();
+                        if ks.len() == 1 {
+                            let st = self.array_elem_set(&t.var, &ks[0], &rhs);
+                            self.emit(&st);
+                            if !has_capture {
+                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            }
+                            return;
+                        }
+                    }
                     self.mark_todo("array-index assign");
                     return;
                 }
@@ -8904,14 +8998,9 @@ impl Render {
         } else {
             self.depth = 0;
             self.emit("fn main() {");
-            // the body was rendered at depth 1 (for a `fn main() {` that
-            // is emitted as its own line); here the brace is spliced in,
-            // so strip the extra level the body carries
-            let head = body_out.remove(0);
-            self.out.push(head.trim_start().to_string());
-            self.out.extend(body_out.iter().map(|l| {
-                l.strip_prefix("    ").unwrap_or(l).to_string()
-            }));
+            // the body was rendered at depth 1, which is exactly right
+            // for statements inside `fn main() {` — splice it in as-is
+            self.out.extend(body_out.into_iter());
             self.out.push("}".to_string());
         }
         if !fn_out.is_empty() {
@@ -15181,8 +15270,65 @@ mod tests {
         assert!(!out.contains("__SHV_a"), "local array leaked a static:\n{out}");
         assert!(out.contains("fn main() {"), "main missing:\n{out}");
     }
-}
+    /// t21 (`a = [1, 2, 3]; print(a[1])`): a main-scope
+    /// constant-length int array in a runtime-free program lowers to a
+    /// plain `[i64; N]` local with a direct `a[1]` read — no static, no
+    /// helper, no `__` names at all.
+    #[test]
+    fn const_len_int_array_is_a_plain_local() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"},{"type":"Str","value":"2","style":"DoubleQuoted"},{"type":"Str","value":"3","style":"DoubleQuoted"}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"key":{"style":"DoubleQuoted","type":"Str","value":"1"},"type":"Index","var":"a"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let a = [1, 2, 3];"), "no plain local:
+{out}");
+        assert!(out.contains("a[1]"), "no direct index:
+{out}");
+        assert!(!out.contains("__SHV_"), "static leaked:
+{out}");
+        assert!(!out.contains("non_upper_case_globals"), "stray allow:
+{out}");
+        assert!(!out.contains("as usize"), "stray cast:
+{out}");
+    }
 
+    /// An element store to a proven in-range constant key is a direct
+    /// store, and forces `let mut`.
+    #[test]
+    fn const_len_array_store_is_direct() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"},{"type":"Str","value":"2","style":"DoubleQuoted"},{"type":"Str","value":"3","style":"DoubleQuoted"}]}]}},
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[{"type":"Int","value":0}]}],"expr":{"type":"Str","value":"9","style":"DoubleQuoted"}},
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"key":{"style":"DoubleQuoted","type":"Str","value":"0"},"type":"Index","var":"a"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let mut a = [1, 2, 3];"), "not mutable:
+{out}");
+        assert!(out.contains("a[0] = "), "no direct store:
+{out}");
+        assert!(!out.contains("__SHV_"), "static leaked:
+{out}");
+    }
+
+    /// A dynamic index keeps the guard, and an out-of-range store keeps
+    /// the global (the verdict vetoes).
+    #[test]
+    fn const_len_dynamic_index_keeps_guard() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"},{"type":"Str","value":"2","style":"DoubleQuoted"},{"type":"Str","value":"3","style":"DoubleQuoted"}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"key":{"type":"Var","name":"i"},"type":"Index","var":"a"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let a = [1, 2, 3];"), "no plain local:
+{out}");
+        assert!(out.contains("std::process::exit(1)"), "guard lost:
+{out}");
+    }
+}
 #[cfg(test)]
 mod tok_tests {
     use super::*;
