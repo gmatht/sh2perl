@@ -277,8 +277,14 @@ impl<'a> Walker<'a> {
                     }
                 };
                 // NOTE: a None head still walks `cmd` above (it may read
-                // vars); actuals go fully risky (dynamic dispatch).
-                self.dispatch_args(head, args);
+                // vars); actuals go fully risky (dynamic dispatch) — except
+                // the decl family (`local x=...`), whose `name=` heads bind
+                // in the current scope (see `walk_decl_args`).
+                if matches!(head, Some("local" | "declare" | "typeset" | "export" | "readonly")) {
+                    self.walk_decl_args(args);
+                } else {
+                    self.dispatch_args(head, args);
+                }
                 if let Some(c) = capture {
                     // capture target is a binding... but a bare-name
                     // capture (`capture=v`) writes v — record as mention
@@ -413,9 +419,17 @@ impl<'a> Walker<'a> {
                 self.expr(rhs);
             }
             IrExpr::Call { func, args } => {
-                // Dispatch forms share the Exec-statement logic (the
-                // callee-name word is skipped — a literal, not a read).
+                // `local x=...` / `declare x=...` (and friends): the
+                // `name=` head word BINDS the name — route through the
+                // decl walk so the write is attributed to the current
+                // scope (see `walk_decl_args`).
                 if matches!(func.as_str(), "exec" | "fnCall" | "callDirect" | "builtin") {
+                    if let Some((IrExpr::Str(h, _), rest)) = args.split_first() {
+                        if matches!(h.as_str(), "local" | "declare" | "typeset" | "export" | "readonly") {
+                            self.walk_decl_args(rest);
+                            return;
+                        }
+                    }
                     // callee-name word skipped (a literal, not a read);
                     // dynamic callees walk fully risky
                     match args.split_first() {
@@ -568,6 +582,42 @@ impl<'a> Walker<'a> {
     /// a file-scope helper embedding arg reads (t80), so those args are
     /// risky. Drift risk if the renderer adds helper paths: the C
     /// backend's post-render guard fails loud, never silent.
+    /// `local`/`declare`/`export`-family words: `name=` heads are
+    /// top-level WRITE mentions in the current scope; flag words are
+    /// skipped; every other word (values, nested calls) walks normally.
+    fn walk_decl_args(&mut self, args: &[IrExpr]) {
+        // flatten one Array wrapper (the exec argv shape)
+        let flat: Vec<&IrExpr> = args
+            .iter()
+            .flat_map(|a| match a {
+                IrExpr::Array(items) => items.iter().collect(),
+                other => vec![other],
+            })
+            .collect();
+        for w in flat {
+            match w {
+                IrExpr::Str(t, _) => {
+                    if t.starts_with('-') {
+                        continue;
+                    }
+                    if let Some((h, _)) = t.split_once('=') {
+                        if is_ident_word(h) {
+                            self.mention_write(h);
+                        }
+                    }
+                }
+                IrExpr::Array(items) => {
+                    for it in items {
+                        self.expr(it);
+                    }
+                }
+                _ => {
+                    self.expr(w);
+                }
+            }
+        }
+    }
+
     fn dispatch_args(&mut self, head: Option<&str>, args: &[IrExpr]) {
         // flatten one Array wrapper (the exec argv shape
         // `exec(cmd, [words])`) so the echo mirror applies per word,
@@ -995,5 +1045,71 @@ mod exec_tests {
         })]);
         let u = use_scopes(&p);
         assert!(u["xs"].iter().all(|x| !x.risky));
+    }
+}
+
+#[cfg(test)]
+mod local_decl_tests {
+    use super::*;
+    use crate::ir::{IrProgram, StrStyle};
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn word(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// `local x=$1` inside `helper` + a `getVar(x)` read: x must be a
+    /// top-level WRITE in Func(helper) scope (the shape pass-2 locals
+    /// need to fire).
+    #[test]
+    fn local_decl_is_a_write_in_fn_scope() {
+        let p = prog(vec![IrStmt::Function {
+            name: "helper".to_string(),
+            body: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        word("local"),
+                        IrExpr::Array(vec![
+                            word("x="),
+                            IrExpr::Call {
+                                func: "getVar".to_string(),
+                                args: vec![word("1")],
+                            },
+                        ]),
+                    ],
+                }),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![word("x")],
+                }),
+            ],
+            named_blocks: vec![],
+        }]);
+        let u = use_scopes(&p);
+        let xs = &u["x"];
+        assert!(
+            xs.iter().any(|x| x.write && x.top && x.scope == Scope::Func("helper".to_string())),
+            "no top-level write in fn scope: {xs:?}"
+        );
+        assert!(xs.iter().any(|x| !x.write), "no read: {xs:?}");
+        assert!(xs.iter().all(|x| !x.risky), "risky: {xs:?}");
+        assert_eq!(local_scope(xs), Some(Scope::Func("helper".to_string())));
     }
 }

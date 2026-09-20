@@ -4212,7 +4212,10 @@ impl Render {
                             continue;
                         }
                         // `local x=$1` — the core splits `x=` and the VALUE
-                        // EXPR into separate word args
+                        // EXPR into separate word args. A pass-2 local
+                        // (function-confined scalar) binds DIRECTLY to
+                        // the active param (`p0`), not through its own
+                        // static: no `__SHV_x` traffic at all.
                         let value_expr: Option<&IrExpr> = if val.is_empty()
                             && i + 1 < words.len()
                             && !matches!(words[i + 1], IrExpr::Str(_, _))
@@ -4222,6 +4225,21 @@ impl Render {
                         } else {
                             None
                         };
+                        if let (Some(e), true) = (value_expr, self.is_local(name)) {
+                            let m = self.ident_base(name);
+                            let init = self.expr_any(e);
+                            self.mark_written(&name.to_string());
+                            // first write IS the `let`; `mut` only when
+                            // the local is written again later
+                            let kw = if self.local_mut.contains(name) {
+                                "let mut"
+                            } else {
+                                "let"
+                            };
+                            self.emit(&format!("{kw} {m} = {init};"));
+                            i += 1;
+                            continue;
+                        }
                         let stmt = if let Some(e) = value_expr {
                             self.assign_stmt_for(&name.to_string(), e)
                         } else if self.is_num(&name) {
