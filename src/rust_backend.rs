@@ -3019,8 +3019,8 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
-                if let Some(e) = self.arith_text(&text) {
-                    format!("{{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}")
+                if let Some(e) = self.arith_text_bool(&text) {
+                    format!("{{ let __b = ({e}); __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
                 } else if text.contains("$(") {
                     format!("{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}", self.arith_text_unparsed(&text, true))
                 } else {
@@ -3884,11 +3884,11 @@ impl Render {
                     .map(|w| word_source_text(w))
                     .collect::<Vec<_>>()
                     .join(" ");
-                if let Some(e) = self.let_expr(&text) {
-                    format!("{{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}")
+                let (e, is_bool) = self.let_expr_bool(&text);
+                if is_bool {
+                    format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
                 } else {
-                    self.mark_todo("let");
-                    "true".to_string()
+                    format!("{{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}")
                 }
             }
             "test" => {
@@ -4572,6 +4572,45 @@ impl Render {
         self.arith_text(t)
     }
 
+    /// `let` in CONDITION position (`(( x == 1 ))` as an if/while test):
+    /// like `let_expr`, but when the whole text is a plain arithmetic
+    /// expression the result renders as a Rust `bool` (no `as i64` +
+    /// `!= 0` round-trip). Assignments/incdec still return the i64
+    /// value; the caller applies the `!= 0` truth test to those.
+    fn let_expr_bool(&mut self, text: &str) -> (String, bool) {
+        let t = text.trim().replace(GLOB_SENTINEL, "");
+        let t = t.trim();
+        // A pure arithmetic expression (no assignment/incdec) can be
+        // rendered directly as bool (the common `(( x == 1 ))` form).
+        if !t.is_empty() {
+            let is_plain = split_ident_rest(t)
+                .map(|(name, rest0)| {
+                    let rest = rest0.trim_start();
+                    name.is_empty()
+                        || !(rest.starts_with("++")
+                            || rest.starts_with("--")
+                            || (rest.starts_with('=')
+                                && !rest.starts_with("==")
+                                && !rest.starts_with("!=")
+                                && !rest.starts_with("<=")
+                                && !rest.starts_with(">="))
+                            || ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="]
+                                .iter()
+                                .any(|op| rest.starts_with(op)))
+                })
+                .unwrap_or(true);
+            if is_plain {
+                if let Some(e) = self.arith_text_bool(t) {
+                    return (e, true);
+                }
+            }
+        }
+        match self.let_expr(text) {
+            Some(e) => (e, false),
+            None => ("0".to_string(), false),
+        }
+    }
+
     fn incdec(&mut self, name: &str, delta: i64, prefix: bool) -> String {
         let d = if delta >= 0 { format!("+{delta}") } else { format!("{delta}") };
         let cur = self.getvar_num(name);
@@ -4588,9 +4627,23 @@ impl Render {
     /// $idents, parens, unary, binary, ternary).
     fn arith_text(&mut self, t: &str) -> Option<String> {
         let toks = arith_tokens(t)?;
-        let mut p = ArithParser { render: self, toks: &toks, pos: 0 };
+        let mut p = ArithParser::new(self, &toks);
         let e = p.parse_ternary()?;
         if p.pos == toks.len() { Some(e) } else { None }
+    }
+
+    /// Like `arith_text`, but renders the top-level result as a Rust
+    /// `bool` (a comparison is already bool — no `as i64` + `!= 0`
+    /// round-trip). Falls back to numeric + `!= 0` for a value.
+    fn arith_text_bool(&mut self, t: &str) -> Option<String> {
+        let toks = arith_tokens(t)?;
+        let mut p = ArithParser::new_bool(self, &toks);
+        let e = p.parse_ternary()?;
+        if p.pos != toks.len() {
+            return None;
+        }
+        // a plain value used as a condition keeps the truth test
+        Some(if p.last_is_bool { e } else { format!("({e} != 0)") })
     }
 
     /// Positional indices (`$1`, `$2`, …) referenced by an arith TEXT.
@@ -11537,9 +11590,30 @@ struct ArithParser<'a, 'r> {
     render: &'r mut Render,
     toks: &'a [String],
     pos: usize,
+    /// When set, the top-level value is consumed as a CONDITION: a
+    /// comparison/logical/ternary result already IS bool, so the
+    /// numeric `as i64` / `!= 0` round-trip is dropped (`((x == 1) as
+    /// i64) != 0` → `(x == 1)`). Nested *numeric* subexpressions keep
+    /// their i64 rendering: only the renderers whose result feeds the
+    /// condition directly consult this flag.
+    bool_mode: bool,
+    /// set by the level that produced a Rust `bool` (comparison,
+    /// logical, `!`); the top level uses it to decide whether a plain
+    /// value needs the `!= 0` truth test.
+    last_is_bool: bool,
 }
 
 impl<'a, 'r> ArithParser<'a, 'r> {
+    /// Numeric-mode parser (the historic behaviour: every result is i64).
+    fn new(render: &'r mut Render, toks: &'a [String]) -> Self {
+        Self { render, toks, pos: 0, bool_mode: false, last_is_bool: false }
+    }
+
+    /// Condition-mode parser: the top-level result is a Rust `bool`.
+    fn new_bool(render: &'r mut Render, toks: &'a [String]) -> Self {
+        Self { render, toks, pos: 0, bool_mode: true, last_is_bool: false }
+    }
+
     fn peek(&self) -> Option<String> {
         self.toks.get(self.pos).cloned()
     }
@@ -11554,27 +11628,50 @@ impl<'a, 'r> ArithParser<'a, 'r> {
             }
             self.pos += 1;
             let e = self.parse_ternary()?;
-            return Some(format!("(if ({c} != 0) {{ {t} }} else {{ {e} }})"));
+            return if self.bool_mode {
+                self.last_is_bool = true;
+                Some(format!("(if {c} {{ {t} != 0 }} else {{ {e} != 0 }})"))
+            } else {
+                Some(format!("(if ({c} != 0) {{ {t} }} else {{ {e} }})"))
+            };
         }
         Some(c)
     }
 
     fn parse_or(&mut self) -> Option<String> {
         let mut l = self.parse_and()?;
+        let mut saw = false;
         while self.peek().as_deref() == Some("||") {
             self.pos += 1;
             let r = self.parse_and()?;
-            l = format!("(({l} != 0 || {r} != 0) as i64)");
+            saw = true;
+            if self.bool_mode {
+                l = format!("({l} || {r})");
+            } else {
+                l = format!("(({l} != 0 || {r} != 0) as i64)");
+            }
+        }
+        if saw && self.bool_mode {
+            self.last_is_bool = true;
         }
         Some(l)
     }
 
     fn parse_and(&mut self) -> Option<String> {
         let mut l = self.parse_bitor()?;
+        let mut saw = false;
         while self.peek().as_deref() == Some("&&") {
             self.pos += 1;
             let r = self.parse_bitor()?;
-            l = format!("(({l} != 0 && {r} != 0) as i64)");
+            saw = true;
+            if self.bool_mode {
+                l = format!("({l} && {r})");
+            } else {
+                l = format!("(({l} != 0 && {r} != 0) as i64)");
+            }
+        }
+        if saw && self.bool_mode {
+            self.last_is_bool = true;
         }
         Some(l)
     }
@@ -11609,41 +11706,71 @@ impl<'a, 'r> ArithParser<'a, 'r> {
         Some(l)
     }
 
+    /// `==`/`!=`, `<`/`>`/`<=`/`>=` — all comparisons in one level (a
+    /// bare relational test is as much a condition as an equality one,
+    /// and mixing them needs one shared bool decision).
     fn parse_eq(&mut self) -> Option<String> {
-        let mut l = self.parse_rel()?;
+        let mut l = self.parse_shift()?;
+        let mut l_bool = self.last_is_bool;
+        let mut saw = false;
         while let Some(op) = self.peek() {
-            if op == "==" || op == "!=" {
+            if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") {
                 self.pos += 1;
-                let r = self.parse_rel()?;
-                l = format!("(({l} {op} {r}) as i64)");
+                self.last_is_bool = false;
+                let r = self.parse_shift()?;
+                let r_bool = self.last_is_bool;
+                saw = true;
+                let bc = self.bool_mode;
+                // a bool-typed operand compared numerically (or against
+                // another bool) needs matching types: in condition mode
+                // both sides become i64 via the truth test
+                let ln = if l_bool && !bc { format!("(({l}) as i64)") } else { l };
+                let rn = if r_bool && !bc { format!("(({r}) as i64)") } else { r };
+                let lc = matches!(op.as_str(), "==" | "!=");
+                if bc && lc && (l_bool || r_bool) {
+                    // bool-vs-bool is fine; bool-vs-number is not — make
+                    // the number a bool
+                    if l_bool && !r_bool {
+                        l = format!("({ln} {op} ({rn} != 0))");
+                    } else if r_bool && !l_bool {
+                        l = format!("(({ln} != 0) {op} {rn})");
+                    } else {
+                        l = format!("({ln} {op} {rn})");
+                    }
+                } else if bc && lc {
+                    l = format!("({ln} {op} {rn})");
+                } else if bc {
+                    // relational: operands stay numeric; `as i64` would
+                    // be wasted, so compare through the truth test at
+                    // the bool level
+                    l = format!("({ln} {op} {rn})");
+                } else {
+                    l = format!("(({ln} {op} {rn}) as i64)");
+                }
+                l_bool = false;
             } else {
                 break;
             }
         }
-        Some(l)
-    }
-
-    fn parse_rel(&mut self) -> Option<String> {
-        let mut l = self.parse_shift()?;
-        while let Some(op) = self.peek() {
-            if op == "<" || op == ">" || op == "<=" || op == ">=" {
-                self.pos += 1;
-                let r = self.parse_shift()?;
-                l = format!("(({l} {op} {r}) as i64)");
-            } else {
-                break;
-            }
+        if saw && self.bool_mode {
+            self.last_is_bool = true;
+        } else {
+            self.last_is_bool = l_bool;
         }
         Some(l)
     }
 
     fn parse_shift(&mut self) -> Option<String> {
+        // a leaf shift expression holds no operator of its own, so the
+        // bool-ness recorded by a *previous* sibling must not leak in
+        self.last_is_bool = false;
         let mut l = self.parse_add()?;
         while let Some(op) = self.peek() {
             if op == "<<" || op == ">>" {
                 self.pos += 1;
                 let r = self.parse_add()?;
                 l = format!("({l} {op} {r})");
+                self.last_is_bool = false;
             } else {
                 break;
             }
@@ -11658,6 +11785,7 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                 self.pos += 1;
                 let r = self.parse_mul()?;
                 l = format!("({l} {op} {r})");
+                self.last_is_bool = false;
             } else {
                 break;
             }
@@ -11672,6 +11800,7 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                 self.pos += 1;
                 let r = self.parse_unary()?;
                 l = format!("({l} {op} {r})");
+                self.last_is_bool = false;
             } else {
                 break;
             }
@@ -11683,22 +11812,37 @@ impl<'a, 'r> ArithParser<'a, 'r> {
         match self.peek().as_deref() {
             Some("!") => {
                 self.pos += 1;
+                let bc = self.bool_mode;
                 let a = self.parse_unary()?;
-                Some(format!("(({a} == 0) as i64)"))
+                let was_bool = self.last_is_bool;
+                self.last_is_bool = false;
+                if bc {
+                    self.last_is_bool = true;
+                    if was_bool {
+                        Some(format!("(!{a})"))
+                    } else {
+                        Some(format!("({a} == 0)"))
+                    }
+                } else {
+                    Some(format!("(({a} == 0) as i64)"))
+                }
             }
             Some("~") => {
                 self.pos += 1;
                 let a = self.parse_unary()?;
+                self.last_is_bool = false;
                 Some(format!("(!{a})"))
             }
             Some("-") => {
                 self.pos += 1;
                 let a = self.parse_unary()?;
+                self.last_is_bool = false;
                 Some(format!("(-{a})"))
             }
             Some("+") => {
                 self.pos += 1;
                 let a = self.parse_unary()?;
+                self.last_is_bool = false;
                 Some(a)
             }
             Some("++") => {
