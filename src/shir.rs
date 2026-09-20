@@ -133,6 +133,139 @@ pub fn golf_enabled() -> bool {
     GOLF.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+// ── Source-language facts (the pipeline's INPUT language) ─────────────
+// The renderers answer "what did this program come from?" — not just
+// "what does it say". The shell-only semantics (`$?`, the exit status
+// register each backend carries: `__SH_RC`/`_sh_rc`/`sh2.lastExit`/
+// `$CHILD_ERROR`) are meaningful only when the SOURCE language has a
+// `$?` equivalent. Python's `subprocess.run(...).returncode` is lowered
+// to a shell command status by the py frontend, so the register is still
+// needed there; a Python program with no command status (every other
+// program) must not carry the register at all — it is dead weight the
+// source can never observe, and the old output-shaped heuristic
+// (`body_rc_is_zero`) only caught the shapes it happened to recognise.
+//
+// Set by the CLI/render ingress from the source file's language
+// (`otranspilerl::render_with_source`); unset = the shell, the
+// historical behaviour, so every existing A1 entry point is unchanged.
+// A thread-local (the `transforms::CURRENT_TARGET` idiom): the flag is
+// per-compilation context — a renderer running on another thread (the
+// unit tests, a future parallel driver) must not see this thread's
+// source language.
+thread_local! {
+    static SOURCE_LANG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Languages whose `$?` (or an equivalent status variable the frontend
+/// lowers onto `$?`) exists: the shell family. Everything else — `py`,
+/// `c`, `pl`, `go`, `fish`, `zsh`-as-a-source-extension for frontends
+/// that do not lower a status, `powershell`, … — has no shell status and
+/// no observable `$?`.
+///
+/// NOTE: `zsh`/`fish`/`posix-sh`/`bat` DO have `$?`; only the frontends
+/// that emit no status lowering are listed as status-free. The list is
+/// the languages whose frontend lowers `$?` reads: everything that
+/// reaches the core through `ast_to_ir` (the shell parser) keeps them.
+fn lang_has_exit_status(lang: &str) -> bool {
+    let l = lang.trim().trim_start_matches('.');
+    match l {
+        // the shell family — `$?` is a source-level construct
+        "sh" | "bash" | "zsh" | "dash" | "posix" | "posix-sh" | "ksh" | "" => true,
+        // A1 passthrough: the source is unknown/opaque, keep the status
+        "shir" => true,
+        // frontend languages without a `$?`. `py` is special-cased only
+        // to document the `returncode` exception below.
+        _ => false,
+    }
+}
+
+/// Record the language the program was lowered FROM (`"sh"`, `"py"`,
+/// `"c"`, …). Called by the render ingress; `None`/unset restores the
+/// shell default.
+pub fn set_source_lang(lang: Option<&str>) {
+    SOURCE_LANG.with(|c| *c.borrow_mut() = lang.map(|s| s.to_string()));
+}
+
+/// The recorded source language, if any.
+pub fn source_lang() -> Option<String> {
+    SOURCE_LANG.with(|c| c.borrow().clone())
+}
+
+/// Does the source language have a `$?` (a shell exit status) that the
+/// generated program must be able to observe? Consulted by the backends
+/// before emitting their status register; `true` when unset (the shell
+/// default, and the conservative answer for an unknown source).
+pub fn source_has_exit_status() -> bool {
+    SOURCE_LANG.with(|c| match c.borrow().as_deref() {
+        None => true,
+        Some(l) => lang_has_exit_status(l),
+    })
+}
+
+/// Does the PROGRAM observe the exit status at all — a `$?` read
+/// (`getVar("?")`/`Var("?")`) anywhere? Independent of the source
+/// language: a Python program that captures
+/// `subprocess.run(...).returncode` lowers to exactly such a read (the
+/// py frontend models the child status as `$?`), so the register must
+/// survive even though Python itself has no `$?` variable. A program
+/// with no read has nothing to observe a status with.
+pub fn prog_observes_exit_status(prog: &IrProgram) -> bool {
+    fn stmts(v: &[IrStmt]) -> bool {
+        v.iter().any(stmt)
+    }
+    fn stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Assign { expr, .. } => expr_reads(expr),
+            IrStmt::Declare { init, .. } => init.as_ref().map(expr_reads).unwrap_or(false),
+            IrStmt::Expr(e) => expr_reads(e),
+            IrStmt::Exec { cmd, args, .. } => expr_reads(cmd) || args.iter().any(expr_reads),
+            IrStmt::Output { value, .. } => expr_reads(value),
+            IrStmt::WriteFile { path, content, .. } => expr_reads(path) || expr_reads(content),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                expr_reads(cond)
+                    || stmts(then)
+                    || elsifs.iter().any(|(c, b)| expr_reads(c) || stmts(b))
+                    || stmts(else_)
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                expr_reads(cond) || stmts(body)
+            }
+            IrStmt::For { iter, body, .. } => expr_reads(iter) || stmts(body),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => stmts(b),
+            IrStmt::Redirect { inner, redirects } => {
+                stmts(inner)
+                    || redirects.iter().any(|r| match r {
+                        IrRedirect { target, .. } => expr_reads(target),
+                    })
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                stmts(body) || named_blocks.iter().any(|(_, b)| stmts(b))
+            }
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| stmts(s)),
+            _ => false,
+        }
+    }
+    fn expr_reads(e: &IrExpr) -> bool {
+        // the shIR status-read predicate (Var("?") / getVar("?") /
+        // `$?` text in an arith string) — the ONE definition, shared
+        // with the lastExit-liveness analysis.
+        ir_expr_reads_status(e)
+    }
+    stmts(&prog.stmts) || prog.subs.iter().any(|s| stmts(&s.body))
+}
+
+/// The register-elision verdict every backend can use: the source
+/// language has no `$?` AND the program never lowers a status read, so
+/// no emitted status variable can ever be observed.
+pub fn exit_status_is_unobservable(prog: &IrProgram) -> bool {
+    !source_has_exit_status() && !prog_observes_exit_status(prog)
+}
+
 /// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
 /// lowering)?
 pub fn slot_var_index(name: &str) -> Option<usize> {
@@ -2559,12 +2692,75 @@ fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     walk(&prog.stmts, &fns)
 }
 
+/// Every statement pointer in the tree, as a `HashMap`-valued `true` set
+/// (the `TEST_COND_DEAD` / `LOOP_STATUS_DEAD` "everything is dead" verdict
+/// for a program whose source language has no exit status: there is no
+/// status to keep anywhere).
+fn all_statements(prog: &IrProgram) -> HashMap<usize, bool> {
+    fn walk(stmts: &[IrStmt], out: &mut HashMap<usize, bool>) {
+        for s in stmts {
+            out.insert(s as *const IrStmt as usize, true);
+            match s {
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, out),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk(then, out);
+                    for (_, arm) in elsifs {
+                        walk(arm, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, out),
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk(body, out);
+                    for (_, nb) in named_blocks {
+                        walk(nb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(&prog.stmts, &mut out);
+    out
+}
+
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
         // under a possible `set -e` no write is droppable (the guard
         // consumes the statement's value) — same for the test conds
         *TEST_COND_DEAD.lock().unwrap() = Some(HashMap::new());
+        return dead;
+    }
+    // SOURCE-LANGUAGE STATUS VERDICT: the source language has no shell
+    // `$?` and the program reads no status
+    // (`crate::shir::exit_status_is_unobservable`), so EVERY status write
+    // is dead by construction — not a liveness guess but a fact about the
+    // source. Walk with an empty live set (and empty end-liveness): each
+    // writer's entry drops through the SAME dead-twin emitters Plan 4
+    // already trusts, so the generated JS carries no `sh2.lastExit` for a
+    // Python program (and `py -> rs` no `__SH_RC`, similarly). Shell
+    // sources are untouched: the verdict is false there.
+    if crate::shir::exit_status_is_unobservable(prog) {
+        let live: HashSet<usize> = HashSet::new();
+        mark_lastexit_dead(&prog.stmts, &live, &mut dead);
+        *TEST_COND_DEAD.lock().unwrap() = Some(all_statements(prog));
+        *LOOP_STATUS_DEAD.lock().unwrap() = Some(all_statements(prog));
         return dead;
     }
     let mut live: HashSet<usize> = HashSet::new();
@@ -55112,6 +55308,62 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod source_language_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    /// The shell (and an unset source, and the opaque A1 passthrough)
+    /// has a `$?`; the frontend languages that lower no status do not.
+    #[test]
+    fn status_bearing_languages() {
+        for lang in ["sh", "bash", "zsh", "posix-sh", "shir"] {
+            set_source_lang(Some(lang));
+            assert!(source_has_exit_status(), "{lang} should have a status");
+        }
+        for lang in ["py", "python", "c", "pl", "go", "fish", "unknown"] {
+            set_source_lang(Some(lang));
+            assert!(!source_has_exit_status(), "{lang} should have no status");
+        }
+        set_source_lang(None);
+        assert!(source_has_exit_status(), "unset = the shell default");
+    }
+
+    /// A `$?` read is what makes the register observable — regardless of
+    /// the source language (`subprocess.run(...).returncode` lowers to
+    /// exactly this read, so a Python program that captures a child
+    /// status still needs the register).
+    #[test]
+    fn status_reads_are_detected() {
+        assert!(!prog_observes_exit_status(&prog_of("echo hi\n")));
+        assert!(prog_observes_exit_status(&prog_of("false\nr=$?\necho $r\n")));
+        // the word-level lowering of `$?` in an interpolation
+        assert!(prog_observes_exit_status(&prog_of("false\necho \"x$?\"\n")));
+        // inside a function body / a loop body (the tree walk recurses)
+        assert!(prog_observes_exit_status(&prog_of(
+            "f() { echo $?; }\nwhile true; do break; done\n"
+        )));
+    }
+
+    /// The register-elision verdict: no source status AND no read.
+    #[test]
+    fn unobservable_verdict() {
+        let quiet = prog_of("echo hi\n");
+        set_source_lang(Some("py"));
+        assert!(exit_status_is_unobservable(&quiet));
+        set_source_lang(Some("sh"));
+        assert!(!exit_status_is_unobservable(&quiet));
+        set_source_lang(Some("py"));
+        let reader = prog_of("false\nr=$?\n");
+        assert!(!exit_status_is_unobservable(&reader), "a $? read keeps it");
+        set_source_lang(None);
     }
 }
 
