@@ -319,11 +319,18 @@ pub fn needs_runtime(prog: &IrProgram) -> bool {
                 // a plain `test`/`arith`/`getVar`/`param`/`arrayLen` is
                 // pure. Anything else (capture, pipeline, source, …) needs
                 // the runtime.
+                //
+                // `setArray`/`setArrayAppend` are pure DATA writes (they
+                // store a value in a variable), so a literal-list
+                // `a = [1,2,3]` does not by itself drag in the runtime —
+                // that verdict gates the runtime-free fast paths (a
+                // straight-line `print`s program can then lower natively).
                 let pure = matches!(
                     func.as_str(),
                     "builtin" | "exec" | "test" | "arith" | "getVar" | "param"
                         | "arrayLen" | "arrayIndex" | "assign" | "return"
                         | "break" | "continue" | "and"
+                        | "setArray" | "setArrayAppend"
                 );
                 if !pure {
                     *out = true;

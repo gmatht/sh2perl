@@ -219,6 +219,24 @@ pub struct Render {
     int_arrays: std::collections::HashSet<String>,
     /// The subset of `static_arrays` consumed as a list.
     static_list_used: std::collections::HashSet<String>,
+    /// CONSTANT-LENGTH VERDICT (shared `analyze_const_len_arrays`):
+    /// arrays whose length is compile-time known and whose every element
+    /// store stays in range. Such an array can live as a plain Rust
+    /// `[T; N]` / `let` local in main instead of a `thread_local!` static
+    /// plus a growable `Vec` — the `a = [1,2,3]; print(a[1])` shape,
+    /// where the whole shell runtime is unnecessary.
+    ///
+    /// NARROW on purpose: only main-scope arrays (a user function's body
+    /// is deferred and may run at an arbitrary point, so the init might
+    /// not have executed when the function body runs), only when the
+    /// program is runtime-free (no redirect/capture/pipeline could
+    /// observe the array), and only when the array is not reachable by a
+    /// dynamic name.
+    const_len_arrays: std::collections::HashMap<String, usize>,
+    /// The subset of `const_len_arrays` that is element-WRITTEN somewhere
+    /// (those need `let mut`; a read-only one must not carry the
+    /// attribute — rustc flags an unused `mut`).
+    local_array_mut: std::collections::HashSet<String>,
     /// LOOP-VAR ESCAPE VERDICT (shared `analyze_loop_var_escapes`): per
     /// pre-order `For` position, whether the loop variable is read
     /// outside that loop. When not, the per-iteration write-back is
@@ -1289,6 +1307,24 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         r.int_arrays = ints;
     }
     r.loop_var_escapes = Some(crate::shir::analyze_loop_var_escapes(&prog));
+    // CONSTANT-LENGTH VERDICT: an array with a proven length whose every
+    // element store stays in range can be a plain `let` local in main —
+    // but only in a program that is otherwise runtime-free (a redirect,
+    // capture or pipeline would observe the var out of scope, and a user
+    // function body runs at an arbitrary point, so it may not see the
+    // init). Narrowing here keeps the analysis general: it answers
+    // "length and store bounds", the renderer decides where that is
+    // usable.
+    r.const_len_arrays = if r.runtime_free {
+        let cl = crate::shir::analyze_const_len_arrays(&prog);
+        let fn_reachable = function_reachable_vars(&prog);
+        cl.into_iter()
+            .filter(|(n, _)| !fn_reachable.contains(n))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    r.local_array_mut = element_written_vars(&prog, &r.const_len_arrays) .into_iter().collect();
     // Run the shared constant-echo lowering here too: this entry point
     // renders from IR without running `Pipeline::canonical`, so the
     // transform is applied directly (it is cheap and idempotent). A
@@ -1774,6 +1810,51 @@ impl Render {
         self.int_arrays.contains(name) && !self.assoc.contains(name)
     }
 
+    /// A main-scope ARRAY with a proven constant length: it lives as a
+    /// plain `let a: [T; N] = …` local instead of a `thread_local!`
+    /// static + growable `Vec` (see `const_len_arrays`). Only ever true
+    /// in a runtime-free program, so no capture/redirect/pipeline can
+    /// observe the variable out of scope.
+    fn is_local_array(&self, name: &str) -> bool {
+        self.const_len_arrays.contains_key(name)
+    }
+
+    /// A compile-time integer for an index expression: a literal int, a
+    /// numeric string, or a constant-folded arith tree.
+    fn const_int_of(key: &str) -> Option<i64> {
+        let t = key.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(n);
+        }
+        None
+    }
+
+    /// The element literals of a constant-length local array.
+    ///
+    /// An all-integer-literal list homes as `[i64; N]` — the whole point
+    /// of the shape (`a = [1, 2, 3]` is a numeric list, and an i64 array
+    /// indexes without a `String` round-trip). Anything else is text
+    /// (shell arrays are textual), rendered with the usual `String`
+    /// literal form; the `.to_string()` is applied ONCE (the literal
+    /// helper already returns an owned `String`).
+    fn local_array_lits(&mut self, items: &[IrExpr]) -> Vec<String> {
+        fn int_lit(e: &IrExpr) -> Option<String> {
+            match e {
+                IrExpr::Int(n) => Some(n.to_string()),
+                IrExpr::Str(s, _) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .map(|n| n.to_string()),
+                _ => None,
+            }
+        }
+        if items.iter().all(|i| int_lit(i).is_some()) {
+            return items.iter().map(|i| int_lit(i).unwrap()).collect();
+        }
+        items.iter().map(|i| self.expr_str(i)).collect()
+    }
+
     fn is_assoc(&self, name: &str) -> bool {
         self.assoc.contains(name)
     }
@@ -1882,6 +1963,12 @@ impl Render {
     }
 
     fn read_arr(&mut self, name: &str) -> String {
+        // LOCAL ARRAY: hand the fixed array over as a slice (no clone of
+        // a static, no growable container).
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            return format!("{m}.to_vec()");
+        }
         let m = self.tls(name);
         // an int home read into a `Vec<String>` context stringifies per
         // element (keeps every word-list consumer compiling); the verdict
@@ -1939,11 +2026,22 @@ impl Render {
     }
 
     fn write_arr(&mut self, name: &str, e: &str) -> String {
+        // LOCAL ARRAY: a whole-array rebind (same proven length).
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            return format!("{m} = {};", Self::unparen(e));
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
     }
 
     fn push_arr(&mut self, name: &str, e: &str) -> String {
+        // unreachable for a local array (an append vetoes the verdict);
+        // assert the invariant rather than silently grow a fixed array
+        assert!(
+            !self.is_local_array(name),
+            "rust_backend: append to constant-length array `{name}`"
+        );
         let m = self.tls(name);
         if self.is_int_array(name) {
             return format!(
@@ -1975,6 +2073,26 @@ impl Render {
     /// An int-homed array (`Vec<i64>`) reads through `array_index_num`;
     /// this `String` form stays for text homes.
     fn array_index_strict(&mut self, var: &str, key: &str) -> String {
+        // LOCAL ARRAY: a fixed-size Rust array indexed in place. CPython
+        // semantics (`xs[i]`: negative wraps, OOB aborts exit(1)) are
+        // preserved with the array's OWN length.
+        if self.is_local_array(var) {
+            let m = self.ident_base(var);
+            let n = self.const_len_arrays.get(var).copied().unwrap_or(0);
+            // a compile-time key: the bound is proven by the verdict, so
+            // the guard collapses to the direct index (i64 is `Copy` —
+            // no `.clone()` either)
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                return format!("{m}[{idx} as usize]");
+            }
+            return format!(
+                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                   let i = if k < 0 {{ n + k }} else {{ k }}; \
+                   if i < 0 || i >= n {{ std::process::exit(1); }} \
+                   {m}[i as usize] }}"
+            );
+        }
         if self.is_int_array(var) {
             return format!("({}).to_string()", self.array_index_num(var, key));
         }
@@ -1992,6 +2110,21 @@ impl Render {
     /// negative-wrap / OOB-exit(1) semantics as `array_index_strict`,
     /// yielding the i64 element directly (Copy — no clone, no parse).
     fn array_index_num(&mut self, var: &str, key: &str) -> String {
+        // LOCAL INT ARRAY: direct fixed-array read (no home/len query).
+        if self.is_local_array(var) {
+            let m = self.ident_base(var);
+            let n = self.const_len_arrays.get(var).copied().unwrap_or(0);
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                return format!("{m}[{idx} as usize]");
+            }
+            return format!(
+                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                   let i = if k < 0 {{ n + k }} else {{ k }}; \
+                   if i < 0 || i >= n {{ std::process::exit(1); }} \
+                   {m}[i as usize] }}"
+            );
+        }
         let m = self.tls(var);
         format!(
             "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
@@ -2020,6 +2153,12 @@ impl Render {
     /// `trim().parse().unwrap_or(0)` rule every int-safe consumer
     /// applies, so a stored string and its later read agree exactly.
     fn array_elem_set(&mut self, name: &str, key: &str, val: &str) -> String {
+        // LOCAL ARRAY: store in place. The verdict proved the key is an
+        // in-range constant for this array, so no resize arm is needed.
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            return format!("{{ let i: usize = {key} as usize; {m}[i] = {val}; }}");
+        }
         let m = self.tls(name);
         if self.is_int_array(name) {
             return format!(
@@ -2051,6 +2190,11 @@ impl Render {
     }
 
     fn array_len(&mut self, name: &str) -> String {
+        // LOCAL ARRAY: the length is a compile-time constant.
+        if self.is_local_array(name) {
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            return format!("{n}i64");
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().len() as i64)")
     }
@@ -6172,6 +6316,22 @@ impl Render {
         let Some(name) = str_arg(args, 0) else {
             return;
         };
+        // LOCAL ARRAY (constant-length verdict + runtime-free program):
+        // the array is a plain `let` in main — a fixed-size Rust array
+        // `[T; N]`, so indexing is a direct bounds-checked access and no
+        // static/`RefCell`/`Vec` machinery is emitted at all. Emitted
+        // BEFORE `mark_written`, because the local's first write IS its
+        // `let` (the write helpers must not see it as a bound static).
+        if self.is_local_array(name) {
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                let lits = self.local_array_lits(items);
+                let m = self.ident_base(name);
+                self.mark_written(name);
+                let mutkw = if self.local_array_mut.contains(name) { "let mut" } else { "let" };
+                self.emit(&format!("{mutkw} {m} = [{}];", lits.join(", ")));
+                return;
+            }
+        }
         self.mark_written(name);
         // ArrayComp: `[elem for var in iter if cond]` (py t80). Lower to
         // a native loop (clear, iterate, test, push) mirroring For.
@@ -7363,7 +7523,46 @@ impl Render {
                 // `arr=(...)` — the RHS is a setArray call
                 if let IrExpr::Call { func, args } = expr {
                     if func == "setArray" || func == "setArrayAppend" {
+                        // LOCAL ARRAY (constant-length verdict, runtime-free
+                        // program): `a = [1, 2, 3]` becomes
+                        // `let mut a = [1, 2, 3]` — a fixed-size Rust array
+                        // with no static and no `Vec`.
+                        if func == "setArray" {
+                            let lname = str_arg(args, 0).map(|s| s.to_string());
+                            if let (Some(n), Some(IrExpr::Array(items))) =
+                                (lname.as_deref(), args.get(1))
+                            {
+                                if self.is_local_array(n) {
+                                    let lits = self.local_array_lits(items);
+                                    self.mark_written(n);
+                                    let m = self.ident_base(n);
+                                    let mutkw = if self.local_array_mut.contains(n) { "let mut" } else { "let" };
+                                    self.emit(&format!("{mutkw} {m} = [{}];", lits.join(", ")));
+                                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                    return;
+                                }
+                            }
+                        }
                         self.array_call_stmt_by_name(func, args);
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        return;
+                    }
+                }
+                // LOCAL ARRAY (constant-length verdict, runtime-free
+                // program): `a = [1, 2, 3]` becomes `let mut a = [1, 2, 3]`
+                // — a fixed-size Rust array, no static and no `Vec`.
+                // Checked before the scalar/array-target dispatch below,
+                // which would otherwise route the name through its
+                // (unwritten) element-0 store.
+                if let (Some(t), IrExpr::Array(items)) = (targets.first(), expr) {
+                    if t.indices.is_empty() && self.is_local_array(&t.var) {
+                        let lits: Vec<String> = items
+                            .iter()
+                            .map(|i| format!("{}.to_string()", self.expr_str(i)))
+                            .collect();
+                        self.mark_written(&t.var);
+                        let m = self.ident_base(&t.var);
+                        self.emit(&format!("let mut {m} = [{}];", lits.join(", ")));
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         return;
                     }
@@ -8705,9 +8904,14 @@ impl Render {
         } else {
             self.depth = 0;
             self.emit("fn main() {");
+            // the body was rendered at depth 1 (for a `fn main() {` that
+            // is emitted as its own line); here the brace is spliced in,
+            // so strip the extra level the body carries
             let head = body_out.remove(0);
-            self.out.push(format!("    {head}"));
-            self.out.extend(body_out.iter().cloned());
+            self.out.push(head.trim_start().to_string());
+            self.out.extend(body_out.iter().map(|l| {
+                l.strip_prefix("    ").unwrap_or(l).to_string()
+            }));
             self.out.push("}".to_string());
         }
         if !fn_out.is_empty() {
@@ -13635,6 +13839,392 @@ fn is_special_var(name: &str) -> bool {
         || matches!(name, "@" | "*" | "#" | "?" | "$" | "!" | "-" | "_" | "PPID" | "BASHPID")
 }
 
+/// The subset of `arrays` that is written with an ELEMENT index
+/// somewhere (`a[i] = v`, `a[i] += 1`): those need `let mut`. A
+/// read-only array must stay immutable, or rustc flags an unused `mut`.
+fn element_written_vars(
+    prog: &IrProgram,
+    arrays: &std::collections::HashMap<String, usize>,
+) -> BTreeSet<String> {
+    fn index_targets(
+        list: &[IrStmt],
+        arrays: &std::collections::HashMap<String, usize>,
+        out: &mut BTreeSet<String>,
+    ) {
+        for s in list {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        if !t.indices.is_empty() {
+                            // `a[i] = v` structured-index store
+                            let base = t.var.split('[').next().unwrap_or(&t.var);
+                            if arrays.contains_key(base) {
+                                out.insert(base.to_string());
+                            }
+                        } else {
+                            // `a[1] = v` text-target store (the index is
+                            // part of the var name)
+                            if let Some(open) = t.var.find('[') {
+                                let base = &t.var[..open];
+                                if arrays.contains_key(base) {
+                                    out.insert(base.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, .. } => {
+                    // a re-declaration rebinds the whole array (same shape)
+                    let _ = var;
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    index_targets(then, arrays, out);
+                    for (_, b) in elsifs {
+                        index_targets(b, arrays, out);
+                    }
+                    index_targets(else_, arrays, out);
+                }
+                IrStmt::For { body, .. }
+                | IrStmt::ForInit { body, .. }
+                | IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => index_targets(body, arrays, out),
+                IrStmt::Redirect { inner, .. } => index_targets(inner, arrays, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        index_targets(st, arrays, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    index_targets(body, arrays, out);
+                    for e in excepts {
+                        index_targets(&e.body, arrays, out);
+                    }
+                    index_targets(else_body, arrays, out);
+                    index_targets(finally_body, arrays, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        index_targets(&c.body, arrays, out);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    index_targets(body, arrays, out);
+                    for (_, b) in named_blocks {
+                        index_targets(b, arrays, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    index_targets(&prog.stmts, arrays, &mut out);
+    for sub in &prog.subs {
+        index_targets(&sub.body, arrays, &mut out);
+    }
+    out
+}
+
+/// Vars a deferred body could observe: any var named anywhere inside a
+/// FUNCTION definition (or a `. source`-able script's own subs). A
+/// function body runs at an arbitrary point in the program (and, in
+/// bash, in the caller's variable scope), so an array rebased to a `let`
+/// local in `main` would fall out of scope entirely. Names are collected
+/// syntactically and over-approximated (a `getVar("x")` string argument
+/// counts) — a false positive only costs the optimization.
+fn function_reachable_vars(prog: &IrProgram) -> BTreeSet<String> {
+    use crate::shir_passes::list_profile::scopes::{all_idents, dollar_vars};
+
+    let mut out: BTreeSet<String> = BTreeSet::new();
+
+    fn expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                out.insert(n.clone());
+            }
+            IrExpr::Call { func, args } => {
+                if matches!(
+                    func.as_str(),
+                    "getVar" | "param" | "arrayIndex" | "arrayLen" | "listVar"
+                ) {
+                    if let Some(IrExpr::Str(s, _)) = args.first() {
+                        out.insert(s.split('[').next().unwrap_or(s).to_string());
+                    }
+                }
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            IrExpr::Index { var, key } => {
+                out.insert(var.clone());
+                expr(key, out);
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    expr(i, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        expr(x, out);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr(lhs, out);
+                expr(rhs, out);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr(cond, out);
+                expr(then, out);
+                expr(else_, out);
+            }
+            IrExpr::DefinedOr { expr: e, default: d } => {
+                expr(e, out);
+                expr(d, out);
+            }
+            IrExpr::Capture { expr: x, .. } => expr(x, out),
+            IrExpr::Arith(a) => arith(a, out),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    expr(v, out);
+                }
+            }
+            IrExpr::Splice(x) => expr(x, out),
+            IrExpr::Str(s, _) => {
+                for v in dollar_vars(s) {
+                    out.insert(v);
+                }
+            }
+            IrExpr::RawExpr(s) => {
+                for v in all_idents(s) {
+                    out.insert(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn arith(a: &crate::ir::ArithAst, out: &mut BTreeSet<String>) {
+        use crate::ir::ArithAst;
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                out.insert(n.clone());
+            }
+            ArithAst::Index { var, key } => {
+                out.insert(var.clone());
+                arith(key, out);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                arith(lhs, out);
+                arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => arith(arg, out),
+            ArithAst::Assign { var, rhs, .. } => {
+                out.insert(var.clone());
+                arith(rhs, out);
+            }
+            ArithAst::IncDec { var, .. } => {
+                out.insert(var.clone());
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                arith(test, out);
+                arith(then, out);
+                arith(else_, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn stmts(list: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in list {
+            match s {
+                IrStmt::Function { body, named_blocks, .. } => {
+                    for b in body {
+                        stmts(std::slice::from_ref(b), out);
+                    }
+                    for (_, b) in named_blocks {
+                        stmts(b, out);
+                    }
+                }
+                IrStmt::Assign { targets, expr: e, .. } => {
+                    for t in targets {
+                        out.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                        for ix in &t.indices {
+                            expr(ix, out);
+                        }
+                    }
+                    expr(e, out);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for d in vars {
+                        out.insert(d.name.clone());
+                    }
+                    if let Some(e) = init {
+                        expr(e, out);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    out.insert(var.clone());
+                    for e in elements {
+                        expr(e, out);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    expr(cond, out);
+                    stmts(then, out);
+                    for (c, b) in elsifs {
+                        expr(c, out);
+                        stmts(b, out);
+                    }
+                    stmts(else_, out);
+                }
+                IrStmt::For { var, iter, body } => {
+                    out.insert(var.clone());
+                    expr(iter, out);
+                    stmts(body, out);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    stmts(init, out);
+                    expr(cond, out);
+                    stmts(step, out);
+                    stmts(body, out);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    expr(cond, out);
+                    stmts(body, out);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => stmts(b, out),
+                IrStmt::Redirect { inner, .. } => stmts(inner, out),
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    stmts(body, out);
+                    for e in excepts {
+                        stmts(&e.body, out);
+                    }
+                    stmts(else_body, out);
+                    stmts(finally_body, out);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    expr(discriminant, out);
+                    for c in clauses {
+                        stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Expr(e) => expr(e, out),
+                IrStmt::Output { value, .. } => expr(value, out),
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        expr(x, out);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr(path, out);
+                    expr(content, out);
+                }
+                IrStmt::Die { expr: e, .. } | IrStmt::Warn { expr: e, .. } => expr(e, out),
+                IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                    expr(cmd, out);
+                    for a in args {
+                        expr(a, out);
+                    }
+                    for r in redirects {
+                        expr(r, out);
+                    }
+                    for (_, e) in env {
+                        expr(e, out);
+                    }
+                }
+                IrStmt::RawText(s) => {
+                    for v in dollar_vars(s) {
+                        out.insert(v);
+                    }
+                }
+                IrStmt::Shaderize { var, body, .. } => {
+                    out.insert(var.clone());
+                    stmts(body, out);
+                }
+                IrStmt::SetChildError(e) => expr(e, out),
+                IrStmt::Ext(n) => {
+                    for c in n.children() {
+                        stmts(std::slice::from_ref(c), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    stmts(&prog.stmts, &mut all);
+    // a reference from anywhere in a deferred body reaches the name
+    let mut deferred: BTreeSet<String> = BTreeSet::new();
+    fn collect_fn_bodies(list: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in list {
+            match s {
+                IrStmt::Function { body, named_blocks, .. } => {
+                    stmts(body, out);
+                    for (_, b) in named_blocks {
+                        stmts(b, out);
+                    }
+                    for b in body {
+                        collect_fn_bodies(std::slice::from_ref(b), out);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_fn_bodies(then, out);
+                    for (_, b) in elsifs {
+                        collect_fn_bodies(b, out);
+                    }
+                    collect_fn_bodies(else_, out);
+                }
+                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                    collect_fn_bodies(body, out)
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                    collect_fn_bodies(body, out)
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    collect_fn_bodies(b, out)
+                }
+                IrStmt::Redirect { inner, .. } => collect_fn_bodies(inner, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_fn_bodies(st, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    collect_fn_bodies(body, out);
+                    for e in excepts {
+                        collect_fn_bodies(&e.body, out);
+                    }
+                    collect_fn_bodies(else_body, out);
+                    collect_fn_bodies(finally_body, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_fn_bodies(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_fn_bodies(&prog.stmts, &mut deferred);
+    for sub in &prog.subs {
+        stmts(&sub.body, &mut deferred);
+    }
+    deferred
+}
+
 fn collect_functions(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -14231,17 +14821,21 @@ mod tests {
             var_bash_env: vec![],
         };
         let out = shir_to_rust(&prog);
-        assert!(
-            out.contains("RefCell<Vec<i64>>"),
-            "no numeric home:\n{out}"
-        );
-        assert!(
-            out.contains("vec![1, 2, 3]"),
-            "init not numeric:\n{out}"
-        );
+        // A runtime-free program (setArray + direct output) lowers the
+        // const-len array as a plain `let a = [1, 2, 3]` local (the
+        // constant-length verdict), so the read indexes a native numeric
+        // array — strictly better than a Vec home:
+        //   * numeric literal init, no `.to_string()`, no `Vec`,
+        //     no `thread_local!` static;
+        //   * `a[1]` is a direct bounds-checked i64 read.
+        assert!(out.contains("= [1, 2, 3]"), "no literal array init:\n{out}");
         assert!(
             !out.contains(".to_string(), \"2\".to_string()"),
             "stringified init kept:\n{out}"
+        );
+        assert!(
+            !out.contains("__SHV_a"),
+            "static kept for a local array:\n{out}"
         );
         assert!(
             !out.contains(".borrow()[__idx as usize].clone()"),
@@ -14567,8 +15161,11 @@ mod tests {
         );
     }
 
-    /// A user var keeps the attribute (its `thread_local!` static is
-    /// lower-case), and the declaration stays at the module root.
+    /// A user array in a runtime-free program is a plain `let` local
+    /// (const-length verdict) — no static, so no attribute is needed;
+    /// the `fn main` allow is dropped with it. A program WITH a
+    /// thread-local user var (state the body renders through) keeps the
+    /// per-static allow.
     #[test]
     fn user_var_keeps_the_allow_attribute() {
         let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
@@ -14578,9 +15175,10 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
         let out = shir_to_rust(&prog);
         assert!(
-            out.contains("thread_local! { #[allow(non_upper_case_globals)] static __SHV_a:"),
-            "user static lost its allow:\n{out}"
+            out.contains("let a = [1];") || out.contains("let mut a = [1];"),
+            "const-len array not a local:\n{out}"
         );
+        assert!(!out.contains("__SHV_a"), "local array leaked a static:\n{out}");
         assert!(out.contains("fn main() {"), "main missing:\n{out}");
     }
 }

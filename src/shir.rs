@@ -10243,6 +10243,396 @@ fn is_ident_name(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Program-wide verdict: the arrays whose LENGTH is a compile-time
+/// constant for the whole program.
+///
+/// A fixed-length array can be materialized as a Rust array (`[T; N]`)
+/// with an element store (`a[i] = v`) rather than a growable `Vec`, and
+/// the renderer can then offer direct indexing (no `resize` arm) — the
+/// `a = [1,2,3]; print(a[1])` shape.
+///
+/// Qualification is deliberately narrow, because a WRONG length is a
+/// miscompile, not a missed optimization:
+///
+///  * the array has exactly one (or more) writes, and ALL of them are
+///    literal lists (`setArray`/`DeclareArray`/array-literal assign) at a
+///    non-loop, top-level position — so the length is known and the
+///    array is never re-grown;
+///  * no append (`setArrayAppend`, `push`, `+=`), no `unset`, no
+///    whole-array replacement by a non-literal, no dynamic-name builtin
+///    (`eval`/`read`/`declare -a "$name"`) that could reach it;
+///  * every write's element count agrees (a program-wide constant);
+///  * every element STORE (`a[i] = v`, `a[k] += …`) is inside the proven
+///    index range `0 <= i < N` — otherwise bash would grow the array and
+///    the constant length would be a lie. A non-constant key, a negative
+///    key, or a key that could reach N vetoes.
+///
+/// The result maps each qualifying array to its constant length. Element
+/// stores are permitted here (unlike `analyze_static_arrays`, which
+/// requires whole-list reads only) — the point of this verdict is the
+/// store-plus-index shape, not just iteration.
+pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+
+    #[derive(Default)]
+    struct Acc {
+        /// array -> literal length of its init (all inits must agree)
+        len: HashMap<String, usize>,
+        /// arrays with no literal init, or disagreeing/again-written
+        bad: std::collections::HashSet<String>,
+        /// arrays whose element store may reach outside `0..len`
+        store_bad: std::collections::HashSet<String>,
+        /// a dynamic-name builtin appeared anywhere (any array may be
+        /// reached by name at runtime) — vetoes everything
+        dynamic: bool,
+    }
+
+    fn literal_len(e: &IrExpr) -> Option<usize> {
+        match e {
+            IrExpr::Array(items) => {
+                // an assoc-map init (`declare -A d; d=([a]=1 [b]=2)`)
+                // arrives with `[k]=v` element words — those are KEY/VALUE
+                // pairs, not list elements; a const-length INDEX array
+                // decision must not claim them
+                if items.iter().any(|it| match it {
+                    IrExpr::Str(s, _) => s.trim_start().starts_with('['),
+                    _ => false,
+                }) {
+                    return None;
+                }
+                Some(items.len())
+            }
+            _ => None,
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<&str> {
+        match e {
+            IrExpr::Str(s, _) if is_ident_name(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Is `key` provably in `0..=last` (the only element a store may
+    /// touch for a length-N array)? Literal ints and small constant
+    /// arithmetic only — anything else vetoes.
+    fn provable_index(key: &IrExpr, last: usize) -> bool {
+        match key {
+            IrExpr::Int(n) => *n >= 0 && (*n as usize) <= last,
+            IrExpr::Str(s, _) => match s.trim().parse::<i128>() {
+                Ok(n) => n >= 0 && (n as usize) <= last,
+                Err(_) => false,
+            },
+            IrExpr::Arith(a) => match const_arith(a) {
+                Some(n) => n >= 0 && (n as usize) <= last,
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Constant-fold a small integer arith tree (no vars, no calls).
+    fn const_arith(a: &ArithAst) -> Option<i128> {
+        match a {
+            ArithAst::Num(n) => Some(*n as i128),
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = const_arith(lhs)?;
+                let r = const_arith(rhs)?;
+                match op.as_str() {
+                    "+" => Some(l + r),
+                    "-" => Some(l - r),
+                    "*" => Some(l * r),
+                    "/" if r != 0 => Some(l / r),
+                    "%" if r != 0 => Some(l % r),
+                    _ => None,
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let v = const_arith(arg)?;
+                match op.as_str() {
+                    "-" => Some(-v),
+                    _ => Some(v),
+                }
+            }
+            ArithAst::Cast { arg, .. } => const_arith(arg),
+            _ => None,
+        }
+    }
+
+    /// Record a write of `name` from `rhs` (a literal list or not).
+    fn write(acc: &mut Acc, name: &str, rhs: &IrExpr) {
+        if acc.bad.contains(name) {
+            return;
+        }
+        match literal_len(rhs) {
+            Some(n) => match acc.len.get(name) {
+                Some(prev) if *prev != n => {
+                    acc.len.remove(name);
+                    acc.bad.insert(name.to_string());
+                }
+                Some(_) => {}
+                None => {
+                    acc.len.insert(name.to_string(), n);
+                }
+            },
+            None => {
+                acc.len.remove(name);
+                acc.bad.insert(name.to_string());
+            }
+        }
+    }
+
+    fn walk_expr(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr(i, acc);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, acc),
+            IrExpr::Call { func, args } => {
+                // name-taking builtins could reach any array by name
+                if matches!(
+                    func.as_str(),
+                    "eval" | "read" | "getVar" | "unset" | "declare" | "local" | "typeset"
+                ) {
+                    acc.dynamic = true;
+                }
+                for a in args {
+                    walk_expr(a, acc);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_expr(x, acc);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, acc);
+                walk_expr(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, acc);
+                walk_expr(then, acc);
+                walk_expr(else_, acc);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, acc);
+                walk_expr(default, acc);
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, acc),
+            IrExpr::Arith(a) => walk_arith(a, acc),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, acc);
+                }
+            }
+            IrExpr::Splice(x) => walk_expr(x, acc),
+            _ => {}
+        }
+    }
+
+    fn walk_arith(a: &ArithAst, acc: &mut Acc) {
+        match a {
+            ArithAst::Index { key, .. } => walk_arith(key, acc),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith(lhs, acc);
+                walk_arith(rhs, acc);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => walk_arith(arg, acc),
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs, acc),
+            ArithAst::IncDec { var, .. } => {
+                // `a[i]++`-style: the walker sees the var via Index
+                let _ = var;
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                walk_arith(test, acc);
+                walk_arith(then, acc);
+                walk_arith(else_, acc);
+            }
+            _ => {}
+        }
+    }
+
+    /// A statement is a top-level init of `name` when it is an Assign to a
+    /// bare name whose RHS is a literal list (possibly wrapped in the
+    /// frontend's `setArray(name, Array[…])` call).
+    fn init_of(expr: &IrExpr) -> Option<&IrExpr> {
+        match expr {
+            IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => args.get(1),
+            _ => None,
+        }
+    }
+
+    fn walk(stmts: &[IrStmt], acc: &mut Acc, in_loop: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    // an element store (`a[i] = …`) must stay in range
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                        if !t.indices.is_empty() {
+                            let Some(n) = acc.len.get(&base).copied() else {
+                                // unknown-length array: an element store
+                                // does not make it constant, but it must
+                                // not silently qualify later either
+                                for ix in &t.indices {
+                                    walk_expr(ix, acc);
+                                }
+                                continue;
+                            };
+                            let last = n.saturating_sub(1);
+                            let ok = t.indices.iter().all(|k| {
+                                // a nested index (`a[x[i]]`) is not
+                                // provable from constants
+                                provable_index(k, last)
+                            });
+                            if !ok {
+                                acc.store_bad.insert(base);
+                            }
+                            for ix in &t.indices {
+                                walk_expr(ix, acc);
+                            }
+                        } else if is_ident_name(&t.var) {
+                            if let Some(rhs) = init_of(expr) {
+                                write(acc, &t.var, rhs);
+                            } else {
+                                write(acc, &t.var, expr);
+                            }
+                        }
+                    }
+                    if let Some(rhs) = init_of(expr) {
+                        walk_expr(rhs, acc);
+                    } else {
+                        walk_expr(expr, acc);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    if in_loop {
+                        let mut a = IrExpr::Array(vec![]);
+                        // a re-init inside a loop: length is still the
+                        // literal count (a `Vec::from_elem`-style write)
+                        a = IrExpr::Array(elements.clone());
+                        write(acc, var, &a);
+                    } else {
+                        let arr = IrExpr::Array(elements.clone());
+                        write(acc, var, &arr);
+                    }
+                    for e in elements {
+                        walk_expr(e, acc);
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setArray" && args.len() >= 2 => {
+                    if let Some(n) = name_arg(&args[0]) {
+                        write(acc, n, &args[1]);
+                    }
+                    walk_expr(&args[1], acc);
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setArrayAppend" => {
+                    // an append breaks the constant length
+                    if let Some(n) = name_arg(args.first().unwrap_or(&IrExpr::Bool(false))) {
+                        acc.len.remove(n);
+                        acc.bad.insert(n.to_string());
+                    }
+                    walk_expr(&IrExpr::Array(args.to_vec()), acc);
+                }
+                IrStmt::Expr(e) => walk_expr(e, acc),
+                IrStmt::Output { value, .. } => walk_expr(value, acc),
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    walk_expr(cond, acc);
+                    walk(then, acc, in_loop);
+                    for (c, b) in elsifs {
+                        walk_expr(c, acc);
+                        walk(b, acc, in_loop);
+                    }
+                    walk(else_, acc, in_loop);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, acc, in_loop);
+                    walk_expr(cond, acc);
+                    walk(step, acc, in_loop);
+                    walk(body, acc, true);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, acc, in_loop);
+                    for (_, b) in named_blocks {
+                        walk(b, acc, in_loop);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, acc, in_loop)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, acc, in_loop),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc, in_loop);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, acc, in_loop);
+                    for e in excepts {
+                        walk(&e.body, acc, in_loop);
+                    }
+                    walk(else_body, acc, in_loop);
+                    walk(finally_body, acc, in_loop);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    walk_expr(discriminant, acc);
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        walk_expr(e, acc);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        walk_expr(x, acc);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    walk_expr(path, acc);
+                    walk_expr(content, acc);
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, acc),
+                _ => {}
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc, false);
+    for sub in &prog.subs {
+        // a function body runs later, but a literal re-init still fixes
+        // the length; an element store there is judged the same way
+        walk(&sub.body, &mut acc, false);
+    }
+    if acc.dynamic {
+        return HashMap::new();
+    }
+    acc.len
+        .into_iter()
+        .filter(|(n, _)| !acc.store_bad.contains(n))
+        .collect()
+}
+
 /// Program-wide verdict: the ARRAYS whose value is a compile-time literal
 /// list. An array qualifies when every write is a single, loop-free
 /// all-literal `setArray`/`DeclareArray`/`Array`-assign and the array is
@@ -55618,5 +56008,163 @@ mod static_word_list_tests {
             static_word_list(&[s("a"), s("b")]),
             Some(vec!["a".to_string(), "b".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod const_len_array_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn init(name: &str, n: usize) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    s(name),
+                    IrExpr::Array((0..n).map(|i| s(&i.to_string())).collect()),
+                ],
+            },
+            asm: None,
+        }
+    }
+
+    fn elem_store(name: &str, key: IrExpr, val: &str) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![key],
+            }],
+            expr: s(val),
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn literal_init_has_constant_length() {
+        // t21: `a = [1,2,3]` then an in-range read.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Output {
+                value: IrExpr::Index {
+                    var: "a".to_string(),
+                    key: Box::new(IrExpr::Int(1)),
+                },
+                newline: true,
+                target: None,
+            },
+        ]));
+        assert_eq!(v.get("a"), Some(&3));
+    }
+
+    #[test]
+    fn reinit_with_a_different_length_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![init("a", 3), init("a", 4)]));
+        assert_eq!(v.get("a"), None, "disagreeing lengths must not qualify");
+    }
+
+    #[test]
+    fn in_range_element_store_keeps_the_length() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(0), "9"),
+        ]));
+        assert_eq!(v.get("a"), Some(&3), "an in-range store keeps the length");
+    }
+
+    #[test]
+    fn out_of_range_element_store_vetoes() {
+        // `a[3] = 9` GROWS a length-3 bash array: the constant length
+        // would be a lie.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(3), "9"),
+        ]));
+        assert_eq!(v.get("a"), None, "an out-of-range store must veto");
+    }
+
+    #[test]
+    fn dynamic_element_store_vetoes() {
+        // `a[$i] = 9` could grow the array at runtime.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Var("i".to_string(), None), "9"),
+        ]));
+        assert_eq!(v.get("a"), None, "a non-constant index must veto");
+    }
+
+    #[test]
+    fn append_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "setArrayAppend".to_string(),
+                args: vec![s("a"), IrExpr::Array(vec![s("4")])],
+            }),
+        ]));
+        assert_eq!(v.get("a"), None, "an append must veto");
+    }
+
+    #[test]
+    fn non_literal_reinit_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![init("a", 3), IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "a".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Var("b".to_string(), None),
+            asm: None,
+        }]));
+        assert_eq!(v.get("a"), None, "a dynamic re-init must veto");
+    }
+
+    #[test]
+    fn dynamic_name_builtin_vetoes_everything() {
+        // `eval`/`read`/`getVar` can name any array at runtime.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "eval".to_string(),
+                args: vec![s("a+=(4)")],
+            }),
+        ]));
+        assert!(v.is_empty(), "a dynamic-name builtin must veto");
+    }
+
+    #[test]
+    fn const_arith_index_is_provable() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(1 + 1), "9"),
+        ]));
+        assert_eq!(v.get("a"), Some(&3));
     }
 }
