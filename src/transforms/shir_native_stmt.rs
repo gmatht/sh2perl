@@ -466,16 +466,47 @@ fn test_and_to_if(st: &mut IrStmt) -> bool {
     if !native_condition {
         return false;
     }
-    let Some(then) = single_always_true_exec(rhs) else {
-        return false;
-    };
+    // `test ... && <echo/printf>`: the then branch is an always-success
+    // exec, which carries the true path's status; no else keeps the
+    // false path at the test's own (non-zero) status.
+    if let Some(then) = single_always_true_exec(rhs) {
+        *st = IrStmt::If {
+            cond: static_pipeline.map(IrExpr::Bool).unwrap_or_else(|| (**lhs).clone()),
+            then,
+            elsifs: vec![],
+            else_: vec![],
+        };
+        return true;
+    }
+    // `test ... && <assignment/other>`. Without this the whole compound
+    // stayed a raw BinOp for the backend, which has no rendering for a
+    // `test` whose words carry an unexpanded `$(...)`
+    // (parse-bracket-subshell-pipe.sh died in ir.rs's render_test_call).
+    // bash's status here is the test's own when it fails, so the else
+    // records a failing status explicitly (an If with no else would
+    // restart at 0, and the script's exit status is this compound's).
+    let Some(then) = single_stmt(rhs) else { return false };
     *st = IrStmt::If {
         cond: static_pipeline.map(IrExpr::Bool).unwrap_or_else(|| (**lhs).clone()),
-        then,
+        then: vec![then],
         elsifs: vec![],
-        else_: vec![],
+        else_: vec![status_exec(false)],
     };
     true
+}
+
+/// The statement form of a `&&`-RHS expression: a bare assignment is
+/// just an Expr statement. Returns None for shapes this rewrite should
+/// not touch (control flow, redirects, …).
+fn single_stmt(e: &IrExpr) -> Option<IrStmt> {
+    match e {
+        IrExpr::Call { func, .. }
+            if matches!(func.as_str(), "assign" | "exec" | "builtin" | "test") =>
+        {
+            Some(IrStmt::Expr(e.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn test_chain_to_if(st: &mut IrStmt) -> bool {
@@ -973,7 +1004,55 @@ fn render_test_text(text: String) -> IrExpr {
     render_test_tokens(&text)
 }
 
+/// `-n $(cmd)` / `-z $(cmd)` (and the bare `$(cmd)` truth test) — a command
+/// substitution in a test. The flat test text carries the `$(...)` as a
+/// literal (the parser does not expand it), so the ordinary token arms
+/// would test a constant string. Run the command and test its output the
+/// way bash does: `-n` ⇔ output non-empty, `-z` ⇔ output empty.
+///
+/// Only the *whole* segment may be a substitution (trailing words would
+/// make the capture an approximation); anything else returns None and
+/// keeps the historic rendering.
+fn render_flag_substitution_test(text: &str) -> Option<IrExpr> {
+    // the `[[ ... ]]` form appends a trailing `[[` marker word
+    let t = text.trim().strip_suffix("[[ ").unwrap_or(text.trim());
+    let t = t.trim().strip_suffix("[[").unwrap_or(t);
+    let t = t.trim();
+    let (flag, rest) = if let Some(r) = t.strip_prefix("-n") {
+        ("-n", r)
+    } else if let Some(r) = t.strip_prefix("-z") {
+        ("-z", r)
+    } else {
+        ("", t)
+    };
+    let rest = rest.trim();
+    // the operand must be exactly one `$( ... )` spanning the whole rest
+    let inner = rest.strip_prefix("$(")?.strip_suffix(')')?;
+    // no nested close-paren ambiguity (the `[[ ... ]]` form's own parens)
+    if inner.contains("$(") || inner.trim().is_empty() {
+        return None;
+    }
+    let cap = crate::ir::cmd_str_to_open_perl_stripped(inner);
+    // `-n` → non-empty output ⇒ length != 0; `-z`/bare → empty ⇒ length == 0
+    let op = if flag == "-n" { crate::ir::BinOpKind::Ne } else { crate::ir::BinOpKind::Eq };
+    Some(IrExpr::BinOp {
+        op,
+        lhs: Box::new(IrExpr::Str(format!("length({cap})"), StrStyle::Raw)),
+        rhs: Box::new(IrExpr::Int(0)),
+    })
+}
+
 fn render_test_tokens(text: &str) -> IrExpr {
+    // `-n $(cmd)` / `-z $(cmd)`: the command substitution is still a
+    // literal in the flattened test text (the parser does not expand it),
+    // so the generic `-n` arms below would render `length("$(cmd)")` —
+    // a non-empty literal string, i.e. ALWAYS TRUE
+    // (parse-bracket-subshell-pipe.sh: bash leaves rc 1 when the pipeline
+    // prints nothing; the literal test left rc 0). Capture the command at
+    // runtime instead, which is what bash's `[[ -n $(...) ]]` means.
+    if let Some(e) = render_flag_substitution_test(text) {
+        return e;
+    }
     // Quote-aware tokenization (the ir.rs tokenizer: double-quoted
     // segments stay ONE token and their quotes are stripped). The old
     // naive split_whitespace handed operands still carrying their shell
