@@ -84,6 +84,7 @@ pub mod planner; // backend node manifests + core solver (the "solve" idea, docs
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+pub mod stray_reserved_word; // a command named `)` / `}` is a bash syntax error → abort (exit 2), keeping the prefix
 // New transforms merged from the workspace (core-requests/transforms/done).
 pub mod background_decide; // `&` background → THREAD/FORK class (analysis; feeds renderer hooks)
 pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (native float emulation)
@@ -116,6 +117,7 @@ pub mod split_set; // set[int] → small ∪ big partitions (runtime routing; sp
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
+        ("stray-reserved-word", stray_reserved_word::transform),
         ("shir-pipeline-native", shir_pipeline_native::transform),
         ("dead-fn-elim", dead_fn_elim::transform),
         // (name, <name>::transform) — estree worker adds entries here
