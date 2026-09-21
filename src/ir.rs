@@ -3690,6 +3690,21 @@ fn render_param(args: &[IrExpr]) -> String {
                 .and_then(call_arg_str)
                 .unwrap_or_else(|| "0".to_string());
             let raw_len = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            // `${@:off:len}` / `${*:off:len}` — a 1-based slice of the
+            // positional parameters (a LIST, not a scalar substring).
+            if name == "@" || name == "*" {
+                let off: usize = raw_off.trim().parse().unwrap_or(1).max(1);
+                let start = off - 1;
+                if raw_len.is_empty() {
+                    return format!("join(' ', @ARGV[{start}..$#ARGV])");
+                }
+                let len: usize = raw_len.trim().parse().unwrap_or(0);
+                if len == 0 {
+                    return "''".to_string();
+                }
+                let end = start + len - 1;
+                return format!("join(' ', @ARGV[{start}..{end}])");
+            }
             // A NON-`@` offset on a SCALAR variable is a substring
             // `${s:off:len}`: `substr`. The A1 drops `[@]`, so consult the
             // program's array census (`numbers[@]:3:4` stays a slice).
@@ -5648,9 +5663,20 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
-        "shopt" | "set" => {
+        "shopt" => {
             // Shell-option toggles — no runtime effect for the supported
             // subset (the corpus's shopt -s/-u lines gate extglob etc.).
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "set" => {
+            // `set -- a b c` replaces the positional parameters.
+            if words.first().and_then(|w| call_arg_str(w)).as_deref() == Some("--") {
+                let items: Vec<String> = words[1..].iter().map(|w| render_word(w)).collect();
+                emit_indent(out, indent);
+                out.push_str(&format!("@ARGV = ({});\n", items.join(", ")));
+            }
+            // Other `set` forms are option toggles — no runtime effect.
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
