@@ -12438,6 +12438,19 @@ impl<'a, 'r> TestParser<'a, 'r> {
                                     let same = ll == rlit;
                                     return if same == eq { "true".to_string() } else { "false".to_string() };
                                 }
+                                // Both operands are CONSTANT, so the compare
+                                // needs no owned Strings: compare the literal
+                                // texts directly (`&str == &str`), as the
+                                // source reads and as every other backend
+                                // renders it (`String("a") === String("a")`,
+                                // `mem.eql(u8, "a", "a")`, `shEq("a","a")`).
+                                let lo = Render::rust_str(ll);
+                                let ro = Render::rust_str(rlit);
+                                return if eq {
+                                    format!("({lo} == {ro})")
+                                } else {
+                                    format!("({lo} != {ro})")
+                                };
                             }
                             return if eq {
                                 format!("({l} == {r})")
@@ -16528,14 +16541,20 @@ mod tests {
         // `[ "a" = "a" ]` is decidable at render time: the constant RHS
         // cannot carry glob metachars, so the sh2 `=`-fallback pattern
         // machinery must not fire — no __sh_glob_like/__sh_fnmatch.
+        // At `-Og` the compare stays visible but takes the LITERAL form
+        // (`"a" == "a"`) — no owned String is needed for two constants.
         // The shrinking fold to a bare `true` is `-Os`/`-Oz` only (like
         // `1 + 2` -> `3`): at the `-Og` default the output must resemble
-        // the input and every other backend keeps the compare visible.
+        // the input.
         crate::shir::set_size_opt(false);
         let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
         assert!(!out.contains("__sh_glob_like"), "glob probe kept at -Og:\n{out}");
         assert!(!out.contains("__sh_fnmatch"), "fnmatch kept at -Og:\n{out}");
-        assert!(out.contains("\"a\".to_string() == \"a\".to_string()"), "{out}");
+        // Both operands are constant, so the compare needs no owned
+        // Strings — it renders like the source (`"a" == "a"`), as every
+        // other backend does (String("a") === String("a"), mem.eql(u8,..)).
+        assert!(out.contains("if \"a\" == \"a\""), "{out}");
+        assert!(!out.contains("to_string()"), "needless String alloc at -Og:\n{out}");
 
         crate::shir::set_size_opt(true);
         let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
