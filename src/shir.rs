@@ -10760,12 +10760,27 @@ pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
             }
             IrExpr::Index { key, .. } => walk_expr(key, acc),
             IrExpr::Call { func, args } => {
-                // name-taking builtins could reach any array by name
+                // Name-taking builtins can reach an array by name at
+                // runtime — but only when the NAME is dynamic. A literal
+                // identifier argument (`getVar("x")`, the lowering of a
+                // plain `print(x)`) names exactly one scalar, so it can
+                // never reach an unrelated array: it is a static read,
+                // not a dynamic one. Veto only when no literal name is
+                // available (a computed name, or a variable holding one).
                 if matches!(
                     func.as_str(),
                     "eval" | "read" | "getVar" | "unset" | "declare" | "local" | "typeset"
                 ) {
-                    acc.dynamic = true;
+                    let literal_name = args.iter().any(|a| match a {
+                        IrExpr::Str(s, _) => {
+                            let t = s.trim();
+                            is_ident_name(t) || t.split('[').next().map(is_ident_name).unwrap_or(false)
+                        }
+                        _ => false,
+                    });
+                    if !literal_name {
+                        acc.dynamic = true;
+                    }
                 }
                 for a in args {
                     walk_expr(a, acc);
@@ -58640,6 +58655,36 @@ mod const_len_array_tests {
             }),
         ]));
         assert!(v.is_empty(), "a dynamic-name builtin must veto");
+    }
+
+    #[test]
+    fn literal_name_getvar_does_not_veto() {
+        // `print(x)` lowers to `getVar("x")` — a LITERAL name that reads
+        // exactly one scalar and can never reach an unrelated array. It
+        // must not veto the constant-length verdict (the `for x in a`
+        // shape over a literal int list).
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![s("x")],
+            }),
+        ]));
+        assert_eq!(v.get("a"), Some(&3), "a literal-name getVar must not veto");
+    }
+
+    #[test]
+    fn dynamic_name_getvar_vetoes() {
+        // A getVar whose name is not a literal identifier can reach any
+        // array at runtime, so the verdict must stay empty.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Var("n".to_string(), None)],
+            }),
+        ]));
+        assert!(v.is_empty(), "a dynamic-name getVar must veto");
     }
 
     #[test]
