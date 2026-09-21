@@ -7184,6 +7184,13 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // fork/exec fallback otherwise). Complex commands keep the bash -c
     // string path. Embed fragments disable the seam (no preamble helpers;
     // the open-idiom below is self-contained).
+    // A command the native capability tree can COMPUTE (basename/dirname/
+    // pwd, …) needs no shell at all — check_qx flags `bash -c` wrapping a
+    // builtin. Try it before the uu-ffi seam (which would still fork/exec
+    // a coreutils binary) and before the bash -c fallback.
+    if let Some(e) = crate::pipeline_native::native_capture(cmd) {
+        return e;
+    }
     if uu_seam_enabled() {
         if let Some(argv) = sh_split_simple_cmd(cmd) {
             return sh_uu_capture_expr(&argv);

@@ -65,23 +65,57 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
     let [IrExpr::Array(stages)] = args.as_slice() else {
         return None;
     };
-    if stages.len() != 2 {
-        return None;
+    // Two stages: producer → consumer.
+    if let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() {
+        let content = pipe_printf_content(s1)?;
+        let (cmd, words) = pipe_consumer(s2)?;
+        let ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl: crate::ir::safe_perl_q_string(&content),
+        };
+        return match native_dispatch(&NativeCtx::Pipe(&ctx)) {
+            Some(NativeEmit::Stmt(s)) => Some(s),
+            _ => None,
+        };
     }
-    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
-        return None;
-    };
-    let content = pipe_printf_content(s1)?;
-    let (cmd, words) = pipe_consumer(s2)?;
-    let ctx = PipelineCtx {
-        cmd,
-        words,
-        content_perl: crate::ir::safe_perl_q_string(&content),
-    };
-    match native_dispatch(&NativeCtx::Pipe(&ctx)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
-        _ => None,
+    // Three stages (`echo … | grep … | wc -l`): the FIRST TWO are lowered
+    // as a native pipeline whose stdout is captured into a scalar, and
+    // that scalar expression becomes the final consumer's payload. The
+    // capability contract takes `content_perl` as a Perl EXPRESSION (the
+    // leaves splice it into `split(/\n/, {body})`), so a variable works
+    // exactly like a literal.
+    if let [IrExpr::Arrow(s1), IrExpr::Arrow(s2), IrExpr::Arrow(s3)] = stages.as_slice() {
+        let content = pipe_printf_content(s1)?;
+        let (mid_cmd, mid_words) = pipe_consumer(s2)?;
+        let mid_ctx = PipelineCtx {
+            cmd: mid_cmd,
+            words: mid_words,
+            content_perl: crate::ir::safe_perl_q_string(&content),
+        };
+        let mid = match native_dispatch(&NativeCtx::Pipe(&mid_ctx)) {
+            Some(NativeEmit::Stmt(s)) => s,
+            _ => return None,
+        };
+        let (cmd, words) = pipe_consumer(s3)?;
+        let v = "__sh_pv";
+        let final_ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl: format!("${v}"),
+        };
+        let tail = match native_dispatch(&NativeCtx::Pipe(&final_ctx)) {
+            Some(NativeEmit::Stmt(s)) => s,
+            _ => return None,
+        };
+        // Run the first two stages with stdout captured (the same
+        // select()-redirect idiom the capture sites use), then the final
+        // consumer reads the captured text.
+        return Some(format!(
+            "my ${v} = do {{ my $__sh_pc = ''; open my $__sh_pf, '>', \\$__sh_pc or die; my $__sh_po = select($__sh_pf); {mid} close $__sh_pf; select($__sh_po); $__sh_pc =~ s/\\n+\\z//; $__sh_pc }}; {tail}"
+        ));
     }
+    None
 }
 
 /// Parent (exec-in-condition): `grep -q PAT FILE` / `cmp -s F1 F2` etc.
@@ -100,6 +134,68 @@ pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
         Some(NativeEmit::Stmt(s)) => Some(s),
         _ => None,
     }
+}
+
+/// Parent (capture): `x=$(cmd)` where `cmd` is a single simple command the
+/// capability tree knows how to compute without a shell. Returns a Perl
+/// EXPRESSION for the captured value.
+///
+/// The shell text is split by `sh_split_simple_cmd` (which refuses shell
+/// metacharacters), then re-shaped as the exec call the leaves expect.
+/// `$__sh_cap` is the value channel: a leaf's statement assigns it, and
+/// this parent returns it as the expression.
+pub(crate) fn native_capture(cmd_text: &str) -> Option<String> {
+    // Single simple command only. A command carrying a nested `$(…)`, a
+    // glob, or any shell metacharacter is left to the uu-ffi seam / the
+    // `bash -c` fallback: `sh_split_simple_cmd` refuses those, and a
+    // spliced inner expression would have to be threaded through the
+    // leaves' literal-word contract (which `grep_lit_str` deliberately
+    // restricts to literals).
+    let argv = crate::ir::sh_split_simple_cmd(cmd_text)?;
+    let (name, words) = argv.split_first()?;
+    let call = IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![
+            IrExpr::Str(name.clone(), crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Array(
+                words
+                    .iter()
+                    .map(|w| IrExpr::Str(w.clone(), crate::ir::StrStyle::DoubleQuoted))
+                    .collect(),
+            ),
+        ],
+    };
+    match native_dispatch(&NativeCtx::Exec { call: &call, cond: false }) {
+        // the leaf wrote the value into $__sh_cap
+        Some(NativeEmit::Stmt(s)) if s.contains("$__sh_cap") => {
+            Some(format!("do {{ my $__sh_cap; {s} $__sh_cap }}"))
+        }
+        _ => None,
+    }
+}
+
+/// Split out the FIRST `$(...)` from `s`, returning
+/// `(before, inner, after)`. Nested parens inside the substitution are
+/// balanced; `None` when there is no substitution.
+fn split_one_subst(s: &str) -> Option<(&str, &str, &str)> {
+    let start = s.find("$(")?;
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start + 1; // at '('
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..start], &s[start + 2..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parent (cat-heredoc): the body of a verified `cat <<'EOF' … EOF` → a
