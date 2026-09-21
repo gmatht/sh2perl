@@ -8327,11 +8327,40 @@ impl Render {
                 if l.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
                     continue;
                 }
+                // A blank line stranded between the removed store and a
+                // closing brace: the store was the block's last statement,
+                // so the separator that preceded it is now trailing
+                // whitespace inside the braces — drop it (`if c { … }`
+                // rather than `if c { …\n\n}`).
+                if l.trim().is_empty()
+                    && self
+                        .out
+                        .last()
+                        .map(|p| p.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
                 self.out.push(l);
+            }
+            // …and one that the DRAIN left at the very end of the buffer
+            // (the emitted `}` line has not been written yet)
+            while self.out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                self.out.pop();
             }
             return;
         }
         self.stmt_inner(s);
+    }
+
+    /// Drop trailing blank lines from the render buffer. A stripped status
+    /// write (or a dropped tail statement) can leave the separator that
+    /// followed it as the buffer's last line; emitting a closing brace next
+    /// would then produce `{ …\n\n}`.
+    fn trim_trailing_blanks(&mut self) {
+        while self.out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+            self.out.pop();
+        }
     }
 
     fn stmt_inner(&mut self, s: &IrStmt) {
@@ -8824,13 +8853,23 @@ impl Render {
                         self.stmt(s);
                     }
                     self.depth -= 1;
-                } else {
-                    // no branch ran — bash's if rc is 0
+                } else if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
+                    // No branch ran ⇒ bash's `$?` is 0, so the if
+                    // synthesizes a false-path status write. That write is
+                    // the ONLY thing the arm carries: when the shared
+                    // liveness proves it unread (nothing observes `$?`
+                    // before the next write — and never for a source with
+                    // no `$?` at all), the arm is pure noise and the whole
+                    // `else { … }` is dropped.
                     self.emit("} else {");
                     self.depth += 1;
                     self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                     self.depth -= 1;
                 }
+                // A dropped else arm (or a stripped status write) can leave
+                // a blank line trailing inside the braces — collapse it so
+                // the block closes on its last statement.
+                self.trim_trailing_blanks();
                 self.emit("}");
             }
             IrStmt::While { cond, body } => {
@@ -8839,26 +8878,48 @@ impl Render {
                 // otherwise the loop's rc = the last body command's rc —
                 // the cond eval stores its own rc every iteration, so the
                 // body's rc is captured and restored after the loop
+                // bash: a while whose condition never tests true exits 0;
+                // otherwise the loop's rc = the last body command's rc —
+                // the cond eval stores its own rc every iteration, so the
+                // body's rc is captured and restored after the loop.
+                //
+                // That capture/restore pair is PURE status bookkeeping:
+                // when the shared liveness proves the loop's status write
+                // unread (and always for a source with no `$?`), the whole
+                // apparatus goes — a plain `while cond { body }` with no
+                // `ran`/`last` temporaries and no trailing restore
+                // (which would otherwise decay into an empty
+                // `if !ran { } else { }` once the stores are stripped).
+                let track = !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s);
                 let ran = self.gensym("__sh_while_ran");
                 let last = self.gensym("__sh_while_last");
-                self.emit(&format!("let mut {ran} = false;"));
-                self.emit(&format!("let mut {last} = 0;"));
+                if track {
+                    self.emit(&format!("let mut {ran} = false;"));
+                    self.emit(&format!("let mut {last} = 0;"));
+                }
                 self.emit(&format!("while {} {{", Self::unparen(&c)));
                 self.loop_depth += 1;
                 self.depth += 1;
-                self.emit(&format!("{ran} = true;"));
-                self.loop_rc_last.push(last.clone());
+                if track {
+                    self.emit(&format!("{ran} = true;"));
+                    self.loop_rc_last.push(last.clone());
+                }
                 for s in body {
                     self.stmt(s);
                 }
-                self.loop_rc_last.pop();
-                self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                if track {
+                    self.loop_rc_last.pop();
+                    self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                }
+                self.trim_trailing_blanks();
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
-                self.emit(&format!(
-                    "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
-                ));
+                if track {
+                    self.emit(&format!(
+                        "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                    ));
+                }
             }
             IrStmt::DoWhile { body, cond, until } => {
                 // bash: do/until rc = the last body command's rc — the cond
@@ -9375,9 +9436,17 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
                 self.emit("}");
-                self.emit(&format!(
-                    "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
-                ));
+                // The loop's final status (bash: the last body command's,
+                // or 0 when the body never ran). Pure status bookkeeping —
+                // when the write is provably unread (the shared liveness,
+                // and always for a source with no `$?`) the whole epilogue
+                // is dropped instead of decaying into an empty
+                // `if !ran { } else { }` once the stores are stripped.
+                if !crate::shir::stmt_status_write_is_unread(s) {
+                    self.emit(&format!(
+                        "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                    ));
+                }
             }
             IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
                 // STREAMING line iteration — O(1) memory (O(limit) for
@@ -16732,6 +16801,36 @@ mod tests {
         let out = render("a=$(echo hi)\necho \"$a\"\n");
         assert!(out.contains("let a = "), "{out}");
         assert!(!out.contains("let a = &"), "temporary borrowed:\n{out}");
+    }
+
+    /// An `if` with an EMPTY else in the source does not manufacture a
+    /// false-path status arm when nothing can observe the status — the
+    /// t25 shape (`if 1 < 2: print("yes")`), which used to render an
+    /// `} else { }` block carrying only a stripped status write.
+    #[test]
+    fn empty_else_is_not_manufactured() {
+        // the py-source shape: no `$?` anywhere for the verdict to preserve
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"If","cond":{"type":"Arith","ast":{"type":"Bin","op":"<","lhs":{"type":"Num","value":1},"rhs":{"type":"Num","value":2}}},"then":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"yes","style":"DoubleQuoted"}]}]}}],"elsifs":[],"else":[]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("A1 ingress");
+        crate::shir::set_source_lang(Some("py"));
+        let out = shir_to_rust(&prog);
+        crate::shir::set_source_lang(None);
+        assert!(!out.contains("else"), "empty else manufactured:\n{out}");
+        assert!(!out.contains("__SH_RC"), "status kept:\n{out}");
+        assert!(out.contains("print!("), "body lost:\n{out}");
+        assert!(out.contains("yes"), "body lost:\n{out}");
+        assert!(!out.contains("\n\n    }"), "stray blank before the brace:\n{out}");
+    }
+
+    /// …but a SHELL source whose `$?` IS read keeps the arm: the false path
+    /// must record status 0 for the read to see.
+    #[test]
+    fn empty_else_kept_when_status_is_read() {
+        let out = render("if true; then echo yes; fi\necho \"rc=$?\"\n");
+        assert!(out.contains("} else {"), "status arm dropped:\n{out}");
+        assert!(out.contains("__SH_RC.store(0, Ordering::SeqCst);"), "{out}");
     }
 
     /// A parameter the body only BORROWS takes `&str` (the shared

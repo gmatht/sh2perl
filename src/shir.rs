@@ -1046,6 +1046,64 @@ pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
         *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
         return;
     }
+    // SOURCE-LANGUAGE STATUS VERDICT: no source `$?` and no status read
+    // means NO status write can ever be observed — every statement that
+    // writes one is unread by construction (not a liveness guess). This is
+    // what lets a renderer drop the status bookkeeping an `if` with an
+    // empty else would otherwise manufacture.
+    if exit_status_is_unobservable(prog) {
+        let mut unread: HashSet<usize> = HashSet::new();
+        fn all(stmts: &[IrStmt], unread: &mut HashSet<usize>) {
+            for st in stmts {
+                if ir_stmt_writes_lastexit(st) {
+                    unread.insert(st as *const IrStmt as usize);
+                }
+                match st {
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::Block(body) => all(body, unread),
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        all(init, unread);
+                        all(step, unread);
+                        all(body, unread);
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        all(then, unread);
+                        for (_, arm) in elsifs {
+                            all(arm, unread);
+                        }
+                        all(else_, unread);
+                    }
+                    IrStmt::Subshell(b) | IrStmt::Background(b) => all(b, unread),
+                    IrStmt::Redirect { inner, .. } => all(inner, unread),
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st2 in stages {
+                            all(st2, unread);
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        all(body, unread);
+                        for (_, nb) in named_blocks {
+                            all(nb, unread);
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body } => {
+                        all(body, unread);
+                        for e in excepts {
+                            all(&e.body, unread);
+                        }
+                        all(else_body, unread);
+                        all(finally_body, unread);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        all(&prog.stmts, &mut unread);
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+        return;
+    }
     let mut live: HashSet<usize> = HashSet::new();
     walk_lastexit_liveness(&prog.stmts, true, &mut live);
     let mut unread: HashSet<usize> = HashSet::new();
