@@ -1012,6 +1012,118 @@ static TEST_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 /// protocol is dropped only when the clone's own liveness says the write
 /// is unread). Active only during the define-arrow construction.
 static ARROW_BODY_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+/// Install the Plan-4 lastExit-write liveness verdict for a renderer that
+/// is NOT the ESTree emitter (the Rust backend carries its own status
+/// register, `__SH_RC`). Same analysis, same pointer keys: the IR tree is
+/// immutable during a render, so the caller MUST call this on the exact
+/// `prog` it then renders. `errexit` is the caller's `set -e` verdict
+/// (`ir_may_enable_errexit`); under a possible errexit no write is
+/// droppable.
+pub fn install_lastexit_deadness(prog: &IrProgram, errexit: bool) {
+    *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+}
+
+/// Renderer-facing accessor for [`LASTEXIT_DEAD`]: true when this
+/// statement's status write is provably unread (so a renderer carrying a
+/// status register may drop the store). Unset ⇒ conservative (false).
+pub fn stmt_lastexit_write_is_dead(stmt: &IrStmt) -> bool {
+    lastexit_write_is_dead(stmt)
+}
+
+/// General status-write liveness for renderers that carry their own status
+/// register (the Rust backend's `__SH_RC`): the set of statements that
+/// WRITE a status (`ir_stmt_writes_lastexit`) but which the backward scan
+/// proved unread. [`LASTEXIT_DEAD`] is the ESTree emitter's narrow map
+/// (only shapes it has a dead twin for); this is the general verdict.
+static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Install the general unread-status-write set (see [`LASTEXIT_UNREAD`]).
+/// Same pointer keys as [`LASTEXIT_DEAD`]: the caller MUST pass the exact
+/// `prog` it then renders.
+pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
+    if errexit {
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        return;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    walk_lastexit_liveness(&prog.stmts, true, &mut live);
+    let mut unread: HashSet<usize> = HashSet::new();
+    fn collect(stmts: &[IrStmt], live: &HashSet<usize>, unread: &mut HashSet<usize>) {
+        for st in stmts {
+            let key = st as *const IrStmt as usize;
+            if ir_stmt_writes_lastexit(st) && !live.contains(&key) {
+                unread.insert(key);
+            }
+            match st {
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect(body, live, unread),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, live, unread);
+                    collect(step, live, unread);
+                    collect(body, live, unread);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, live, unread);
+                    for (_, arm) in elsifs {
+                        collect(arm, live, unread);
+                    }
+                    collect(else_, live, unread);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) => collect(b, live, unread),
+                IrStmt::Redirect { inner, .. } => collect(inner, live, unread),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st2 in stages {
+                        collect(st2, live, unread);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, live, unread);
+                    for (_, nb) in named_blocks {
+                        collect(nb, live, unread);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    collect(body, live, unread);
+                    for e in excepts {
+                        collect(&e.body, live, unread);
+                    }
+                    collect(else_body, live, unread);
+                    collect(finally_body, live, unread);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &live, &mut unread);
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+}
+
+/// Renderer-facing accessor for [`LASTEXIT_UNREAD`]: true when this
+/// statement writes a status that the backward scan proved unread. Unset ⇒
+/// conservative (false — keep the write).
+pub fn stmt_status_write_is_unread(stmt: &IrStmt) -> bool {
+    LASTEXIT_UNREAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
+        .unwrap_or(false)
+}
+
+
 fn test_cond_write_is_dead(stmt: &IrStmt) -> bool {
     if let Some(m) = ARROW_BODY_COND_DEAD.lock().unwrap().as_ref() {
         if let Some(dead) = m.get(&(stmt as *const IrStmt as usize)) {
@@ -1166,11 +1278,14 @@ pub(crate) fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
         }
         IrStmt::Expr(e) => match e {
             IrExpr::BinOp { op, .. } => matches!(op, BinOpKind::And | BinOpKind::Or),
-            IrExpr::Call { func, args } => {
-                args.iter().any(ir_expr_reads_status)
-                    || matches!(func.as_str(), "and" | "or" | "exit" | "return")
+            // delegate to the expression predicate FIRST: it knows the
+            // `getVar("?")` form of a status read (the `$?` word-level
+            // lowering), which a bare `args.any(...)` scan misses.
+            other => {
+                ir_expr_reads_status(other)
+                    || matches!(other, IrExpr::Call { func, .. }
+                        if matches!(func.as_str(), "and" | "or" | "exit" | "return"))
             }
-            other => ir_expr_reads_status(other),
         },
         IrStmt::While { cond, .. } | IrStmt::If { cond, .. } => ir_expr_reads_status(cond),
         IrStmt::DoWhile { cond, .. } => ir_expr_reads_status(cond),
@@ -56710,6 +56825,81 @@ mod const_len_array_tests {
             elem_store("a", IrExpr::Int(1 + 1), "9"),
         ]));
         assert_eq!(v.get("a"), Some(&3));
+    }
+}
+
+#[cfg(test)]
+mod unread_status_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn echo(word: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![s("echo"), IrExpr::Array(vec![s(word)])],
+        })
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn consecutive_writers_leave_only_the_last_live() {
+        // two status writers, no reader: the FIRST is unread (the second
+        // overwrites it), the LAST carries the program's final status.
+        let p = prog(vec![echo("a"), echo("b")]);
+        install_unread_status_writes(&p, false);
+        let (a, b) = match (&p.stmts[0], &p.stmts[1]) {
+            (x, y) => (x, y),
+        };
+        assert!(stmt_status_write_is_unread(a), "first writer must be unread");
+        assert!(!stmt_status_write_is_unread(b), "last writer must stay live");
+    }
+
+    #[test]
+    fn errexit_vetoes_every_drop() {
+        // under a possible `set -e` the guard consumes the status
+        let p = prog(vec![echo("a"), echo("b")]);
+        install_unread_status_writes(&p, true);
+        for st in &p.stmts {
+            assert!(!stmt_status_write_is_unread(st), "errexit must veto");
+        }
+    }
+
+    #[test]
+    fn status_read_keeps_the_preceding_write() {
+        // `echo a; echo "$?"` — the reader pins the first write live
+        let p = prog(vec![
+            echo("a"),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![s("?")],
+            }),
+            echo("b"),
+        ]);
+        install_unread_status_writes(&p, false);
+        assert!(
+            !stmt_status_write_is_unread(&p.stmts[0]),
+            "a $? read must keep the preceding write live"
+        );
     }
 }
 

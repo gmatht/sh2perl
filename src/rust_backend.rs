@@ -1330,6 +1330,16 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // (`py -> rs` for a plain Python program: no `static __SH_RC`, no
     // stores, no `process::exit(__SH_RC…)`). False = shell default.
     r.rc_disabled = crate::shir::exit_status_is_unobservable(&prog);
+    // PLAN-4 STATUS-WRITE LIVENESS (shared analysis): which statements'
+    // status writes are provably unread. The Rust renderer carries its own
+    // register (`__SH_RC`), so it installs the same verdict the ESTree
+    // emitter uses and drops the dead `store(0, …)` writes — a
+    // `setVar`/pure builtin's status is overwritten (or the program exits
+    // 0) before any `$?` read. Pointer-keyed: install on the exact `prog`
+    // that is rendered below.
+    let errexit = crate::shir::ir_may_enable_errexit(&prog);
+    crate::shir::install_lastexit_deadness(&prog, errexit);
+    crate::shir::install_unread_status_writes(&prog, errexit);
     // STATIC ARRAY VERDICT (shared analysis): literal-list arrays that are
     // only read as a whole list can use a borrowed representation.
     r.static_arrays = Some(crate::shir::analyze_static_arrays(&prog));
@@ -1464,6 +1474,18 @@ impl Render {
     /// their own). A load becomes `0` — the register can hold nothing else
     /// the source could have observed, and the program has no status read
     /// by the verdict that set `rc_disabled`.
+    /// Emit a statement's trailing `__SH_RC.store(0, …)` only when the
+    /// shared Plan-4 liveness keeps it. A statement whose status write is
+    /// provably unread (nothing observes `$?` before the register is
+    /// overwritten or the program exits) carries no store — the same
+    /// verdict the ESTree emitter uses to drop `sh2.lastExit`.
+    fn status_store(&mut self, s: &IrStmt) {
+        if crate::shir::stmt_status_write_is_unread(s) {
+            return;
+        }
+        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+    }
+
     fn rc_strip(&self, s: &str) -> String {
         if !self.rc_disabled || !s.contains("__SH_RC") {
             return s.to_string();
@@ -7725,6 +7747,28 @@ impl Render {
     // ── statements ───────────────────────────────────────────────────
 
     fn stmt(&mut self, s: &IrStmt) {
+        // PLAN-4 STATUS LIVENESS: a statement whose status write the shared
+        // verdict marks unread contributes no `__SH_RC.store(0, …)`. The
+        // write sites are spread across the statement arms (exec/echo/
+        // setVar/…), so strip the store from whatever the arm emitted —
+        // exact, because the renderer only ever emits the literal
+        // `__SH_RC.store(0, Ordering::SeqCst);` line for a status write.
+        if crate::shir::stmt_status_write_is_unread(s) {
+            let mark = self.out.len();
+            self.stmt_inner(s);
+            let tail: Vec<String> = self.out.drain(mark..).collect();
+            for l in tail {
+                if l.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                    continue;
+                }
+                self.out.push(l);
+            }
+            return;
+        }
+        self.stmt_inner(s);
+    }
+
+    fn stmt_inner(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
                 // setVar(name, value) — the frontend-emitted store write:
@@ -7748,7 +7792,7 @@ impl Render {
                         };
                         self.emit(&emitted);
                     }
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.status_store(s);
                 }
                 IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
                     // user-function call: the argv-swap convention (the
@@ -15114,6 +15158,27 @@ mod tests {
         // not code — the golf pass must not touch them.
         let out = super::golf_rust("fn main() {\n    print!(\"a // b __sh_x\");\n}\n");
         assert!(out.contains("\"a // b __sh_x\""), "string literal altered:\n{out}");
+    }
+
+    #[test]
+    fn dead_status_store_dropped() {
+        // No `$?` read anywhere and the final statement's status is the
+        // only observable one: the earlier `echo`/assignment status
+        // writes are provably unread and carry no `__SH_RC.store`.
+        let out = render("x=1\necho hi\necho there\n");
+        let n = out.matches("__SH_RC.store(0, Ordering::SeqCst);").count();
+        assert!(n <= 1, "dead status stores kept ({n}):\n{out}");
+    }
+
+    #[test]
+    fn status_store_kept_when_read() {
+        // `$?` observes the previous status — the write before it must
+        // stay, so the register is not elided wholesale.
+        let out = render("false\necho \"rc=$?\"\n");
+        assert!(
+            out.contains("__SH_RC.store(") && out.contains("__SH_RC.load"),
+            "status read lost:\n{out}"
+        );
     }
 
     #[test]
