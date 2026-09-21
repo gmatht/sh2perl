@@ -1043,6 +1043,127 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         imports.push("Sys::Hostname qw(hostname)".to_string());
     }
 
+/// The byte index of the first newline that is NOT inside a Perl string
+/// literal — where the `# line N` source-mapping comment may be spliced.
+///
+/// A native capture's payload can be a multi-line `q{...}` literal
+/// (`x=$(seq 1 10 | head -3)`), and splicing the comment into it would
+/// print the comment as part of the captured value. Tracks `'...'`,
+/// `"..."`, backticks, `q<d>...<d>` / `qq<d>...<d>` (bracket delimiters
+/// nest) and `\` escapes.
+fn first_code_newline(s: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        Single,
+        Double,
+        Backtick,
+        /// `q<open> ... <close>`
+        Q(char, char),
+    }
+    let b = s.as_bytes();
+    let mut st = St::Code;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        match st {
+            St::Code => match c {
+                '\'' => st = St::Single,
+                '"' => st = St::Double,
+                '`' => st = St::Backtick,
+                '#' => {
+                    // a comment runs to the end of the line
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                'q' => {
+                    // `q<d>` / `qq<d>`: only when a delimiter follows
+                    let (nd, adv) = if b.get(i + 1) == Some(&b'q') {
+                        (b.get(i + 2).copied(), 3)
+                    } else {
+                        (b.get(i + 1).copied(), 2)
+                    };
+                    if let Some(d) = nd {
+                        let d = d as char;
+                        if d.is_ascii_alphanumeric() || d == '_' {
+                            i += 1;
+                            continue;
+                        }
+                        let close = match d {
+                            '(' => ')',
+                            '[' => ']',
+                            '{' => '}',
+                            '<' => '>',
+                            o => o,
+                        };
+                        st = St::Q(d, close);
+                        i += adv;
+                        continue;
+                    }
+                }
+                '\n' => return Some(i),
+                _ => {}
+            },
+            St::Single => match c {
+                '\\' => {
+                    i += 2;
+                    continue;
+                }
+                '\'' => st = St::Code,
+                _ => {}
+            },
+            St::Double | St::Backtick => {
+                let end = if st == St::Double { '"' } else { '`' };
+                match c {
+                    '\\' => {
+                        i += 2;
+                        continue;
+                    }
+                    _ if c == end => st = St::Code,
+                    _ => {}
+                }
+            }
+            St::Q(open, close) => {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if open != close && c == open {
+                    // bracket pairs nest — skip the balanced run
+                    let mut depth = 1usize;
+                    let mut j = i + 1;
+                    while j < b.len() {
+                        let cj = b[j] as char;
+                        if cj == '\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if cj == open {
+                            depth += 1;
+                        } else if cj == close {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j + 1;
+                    st = St::Code;
+                    continue;
+                }
+                if c == close {
+                    st = St::Code;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
     // ── Body ────────────────────────────────────────────────────────
     // Render statements + subs + exit into a `body` buffer FIRST so the
     // modern-IR preamble can be scanned against the ACTUAL generated text:
@@ -1063,9 +1184,13 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         emit_stmt(&mut body, stmt, 0);
         if let Some(l) = line {
             // a SHORT comment at the end of the statement's first line:
-            // `$sum += $i;  # line 7` — the source-mapping convention
+            // `$sum += $i;  # line 7` — the source-mapping convention.
+            // The newline must be OUTSIDE any string literal: a native
+            // capture's payload can be a multi-line `q{…}` (e.g.
+            // `x=$(seq 1 10 | head -3)`), and inserting into it would
+            // print the comment as part of the captured value.
             let added = &body[before..];
-            if let Some(nl) = added.find('\n') {
+            if let Some(nl) = first_code_newline(added) {
                 body.insert_str(before + nl, &format!("  # line {l}"));
             }
         }
@@ -2236,6 +2361,26 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if func == "capture" {
                         // Modern-IR command substitution: Assign{var, capture(…)}
                         // — rebuild the shell command and capture its stdout.
+                        // A capture of a single NATIVE PIPELINE
+                        // (`x=$(echo hi | sort)`) is lowered natively: run
+                        // the shared pipeline capability's statement with
+                        // stdout redirected into the variable, instead of
+                        // shelling the whole thing to `bash -c` (which
+                        // check_qx flags as "wrapping builtin 'echo'").
+                        if let Some(arrow) = capture_call_arrow(expr) {
+                            if let [IrStmt::Expr(e)] = arrow.as_slice() {
+                                if let Some(stmt) =
+                                    crate::pipeline_native::native_pipeline(e)
+                                {
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!(
+                                        "{} = do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {stmt} close $__fh; select($__old); $__cap =~ s/\\n+\\z//; $__cap }};\n",
+                                        lhs
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
                         if let Some(cmd) = capture_call_to_cmd(expr) {
                             emit_capture_assign(out, indent, &lhs, &cmd);
                             return;
@@ -2243,6 +2388,29 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                 }
                 if let IrExpr::Capture { native: false, .. } = expr {
+                    // A capture of a single NATIVE PIPELINE
+                    // (`x=$(echo hi | sort)`) — the shared pipeline
+                    // capability already lowers the body to a Perl
+                    // statement that prints the result; run it with stdout
+                    // redirected into the target instead of shelling the
+                    // whole thing to `bash -c` (check_qx: "wrapping
+                    // builtin 'echo'").
+                    if let IrExpr::Capture { expr: inner, .. } = expr {
+                        if let IrExpr::Arrow(stmts) = inner.as_ref() {
+                            if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                                if let Some(stmt) =
+                                    crate::pipeline_native::native_pipeline(e)
+                                {
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!(
+                                        "{} = do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {stmt} close $__fh; select($__old); $__cap =~ s/\\n+\\z//; $__cap }};\n",
+                                        lhs
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     // Extract the inner expression string for qx{...}
                     if let IrExpr::Capture {
                         expr: inner_expr, ..
@@ -4517,6 +4685,24 @@ fn capture_call_to_cmd(call: &IrExpr) -> Option<String> {
     None
 }
 
+/// The Arrow body of a `capture(Arrow([…]))` call, if that is its shape —
+/// the IR view a native-pipeline capture needs (the shell-text view is
+/// `capture_call_to_cmd`).
+fn capture_call_arrow(call: &IrExpr) -> Option<&Vec<IrStmt>> {
+    let IrExpr::Call { func, args } = call else {
+        return None;
+    };
+    if func != "capture" {
+        return None;
+    }
+    for a in args {
+        if let IrExpr::Arrow(stmts) = a {
+            return Some(stmts);
+        }
+    }
+    None
+}
+
 /// Render a `for` iterable: `Array([…])` → Perl list; `Range` → `a..b`;
 /// `split(x)` → `split /\s+/, x` (bash IFS word splitting); a single
 /// `capture` element → iterate the captured words.
@@ -5982,6 +6168,22 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // — parse-redirect-clobber's cmdsub-in-arg).
             if !*native {
                 if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                    // A capture of a single NATIVE PIPELINE (`x=$(echo hi |
+                    // sort)`) — the shared pipeline capability already knows
+                    // how to lower the body to a Perl statement that PRINTS
+                    // the result. Run that statement with stdout redirected
+                    // into a buffer instead of shelling the whole thing to
+                    // `bash -c` (which check_qx flags as "wrapping builtin
+                    // 'echo'"). Same redirect idiom as the PERL-SIDE capture
+                    // below; the statement's own `print` follows the
+                    // selected handle.
+                    if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                        if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
+                            return format!(
+                                "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {stmt} close $__fh; select($__old); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            );
+                        }
+                    }
                     if let Some(cmd) = stmts_to_shell_cmd(stmts) {
                         return cmd_str_to_open_perl(&cmd);
                     }
@@ -6028,7 +6230,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // needs fd 1 CLOSED first (EBADF otherwise — verified
                     // on perl 5.38; the dup2 target must be free).
                     return format!(
-                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap }}"
+                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
                     );
                 }
             }

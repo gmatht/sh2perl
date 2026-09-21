@@ -135,14 +135,87 @@ fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
     let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
         return None;
     };
-    if cmd != "printf" || words.len() != 1 {
-        return None;
+    // `echo [flags] words…` — the corpus's dominant producer. Join the
+    // literal words with spaces. NOTE the payload convention shared with
+    // the `printf` path: NO trailing newline. The consumers add it back
+    // where it matters (`wc -c`'s `length(body) + 1`), so `echo -n` —
+    // which suppresses it — must refuse rather than be mis-counted.
+    // `-e` interprets backslash escapes (`echo -e "a\nb"`).
+    if cmd == "echo" {
+        let mut escapes = false;
+        let mut parts: Vec<String> = Vec::new();
+        let mut seen_word = false;
+        for w in words {
+            let lit = crate::ir::grep_lit_str(w)?;
+            // leading flags only (bash: `echo -n x`, but `echo x -n`
+            // prints `x -n`)
+            if !seen_word && lit.starts_with('-') && lit.len() > 1 {
+                for c in lit[1..].chars() {
+                    match c {
+                        'e' => escapes = true,
+                        'E' => escapes = false,
+                        // `-n` drops the trailing newline the consumers
+                        // assume is there
+                        _ => return None,
+                    }
+                }
+                continue;
+            }
+            seen_word = true;
+            parts.push(lit);
+        }
+        let mut payload = parts.join(" ");
+        if escapes {
+            payload = printf_unescape(&payload);
+        }
+        return Some(payload);
     }
-    let fmt = crate::ir::grep_lit_str(&words[0])?;
-    if fmt.contains('%') {
-        return None;
+    if cmd == "printf" {
+        if words.len() != 1 {
+            return None;
+        }
+        let fmt = crate::ir::grep_lit_str(&words[0])?;
+        if fmt.contains('%') {
+            return None;
+        }
+        return Some(printf_unescape(&fmt));
     }
-    Some(printf_unescape(&fmt))
+    // `seq [first [step]] last` — the ascending integer sequence, joined
+    // by newlines. The consumers split on `\n`, and the payload
+    // convention is no trailing newline (same as printf/echo), so a
+    // `seq 1 10 | wc -l` counts 10 lines. Descending (`seq 3 1`) prints
+    // nothing, matching bash. Non-integer or >3 operands refuse.
+    if cmd == "seq" {
+        let nums: Vec<i64> = words
+            .iter()
+            .map(|w| crate::ir::grep_lit_str(w)?.trim().parse::<i64>().ok())
+            .collect::<Option<_>>()?;
+        let (first, step, last) = match nums.as_slice() {
+            [last] => (1, 1, *last),
+            [first, last] => (*first, 1, *last),
+            [first, step, last] => (*first, *step, *last),
+            _ => return None,
+        };
+        if step == 0 {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::new();
+        if step > 0 {
+            let mut v = first;
+            while v <= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        } else {
+            let mut v = first;
+            while v >= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        }
+        return Some(out.join("\n"));
+    }
+    None
 }
 
 /// The consumer command + option words of the second stage.
