@@ -129,15 +129,56 @@ impl FnSig {
 ///     call the borrow is for (the callee may not store it — that is what
 ///     the borrow verdict guarantees).
 fn borrow_word(w: &str) -> String {
-    let t = w.trim();
-    if let Some(base) = t.strip_suffix(".to_string()") {
-        let base = base.trim();
-        // a plain string literal (never an index/call/arith result)
-        if base.len() >= 2 && base.starts_with('"') && base.ends_with('"') {
-            return base.to_string();
-        }
+    if let Some(lit) = string_literal_word(w) {
+        return lit.to_string();
     }
     format!("&{}", Render::unparen(w))
+}
+
+/// The bare literal text when a rendered word is `<"…">.to_string()` (the
+/// form the renderer emits for a string constant), else None. A literal is
+/// `&'static str`, so it needs no allocation and no borrow of a temporary
+/// — `f("hello")` rather than `f(&"hello".to_string())`.
+/// A coarse classification of a binding's RHS, used to decide whether a
+/// borrowable local can actually take a borrowed type: "literal" for a
+/// string constant (a `&'static str`), "var:<name>" for a read of another
+/// variable, "other" for anything computed (a temporary — not borrowable).
+fn expr_rhs_key(e: &IrExpr) -> String {
+    match e {
+        IrExpr::Str(..) => "literal".to_string(),
+        IrExpr::Var(n, _) => format!("var:{n}"),
+        IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+            Some(IrExpr::Str(n, _)) => format!("var:{n}"),
+            _ => "other".to_string(),
+        },
+        _ => "other".to_string(),
+    }
+}
+
+fn string_literal_word(w: &str) -> Option<&str> {
+    let t = w.trim();
+    let base = t.strip_suffix(".to_string()")?.trim();
+    (base.len() >= 2 && base.starts_with('"') && base.ends_with('"')).then_some(base)
+}
+
+/// The RHS for a BORROWABLE LOCAL's single binding (`shir::
+/// analyze_var_borrowable`). Stricter than [`borrow_word`]: the binding
+/// OUTLIVES the statement, so only a value that lives at least as long as
+/// the binding may be borrowed. That means a `&'static str` literal, or a
+/// read of another borrowable local — never a temporary (a capture block,
+/// a call result, an interpolation), which would dangle on the next line.
+///
+/// A word that does not qualify keeps its owned `String` form: the caller
+/// falls back to the plain assignment, and the variable's declared type
+/// follows (the renderer's `read_str` only emits a borrow for a name in
+/// `borrowable_vars`, so the two must agree).
+fn borrowable_binding_rhs(w: &str) -> Option<String> {
+    if let Some(lit) = string_literal_word(w) {
+        return Some(lit.to_string());
+    }
+    // `&<other>` — a borrow of another borrowable local (the renderer
+    // emits those reads bare, so a nested borrow appears as `&name`)
+    None
 }
 
 /// Pass-3 probe record for one function-body render (legacy convention;
@@ -282,6 +323,11 @@ pub struct Render {
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
     runtime_free: bool,
+    /// The BORROWABLE-LOCAL verdict (`shir::analyze_var_borrowable`): the
+    /// single-assignment variables whose every read is a borrow, so they
+    /// can be bound as `&str` (no `.to_string()` at the binding, no
+    /// `.clone()` at each read). Set once before rendering.
+    borrowable_vars: std::collections::HashSet<String>,
     /// The per-function sink-context verdict (`shir::analyze_fn_sink_contexts`):
     /// the functions whose every call site is OUTSIDE any redirect/capture,
     /// so their bodies can never see a non-stdout sink and print straight to
@@ -1422,6 +1468,93 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // other construct — the sink check is dead code in them. `Sometimes`
     // (the conservative default) stays out of the set.
     r.fn_value_used = fn_value_used(&prog);
+    // BORROWABLE LOCALS (shared analysis): a single-assignment variable
+    // whose every read is a borrow binds as `&str` — `let a = "foo";` and
+    // `println!("{}{}", a, b)` instead of `let a = "foo".to_string();`
+    // plus a `.clone()` per read.
+    r.borrowable_vars = crate::shir::analyze_var_borrowable(&prog);
+    // NARROW the verdict to bindings whose RHS is actually borrowable: the
+    // analysis answers "single assignment, every read a borrow", but the
+    // BINDING also has to be something that outlives the variable (a
+    // literal or another borrowable local). A capture block or call result
+    // is a temporary, so the binding stays owned and the name must drop out
+    // — `read_str` consults this same set, so the two cannot disagree.
+    {
+        let mut bindings: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        fn find_bindings(stmts: &[IrStmt], out: &mut std::collections::HashMap<String, String>) {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, expr, .. } if targets.len() == 1 => {
+                        if targets[0].indices.is_empty() {
+                            out.entry(targets[0].var.clone()).or_insert_with(|| expr_rhs_key(expr));
+                        }
+                    }
+                    IrStmt::Declare { vars, init: Some(i), .. } => {
+                        let key = expr_rhs_key(i);
+                        for v in vars {
+                            out.entry(v.name.clone()).or_insert_with(|| key.clone());
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        find_bindings(then, out);
+                        for (_, b) in elsifs {
+                            find_bindings(b, out);
+                        }
+                        find_bindings(else_, out);
+                    }
+                    IrStmt::While { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::DoWhile { body, .. } => find_bindings(body, out),
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        find_bindings(body, out);
+                        for (_, b) in named_blocks {
+                            find_bindings(b, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        find_bindings(&prog.stmts, &mut bindings);
+        let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in &r.borrowable_vars {
+            if let Some(kind) = bindings.get(name) {
+                if kind == "literal" {
+                    keep.insert(name.clone());
+                }
+                if kind.starts_with("var:") {
+                    // a read of another borrowable local — keep it when
+                    // that source is itself kept (fixed point below)
+                }
+            }
+        }
+        // fixed point: `a = "x"; b = a` — b borrows a, so b qualifies only
+        // if a does
+        loop {
+            let mut grew = false;
+            for name in &r.borrowable_vars {
+                if keep.contains(name) {
+                    continue;
+                }
+                if let Some(kind) = bindings.get(name) {
+                    if let Some(src) = kind.strip_prefix("var:") {
+                        if keep.contains(src) {
+                            keep.insert(name.clone());
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        r.borrowable_vars = keep;
+        // a variable whose binding did NOT qualify keeps its owned form, so
+        // its reads must clone again — `read_str` consults exactly this set
+    }
     r.fn_sink_never = crate::shir::analyze_fn_sink_contexts(&prog)
         .into_iter()
         .filter(|(_, v)| *v == crate::shir::SinkContext::Never)
@@ -2329,10 +2462,29 @@ impl Render {
             return format!("__sh_arg({ci})");
         }
         if self.local_vars.contains_key(name) {
+            // a BORROWABLE local binds as `&str` (`shir::analyze_var_borrowable`):
+            // the read IS the borrow, so no clone — `&str` is `Copy`, so a
+            // further read of the borrow is free
+            if self.borrowable_vars.contains(name) {
+                return self.var_ident(name);
+            }
             return format!("{}.clone()", self.var_ident(name));
         }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().clone())")
+    }
+
+    /// A string read where an OWNED `String` is required (a `Vec<String>`
+    /// element, a store) rather than a borrow. `read_str` returns a `&str`
+    /// for a borrowable local; this converts it back for the contexts that
+    /// need ownership (`vec![…]` word lists, the runtime helpers that take
+    /// `String`).
+    fn read_str_owned(&mut self, name: &str) -> String {
+        let s = self.read_str(name);
+        if self.local_vars.contains_key(name) && self.borrowable_vars.contains(name) {
+            return format!("{s}.to_string()");
+        }
+        s
     }
 
     fn read_num_of_str(&mut self, name: &str) -> String {
@@ -2362,6 +2514,31 @@ impl Render {
     /// assignments. `mut` only when the var is written again later.
     fn local_write_stmt(&mut self, name: &str, e: &str) -> String {
         let m = self.var_ident(name);
+        // A BORROWABLE local binds the value as a borrowed `&str`
+        // (`shir::analyze_var_borrowable`): the single assignment's RHS is
+        // rendered as a borrow (`"foo"` not `"foo".to_string()`, `x` not
+        // `x.clone()`). The variable is immutable and every read borrows
+        // it, so nothing can outlive the borrow.
+        if self.borrowable_vars.contains(name) {
+            let raw = Self::unparen(e);
+            if let Some(rhs) = borrowable_binding_rhs(raw) {
+                let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
+                let mut attr = String::new();
+                if m.chars().any(|c| c.is_ascii_uppercase()) {
+                    attr.push_str("#[allow(non_snake_case)] ");
+                }
+                if self.local_init.insert(name.to_string()) {
+                    return format!("{attr}{kw} {m} = {rhs};");
+                }
+                return format!("{m} = {rhs};");
+            }
+            // the RHS is not borrowable (a capture block, a call result,
+            // an interpolation): fall through to the OWNED binding. The
+            // name must then also drop out of `borrowable_vars` so its
+            // reads use the owned form — see `borrowable_vars` handling in
+            // `shir_to_rust` (the verdict is filtered to bindings whose
+            // RHS qualifies).
+        }
         let e = Self::unparen(e).to_string();
         if self.local_init.insert(name.to_string()) {
             let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
@@ -5218,7 +5395,9 @@ impl Render {
                     } else if self.is_array(name) {
                         self.read_arr(name)
                     } else {
-                        format!("vec![{}]", self.read_str(name))
+                        // a `Vec<String>` element: an owned String, so a
+                        // borrowable local's `&str` is stringified here
+                        format!("vec![{}]", self.read_str_owned(name))
                     }
                 } else {
                     format!("vec![{}]", self.getvar_str(name))
@@ -16504,6 +16683,55 @@ mod tests {
         assert!(!out.contains("let __a: Vec<String>"), "{out}");
         assert!(!out.contains("__SH_ARGV"), "argv machinery kept:\n{out}");
         assert!(!out.contains("fn __sh_arg"), "arg helper kept:\n{out}");
+    }
+
+    /// A single-assignment local whose every read is a borrow binds as a
+    /// borrowed `&str`: no `.to_string()` at the binding, no `.clone()` at
+    /// the reads. This is the t24 shape (`a = "foo"; b = "bar"; print(a+b)`).
+    #[test]
+    fn borrowable_locals_take_str() {
+        // The py-frontend shape (`a = "foo"; b = "bar"; print(a + b)`): the
+        // bindings survive (the shell path would constant-fold them away),
+        // so their storage is what the verdict is about. Each read is a
+        // borrow, so both bindings drop `.to_string()` and every read drops
+        // its `.clone()`.
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"foo","style":"DoubleQuoted"}},
+            {"type":"Assign","targets":[{"var":"b","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"bar","style":"DoubleQuoted"}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Interpolate","parts":[{"kind":"expr","expr":{"type":"Call","func":"getVar","args":[{"type":"Str","value":"a","style":"DoubleQuoted"}]}},{"kind":"expr","expr":{"type":"Call","func":"getVar","args":[{"type":"Str","value":"b","style":"DoubleQuoted"}]}}]}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Interpolate","parts":[{"kind":"expr","expr":{"type":"Call","func":"getVar","args":[{"type":"Str","value":"a","style":"DoubleQuoted"}]}},{"kind":"expr","expr":{"type":"Call","func":"getVar","args":[{"type":"Str","value":"b","style":"DoubleQuoted"}]}}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("A1 ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let a = \"foo\";"), "binding not borrowed:\n{out}");
+        assert!(out.contains("let b = \"bar\";"), "binding not borrowed:\n{out}");
+        assert!(!out.contains("\"foo\".to_string()"), "allocation kept:\n{out}");
+        assert!(!out.contains("a.clone()"), "read cloned:\n{out}");
+        assert!(!out.contains("b.clone()"), "read cloned:\n{out}");
+    }
+
+    /// A REASSIGNED local stays owned: a borrowed type would be invalidated
+    /// by the second store.
+    #[test]
+    fn reassigned_locals_stay_owned() {
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"foo","style":"DoubleQuoted"}},
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"bar","style":"DoubleQuoted"}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","args":[{"type":"Str","value":"a","style":"DoubleQuoted"}]}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","args":[{"type":"Str","value":"a","style":"DoubleQuoted"}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("A1 ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let mut a = \"foo\".to_string();"), "{out}");
+    }
+
+    /// A local whose binding is a TEMPORARY (a capture result) stays owned:
+    /// borrowing it would dangle on the next statement.
+    #[test]
+    fn temporary_boundings_stay_owned() {
+        let out = render("a=$(echo hi)\necho \"$a\"\n");
+        assert!(out.contains("let a = "), "{out}");
+        assert!(!out.contains("let a = &"), "temporary borrowed:\n{out}");
     }
 
     /// A parameter the body only BORROWS takes `&str` (the shared

@@ -12419,6 +12419,332 @@ pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
     out
 }
 
+/// The single-assignment variables whose value is only ever BORROWED —
+/// the variable-level generalisation of [`ParamUse`].
+///
+/// A variable qualifies when BOTH hold:
+///
+///   * it is IMMUTABLE: written exactly once, that write at most once per
+///     run, and never re-written by a runtime store, native arith
+///     (`x++`), an index element, or anything whose value we cannot see —
+///     i.e. exactly the existing `analyze_var_const` `Const` verdict.
+///     This is what makes a borrowed type sound: the storage is bound once
+///     and never re-assigned, so a `&str` pointing at that binding cannot
+///     be invalidated by a later store.
+///   * every READ of the value is a borrow — printed, interpolated,
+///     tested, compared, formatted, concatenated INTO A NEW VALUE, passed
+///     to a child process. Nothing reads it in order to retain it (an
+///     array-element store, a `return`, a closure the callee keeps, a
+///     write builtin's target).
+///
+/// Together those are the licence an ownership-model backend needs to bind
+/// the variable as a `&str` (Rust), `string_view` (C++), `[]const u8`
+/// (Zig) instead of an owned string — no `.to_string()` at the binding and
+/// no `.clone()` at every read.
+///
+/// Returns the set of variable names that qualify. As with
+/// [`analyze_param_use`], an unanalysable construct (`eval`/`source`, an
+/// opaque node) simply withholds the verdict, so a name absent from the
+/// set is the conservative answer, never a guess.
+pub fn analyze_var_borrowable(prog: &IrProgram) -> std::collections::HashSet<String> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt, VarKind};
+    use std::collections::HashSet;
+
+    // ── 1. immutability: exactly the const verdict ────────────────────
+    let immutable: HashSet<String> = analyze_var_const(prog)
+        .into_iter()
+        .filter(|(_, k)| *k == VarKind::Const)
+        .map(|(n, _)| n)
+        .collect();
+    if immutable.is_empty() {
+        return HashSet::new();
+    }
+
+    // ── 2. every read of the value is a borrow ────────────────────────
+    // `retained` collects names read in a retaining position; `read`
+    // collects every name read at all (a name that is never read is not
+    // borrowable — there is nothing to borrow, and removing its binding
+    // would change the program's shape for no benefit).
+    #[derive(Default)]
+    struct Acc {
+        retained: HashSet<String>,
+        read: HashSet<String>,
+        veto: bool,
+    }
+
+    impl Acc {
+        fn mark_read(&mut self, name: &str) {
+            self.read.insert(name.to_string());
+        }
+        fn mark_retained(&mut self, name: &str) {
+            self.read.insert(name.to_string());
+            self.retained.insert(name.to_string());
+        }
+    }
+
+    /// The variable name a value-read expression names, if any.
+    fn read_var(e: &IrExpr) -> Option<&str> {
+        match e {
+            IrExpr::Var(n, _) => Some(n.as_str()),
+            // the A1 read form: getVar("name") / param("", "name", …)
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) if !n.is_empty() => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every variable read inside `e`, reported as borrows unless the
+    /// expression is a retaining position (handled by the caller).
+    fn mark_reads(e: &IrExpr, acc: &mut Acc) {
+        walk(e, &mut |x| {
+            if let Some(n) = read_var(x) {
+                acc.mark_read(n);
+            }
+        });
+    }
+    fn mark_retains(e: &IrExpr, acc: &mut Acc) {
+        walk(e, &mut |x| {
+            if let Some(n) = read_var(x) {
+                acc.mark_retained(n);
+            }
+        });
+    }
+
+    /// A generic expression walk (mentions, not ownership semantics).
+    fn walk(e: &IrExpr, f: &mut impl FnMut(&IrExpr)) {
+        f(e);
+        match e {
+            IrExpr::Index { key, .. } => walk(key, f),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk(lhs, f);
+                walk(rhs, f);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk(cond, f);
+                walk(then, f);
+                walk(else_, f);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk(expr, f);
+                walk(default, f);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk(x, f);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk(i, f);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk(a, f);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk(obj, f);
+                for a in args {
+                    walk(a, f);
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk(expr, f),
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    if let IrStmt::Expr(x) = s {
+                        walk(x, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a statement list.
+    fn stmts(list: &[IrStmt], acc: &mut Acc) {
+        for s in list {
+            stmt(s, acc);
+        }
+    }
+
+    fn stmt(s: &IrStmt, acc: &mut Acc) {
+        match s {
+            // The BINDING itself: the TARGET is written, not read here.
+            // The RHS is routed through `expr` so the retaining shapes are
+            // recognised — an array store (`arr = [a]`, the `setArray`
+            // call form) keeps every element value, while a scalar
+            // binding consumes its RHS to build the new value (a borrow).
+            IrStmt::Assign { expr: rhs, .. } => expr(rhs, acc),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    mark_reads(i, acc);
+                }
+            }
+            // a collection STORE retains every element read
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    mark_retains(e, acc);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                mark_reads(path, acc);
+                mark_retains(content, acc);
+            }
+            // returning a value hands it to the caller — retained
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => mark_retains(e, acc),
+            IrStmt::Output { value, .. } => mark_reads(value, acc),
+            IrStmt::Expr(e) => expr(e, acc),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                mark_reads(cond, acc);
+                stmts(then, acc);
+                for (c, b) in elsifs {
+                    mark_reads(c, acc);
+                    stmts(b, acc);
+                }
+                stmts(else_, acc);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                mark_reads(cond, acc);
+                stmts(body, acc);
+            }
+            IrStmt::For { iter, body, .. } => {
+                mark_reads(iter, acc);
+                stmts(body, acc);
+            }
+            IrStmt::ForInit {
+                init, cond, step, body,
+            } => {
+                stmts(init, acc);
+                mark_reads(cond, acc);
+                stmts(step, acc);
+                stmts(body, acc);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => stmts(b, acc),
+            // a background body may outlive the enclosing frame — any
+            // read of a borrowed value there is retained
+            IrStmt::Background(b) => {
+                for st in b {
+                    match st {
+                        IrStmt::Expr(e) => mark_retains(e, acc),
+                        IrStmt::Assign { expr, .. } => mark_retains(expr, acc),
+                        other => stmt(other, acc),
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    mark_reads(&r.target, acc);
+                }
+                stmts(inner, acc);
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                mark_reads(discriminant, acc);
+                for c in clauses {
+                    stmts(&c.body, acc);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                stmts(body, acc);
+                for e in excepts {
+                    stmts(&e.body, acc);
+                }
+                stmts(else_body, acc);
+                stmts(finally_body, acc);
+            }
+            // a nested function definition may run AFTER this frame — a
+            // borrowed local would dangle, so every value it reads is
+            // retained and the body is unanalysable
+            IrStmt::Function { body, named_blocks, .. } => {
+                for st in body.iter().chain(named_blocks.iter().flat_map(|(_, b)| b.iter())) {
+                    match st {
+                        IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => mark_retains(e, acc),
+                        _ => {}
+                    }
+                }
+                acc.veto = true;
+            }
+            IrStmt::Exec { cmd, args, .. } => {
+                mark_reads(cmd, acc);
+                for a in args {
+                    mark_reads(a, acc);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    stmts(st, acc);
+                }
+            }
+            IrStmt::RawText(_) | IrStmt::Ext(_) => acc.veto = true,
+            IrStmt::Label(_) | IrStmt::Goto(_) | IrStmt::Require(_) | IrStmt::Die { .. }
+            | IrStmt::Warn { .. } | IrStmt::SetChildError(_) | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. } | IrStmt::Select { .. } => acc.veto = true,
+            _ => {}
+        }
+    }
+
+    fn expr(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            // a write builtin RETAINS: `setVar(x, v)` stores v in x's
+            // storage, so v is retained
+            IrExpr::Call { func, args } if func == "setVar" => {
+                mark_reads(args.first().unwrap_or(&IrExpr::Int(0)), acc);
+                for a in args.iter().skip(2) {
+                    mark_reads(a, acc);
+                }
+                if let Some(v) = args.get(1) {
+                    mark_retains(v, acc);
+                }
+            }
+            IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+                for a in args {
+                    mark_retains(a, acc);
+                }
+            }
+            // a command/child reads the value at the process boundary
+            IrExpr::Call { .. } | IrExpr::MethodCall { .. } => mark_reads(e, acc),
+            IrExpr::Capture { expr: inner, .. } => match &**inner {
+                IrExpr::Arrow(body) => stmts(body, acc),
+                other => expr(other, acc),
+            },
+            IrExpr::Arrow(body) => stmts(body, acc),
+            other => mark_reads(other, acc),
+        }
+    }
+
+    let mut acc = Acc::default();
+    stmts(&prog.stmts, &mut acc);
+    for sub in &prog.subs {
+        stmts(&sub.body, &mut acc);
+    }
+    if acc.veto {
+        // an unclassifiable construct anywhere: withhold the whole verdict
+        // rather than risk a dangling borrow
+        return HashSet::new();
+    }
+    immutable
+        .into_iter()
+        .filter(|n| acc.read.contains(n) && !acc.retained.contains(n))
+        .collect()
+}
+
 pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
     use crate::ir::{IrExpr, IrStmt};
 
@@ -56581,6 +56907,69 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod var_borrowable_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn borrowable(src: &str) -> std::collections::HashSet<String> {
+        analyze_var_borrowable(&prog_of(src))
+    }
+
+    /// A single-assignment string whose every read is a borrow qualifies:
+    /// the value is bound once and only ever printed/formatted.
+    #[test]
+    fn single_assignment_borrowed_reads_qualify() {
+        // the t24 shape: two constants concatenated for a print
+        let b = borrowable("a=foo\nb=bar\necho \"$a$b\"\n");
+        assert!(b.contains("a"), "{b:?}");
+        assert!(b.contains("b"), "{b:?}");
+        // a read consumed to build a NEW value, and a plain print
+        assert!(borrowable("a=foo\necho \"$a\"\n").contains("a"));
+        assert!(borrowable("a=foo\nc=\"$a bar\"\necho \"$c\"\n").contains("a"));
+    }
+
+    /// A REASSIGNED variable is not single-assignment — it must stay owned.
+    #[test]
+    fn reassigned_vars_do_not_qualify() {
+        assert!(!borrowable("a=foo\na=bar\necho \"$a\"\n").contains("a"));
+        // a self-referential append mutates the binding
+        assert!(!borrowable("a=foo\na=\"$a x\"\necho \"$a\"\n").contains("a"));
+    }
+
+    /// A value read in a RETAINING position cannot be borrowed: an array
+    /// element store keeps the value past the binding.
+    #[test]
+    fn retaining_reads_do_not_qualify() {
+        // array element (the frontend's structured array assignment)
+        let src = "{\"type\":\"Program\",\"contract_version\":1,\"imports\":[],\"requires\":[],\"var_types\":[],\"stmt_lines\":[],\"subs\":[],\"stmts\":[\
+{\"type\":\"Assign\",\"targets\":[{\"var\":\"a\",\"sigil\":null,\"indices\":[]}],\"expr\":{\"type\":\"Str\",\"value\":\"foo\",\"style\":\"DoubleQuoted\"}},\
+{\"type\":\"Assign\",\"targets\":[{\"var\":\"arr\",\"sigil\":null,\"indices\":[]}],\"expr\":{\"type\":\"Call\",\"func\":\"setArray\",\"args\":[{\"type\":\"Str\",\"value\":\"arr\",\"style\":\"DoubleQuoted\"},{\"type\":\"Array\",\"elements\":[{\"type\":\"Call\",\"func\":\"getVar\",\"args\":[{\"type\":\"Str\",\"value\":\"a\",\"style\":\"DoubleQuoted\"}]}]}]}}]}";
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("A1 ingress");
+        let b = analyze_var_borrowable(&prog);
+        assert!(!b.contains("a"), "an array store retains: {b:?}");
+    }
+
+    /// An unanalysable construct withholds the WHOLE verdict (a dangling
+    /// borrow would be a miscompile, so nothing is claimed).
+    #[test]
+    fn opaque_constructs_withhold_the_verdict() {
+        assert!(borrowable("a=foo\neval \"echo $a\"\n").is_empty());
+    }
+
+    /// A name that is never read is not borrowable (there is nothing to
+    /// borrow, and removing the binding would change the program's shape
+    /// for no benefit).
+    #[test]
+    fn unread_vars_do_not_qualify() {
+        assert!(!borrowable("a=foo\necho hi\n").contains("a"));
     }
 }
 
