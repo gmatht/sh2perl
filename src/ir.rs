@@ -1862,6 +1862,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(&format!("sub {} {{\n", name));
             emit_indent(out, indent + 1);
             out.push_str("local @ARGV = @_;\n");
+            // `$#` is this call's argument count — snapshot it before any
+            // `$ARGV[n]` read extends the magic @ARGV (shadows the
+            // top-level `$__argc`).
+            emit_indent(out, indent + 1);
+            out.push_str("my $__argc = @ARGV;\n");
             for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
@@ -3295,7 +3300,10 @@ fn var_read(name: &str) -> String {
     match name {
         "#" => "$__argc".to_string(),
         "?" => "$CHILD_ERROR".to_string(),
-        "@" | "*" => "@ARGV".to_string(),
+        "@" => "@ARGV".to_string(),
+        // `$*` is the positional params joined by the first IFS char (space
+        // in the default IFS) — in scalar context `@ARGV` gave the COUNT.
+        "*" => "join(' ', @ARGV)".to_string(),
         "$" => "$$".to_string(),
         _ if !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
@@ -3559,6 +3567,17 @@ fn strip_re(var: &str, pat: &str) -> String {
     format!("(({} =~ s{{{}}}{{}}r))", var, pat.replace('}', "\\}"))
 }
 
+/// A parameter-expansion default/replacement value: a quoted literal is
+/// unquoted (`"default"` → `"default"`), everything else renders as a word.
+fn param_value(a: &IrExpr) -> String {
+    if let IrExpr::Str(s, _) = a {
+        let t = s.trim().trim_matches('"').trim_matches('\'');
+        render_str_literal(t, &StrStyle::DoubleQuoted)
+    } else {
+        render_word(a)
+    }
+}
+
 /// `${var…}` parameter expansion (Call param): op, var, value/pattern...
 fn render_param(args: &[IrExpr]) -> String {
     let op = args.first().and_then(call_arg_str).unwrap_or_default();
@@ -3573,11 +3592,11 @@ fn render_param(args: &[IrExpr]) -> String {
     };
     let val = args
         .get(2)
-        .map(render_word)
+        .map(param_value)
         .unwrap_or_else(|| "''".to_string());
     let repl = args
         .get(3)
-        .map(render_word)
+        .map(param_value)
         .unwrap_or_else(|| "''".to_string());
     match op.as_str() {
         "" => var,
@@ -3585,14 +3604,14 @@ fn render_param(args: &[IrExpr]) -> String {
         "len" => format!("length({})", var),
         "-" => {
             if var.starts_with('@') {
-                format!("({} ? {} : {})", var, var, val)
+                format!("(@ARGV ? join(' ', @ARGV) : {})", val)
             } else {
                 format!("(defined({}) ? {} : {})", var, var, val)
             }
         }
         ":-" => {
             if var.starts_with('@') {
-                format!("({} ? {} : {})", var, var, val)
+                format!("(@ARGV ? join(' ', @ARGV) : {})", val)
             } else {
                 format!(
                     "((defined({v}) && length({v})) ? {v} : {d})",
@@ -8032,7 +8051,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 "listVar" | "getArray" | "arrayItems" => args
                     .first()
                     .and_then(call_arg_str)
-                    .map(|n| format!("@{}", n))
+                    .map(|n| {
+                        if n == "@" || n == "*" {
+                            "@ARGV".to_string()
+                        } else {
+                            format!("@{}", n)
+                        }
+                    })
                     .unwrap_or_else(|| "()".to_string()),
                 "redirect" => {
                     // Redirect used as a condition: run the command with its
