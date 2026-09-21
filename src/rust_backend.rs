@@ -12426,12 +12426,18 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     // constant still needs fnmatch.
                     if let Some(rlit) = rhs_lit {
                         if !glob_like(rlit) {
-                            // Fully-constant comparison folds to a plain bool
-                            // (no String allocation). Numeric operands keep
-                            // their string rendering.
+                            // Fully-constant comparison can fold to a
+                            // plain bool (no String allocation). Numeric
+                            // operands keep their string rendering. Gated on
+                            // `-Os`/`-Oz` like the other shrinking folds: at
+                            // the `-Og` default the output must resemble the
+                            // input, so the compare stays visible — matching
+                            // every other backend.
                             if let (Some(ll), false, false) = (lhs_lit, lhs_num, rhs_num) {
-                                let same = ll == rlit;
-                                return if same == eq { "true".to_string() } else { "false".to_string() };
+                                if crate::shir::size_opt_enabled() {
+                                    let same = ll == rlit;
+                                    return if same == eq { "true".to_string() } else { "false".to_string() };
+                                }
                             }
                             return if eq {
                                 format!("({l} == {r})")
@@ -16515,6 +16521,58 @@ mod tests {
         let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
         assert!(out.contains("print!(\"a\")"), "{out}");
         assert!(out.contains("print!(\"x\\ty\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn const_string_test_folds_only_with_size_opt() {
+        // `[ "a" = "a" ]` is decidable at render time: the constant RHS
+        // cannot carry glob metachars, so the sh2 `=`-fallback pattern
+        // machinery must not fire — no __sh_glob_like/__sh_fnmatch.
+        // The shrinking fold to a bare `true` is `-Os`/`-Oz` only (like
+        // `1 + 2` -> `3`): at the `-Og` default the output must resemble
+        // the input and every other backend keeps the compare visible.
+        crate::shir::set_size_opt(false);
+        let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
+        assert!(!out.contains("__sh_glob_like"), "glob probe kept at -Og:\n{out}");
+        assert!(!out.contains("__sh_fnmatch"), "fnmatch kept at -Og:\n{out}");
+        assert!(out.contains("\"a\".to_string() == \"a\".to_string()"), "{out}");
+
+        crate::shir::set_size_opt(true);
+        let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
+        assert!(out.contains("if true"), "expected the -Os fold:\n{out}");
+        assert!(!out.contains("to_string()"), "no String allocation:\n{out}");
+        let out = render("if [ \"a\" = \"b\" ]; then echo x; fi\n");
+        assert!(out.contains("if false"), "{out}");
+        crate::shir::set_size_opt(false);
+    }
+
+    #[test]
+    fn glob_rhs_keeps_the_runtime_probe() {
+        // A metachar-bearing RHS still needs the glob fallback, and a
+        // VARIABLE rhs is only decidable at runtime — both keep the probe
+        // (the sh2 evalTest contract; the go-sh frontend lowers
+        // strings.Contains to `"$s"=*world*`).
+        crate::shir::set_size_opt(true);
+        let out = render("if [ \"abc\" = \"a*\" ]; then echo m; fi\n");
+        assert!(out.contains("__sh_glob_like") && out.contains("__sh_fnmatch"), "{out}");
+        let out = render("pat='a*'\nif [ \"abc\" = \"$pat\" ]; then echo m; fi\n");
+        assert!(out.contains("__sh_glob_like"), "variable rhs lost the probe:\n{out}");
+        crate::shir::set_size_opt(false);
+    }
+
+    #[test]
+    fn status_wrapper_stripped_in_condition_position() {
+        // the `{ let __b = E; __SH_RC.store(..); __b }` wrapper exists to
+        // land the test's status in `$?`; an `if` resets __SH_RC itself,
+        // so in condition position the store is dead and the wrapper goes.
+        crate::shir::set_size_opt(false);
+        let out = render("if [ \"$x\" = \"hi\" ]; then echo y; fi\n");
+        assert!(!out.contains("let __b"), "dead status wrapper kept:\n{out}");
+        assert!(!out.contains("__SH_RC"), "dead rc register kept:\n{out}");
+        // ...but the status IS observable after a bare test, so it stays.
+        let out = render("[ \"a\" = \"b\" ]\necho \"$?\"\n");
+        assert!(out.contains("__SH_RC"), "observable status dropped:\n{out}");
+        crate::shir::set_size_opt(false);
     }
 
     #[test]
