@@ -16738,13 +16738,17 @@ mod tests {
         // read whole, so the init is a literal vec (no `__sh_cat`
         // field-list machinery) AND the loop iterates the literals.
         let out = render("xs=(a b c)\nfor x in \"${xs[@]}\"; do echo \"$x\"; done\n");
+        // The const-length verdict now wins over the static-list shape:
+        // `xs` is a plain `let` local array, so the loop iterates THAT
+        // (no duplicated literal list). Verified by execution — the
+        // rendered program prints `a\nb\nc`, byte-identical to bash.
         assert!(
-            out.contains("vec![\"a\".to_string(), \"b\".to_string(), \"c\".to_string()]"),
-            "array init not a literal vec:\n{out}"
+            out.contains("let xs = [\"a\".to_string(), \"b\".to_string(), \"c\".to_string()];"),
+            "array init not a literal local:\n{out}"
         );
         assert!(
-            out.contains("for x in [\"a\", \"b\", \"c\"]"),
-            "loop did not iterate the literal list:\n{out}"
+            out.contains("for x in xs"),
+            "loop did not iterate the local array:\n{out}"
         );
         assert!(!out.contains("__sh_cat"), "word-concat helper kept:\n{out}");
     }
