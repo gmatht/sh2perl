@@ -2383,6 +2383,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         e
                     ));
                 }
+                // `! cmd` in statement position — run the command and
+                // invert the exit status (not-negation.sh's bare `! grep`).
+                IrExpr::BinOp { op: BinOpKind::Not, rhs, .. } => {
+                    if let Some(cmd) = expr_to_cmd(rhs) {
+                        emit_shell_cmd(out, indent, &cmd);
+                        emit_indent(out, indent);
+                        out.push_str("$main_exit_code = $CHILD_ERROR = ($CHILD_ERROR == 0) ? 1 : 0;\n");
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str("die \"otranspilerl: shIR `!` expression not renderable (Perl backend)\\n\";\n");
+                    }
+                }
                 // Non-Call expressions: bare `&&`/`||` chains of execs,
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
@@ -7777,6 +7789,12 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::BinOp { lhs, op, rhs } => {
+            // `! cmd` arrives as `BinOp{op:Not, lhs, rhs}` (the parser
+            // duplicates the operand) — Perl's `!` is UNARY (`lhs !rhs`
+            // was a syntax error).
+            if matches!(op, BinOpKind::Not) {
+                return format!("!({})", ir_expr_to_perl(rhs));
+            }
             let l = ir_expr_to_perl(lhs);
             let r = ir_expr_to_perl(rhs);
             let op_str = match op {
