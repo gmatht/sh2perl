@@ -8491,6 +8491,50 @@ impl Render {
         }
     }
 
+    /// Splice a statement list INLINE in place of a rendered `if cond {`
+    /// line: emit the body, then drop the trailing `}` (the `if` line
+    /// supplied the depth, so the body carried its own closing brace).
+    /// No `$?` is observable on the elided path, so the status bookkeeping
+    /// the general rendering adds is unnecessary here.
+    fn inline_branch_block(&mut self, stmts: &[IrStmt]) {
+        // The elided `if cond {` supplied the inner depth, so the body was
+        // rendered one level deeper than the position it now occupies.
+        // Render through a buffer and shift the whole block back.
+        let mark = self.out.len();
+        self.depth += 1;
+        for s in stmts {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        let body: Vec<String> = self.out.drain(mark..).collect();
+        // The body ended with its own `}` line — the elided `if cond {`
+        // takes its place, so drop it (and a blank before it).
+        let mut body = body;
+        while let Some(last) = body.last() {
+            if last.trim() == "}" || last.trim().is_empty() {
+                body.pop();
+                continue;
+            }
+            break;
+        }
+        for l in body {
+            self.emit(l.trim_start());
+        }
+    }
+
+    /// Re-align the closing brace of a block that was spliced INLINE (its
+    /// `if cond {` line elided): the statements carry the inner depth, so a
+    /// trailing `}` written at that depth reads one level too deep.
+    /// `trim_trailing_blanks` first (the caller's trailing blank collapse).
+    fn trim_for_inline_close(&mut self) {
+        self.trim_trailing_blanks();
+        if let Some(last) = self.out.last_mut() {
+            if last.trim() == "}" {
+                *last = "}".to_string();
+            }
+        }
+    }
+
     fn stmt_inner(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
@@ -8959,46 +9003,143 @@ impl Render {
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 let c = Self::unwrap_cond(&self.expr_bool(cond));
-                self.emit(&format!("if {} {{", Self::unparen(&c)));
-                self.depth += 1;
-                for s in then {
-                    self.stmt(s);
-                }
-                self.depth -= 1;
-                for (ec, body) in elsifs {
-                    let ec = Self::unwrap_cond(&self.expr_bool(ec));
-                    self.emit(&format!("}} else if {ec} {{"));
+                let mut inlined = false;
+                // A condition PROVEN constant (`-Os`/`-Oz` folds a literal
+                // test to `true`/`false`) needs no `if` at all: emit the
+                // taken branch inline and drop the other. That is the whole
+                // point of the shrinking fold — a constant branch would
+                // otherwise render as dead code the optimiser has to
+                // re-discover (and `if true` reads as noise next to the
+                // source). `else` clauses are only reachable when the
+                // constant is false, and vice versa.
+                if let Some(truth) = const_cond_truth(&c) {
+                    // `elif` chains: the first non-constant branch decides
+                    // whether the whole `if` is decidable at all.
+                    let mut taken: &[IrStmt] = if truth { then } else { &[] };
+                    let mut alt: &[IrStmt] = if truth { &[] } else { else_ };
+                    let mut all_const = true;
+                    if !truth {
+                        let mut resolved = false;
+                        for (ec, body) in elsifs {
+                            let e = Self::unwrap_cond(&self.expr_bool(ec));
+                            match const_cond_truth(&e) {
+                                Some(true) => {
+                                    taken = body;
+                                    resolved = true;
+                                    break;
+                                }
+                                Some(false) => continue,
+                                None => {
+                                    all_const = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = resolved;
+                    }
+                    if all_const {
+                        // Emit only what runs: the taken branch inline, and
+                        // (when nothing is taken) the false-path status 0 —
+                        // the same status rule the empty-else arm applies.
+                        if taken.is_empty() {
+                            if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
+                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            }
+                        } else {
+                            self.inline_branch_block(taken);
+                        }
+                        if alt.is_empty() {
+                            // Nothing runs at all: the whole `if` (and its
+                            // `}`) is gone, so no brace is owed below.
+                            inlined = true;
+                        } else {
+                            // The `else` body is spliced inline too — the
+                            // `} else {` line it would have followed is
+                            // elided, so it carries its own closing brace
+                            // the same way.
+                            self.inline_branch_block(alt);
+                            inlined = true;
+                        }
+                    } else {
+                        self.emit(&format!("if {} {{", Self::unparen(&c)));
+                        self.depth += 1;
+                        for s in then {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        for (ec, body) in elsifs {
+                            let ec = Self::unwrap_cond(&self.expr_bool(ec));
+                            self.emit(&format!("}} else if {ec} {{"));
+                            self.depth += 1;
+                            for s in body {
+                                self.stmt(s);
+                            }
+                            self.depth -= 1;
+                        }
+                        if !else_.is_empty() {
+                            self.emit("} else {");
+                            self.depth += 1;
+                            for s in else_ {
+                                self.stmt(s);
+                            }
+                            self.depth -= 1;
+                        } else if !self.rc_disabled
+                            && !crate::shir::stmt_status_write_is_unread(s)
+                        {
+                            self.emit("} else {");
+                            self.depth += 1;
+                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            self.depth -= 1;
+                        }
+                    }
+                } else {
+                    self.emit(&format!("if {} {{", Self::unparen(&c)));
                     self.depth += 1;
-                    for s in body {
+                    for s in then {
                         self.stmt(s);
                     }
                     self.depth -= 1;
-                }
-                if !else_.is_empty() {
-                    self.emit("} else {");
-                    self.depth += 1;
-                    for s in else_ {
-                        self.stmt(s);
+                    for (ec, body) in elsifs {
+                        let ec = Self::unwrap_cond(&self.expr_bool(ec));
+                        self.emit(&format!("}} else if {ec} {{"));
+                        self.depth += 1;
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
                     }
-                    self.depth -= 1;
-                } else if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
-                    // No branch ran ⇒ bash's `$?` is 0, so the if
-                    // synthesizes a false-path status write. That write is
-                    // the ONLY thing the arm carries: when the shared
-                    // liveness proves it unread (nothing observes `$?`
-                    // before the next write — and never for a source with
-                    // no `$?` at all), the arm is pure noise and the whole
-                    // `else { … }` is dropped.
-                    self.emit("} else {");
-                    self.depth += 1;
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
-                    self.depth -= 1;
+                    if !else_.is_empty() {
+                        self.emit("} else {");
+                        self.depth += 1;
+                        for s in else_ {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                    } else if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
+                        // No branch ran ⇒ bash's `$?` is 0, so the if
+                        // synthesizes a false-path status write. That write is
+                        // the ONLY thing the arm carries: when the shared
+                        // liveness proves it unread (nothing observes `$?`
+                        // before the next write — and never for a source with
+                        // no `$?` at all), the arm is pure noise and the whole
+                        // `else { … }` is dropped.
+                        self.emit("} else {");
+                        self.depth += 1;
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.depth -= 1;
+                    }
                 }
                 // A dropped else arm (or a stripped status write) can leave
                 // a blank line trailing inside the braces — collapse it so
                 // the block closes on its last statement.
-                self.trim_trailing_blanks();
-                self.emit("}");
+                //
+                // The inline splice already consumed the body's own `}`
+                // (there is no `if cond {` line for it to close), so only
+                // the general rendering writes one here.
+                if !inlined {
+                    self.trim_trailing_blanks();
+                    self.emit("}");
+                }
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr_bool(cond);
@@ -10421,6 +10562,17 @@ fn normalize_arith_vars(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// The truth value of a condition the renderer has folded to a literal
+/// (`true`/`false`, possibly parenthesised) — `None` for a runtime
+/// condition. Used to drop an `if` whose branch is already decided.
+fn const_cond_truth(c: &str) -> Option<bool> {
+    match c.trim().trim_matches(|ch| ch == '(' || ch == ')').trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Does the CONSTANT text carry a glob metachar? Render-time twin of the
@@ -16558,10 +16710,17 @@ mod tests {
 
         crate::shir::set_size_opt(true);
         let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
-        assert!(out.contains("if true"), "expected the -Os fold:\n{out}");
+        // The whole `if` is gone: the branch runs inline, so at -Os the
+        // program is literally the body of the taken branch.
+        assert!(!out.contains("if "), "constant `if` not elided at -Os:\n{out}");
+        assert!(out.contains("print!(\"same\\n\")"), "{out}");
         assert!(!out.contains("to_string()"), "no String allocation:\n{out}");
         let out = render("if [ \"a\" = \"b\" ]; then echo x; fi\n");
-        assert!(out.contains("if false"), "{out}");
+        assert!(!out.contains("if ") && !out.contains("print!"), "dead branch kept:\n{out}");
+        // a constant false with an else keeps only the else body
+        let out = render("if [ \"a\" = \"b\" ]; then echo x; else echo y; fi\n");
+        assert!(!out.contains("if "), "constant `if` not elided:\n{out}");
+        assert!(out.contains("print!(\"y\\n\")") && !out.contains("print!(\"x\\n\")"), "{out}");
         crate::shir::set_size_opt(false);
     }
 
