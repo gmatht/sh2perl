@@ -42,6 +42,11 @@ pub(crate) enum NativeCtx<'a> {
     Pipe(&'a PipelineCtx),
     /// an exec call: `cond=true` in if/while condition, `false` as a statement
     Exec { call: &'a IrExpr, cond: bool },
+    /// an exec call in CAPTURE position (`x=$(cmd)`) — the leaf returns its
+    /// value in `$__sh_cap` instead of printing. Distinct from `Exec` so a
+    /// value-channel leaf can never be reached from statement position,
+    /// where `$__sh_cap` has no declaration and no output.
+    Capture { call: &'a IrExpr },
     /// a `cat <<'EOF' … EOF` heredoc body (already unescaped literal)
     Heredoc(&'a str),
     /// a `(grep -q PAT FILE && echo A) || echo B` control chain
@@ -149,11 +154,15 @@ pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
 /// The shell-text view loses the redirect, so the capability tree is handed
 /// the IR call directly. Returns a Perl EXPRESSION for the captured value.
 pub(crate) fn native_capture_call(call: &IrExpr) -> Option<String> {
-    match native_dispatch(&NativeCtx::Exec { call, cond: false }) {
+    match native_dispatch(&NativeCtx::Capture { call }) {
         // the leaf wrote the value into $__sh_cap — return it as the
         // expression (same channel native_capture uses)
         Some(NativeEmit::Stmt(s)) if s.contains("$__sh_cap") => {
-            Some(format!("do {{ my $__sh_cap; {s} $__sh_cap }}"))
+            // bash's `$(…)` strips ALL trailing newlines — a leaf's value
+            // (e.g. `cat FILE`) keeps the file's final newline otherwise.
+            Some(format!(
+                "do {{ my $__sh_cap; {s} $__sh_cap =~ s/\\n+\\z// if defined $__sh_cap; $__sh_cap }}"
+            ))
         }
         _ => None,
     }

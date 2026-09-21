@@ -31,7 +31,7 @@ use crate::pipeline_native::{NativeCtx, NativeEmit};
 pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     match ctx {
         NativeCtx::Pipe(p) => wc_pipe(&p.cmd, &p.words, &p.content_perl),
-        NativeCtx::Exec { call, cond: false } => wc_file(call),
+        NativeCtx::Capture { call } => wc_file(call),
         _ => None,
     }
 }
