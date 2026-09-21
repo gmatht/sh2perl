@@ -3537,6 +3537,13 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
         _ => render_word(e),
     }
 }
+/// `${p##pat}` / `${p%%pat}` prefix/suffix removal → a Perl `s{}{}r`
+/// substitution. The brace delimiter avoids pattern chars (`:`, `/`) that
+/// collide with the old `s:...:...:` form (`${PATH%%:*}` became `s::.*$`).
+fn strip_re(var: &str, pat: &str) -> String {
+    format!("(({} =~ s{{{}}}{{}}r))", var, pat.replace('}', "\\}"))
+}
+
 /// `${var…}` parameter expansion (Call param): op, var, value/pattern...
 fn render_param(args: &[IrExpr]) -> String {
     let op = args.first().and_then(call_arg_str).unwrap_or_default();
@@ -3592,7 +3599,7 @@ fn render_param(args: &[IrExpr]) -> String {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             let greedy = matches!(op.as_str(), "##" | "##:");
             let re = glob_to_regex_greedy(&pat, greedy);
-            format!("(({} =~ s:^{}::r))", var, re)
+            format!("(({} =~ s{{{}}}{{}}r))", var, format!("^{}", re).replace('}', "\\}"))
         }
         // Suffix removal: % shortest, %% longest. The `%.*` extension
         // idiom strips the last extension (shortest) / from the first dot
@@ -3601,9 +3608,9 @@ fn render_param(args: &[IrExpr]) -> String {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             if pat == ".*" {
                 if op == "%%" || op == "%%:" {
-                    format!("(({} =~ s:\\.*$::r))", var)
+                    strip_re(&var, "\\.*$")
                 } else {
-                    format!("(({} =~ s:\\.[^.]*$::r))", var)
+                    strip_re(&var, "\\.[^.]*$")
                 }
             } else if pat.len() == 2 && pat.ends_with('*') {
                 // C* pattern: % removes from the LAST C, %% from the FIRST
@@ -3614,16 +3621,16 @@ fn render_param(args: &[IrExpr]) -> String {
                 } else {
                     format!("{}[^{}]*", c, c)
                 };
-                format!("(({} =~ s:{}$::r))", var, re)
+                strip_re(&var, &format!("{}$", re))
             } else {
                 let greedy = matches!(op.as_str(), "%%" | "%%:");
                 let re = glob_to_regex_greedy(&pat, greedy);
-                format!("(({} =~ s:{}$::r))", var, re)
+                strip_re(&var, &format!("{}$", re))
             }
         }
         // Named idioms the IR maps: ##*/ → basename, %/* → dirname.
-        "basename" => format!("(({} =~ s:^.*/::r))", var),
-        "dirname" => format!("(({} =~ s:/[^/]*$::r))", var),
+        "basename" => strip_re(&var, "^.*/"),
+        "dirname" => strip_re(&var, "/[^/]*$"),
         // Case modification: ^^/,, = all, ^/, = first char.
         "^^" => format!("uc({})", var),
         ",," => format!("lc({})", var),

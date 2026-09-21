@@ -1022,12 +1022,26 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
 /// top-level && / || and recurse; single segments go through the token
 /// forms below.
 fn render_test_text(text: String) -> IrExpr {
-    for (word, is_and) in [("&&", true), ("||", false)] {
+    for (word, is_and) in [
+        ("&&", true),
+        ("-a", true),
+        ("||", false),
+        ("-o", false),
+    ] {
         if let Some(pos) = text.find(&format!(" {} ", word)) {
             let (l, r) = text.split_at(pos);
+            // A LEADING `-a`/`-o` is the file-test operand (`[ -a file ]`),
+            // not the AND/OR connector.
+            if l.trim().is_empty() {
+                continue;
+            }
             let r = &r[word.len() + 2..];
             return IrExpr::BinOp {
-                op: if is_and { crate::ir::BinOpKind::And } else { crate::ir::BinOpKind::Or },
+                op: if is_and {
+                    crate::ir::BinOpKind::And
+                } else {
+                    crate::ir::BinOpKind::Or
+                },
                 lhs: Box::new(render_test_text(l.to_string())),
                 rhs: Box::new(render_test_text(r.to_string())),
             };
@@ -1090,6 +1104,18 @@ fn render_test_tokens(text: &str) -> IrExpr {
     // naive split_whitespace handed operands still carrying their shell
     // quotes to the -f/-d/... wrappers, which re-quoted them — the
     // `-f ""test.txt""` doubling class (fail's largest red block).
+    //
+    // The catch-all embeds the raw test text in a Perl double-quoted
+    // string: escape `\`/`"` so `"$a"\>"$b"` stays one string literal.
+    let test_fallback = |t: &str| {
+        IrExpr::Str(
+            format!(
+                "do {{ my $t = \"{}\"; $t =~ /-\\w+/ ? 1 : 0 }}",
+                t.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+            StrStyle::Raw,
+        )
+    };
     let mut tokens: Vec<String> = crate::ir::tokenize_test(text);
     // the `[[ ... ]]` form appends a trailing `[[` marker word
     if tokens.last().map(String::as_str) == Some("[[") {
@@ -1175,7 +1201,7 @@ fn render_test_tokens(text: &str) -> IrExpr {
                     rhs: Box::new(IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(stat_left_ino), rhs: Box::new(stat_right_ino) }),
                 }
             },
-            _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
+            _ => test_fallback(text),
         }
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
         let (op, arg) = (tokens[0].as_str(), tokens[1].as_str());
@@ -1187,7 +1213,7 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-S" => IrExpr::Str(format!("-S {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
+            _ => test_fallback(text),
         }
     } else if tokens.len() == 1 {
         // Bare operand: truthiness = non-empty string; delegate the
@@ -1197,7 +1223,7 @@ fn render_test_tokens(text: &str) -> IrExpr {
             StrStyle::Raw,
         )
     } else {
-        IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw)
+        test_fallback(text)
     }
 }
 
@@ -1522,7 +1548,7 @@ fn native_bash_script(st: &mut IrStmt) -> bool {
 /// A native `print` statement for a literal line.
 fn output_stmt(text: &str) -> IrStmt {
     IrStmt::Output {
-        value: IrExpr::Str(text.to_string(), StrStyle::Raw),
+        value: IrExpr::Str(text.to_string(), StrStyle::DoubleQuoted),
         newline: true,
         target: None,
     }
