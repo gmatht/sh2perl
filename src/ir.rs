@@ -3193,6 +3193,20 @@ fn render_word(e: &IrExpr) -> String {
                 // Command substitution in unquoted word position: capture
                 // stdout, then split on IFS whitespace (bash word-splitting
                 // semantics). The join keeps it a single string for print.
+                //
+                // A single-statement body the capability tree can compute
+                // (`$(wc -c < FILE)`) is lowered natively first — the
+                // shell-text view loses the redirect, so it would otherwise
+                // shell out (check_qx: "wrapping builtin 'wc'").
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                        if let Some(val) =
+                            crate::pipeline_native::native_capture_call(e)
+                        {
+                            return format!("join(' ', split(/\\s+/, {val}))");
+                        }
+                    }
+                }
                 let cap = args.first().and_then(arrow_to_cmd);
                 match cap {
                     Some(cmd) => {
