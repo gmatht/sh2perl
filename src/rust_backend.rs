@@ -240,6 +240,19 @@ pub struct Render {
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
     runtime_free: bool,
+    /// The per-function sink-context verdict (`shir::analyze_fn_sink_contexts`):
+    /// the functions whose every call site is OUTSIDE any redirect/capture,
+    /// so their bodies can never see a non-stdout sink and print straight to
+    /// stdout. This is what lets a redirect-bearing program still emit
+    /// idiomatic `print!` inside its never-redirected functions (the
+    /// program-wide `runtime_free` verdict cannot: one redirect anywhere
+    /// keeps the runtime). Set once before rendering; empty = keep every
+    /// sink check (the conservative default).
+    fn_sink_never: std::collections::HashSet<String>,
+    /// Some print was emitted where a sink CAN be active, so the sink-aware
+    /// helper (and its sink check) must survive. Cleared only when every
+    /// print site proved sink-free.
+    sink_check_needed: bool,
     /// The SOURCE language has no `$?` and the program contains no status
     /// read (`debashl::shir::exit_status_is_unobservable`): the exit
     /// status register is unreachable from the source, so the renderer
@@ -916,10 +929,10 @@ fn cat_peephole(text: &str) -> String {
 ///
 /// Only the helper body is touched: it is the sole reader of the sinks
 /// in this case, and the callers are unchanged.
-fn inline_sinks_when_unused(text: String, runtime_free: bool) -> String {
+fn inline_sinks_when_unused(text: String, sink_check_needed: bool) -> String {
     let sets_out = text.contains("*__SH_OUT.lock().unwrap() = Some");
     let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some");
-    if !runtime_free || sets_out || sets_file {
+    if sink_check_needed || sets_out || sets_file {
         return text;
     }
     // __sh_print_words' sink-check tail (both print paths end the same
@@ -1338,6 +1351,16 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // captures, pipelines, shell-outs.) Decided BEFORE rendering so the
     // echo lowering can emit a bare `print!` directly.
     r.runtime_free = !crate::shir_passes::analysis::needs_runtime(&prog);
+    // PER-FUNCTION SINK CONTEXT (shared analysis): the functions no call
+    // site ever enters under a redirect/capture. Their bodies print
+    // straight to stdout even when the PROGRAM keeps the runtime for some
+    // other construct — the sink check is dead code in them. `Sometimes`
+    // (the conservative default) stays out of the set.
+    r.fn_sink_never = crate::shir::analyze_fn_sink_contexts(&prog)
+        .into_iter()
+        .filter(|(_, v)| *v == crate::shir::SinkContext::Never)
+        .map(|(k, _)| k)
+        .collect();
     // SOURCE-LANGUAGE STATUS VERDICT (shared): the source has no `$?` and
     // the program reads no status — so the register this renderer carries
     // for shell semantics is unreachable and is not emitted at all
@@ -1404,7 +1427,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // Belt-and-braces: confirm in the rendered output that no sink was
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
-    let text = inline_sinks_when_unused(text, r.runtime_free);
+    let text = inline_sinks_when_unused(text, !r.runtime_free && r.sink_check_needed);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -1444,6 +1467,21 @@ impl Render {
     /// (joins/scopes), no diverts, no user-function calls (a callee may
     /// read the caller's status). Helpers never touch `__SH_RC`
     /// (audited), so anything else is straight-line w.r.t. status.
+    /// Is the body currently being rendered one nobody ever calls under a
+    /// redirect/capture? Then its prints need no sink check: the sink is
+    /// the process stdout at every entry (`runtime_free` already covers
+    /// the whole-program case; this covers a redirect-bearing program
+    /// whose individual function is still never redirected).
+    fn sink_free_here(&self) -> bool {
+        if self.runtime_free {
+            return true;
+        }
+        match self.active_fn.as_deref() {
+            Some(f) => self.fn_sink_never.contains(f),
+            None => false,
+        }
+    }
+
     fn rc_plain(&self, line: &str) -> bool {
         if line.contains("__SH_RC.load")
             || line.contains('{')
@@ -1603,6 +1641,13 @@ impl Render {
     }
 
     fn add_helper(&mut self, h: &str) {
+        // The two sink-aware print helpers route output through
+        // `__SH_OUT`/`__SH_OUTFILE_TL`; requesting either means some print
+        // site could see an active sink, so the check must survive
+        // (`sink_check_needed`). Every OTHER helper is sink-free.
+        if matches!(h, "puts" | "print_words") {
+            self.sink_check_needed = true;
+        }
         if self.helpers.insert(h.to_string()) {
             for dep in helper_deps(h) {
                 self.add_helper(dep);
@@ -5035,7 +5080,7 @@ impl Render {
         let mut out: Vec<String> = Vec::new();
         let mut splat = false;
         for w in items {
-            if Self::is_splat_word(w) {
+            if std::env::var("SH2_NO_SPLAT").is_err() && Self::is_splat_word(w) {
                 // a splat: `words_expr` returns a `Vec<String>` (the
                 // array's elements / the positionals) — many words
                 out.push(self.words_expr(w));
@@ -5058,6 +5103,18 @@ impl Render {
                 "listVar" | "arrayItems" => true,
                 // `getVar("@")` is the same read on the lifted path
                 "getVar" => matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "@" || n == "*"),
+                // `${arr[@]}` / `${arr[*]}` (and `${@:n:m}`) — the
+                // `param` slice/at form expands to the array's elements
+                "param" => {
+                    let name = str_arg(args, 1).unwrap_or("");
+                    let idx_at =
+                        matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+                    name.ends_with("[@]")
+                        || name.ends_with("[*]")
+                        || name == "@"
+                        || name == "*"
+                        || idx_at
+                }
                 _ => false,
             },
             _ => false,
@@ -7168,16 +7225,19 @@ impl Render {
         // output — the space-joined words, `-e` unescaping and the
         // trailing newline — is known at render time, so skip the
         // Vec<Vec<String>> construction and the join loop and emit a
-        // single precomputed string. With no runtime (no redirect/
-        // capture anywhere) that is a bare `print!`; otherwise route
-        // through `__sh_puts`, which honours the active sinks.
+        // single precomputed string. When no sink can be active here —
+        // the program has no redirect at all (`runtime_free`) or this
+        // function is never called under one (the per-function sink
+        // verdict) — that is a bare `print!`; otherwise route through
+        // `__sh_puts`, which honours the active sinks.
         if !self.word_fail_guard {
             if let Some(text) = Self::const_echo_text(&parts, nl, esc) {
-                if self.runtime_free {
+                if self.sink_free_here() {
                     // `print!("…")` — the string is a Rust literal, so the
                     // `{}` placeholder is unnecessary
                     self.emit(&format!("print!({});", Self::rust_str(&text)));
                 } else {
+                    self.sink_check_needed = true;
                     self.add_helper("puts");
                     self.emit(&format!("__sh_puts({});", Self::rust_str(&text)));
                 }
@@ -7206,12 +7266,15 @@ impl Render {
                 ws.join(", "), nl, esc
             ));
         } else {
-            // Runtime-free program printing words that are each a SINGLE
-            // element: the join loop is a no-op, so print them directly
-            // (no helper). This is the common `echo "$x"` shape. NOT
-            // taken for `-e` (esc): the escapes must still be expanded at
-            // runtime, which only __sh_print_words does.
-            let direct = if self.runtime_free && !esc {
+            // Printing words that are each a SINGLE element: the join loop
+            // is a no-op, so print them directly (no helper). This is the
+            // common `echo "$x"` shape. Taken whenever no sink can be
+            // active here — the whole program is runtime-free, OR this
+            // function is never called under a redirect (the per-function
+            // sink verdict). NOT taken for `-e` (esc): the escapes must
+            // still be expanded at runtime, which only __sh_print_words
+            // does.
+            let direct = if self.sink_free_here() && !esc {
                 ws.iter().map(|w| Self::vec_of_one(w)).collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -7245,6 +7308,7 @@ impl Render {
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 return;
             }
+            self.sink_check_needed = true;
             self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
             self.emit("__SH_RC.store(0, Ordering::SeqCst);");
         }
@@ -15880,6 +15944,42 @@ mod tests {
             out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn never_redirected_function_prints_without_the_sink_check() {
+        // The PER-FUNCTION sink verdict: `f` is called only at top level,
+        // so its prints can never land in a sink — yet the PROGRAM has a
+        // redirect, so the program-wide verdict keeps the runtime. The
+        // body must still print idiomatically.
+        let out = render("f() { echo a; echo b; }\nf\n{ echo g; } > /tmp/sh2_nf_probe.txt\n");
+        assert!(
+            out.contains("fn f()") && out.contains("print!(\"a\\n\")"),
+            "never-redirected body not idiomatic:\n{out}"
+        );
+        assert!(
+            !out.split("fn f()").nth(1).unwrap_or("").contains("__sh_puts"),
+            "sink helper kept in the never-redirected body:\n{out}"
+        );
+        // …and the program's redirect machinery is still there for the
+        // group that needs it
+        assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
+    }
+
+    #[test]
+    fn redirected_function_keeps_the_sink_check() {
+        // `f > file` must route the body's output into the file.
+        let out = render("f() { echo a; echo b; }\nf > /tmp/sh2_redir_probe.txt\n");
+        let body = out.split("fn f()").nth(1).unwrap_or("");
+        assert!(body.contains("__sh_puts"), "sink helper dropped:\n{out}");
+    }
+
+    #[test]
+    fn both_call_shapes_keep_the_sink_check() {
+        // Sometimes-redirected: the conservative verdict.
+        let out = render("f() { echo a; echo b; }\nf\nf > /tmp/sh2_both_probe.txt\n");
+        let body = out.split("fn f()").nth(1).unwrap_or("");
+        assert!(body.contains("__sh_puts"), "sink helper dropped:\n{out}");
     }
 
     #[test]

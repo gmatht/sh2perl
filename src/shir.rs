@@ -10944,6 +10944,399 @@ pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
         .collect()
 }
 
+/// How a function's output sink looks at its call sites — the per-function
+/// verdict sibling of the program-wide [`crate::shir_passes::analysis::needs_runtime`].
+///
+/// A shell function's `echo` must honour whatever fd-1 redirection is
+/// active where it is CALLED (`f > file` routes the body's output to the
+/// file), which is why every print goes through a sink-aware helper. But a
+/// function that is never called under a redirect can never see a non-stdout
+/// sink, so its body can print straight to stdout — idiomatic host code
+/// with no sink arm at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkContext {
+    /// Every call site is outside any redirect/capture: the sink is the
+    /// process stdout at every entry, so a body print is a plain print.
+    Never,
+    /// Every call site is inside a redirect/capture: the body always
+    /// writes to an active sink.
+    Always,
+    /// Both (or the verdict could not be established — a dynamic caller,
+    /// no call site at all, an exported/ambiguous name): the body must
+    /// keep the runtime sink check. The CONSERVATIVE default.
+    Sometimes,
+}
+
+/// Per-function sink-context verdict — see [`SinkContext`].
+///
+/// The walk tracks whether it is inside a redirect/capture region and
+/// records that fact at every call site of a DEFINED function. Callers the
+/// analysis cannot see (a dynamic `eval`/`source`, a name that is also a
+/// sub, a function called before its definition is known, a function with
+/// no call site in the program) leave the verdict at `Sometimes`, so a
+/// `Never` verdict is always a licence and never a guess.
+///
+/// Redirect kinds that establish a sink: `IrStmt::Redirect` (a `{ … } > f`
+/// group / `f > f` command redirect), a `Capture` expression (command
+/// substitution — an implicit fd-1 sink), and a pipeline stage that is not
+/// the LAST (its stdout goes into the pipe). A pipeline's last stage keeps
+/// the caller's sink.
+pub fn analyze_fn_sink_contexts(prog: &IrProgram) -> HashMap<String, SinkContext> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    // every function name defined anywhere (nested defs included) — a call
+    // to one of these is what we classify
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // names defined more than once, or colliding with a sub: ambiguous
+    // bodies → conservative
+    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn collect_defs(
+        stmts: &[IrStmt],
+        defined: &mut std::collections::HashSet<String>,
+        ambiguous: &mut std::collections::HashSet<String>,
+    ) {
+        for st in stmts {
+            match st {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks,
+                } => {
+                    if !defined.insert(name.clone()) {
+                        ambiguous.insert(name.clone());
+                    }
+                    collect_defs(body, defined, ambiguous);
+                    for (_, nb) in named_blocks {
+                        collect_defs(nb, defined, ambiguous);
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => collect_defs(body, defined, ambiguous),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    collect_defs(then, defined, ambiguous);
+                    for (_, arm) in elsifs {
+                        collect_defs(arm, defined, ambiguous);
+                    }
+                    collect_defs(else_, defined, ambiguous);
+                }
+                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                    collect_defs(body, defined, ambiguous)
+                }
+                IrStmt::Redirect { inner, .. } => collect_defs(inner, defined, ambiguous),
+                _ => {}
+            }
+        }
+    }
+    collect_defs(&prog.stmts, &mut defined, &mut ambiguous);
+    for sub in &prog.subs {
+        // a sub sharing a shell function's name makes the callee ambiguous
+        // (the outparam channel is invisible here)
+        if defined.contains(&sub.name) {
+            ambiguous.insert(sub.name.clone());
+        }
+    }
+
+    /// Every call site's sink state, per function name: (saw_never,
+    /// saw_always). A name absent from the map was never observed as a
+    /// call.
+    type Sites = HashMap<String, (bool, bool)>;
+    struct Walk<'a> {
+        defined: &'a std::collections::HashSet<String>,
+        sites: Sites,
+        in_sink: bool,
+        /// set while walking a function BODY definition: a call inside one
+        /// function's body happens wherever THAT function is called, so the
+        /// textual sink state there says nothing about the callee. Marked
+        /// "unclassifiable" instead of recording a spurious site.
+        in_def: usize,
+    }
+    impl<'a> Walk<'a> {
+        fn call(&mut self, name: &str) {
+            if !self.defined.contains(name) {
+                return;
+            }
+            let e = self.sites.entry(name.to_string()).or_insert((false, false));
+            if self.in_def > 0 {
+                // inside a body: the sink depends on the CALLER's caller —
+                // conservative (leave both flags alone; absence of a
+                // Never/Always observation keeps the verdict Sometimes)
+                return;
+            }
+            if self.in_sink {
+                e.1 = true;
+            } else {
+                e.0 = true;
+            }
+        }
+        fn stmts(&mut self, stmts: &[IrStmt]) {
+            for s in stmts {
+                self.stmt(s);
+            }
+        }
+        fn stmt(&mut self, s: &IrStmt) {
+            match s {
+                // a redirect region: fd-1 (or any fd) is remapped for the
+                // inner statements — a nested group redirect nests
+                IrStmt::Redirect { inner, .. } => {
+                    let saved = self.in_sink;
+                    self.in_sink = true;
+                    self.stmts(inner);
+                    self.in_sink = saved;
+                }
+                // a function DEFINITION body: not executed here
+                IrStmt::Function {
+                    body, named_blocks, ..
+                } => {
+                    self.in_def += 1;
+                    self.stmts(body);
+                    for (_, nb) in named_blocks {
+                        self.stmts(nb);
+                    }
+                    self.in_def -= 1;
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    self.expr(cond);
+                    self.stmts(body);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    self.expr(iter);
+                    self.stmts(body);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    self.stmts(init);
+                    self.expr(cond);
+                    self.stmts(step);
+                    self.stmts(body);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => self.stmts(b),
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    self.expr(cond);
+                    self.stmts(then);
+                    for (c, arm) in elsifs {
+                        self.expr(c);
+                        self.stmts(arm);
+                    }
+                    self.stmts(else_);
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                } => {
+                    self.expr(discriminant);
+                    for c in clauses {
+                        self.stmts(&c.body);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    self.stmts(body);
+                    for e in excepts {
+                        self.stmts(&e.body);
+                    }
+                    self.stmts(else_body);
+                    self.stmts(finally_body);
+                }
+                IrStmt::Expr(e) => self.expr(e),
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    ..
+                } => {
+                    // `f > file` at command level: the redirects list on
+                    // an Exec is the same sink
+                    let saved = self.in_sink;
+                    if !redirects.is_empty() {
+                        self.in_sink = true;
+                    }
+                    self.expr(cmd);
+                    for a in args {
+                        self.expr(a);
+                    }
+                    self.in_sink = saved;
+                }
+                IrStmt::Output { value, target, .. } => {
+                    let saved = self.in_sink;
+                    if target.is_some() {
+                        self.in_sink = true;
+                    }
+                    self.expr(value);
+                    self.in_sink = saved;
+                }
+                IrStmt::Assign { expr, .. } => self.expr(expr),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        self.expr(i);
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        self.expr(e);
+                    }
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => self.expr(e),
+                // a pipeline: every stage but the LAST writes into the pipe
+                // (a sink); the last stage inherits the caller's sink
+                IrStmt::Pipeline { stages, .. } => {
+                    let n = stages.len();
+                    for (i, st) in stages.iter().enumerate() {
+                        let saved = self.in_sink;
+                        if i + 1 < n {
+                            self.in_sink = true;
+                        }
+                        self.stmts(st);
+                        self.in_sink = saved;
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn expr(&mut self, e: &IrExpr) {
+            match e {
+                // command substitution: an implicit fd-1 sink for its body
+                IrExpr::Capture { expr, .. } => match &**expr {
+                    IrExpr::Arrow(body) => {
+                        let saved = self.in_sink;
+                        self.in_sink = true;
+                        self.stmts(body);
+                        self.in_sink = saved;
+                    }
+                    other => self.expr(other),
+                },
+                IrExpr::Arrow(body) => self.stmts(body),
+                IrExpr::Call { func, args } => {
+                    // the fn-call shapes (see the backend's is_fn_capture):
+                    // `fnCall("f")` / `exec("f", [...])` / `builtin(...)`
+                    if matches!(func.as_str(), "fnCall" | "fnValue") {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            self.call(name);
+                        }
+                    } else if func == "exec" || func == "builtin" {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            self.call(name);
+                        }
+                    }
+                    // A PIPELINE call carries its stages as `Arrow` bodies:
+                    // every stage but the LAST writes into the pipe (a
+                    // sink); the last stage keeps the caller's sink.
+                    if func == "pipeline" {
+                        let stages: &[IrExpr] = match args.first() {
+                            Some(IrExpr::Array(items)) => items,
+                            _ => &[],
+                        };
+                        let n = stages.len();
+                        for (i, st) in stages.iter().enumerate() {
+                            let saved = self.in_sink;
+                            if i + 1 < n {
+                                self.in_sink = true;
+                            }
+                            self.expr(st);
+                            self.in_sink = saved;
+                        }
+                        for a in args.iter().skip(1) {
+                            self.expr(a);
+                        }
+                        return;
+                    }
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                IrExpr::BinOp { lhs, rhs, .. } => {
+                    self.expr(lhs);
+                    self.expr(rhs);
+                }
+                IrExpr::Ternary { cond, then, else_ } => {
+                    self.expr(cond);
+                    self.expr(then);
+                    self.expr(else_);
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            self.expr(x);
+                        }
+                    }
+                }
+                IrExpr::Index { key, .. } => self.expr(key),
+                IrExpr::DefinedOr { expr, default } => {
+                    self.expr(expr);
+                    self.expr(default);
+                }
+                IrExpr::Array(items) => {
+                    for i in items {
+                        self.expr(i);
+                    }
+                }
+                IrExpr::MethodCall { obj, args, .. } => {
+                    self.expr(obj);
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut w = Walk {
+        defined: &defined,
+        sites: HashMap::new(),
+        in_sink: false,
+        in_def: 0,
+    };
+    w.stmts(&prog.stmts);
+    for sub in &prog.subs {
+        // a sub body runs at its call sites (outparam), which this walk
+        // does not model → its name stays conservative
+        let _ = sub;
+    }
+
+    let mut out: HashMap<String, SinkContext> = HashMap::new();
+    for name in &defined {
+        if ambiguous.contains(name) {
+            out.insert(name.clone(), SinkContext::Sometimes);
+            continue;
+        }
+        // a function DEFINED but never called in-program: the sink at its
+        // (unknown, possibly external) call sites is not established
+        match w.sites.get(name) {
+            Some((true, false)) => {
+                out.insert(name.clone(), SinkContext::Never);
+            }
+            Some((false, true)) => {
+                out.insert(name.clone(), SinkContext::Always);
+            }
+            _ => {
+                out.insert(name.clone(), SinkContext::Sometimes);
+            }
+        }
+    }
+    out
+}
+
 /// Program-wide verdict: the ARRAYS whose value is a compile-time literal
 /// list. An array qualifies when every write is a single, loop-free
 /// all-literal `setArray`/`DeclareArray`/`Array`-assign and the array is
@@ -55607,6 +56000,135 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         eprintln!(
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
+        );
+    }
+}
+
+#[cfg(test)]
+mod sink_context_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn ctx_of(src: &str, name: &str) -> SinkContext {
+        *analyze_fn_sink_contexts(&prog_of(src))
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from the verdict:\n{src}"))
+    }
+
+    /// A function only ever called at top level is NEVER redirected: its
+    /// prints cannot land in a non-stdout sink.
+    #[test]
+    fn never_redirected_function() {
+        assert_eq!(ctx_of("f() { echo a; echo b; }\nf\n", "f"), SinkContext::Never);
+        // a redirect elsewhere in the program does not change f's verdict
+        assert_eq!(
+            ctx_of("f() { echo a; }\nf\n{ echo g; } > /tmp/x\n", "f"),
+            SinkContext::Never
+        );
+    }
+
+    /// A function whose only call site is under a redirect/capture ALWAYS
+    /// sees a sink.
+    #[test]
+    fn always_redirected_function() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf > /tmp/x\n", "f"),
+            SinkContext::Always
+        );
+        // a command substitution is an implicit fd-1 sink
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nx=$(f)\n", "f"),
+            SinkContext::Always
+        );
+        // a non-final pipeline stage routes into the pipe
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf | cat\n", "f"),
+            SinkContext::Always
+        );
+    }
+
+    /// Both call shapes at once: the sink check must survive (the
+    /// conservative verdict).
+    #[test]
+    fn sometimes_redirected_function_is_conservative() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf\nf > /tmp/x\n", "f"),
+            SinkContext::Sometimes
+        );
+    }
+
+    /// Unknown callers are conservative: a defined-but-never-called
+    /// function, a function called from inside ANOTHER function's body
+    /// (whose own sink depends on its callers), and an ambiguous
+    /// redefinition.
+    #[test]
+    fn unknown_callers_are_conservative() {
+        assert_eq!(
+            ctx_of("f() { echo a; }\n", "f"),
+            SinkContext::Sometimes,
+            "a defined-but-uncalled function has unknown callers"
+        );
+        assert_eq!(
+            ctx_of("g() { echo a; }\nf() { g; }\nf\n", "g"),
+            SinkContext::Sometimes,
+            "a call inside a body depends on that body's callers"
+        );
+        assert_eq!(
+            ctx_of("f() { echo a; }\nf() { echo b; }\nf\n", "f"),
+            SinkContext::Sometimes,
+            "a redefinition makes the callee ambiguous"
+        );
+    }
+
+    /// A nested redirect does not "cancel" the sink — the inner statements
+    /// are still inside one.
+    #[test]
+    fn nested_redirect_stays_always() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\n{ f; echo g; } > /tmp/x\n", "f"),
+            SinkContext::Always
+        );
+    }
+
+    /// The Rust backend decides the same thing from its own call-shape
+    /// recognition (the `exec("f", [...])` form the frontends emit).
+    #[test]
+    fn fn_call_shape_is_recognised() {
+        let prog = crate::ir::IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        assert_eq!(
+            analyze_fn_sink_contexts(&prog).get("f").copied(),
+            Some(SinkContext::Never)
         );
     }
 }
