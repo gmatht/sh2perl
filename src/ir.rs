@@ -2210,6 +2210,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             cond
                         ));
                     }
+                    "grepMatches" => {
+                        // `grep -o PAT` — print each match.
+                        let text = args.first().map(ir_expr_to_perl).unwrap_or_else(|| "''".into());
+                        let pat = args.get(1).and_then(call_arg_str).unwrap_or_default();
+                        let flags = args.get(2).and_then(call_arg_str).unwrap_or_default();
+                        let rx = grep_o_regex(&pat, &flags);
+                        let fl = if flags.contains('i') { "i" } else { "" };
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "for my $__m (({text}) =~ /{rx}/{fl}g) {{ print $__m, \"\\n\"; }} $main_exit_code = $CHILD_ERROR = 0;\n"
+                        ));
+                    }
                     "pipeline" => {
                         // Side-effect pipeline: prefer a native fold when the
                         // stages are literal builtins (`echo … | tr …`,
@@ -3981,6 +3993,48 @@ fn arith_text_to_perl(text: &str) -> String {
         }
         out.push(chars[i]);
         i += 1;
+    }
+    out
+}
+
+/// The Perl regex body for the `grep -o` lift's `grepMatches(text, pat,
+/// flags)`. `-F` quotes, `-E` is taken as-is, otherwise BRE→Perl.
+fn grep_o_regex(pat: &str, flags: &str) -> String {
+    if flags.contains('F') {
+        return pat
+            .chars()
+            .map(|c| {
+                if "\\^$.|?*+()[]{}".contains(c) {
+                    format!("\\{c}")
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+    }
+    if flags.contains('E') {
+        return pat.replace('\\', "\\\\").replace('/', "\\/");
+    }
+    let mut out = String::new();
+    let mut it = pat.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some(x) if "(){}|+?".contains(x) => out.push(x),
+                Some(x) => {
+                    out.push('\\');
+                    out.push(x);
+                }
+                None => out.push('\\'),
+            }
+        } else if "(){}|+?".contains(c) {
+            out.push('\\');
+            out.push(c);
+        } else if c == '/' {
+            out.push_str("\\/");
+        } else {
+            out.push(c);
+        }
     }
     out
 }
@@ -8007,6 +8061,16 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
+                // `grep -o PAT` lift: the matches (list in list context, the
+                // first in scalar).
+                "grepMatches" => {
+                    let text = args.first().map(ir_expr_to_perl).unwrap_or_else(|| "''".into());
+                    let pat = args.get(1).and_then(call_arg_str).unwrap_or_default();
+                    let flags = args.get(2).and_then(call_arg_str).unwrap_or_default();
+                    let rx = grep_o_regex(&pat, &flags);
+                    let fl = if flags.contains('i') { "i" } else { "" };
+                    format!("(({text}) =~ /{rx}/{fl}g)")
+                }
                 "line" => {
                     // multi-return line read (`line(cap, N)` = the C
                     // frontend's outparam channel): String(v).split('\n')[N]
