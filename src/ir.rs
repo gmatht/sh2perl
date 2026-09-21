@@ -2291,9 +2291,6 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             asm,
             ..
         } => {
-            if std::env::var("SH2_PROBE").is_ok() && format!("{targets:?}").contains("sed_result") {
-                eprintln!("PROBE Assign(sed_result) expr = {expr:?}");
-            }
             let rhs = ir_expr_to_perl(expr);
             // Declarator-position asm label (`int x asm("myx") = 7;` —
             // core request c-sh-go-toplevelasmargument-20260814-042952):
@@ -2388,18 +2385,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                 }
                 if let IrExpr::Capture { native: false, .. } = expr {
-                    // A capture of a single NATIVE PIPELINE
-                    // (`x=$(echo hi | sort)`) — the shared pipeline
-                    // capability already lowers the body to a Perl
-                    // statement that prints the result; run it with stdout
-                    // redirected into the target instead of shelling the
-                    // whole thing to `bash -c` (check_qx: "wrapping
-                    // builtin 'echo'").
                     if let IrExpr::Capture { expr: inner, .. } = expr {
                         if let IrExpr::Arrow(stmts) = inner.as_ref() {
                             if let [IrStmt::Expr(e)] = stmts.as_slice() {
-                                if let Some(stmt) =
-                                    crate::pipeline_native::native_pipeline(e)
+                                if let Some(stmt) = crate::pipeline_native::native_pipeline(e)
                                 {
                                     emit_indent(out, indent);
                                     out.push_str(&format!(
@@ -2833,7 +2822,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 {
                     emit_indent(out, indent);
                     out.push_str(&format!(
-                        "my ${var} = do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt} open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }};\n"
+                        "my ${var} = do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }};\n"
                     ));
                     return;
                 }
@@ -2850,7 +2839,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                 }
             } else {
-                // Side-effect pipeline: emit stage statements directly.
+                // Side-effect pipeline: prefer the CAPABILITY tree on the
+                // equivalent `pipeline(...)` expression — a literal
+                // producer plus a supported consumer lowers to ONE native
+                // statement, where emitting the stages separately would
+                // render the consumer as a bare exec reading stdin (no
+                // payload channel -> it shells out: check_qx "wrapping
+                // builtin 'grep'").
+                if let Some(stmt) = stages_as_pipeline_expr(stages)
+                    .and_then(|e| crate::pipeline_native::native_pipeline(&e))
+                {
+                    emit_indent(out, indent);
+                    out.push_str(&stmt);
+                    out.push('\n');
+                    return;
+                }
                 for stage in stages {
                     for s in stage {
                         emit_stmt(out, s, indent);
@@ -6260,6 +6263,18 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // the capture buffer, run, restore; `print STDOUT` follows
             // the redirected handle).
             if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                // A native capture whose body is still the `pipeline(...)`
+                // CALL (the fold flipped `native` but left the call, e.g.
+                // `x=$(echo … | grep -i …)`): lowering it through the
+                // capability tree gives ONE statement that prints the
+                // result, which the redirect below captures.
+                if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                    if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
+                        return format!(
+                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                        );
+                    }
+                }
                 if stmts.iter().any(|s| matches!(s, IrStmt::RawText(_))) {
                     let mut body = String::new();
                     for st in stmts.iter() {
@@ -6269,7 +6284,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // needs fd 1 CLOSED first (EBADF otherwise — verified
                     // on perl 5.38; the dup2 target must be free).
                     return format!(
-                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
                     );
                 }
             }

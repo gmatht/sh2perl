@@ -3043,7 +3043,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
     );
     match out {
         Some(oq) => code.push_str(&format!(
-            "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
+            "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0; }}"
         )),
         None => {
             let tail = match &else_echo {
@@ -3053,7 +3053,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
                         "if (@__out) {{ print join(\"\\n\", @__out), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0; }} else {{ print STDOUT {eq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}"
                     )
                 }
-                None => "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0;".to_string(),
+                None => "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0; }".to_string(),
             };
             code.push_str(&tail);
         }
