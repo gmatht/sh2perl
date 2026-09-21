@@ -113,8 +113,20 @@ fn wc_file(call: &crate::ir::IrExpr) -> Option<NativeEmit> {
     if !matches!(mode, Some(IrExpr::Str(ref m, _)) if m == "in" || m == "r") {
         return None;
     }
-    let Some(IrExpr::Str(path, _)) = target else {
+    let Some(target) = target else {
         return None;
+    };
+    // A literal path or a scalar/getVar (`wc -c < "$file"`).
+    let path_expr = match &target {
+        IrExpr::Str(p, _) => crate::ir::safe_perl_q_string(p),
+        IrExpr::Var(n, _) => format!("${n}"),
+        IrExpr::Call { func: gf, args: ga } if gf == "getVar" => {
+            let IrExpr::Str(n, _) = ga.first()? else {
+                return None;
+            };
+            format!("${n}")
+        }
+        _ => return None,
     };
     // read the whole file; a missing file exits 1 with no output
     let count = match flag.as_str() {
@@ -134,6 +146,6 @@ fn wc_file(call: &crate::ir::IrExpr) -> Option<NativeEmit> {
     };
     Some(NativeEmit::Stmt(format!(
         "my $__f = {path}; if (open(my $__h, '<', $__f)) {{ my $__d = do {{ local $/; <$__h> }}; close($__h); $__d //= q{{}}; $__sh_cap = {val}; $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; }}",
-        path = crate::ir::safe_perl_q_string(&path)
+        path = path_expr
     )))
 }

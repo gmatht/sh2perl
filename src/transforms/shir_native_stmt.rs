@@ -713,7 +713,9 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                     }
                     out.push(IrStmt::Assign {
                         targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
-                        expr: IrExpr::Str(value, StrStyle::Raw),
+                        // The value is a parser literal (the dynamic forms
+                        // are refused above) — quote it as a Perl string.
+                        expr: IrExpr::Str(value, StrStyle::DoubleQuoted),
                         asm: None,
                     });
                 } else {
@@ -721,7 +723,13 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                     // safe flags are attribute-only (no value change).
                     if !valid_var_name(assignment) { return false; }
                     if let Some(f) = &flag {
-                        if f.contains('a') || f.contains('A') {
+                        if f.contains('A') {
+                            out.push(IrStmt::DeclareArray {
+                                var: assignment.to_string(),
+                                sigil: Some(crate::ir::Sigil::Hash),
+                                elements: vec![],
+                            });
+                        } else if f.contains('a') {
                             out.push(empty_array_assign(assignment));
                         }
                     } else {
@@ -736,6 +744,30 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                 }
                 let Some(IrExpr::Str(name, _)) = sargs.first() else { return false; };
                 if !valid_var_name(name) { return false; }
+                // `declare -A name=([k]=v …)` → a Perl HASH literal
+                // (`%name = (k => v, …)`; `%assoc` was left undeclared before).
+                if flag.as_deref().map(|f| f.contains('A')).unwrap_or(false) {
+                    let Some(IrExpr::Array(elems)) = sargs.get(1) else { return false; };
+                    let mut flat: Vec<IrExpr> = Vec::new();
+                    for el in elems {
+                        let Some(s) = crate::ir::grep_lit_str(el) else { return false; };
+                        let Some(rest) = s.strip_prefix('[') else { return false; };
+                        let Some(close) = rest.find(']') else { return false; };
+                        let k = rest[..close].to_string();
+                        let v = rest[close + 1..]
+                            .strip_prefix('=')
+                            .unwrap_or("")
+                            .to_string();
+                        flat.push(IrExpr::Str(k, StrStyle::DoubleQuoted));
+                        flat.push(IrExpr::Str(v, StrStyle::DoubleQuoted));
+                    }
+                    out.push(IrStmt::DeclareArray {
+                        var: name.clone(),
+                        sigil: Some(crate::ir::Sigil::Hash),
+                        elements: flat,
+                    });
+                    continue;
+                }
                 out.push(IrStmt::Assign {
                     targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }],
                     expr: word.clone(),
@@ -806,7 +838,7 @@ fn native_cat_heredoc_writefile(st: &mut IrStmt) -> bool {
     let (Some(path), Some(content)) = (write_target, heredoc_body) else { return false; };
     *st = IrStmt::WriteFile {
         path,
-        content: IrExpr::Str(content, StrStyle::Raw),
+        content: IrExpr::Str(content, StrStyle::DoubleQuoted),
         append: false,
     };
     true
@@ -1073,15 +1105,30 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-s" => IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs: Box::new(IrExpr::Str(format!("-s \"{}\"", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Bool(true)) },
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            "=" | "==" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
-            "!=" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
+            "=" | "==" => IrExpr::Str(
+                crate::ir::nocase_str_eq(
+                    &crate::ir::render_test_operand(left),
+                    &crate::ir::render_test_operand(right),
+                ),
+                StrStyle::Raw,
+            ),
+            "!=" => IrExpr::Str(
+                format!(
+                    "(!{})",
+                    crate::ir::nocase_str_eq(
+                        &crate::ir::render_test_operand(left),
+                        &crate::ir::render_test_operand(right),
+                    )
+                ),
+                StrStyle::Raw,
+            ),
             // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
             // old catchall parsed it as "text contains a -flag", a bogus
             // truthiness). Perl accepts a STRING as the pattern, so the
             // single-quoted render is safe against delimiter chars;
             // Perl's dialect ≈ ERE for the corpus patterns.
             "=~" => {
-                let l = left.trim_matches('"');
+                let l = crate::ir::render_test_operand(left);
                 let pat = right
                     .trim_matches('"')
                     .trim_matches('\'')
@@ -1096,12 +1143,12 @@ fn render_test_tokens(text: &str) -> IrExpr {
             // stderr only). Before this arm these fell to the regex hack
             // below, which is ALWAYS TRUE whenever the string contains
             // `-eq` etc. — c-corpus rich.c rendered every loop-if taken.
-            "-eq" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-ne" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-gt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Gt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-eq" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-ne" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-gt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Gt, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
             // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
             // old catchall parsed it as "text contains a -flag", a bogus
             // truthiness). Perl accepts a STRING as the pattern, so the
@@ -1142,6 +1189,13 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
         }
+    } else if tokens.len() == 1 {
+        // Bare operand: truthiness = non-empty string; delegate the
+        // `${…}` / `$(…)` / `$((…))` forms to the shared renderer.
+        IrExpr::Str(
+            format!("length({})", crate::ir::render_test_operand(&tokens[0])),
+            StrStyle::Raw,
+        )
     } else {
         IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw)
     }
@@ -1614,7 +1668,7 @@ fn native_cat_heredoc_redirect_call(st: &mut IrStmt) -> bool {
     let Some(body) = body else { return false; };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(body, StrStyle::Raw),
+            value: IrExpr::Str(body, StrStyle::DoubleQuoted),
             newline: false,
             target: None,
         },
@@ -2344,10 +2398,17 @@ fn normalize_literal_exec_words(st: &mut IrStmt) -> bool {
     if !matches!(func.as_str(), "exec" | "builtin") {
         return false;
     }
-    let is_typeset = match args.first() {
-        Some(IrExpr::Str(name, _)) => name == "typeset",
-        _ => false,
+    let (is_typeset, is_local) = match args.first() {
+        Some(IrExpr::Str(name, _)) => (name == "typeset", name == "local"),
+        _ => (false, false),
     };
+    // `local` is an assignment builtin: its value words are rendered as Perl
+    // expressions by the `local` emitter, so a quoted literal must stay an
+    // Interpolate (`"hello"`) — collapsing it to `Str(Raw)` emitted the bare
+    // word `hello` (`my $msg = hello;`, examples/081_nested_functions).
+    if is_local {
+        return false;
+    }
     let [IrExpr::Str(_, _), IrExpr::Array(words)] = args.as_mut_slice() else {
         return false;
     };
@@ -2355,7 +2416,10 @@ fn normalize_literal_exec_words(st: &mut IrStmt) -> bool {
     for word in words.iter_mut() {
         if let Some(text) = literal_text(word) {
             if !matches!(word, IrExpr::Str(_, _)) {
-                *word = IrExpr::Str(text, StrStyle::Raw);
+                // Keep the string STYLE so `render_word` quotes it as a Perl
+                // string (`upper "hello"` → `upper("hello")`, not the
+                // bareword `hello`); `bash_word_for` shells-quotes either way.
+                *word = IrExpr::Str(text, StrStyle::DoubleQuoted);
                 changed = true;
             }
         }
@@ -2551,7 +2615,7 @@ fn native_printf_v_stmt(st: &mut IrStmt) -> bool {
     }
     if used != values.len() { return false; }
     *st = IrStmt::Block(vec![
-        IrStmt::Assign { targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }], expr: IrExpr::Str(output, StrStyle::Raw), asm: None },
+        IrStmt::Assign { targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }], expr: IrExpr::Str(output, StrStyle::DoubleQuoted), asm: None },
         status_exec(true),
     ]);
     true
@@ -3081,7 +3145,8 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
 
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
-        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+        // A Var target is the runtime VALUE (`$__ps_tmp0`), not its name.
+        IrExpr::Var(_, _) | IrExpr::Ident(_) => crate::ir::ir_expr_to_perl(&r.target),
         _ => return false,
     };
     // the inner stmt may arrive Block-wrapped
@@ -4996,8 +5061,8 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
             }
             let o = match &r.target {
                 IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-                IrExpr::Var(n, _) | IrExpr::Ident(n) => {
-                    Some(crate::ir::safe_perl_q_string(n))
+                IrExpr::Var(_, _) | IrExpr::Ident(_) => {
+                    Some(crate::ir::ir_expr_to_perl(&r.target))
                 }
                 _ => return false,
             };
@@ -5017,7 +5082,7 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
     let file_q = |w: &IrExpr| -> Option<String> {
         match w {
             IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            IrExpr::Var(_, _) | IrExpr::Ident(_) => Some(crate::ir::ir_expr_to_perl(w)),
             _ => None,
         }
     };
@@ -5827,7 +5892,7 @@ fn native_comm_stmt(st: &mut IrStmt) -> bool {
     let file_q = |w: &IrExpr| -> Option<String> {
         match w {
             IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            IrExpr::Var(_, _) | IrExpr::Ident(_) => Some(crate::ir::ir_expr_to_perl(w)),
             _ => None,
         }
     };

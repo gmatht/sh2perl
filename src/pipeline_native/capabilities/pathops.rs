@@ -53,10 +53,6 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     let [crate::ir::IrExpr::Str(cmd, _), crate::ir::IrExpr::Array(words)] = args.as_slice() else {
         return None;
     };
-    let words: Vec<String> = words
-        .iter()
-        .map(crate::ir::grep_lit_str)
-        .collect::<Option<_>>()?;
     let perl = match cmd.as_str() {
         // `pwd` — the physical working directory. `Cwd::getcwd` is
         // require'd inline so no preamble import is needed (a capability
@@ -64,9 +60,22 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         "pwd" if words.is_empty() => {
             "(require Cwd, Cwd::getcwd())".to_string()
         }
-        "basename" if words.len() == 1 => basename(&words[0], None)?,
-        "basename" if words.len() == 2 => basename(&words[0], Some(&words[1]))?,
-        "dirname" if words.len() == 1 => dirname(&words[0])?,
+        // Literal paths use the compile-time rules; a dynamic path
+        // (`basename $(pwd)`, `dirname "$0"`) falls back to core
+        // File::Basename so the builtin is never shelled out.
+        "basename" if words.len() == 1 => match crate::ir::grep_lit_str(&words[0]) {
+            Some(l) => basename(&l, None)?,
+            None => runtime_path("basename", &words[0])?,
+        },
+        "basename" if words.len() == 2 => {
+            let p = crate::ir::grep_lit_str(&words[0])?;
+            let s = crate::ir::grep_lit_str(&words[1])?;
+            basename(&p, Some(&s))?
+        }
+        "dirname" if words.len() == 1 => match crate::ir::grep_lit_str(&words[0]) {
+            Some(l) => dirname(&l)?,
+            None => runtime_path("dirname", &words[0])?,
+        },
         _ => return None,
     };
     // The capture parent reads `$__sh_cap`; the VALUE form is the same
@@ -80,6 +89,31 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
 /// A perl string literal for `s` (single-quoted unless it contains a quote).
 fn lit(s: &str) -> String {
     format!("q{{{}}}", s.replace('\\', "\\\\").replace('}', "\\}"))
+}
+
+/// A word as a Perl expression (literal → quoted string; otherwise the
+/// shared word renderer).
+fn word_expr(w: &crate::ir::IrExpr) -> Option<String> {
+    if let Some(l) = crate::ir::grep_lit_str(w) {
+        return Some(lit(&l));
+    }
+    match w {
+        crate::ir::IrExpr::Str(..)
+        | crate::ir::IrExpr::Interpolate(..)
+        | crate::ir::IrExpr::Var(..)
+        | crate::ir::IrExpr::Call { .. }
+        | crate::ir::IrExpr::Capture { .. } => Some(crate::ir::ir_expr_to_perl(w)),
+        _ => None,
+    }
+}
+
+/// Runtime `basename`/`dirname` for a dynamic path (core File::Basename).
+fn runtime_path(kind: &str, w: &crate::ir::IrExpr) -> Option<String> {
+    let p = word_expr(w)?;
+    Some(format!(
+        "(do {{ require File::Basename; File::Basename::{}({}) }})",
+        kind, p
+    ))
 }
 
 /// `basename PATH [SUFFIX]` — bash strips trailing slashes, takes the
