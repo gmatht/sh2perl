@@ -5019,6 +5019,51 @@ impl Render {
     /// Render a WORD as a Vec<String> runtime expression. Unquoted globs
     /// (SH2GLOB), split/brace/listVar/capture words expand to multiple
     /// elements; everything else is a single element.
+    /// Argument words for a user-function call. Unlike a plain
+    /// `expr_any` per element, a SPLAT element (`"$@"`/`${arr[@]}` — an
+    /// `Array` nested inside the argument `Array`) expands to MANY words:
+    /// it contributes a `Vec<String>` sub-list that the caller
+    /// concatenates. Non-splat elements contribute exactly one word.
+    ///
+    /// Returns `(words, splat)` — `splat` is true when at least one
+    /// element was a splat, so the caller must build the arg vector with
+    /// `__sh_cat(&[...])` (which flattens) rather than `vec![...]`.
+    fn call_arg_words(&mut self, a: Option<&IrExpr>) -> (Vec<String>, bool) {
+        let Some(IrExpr::Array(items)) = a else {
+            return (Vec::new(), false);
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut splat = false;
+        for w in items {
+            if Self::is_splat_word(w) {
+                // a splat: `words_expr` returns a `Vec<String>` (the
+                // array's elements / the positionals) — many words
+                out.push(self.words_expr(w));
+                splat = true;
+            } else {
+                out.push(format!("vec![{}]", self.expr_any(w)));
+            }
+        }
+        (out, splat)
+    }
+
+    /// A word that expands to MANY words: `"$@"`/`"$*"` (the word-level
+    /// `listVar`/`getVar` lowering), `${arr[@]}` (a `listVar`/`arrayItems`
+    /// call or an array name read). A plain word expands to one.
+    fn is_splat_word(w: &IrExpr) -> bool {
+        match w {
+            IrExpr::Array(_) => true,
+            IrExpr::Call { func, args } => match func.as_str() {
+                // the whole-positional / array-list forms
+                "listVar" | "arrayItems" => true,
+                // `getVar("@")` is the same read on the lifted path
+                "getVar" => matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "@" || n == "*"),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn words_expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => {
@@ -5173,24 +5218,22 @@ impl Render {
                 // the argv-swap call then read __SH_RET (the function's
                 // `return expr` home) — mirrors call_str's fnValue arm
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    let ws: Vec<String> = args
-                        .get(1)
-                        .and_then(|a| match a {
-                            IrExpr::Array(items) => {
-                                Some(items.iter().map(|w| self.expr_any(w)).collect())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
+                    let (ws, splat) = self.call_arg_words(args.get(1));
                     // pass-3: direct call, value wrapped for word context
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
                         let v = self.fn_call_value(name, ws, &sig, false);
                         return format!("vec![{v}]");
                     }
                     let m = self.fn_ident(name);
+                    // a splat element needs the flattening constructor
+                    let constr = if splat {
+                        self.add_helper("cat");
+                        format!("__sh_cat(&[{}])", ws.join(", "))
+                    } else {
+                        format!("vec![{}]", ws.join(", "))
+                    };
                     format!(
-                        "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
-                        ws.join(", "),
+                        "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
                         m
                     )
                 } else {
@@ -6664,9 +6707,15 @@ impl Render {
         if sig.arity == 0 && !sig.argv {
             return format!("{m}()");
         }
-        if cat {
+        // `ws` holds one `vec![word]` per argument; a SPLAT element holds
+        // a multi-word `Vec<String>` instead, so the two cannot be
+        // concatenated with `vec![a, b]` (that would nest). `__sh_cat`
+        // flattens a `&[Vec<String>]` — always correct, and what `cat`
+        // already selects.
+        if cat || ws.iter().any(|w| !w.starts_with("vec![")) {
             self.add_helper("cat");
         }
+        let cat = cat || ws.iter().any(|w| !w.starts_with("vec!["));
         let constr = if cat {
             format!("__sh_cat(&[{}])", ws.join(", "))
         } else {
@@ -7532,24 +7581,21 @@ impl Render {
                 // value-returning user-function call: the argv-swap call
                 // then read __SH_RET (the function's `return expr` home)
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    let ws: Vec<String> = args
-                        .get(1)
-                        .and_then(|a| match a {
-                            IrExpr::Array(items) => {
-                                Some(items.iter().map(|w| self.expr_any(w)).collect())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
+                    let (ws, splat) = self.call_arg_words(args.get(1));
                     // pass-3: a probed signature calls directly (the
                     // value IS the return, no __SH_RET re-read)
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
                         return self.fn_call_value(name, ws, &sig, false);
                     }
                     let m = self.fn_ident(name);
+                    let constr = if splat {
+                        self.add_helper("cat");
+                        format!("__sh_cat(&[{}])", ws.join(", "))
+                    } else {
+                        format!("vec![{}]", ws.join(", "))
+                    };
                     return format!(
-                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
-                        ws.join(", "),
+                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
                         m
                     );
                 }
@@ -15258,6 +15304,26 @@ mod tests {
     }
 
     #[test]
+    fn dollar_at_splices_into_the_callee_args() {
+        // `inner "$@"` passes every positional as its OWN word — the
+        // argument list must flatten (`__sh_cat`), not join into one
+        // string (the pre-existing bug: expr_any is single-word).
+        let out = render("inner() { echo \"$#\"; }\nouter() { inner \"$@\"; }\nouter p q\n");
+        assert!(
+            !out.contains(".join(\" \")"),
+            "\"$@\" collapsed to one word:\n{out}"
+        );
+        assert!(out.contains("__sh_cat("), "splat not flattened:\n{out}");
+    }
+
+    #[test]
+    fn plain_words_still_do_not_splice() {
+        // a non-splat argument list keeps the cheap `vec![...]`
+        let out = render("inner() { echo \"$#\"; }\nouter() { inner a b; }\nouter\n");
+        assert!(out.contains("vec!["), "{out}");
+    }
+
+    #[test]
     fn whole_argv_fn_takes_a_slice() {
         // `f() { echo "$#:$*"; }` — no shift, so the caller's words are
         // the callee's argv verbatim: pass them as a `&[String]` param
@@ -15713,6 +15779,94 @@ mod tests {
         assert!(!out.contains("let mut used = false"), "{out}");
         assert!(!out.contains("__sh_puts"), "{out}");
         assert!(out.contains("print!(\"hi\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn function_bodies_are_runtime_free_when_redirect_free() {
+        // A function DEFINITION is not a runtime construct: the shared
+        // RuntimeFootprint verdict must recurse into function bodies, so
+        // a redirect-free program with a function keeps no sink runtime
+        // (no `__SH_OUT`/`__SH_OUTFILE_TL`, no sink-aware print helper).
+        // The function's VALUE home (`__SH_RET`) is a separate mechanism
+        // and stays.
+        let out = render("f() { local x=1; }\nf\n");
+        assert!(!out.contains("__SH_OUT"), "sink statics kept:\n{out}");
+        assert!(!out.contains("let mut used = false"), "sink tail kept:\n{out}");
+        assert!(out.contains("__SH_RET"), "the value home was dropped:\n{out}");
+        // …but a redirect INSIDE the function body keeps the runtime: the
+        // sink state is program-global, so the definition's location does
+        // not matter.
+        let redir = render("f() { echo \"in-func\" > /tmp/sh2_fn_probe.txt; }\nf\n");
+        assert!(redir.contains("__SH_OUTFILE_TL"), "{redir}");
+    }
+
+    #[test]
+    fn pure_function_body_prints_natively() {
+        // The bug this fixes: `def f(): print("in-func")` (the py
+        // frontend shape — a Function whose body holds a constant echo)
+        // used to mark the program runtime-full, so the print went
+        // through `__sh_puts` with its sink statics. The body now lowers
+        // to the host's own `print!`.
+        let out = render("f() { echo \"in-func\"; }\nf\n");
+        // …except that this SHELL source renders `f` at the top level as
+        // `echo f` (a shell-out), which legitimately needs the runtime
+        // print helper. Assert the part that is about the function body:
+        // the function itself prints natively instead of via a sink.
+        assert!(!out.contains("__sh_puts"), "{out}");
+    }
+
+    /// The py-frontend shape end to end: a `Function` whose body is a
+    /// constant `exec echo` (exactly what `def f(): print("in-func")`
+    /// lowers to), called from the top level. The body must print with a
+    /// bare `print!` — no `__sh_puts`, no sink statics — while the
+    /// function's value home is untouched.
+    #[test]
+    fn py_function_body_drops_the_sink_helper() {
+        let echo = IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str(
+                    "in-func".to_string(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )]),
+            ],
+        });
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    body: vec![echo],
+                    named_blocks: vec![],
+                },
+                // the py frontend's call shape: exec("f", [])
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("f".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_rust(&prog);
+        assert!(!out.contains("__sh_puts"), "sink helper kept:\n{out}");
+        assert!(!out.contains("__SH_OUT"), "sink statics kept:\n{out}");
+        assert!(
+            out.contains("print!("),
+            "the body did not print natively:\n{out}"
+        );
     }
 
     #[test]

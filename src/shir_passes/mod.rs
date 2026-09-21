@@ -573,6 +573,108 @@ mod tests {
         assert!(super::analysis::needs_runtime(&cap));
     }
 
+    /// A function DEFINITION is not a runtime construct: what the body
+    /// CONTAINS decides. This is the verdict that lets a redirect-free
+    /// function-bearing program emit its host language's own `print`
+    /// rather than a sink-aware helper (the reason a Python `def f():
+    /// print(...)` no longer carries `__sh_puts`/`__SH_OUT`).
+    #[test]
+    fn function_bodies_decide_the_runtime_verdict() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                var_storage: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+            }
+        }
+        fn echo_hi() -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })
+        }
+        let call = IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![]),
+            ],
+        });
+
+        // `def f(): print("hi"); f()` — a pure function body is
+        // runtime-free.
+        let pure = prog(vec![
+            IrStmt::Function {
+                name: "f".to_string(),
+                body: vec![echo_hi()],
+                named_blocks: vec![],
+            },
+            call.clone(),
+        ]);
+        assert!(
+            !super::analysis::needs_runtime(&pure),
+            "a pure function body must not mark the program runtime-full"
+        );
+
+        // …but a redirect INSIDE the function body is a runtime need
+        // (the sink state is program-global, so it does not matter that
+        // the definition itself is not executed).
+        let redirected = prog(vec![IrStmt::Function {
+            name: "f".to_string(),
+            body: vec![IrStmt::Redirect {
+                inner: vec![echo_hi()],
+                redirects: vec![],
+            }],
+            named_blocks: vec![],
+        }]);
+        assert!(
+            super::analysis::needs_runtime(&redirected),
+            "a redirect in a function body needs the runtime"
+        );
+
+        // …and a named block is part of the function.
+        let named = prog(vec![IrStmt::Function {
+            name: "f".to_string(),
+            body: vec![echo_hi()],
+            named_blocks: vec![(
+                "end".to_string(),
+                vec![IrStmt::Expr(IrExpr::Capture {
+                    expr: Box::new(IrExpr::Arrow(vec![])),
+                    native: false,
+                })],
+            )],
+        }]);
+        assert!(
+            super::analysis::needs_runtime(&named),
+            "a named block's capture needs the runtime"
+        );
+
+        // A SUB body is part of the program too.
+        let mut sub_prog = prog(vec![call]);
+        sub_prog.subs = vec![crate::ir::IrSub {
+            name: "f".to_string(),
+            params: vec![],
+            body: vec![echo_hi()],
+        }];
+        assert!(
+            !super::analysis::needs_runtime(&sub_prog),
+            "a pure sub body must not mark the program runtime-full"
+        );
+    }
+
     /// The canonical pipeline lowers a constant echo to a native Output
     /// (the EchoFold transform), so every backend sees `print`-shaped IR
     /// rather than an `exec echo` call.

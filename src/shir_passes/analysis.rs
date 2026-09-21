@@ -282,11 +282,101 @@ pub fn needs_runtime(prog: &IrProgram) -> bool {
                     stmt_needs(s, out);
                 }
             }
+            // A function DEFINITION is not itself a runtime construct:
+            // the body lowers to the host language's own function, and an
+            // unredirected `print` inside it is that language's own print.
+            // What the body CONTAINS still decides (a redirect/capture/
+            // pipeline/shell-out anywhere — in main or in any function —
+            // marks the whole program runtime-full, since the sink state
+            // is program-global). Named blocks run inside the function
+            // (PowerShell begin/process/end), so they are part of it.
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                for s in body {
+                    stmt_needs(s, out);
+                }
+                for (_, b) in named_blocks {
+                    for s in b {
+                        stmt_needs(s, out);
+                    }
+                }
+            }
+            // A literal-list array is pure DATA (`a = [1,2,3]`), the same
+            // verdict `setArray`/`setArrayAppend` calls already get: the
+            // elements are expressions, nothing is redirected.
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    expr_needs(e, out);
+                }
+            }
+            // Label/Goto are pure control flow annotations (the structured
+            // restructure pass consumes them; a survivor is a renderer
+            // concern, not a runtime one).
+            IrStmt::Label(_) | IrStmt::Goto(_) => {}
+            // try/except/else/finally: control flow over statement lists.
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    stmt_needs(s, out);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        stmt_needs(s, out);
+                    }
+                }
+                for s in else_body {
+                    stmt_needs(s, out);
+                }
+                for s in finally_body {
+                    stmt_needs(s, out);
+                }
+            }
+            // C-style for: init/cond/step/body are all plain statements
+            // and expressions.
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                for s in init {
+                    stmt_needs(s, out);
+                }
+                expr_needs(cond, out);
+                for s in step {
+                    stmt_needs(s, out);
+                }
+                for s in body {
+                    stmt_needs(s, out);
+                }
+            }
+            // `case`/`select`: a discriminant and clause bodies. (The
+            // patterns are literal/glob text, never an expression.)
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                expr_needs(discriminant, out);
+                for c in clauses {
+                    for s in &c.body {
+                        stmt_needs(s, out);
+                    }
+                }
+            }
             IrStmt::Expr(e) => expr_needs(e, out),
             IrStmt::Return(Some(e)) => expr_needs(e, out),
             IrStmt::Exit(Some(e)) => expr_needs(e, out),
             IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::Break | IrStmt::Continue => {}
-            // everything below needs the runtime
+            // everything below needs the runtime (redirects, captures,
+            // pipelines, shell-outs, subshells/background jobs, RawText,
+            // extension nodes, …)
             _ => *out = true,
         }
     }
@@ -381,6 +471,15 @@ pub fn needs_runtime(prog: &IrProgram) -> bool {
     let mut out = false;
     for s in &prog.stmts {
         stmt_needs(s, &mut out);
+    }
+    // Subroutine bodies (the A1 `subs` list — the frontend's own
+    // functions, distinct from shell `IrStmt::Function` definitions) are
+    // part of the program: what they contain decides the verdict, and a
+    // redirect-free sub must not by itself mark the program runtime-full.
+    for sub in &prog.subs {
+        for s in &sub.body {
+            stmt_needs(s, &mut out);
+        }
     }
     out
 }
