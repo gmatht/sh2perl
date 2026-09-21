@@ -1118,7 +1118,8 @@ fn render_test_tokens(text: &str) -> IrExpr {
     };
     let mut tokens: Vec<String> = crate::ir::tokenize_test(text);
     // the `[[ ... ]]` form appends a trailing `[[` marker word
-    if tokens.last().map(String::as_str) == Some("[[") {
+    let double_bracket = tokens.last().map(String::as_str) == Some("[[");
+    if double_bracket {
         tokens.pop();
     }
     // Build an IrExpr for the condition
@@ -1131,13 +1132,36 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-s" => IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs: Box::new(IrExpr::Str(format!("-s \"{}\"", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Bool(true)) },
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            "=" | "==" => IrExpr::Str(
-                crate::ir::nocase_str_eq(
-                    &crate::ir::render_test_operand(left),
-                    &crate::ir::render_test_operand(right),
-                ),
-                StrStyle::Raw,
-            ),
+            "=" | "==" => {
+                // A glob/extglob RHS (`[[ $x = @(foo|bar) ]]`) is a PATTERN
+                // match, not string equality.
+                let rhs = right.trim_matches('"').trim_matches('\'');
+                let has_glob = rhs.contains('*')
+                    || rhs.contains('?')
+                    || rhs.contains('[')
+                    || rhs.contains("@(")
+                    || rhs.contains("+(")
+                    || rhs.contains("*(")
+                    || rhs.contains("?(")
+                    || rhs.contains("!(");
+                // Globbing needs an UNQUOTED `[[ ]]` pattern: `[ ]`'s RHS is
+                // always literal, and a quoted `[[ ]]` pattern is too.
+                let rhs_quoted = text.contains(&format!("\"{right}\""))
+                    || text.contains(&format!("'{right}'"));
+                if has_glob && double_bracket && !rhs_quoted {
+                    let lhs = crate::ir::render_test_operand(left);
+                    if let Some(re) = crate::ir::glob_or_extglob_to_regex(&lhs, rhs) {
+                        return IrExpr::Str(format!("({lhs} =~ /{re}/)"), StrStyle::Raw);
+                    }
+                }
+                IrExpr::Str(
+                    crate::ir::nocase_str_eq(
+                        &crate::ir::render_test_operand(left),
+                        &crate::ir::render_test_operand(right),
+                    ),
+                    StrStyle::Raw,
+                )
+            }
             "!=" => IrExpr::Str(
                 format!(
                     "(!{})",

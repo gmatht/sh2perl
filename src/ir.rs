@@ -3333,6 +3333,47 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
     let mut out = String::new();
     let mut chars = pat.chars().peekable();
     while let Some(c) = chars.next() {
+        // extglob group: `@(a|b)`, `+(a|b)`, `*(a|b)`, `?(a|b)`.
+        if matches!(c, '@' | '+' | '*' | '?') && chars.peek() == Some(&'(') {
+            chars.next(); // consume '('
+            let mut inner = String::new();
+            let mut depth = 1;
+            while let Some(&d) = chars.peek() {
+                chars.next();
+                if d == '(' {
+                    depth += 1;
+                }
+                if d == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                inner.push(d);
+            }
+            let alts: Vec<String> = inner
+                .split('|')
+                .map(|a| glob_to_regex_greedy(a, greedy))
+                .collect();
+            let grp = format!("(?:{})", alts.join("|"));
+            match c {
+                '@' => out.push_str(&grp),
+                '+' => {
+                    out.push_str(&grp);
+                    out.push('+');
+                }
+                '*' => {
+                    out.push_str(&grp);
+                    out.push('*');
+                }
+                '?' => {
+                    out.push_str(&grp);
+                    out.push('?');
+                }
+                _ => {}
+            }
+            continue;
+        }
         match c {
             '*' => out.push_str(star),
             '?' => out.push_str("."),
@@ -6779,7 +6820,7 @@ fn render_flat_test(s: &str) -> Option<String> {
 
 /// glob → anchored regex; `!(P).S` extglob → the corpus idiom as a
 /// compound: ends-with-S and not P+S.
-fn glob_or_extglob_to_regex(lhs: &str, pat: &str) -> Option<String> {
+pub(crate) fn glob_or_extglob_to_regex(lhs: &str, pat: &str) -> Option<String> {
     let pat = pat.trim_matches('"').trim_matches('\'');
     if let Some(open) = pat.find("!(") {
         if let Some(close_rel) = pat[open + 2..].find(')') {
