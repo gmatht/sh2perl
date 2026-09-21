@@ -388,6 +388,11 @@ pub struct Render {
     /// (those need `let mut`; a read-only one must not carry the
     /// attribute — rustc flags an unused `mut`).
     local_array_mut: std::collections::HashSet<String>,
+    /// The local arrays whose literal init is ALL integers, so their
+    /// storage is `[i64; N]` regardless of whether the shared int verdict
+    /// (which requires an int *consumer*) fired. One source of truth for
+    /// the element type across init, element read, and iteration.
+    local_int_lits: std::collections::HashSet<String>,
     /// LOOP-VAR ESCAPE VERDICT (shared `analyze_loop_var_escapes`): per
     /// pre-order `For` position, whether the loop variable is read
     /// outside that loop. When not, the per-iteration write-back is
@@ -1608,6 +1613,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         std::collections::HashMap::new()
     };
     r.local_array_mut = element_written_vars(&prog, &r.const_len_arrays) .into_iter().collect();
+    r.local_int_lits = all_int_literal_arrays(&prog, &r.const_len_arrays).into_iter().collect();
     // Run the shared constant-echo lowering here too: this entry point
     // renders from IR without running `Pipeline::canonical`, so the
     // transform is applied directly (it is cheap and idempotent). A
@@ -2313,13 +2319,107 @@ impl Render {
     }
 
     /// A compile-time integer for an index expression: a literal int, a
-    /// numeric string, or a constant-folded arith tree.
+    /// numeric string, or a constant-folded arith tree (the rendered text
+    /// `(0i64 - 1i64)`). Folding here is what lets a PROVEN-constant index
+    /// collapse to a bare Rust array read (`a[2]`) — a non-constant key
+    /// still gets the negative-wrap/OOB guard. "Provably in range" is a
+    /// property of the VALUE, not of the source spelling.
     fn const_int_of(key: &str) -> Option<i64> {
-        let t = key.trim();
-        if let Ok(n) = t.parse::<i64>() {
-            return Some(n);
+        Self::eval_const_int(key.trim())
+    }
+
+    /// Evaluate a constant integer expression string. Only the shapes the
+    /// renderer itself produces for an arith tree are accepted (integer
+    /// literals with a Rust suffix, parentheses, `+ - * /`); anything
+    /// else — a variable, a method call, an overflow — yields `None`.
+    fn eval_const_int(s: &str) -> Option<i64> {
+        struct P<'a> {
+            s: &'a [u8],
+            i: usize,
         }
-        None
+        impl P<'_> {
+            fn ws(&mut self) {
+                while self.i < self.s.len() && (self.s[self.i] as char).is_whitespace() {
+                    self.i += 1;
+                }
+            }
+            fn number(&mut self) -> Option<i64> {
+                self.ws();
+                let start = self.i;
+                if self.i < self.s.len() && (self.s[self.i] == b'-' || self.s[self.i] == b'+') {
+                    self.i += 1;
+                }
+                let d0 = self.i;
+                while self.i < self.s.len() && self.s[self.i].is_ascii_digit() {
+                    self.i += 1;
+                }
+                if self.i == d0 {
+                    return None;
+                }
+                let text = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+                let n: i64 = text.parse().ok()?;
+                let rest = &self.s[self.i..];
+                for suf in [b"i64".as_slice(), b"i32", b"usize", b"isize", b"u64", b"u32"] {
+                    if rest.starts_with(suf) {
+                        self.i += suf.len();
+                        break;
+                    }
+                }
+                Some(n)
+            }
+            fn atom(&mut self) -> Option<i64> {
+                self.ws();
+                if self.i < self.s.len() && self.s[self.i] == b'(' {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    self.ws();
+                    if self.i >= self.s.len() || self.s[self.i] != b')' {
+                        return None;
+                    }
+                    self.i += 1;
+                    return Some(v);
+                }
+                let v = self.number()?;
+                self.ws();
+                // a trailing `.to_string()` / `.trim()` means not a bare constant
+                if self.s[self.i..].starts_with(b".") {
+                    return None;
+                }
+                Some(v)
+            }
+            fn expr(&mut self) -> Option<i64> {
+                let mut v = self.atom()?;
+                loop {
+                    self.ws();
+                    let op = match self.s.get(self.i) {
+                        Some(b'+') => b'+',
+                        Some(b'-') => b'-',
+                        Some(b'*') => b'*',
+                        Some(b'/') => b'/',
+                        _ => break,
+                    };
+                    self.i += 1;
+                    let r = self.atom()?;
+                    v = match op {
+                        b'+' => v.checked_add(r)?,
+                        b'-' => v.checked_sub(r)?,
+                        b'*' => v.checked_mul(r)?,
+                        b'/' => {
+                            if r == 0 {
+                                return None;
+                            }
+                            v.checked_div(r)?
+                        }
+                        _ => return None,
+                    };
+                }
+                Some(v)
+            }
+        }
+        let mut p = P { s: s.as_bytes(), i: 0 };
+        let v = p.expr()?;
+        p.ws();
+        if p.i == p.s.len() { Some(v) } else { None }
     }
 
     /// A main-scope const-length array is int-homed when the SHARED
@@ -2328,7 +2428,13 @@ impl Render {
     /// backend's `int_index_arrays` local verdict unions the shared one,
     /// so an element-read int list qualifies too).
     fn local_array_is_int(&self, name: &str) -> bool {
-        self.int_arrays.contains(name)
+        // The init literal rule (`local_array_lits`) and the shared int
+        // verdict must agree on the storage type; when the init is an
+        // all-int literal list the storage IS `[i64; N]` (the renderer
+        // emits bare ints), so such a local is int-homed even if the
+        // shared verdict (which needs an int *consumer*) did not fire —
+        // e.g. `a = [1,2,3]` only iterated (`for x in a`).
+        self.int_arrays.contains(name) || self.local_int_lits.contains(name)
     }
 
     /// The element literals of a constant-length local array.
@@ -9053,12 +9159,34 @@ impl Render {
                                 self.static_list_used.insert(n.clone());
                             }
                             let elem_g = self.gensym("__sh_w");
-                            let lits: Vec<String> =
-                                texts.iter().map(|t| Self::rust_str(t)).collect();
-                            let iter = if lits.is_empty() {
-                                "[] as [&str; 0]".to_string()
-                            } else {
-                                format!("[{}]", lits.join(", "))
+                            // LOCAL ARRAY: the array is already a plain
+                            // `let a = [T; N]` in this scope, so iterate it
+                            // directly — no duplicated literal list, and the
+                            // element type matches the storage (`i64` for an
+                            // int-homed home, `String` otherwise). A local is
+                            // a main-scope `let`, so it is in scope here.
+                            let local_iter = named
+                                .as_ref()
+                                .filter(|n| self.is_local_array(n))
+                                .map(|n| {
+                                    let m = self.ident_base(n);
+                                    if self.local_array_is_int(n) {
+                                        m
+                                    } else {
+                                        format!("{m}.iter()")
+                                    }
+                                });
+                            let iter = match local_iter {
+                                Some(it) => it,
+                                None => {
+                                    let lits: Vec<String> =
+                                        texts.iter().map(|t| Self::rust_str(t)).collect();
+                                    if lits.is_empty() {
+                                        "[] as [&str; 0]".to_string()
+                                    } else {
+                                        format!("[{}]", lits.join(", "))
+                                    }
+                                }
                             };
                             // NATIVE binding: when the loop var is only
                             // read (no own-flow write, no shadowing
@@ -15202,6 +15330,143 @@ fn element_written_vars(
     out
 }
 
+/// The `const_len_arrays` whose every init RHS is an all-integer literal
+/// list (`a = [1, 2, 3]`). Their local storage is `[i64; N]`. This is the
+/// same rule `local_array_lits` applies when it renders the `let`, lifted
+/// to a verdict so the element type is decided once (init, element read,
+/// and iteration all consult it): the shared int verdict requires an int
+/// *consumer*, so an iterated-only int list would otherwise be typed by
+/// inference in one place and by the verdict in another.
+fn all_int_literal_arrays(
+    prog: &IrProgram,
+    arrays: &std::collections::HashMap<String, usize>,
+) -> BTreeSet<String> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    #[derive(Default)]
+    struct Acc {
+        all_int: std::collections::HashSet<String>,
+        not_int: std::collections::HashSet<String>,
+    }
+
+    fn int_lit(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+            _ => false,
+        }
+    }
+
+    /// The literal element list of a write RHS (a bare Array, or the
+    /// frontend's `setArray(name, Array[…])`).
+    fn elems_of(e: &IrExpr) -> Option<&Vec<IrExpr>> {
+        match e {
+            IrExpr::Array(items) => Some(items),
+            IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                match args.get(1) {
+                    Some(IrExpr::Array(items)) => Some(items),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) if is_ident(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    fn note(acc: &mut Acc, name: &str, rhs: &IrExpr) {
+        match elems_of(rhs) {
+            Some(items) if items.iter().all(int_lit) => {
+                acc.all_int.insert(name.to_string());
+            }
+            _ => {
+                acc.not_int.insert(name.to_string());
+            }
+        }
+    }
+
+    fn walk(stmts: &[IrStmt], acc: &mut Acc) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && is_ident(&t.var) {
+                            note(acc, &t.var, expr);
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let arr = IrExpr::Array(elements.clone());
+                    note(acc, var, &arr);
+                }
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if func == "setArray" && args.len() >= 2 =>
+                {
+                    if let Some(n) = name_arg(&args[0]) {
+                        note(acc, &n, &args[1]);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, acc);
+                    for (_, b) in elsifs {
+                        walk(b, acc);
+                    }
+                    walk(else_, acc);
+                }
+                IrStmt::For { body, .. }
+                | IrStmt::ForInit { body, .. }
+                | IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, acc),
+                IrStmt::Redirect { inner, .. } => walk(inner, acc),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, acc);
+                    for e in excepts {
+                        walk(&e.body, acc);
+                    }
+                    walk(else_body, acc);
+                    walk(finally_body, acc);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, acc);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, acc);
+                    for (_, b) in named_blocks {
+                        walk(b, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut acc);
+    }
+    arrays
+        .keys()
+        .filter(|n| acc.all_int.contains(*n) && !acc.not_int.contains(*n))
+        .cloned()
+        .collect()
+}
+
 /// Vars a deferred body could observe: any var named anywhere inside a
 /// FUNCTION definition (or a `. source`-able script's own subs). A
 /// function body runs at an arbitrary point in the program (and, in
@@ -17233,6 +17498,49 @@ mod tests {
         assert!(out.contains("let a = [1, 2, 3];"), "no plain local:
 {out}");
         assert!(out.contains("std::process::exit(1)"), "guard lost:
+{out}");
+    }
+
+    /// A constant-FOLDED index (`a[1+1]` -> the renderer's `(1i64 + 1i64)`,
+    /// and a Python negative literal `a[-1]` -> `(0i64 - 1i64)`) is a
+    /// compile-time key for the const-length verdict, so it collapses to
+    /// the bare `a[2]` -- no wrap/OOB guard, no `as usize`.
+    #[test]
+    fn const_len_folded_index_collapses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"},{"type":"Str","value":"2","style":"DoubleQuoted"},{"type":"Str","value":"3","style":"DoubleQuoted"}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"key":{"type":"Arith","ast":{"type":"Bin","op":"-","lhs":{"type":"Num","value":0},"rhs":{"type":"Num","value":1}}},"type":"Index","var":"a"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("a[2]"), "folded index not collapsed:
+{out}");
+        assert!(!out.contains("std::process::exit(1)"), "guard kept:
+{out}");
+        assert!(!out.contains("as usize"), "cast kept:
+{out}");
+    }
+
+    /// `for x in a` over a const-length int array iterates the LOCAL
+    /// array itself -- not a duplicated literal list, and no `__SHV_a`
+    /// static. The `getVar("x")` a plain `print(x)` lowers to must NOT
+    /// veto the const-length verdict (a literal name is a static read,
+    /// not a dynamic one).
+    #[test]
+    fn const_len_array_iterates_locally() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","sigil":null,"indices":[]}],"expr":{"type":"Call","func":"setArray","purity":"Emulable","args":[{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"},{"type":"Str","value":"2","style":"DoubleQuoted"},{"type":"Str","value":"3","style":"DoubleQuoted"}]}]}},
+            {"type":"For","var":"x","iter":{"type":"Array","elements":[{"type":"Call","func":"param","purity":"PureCpu","args":[{"type":"Str","value":"slice","style":"DoubleQuoted"},{"type":"Str","value":"a","style":"DoubleQuoted"},{"type":"Str","value":"@","style":"DoubleQuoted"},{"type":"Str","value":"","style":"DoubleQuoted"}]}]},"body":[
+                {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}}
+            ]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
+        let out = shir_to_rust(&prog);
+        assert!(out.contains("let a = [1, 2, 3];"), "no plain local:
+{out}");
+        assert!(!out.contains("__SHV_"), "static leaked:
+{out}");
+        assert!(out.contains("for x in a "), "not iterating the local:
 {out}");
     }
 }
