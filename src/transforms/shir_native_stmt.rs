@@ -1180,13 +1180,13 @@ fn render_test_tokens(text: &str) -> IrExpr {
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
         let (op, arg) = (tokens[0].as_str(), tokens[1].as_str());
         match op {
-            "-f" => IrExpr::Str(format!("-f \"{}\"", arg), StrStyle::Raw),
-            "-d" => IrExpr::Str(format!("-d \"{}\"", arg), StrStyle::Raw),
-            "-e" => IrExpr::Str(format!("-e \"{}\"", arg), StrStyle::Raw),
-            "-s" => IrExpr::Str(format!("-s \"{}\"", arg), StrStyle::Raw),
-            "-S" => IrExpr::Str(format!("-S \"{}\"", arg), StrStyle::Raw),
-            "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
+            "-f" => IrExpr::Str(format!("-f {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-d" => IrExpr::Str(format!("-d {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-e" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-s" => IrExpr::Str(format!("-s {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-S" => IrExpr::Str(format!("-S {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
+            "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
         }
     } else if tokens.len() == 1 {

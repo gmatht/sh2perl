@@ -3897,27 +3897,79 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
 /// Convert a bash arithmetic text ("value % 2 == 0") to Perl by prefixing
 /// bare identifiers with `$` (the let / (( )) condition form).
 fn arith_text_to_perl(text: &str) -> String {
-    let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+    let chars: Vec<char> = text.chars().collect();
     let skipped = [
         "if", "else", "for", "while", "do", "and", "or", "not", "xor", "sub", "my", "local", "our",
         "defined", "undef", "int", "length", "scalar", "eq", "ne", "lt", "gt", "le", "ge", "cmp",
+        "sqrt", "abs",
     ];
-    let bytes = text.as_bytes();
-    re.replace_all(text, |caps: &regex::Captures| {
-        let w = &caps[1];
-        // A name already written as `$name`/`${name}` must not get a second
-        // `$` (`$n == 5` was becoming `$$n == 5`).
-        let start = caps.get(0).unwrap().start();
-        if start > 0 && bytes[start - 1] == b'$' {
-            return w.to_string();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // `${…}` — a parameter expansion: lower it directly (the bare-name
+        // prefixing below would corrupt `${#args[@]}` into `${#$args[@]}`).
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            let mut j = i + 2;
+            let mut depth = 1;
+            while j < chars.len() && depth > 0 {
+                if chars[j] == '{' {
+                    depth += 1;
+                }
+                if chars[j] == '}' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            let inner: String = chars[i + 2..j.saturating_sub(1)].iter().collect();
+            out.push_str(&param_inner_perl(&inner));
+            i = j;
+            continue;
         }
-        if skipped.contains(&w) {
-            w.to_string()
-        } else {
-            format!("${}", w)
+        // `$name` — already a Perl read, copy verbatim.
+        if chars[i] == '$'
+            && i + 1 < chars.len()
+            && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_')
+        {
+            out.push('$');
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
         }
-    })
-    .to_string()
+        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let w: String = chars[start..i].iter().collect();
+            if skipped.contains(&w.as_str()) {
+                out.push_str(&w);
+            } else {
+                out.push_str(&format!("${}", w));
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The Perl for a `${…}` inner text (used by the `let`-text lowering).
+fn param_inner_perl(inner: &str) -> String {
+    if let Some(rest) = inner.strip_prefix('#') {
+        if let Some(arr) = rest.strip_suffix("[@]") {
+            return format!("scalar(@{})", arr);
+        }
+        return format!("length({})", var_read(rest));
+    }
+    if let Some(rest) = inner.strip_prefix('!') {
+        let base = rest.trim_end_matches("[@]").trim_end_matches('*');
+        return format!("keys %{}", base);
+    }
+    var_read(inner)
 }
 
 /// A word as bash syntax: literals shell-quoted, captures as `$(…)`
