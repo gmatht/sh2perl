@@ -3685,15 +3685,21 @@ fn render_param(args: &[IrExpr]) -> String {
                 return format!("substr({}, {}, {})", var, raw_off, raw_len);
             }
             // `${#arr[@]}` — array LENGTH (the `#`-prefixed name with an
-            // `@` offset and no length).
+            // `@` offset and no length). A hash's `${#h[@]}` is its key
+            // count.
             if name.starts_with('#') && raw_off == "@" && raw_len.is_empty() {
-                let arr = &name[1..];
-                return format!("scalar(@{})", arr);
+                let base = &name[1..];
+                return if array_var(base) {
+                    format!("scalar(@{})", base)
+                } else {
+                    format!("scalar(keys %{})", base)
+                };
             }
             // `${!map[@]}` — HASH KEYS (the `!`-prefixed name with an `@`
-            // offset and no length).
+            // offset and no length). The `${!prefix*[@]}` prefix form
+            // carries a trailing `*`.
             if name.starts_with('!') && raw_off == "@" && raw_len.is_empty() {
-                return format!("keys %{}", &name[1..]);
+                return format!("keys %{}", name[1..].trim_end_matches('*'));
             }
             // `${arr[@]}` — all elements: a LIST in iteration contexts, but
             // a space-joined string in scalar/print contexts.  The legacy
@@ -6107,7 +6113,7 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                     // base as an array/hash — `var_is_declarable` rejects the
                     // bracketed form, so the base was never hoisted.
                     let bang = name.starts_with('!');
-                    let name = name.trim_start_matches(['!', '#']);
+                    let name = name.trim_start_matches(['!', '#']).trim_end_matches('*');
                     let (base, index) = split_indexed_var(name);
                     let sigil = if bang {
                         Sigil::Hash
