@@ -2533,6 +2533,10 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
                 *word = decoded;
             }
         }
+        // A backslash-newline continuation can leave an EMPTY word
+        // (`echo "a" \ "b"`); `echo` drops it (it joins the rest with
+        // single spaces), and an explicit empty arg is equivalent to no arg.
+        option_words.retain(|w| !w.is_empty());
         option_words
             .into_iter()
             .map(|word| IrExpr::Str(word, StrStyle::DoubleQuoted))
@@ -2566,7 +2570,7 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
                 lhs: Box::new(IrExpr::BinOp {
                     lhs: Box::new(value),
                     op: BinOpKind::Concat,
-                    rhs: Box::new(IrExpr::Str(" ".into(), StrStyle::Raw)),
+                    rhs: Box::new(IrExpr::Str(" ".into(), StrStyle::DoubleQuoted)),
                 }),
                 op: BinOpKind::Concat,
                 rhs: Box::new(word),

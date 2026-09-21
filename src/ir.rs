@@ -1348,7 +1348,7 @@ fn first_code_newline(s: &str) -> Option<usize> {
         let mut read_vars = Vec::new();
         collect_read_vars_stmts(&stmts, &mut read_vars);
         for (n, s) in read_vars {
-            if !vars.iter().any(|(vn, _)| vn == &n) {
+            if !vars.iter().any(|(vn, vs)| vn == &n && *vs == s) {
                 vars.push((n, s));
             }
         }
@@ -1905,7 +1905,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_indent(out, indent);
                         out.push_str(&format!(
                             "print({}); $main_exit_code = $CHILD_ERROR = 0;\n",
-                            render_str_literal(&body, &StrStyle::Heredoc)
+                            render_str_literal(
+                                &rewrite_heredoc_env(&body),
+                                &StrStyle::Heredoc
+                            )
                         ));
                         return;
                     }
@@ -4156,40 +4159,62 @@ const EMULATED_COMMANDS: &[&str] = &[
 fn var_exports_str(cmd: &str) -> String {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = String::new();
-    let chars: Vec<char> = cmd.chars().collect();
-    let mut i = 0;
-    let mut in_sq = false;
     let name_re = regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            in_sq = !in_sq;
-            i += 1;
+    // Heredoc bodies (e.g. an embedded `perl <<'EOF' … my $sum = 0; …`) are
+    // NOT shell text — their `$vars` are the embedded program's own.
+    let mut heredoc: Option<String> = None;
+    for line in cmd.lines() {
+        if let Some(delim) = &heredoc {
+            if line.trim() == delim {
+                heredoc = None;
+            }
             continue;
         }
-        // A `$var` inside a single-quoted shell word is LITERAL text (e.g.
-        // an embedded `perl -e '…$i…'` script) — it must not be exported
-        // (that referenced an undeclared Perl var, a strict compile error).
-        if c == '$' && !in_sq && i + 1 < chars.len() {
-            let rest: String = chars[i + 1..].iter().collect();
-            if let Some(cap) = name_re.captures(&rest) {
-                let name = cap[1].to_string();
-                i += 1 + name.len();
-                if name != "ENV"
-                    && !name.starts_with("__sh2_")
-                    && !name
-                        .chars()
-                        .next()
-                        .map(|c| c.is_ascii_uppercase())
-                        .unwrap_or(false)
-                    && seen.insert(name.clone())
-                {
-                    out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
-                }
-                continue;
+        if let Some(pos) = line.find("<<") {
+            let rest = line[pos + 2..].trim_start_matches('-').trim_start();
+            let d: String = rest
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !d.is_empty() {
+                heredoc = Some(d);
             }
         }
-        i += 1;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut in_sq = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\'' {
+                in_sq = !in_sq;
+                i += 1;
+                continue;
+            }
+            // A `$var` inside a single-quoted shell word is LITERAL text
+            // (e.g. an embedded `perl -e '…$i…'` script) — it must not be
+            // exported (that referenced an undeclared Perl var).
+            if c == '$' && !in_sq && i + 1 < chars.len() {
+                let rest: String = chars[i + 1..].iter().collect();
+                if let Some(cap) = name_re.captures(&rest) {
+                    let name = cap[1].to_string();
+                    i += 1 + name.len();
+                    if name != "ENV"
+                        && !name.starts_with("__sh2_")
+                        && !name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_uppercase())
+                            .unwrap_or(false)
+                        && seen.insert(name.clone())
+                    {
+                        out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+                    }
+                    continue;
+                }
+            }
+            i += 1;
+        }
     }
     out
 }
@@ -4750,6 +4775,13 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
 /// The body of a verified `cat <<'EOF' … EOF` (cat with no args, exactly
 /// one stdin heredoc redirect with a literal body). Shape check only — the
 /// native emission lives in the pipeline_native cat capability.
+/// Rewrite env-style `$NAME`/`${NAME}` in an interpolated heredoc body to
+/// `$ENV{NAME}` (the assignment rendered those names as `%ENV{…}`).
+fn rewrite_heredoc_env(s: &str) -> String {
+    let re = regex::Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
+    re.replace_all(s, "$$ENV{$1}").to_string()
+}
+
 fn cat_heredoc_body(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else { return None };
     if func != "exec" {
@@ -6137,7 +6169,9 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                         Sigil::Scalar
                     };
                     let base = base.replace('.', "_").replace('-', "_");
-                    if var_is_declarable(&base) && !out.iter().any(|(n, _)| n == &base) {
+                    if var_is_declarable(&base)
+                        && !out.iter().any(|(n, s)| n == &base && *s == sigil)
+                    {
                         out.push((base, sigil));
                     }
                 }
@@ -6552,6 +6586,13 @@ fn render_test_expr(s: &str) -> String {
 /// A `[[ ]]`-flavored operand: strip quotes, `$var` → read, else literal.
 fn flat_operand(s: &str) -> String {
     let t = s.trim().trim_matches('"').trim_matches('\'');
+    // `${…}` — delegate to the parameter-expansion renderer
+    // (`"${arr[@]}"` was emitted verbatim, an invalid Perl interpolation).
+    if t.starts_with("${") && t.ends_with('}') {
+        if let Some(p) = param_text_to_perl(t) {
+            return p;
+        }
+    }
     if t == "~" {
         return "$ENV{HOME}".to_string();
     }
@@ -6960,6 +7001,10 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
     let name: String = chars[..i].iter().collect();
     let rest: String = chars[i..].iter().collect();
     if rest.is_empty() {
+        // `"${arr[@]}"` — all elements, joined by spaces in scalar context.
+        if let Some(base) = name.strip_suffix("[@]").or_else(|| name.strip_suffix("[*]")) {
+            return Some(format!("join(' ', @{})", base));
+        }
         return Some(var_read(&name));
     }
     for op in [":-", ":+", ":=", ":?", "##", "%%", "//", "#", "%", "-", "+", "=", "?", "/"] {
@@ -6976,6 +7021,13 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
 }
 
 pub(crate) fn render_test_operand(tok: &str) -> String {
+    // Strip surrounding source quotes (`"${arr[@]}"` arrives with them).
+    let tok = tok.trim();
+    let tok = if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
+        &tok[1..tok.len() - 1]
+    } else {
+        tok
+    };
     // `${…}` parameter expansion inside a test operand.
     if tok.starts_with("${") && tok.ends_with('}') {
         if let Some(p) = param_text_to_perl(tok) {
