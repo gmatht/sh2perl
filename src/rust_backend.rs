@@ -72,7 +72,11 @@ enum Part {
 /// read only numerically (then `i64`, parsed once at the call).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FnParamTy {
+    /// an owned `String` parameter (the body retains the value)
     Str,
+    /// a borrowed `&str` parameter (the body only ever borrows it —
+    /// `FnSig::borrow`, from the shared `shir::analyze_param_use`)
+    StrRef,
     Num,
 }
 
@@ -96,6 +100,44 @@ struct FnSig {
     /// `$#` is `args.len()`, `$@`/`$*` are `args`. Mutually exclusive with
     /// `rest`.
     argv: bool,
+    /// Per-parameter BORROW verdict (the shared `shir::analyze_param_use`):
+    /// `true` when the body only ever borrows the parameter, so the
+    /// signature takes `&str` and the caller passes a borrow. Only
+    /// meaningful for `FnParamTy::Str` params (a numeric param is already a
+    /// Copy `i64`); `false` = hand over an owned `String`.
+    borrow: Vec<bool>,
+}
+
+impl FnSig {
+    /// Is parameter `i` a borrowed `&str` (the shared borrow verdict, and
+    /// only meaningful for a Str param — a Num param is a Copy i64)?
+    fn param_is_borrowed(&self, i: usize) -> bool {
+        self.tys.get(i) == Some(&FnParamTy::Str)
+            && self.borrow.get(i).copied().unwrap_or(false)
+    }
+}
+
+/// Render a word for a BORROWED (`&str`) parameter. The word is a Rust
+/// expression producing a `String`; a `&str` parameter wants a borrow of
+/// it. Two shapes avoid a pointless temporary:
+///
+///   * `<literal>.to_string()` → the literal itself (`"hello"` is already
+///     a `&'static str`, so `f("hello")` — no allocation, no borrow of a
+///     temporary);
+///   * anything else → `&(expr)`, a borrow of the word. The temporary
+///     lives to the end of the enclosing statement, which is exactly the
+///     call the borrow is for (the callee may not store it — that is what
+///     the borrow verdict guarantees).
+fn borrow_word(w: &str) -> String {
+    let t = w.trim();
+    if let Some(base) = t.strip_suffix(".to_string()") {
+        let base = base.trim();
+        // a plain string literal (never an index/call/arith result)
+        if base.len() >= 2 && base.starts_with('"') && base.ends_with('"') {
+            return base.to_string();
+        }
+    }
+    format!("&{}", Render::unparen(w))
 }
 
 /// Pass-3 probe record for one function-body render (legacy convention;
@@ -1809,6 +1851,11 @@ impl Render {
         } else {
             format!("_p{i}")
         };
+        // a borrowed `&str` param reads as the borrow itself (no clone);
+        // an owned `String` param is cloned so the caller keeps its value
+        if sig.tys[i] == FnParamTy::Str && sig.borrow.get(i).copied().unwrap_or(false) {
+            return Some((base, FnParamTy::StrRef));
+        }
         Some((base, sig.tys[i]))
     }
 
@@ -2233,7 +2280,7 @@ impl Render {
             self.probe_num(ci);
             match self.fn_param(ci) {
                 Some((b, FnParamTy::Num)) => return b,
-                Some((b, FnParamTy::Str)) => {
+                Some((b, FnParamTy::Str)) | Some((b, FnParamTy::StrRef)) => {
                     return format!("{b}.trim().parse::<i64>().unwrap_or(0)")
                 }
                 None => {}
@@ -2269,6 +2316,10 @@ impl Render {
             self.probe_str(ci);
             match self.fn_param(ci) {
                 Some((b, FnParamTy::Str)) => return format!("{b}.clone()"),
+                // a `&str` param IS the borrow — every context the
+                // analysis allowed only borrows it (a store would have
+                // made the param owned), so hand it over bare
+                Some((b, FnParamTy::StrRef)) => return b,
                 // numeric param read as string: impossible (the probe
                 // forces Str on any string read) — canonical form keeps
                 // the value correct if it ever fires
@@ -2675,6 +2726,7 @@ impl Render {
                     self.probe_str(ci);
                     match self.fn_param(ci) {
                         Some((b, FnParamTy::Str)) => format!("{b}.clone()"),
+                        Some((b, FnParamTy::StrRef)) => b,
                         Some((b, FnParamTy::Num)) => format!("{b}.to_string()"),
                         None => format!("__sh_arg({ci})"),
                     }
@@ -2722,7 +2774,7 @@ impl Render {
                     self.probe_num(ci);
                     match self.fn_param(ci) {
                         Some((b, FnParamTy::Num)) => b,
-                        Some((b, FnParamTy::Str)) => {
+                        Some((b, FnParamTy::Str)) | Some((b, FnParamTy::StrRef)) => {
                             format!("{b}.trim().parse::<i64>().unwrap_or(0)")
                         }
                         None => {
@@ -3642,7 +3694,9 @@ impl Render {
                         // a string param parses on demand (its uses
                         // aren't cached) — via getvar_num so the probe
                         // records the numeric read too
-                        Some((_, FnParamTy::Str)) => self.getvar_num(name),
+                        Some((_, FnParamTy::Str)) | Some((_, FnParamTy::StrRef)) => {
+                            self.getvar_num(name)
+                        }
                         None => format!("__pn_{name}"),
                     }
                 } else {
@@ -5030,7 +5084,8 @@ impl Render {
                         let cj = self.shifted_param(j).unwrap_or(j);
                         self.probe_str(cj);
                         match self.fn_param(cj) {
-                            Some((b, FnParamTy::Str)) => {
+                            Some((b, FnParamTy::Str))
+                            | Some((b, FnParamTy::StrRef)) => {
                                 format!("{b}.trim().is_empty()")
                             }
                             // a guard on a numeric param is impossible
@@ -5104,7 +5159,7 @@ impl Render {
         let mut out: Vec<String> = Vec::new();
         let mut splat = false;
         for w in items {
-            if std::env::var("SH2_NO_SPLAT").is_err() && Self::is_splat_word(w) {
+            if Self::is_splat_word(w) {
                 // a splat: `words_expr` returns a `Vec<String>` (the
                 // array's elements / the positionals) — many words
                 out.push(self.words_expr(w));
@@ -6803,13 +6858,24 @@ impl Render {
                 let args: Vec<String> = words
                     .iter()
                     .enumerate()
-                    .map(|(i, w)| match sig.tys[i] {
-                        // the param is String: hand over the rendered word
-                        FnParamTy::Str => (*w).to_string(),
-                        // the param is i64: the word is a String expr — the
-                        // callee's signature forces a parse at the boundary
-                        FnParamTy::Num => {
-                            format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                    .map(|(i, w)| {
+                        // the BORROW verdict (a separate axis from the
+                        // type): a borrowed `&str` param takes the word by
+                        // reference — the temporary lives to the end of the
+                        // call statement, which is all the callee may use
+                        // it for
+                        if sig.param_is_borrowed(i) {
+                            return borrow_word(w);
+                        }
+                        match sig.tys[i] {
+                            // the param is String: hand over the rendered word
+                            FnParamTy::Str => (*w).to_string(),
+                            FnParamTy::StrRef => borrow_word(w),
+                            // the param is i64: the word is a String expr — the
+                            // callee's signature forces a parse at the boundary
+                            FnParamTy::Num => {
+                                format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                            }
                         }
                     })
                     .collect();
@@ -6848,17 +6914,26 @@ impl Render {
         // DIRECT-ARGS path (see fn_call_value): a fixed-arity signature
         // with no rest/argv param takes one word per parameter, so the
         // `Vec<String>` assembly + `__a.get(i)…` unpack is a pure round
-        // trip.
+        // trip. `cat` is irrelevant here: the path requires every word to
+        // be a SINGLE-element vec, and `__sh_cat` only exists to flatten a
+        // splat (a runtime-sized `Vec<String>` word), which this path
+        // rejects.
         let direct = if sig.rest.is_none() && !sig.argv && ws.len() == sig.arity {
             let words: Option<Vec<&str>> = ws.iter().map(|w| Self::vec_of_one(w)).collect();
             words.map(|words| {
                 words
                     .iter()
                     .enumerate()
-                    .map(|(i, w)| match sig.tys[i] {
-                        FnParamTy::Str => (*w).to_string(),
-                        FnParamTy::Num => {
-                            format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                    .map(|(i, w)| {
+                        if sig.param_is_borrowed(i) {
+                            return borrow_word(w);
+                        }
+                        match sig.tys[i] {
+                            FnParamTy::Str => (*w).to_string(),
+                            FnParamTy::StrRef => borrow_word(w),
+                            FnParamTy::Num => {
+                                format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                            }
                         }
                     })
                     .collect::<Vec<_>>()
@@ -6900,11 +6975,22 @@ impl Render {
     /// trailing `&[String]` slice — `__a` holds the caller words.
     fn fn_call_args(sig: &FnSig) -> String {
         let mut args: Vec<String> = (0..sig.arity)
-            .map(|i| match sig.tys[i] {
-                FnParamTy::Str => format!("__a.get({i}).cloned().unwrap_or_default()"),
-                FnParamTy::Num => format!(
-                    "__a.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
-                ),
+            .map(|i| {
+                // `&str` param: borrow the assembled word (`""` when the
+                // caller passed nothing — the default an absent positional
+                // has at the call boundary)
+                if sig.param_is_borrowed(i) {
+                    return format!("__a.get({i}).map(|s| s.as_str()).unwrap_or(\"\")");
+                }
+                match sig.tys[i] {
+                    FnParamTy::Str => format!("__a.get({i}).cloned().unwrap_or_default()"),
+                    FnParamTy::StrRef => {
+                        format!("__a.get({i}).map(|s| s.as_str()).unwrap_or(\"\")")
+                    }
+                    FnParamTy::Num => format!(
+                        "__a.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
+                    ),
+                }
             })
             .collect();
         if let Some(off) = sig.rest {
@@ -9321,6 +9407,22 @@ impl Render {
             collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            if stmts_have_huge(&prog.stmts) { collect_all_assign_targets(&prog.stmts, &mut big); }            self.bigint_vars = big;
         }
 
+        // SHARED PARAMETER-BORROW VERDICT (shir::analyze_param_use): the
+        // functions whose parameters are only ever borrowed. A `&str`
+        // signature (and a borrowed call-site argument) is emitted for
+        // those — see FnSig::borrow.
+        let param_borrow: HashMap<String, Vec<bool>> = crate::shir::analyze_param_use(prog)
+            .into_iter()
+            .map(|(n, uses)| {
+                (
+                    n,
+                    uses.into_iter()
+                        .map(|u| u == crate::shir::ParamUse::Borrow)
+                        .collect(),
+                )
+            })
+            .collect();
+
         // Pass 3a: probe every function body (positional reads + wildness)
         // BEFORE rendering main, so main's call sites already know the
         // signatures. The probe renders with the legacy argv convention
@@ -9437,6 +9539,15 @@ impl Render {
                         // here (checked above), so the reads were served
                         // from the argv param during the probe.
                         argv: probe.argv_read,
+                        // the shared borrow verdict, per parameter. Only
+                        // consulted when the rewrite that would re-index
+                        // the positionals is INACTIVE (a shift/argv
+                        // rewrite changes which caller word a param is).
+                        borrow: if probe.saw_shift || probe.argv_read {
+                            vec![false; arity]
+                        } else {
+                            param_borrow.get(name).cloned().unwrap_or_default()
+                        },
                     },
                 );
             }
@@ -9569,7 +9680,15 @@ impl Render {
                         } else {
                             format!("_p{i}")
                         };
-                        let ty = if s.tys[i] == FnParamTy::Num { "i64" } else { "String" };
+                        // a param the body only BORROWS takes `&str` (the
+                        // shared verdict); a numeric param is a Copy i64
+                        let ty = if s.tys[i] == FnParamTy::Num {
+                            "i64"
+                        } else if s.borrow.get(i).copied().unwrap_or(false) {
+                            "&str"
+                        } else {
+                            "String"
+                        };
                         format!("{pn}: {ty}")
                     })
                     .collect();
@@ -16385,6 +16504,53 @@ mod tests {
         assert!(!out.contains("let __a: Vec<String>"), "{out}");
         assert!(!out.contains("__SH_ARGV"), "argv machinery kept:\n{out}");
         assert!(!out.contains("fn __sh_arg"), "arg helper kept:\n{out}");
+    }
+
+    /// A parameter the body only BORROWS takes `&str` (the shared
+    /// `shir::analyze_param_use` verdict), the caller passes a borrow, and
+    /// a literal is passed WITHOUT the `.to_string()` allocation the owned
+    /// form needed. This is the idiomatic shape the analysis buys.
+    #[test]
+    fn borrowed_params_take_str() {
+        // `test -n "$1"` reads the parameter only to test it — a pure
+        // borrow (an `echo "$1"` body would be the echo-RETURN shape,
+        // which hands the value back to the caller and so stays owned).
+        let out = render("f() { test -n \"$1\"; }\nf hello\n");
+        assert!(out.contains("fn f(p0: &str)"), "no &str param:\n{out}");
+        assert!(!out.contains("p0.clone()"), "param cloned:\n{out}");
+        assert!(!out.contains("p0.to_string()"), "param stringified:\n{out}");
+        // the literal is passed directly: no `.to_string()` allocation and
+        // no borrow of a temporary
+        assert!(out.contains("f(\"hello\")"), "literal not passed:\n{out}");
+        assert!(
+            !out.contains("\"hello\".to_string()"),
+            "pointless allocation kept:\n{out}"
+        );
+    }
+
+    /// A parameter the body STORES stays owned — the caller must hand over
+    /// a `String` (a `&str` here would not compile: the callee keeps it).
+    #[test]
+    fn stored_params_stay_owned() {
+        let out = render("f() { local x=\"$1\"; echo \"$x\"; }\nf hi\n");
+        assert!(out.contains("fn f(p0: String)"), "param not owned:\n{out}");
+        assert!(out.contains("\"hi\".to_string()"), "value not owned:\n{out}");
+    }
+
+    /// Unanalysable bodies (an opaque `eval`, a positional rebind, an
+    /// ambiguous redefinition) keep every parameter owned.
+    #[test]
+    fn unanalysable_bodies_stay_owned() {
+        for src in [
+            "f() { eval \"echo $1\"; }\nf hi\n",
+            "f() { set -- a b; test -n \"$1\"; }\nf hi\n",
+        ] {
+            let out = render(src);
+            assert!(
+                !out.contains("p0: &str"),
+                "unanalysable body got a borrow ({src}):\n{out}"
+            );
+        }
     }
 
     /// A function called only for its side effect returns `()`: no

@@ -11839,6 +11839,586 @@ pub fn analyze_loop_var_escapes(prog: &IrProgram) -> HashMap<usize, bool> {
 // A function with no `shift` at all maps to 0 (callers may pass position
 // 0..n directly). Anything else is ABSENT from the map (conservative:
 // the legacy argv save/restore dance stays).
+/// How a function PARAMETER is consumed in its body — the licence for a
+/// borrowed (`&str`) parameter in the ownership-model backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamUse {
+    /// The parameter is only ever BORROWED: printed, interpolated,
+    /// compared, tested, parsed, hashed — every consumer needs only
+    /// `&str`. A borrow-typed parameter (`p: &str`) serves all of them, so
+    /// the caller need not hand over ownership (no `to_string()`).
+    Borrow,
+    /// The parameter (or a value derived from it) is STORED: assigned into
+    /// a variable, pushed into an owned collection, returned, or captured
+    /// into a closure that outlives the call. The callee keeps the value,
+    /// so the caller must hand over an owned `String`.
+    Own,
+}
+
+/// Per-function, per-parameter consumption verdict — see [`ParamUse`].
+///
+/// Keyed by function name → a `Vec` indexed by parameter (0-based, the
+/// shell `$1` is index 0). A function that is not in the map has no
+/// established verdict: its parameters must stay owned (the conservative
+/// default — see the ambiguity rules below).
+///
+/// WHY THIS IS A CORE ANALYSIS: every ownership-model backend (Rust's
+/// `String` vs `&str`, C++'s `std::string` vs `std::string_view`, Zig's
+/// `[]u8` vs `[]const u8`, …) pays the same avoidable copy at the call
+/// boundary. The decision is a property of the SOURCE program — how the
+/// callee uses the value — not of any one renderer, so it belongs here and
+/// is consumed by each backend that can express a borrow.
+///
+/// Deliberately conservative, because a wrong `Borrow` is a miscompile
+/// (the callee would store a reference that dies with the call frame):
+///   * the body must be a SINGLE unambiguous definition (a redefinition
+///     marks the name ambiguous);
+///   * positionals must not be REBOUND in the body (`set --`, `shift`) —
+///     the parameter then no longer identifies one caller word;
+///   * any construct the walk cannot classify (`eval`, `source`, a
+///     shell-out whose command text contains the positional, an unknown
+///     `ext`/method node) marks EVERY parameter owned;
+///   * a nested-function definition inside the body marks the parameters
+///     it could capture owned (the nested body may run after the call).
+pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+    use std::collections::HashSet;
+
+    struct Acc {
+        /// parameter index -> usage (grows as reads are seen)
+        uses: Vec<ParamUse>,
+        /// the body rebinds the positional list (`set --` / `shift`) or
+        /// does something opaque — no verdict at all
+        veto: bool,
+        /// the body reads `$@`/`$*`/`$#` (a whole-argv read: not a single
+        /// parameter, but it makes the parameter model unsafe with a
+        /// rebinding — the shift verdict owns that case)
+        wild: bool,
+    }
+
+    /// The positional index of a `$N` read, if this expression is one.
+    fn positional_index(e: &IrExpr) -> Option<usize> {
+        let name = match e {
+            IrExpr::Var(n, _) => n.as_str(),
+            IrExpr::Str(n, _) => n.trim(),
+            IrExpr::Call { func, args } if func == "getVar" || func == "param" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => n.trim(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // `$0` is the script name, not a parameter
+        let n: usize = name.parse().ok()?;
+        (n >= 1).then(|| n - 1)
+    }
+
+    /// Does this expression CONTAIN a positional read (any position)?
+    fn mentions_positional(e: &IrExpr) -> bool {
+        let mut hit = false;
+        walk_expr_generic(e, &mut |x| {
+            if positional_index(x).is_some() {
+                hit = true;
+            }
+        });
+        hit
+    }
+
+    /// A generic expression walker used only by `mentions_positional`.
+    fn walk_expr_generic(e: &IrExpr, f: &mut impl FnMut(&IrExpr)) {
+        f(e);
+        match e {
+            IrExpr::Index { key, .. } => walk_expr_generic(key, f),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr_generic(lhs, f);
+                walk_expr_generic(rhs, f);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr_generic(cond, f);
+                walk_expr_generic(then, f);
+                walk_expr_generic(else_, f);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr_generic(expr, f);
+                walk_expr_generic(default, f);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_generic(x, f);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr_generic(i, f);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr_generic(a, f);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr_generic(obj, f);
+                for a in args {
+                    walk_expr_generic(a, f);
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr_generic(expr, f),
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    if let IrStmt::Expr(x) = s {
+                        walk_expr_generic(x, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    impl Acc {
+        fn mark(&mut self, i: usize, u: ParamUse) {
+            if self.uses.len() <= i {
+                self.uses.resize(i + 1, ParamUse::Borrow);
+            }
+            if u == ParamUse::Own {
+                self.uses[i] = ParamUse::Own;
+            }
+        }
+        /// Every positional mentioned in `e` is consumed by value.
+        fn mark_owned_in(&mut self, e: &IrExpr) {
+            let mut hits: Vec<usize> = Vec::new();
+            walk_expr_generic(e, &mut |x| {
+                if let Some(i) = positional_index(x) {
+                    hits.push(i);
+                }
+            });
+            for i in hits {
+                self.mark(i, ParamUse::Own);
+            }
+        }
+        /// Every positional mentioned in `e` is merely borrowed.
+        fn mark_borrowed_in(&mut self, e: &IrExpr) {
+            let mut hits: Vec<usize> = Vec::new();
+            walk_expr_generic(e, &mut |x| {
+                if let Some(i) = positional_index(x) {
+                    hits.push(i);
+                }
+            });
+            for i in hits {
+                self.mark(i, ParamUse::Borrow);
+            }
+        }
+    }
+
+    /// Walk a statement list. `owned_ctx` is true where the value's storage
+    /// is RETAINED past the expression (assignment RHS, collection store,
+    /// return value, a closure the callee keeps).
+    fn walk_stmts(stmts: &[IrStmt], acc: &mut Acc) {
+        for s in stmts {
+            walk_stmt(s, acc);
+        }
+    }
+
+    fn walk_stmt(s: &IrStmt, acc: &mut Acc) {
+        match s {
+            // STORING a positional (or anything derived from one) retains
+            // the value: `local x="$1"`, `arr=("$1")`, `x=$1`.
+            IrStmt::Assign { expr, .. } => acc.mark_owned_in(expr),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    acc.mark_owned_in(i);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    acc.mark_owned_in(e);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                acc.mark_owned_in(path);
+                acc.mark_owned_in(content);
+            }
+            // A `return "$1"` hands the value to the CALLER — retained.
+            IrStmt::Return(Some(e)) => acc.mark_owned_in(e),
+            // An output is a borrow: the print consumes the text.
+            IrStmt::Output { value, .. } => acc.mark_borrowed_in(value),
+            // A plain expression statement. `builtin`/`exec` carries the
+            // DECL/WRITE words (`local x="$1"`, `declare -a`, `export
+            // X="$1"`, `read x`) whose value is RETAINED in a variable —
+            // those must mark the positional owned, not borrowed.
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if matches!(func.as_str(), "builtin" | "exec") =>
+            {
+                // the command HEAD name: `builtin("eval", [...])`
+                let head = match args.first() {
+                    Some(IrExpr::Str(h, _)) => h.as_str(),
+                    _ => "",
+                };
+                // `eval`/`source`/`.` build a command string interpreted
+                // later; `set --`/`shift` rebind the positionals. None of
+                // these can be analysed from the IR — veto the function so
+                // every parameter stays owned.
+                if matches!(head, "eval" | "source" | "." | "set" | "shift") {
+                    acc.veto = true;
+                    return;
+                }
+                let retains = matches!(
+                    head,
+                    "local" | "declare" | "typeset" | "export" | "readonly"
+                        | "read" | "mapfile" | "readarray"
+                );
+                for a in args.iter().skip(1) {
+                    if retains {
+                        // a decl word `name=` (its VALUE word follows) or a
+                        // `name=value` literal: the assignment stores into
+                        // the variable, so the value is retained
+                        acc.mark_owned_in(a);
+                        // `local x=` + a separate value word: the word after
+                        // an empty `name=` is the stored value
+                        if let IrExpr::Str(n, _) = a {
+                            if n.ends_with('=') {
+                                // the FOLLOWING array element is the value
+                                // (handled by the flat mark above for the
+                                // `name=value` form; an empty `name=` is
+                                // followed by the value word in the same
+                                // array, which the mark above already covers
+                                // because the whole array is walked)
+                                let _ = n;
+                            }
+                        }
+                    } else {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+                // a non-decl `exec`/`builtin` (echo, printf, test, …)
+                // borrows its words
+                if !retains {
+                    for a in args.iter().skip(1) {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr_borrowed(e, acc),
+            // conditions/iterables: borrowed (compared, tested, iterated)
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                acc.mark_borrowed_in(cond);
+                walk_stmts(then, acc);
+                for (c, b) in elsifs {
+                    acc.mark_borrowed_in(c);
+                    walk_stmts(b, acc);
+                }
+                walk_stmts(else_, acc);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                acc.mark_borrowed_in(cond);
+                walk_stmts(body, acc);
+            }
+            IrStmt::For { iter, body, .. } => {
+                acc.mark_borrowed_in(iter);
+                walk_stmts(body, acc);
+            }
+            IrStmt::ForInit {
+                init, cond, step, body,
+            } => {
+                walk_stmts(init, acc);
+                acc.mark_borrowed_in(cond);
+                walk_stmts(step, acc);
+                walk_stmts(body, acc);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => walk_stmts(b, acc),
+            IrStmt::Background(b) => {
+                // a background body may outlive the call frame
+                for st in b {
+                    match st {
+                        IrStmt::Assign { expr, .. } => acc.mark_owned_in(expr),
+                        _ => walk_stmt(st, acc),
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    acc.mark_owned_in(&r.target);
+                }
+                walk_stmts(inner, acc);
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                acc.mark_borrowed_in(discriminant);
+                for c in clauses {
+                    walk_stmts(&c.body, acc);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                walk_stmts(body, acc);
+                for e in excepts {
+                    walk_stmts(&e.body, acc);
+                }
+                walk_stmts(else_body, acc);
+                walk_stmts(finally_body, acc);
+            }
+            // A nested function definition may be called AFTER this frame
+            // returns — anything it mentions is retained.
+            IrStmt::Function { body, named_blocks, .. } => {
+                for st in body.iter().chain(named_blocks.iter().flat_map(|(_, b)| b.iter())) {
+                    if let IrStmt::Expr(e) = st {
+                        acc.mark_owned_in(e);
+                    } else if let IrStmt::Assign { expr, .. } = st {
+                        acc.mark_owned_in(expr);
+                    }
+                }
+                acc.veto = true;
+            }
+            IrStmt::Exit(Some(e)) => acc.mark_owned_in(e),
+            IrStmt::Exit(None) | IrStmt::Return(None) | IrStmt::Break | IrStmt::Continue => {}
+            // `$@`/`$*`/`$#`: a whole-argv read
+            IrStmt::Exec { cmd, args, .. } => {
+                walk_exec(cmd, args, acc);
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_stmts(st, acc);
+                }
+            }
+            IrStmt::RawText(_) | IrStmt::Ext(_) => {
+                // opaque: we cannot see what the text does with argv
+                acc.veto = true;
+            }
+            // `die`/`warn` build a message from their expression (the
+            // value is consumed to build the text — a borrow, but the
+            // node is rare enough that the conservative answer is fine)
+            IrStmt::Die { .. } | IrStmt::Warn { .. } => acc.veto = true,
+            IrStmt::Label(_)
+            | IrStmt::Goto(_)
+            | IrStmt::Require(_)
+            | IrStmt::SetChildError(_)
+            | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. }
+            | IrStmt::Select { .. } => acc.veto = true,
+            _ => acc.veto = true,
+        }
+    }
+
+    /// A command: the positional in an ARGUMENT position is borrowed (the
+    /// child reads it), but `eval`/`source`, a write builtin, and anything
+    /// opaque retain it.
+    fn walk_exec(cmd: &IrExpr, args: &[IrExpr], acc: &mut Acc) {
+        let head = match cmd {
+            IrExpr::Str(h, _) => h.as_str(),
+            _ => {
+                acc.veto = true;
+                return;
+            }
+        };
+        // `eval`/`source`/`.` build a command STRING that is interpreted
+        // later — whether the positional is retained is not visible in the
+        // IR, so no verdict is safe: veto the whole function rather than
+        // guess (a wrong `Borrow` would hand the callee a reference that
+        // dies with the call frame).
+        if matches!(head, "eval" | "source" | ".") {
+            acc.veto = true;
+            return;
+        }
+        let opaque = matches!(head, "trap" | "alias" | "export" | "readonly");
+        // `shift` / `set --` rebind the positionals
+        if head == "shift" {
+            acc.veto = true;
+            return;
+        }
+        // a write builtin (`printf -v x`, `read x`, `mapfile`) stores
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) if s == "-v" => {
+                    acc.veto = true;
+                    return;
+                }
+                IrExpr::Str(s, _) if s.starts_with('=') || s.contains('=') => {
+                    // a VAR=value word — the value is retained
+                    acc.mark_owned_in(a);
+                }
+                _ => {}
+            }
+        }
+        if head == "set" {
+            acc.veto = true;
+            return;
+        }
+        if head == "read" || head == "mapfile" || head == "readarray" {
+            acc.veto = true;
+            return;
+        }
+        for a in args {
+            if opaque {
+                acc.mark_owned_in(a);
+            } else {
+                acc.mark_borrowed_in(a);
+            }
+        }
+    }
+
+    /// An expression in a position whose value is consumed by the very
+    /// next operation (a print argument, a test operand, a command word).
+    /// A bare positional is a BORROW; a positional inside a CALL that
+    /// produces a new value is still a borrow of the input.
+    fn walk_expr_borrowed(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            // `capture`/`pipeline` bodies run in a CHILD — the value is
+            // copied at the boundary, so it is borrowed
+            IrExpr::Capture { expr, .. } => match &**expr {
+                IrExpr::Arrow(body) => walk_stmts(body, acc),
+                other => walk_expr_borrowed(other, acc),
+            },
+            IrExpr::Arrow(body) => walk_stmts(body, acc),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr_borrowed(lhs, acc);
+                walk_expr_borrowed(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr_borrowed(cond, acc);
+                walk_expr_borrowed(then, acc);
+                walk_expr_borrowed(else_, acc);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr_borrowed(expr, acc);
+                walk_expr_borrowed(default, acc);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_borrowed(x, acc);
+                    }
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr_borrowed(key, acc),
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr_borrowed(i, acc);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr_borrowed(obj, acc);
+                for a in args {
+                    walk_expr_borrowed(a, acc);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // `setVar`/`setArray` RETAIN; `getVar`/`param`/`test`/…
+                // borrow
+                let retains = matches!(
+                    func.as_str(),
+                    "setVar" | "setArray" | "setArrayAppend" | "listVar"
+                );
+                for a in args {
+                    if retains {
+                        acc.mark_owned_in(a);
+                    } else {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+            }
+            IrExpr::Str(..) | IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Var(..) => {
+                acc.mark_borrowed_in(e)
+            }
+            _ => acc.mark_owned_in(e),
+        }
+    }
+
+    // ── driver: one verdict per unambiguous function definition ────────
+    let mut defs: HashMap<String, &Vec<IrStmt>> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    fn collect<'a>(
+        stmts: &'a [IrStmt],
+        defs: &mut HashMap<String, &'a Vec<IrStmt>>,
+        ambiguous: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Function { name, body, named_blocks } => {
+                    if defs.insert(name.clone(), body).is_some() {
+                        ambiguous.insert(name.clone());
+                    }
+                    for (_, b) in named_blocks {
+                        collect(b, defs, ambiguous);
+                    }
+                    collect(body, defs, ambiguous);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::Redirect { inner: b, .. } => collect(b, defs, ambiguous),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, defs, ambiguous);
+                    for (_, b) in elsifs {
+                        collect(b, defs, ambiguous);
+                    }
+                    collect(else_, defs, ambiguous);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, defs, ambiguous);
+                    collect(step, defs, ambiguous);
+                    collect(body, defs, ambiguous);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, defs, ambiguous);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &mut defs, &mut ambiguous);
+    for sub in &prog.subs {
+        // a sub is not a shell function; a name collision makes callers
+        // ambiguous
+        if defs.contains_key(&sub.name) {
+            ambiguous.insert(sub.name.clone());
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (name, body) in defs {
+        if ambiguous.contains(&name) {
+            continue;
+        }
+        let mut acc = Acc {
+            uses: Vec::new(),
+            veto: false,
+            wild: false,
+        };
+        walk_stmts(body, &mut acc);
+        // A body that rebinds the positionals, or that we could not fully
+        // classify, keeps every parameter owned.
+        if acc.veto || acc.wild {
+            continue;
+        }
+        // A parameter the body never mentions is a borrow (nothing to
+        // retain).
+        out.insert(name, acc.uses);
+    }
+    out
+}
+
 pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
     use crate::ir::{IrExpr, IrStmt};
 
@@ -56001,6 +56581,96 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod param_use_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn use_of(src: &str, name: &str, i: usize) -> Option<ParamUse> {
+        analyze_param_use(&prog_of(src))
+            .get(name)
+            .and_then(|v| v.get(i).copied())
+    }
+
+    /// A parameter the body only BORROWS (printed, tested, formatted) can
+    /// be a `&str` in an ownership-model backend.
+    #[test]
+    fn borrowed_params() {
+        assert_eq!(
+            use_of("f() { echo \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+        assert_eq!(
+            use_of("f() { test -n \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+        assert_eq!(
+            use_of("f() { printf \"%s\" \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+    }
+
+    /// A parameter the body STORES (or returns) is retained: the caller
+    /// must hand over an owned value.
+    #[test]
+    fn owned_params() {
+        // assignment
+        assert_eq!(
+            use_of("f() { x=\"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // local decl (`local x="$1"` lowers to a builtin decl word)
+        assert_eq!(
+            use_of("f() { local x=\"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // array element
+        assert_eq!(
+            use_of("f() { a=(\"$1\"); }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // return hands the value to the caller
+        assert_eq!(
+            use_of("f() { return \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+    }
+
+    /// Nothing unsafe survives: `eval`/`source` (opaque command text),
+    /// `set --`/`shift` (the positional no longer names one caller word),
+    /// an ambiguous redefinition — all are vetoed, so the parameters stay
+    /// owned and the key is absent from the verdict.
+    #[test]
+    fn unanalysable_bodies_are_vetoed() {
+        for src in [
+            "f() { eval \"echo $1\"; }\nf hi\n",
+            "f() { source /dev/null; echo \"$1\"; }\nf hi\n",
+            "f() { set -- a b; echo \"$1\"; }\nf hi\n",
+            "f() { x=\"$1\"; }\nf() { echo \"$1\"; }\nf hi\n",
+        ] {
+            let v = analyze_param_use(&prog_of(src));
+            assert!(
+                !v.contains_key("f"),
+                "unanalysable body got a verdict ({src}): {v:?}"
+            );
+        }
+    }
+
+    /// Several parameters are indexed independently: `$1` stored, `$2`
+    /// borrowed.
+    #[test]
+    fn per_parameter_verdict() {
+        let v = analyze_param_use(&prog_of("f() { y=\"$1\"; echo \"$2\"; }\nf a b\n"));
+        let f = v.get("f").expect("verdict for f");
+        assert_eq!(f.first().copied(), Some(ParamUse::Own), "the first param is stored");
+        assert_eq!(f.get(1).copied(), Some(ParamUse::Borrow), "the second param is printed");
     }
 }
 
