@@ -2366,6 +2366,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // check_qx flags as "wrapping builtin 'echo'").
                         if let Some(arrow) = capture_call_arrow(expr) {
                             if let [IrStmt::Expr(e)] = arrow.as_slice() {
+                                // a redirect-fed command (`x=$(wc -l < FILE)`)
+                                if let Some(val) =
+                                    crate::pipeline_native::native_capture_call(e)
+                                {
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!("{} = {};\n", lhs, val));
+                                    return;
+                                }
                                 if let Some(stmt) =
                                     crate::pipeline_native::native_pipeline(e)
                                 {
@@ -2388,6 +2396,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if let IrExpr::Capture { expr: inner, .. } = expr {
                         if let IrExpr::Arrow(stmts) = inner.as_ref() {
                             if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                                // a redirect-fed command (`x=$(wc -l < FILE)`)
+                                if let Some(val) =
+                                    crate::pipeline_native::native_capture_call(e)
+                                {
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!("{} = {};\n", lhs, val));
+                                    return;
+                                }
                                 if let Some(stmt) = crate::pipeline_native::native_pipeline(e)
                                 {
                                     emit_indent(out, indent);
@@ -6220,6 +6236,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // below; the statement's own `print` follows the
                     // selected handle.
                     if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                        // a redirect-fed command (`x=$(wc -l < FILE)`) —
+                        // the capability tree gets the IR call directly
+                        if let Some(expr) =
+                            crate::pipeline_native::native_capture_call(e)
+                        {
+                            return expr;
+                        }
                         if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
                             return format!(
                                 "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {stmt} close $__fh; select($__old); $__cap =~ s/\\n+\\z//; $__cap }}"

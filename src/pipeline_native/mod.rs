@@ -144,6 +144,21 @@ pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
 /// metacharacters), then re-shaped as the exec call the leaves expect.
 /// `$__sh_cap` is the value channel: a leaf's statement assigns it, and
 /// this parent returns it as the expression.
+/// Parent (redirect-capture): the body of a `capture` whose expression is a
+/// `redirect(Arrow([exec …]), [{fd:0,in,FILE}])` — `x=$(wc -l < FILE)`.
+/// The shell-text view loses the redirect, so the capability tree is handed
+/// the IR call directly. Returns a Perl EXPRESSION for the captured value.
+pub(crate) fn native_capture_call(call: &IrExpr) -> Option<String> {
+    match native_dispatch(&NativeCtx::Exec { call, cond: false }) {
+        // the leaf wrote the value into $__sh_cap — return it as the
+        // expression (same channel native_capture uses)
+        Some(NativeEmit::Stmt(s)) if s.contains("$__sh_cap") => {
+            Some(format!("do {{ my $__sh_cap; {s} $__sh_cap }}"))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn native_capture(cmd_text: &str) -> Option<String> {
     // Single simple command only. A command carrying a nested `$(…)`, a
     // glob, or any shell metacharacter is left to the uu-ffi seam / the
