@@ -2820,6 +2820,23 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Use the stored command string if available, otherwise
                 // fall back to emitting the stage statements.
                 // Omit $CHILD_ERROR tracking (same rationale as System capture).
+                //
+                // Prefer the CAPABILITY tree on the equivalent
+                // `pipeline(...)` expression: a literal producer plus a
+                // supported consumer (`x=$(echo … | grep -i …)`) lowers to
+                // one native statement, which we run with stdout captured.
+                // The per-stage fallback below would emit the consumer as
+                // a bare exec reading stdin — no payload channel, so it
+                // shells out (check_qx: wrapping builtin 'grep').
+                if let Some(stmt) = stages_as_pipeline_expr(stages)
+                    .and_then(|e| crate::pipeline_native::native_pipeline(&e))
+                {
+                    emit_indent(out, indent);
+                    out.push_str(&format!(
+                        "my ${var} = do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt} open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }};\n"
+                    ));
+                    return;
+                }
                 if let Some(cmd) = cmd_str {
                     let open_expr = cmd_str_to_open_perl(cmd);
                     emit_indent(out, indent);
@@ -6153,6 +6170,28 @@ fn render_test_call(args: &[IrExpr]) -> String {
 }
 
 // ── Expression emitter ───────────────────────────────────────────────
+
+/// Rebuild the `pipeline(Array([Arrow, Arrow, …]))` EXPRESSION from an
+/// `IrStmt::Pipeline` stage list, so the capability tree can be consulted
+/// on the expression form (which carries the producer's literal payload).
+/// Returns None for a stage shape the expression form cannot express
+/// (anything but a single exec/builtin statement per stage).
+fn stages_as_pipeline_expr(stages: &[Vec<IrStmt>]) -> Option<IrExpr> {
+    if stages.len() < 2 {
+        return None;
+    }
+    let mut arrows: Vec<IrExpr> = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let [IrStmt::Expr(_)] = stage.as_slice() else {
+            return None;
+        };
+        arrows.push(IrExpr::Arrow(stage.clone()));
+    }
+    Some(IrExpr::Call {
+        func: "pipeline".to_string(),
+        args: vec![IrExpr::Array(arrows)],
+    })
+}
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {

@@ -253,6 +253,11 @@ pub struct Render {
     /// helper (and its sink check) must survive. Cleared only when every
     /// print site proved sink-free.
     sink_check_needed: bool,
+    /// The functions whose RETURN VALUE is consumed (`fn_value_used`):
+    /// only these get a `-> String` signature and the sticky `__SH_RET`
+    /// tail. A function called only for its side effect returns `()`, so
+    /// no `__SH_RET` static is needed for it at all.
+    fn_value_used: std::collections::HashSet<String>,
     /// The SOURCE language has no `$?` and the program contains no status
     /// read (`debashl::shir::exit_status_is_unobservable`): the exit
     /// status register is unreachable from the source, so the renderer
@@ -1195,12 +1200,30 @@ fn golf_rust(text: &str) -> String {
 /// own signature line. Comments mentioning the name don't count, so the
 /// definition's doc/comments are ignored.
 fn prune_unused_helpers(text: String) -> String {
-    const HELPERS: &[&str] = &["__sh_echo_esc", "__sh_printf_b", "__sh_puts", "__sh_print_words", "__sh_cat"];
+    // EVERY registered helper, by its RENDERED `fn __sh_*` name — derived
+    // from the registry itself (`HELPER_ORDER` × `helper_source`), so a
+    // helper added there can never be forgotten here. A helper whose
+    // `helper_source` is empty (or whose name has no `fn __sh_` prefix)
+    // is skipped; the two-word `print_words` variants both render
+    // `__sh_print_words`, which the duplicate-tolerant scan handles.
+    let helper_names: Vec<String> = HELPER_ORDER
+        .iter()
+        .filter_map(|h| {
+            let src = helper_source(h);
+            let name: String = src
+                .strip_prefix("fn ")?
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+    let helpers: Vec<&str> = helper_names.iter().map(|s| s.as_str()).collect();
     let lines: Vec<&str> = text.lines().collect();
     let mut drop: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        let Some(name) = HELPERS.iter().find(|n| t.starts_with(&format!("fn {n}("))) else {
+        let Some(name) = helpers.iter().find(|n| t.starts_with(&format!("fn {n}("))) else {
             continue;
         };
         // is the name mentioned on any other non-comment line?
@@ -1356,6 +1379,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // straight to stdout even when the PROGRAM keeps the runtime for some
     // other construct — the sink check is dead code in them. `Sometimes`
     // (the conservative default) stays out of the set.
+    r.fn_value_used = fn_value_used(&prog);
     r.fn_sink_never = crate::shir::analyze_fn_sink_contexts(&prog)
         .into_iter()
         .filter(|(_, v)| *v == crate::shir::SinkContext::Never)
@@ -6764,6 +6788,34 @@ impl Render {
         if sig.arity == 0 && !sig.argv {
             return format!("{m}()");
         }
+        // DIRECT-ARGS path: a fixed-arity signature with no rest/argv param
+        // takes its words one per parameter, so the `Vec<String>` assembly
+        // and the `__a.get(i)…` unpack are a pure round trip — pass the
+        // rendered words straight through (`f("hello".to_string())` rather
+        // than `{ let __a = vec![…]; f(__a.get(0)…unwrap_or_default()) }`).
+        // Only when EVERY word is a single-element vec (no splat: a splat's
+        // words are a runtime-sized `Vec<String>` and cannot be spread
+        // statically) and the arity matches the word count.
+        if sig.rest.is_none() && !sig.argv && ws.len() == sig.arity {
+            let direct: Option<Vec<&str>> =
+                ws.iter().map(|w| Self::vec_of_one(w)).collect();
+            if let Some(words) = direct {
+                let args: Vec<String> = words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| match sig.tys[i] {
+                        // the param is String: hand over the rendered word
+                        FnParamTy::Str => (*w).to_string(),
+                        // the param is i64: the word is a String expr — the
+                        // callee's signature forces a parse at the boundary
+                        FnParamTy::Num => {
+                            format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                        }
+                    })
+                    .collect();
+                return format!("{m}({})", args.join(", "));
+            }
+        }
         // `ws` holds one `vec![word]` per argument; a SPLAT element holds
         // a multi-word `Vec<String>` instead, so the two cannot be
         // concatenated with `vec![a, b]` (that would nest). `__sh_cat`
@@ -6793,6 +6845,34 @@ impl Render {
         tail: Option<&str>,
     ) -> String {
         let m = self.fn_ident(name);
+        // DIRECT-ARGS path (see fn_call_value): a fixed-arity signature
+        // with no rest/argv param takes one word per parameter, so the
+        // `Vec<String>` assembly + `__a.get(i)…` unpack is a pure round
+        // trip.
+        let direct = if sig.rest.is_none() && !sig.argv && ws.len() == sig.arity {
+            let words: Option<Vec<&str>> = ws.iter().map(|w| Self::vec_of_one(w)).collect();
+            words.map(|words| {
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| match sig.tys[i] {
+                        FnParamTy::Str => (*w).to_string(),
+                        FnParamTy::Num => {
+                            format!("({w}).trim().parse::<i64>().unwrap_or(0)")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        if let Some(args) = direct {
+            let call = format!("{m}({})", args.join(", "));
+            return match tail {
+                Some(t) => format!("{{ {call}; {t} }}"),
+                None => format!("{{ {call}; }}"),
+            };
+        }
         let args = Self::fn_call_args(sig);
         let call = format!("{m}({args})");
         let mut inner = String::new();
@@ -7167,6 +7247,34 @@ impl Render {
     /// single word, so a runtime-free program can print `EXPR` directly.
     /// `None` for anything else (multi-element vecs, `split(...)`,
     /// arbitrary expressions).
+    /// Drop a single trailing `.clone()` from a print argument when the
+    /// expression it clones is a plain borrowable place (`p0`, `__SHV_x
+    /// .with(|v| v.borrow().clone())` is NOT such a place — it ends in a
+    /// call — so only `ident` and `ident.field` shapes qualify). The print
+    /// macros take their arguments by reference, so the clone only
+    /// allocates a temporary that is dropped immediately.
+    fn drop_trailing_clone(expr: &str) -> String {
+        let t = expr.trim_end();
+        let Some(base) = t.strip_suffix(".clone()") else {
+            return expr.to_string();
+        };
+        let base = base.trim_end();
+        // a bare identifier or dotted path (no parentheses/brackets: a call,
+        // index or with-block must keep its clone)
+        if base.is_empty()
+            || !base
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            || base.starts_with('.')
+            || base.ends_with('.')
+        {
+            return expr.to_string();
+        }
+        // the receiver was parenthesized (`(x).clone()`): keep the parens
+        // only if the base itself needed them — a bare path does not
+        base.to_string()
+    }
+
     fn vec_of_one(expr: &str) -> Option<&str> {
         let t = expr.trim();
         let inner = t.strip_prefix("vec![")?.strip_suffix(']')?;
@@ -7293,7 +7401,14 @@ impl Render {
                         Some(e) if self.word_is_numeric(e) => self.expr_num(e),
                         _ => fallback.to_string(),
                     };
-                    args.push(rendered);
+                    // `{}` borrows its argument (`Display::fmt(&self)`), so
+                    // a renderer-added `.clone()` on a plain owned value is
+                    // dead weight in a print: `println!("{}", p0.clone())`
+                    // prints the same as `println!("{}", p0)`. Only the
+                    // TRAILING `.clone()` of a bare path/field expression is
+                    // dropped — a call whose clone feeds further work, or a
+                    // clone that is not the whole argument, is left alone.
+                    args.push(Self::drop_trailing_clone(&rendered));
                 }
                 if args.len() == 1 {
                     self.emit(&format!("{mac}(\"{{}}\", {});", args[0]));
@@ -9441,6 +9556,11 @@ impl Render {
             // (the sticky __SH_RET cell is the return value); otherwise
             // the legacy zero-arg argv convention
             let sig = self.fn_sigs.get(name).cloned();
+            // Does anything CONSUME this function's value? A function only
+            // ever called for its side effect returns `()`: no sticky
+            // `__SH_RET` cell in its signature, no final clone — and, if no
+            // other function needs one either, no `__SH_RET` static at all.
+            let value_used = self.fn_value_used.contains(name);
             if let Some(s) = &sig {
                 let mut params: Vec<String> = (0..s.arity)
                     .map(|i| {
@@ -9463,7 +9583,8 @@ impl Render {
                 if s.argv {
                     params.push("__argv: &[String]".to_string());
                 }
-                self.emit(&format!("fn {m}({}) -> String {{", params.join(", ")));
+                let ret = if value_used { " -> String" } else { "" };
+                self.emit(&format!("fn {m}({}){ret} {{", params.join(", ")));
             } else {
                 self.emit(&format!("fn {m}() {{"));
             }
@@ -9515,6 +9636,7 @@ impl Render {
             // the legacy convention leaves in it). Skipped after an
             // unconditional divert (rustc would flag it unreachable).
             if sig.is_some()
+                && value_used
                 && !matches!(
                     body.last(),
                     Some(IrStmt::Return(_)) | Some(IrStmt::Exit(_))
@@ -9523,6 +9645,17 @@ impl Render {
                 self.emit("__SH_RET.lock().unwrap().clone()");
             }
             self.depth -= 1;
+            // a side-effect-only function has no value tail: drop the blank
+            // line the tail's absence leaves before the closing brace
+            if !value_used {
+                while let Some(last) = self.out.last() {
+                    if last.trim().is_empty() {
+                        self.out.pop();
+                    } else {
+                        break;
+                    }
+                }
+            }
             self.emit("}");
             self.emit("");
         }
@@ -15113,6 +15246,314 @@ fn collect_attrs(
     }
 }
 
+/// The functions whose RETURN VALUE is consumed somewhere — the licence to
+/// emit a real `-> String` and the sticky `__SH_RET` tail.
+///
+/// A value is consumed when the function's name appears in a *value*
+/// position: the `fnValue`/`fnCall` call nodes (the C frontend's value
+/// model — assignment RHS, word interpolation, a `return expr`), or a
+/// capture whose body calls it. A plain statement call (`exec("f", …)`,
+/// the shape `f` on its own line lowers to) DISCARDS the value, so a
+/// function only ever called that way can be a plain `()`-returning fn:
+/// no `__SH_RET` cell, no final clone, and the callsite reads nothing.
+///
+/// Conservative by construction: any mention of the name that is not
+/// provably a discard marks it used (an unknown `ext`/`MethodCall` arg,
+/// a dynamic dispatch, an ambiguous redefinition), because a dropped value
+/// home on a live path is a miscompile while a kept one is only dead
+/// weight.
+fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    fn collect_defs(
+        stmts: &[IrStmt],
+        defined: &mut std::collections::HashSet<String>,
+        ambiguous: &mut std::collections::HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks,
+                } => {
+                    if !defined.insert(name.clone()) {
+                        ambiguous.insert(name.clone());
+                    }
+                    collect_defs(body, defined, ambiguous);
+                    for (_, nb) in named_blocks {
+                        collect_defs(nb, defined, ambiguous);
+                    }
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::Redirect { inner: b, .. } => collect_defs(b, defined, ambiguous),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    collect_defs(then, defined, ambiguous);
+                    for (_, b) in elsifs {
+                        collect_defs(b, defined, ambiguous);
+                    }
+                    collect_defs(else_, defined, ambiguous);
+                }
+                IrStmt::ForInit {
+                    init, step, body, ..
+                } => {
+                    collect_defs(init, defined, ambiguous);
+                    collect_defs(step, defined, ambiguous);
+                    collect_defs(body, defined, ambiguous);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_defs(&c.body, defined, ambiguous);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_defs(&prog.stmts, &mut defined, &mut ambiguous);
+
+    /// Walk a statement list. `value_ctx` says whether this position's
+    /// RESULT is consumed (an assignment RHS, a condition, an argument).
+    /// A plain `IrStmt::Expr(exec("f", …))` is a DISCARD.
+    fn walk_stmts(
+        stmts: &[IrStmt],
+        defined: &std::collections::HashSet<String>,
+        ambiguous: &std::collections::HashSet<String>,
+        used: &mut std::collections::HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                // a bare statement-position call: the value is discarded
+                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    if matches!(func.as_str(), "exec" | "builtin") {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            // …but its ARGUMENTS are value positions
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for a in items {
+                                    walk_expr(a, defined, ambiguous, used);
+                                }
+                            }
+                            let _ = n;
+                            continue;
+                        }
+                    }
+                    // A non-`exec` call in statement position (e.g. a
+                    // `test`/`and`/`or` node): walk its args as value
+                    // positions. (`exec` was handled above — its value is
+                    // discarded.)
+                    for a in args {
+                        walk_expr(a, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Assign { expr, .. } => walk_expr(expr, defined, ambiguous, used),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        walk_expr(i, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        walk_expr(e, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Output { value, .. } => walk_expr(value, defined, ambiguous, used),
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    walk_expr(cond, defined, ambiguous, used);
+                    walk_stmts(then, defined, ambiguous, used);
+                    for (c, b) in elsifs {
+                        walk_expr(c, defined, ambiguous, used);
+                        walk_stmts(b, defined, ambiguous, used);
+                    }
+                    walk_stmts(else_, defined, ambiguous, used);
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, defined, ambiguous, used);
+                    walk_stmts(body, defined, ambiguous, used);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, defined, ambiguous, used);
+                    walk_stmts(body, defined, ambiguous, used);
+                }
+                IrStmt::ForInit {
+                    init, cond, step, body,
+                } => {
+                    walk_stmts(init, defined, ambiguous, used);
+                    walk_expr(cond, defined, ambiguous, used);
+                    walk_stmts(step, defined, ambiguous, used);
+                    walk_stmts(body, defined, ambiguous, used);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    walk_stmts(b, defined, ambiguous, used)
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    walk_stmts(inner, defined, ambiguous, used);
+                    for r in redirects {
+                        walk_expr(&r.target, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk_stmts(body, defined, ambiguous, used);
+                    for (_, nb) in named_blocks {
+                        walk_stmts(nb, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk_stmts(st, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    walk_expr(discriminant, defined, ambiguous, used);
+                    for c in clauses {
+                        walk_stmts(&c.body, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => {
+                    walk_expr(e, defined, ambiguous, used)
+                }
+                IrStmt::Exec { cmd, args, redirects, .. } => {
+                    walk_expr(cmd, defined, ambiguous, used);
+                    for a in args {
+                        walk_expr(a, defined, ambiguous, used);
+                    }
+                    // `Exec.redirects` holds plain expressions (the
+                    // target words), unlike `IrStmt::Redirect`'s records
+                    for r in redirects {
+                        walk_expr(r, defined, ambiguous, used);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk_stmts(body, defined, ambiguous, used);
+                    for e in excepts {
+                        walk_stmts(&e.body, defined, ambiguous, used);
+                    }
+                    walk_stmts(else_body, defined, ambiguous, used);
+                    walk_stmts(finally_body, defined, ambiguous, used);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Walk an EXPRESSION in a VALUE position (its result is consumed).
+    fn walk_expr(
+        e: &IrExpr,
+        defined: &std::collections::HashSet<String>,
+        ambiguous: &std::collections::HashSet<String>,
+        used: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                // the value-call nodes: the function's return IS consumed
+                if matches!(func.as_str(), "fnValue" | "fnCall") {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if defined.contains(n) {
+                            used.insert(n.clone());
+                        }
+                    }
+                }
+                // a `capture`/`pipeline`/… whose body calls a function also
+                // consumes it (the capture IS the value)
+                if func == "capture" {
+                    if let Some(a) = args.first() {
+                        if let IrExpr::Arrow(body) = a {
+                            walk_stmts(body, defined, ambiguous, used);
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, defined, ambiguous, used);
+                }
+            }
+            IrExpr::Capture { expr, .. } => {
+                match &**expr {
+                    // the capture's body value IS the captured text
+                    IrExpr::Arrow(body) => walk_stmts(body, defined, ambiguous, used),
+                    other => walk_expr(other, defined, ambiguous, used),
+                }
+            }
+            IrExpr::Arrow(body) => walk_stmts(body, defined, ambiguous, used),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, defined, ambiguous, used);
+                walk_expr(rhs, defined, ambiguous, used);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, defined, ambiguous, used);
+                walk_expr(then, defined, ambiguous, used);
+                walk_expr(else_, defined, ambiguous, used);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, defined, ambiguous, used);
+                walk_expr(default, defined, ambiguous, used);
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, defined, ambiguous, used),
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr(i, defined, ambiguous, used);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, defined, ambiguous, used);
+                    }
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, defined, ambiguous, used);
+                for a in args {
+                    walk_expr(a, defined, ambiguous, used);
+                }
+            }
+            // Unknown shapes: conservatively mark every defined name the
+            // node mentions (a dropped value home is a miscompile).
+            other => {
+                let mut txt = String::new();
+                if let IrExpr::Ext(n) = other {
+                    txt = format!("{n:?}");
+                }
+                if !txt.is_empty() {
+                    for d in defined {
+                        if txt.contains(d.as_str()) {
+                            used.insert(d.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_stmts(&prog.stmts, &defined, &ambiguous, &mut used);
+    for sub in &prog.subs {
+        walk_stmts(&sub.body, &defined, &ambiguous, &mut used);
+    }
+    // An ambiguous definition (redefinition, or a name a sub also owns)
+    // keeps its value home: the callee may be either body.
+    for a in &ambiguous {
+        used.insert(a.clone());
+    }
+    used
+}
+
 /// Collect every function DEFINITION (top-level and nested).
 fn collect_fn_defs(stmts: &[IrStmt], out: &mut Vec<(String, Vec<IrStmt>, bool)>) {
     for s in stmts {
@@ -15856,7 +16297,9 @@ mod tests {
         let out = render("f() { local x=1; }\nf\n");
         assert!(!out.contains("__SH_OUT"), "sink statics kept:\n{out}");
         assert!(!out.contains("let mut used = false"), "sink tail kept:\n{out}");
-        assert!(out.contains("__SH_RET"), "the value home was dropped:\n{out}");
+        // the function is called for its side effect only, so its value
+        // home is not emitted either (see fn_value_used)
+        assert!(!out.contains("__SH_RET"), "unused value home kept:\n{out}");
         // …but a redirect INSIDE the function body keeps the runtime: the
         // sink state is program-global, so the definition's location does
         // not matter.
@@ -15931,6 +16374,30 @@ mod tests {
             out.contains("print!("),
             "the body did not print natively:\n{out}"
         );
+    }
+
+    /// The call site passes the words STRAIGHT to the parameters when the
+    /// signature is fixed-arity: no `Vec<String>` round trip, no
+    /// `__a.get(i).cloned().unwrap_or_default()` unpack.
+    #[test]
+    fn fixed_arity_call_skips_the_argv_round_trip() {
+        let out = render("f() { local x=\"$1\"; echo \"$x\"; }\nf hi\n");
+        assert!(!out.contains("let __a: Vec<String>"), "{out}");
+        assert!(!out.contains("__SH_ARGV"), "argv machinery kept:\n{out}");
+        assert!(!out.contains("fn __sh_arg"), "arg helper kept:\n{out}");
+    }
+
+    /// A function called only for its side effect returns `()`: no
+    /// `-> String`, no `__SH_RET` cell, no final clone — and the caller
+    /// reads nothing. A function whose value IS consumed keeps the home.
+    #[test]
+    fn side_effect_only_function_drops_the_value_home() {
+        let out = render("f() { echo \"a\"; echo \"b\"; }\nf\n");
+        assert!(!out.contains("__SH_RET"), "value home kept:\n{out}");
+        assert!(!out.contains("-> String"), "value return kept:\n{out}");
+        // …the value-consumed shape keeps it
+        let used = render("f() { echo a; }\nx=$(f)\necho \"$x\"\n");
+        assert!(used.contains("__SH_RET"), "value home dropped:\n{used}");
     }
 
     #[test]
@@ -16147,12 +16614,16 @@ mod tests {
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t22 A1 ingress");
         let out = shir_to_rust(&prog);
-        assert!(out.contains("fn f() -> String"), "verbatim user fn name:\n{out}");
+        // The name is verbatim (`fn f`, not `fn __sh_fn_f`). The body's
+        // `echo` value is DISCARDED (the call is the statement-position
+        // `exec("f", [])` shape), so f returns `()` — a value used only
+        // where a function's value is consumed gets `-> String`.
+        assert!(out.contains("fn f("), "verbatim user fn name:\n{out}");
         assert!(!out.contains("__sh_fn_f"), "no namespace rename:\n{out}");
         // main is emitted BEFORE the function bodies (rustc needs no
         // forward declaration; the CALL site is inside main)
         let main_at = out.find("fn main()").expect("main");
-        let f_at = out.find("fn f() -> String").expect("fn f");
+        let f_at = out.find("fn f(").expect("fn f");
         assert!(main_at < f_at, "definitions follow main:\n{out}");
     }
 
