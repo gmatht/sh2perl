@@ -90,6 +90,12 @@ struct FnSig {
     /// `arity` counts the params BEFORE the rest; the rest param is the
     /// `(arity)`-th Rust parameter.
     rest: Option<usize>,
+    /// WHOLE-ARGV verdict: the body reads `$@`/`$*`/`$#` with NO shift (so
+    /// the argv is the caller's words verbatim). The caller passes them as
+    /// a trailing `&[String]` slice instead of swapping `__SH_ARGV`;
+    /// `$#` is `args.len()`, `$@`/`$*` are `args`. Mutually exclusive with
+    /// `rest`.
+    argv: bool,
 }
 
 /// Pass-3 probe record for one function-body render (legacy convention;
@@ -104,6 +110,9 @@ struct FnProbe {
     rest_read: bool,
     /// the probe rendered a shift (its amount is the offset verdict)
     saw_shift: bool,
+    /// the body read the whole argv (`$@`/`$*`/`$#`) without rebinding it
+    /// — eligible for the whole-argv slice rewrite.
+    argv_read: bool,
 }
 
 #[derive(Default)]
@@ -154,6 +163,11 @@ pub struct Render {
     active_shift: Option<usize>,
     /// binding name of the active rest param (`__rest`), None otherwise
     active_rest: Option<String>,
+    /// whole-argv rewrite is ACTIVE for the current function body: `$@`/`$*`
+    /// read the trailing `&[String]` param and `$#` is its length. Set when
+    /// the pass-3 probe committed an argv-slice signature (see
+    /// `FnSig::argv`).
+    active_argv: bool,
     /// the active rewrite's shift statement has been emitted (post-shift
     /// positional reads re-base by the offset)
     shift_emitted: bool,
@@ -1637,6 +1651,17 @@ impl Render {
         }
     }
 
+    /// Pass-3 probe: the body reads the whole argv WITHOUT rebinding it
+    /// (`$@`/`$*`/`$#`, no `shift`/`set --`). Such a body can take the
+    /// caller's words as a trailing `&[String]` slice — no `__SH_ARGV`
+    /// swap, and `$#`/`$@` read the slice. A separate verdict from
+    /// `wild`, which additionally covers rebinding.
+    fn probe_argv_read(&mut self) {
+        if let Some(p) = self.probe.as_mut() {
+            p.argv_read = true;
+        }
+    }
+
     /// The active rewrite's trailing rest param (`Vec<String>`) if a
     /// whole-argv read can be served from it: requires the shift-offset
     /// rewrite to be active AND the shift to have been emitted (pre-shift
@@ -1651,10 +1676,17 @@ impl Render {
     }
 
     /// Whole-argv read (`$@`/`$*`) in the active rewrite: the rest param
-    /// when post-shift, else None (caller keeps `__SH_ARGV`). The result
-    /// is a `Vec<String>` so it drops into every word-list context
+    /// when post-shift, the whole-argv slice in the no-shift rewrite,
+    /// else None (caller keeps `__SH_ARGV`). The result is a
+    /// `Vec<String>` so it drops into every word-list context
     /// (`__sh_cat(&[..])` included).
     fn argv_read(&mut self) -> Option<String> {
+        if self.active_argv {
+            if let Some(p) = self.probe.as_mut() {
+                p.argv_read = true;
+            }
+            return Some(format!("{}.to_vec()", self.argv_binding()?));
+        }
         if self.active_shift.is_some() {
             if let Some(r) = self.rest_param() {
                 if let Some(p) = self.probe.as_mut() {
@@ -1662,6 +1694,27 @@ impl Render {
                 }
                 return Some(format!("{r}.to_vec()"));
             }
+        }
+        None
+    }
+
+    /// The active whole-argv slice binding name, when the rewrite is armed.
+    fn argv_binding(&self) -> Option<String> {
+        if self.active_argv {
+            self.active_rest.clone()
+        } else {
+            None
+        }
+    }
+
+    /// `$#` in the active whole-argv rewrite: the slice's length. None when
+    /// the rewrite is not armed (caller reads `__SH_ARGV`).
+    fn argv_len(&mut self) -> Option<String> {
+        if self.active_argv {
+            if let Some(p) = self.probe.as_mut() {
+                p.argv_read = true;
+            }
+            return self.argv_binding().map(|b| format!("{b}.len()"));
         }
         None
     }
@@ -2502,6 +2555,9 @@ impl Render {
                 "?" => "__SH_RC.load(Ordering::SeqCst).to_string()".to_string(),
                 "$" => "std::process::id().to_string()".to_string(),
                 "#" => {
+                    if let Some(n) = self.argv_len() {
+                        return format!("{n}.to_string()");
+                    }
                     self.probe_wild();
                     "__SH_ARGV.lock().unwrap().len().to_string()".to_string()
                 }
@@ -2584,6 +2640,9 @@ impl Render {
                 "?" => "__SH_RC.load(Ordering::SeqCst)".to_string(),
                 "$" => "std::process::id() as i64".to_string(),
                 "#" => {
+                    if let Some(n) = self.argv_len() {
+                        return format!("{n} as i64");
+                    }
                     self.probe_wild();
                     "__SH_ARGV.lock().unwrap().len() as i64".to_string()
                 }
@@ -5289,6 +5348,19 @@ impl Render {
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "i64::MIN".to_string(),
                     Some(x) => self.slice_index_expr(x),
                 };
+                // whole-argv rewrite: slice the trailing argv param
+                if let Some(b) = self.argv_binding() {
+                    if let Some(p) = self.probe.as_mut() {
+                        p.argv_read = true;
+                    }
+                    return format!(
+                        "{{ let __v = {b}; let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
+                         let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                         let __e = __e.max(__o); \
+                         __v[__o..__e].to_vec() }}"
+                    );
+                }
                 self.probe_wild();
                 return format!(
                     "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
@@ -6589,7 +6661,7 @@ impl Render {
         cat: bool,
     ) -> String {
         let m = self.fn_ident(name);
-        if sig.arity == 0 {
+        if sig.arity == 0 && !sig.argv {
             return format!("{m}()");
         }
         if cat {
@@ -6618,7 +6690,7 @@ impl Render {
         let args = Self::fn_call_args(sig);
         let call = format!("{m}({args})");
         let mut inner = String::new();
-        if sig.arity > 0 {
+        if sig.arity > 0 || sig.argv {
             if cat {
                 self.add_helper("cat");
             }
@@ -6656,6 +6728,10 @@ impl Render {
             // can exceed the offset (e.g. `$2` after `shift` ⇒ arity 3,
             // offset 1 ⇒ rest = caller words 1..).
             args.push(format!("&__a[({off}).min(__a.len())..]"));
+        }
+        if sig.argv {
+            // whole-argv rewrite: the caller's words ARE the callee's argv
+            args.push("&__a".to_string());
         }
         args.join(", ")
     }
@@ -9031,6 +9107,10 @@ impl Render {
             // shared shIR verdict: fn name -> constant argv shift offset
             // (present only for the narrow qualifying shapes)
             let shift_offsets = crate::shir::analyze_shift_offsets(prog);
+            // shared shIR verdict: functions that read the whole argv
+            // (`$@`/`$*`/`$#`) without rebinding it — eligible for the
+            // argv-slice rewrite
+            let whole_argv = crate::shir::analyze_whole_argv_fns(prog);
             for (name, body, _named) in &pfns {
                 let saved_out = std::mem::take(&mut self.out);
                 let saved_depth = self.depth;
@@ -9047,6 +9127,10 @@ impl Render {
                 let off = shift_offsets.get(name).copied().filter(|k| *k > 0);
                 self.active_shift = off;
                 self.active_rest = off.map(|_| "__rest".to_string());
+                self.active_argv = off.is_none() && whole_argv.contains(name);
+                if self.active_argv {
+                    self.active_rest = Some("__argv".to_string());
+                }
                 self.shift_emitted = false;
                 {
                     let mut cached = BTreeSet::new();
@@ -9123,6 +9207,11 @@ impl Render {
                         } else {
                             None
                         },
+                        // whole-argv rewrite: the body read `$@`/`$*`/`$#`
+                        // and never rebound the argv. `probe.wild` is false
+                        // here (checked above), so the reads were served
+                        // from the argv param during the probe.
+                        argv: probe.argv_read,
                     },
                 );
             }
@@ -9261,6 +9350,9 @@ impl Render {
                 if s.rest.is_some() {
                     params.push("__rest: &[String]".to_string());
                 }
+                if s.argv {
+                    params.push("__argv: &[String]".to_string());
+                }
                 self.emit(&format!("fn {m}({}) -> String {{", params.join(", ")));
             } else {
                 self.emit(&format!("fn {m}() {{"));
@@ -9274,6 +9366,10 @@ impl Render {
             // recorded caller indices under the same arming)
             self.active_shift = sig.as_ref().and_then(|s| s.rest);
             self.active_rest = self.active_shift.map(|_| "__rest".to_string());
+            self.active_argv = sig.as_ref().map(|s| s.argv).unwrap_or(false);
+            if self.active_argv {
+                self.active_rest = Some("__argv".to_string());
+            }
             self.shift_emitted = false;
             // numeric positional cache (entry-bound i64 locals; avoids
             // per-op parse+alloc in loops — t86).
@@ -9302,6 +9398,7 @@ impl Render {
             self.active_fn = None;
             self.active_shift = None;
             self.active_rest = None;
+            self.active_argv = false;
             self.shift_emitted = false;
             self.in_function = false;
             // value tail: fall-off-the-end yields the sticky cell (what
@@ -15158,6 +15255,40 @@ mod tests {
         // not code — the golf pass must not touch them.
         let out = super::golf_rust("fn main() {\n    print!(\"a // b __sh_x\");\n}\n");
         assert!(out.contains("\"a // b __sh_x\""), "string literal altered:\n{out}");
+    }
+
+    #[test]
+    fn whole_argv_fn_takes_a_slice() {
+        // `f() { echo "$#:$*"; }` — no shift, so the caller's words are
+        // the callee's argv verbatim: pass them as a `&[String]` param
+        // instead of swapping `__SH_ARGV` at the call site.
+        let out = render("f() { echo \"$#:$*\"; }\nf a b\n");
+        assert!(out.contains("__argv: &[String]"), "argv param not emitted:\n{out}");
+        assert!(
+            !out.contains("let __old = __SH_ARGV"),
+            "legacy argv swap kept:\n{out}"
+        );
+        assert!(out.contains("__argv.len()"), "$# not the slice length:\n{out}");
+    }
+
+    #[test]
+    fn whole_argv_vetoed_by_shift() {
+        // a shift rebases the argv — the whole-argv model does not apply
+        // (the shift-offset rewrite handles it instead)
+        let out = render("f() { shift; echo \"$#\"; }\nf a b\n");
+        assert!(
+            !out.contains("__argv: &[String]"),
+            "whole-argv rewrite applied over a shift:\n{out}"
+        );
+    }
+
+    #[test]
+    fn whole_argv_vetoed_by_set_dashdash() {
+        let out = render("f() { set -- x; echo \"$*\"; }\nf a b\n");
+        assert!(
+            !out.contains("__argv: &[String]"),
+            "whole-argv rewrite applied over set --:\n{out}"
+        );
     }
 
     #[test]

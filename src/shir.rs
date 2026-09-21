@@ -11717,6 +11717,191 @@ pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
     out
 }
 
+/// Functions that read the WHOLE argv (`$@`/`$*`/`$#`) without rebinding
+/// it: no `shift`, no `set --`, no positional write, no `$#`-changing
+/// construct. Such a function can take the caller's words as a trailing
+/// `&[String]` parameter instead of the caller swapping `__SH_ARGV` — a
+/// renderer-level rewrite (the verdict is just "the argv is the caller's
+/// words, verbatim, for the whole body").
+///
+/// Distinct from [`analyze_shift_offsets`]: that one re-bases a constant
+/// shift; this one is the no-shift case (`$#` is allowed here — it is the
+/// slice's length — but vetoes the shift rewrite, which cannot model it).
+pub fn analyze_whole_argv_fns(prog: &IrProgram) -> HashSet<String> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    fn walk(stmts: &[IrStmt], reads: &mut bool, veto: &mut bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    if func == "builtin" || func == "exec" {
+                        if let Some(IrExpr::Str(h, _)) = args.first() {
+                            // rebinding the argv ends the model
+                            if h == "shift" || h == "set" {
+                                *veto = true;
+                            }
+                        }
+                    } else if func == "getVar" || func == "listVar" {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            if n == "@" || n == "*" || n == "#" {
+                                *reads = true;
+                            }
+                        }
+                    }
+                    for a in args {
+                        expr_walk(a, reads, veto);
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if !t.var.is_empty() && t.var.chars().all(|c| c.is_ascii_digit()) {
+                            *veto = true; // positional write
+                        }
+                    }
+                    expr_walk(expr, reads, veto);
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    expr_walk(cond, reads, veto);
+                    walk(then, reads, veto);
+                    for (c, b) in elsifs {
+                        expr_walk(c, reads, veto);
+                        walk(b, reads, veto);
+                    }
+                    walk(else_, reads, veto);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    expr_walk(cond, reads, veto);
+                    walk(body, reads, veto);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    expr_walk(iter, reads, veto);
+                    walk(body, reads, veto);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, reads, veto);
+                    expr_walk(cond, reads, veto);
+                    walk(step, reads, veto);
+                    walk(body, reads, veto);
+                }
+                // a NESTED function has its own argv frame — skip it
+                IrStmt::Function { .. } => {}
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    walk(b, reads, veto)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, reads, veto),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, reads, veto);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, reads, veto);
+                    for e in excepts {
+                        walk(&e.body, reads, veto);
+                    }
+                    walk(else_body, reads, veto);
+                    walk(finally_body, reads, veto);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    expr_walk(discriminant, reads, veto);
+                    for c in clauses {
+                        walk(&c.body, reads, veto);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, reads, veto);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        expr_walk(x, reads, veto);
+                    }
+                }
+                IrStmt::Output { value, .. } => expr_walk(value, reads, veto),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        expr_walk(e, reads, veto);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr_walk(path, reads, veto);
+                    expr_walk(content, reads, veto);
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        expr_walk(e, reads, veto);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn expr_walk(e: &IrExpr, reads: &mut bool, veto: &mut bool) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "getVar" || func == "listVar" {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n == "@" || n == "*" || n == "#" {
+                            *reads = true;
+                        }
+                    }
+                }
+                for a in args {
+                    expr_walk(a, reads, veto);
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    expr_walk(i, reads, veto);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        expr_walk(x, reads, veto);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_walk(lhs, reads, veto);
+                expr_walk(rhs, reads, veto);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_walk(cond, reads, veto);
+                expr_walk(then, reads, veto);
+                expr_walk(else_, reads, veto);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_walk(expr, reads, veto);
+                expr_walk(default, reads, veto);
+            }
+            IrExpr::Capture { expr, .. } => expr_walk(expr, reads, veto),
+            IrExpr::Index { key, .. } => expr_walk(key, reads, veto),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    expr_walk(v, reads, veto);
+                }
+            }
+            IrExpr::Splice(x) => expr_walk(x, reads, veto),
+            _ => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            let (mut reads, mut veto) = (false, false);
+            walk(body, &mut reads, &mut veto);
+            if reads && !veto {
+                out.insert(name.clone());
+            }
+        }
+    }
+    out
+}
+
 pub fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
     let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let bigint_vars = analyze_bigint_vars(prog);
@@ -56900,6 +57085,104 @@ mod unread_status_tests {
             !stmt_status_write_is_unread(&p.stmts[0]),
             "a $? read must keep the preceding write live"
         );
+    }
+}
+
+#[cfg(test)]
+mod whole_argv_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn call(func: &str, args: Vec<IrExpr>) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call { func: func.to_string(), args })
+    }
+
+    fn fn_stmt(name: &str, body: Vec<IrStmt>) -> IrStmt {
+        IrStmt::Function { name: name.to_string(), body, named_blocks: vec![] }
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn argv_read_without_rebind_qualifies() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("getVar", vec![s("#")]),
+                call("listVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn shift_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("builtin", vec![s("shift"), IrExpr::Array(vec![])]),
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn set_dashdash_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("builtin", vec![s("set"), IrExpr::Array(vec![s("--"), s("x")])]),
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn no_argv_read_does_not_qualify() {
+        // a function that never touches `$@`/`$#` gets no argv param
+        let p = prog(vec![fn_stmt("f", vec![call("getVar", vec![s("1")])])]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn positional_write_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "1".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: s("x"),
+                    asm: None,
+                },
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
     }
 }
 
