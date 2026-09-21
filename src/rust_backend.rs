@@ -2069,6 +2069,28 @@ impl Render {
     /// Strip one fully-enclosing matched `( … )` pair (safe in any
     /// function-argument or `if`/`while`-condition position, where the
     /// expression is delimited by the surrounding syntax).
+    /// Strip the `{ let __b = EXPR; __SH_RC.store(...); __b }` status
+    /// wrapper when the value is used as a BOOLEAN CONDITION: an
+    /// `if`/`while`/`else if` resets `__SH_RC` itself, so the wrapper's
+    /// store is dead and the expression reduces to `EXPR`.
+    fn unwrap_cond(s: &str) -> String {
+        let t = s.trim();
+        let rest = match t
+            .strip_prefix("{ let __b = ")
+            .and_then(|r| r.strip_suffix("; __b }"))
+        {
+            Some(r) => r,
+            None => return s.to_string(),
+        };
+        let marker = "; __SH_RC.store(";
+        match rest.split_once(marker) {
+            Some((expr, tail)) if tail.contains("__b { 0 } else { 1 }") => {
+                Self::unparen(expr.trim()).to_string()
+            }
+            _ => s.to_string(),
+        }
+    }
+
     fn unparen(s: &str) -> &str {
         let b = s.as_bytes();
         if b.len() < 2 || b[0] != b'(' || b[b.len() - 1] != b')' {
@@ -8936,7 +8958,7 @@ impl Render {
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
-                let c = self.expr_bool(cond);
+                let c = Self::unwrap_cond(&self.expr_bool(cond));
                 self.emit(&format!("if {} {{", Self::unparen(&c)));
                 self.depth += 1;
                 for s in then {
@@ -8944,7 +8966,7 @@ impl Render {
                 }
                 self.depth -= 1;
                 for (ec, body) in elsifs {
-                    let ec = self.expr_bool(ec);
+                    let ec = Self::unwrap_cond(&self.expr_bool(ec));
                     self.emit(&format!("}} else if {ec} {{"));
                     self.depth += 1;
                     for s in body {
@@ -10399,6 +10421,23 @@ fn normalize_arith_vars(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Does the CONSTANT text carry a glob metachar? Render-time twin of the
+/// `__sh_glob_like` runtime helper (the `=` fallback's decision) — keep the
+/// two in sync. Folds `[ "$a" = "lit" ]` to a plain string compare when the
+/// literal RHS can never glob-match.
+fn glob_like(s: &str) -> bool {
+    let ch: Vec<char> = s.chars().collect();
+    for i in 0..ch.len() {
+        if matches!(ch[i], '*' | '?' | '[') {
+            return true;
+        }
+        if matches!(ch[i], '!' | '@' | '+' | '?') && i + 1 < ch.len() && ch[i + 1] == '(' {
+            return true;
+        }
+    }
+    false
 }
 
 fn helper_deps(h: &str) -> &'static [&'static str] {
@@ -12196,11 +12235,18 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 Some(self.unary_test(&op, &operand))
             }
             TTok::Operand(_) => {
+                // the CONSTANT texts (when literal) drive the fold in
+                // `binary_test`: a comparison against a literal RHS that
+                // cannot glob is decidable as a plain string compare
+                let lhs_lit = self.operand_literal();
                 let (lhs, lhs_num) = self.operand()?;
                 if let Some(TTok::Bin(op)) = self.toks.get(self.pos).cloned() {
                     self.pos += 1;
+                    let rhs_lit = self.operand_literal();
                     let (rhs, rhs_num) = self.operand()?;
-                    Some(self.binary_test(&op, &lhs, lhs_num, &rhs, rhs_num))
+                    Some(self.binary_test_lit(
+                        &op, &lhs, lhs_num, lhs_lit.as_deref(), &rhs, rhs_num, rhs_lit.as_deref(),
+                    ))
                 } else {
                     // single operand — non-empty string
                     Some(format!("(!{lhs}.is_empty())"))
@@ -12216,6 +12262,26 @@ impl<'a, 'r> TestParser<'a, 'r> {
         let TTok::Operand(text) = tok else { return None };
         self.pos += 1;
         Some(self.render.test_operand_expr(&text, self.style))
+    }
+
+    /// The CONSTANT text of an operand, when it is a pure literal: a
+    /// quoted string (`"a"`, `'a'`, with no `$`/backtick inside) or an
+    /// unquoted bare word. `None` for anything that expands at runtime.
+    fn operand_literal(&self) -> Option<String> {
+        let TTok::Operand(text) = self.toks.get(self.pos)? else {
+            return None;
+        };
+        let t = text.trim();
+        let quoted = (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+            || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2);
+        let inner = if quoted { &t[1..t.len() - 1] } else { t };
+        if inner.contains('$') || inner.contains('`') || inner.contains('\\') {
+            return None;
+        }
+        if !quoted && (inner.starts_with('~') || inner.is_empty()) {
+            return None;
+        }
+        Some(inner.to_string())
     }
 
     fn unary_test(&mut self, op: &str, operand: &str) -> String {
@@ -12302,7 +12368,16 @@ impl<'a, 'r> TestParser<'a, 'r> {
         }
     }
 
-    fn binary_test(&mut self, op: &str, lhs: &str, lhs_num: bool, rhs: &str, rhs_num: bool) -> String {
+    fn binary_test(
+        &mut self,
+        op: &str,
+        lhs: &str,
+        lhs_num: bool,
+        rhs: &str,
+        rhs_num: bool,
+        lhs_lit: Option<&str>,
+        rhs_lit: Option<&str>,
+    ) -> String {
         match op {
             "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
                 let rs = match op {
@@ -12342,10 +12417,32 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     // bash would compare literally). The metachar test
                     // runs on the EVALUATED rhs (it may be a variable),
                     // mirroring the JS side exactly.
-                    self.render.add_helper("fnmatch");
-                    self.render.add_helper("globlike");
                     let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
                     let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
+                    // When the RHS is a CONSTANT the metachar decision is
+                    // known at render time (`"a" == "a"` is the literal
+                    // string compare, not a pattern match) — fold it and
+                    // skip the glob machinery entirely. A metachar-bearing
+                    // constant still needs fnmatch.
+                    if let Some(rlit) = rhs_lit {
+                        if !glob_like(rlit) {
+                            // Fully-constant comparison folds to a plain bool
+                            // (no String allocation). Numeric operands keep
+                            // their string rendering.
+                            if let (Some(ll), false, false) = (lhs_lit, lhs_num, rhs_num) {
+                                let same = ll == rlit;
+                                return if same == eq { "true".to_string() } else { "false".to_string() };
+                            }
+                            return if eq {
+                                format!("({l} == {r})")
+                            } else {
+                                format!("({l} != {r})")
+                            };
+                        }
+                    } else {
+                        self.render.add_helper("globlike");
+                    }
+                    self.render.add_helper("fnmatch");
                     if eq {
                         format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ __sh_fnmatch(&__r, &{l}) }} else {{ {l} == __r }} }}")
                     } else {
@@ -12371,6 +12468,21 @@ impl<'a, 'r> TestParser<'a, 'r> {
             }
             _ => format!("(!{lhs}.is_empty())"),
         }
+    }
+
+    /// Entry point carrying the operands' CONSTANT texts (when literal) so
+    /// `binary_test` can fold a non-glob literal RHS to a plain compare.
+    fn binary_test_lit(
+        &mut self,
+        op: &str,
+        lhs: &str,
+        lhs_num: bool,
+        lhs_lit: Option<&str>,
+        rhs: &str,
+        rhs_num: bool,
+        rhs_lit: Option<&str>,
+    ) -> String {
+        self.binary_test(op, lhs, lhs_num, rhs, rhs_num, lhs_lit, rhs_lit)
     }
 
     fn peek_is(&self, t: &TTok) -> bool {
