@@ -3310,6 +3310,11 @@ fn var_read(name: &str) -> String {
             return format!("${}[${}]", base, idx.trim_matches('"').trim_matches('\''));
         }
         let key = idx.trim_matches('"').trim_matches('\'');
+        // A variable subscript (`${words[$counter]}`) indexes with the
+        // variable's value, not the literal name.
+        if key.starts_with('$') || key.starts_with("${") {
+            return format!("${}{{{}}}", base, key);
+        }
         return format!("${}{{'{}'}}", base, key.replace('\'', "\\'"));
     }
     match name {
