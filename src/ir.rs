@@ -2310,6 +2310,17 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                         if let Some(cmd) = pipeline_call_to_cmd(e) {
                             emit_shell_cmd(out, indent, &cmd);
+                        } else if let Some(stages) = pipeline_stages_of(e) {
+                            // No single shell command (a stage is a Perl-side
+                            // materialisation, e.g. a process substitution):
+                            // emit the stages in order. The producer stages
+                            // write their files; the last consumer reads
+                            // STDIN, exactly like the original pipeline.
+                            for stage in &stages {
+                                for s in stage {
+                                    emit_stmt(out, s, indent);
+                                }
+                            }
                         } else {
                             emit_indent(out, indent);
                             out.push_str("die \"otranspilerl: shIR pipeline not yet supported by the Perl backend\\n\";\n");
@@ -5026,6 +5037,119 @@ fn emit_capture_assign(out: &mut String, indent: usize, lhs: &str, cmd: &str) {
 
 /// Rebuild the shell command string for an expression: a `Call exec`,
 /// a `pipeline` Call, or a `&&`/`||` chain of those (bash control operators).
+/// Rebuild the ORIGINAL `< (producer )` word from a procsub materialization.
+///
+/// transforms/process_subst rewrites `<(C)` in a pipeline stage into a run of
+/// statements (`tmp = mktemp`; `C > tmp`; …). Feeding that run to the
+/// pipeline's shell command is impossible — and the consumer would read the
+/// script's stdin instead of the producer — so recognise the shape and emit
+/// the shell form back: the mktemp/redirect pair IS the process substitution.
+fn procsub_materialization_to_cmd(args: &[IrExpr]) -> Option<String> {
+    // `and(Arrow(stmts))` — a single closure arg.
+    let body = args.iter().find_map(|a| match a {
+        IrExpr::Arrow(b) => Some(b),
+        _ => None,
+    })?;
+    // The producers: `Redirect { inner, redirects: [fd 1 -> tmp] }`. Emit
+    // each as `<(inner)`; the mktemp Assigns and the trailing rm are the
+    // materialisation's own bookkeeping and must NOT appear.
+    // tmp name -> the `<(producer)` word it stands for
+    let mut subs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // The consumer: the LAST exec, which references the tmp names as
+    // ordinary argv words (bash's /dev/fd/N argument passing), or the only
+    // exec when the procsub is on stdin.
+    let mut consumer: Option<&IrExpr> = None;
+    for s in body {
+        match s {
+            IrStmt::Redirect { inner, redirects } => {
+                let mut procsub = false;
+                for r in redirects {
+                    let is_tmp = matches!(&r.target, IrExpr::Var(n, _) if n.starts_with("__ps_tmp"));
+                    if r.fd.unwrap_or(1) == 1
+                        && matches!(r.mode.as_str(), "w" | "wc")
+                        && is_tmp
+                    {
+                        let IrExpr::Var(tmp, _) = &r.target else {
+                            return None;
+                        };
+                        let cmd = stmts_to_shell_cmd(inner)?;
+                        subs.insert(tmp.clone(), format!("<({cmd})"));
+                        procsub = true;
+                    } else if is_tmp && r.mode == "r" {
+                        // `< <(producer)` on fd 0 — the consumer reads the
+                        // materialised file; rebuild as a stdin procsub.
+                        let IrExpr::Var(tmp, _) = &r.target else {
+                            return None;
+                        };
+                        let cmd = stmts_to_shell_cmd(inner)?;
+                        subs.insert(tmp.clone(), format!("<({cmd})"));
+                        procsub = true;
+                    }
+                }
+                if !procsub {
+                    return None;
+                }
+            }
+            IrStmt::Assign { .. } => { /* tmp = $(mktemp) */ }
+            IrStmt::Expr(IrExpr::Call { func, .. })
+                if func == "exec" || func == "builtin" =>
+            {
+                // `rm tmp…` is the materialisation's cleanup, not the
+                // consumer; the consumer is an exec that is not `rm`.
+                let is_rm = matches!(
+                    s,
+                    IrStmt::Expr(IrExpr::Call { args, .. })
+                        if args.first().and_then(call_arg_str).as_deref() == Some("rm")
+                );
+                if !is_rm {
+                    consumer = Some(match s {
+                        IrStmt::Expr(e) => e,
+                        _ => unreachable!(),
+                    });
+                }
+            }
+            _ => return None,
+        }
+    }
+    match consumer {
+        Some(c) => {
+            // Rebuild the consumer with each `__ps_tmpN` word replaced by
+            // its `< (producer )` text.
+            let (cmd, words) = match c {
+                IrExpr::Call { args, .. } => exec_call_parts(args)?,
+                _ => return None,
+            };
+            let rendered: Vec<String> = words
+                .iter()
+                .map(|w| match w {
+                    IrExpr::Var(n, _) if subs.contains_key(n) => subs[n].clone(),
+                    other => bash_word_for(other),
+                })
+                .collect();
+            let mut out = bash_quote_word(&cmd);
+            if !rendered.is_empty() {
+                out.push(' ');
+                out.push_str(&rendered.join(" "));
+            }
+            if subs.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        // Only the producers (e.g. `echo x > >(cat)`) — emit their words.
+        None => {
+            if subs.is_empty() {
+                None
+            } else {
+                let mut v: Vec<String> = subs.values().cloned().collect();
+                v.sort();
+                Some(v.join(" "))
+            }
+        }
+    }
+}
+
 fn expr_to_cmd(e: &IrExpr) -> Option<String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
@@ -5050,6 +5174,13 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
                 }
                 Some(format!("[ {} ]", text))
             }
+            // The process-substitution MATERIALIZATION (transforms/
+            // process_subst): `and([Assign(tmp, capture(mktemp)),
+            //  Redirect(producer, tmp), …, cleanup])`. As a pipeline stage
+            // it must rebuild as the original `<(producer)` shell word —
+            // otherwise the producer writes a temp file nobody reads and
+            // the consumer sees the script's stdin.
+            "and" => procsub_materialization_to_cmd(args),
             _ => None,
         },
         IrExpr::BinOp { lhs, op, rhs } => {
@@ -5894,6 +6025,38 @@ fn set_is_plain_range(set: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '-')
 }
 
+/// The stage statement-lists of a `pipeline(...)` call (the shapes
+/// `pipeline([Arrow, …])` / `pipeline(Arrow, …)`), for the emitter's
+/// stage-by-stage fallback when no single shell command exists.
+fn pipeline_stages_of(call: &IrExpr) -> Option<Vec<Vec<IrStmt>>> {
+    let IrExpr::Call { func, args } = call else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let mut out: Vec<Vec<IrStmt>> = Vec::new();
+    for a in args {
+        match a {
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    match el {
+                        IrExpr::Arrow(b) => out.push(b.clone()),
+                        _ => return None,
+                    }
+                }
+            }
+            IrExpr::Arrow(b) => out.push(b.clone()),
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
         if func == "pipeline" {
@@ -5907,7 +6070,15 @@ fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
                     stage_exprs.push(a);
                 }
             }
-            let stages: Vec<String> = stage_exprs.iter().filter_map(|a| arrow_to_cmd(a)).collect();
+            let mut stages: Vec<String> = Vec::new();
+            for a in &stage_exprs {
+                // A stage whose shell text cannot be rebuilt (the
+                // process-substitution materialisation is an `and`
+                // closure) must NOT be silently DROPPED — the command
+                // would lose a producer (`paste <(…) <(…) | head` became
+                // `head`). Refuse, so the caller emits the stages natively.
+                stages.push(arrow_to_cmd(a)?);
+            }
             if stages.is_empty() {
                 return None;
             }
