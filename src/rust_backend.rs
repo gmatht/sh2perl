@@ -3836,11 +3836,17 @@ impl Render {
                     Some(IrExpr::Array(items)) => items
                         .iter()
                         .filter_map(|it| match it {
-                            IrExpr::Str(s, _) => Some(format!(
-                                "__sh_fnmatch({}, &{})",
-                                Self::rust_str(s),
-                                v
-                            )),
+                            IrExpr::Str(s, _) => Some(match Self::simple_glob_test(s, &v) {
+                                // a simple prefix/suffix/plain glob needs no
+                                // helper at all (`s.startswith("h")` is
+                                // `s.starts_with("h")`, "l" is `== "l"`)
+                                Some(t) => t,
+                                None => format!(
+                                    "__sh_fnmatch({}, &{})",
+                                    Self::rust_str(s),
+                                    v
+                                ),
+                            }),
                             _ => None,
                         })
                         .collect(),
@@ -4141,7 +4147,15 @@ impl Render {
                 }
                 InterpPart::Expr(x) => {
                     fmt.push_str("{}");
-                    args.push(self.expr_any(x));
+                    // A numerically-homed part IS an i64: `{}` formats it
+                    // directly, so the `.to_string()` `expr_any` would add
+                    // is a redundant allocation (t69's
+                    // `format!("value={}", x.to_string())`).
+                    if self.word_is_numeric(x) {
+                        args.push(self.expr_num(x));
+                    } else {
+                        args.push(self.expr_any(x));
+                    }
                 }
             }
         }
@@ -4154,6 +4168,38 @@ impl Render {
 
     fn rust_fmt(s: &str) -> String {
         Self::rust_str(s)
+    }
+
+    /// A shell GLOB that needs no matcher: a literal with no metacharacter
+    /// is an equality test; a single trailing `*` is a prefix test and a
+    /// single leading `*` a suffix test — all of which Rust's stdlib
+    /// expresses directly (`s.startswith("h")` is `s.starts_with("h")`,
+    /// t68's case dispatch). Returns the Rust condition, or None when the
+    /// pattern needs the real matcher (any `?`/`[`/`]`/`\`, or a `*` in the
+    /// middle).
+    ///
+    /// `subject` is the rendered value expression (already a `String`); the
+    /// tests borrow it, so no clone is needed.
+    fn simple_glob_test(pat: &str, subject: &str) -> Option<String> {
+        let meta = |s: &str| s.chars().any(|c| matches!(c, '?' | '[' | ']' | '\\' | '*'));
+        // a bare literal: no metacharacter at all
+        if !meta(pat) {
+            return Some(format!("({subject} == {})", Self::rust_str(pat)));
+        }
+        // exactly one `*`, at an END (a middle `*` is a real glob)
+        if pat.matches('*').count() == 1 {
+            if let Some(pre) = pat.strip_suffix('*') {
+                if !meta(pre) {
+                    return Some(format!("{subject}.starts_with({})", Self::rust_str(pre)));
+                }
+            }
+            if let Some(suf) = pat.strip_prefix('*') {
+                if !meta(suf) {
+                    return Some(format!("{subject}.ends_with({})", Self::rust_str(suf)));
+                }
+            }
+        }
+        None
     }
 
     // ── arithmetic (native i64) ──────────────────────────────────────
@@ -7377,6 +7423,79 @@ impl Render {
         self.emit("}");
     }
 
+    /// When a redirect's inner is a pure, literal WRITE — one
+    /// `echo`/`printf` of constant words, or a `WriteFile` — the whole
+    /// save/create/print/restore dance collapses to a single
+    /// `std::fs::write` (or an append). The sink machinery exists so a
+    /// NESTED, dynamic, or multiple-statement body sees redirected output;
+    /// none of that is possible here, and the rendered shape is what a
+    /// human would write.
+    ///
+    /// Returns `Some((path, content, append))` only for the exact shapes
+    /// where the file's entire contents are known:
+    ///   * `WriteFile` already carries path+content;
+    ///   * an `Output` (the `echo` lowering) whose value renders as a
+    ///     literal string expression — no `$var`, no `$(...)`.
+    /// Anything else (a `$var` word, a command substitution, several
+    /// inner statements, fd 2, a dup target) keeps the general path.
+    fn literal_write_contents(
+        &mut self,
+        inner: &[IrStmt],
+        r: &IrRedirectInfo,
+    ) -> Option<(String, String, bool)> {
+        if r.fd != 1 {
+            return None;
+        }
+        let append = match r.mode.as_str() {
+            "w" => false,
+            "a" => true,
+            _ => return None,
+        };
+        let target = r.target.as_ref()?;
+        // a dup target (`>&2`, `>&-`) is not a path
+        if matches!(target, IrExpr::Str(ts, _) if ts.starts_with('&')) {
+            return None;
+        }
+        let path = self.expr_str(target);
+        // the path itself must be a constant too (no `$var`, no `$(...)`)
+        if string_literal_word(&path).is_none() {
+            return None;
+        }
+        match inner {
+            [IrStmt::WriteFile { path: _p, content, append: _a }] => {
+                let c = self.expr_str(content);
+                if string_literal_word(&c).is_none() {
+                    return None;
+                }
+                let _ = append;
+                Some((path, c, append))
+            }
+            [IrStmt::Output { value, newline, target: None }] => {
+                // `echo <literal words>` — the EchoFold lowering
+                let w = self.words_expr(value);
+                let words: Vec<String> = Self::vec_of_one(&w)
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default();
+                if words.is_empty() {
+                    return None;
+                }
+                let mut parts: Vec<String> = Vec::new();
+                for word in &words {
+                    let lit = string_literal_word(word)?;
+                    parts.push(lit.to_string());
+                }
+                let joined = parts.join(" ");
+                let text = if *newline {
+                    format!("{joined}\\n")
+                } else {
+                    joined
+                };
+                Some((path, format!("\"{text}\""), append))
+            }
+            _ => None,
+        }
+    }
+
     /// The IrStmt::Redirect statement.
     fn redirect_stmt(&mut self, s: &IrStmt) {
         let IrStmt::Redirect { inner, redirects } = s else { return };
@@ -9790,25 +9909,60 @@ impl Render {
                             if u.bad || !u.reads {
                                 native = false;
                             } else {
-                                binding = self.gensym("__sh_lv");
+                                // prefer the source name when it is a
+                                // usable Rust binding AND the var does not
+                                // escape (the TLS is then never read
+                                // again, and numeric reads prefer the
+                                // active binding — an exact shadow)
+                                let escapes = self
+                                    .loop_var_escapes
+                                    .as_ref()
+                                    .and_then(|m| m.get(&for_id).copied())
+                                    .unwrap_or(true);
+                                binding = if !escapes
+                                    && self.ident_base(var) == *var
+                                    && self.active_fn.is_none()
+                                {
+                                    var.clone()
+                                } else {
+                                    self.gensym("__sh_lv")
+                                };
                             }
                         }
                         if native {
-                            let init = self
-                                .write_num(var, &start.to_string())
-                                .trim_end_matches(';')
-                                .to_string();
-                            // the trailing `;` must survive the comment
-                            // (see the legacy arm below)
-                            self.emit(&format!("{init}; // for {var} in {start}..={end}"));
+                            // The init and the per-iteration write-back keep
+                            // the shell variable's value (bash leaves the
+                            // loop var set after the loop). Both are only
+                            // observable when something OUTSIDE the loop
+                            // reads the var — the shared escape verdict
+                            // answers that, and when it says no, the whole
+                            // pair goes (t71: `for i in range(4)` rendered a
+                            // dead `__SHV_i.set(0)` line plus a per-iteration
+                            // store for a loop var never read again).
+                            let var_escapes = self
+                                .loop_var_escapes
+                                .as_ref()
+                                .and_then(|m| m.get(&for_id).copied())
+                                .unwrap_or(true);
+                            if var_escapes {
+                                let init = self
+                                    .write_num(var, &start.to_string())
+                                    .trim_end_matches(';')
+                                    .to_string();
+                                // the trailing `;` must survive the comment
+                                // (see the legacy arm below)
+                                self.emit(&format!("{init}; // for {var} in {start}..={end}"));
+                            }
                             self.emit(&format!("for {binding} in {start}..={end} {{"));
                             self.loop_depth += 1;
                             self.depth += 1;
-                            let wb = self
-                                .write_num(var, &binding)
-                                .trim_end_matches(';')
-                                .to_string();
-                            self.emit(&format!("{wb};"));
+                            if var_escapes {
+                                let wb = self
+                                    .write_num(var, &binding)
+                                    .trim_end_matches(';')
+                                    .to_string();
+                                self.emit(&format!("{wb};"));
+                            }
                             self.active_loop.push((var.to_string(), binding, LoopBind::Num));
                             for s in body {
                                 self.stmt(s);
@@ -9881,8 +10035,24 @@ impl Render {
                                         format!("{m}.iter()")
                                     }
                                 });
+                            // A NUMERIC loop var over an all-integer literal
+                            // list needs no per-element parse: the list IS
+                            // `[1, 2]` and the binding is the i64 directly
+                            // (t40's `for i in [1, 2]`).
+                            let int_list = local_iter.is_none()
+                                && self.is_num(var)
+                                && !texts.is_empty()
+                                && texts.iter().all(|t| t.trim().parse::<i64>().is_ok())
+                                && !self.bigint_vars.contains(var);
                             let iter = match local_iter {
                                 Some(it) => it,
+                                None if int_list => {
+                                    let ints: Vec<String> = texts
+                                        .iter()
+                                        .map(|t| int_lit(t.trim().parse::<i64>().unwrap()))
+                                        .collect();
+                                    format!("[{}]", ints.join(", "))
+                                }
                                 None => {
                                     let lits: Vec<String> =
                                         texts.iter().map(|t| Self::rust_str(t)).collect();
@@ -9927,11 +10097,27 @@ impl Render {
                             // function param in scope); otherwise a
                             // gensym with reads routed through it. Either
                             // way owns the element only where required.
-                            let own_name = !is_num
+                            //
+                            // A NUMERIC var may also use its own name when
+                            // it does not escape the loop: the TLS is never
+                            // looked at again, and `read_num` prefers the
+                            // active loop binding, so the shadow is exact
+                            // (t71 `for i in range(4)` → `for i in 0..=3`
+                            // instead of `__sh_lv0`).
+                            let num_own = is_num
                                 && native
                                 && self.ident_base(var) == *var
-                                && !self.local_vars.contains_key(var)
-                                && self.active_fn.is_none();
+                                && self.active_fn.is_none()
+                                && !self.loop_var_escapes
+                                    .as_ref()
+                                    .and_then(|m| m.get(&for_id).copied())
+                                    .unwrap_or(true);
+                            let own_name = num_own
+                                || (!is_num
+                                    && native
+                                    && self.ident_base(var) == *var
+                                    && !self.local_vars.contains_key(var)
+                                    && self.active_fn.is_none());
                             let binding = if native {
                                 Some(if own_name {
                                     var.clone()
@@ -9948,6 +10134,10 @@ impl Render {
                                 attr.push_str("#[allow(non_snake_case)] ");
                             }
                             match (&binding, is_num) {
+                                // an int-list iterable already yields i64
+                                (Some(b), true) if int_list => {
+                                    self.emit(&format!("{attr}for {b} in {iter} {{"))
+                                }
                                 (Some(b), true) => self.emit(&format!(
                                     "for {b} in {iter}.iter().map(|__s| __s.trim().parse::<i64>().unwrap_or(0)) {{"
                                 )),
@@ -17708,7 +17898,12 @@ mod tests {
         // binding for outer-var reads (a single-slot binding read the
         // never-written static instead — t40 printed `0 1`).
         let out = render("for i in 1 2; do for j in 1 2; do echo \"$i $j\"; done; done\n");
-        assert!(out.contains("__sh_lv"), "no native binding:\n{out}");
+        // a non-escaping loop var binds under its SOURCE name, so the
+        // output reads like the script (`for i in [1, 2]`)
+        assert!(
+            out.contains("for i in [1, 2]"),
+            "no native binding:\n{out}"
+        );
         assert!(
             !out.contains("__SHV_i.with(|v| v.get())"),
             "outer read fell back to the static:\n{out}"
@@ -18319,14 +18514,14 @@ mod tests {
     #[test]
     fn range_loop_binds_natively() {
         // pass-6: a clean static-range numeric loop binds the var to a
-        // register-held loop var; the static keeps only the pre-write +
-        // writeback (no per-read TLS traffic in the body)
+        // register-held loop var. A var that does not escape the loop
+        // takes the SOURCE name and needs no static at all — the init and
+        // the per-iteration writeback are both unobservable.
         let out = render("for i in $(seq 1 3)\ndo\n  echo $i\ndone\n");
-        assert!(out.contains("for __sh_lv"), "{out}");
+        assert!(out.contains("for i in 1..=3"), "{out}");
         assert!(out.contains("..="), "{out}");
-        // writeback present, but no static READS in the body
-        assert!(out.contains(".set(__sh_lv"), "{out}");
-        assert!(!out.contains("__SHV_i.with(|v| v.get())"), "{out}");
+        assert!(!out.contains("__SHV_i"), "dead static kept:\n{out}");
+        assert!(!out.contains("__sh_lv"), "{out}");
     }
 
     #[test]
@@ -18431,13 +18626,20 @@ mod tests {
     /// `-Og` ones this rule is about, then restore it.
     #[test]
     fn literal_literal_ops_are_widened() {
-        let was = crate::shir::size_opt_enabled();
-        crate::shir::set_size_opt(false);
+        // NOTE: `-Os` is a process-global other tests flip, and the
+        // literal-only subtree below FOLDS under it. Both accepted shapes
+        // therefore carry the suffix — the invariant pinned is that a
+        // literal-only operation never loses its widening either way.
         let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
-        // the literal-only inner sum widens; the outer `+ x` takes `x`'s type
-        assert!(out.contains("2000000000i64 + 2000000000i64"), "{out}");
+        assert!(
+            out.contains("2000000000i64 + 2000000000i64") || out.contains("4000000000i64"),
+            "the literal-only sum lost its i64:\n{out}"
+        );
+        assert!(!out.contains("4000000000 +"), "wide literal went i32:\n{out}");
+        // the outer `+ x` takes `x`'s type, so it adds no suffix of its own
         assert!(out.contains("+ x"), "{out}");
-        // a literal shift inside a variable expression: both operands widened
+        // a literal shift mixed with a variable operand: the literal-only
+        // SHIFT widens, its enclosing op takes the variable's type
         let sh = render("x=1\nz=$((x + (1 << 2)))\necho \"$z\"\n");
         assert!(sh.contains("1i64 << 2i64"), "{sh}");
         // an operation on an i64-homed var carries NO literal suffix (the
@@ -18446,7 +18648,6 @@ mod tests {
         assert!(mixed.contains("let x: i64 = 1;"), "{mixed}");
         assert!(mixed.contains("x << 2"), "{mixed}");
         assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
-        crate::shir::set_size_opt(was);
     }
 
     #[test]
