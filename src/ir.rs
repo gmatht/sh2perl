@@ -3558,7 +3558,16 @@ fn perl_lhs_for(var: &str) -> String {
             // scalar), which under `use strict` wrote to a different slot
             // than the `$map{'k'}` reads.
             let key = i.trim_matches('"').trim_matches('\'');
-            if key.starts_with('$') || key.starts_with("${") {
+            // A SUBSCRIPT that is itself an expansion (`options["${flags:j:1}"]`,
+            // `h[$k]`) must be lowered to Perl — emitting the raw `${…}`
+            // text produced `$options{${flags:j:1}}` (a syntax error /
+            // literal key, so the hash stayed empty).
+            if key.starts_with("${") && key.ends_with('}') {
+                if let Some(p) = param_text_to_perl(key) {
+                    return format!("${}{{{}}}", base, p);
+                }
+            }
+            if key.starts_with('$') {
                 return format!("${}{{{}}}", base, key);
             }
             format!("${}{{'{}'}}", base, key.replace('\'', "\\'"))
@@ -4107,17 +4116,40 @@ fn render_param(args: &[IrExpr]) -> String {
         ",," => format!("lc({})", var),
         "^" => format!("ucfirst({})", var),
         "," => format!("lcfirst({})", var),
-        // Substring: ${var:off:len} → substr($var, off, len).
+        // Substring: ${var:off:len} → substr($var, off, len). The offset and
+        // length may be VARIABLES (`${flags:j:1}` — the bash idiom for
+        // `substr($flags, $j, 1)`); a bare identifier must become a Perl
+        // read, and a negative offset counts from the end.
         ":" => {
-            let off = args
-                .get(2)
-                .and_then(call_arg_str)
-                .unwrap_or_else(|| "0".to_string());
-            let len = args.get(3).and_then(call_arg_str).unwrap_or_default();
-            if len.is_empty() {
+            let num_or_read = |t: String| -> String {
+                let t = t.trim().to_string();
+                if t.is_empty() {
+                    return "0".to_string();
+                }
+                if t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    || t.starts_with('-')
+                {
+                    return t;
+                }
+                if t.starts_with('$') || t.starts_with("${") {
+                    if t.starts_with("${") {
+                        return param_text_to_perl(&t).unwrap_or(t);
+                    }
+                    return var_read(t.trim_start_matches('$'));
+                }
+                if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return var_read(&t);
+                }
+                t
+            };
+            let off = num_or_read(
+                args.get(2).and_then(call_arg_str).unwrap_or_default(),
+            );
+            let len_raw = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            if len_raw.trim().is_empty() {
                 format!("substr({}, {})", var, off)
             } else {
-                format!("substr({}, {}, {})", var, off, len)
+                format!("substr({}, {}, {})", var, off, num_or_read(len_raw))
             }
         }
         // Substitution: / first, // all.
@@ -4165,10 +4197,34 @@ fn render_param(args: &[IrExpr]) -> String {
             // `${s:off:len}`: `substr`. The A1 drops `[@]`, so consult the
             // program's array census (`numbers[@]:3:4` stays a slice).
             if raw_off != "@" && !array_var(&name) {
+                // The offset/length may be VARIABLES — `${flags:j:1}` is the
+                // bash idiom for `substr($flags, $j, 1)`; emitting the bare
+                // name produced a syntax error (`substr($f, j, 1)`).
+                let as_arg = |t: &str| -> String {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        return "0".to_string();
+                    }
+                    if t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                        || t.starts_with('-')
+                    {
+                        return t.to_string();
+                    }
+                    if t.starts_with("${") {
+                        return param_text_to_perl(t).unwrap_or_else(|| t.to_string());
+                    }
+                    if let Some(n) = t.strip_prefix('$') {
+                        return var_read(n);
+                    }
+                    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        return var_read(t);
+                    }
+                    t.to_string()
+                };
                 if raw_len.is_empty() {
-                    return format!("substr({}, {})", var, raw_off);
+                    return format!("substr({}, {})", var, as_arg(&raw_off));
                 }
-                return format!("substr({}, {}, {})", var, raw_off, raw_len);
+                return format!("substr({}, {}, {})", var, as_arg(&raw_off), as_arg(&raw_len));
             }
             // `${#arr[@]}` — array LENGTH (the `#`-prefixed name with an
             // `@` offset and no length). A hash's `${#h[@]}` is its key
@@ -8067,6 +8123,31 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
             return Some(format!("join(' ', @{})", base));
         }
         return Some(var_read(&name));
+    }
+    // `${s:off:len}` — the substring/slice form (`${flags:j:1}`). The `:`
+    // also introduces `:-`/`:=`/`:?`/`:+`, which the operator list below
+    // handles, so only a `:digit`/`:$` continuation is a slice.
+    if let Some(rest) = rest.strip_prefix(':') {
+        // `:` followed by anything that is NOT one of the parameter
+        // operators (`:-`, `:=`, `:?`, `:+`) is a slice. An identifier
+        // subscript (`${flags:j:1}`) is the common shell idiom for
+        // `substr(..., $j, 1)`.
+        let is_op = [':', '=', '?', '+']
+            .iter()
+            .any(|c| rest.starts_with(*c));
+        if !is_op {
+        
+            let (off, len) = match rest.split_once(':') {
+                Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+                None => (rest.trim().to_string(), String::new()),
+            };
+            return Some(render_param(&[
+                IrExpr::Str(":".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Str(name, StrStyle::DoubleQuoted),
+                IrExpr::Str(off, StrStyle::DoubleQuoted),
+                IrExpr::Str(len, StrStyle::DoubleQuoted),
+            ]));
+        }
     }
     for op in [":-", ":+", ":=", ":?", "##", "%%", "//", "#", "%", "-", "+", "=", "?", "/"] {
         if let Some(arg) = rest.strip_prefix(op) {
