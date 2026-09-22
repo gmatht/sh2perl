@@ -12622,11 +12622,69 @@ pub fn analyze_var_borrowable(prog: &IrProgram) -> std::collections::HashSet<Str
         }
     }
 
+    /// The variable NAMES a call carries as string arguments — the
+    /// frontend convention where a value builtin takes the operand's name
+    /// as a `Str` (`param("slice", "s", …)` for `s[1:3]`, `arrayLen("a")`,
+    /// `join("a")`, `arrayIndex("a", …)`, `assocGet("m", …)`, `split("s",
+    /// …)`, `sum`/`min`/`max("a")`). These are READS of the named variable:
+    /// without them `analyze_var_borrowable` sees no read at all and
+    /// withholds, so the var stays an owned thread_local and every use
+    /// clones it (t37/t38: `let s = "hello".to_string();` then
+    /// `__sh_len(&s.clone())`).
+    ///
+    /// Only the exact funcs and arg positions the renderers consult as a
+    /// NAME are listed (see `param_str`, `listvar_joined`, `join_str`,
+    /// `array_index_str`, `assoc_get`). Anything else returns nothing, so
+    /// an unrecognised call cannot accidentally promote a string literal
+    /// into a read.
+    fn name_args(e: &IrExpr) -> Vec<&str> {
+        let (func, args) = match e {
+            IrExpr::Call { func, args } => (func.as_str(), args),
+            _ => return Vec::new(),
+        };
+        // (index, strips an `[@]`/`[*]` suffix)
+        let at: Option<usize> = match func {
+            // param(op, name, …) — `op` selects the operation, `name` is
+            // the variable (`slice`, `#`, `%`, `len`, `[@]`, …)
+            "param" => Some(1),
+            // the single-name value builtins
+            "arrayLen" | "arrayIndex" | "arrayItems" | "listVar" | "join" | "split" | "sum"
+            | "min" | "max" | "assocGet" | "assocKeys" => Some(0),
+            _ => None,
+        };
+        let idx = match at {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        if let Some(IrExpr::Str(n, _)) = args.get(idx) {
+            // `#x[@]` / `!m[@]` carry a sigil prefix and an `[@]`/`[*]`
+            // suffix in the name string
+            let n = n.trim_start_matches('#').trim_start_matches('!');
+            let n = n
+                .strip_suffix("[@]")
+                .or_else(|| n.strip_suffix("[*]"))
+                .unwrap_or(n);
+            if !n.is_empty() && n != "@" && n != "*" {
+                out.push(n);
+            }
+        }
+        out
+    }
+
     /// Every variable read inside `e`, reported as borrows unless the
     /// expression is a retaining position (handled by the caller).
     fn mark_reads(e: &IrExpr, acc: &mut Acc) {
+        // a call whose args NAME variables (`param("slice", "s", …)`)
+        // reads those variables
+        for n in name_args(e) {
+            acc.mark_read(n);
+        }
         walk(e, &mut |x| {
             if let Some(n) = read_var(x) {
+                acc.mark_read(n);
+            }
+            for n in name_args(x) {
                 acc.mark_read(n);
             }
         });

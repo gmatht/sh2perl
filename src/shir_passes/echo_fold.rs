@@ -105,7 +105,11 @@ fn constant_echo(st: &IrStmt) -> Option<IrStmt> {
     let IrExpr::Array(words) = args.get(1)? else {
         return None;
     };
-    fold_to_output(words)
+    // an all-literal echo folds to a precomputed string; a single
+    // INTEGER-valued word folds to an Output carrying the value (so the
+    // print path formats the number directly instead of round-tripping
+    // through `.to_string()`).
+    fold_to_output(words).or_else(|| fold_numeric_echo(args))
 }
 
 /// The constant-echo fold: join the (all-literal) words, apply the
@@ -151,6 +155,58 @@ fn fold_to_output(words: &[IrExpr]) -> Option<IrStmt> {
         newline: nl,
         target: None,
     })
+}
+
+/// Fold a single-word `echo` whose word is an INTEGER by construction
+/// into a native `Output` carrying the value itself.
+///
+/// `echo <int-expr>` is a print of a number: leaving it an exec call makes
+/// every renderer stringify first (`__sh_len(&s).to_string()`), only for
+/// the print to format it back. `Output { value, newline: true }` lets each
+/// backend print the value directly (`println!("{}", __sh_len(&s))`).
+///
+/// Conservative: exactly `echo` with ONE word (a single word has no
+/// separator, so word joining cannot matter) and a value that is numeric
+/// BY CONSTRUCTION — a bare `Int`/`Arith`, or the int-returning builtins
+/// (`param("len", …)`, `arrayLen`). Anything else refuses; the string path
+/// is correct, just noisier.
+fn fold_numeric_echo(args: &[IrExpr]) -> Option<IrStmt> {
+    let IrExpr::Str(cmd, _) = args.first()? else {
+        return None;
+    };
+    if cmd != "echo" {
+        return None;
+    }
+    let IrExpr::Array(words) = args.get(1)? else {
+        return None;
+    };
+    let [word] = words.as_slice() else {
+        return None;
+    };
+    if !numeric_word(word) {
+        return None;
+    }
+    Some(IrStmt::Output {
+        value: word.clone(),
+        newline: true,
+        target: None,
+    })
+}
+
+/// Is this word a number by construction (so a print can format it with no
+/// stringification round-trip)? A bare `Int`/`Arith`, and the builtins that
+/// return an integer.
+pub fn numeric_word(w: &IrExpr) -> bool {
+    match w {
+        IrExpr::Int(_) | IrExpr::Arith(_) => true,
+        IrExpr::Call { func, args } => match func.as_str() {
+            "arrayLen" => true,
+            // `param(op, …)`: only the LENGTH op yields an integer
+            "param" => matches!(args.first(), Some(IrExpr::Str(op, _)) if op == "len"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The compile-time text of a word, or `None` when it involves any
@@ -347,5 +403,30 @@ mod tests {
         assert_eq!(echo_esc("a\\\\b"), "a\\b");
         assert_eq!(echo_esc("ab\\cde"), "ab"); // \c truncates
         assert_eq!(echo_esc("\\101"), "A"); // octal
+    }
+}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    #[test]
+    fn numeric_echo_folds() {
+        let st = IrStmt::Expr(IrExpr::Call {
+            func: "exec".into(),
+            args: vec![
+                IrExpr::Str("echo".into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "arrayLen".into(),
+                    args: vec![IrExpr::Str("a".into(), StrStyle::DoubleQuoted)],
+                }]),
+            ],
+        });
+        let out = constant_echo(&st).expect("numeric echo must fold");
+        match out {
+            IrStmt::Output { newline, .. } => assert!(newline),
+            other => panic!("not an Output: {other:?}"),
+        }
     }
 }
