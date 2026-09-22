@@ -2672,6 +2672,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     out.push_str(&format!("{} = {};\n", lhs, expr));
                                     return;
                                 }
+                                // A `||` chain of pipeline-expressible
+                                // commands (`x=$(stat … || wc -c < f)`).
+                                if let Some(expr) = chain_or_capture(e) {
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!("{} = {};\n", lhs, expr));
+                                    return;
+                                }
                             }
                             // Natively emittable body (folded `Output`,
                             // emulated commands): capture the Perl prints.
@@ -7556,6 +7563,35 @@ fn capture_body_native(stmts: &[IrStmt]) -> bool {
         })
 }
 
+/// A `||` chain of pipeline-expressible commands as a Perl expression:
+/// `A || B` runs `A`; on a nonzero status it runs `B` instead. Used by
+/// `x=$(stat … || wc -c < f)` so the capture does not shell to `bash -c`
+/// (check_qx).
+fn chain_or_capture(e: &IrExpr) -> Option<String> {
+    if let IrExpr::BinOp {
+        lhs,
+        op: BinOpKind::Or,
+        rhs,
+    } = e
+    {
+        let l = chain_or_capture(lhs).or_else(|| pipeline_leaf_capture(lhs))?;
+        let r = pipeline_leaf_capture(rhs)?;
+        return Some(format!(
+            "do {{ my $__c = {}; if ($CHILD_ERROR != 0) {{ $__c = {}; }} $__c }}",
+            l, r
+        ));
+    }
+    None
+}
+
+/// One pipeline-expressible command (no globs/vars it cannot expand)
+/// as a `__sh_pipe_capture` expression.
+fn pipeline_leaf_capture(e: &IrExpr) -> Option<String> {
+    let cmd = expr_to_cmd(e)?;
+    let v = pipeline_value_cmd(&cmd)?;
+    Some(format!("__sh_pipe_capture({})", v))
+}
+
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Capture { expr, native } => {
@@ -7601,6 +7637,11 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             );
                         }
                         if let Some(expr) = capture_uu_expr(e) {
+                            return expr;
+                        }
+                        // `x=$(stat … || wc -c < f)` — a `||` chain whose
+                        // leaves the pipeline can run in-process.
+                        if let Some(expr) = chain_or_capture(e) {
                             return expr;
                         }
                     }
