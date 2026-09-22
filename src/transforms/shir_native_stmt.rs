@@ -2670,13 +2670,28 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
         // is represented by split(...) and is intentionally refused.
         // Leading option words (-e/-E/-n) are skipped.
         let mut ws: Vec<IrExpr> = Vec::new();
+        let mut leading = true;
         for w in words {
             if matches!(
                 w,
                 IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n"
             ) {
-                continue;
+                // The flags only count in LEADING position (bash: `echo x -n`
+                // prints `x -n`) — and `-n` must actually CLEAR the newline,
+                // not just be dropped (`echo -n "$x"` printed a newline).
+                if leading {
+                    if let IrExpr::Str(sv, _) = w {
+                        match sv.as_str() {
+                            "-n" => newline = false,
+                            "-e" => decode_escapes = true,
+                            "-E" => decode_escapes = false,
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
             }
+            leading = false;
             if !is_quoted_echo_expr(w) {
                 return false;
             }

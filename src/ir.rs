@@ -7479,7 +7479,6 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
 /// as flattened by ast_to_ir) as a Perl boolean expression.
 fn render_test_expr(s: &str) -> String {
-    if std::env::var("DLS4").is_ok() { eprintln!("DLS4 test_expr {:?}", s); }
     // `[[ ]]` tests flatten to NO-WHITESPACE forms ("$s==*.txt",
     // "$s=~^re$", "$f1==!(*.min).js", ""$y"="5"") that the spaced
     // tokenizer can't parse. Spaced strings (with -gt/-a/etc.) keep the
@@ -7555,7 +7554,6 @@ pub(crate) fn nocase_str_eq(lhs: &str, rhs: &str) -> String {
 /// Render a flattened `[[ ]]` test: lhs OP rhs where OP is `==`, `=~`,
 /// `!=` or `=`. Glob and extglob patterns become regex matches.
 fn render_flat_test(s: &str) -> Option<String> {
-    if std::env::var("DLS4").is_ok() { eprintln!("DLS4 flat_test {:?}", s); }
     for (op, kind) in [("==", "eq"), ("=~", "re"), ("!=", "ne"), ("=", "eq")] {
         if let Some(pos) = s.find(op) {
             let lhs = flat_operand(&s[..pos]);
