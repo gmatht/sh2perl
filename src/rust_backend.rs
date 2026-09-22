@@ -1563,9 +1563,9 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         // Finally, drop any Int-homed name (`is_num`): a numeric local is
         // declared `: i64` by `local_write_stmt`, so it can never hold a
         // borrowed `&str`. The two verdicts are computed independently, and
-        // when both fired the ternary/numeric path emitted arms as `&str`
-        // into an `: i64` binding — hard rustc E0308 (e.g. a numeric ternary
-        // `n = 10 if c else 20`, and the shell form
+        // when both fired the ternary path emitted `&str` arms into an
+        // `: i64` binding — a hard rustc E0308 for a NUMERIC ternary
+        // (`n = 10 if c else 20`, and the shell form
         // `if [ c ]; then n=10; else n=20; fi`). Numeric wins.
         {
             let str_forced = str_forced_vars(&prog);
@@ -3349,6 +3349,25 @@ impl Render {
                 } else {
                     "0".to_string()
                 }
+            }
+            // `param("len", name)` — the char-count of a string, an i64 in
+            // hand. The string path would emit `__sh_len(&s).to_string()`
+            // and then PARSE it back, so render the value directly.
+            IrExpr::Call { func, args } if func == "param" => {
+                let op = str_arg(args, 0).unwrap_or("");
+                if op == "len" {
+                    let name = str_arg(args, 1).unwrap_or("");
+                    if !name.is_empty() {
+                        self.add_helper("len");
+                        // `__sh_len` takes `&str`; a borrowable local IS a
+                        // `&str` already, so hand it over without a
+                        // `.to_string()` round-trip.
+                        let s = self.read_str(name);
+                        return format!("__sh_len(&{})", Render::unparen(&s));
+                    }
+                }
+                let s = self.expr_str(&IrExpr::Call { func: func.clone(), args: args.to_vec() });
+                format!("{s}.trim().parse::<i64>().unwrap_or(0)")
             }
             // numeric reductions (t98 `s += min(xs)`; empty max/min → 0,
             // Python raises — documented gap, no test covers it).
@@ -7904,6 +7923,22 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(n, _)) if self.is_num(n))
             }
+            // int-RETURNING value builtins: `{}` formats an i64 directly,
+            // so appending `.to_string()` is a redundant allocation
+            // (`__sh_len(&s).to_string()` → `__sh_len(&s)`).
+            IrExpr::Call { func, args } => match func.as_str() {
+                // `arrayLen("a")` — always an i64 length
+                "arrayLen" => true,
+                // `sum`/`min`/`max` over an INT-homed array (`Vec<i64>`);
+                // refuse for an assoc map (no numeric reduction).
+                "sum" | "min" | "max" => match args.first() {
+                    Some(IrExpr::Str(n, _)) => self.is_int_array(n),
+                    _ => false,
+                },
+                // `param("len", …)` — the char-count of a string, an i64
+                "param" => matches!(args.first(), Some(IrExpr::Str(op, _)) if op == "len"),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -9345,6 +9380,16 @@ impl Render {
                         return;
                     }
                 }
+                // A single INTEGER-valued echo (EchoFold's numeric arm):
+                // print the number itself — `{}` formats it, so the
+                // `.to_string()` a word list would force is pure waste.
+                if self.runtime_free && crate::shir_passes::echo_fold::numeric_word(value) {
+                    let v = self.expr_num(value);
+                    let mac = if *newline { "println!" } else { "print!" };
+                    self.emit(&format!("{mac}(\"{{}}\", {});", Self::drop_trailing_clone(&v)));
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    return;
+                }
                 let w = self.words_expr(value);
                 self.add_helper("print_words");
                 self.emit(&format!("__sh_print_words(&[{w}], {}, false);", newline));
@@ -9385,10 +9430,9 @@ impl Render {
                         let bare = |x: &str| {
                             string_literal_word(x).map(|s| s.to_string()).unwrap_or_else(|| x.to_string())
                         };
-                        let ce = Self::unwrap_cond(&self.expr_bool(cond));
                         let binding = format!(
                             "if {} {{ {} }} else {{ {} }}",
-                            Self::unparen(&ce),
+                            Self::unparen(&self.expr_bool(cond)),
                             bare(&Self::unparen(&tc).to_string()),
                             bare(&Self::unparen(&ec).to_string())
                         );
@@ -9413,12 +9457,7 @@ impl Render {
                             _ => (tc, ec),
                         }
                     };
-                    // the same condition-position cleanup the statement form
-                    // gets: a truthiness test renders as a bare bool, some
-                    // forms still carry a status wrapper. Also strip the
-                    // interpolator's identity `format!` for a whole-word
-                    // operand.
-                    let ce = Self::unwrap_cond(&self.expr_bool(cond));
+                    let ce = self.expr_bool(cond);
                     let binding =
                         format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
                     let st = self.local_write_stmt(&name, &binding);
@@ -9495,7 +9534,7 @@ impl Render {
                         self.depth -= 1;
                         for (ec, body) in elsifs {
                             let ec = Self::unwrap_cond(&self.expr_bool(ec));
-                            self.emit(&format!("}} else if {ec} {{"));
+                            self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
                             self.depth += 1;
                             for s in body {
                                 self.stmt(s);
@@ -9527,7 +9566,7 @@ impl Render {
                     self.depth -= 1;
                     for (ec, body) in elsifs {
                         let ec = Self::unwrap_cond(&self.expr_bool(ec));
-                        self.emit(&format!("}} else if {ec} {{"));
+                        self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
                         self.depth += 1;
                         for s in body {
                             self.stmt(s);
@@ -17939,7 +17978,12 @@ mod tests {
     /// borrowing it would dangle on the next statement.
     #[test]
     fn temporary_boundings_stay_owned() {
-        let out = render("a=$(echo hi)\necho \"$a\"\n");
+        // A capture whose body is a runtime read is a TEMPORARY, so the
+        // binding stays owned. (`a=$(echo hi)` no longer reaches the backend:
+        // the ingress `const_capture_fold` folds a constant-echo capture to
+        // the literal, so the test uses a capture the fold must refuse —
+        // a variable word.)
+        let out = render("v=hi\na=$(echo \"$v\")\necho \"$a\"\n");
         assert!(out.contains("let a = "), "{out}");
         assert!(!out.contains("let a = &"), "temporary borrowed:\n{out}");
     }
