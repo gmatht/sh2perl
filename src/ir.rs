@@ -7495,6 +7495,10 @@ fn capture_expr_native(e: &IrExpr) -> bool {
                 }
             }
             "$fn_call" | "fnCall" => true,
+            // The shared `test`/`arith` ops are pure-Perl (render_test_call /
+            // arith_str_to_perl) — capturable in-process.
+            "test" => true,
+            "arith" => true,
             // `A && B` / `A || B` closures (the shell frontend's chain form).
             "and" | "or" => {
                 !args.is_empty()
@@ -7511,6 +7515,11 @@ fn capture_expr_native(e: &IrExpr) -> bool {
                 && capture_expr_native(rhs)
         }
         IrExpr::Arith(_) => true,
+        // A raw test operand (`If{cond: Str("-d 'a'", Raw)}` — the
+        // `test` chain lowered to an if/else); a plain value is native.
+        IrExpr::Str(_, _) => true,
+        IrExpr::Var(_, _) => true,
+        IrExpr::Interpolate(_) => true,
         _ => false,
     }
 }
@@ -7526,6 +7535,23 @@ fn capture_body_native(stmts: &[IrStmt]) -> bool {
             IrStmt::Output { .. } => true,
             IrStmt::Block(inner) => capture_body_native(inner),
             IrStmt::Expr(e) => capture_expr_native(e),
+            // `A && B || C` lowers to an if/else with native branches
+            // (`test -d a && echo yes || echo no` inside `$( … )`).
+            // Empty branches are fine.
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                capture_expr_native(cond)
+                    && (then.is_empty() || capture_body_native(then))
+                    && elsifs.iter().all(|(c, b)| {
+                        capture_expr_native(c) && (b.is_empty() || capture_body_native(b))
+                    })
+                    && (else_.is_empty() || capture_body_native(else_))
+            }
             _ => false,
         })
 }
@@ -8718,7 +8744,13 @@ fn pipeline_value_cmd(cmd: &str) -> Option<String> {
                     parts.push(safe_perl_q_string(&lit));
                     lit.clear();
                 }
-                parts.push(format!("__sh_q({})", var_read(&name)));
+                // The redirect arm binds dynamic targets into `%ENV` slots.
+                let val = if name.starts_with("__sh2_") {
+                    format!("$ENV{{{}}}", name)
+                } else {
+                    var_read(&name)
+                };
+                parts.push(format!("__sh_q({})", val));
                 i = j + 1;
                 continue;
             }
