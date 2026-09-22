@@ -1786,6 +1786,24 @@ impl Render {
                 } else {
                     after = end;
                 }
+                // When the store was the ONLY content on its line, the
+                // removal leaves an empty line — a blank in the middle of a
+                // multi-line emit (`while { let __f = …; <store>; __any }`,
+                // the py read-loop). Swallow the trailing newline too, but
+                // never a leading one: the line we are on must not merge
+                // with the line before it.
+                let line_start = out.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let prefix_blank = out[line_start..].trim().is_empty();
+                if prefix_blank {
+                    let mut n = after;
+                    while n < tail.len() && (tail.as_bytes()[n] == b' ' || tail.as_bytes()[n] == b'\t')
+                    {
+                        n += 1;
+                    }
+                    if n < tail.len() && tail.as_bytes()[n] == b'\n' {
+                        after = n + 1;
+                    }
+                }
                 rest = &tail[after..];
             } else if tail.starts_with("__SH_RC.load(") {
                 let Some(end) = Self::match_paren(tail, "__SH_RC.load(".len() - 1) else {
@@ -5311,10 +5329,42 @@ impl Render {
                     continue;
                 }
                 let get = format!("__f.get({idx}).cloned().unwrap_or_default()");
-                if self.is_num(name) {
-                    lines.push(self.write_num(name, &format!("{get}.trim().parse::<i64>().unwrap_or(0)")));
+                // A pure expression builder must not touch the output
+                // buffer: `write_str`/`write_num` call `emit`, which
+                // appends (depth-indented) to `self.out` AND can push a
+                // separator blank. The caller emits THIS string, so the
+                // side effect left stray blank lines inside the while
+                // condition (t61).
+                if self.local_vars.contains_key(name) {
+                    // a pass-2 local: its deferred `let` is consumed here,
+                    // exactly as `local_write_stmt` does (without emit)
+                    if self.local_init.remove(name) {
+                        let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
+                        let ty = if self.is_num(name) { ": i64" } else { "" };
+                        let m = self.var_ident(name);
+                        let val = if self.is_num(name) {
+                            format!("{get}.trim().parse::<i64>().unwrap_or(0)")
+                        } else {
+                            get.clone()
+                        };
+                        lines.push(format!("{kw} {m}{ty} = {val};"));
+                    } else {
+                        let m = self.var_ident(name);
+                        let val = if self.is_num(name) {
+                            format!("{get}.trim().parse::<i64>().unwrap_or(0)")
+                        } else {
+                            get.clone()
+                        };
+                        lines.push(format!("{m} = {val};"));
+                    }
+                } else if self.is_num(name) {
+                    let m = self.tls(name);
+                    lines.push(format!(
+                        "{m}.with(|v| v.set({get}.trim().parse::<i64>().unwrap_or(0)));"
+                    ));
                 } else {
-                    lines.push(self.write_str(name, &get));
+                    let m = self.tls(name);
+                    lines.push(format!("{m}.with(|v| *v.borrow_mut() = {get});"));
                 }
             }
         }
@@ -7527,7 +7577,7 @@ impl Render {
     fn fn_call_stmt(&mut self, name: &str, words: &[&IrExpr]) -> String {
         let ws: Vec<String> = words.iter().map(|w| self.words_expr(w)).collect();
         if let Some(sig) = self.fn_sigs.get(name).cloned() {
-            return self.fn_call_exec(name, ws, &sig, true, None);
+            return Self::stmt_unblock(&self.fn_call_exec(name, ws, &sig, true, None));
         }
         self.add_helper("cat");
         format!(
@@ -7535,6 +7585,33 @@ impl Render {
             ws.join(", "),
             self.fn_ident(name)
         )
+    }
+
+    /// A STATEMENT-position user-function call needs no block: the
+    /// `{ call; }` wrapper exists only so the expression form can carry a
+    /// temporary or a trailing value. Unwrapping a bare `{ call; }` turns
+    /// t41's `{ f(); }` into `f();`. A block that binds anything (the
+    /// argv-swap convention, a `let __a`) or holds more than one statement
+    /// is left alone.
+    fn stmt_unblock(s: &str) -> String {
+        let t = s.trim();
+        let Some(inner) = t.strip_prefix("{ ").and_then(|r| r.strip_suffix(" }")) else {
+            return s.to_string();
+        };
+        let inner = inner.trim();
+        // a `let`/`*… = …` temporary, or an extra statement, means the block
+        // is doing real work
+        if inner.contains("let ") || inner.contains('=') {
+            return s.to_string();
+        }
+        let Some(call) = inner.strip_suffix(';') else {
+            return s.to_string();
+        };
+        let call = call.trim();
+        if call.is_empty() || call.contains(';') {
+            return s.to_string();
+        }
+        format!("{call};")
     }
 
     fn fn_call_bool(&mut self, name: &str, words: &[&IrExpr]) -> String {
@@ -18037,6 +18114,51 @@ mod tests {
         assert!(out.contains("let a = "), "binding lost:\n{out}");
         assert!(out.contains("let b = "), "binding lost:\n{out}");
         assert!(!out.contains("__SH_RC"), "status kept:\n{out}");
+    }
+
+    /// A stripped status store that sat mid-PAYLOAD (a multi-line emit, not
+    /// its own `emit` call) must not leave an empty line behind either: the
+    /// py read-loop's cond block is one multi-line unit holding the store,
+    /// and t61 rendered a blank line between the assignment and the test.
+    #[test]
+    fn stripped_store_mid_payload_leaves_no_blank() {
+        crate::shir::set_source_lang(Some("py"));
+        let out = render("while read line; do echo \"L:$line\"; done\n");
+        crate::shir::set_source_lang(None);
+        // scope to the cond block: the module sections above are separated
+        // by intentional blanks
+        let main_body: String = out
+            .lines()
+            .skip_while(|l| !l.contains("fn main()"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!main_body.contains("\n\n"), "stray blank in main:\n{out}");
+        assert!(main_body.contains("__any"), "cond value lost:\n{out}");
+        assert!(!main_body.contains("__SH_RC"), "status kept:\n{out}");
+    }
+
+    /// A STATEMENT-position user-function call needs no block: t41's
+    /// `{ f(); }` should be a bare `f();`. A block that binds a temporary
+    /// (the argv-swap convention, or a value-returning call) must keep its
+    /// braces. Uses the py shape (a side-effect-only function), since a
+    /// shell `f() { echo hi; }` is echo-return-LIFTED and called as a
+    /// value.
+    #[test]
+    fn statement_fn_call_is_not_block_wrapped() {
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[],"named_blocks":{},"body":[
+                {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"hi","style":"DoubleQuoted"}]}]}}
+            ]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"f","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}}
+        ]}"#;
+        match crate::shir_json_in::shir_json_to_ir(a1) {
+            Ok(prog) => {
+                let out = shir_to_rust(&prog);
+                assert!(out.contains("    f();\n"), "block not unwrapped:\n{out}");
+                assert!(!out.contains("{ f(); }"), "{out}");
+            }
+            Err(e) => panic!("A1 ingress rejected the fixture: {e}"),
+        }
     }
 
     /// …but a SHELL source whose `$?` IS read keeps the arm: the false path

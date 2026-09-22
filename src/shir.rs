@@ -11325,6 +11325,23 @@ pub fn analyze_fn_sink_contexts(prog: &IrProgram) -> HashMap<String, SinkContext
                 },
                 IrExpr::Arrow(body) => self.stmts(body),
                 IrExpr::Call { func, args } => {
+                    // the FRONTEND spelling of a command substitution:
+                    // `capture(Arrow([…]))` — same implicit fd-1 sink as the
+                    // `Capture` node above. Without this arm a function
+                    // called inside a capture body was recorded as a
+                    // NEVER-sinked site, so the renderer printed straight to
+                    // stdout (bypassing the capture buffer) and the value
+                    // came back empty (t52/t41 shape: `x = f()` printed the
+                    // function's output AND an extra blank line).
+                    if func == "capture" {
+                        let saved = self.in_sink;
+                        self.in_sink = true;
+                        for a in args {
+                            self.expr(a);
+                        }
+                        self.in_sink = saved;
+                        return;
+                    }
                     // the fn-call shapes (see the backend's is_fn_capture):
                     // `fnCall("f")` / `exec("f", [...])` / `builtin(...)`
                     if matches!(func.as_str(), "fnCall" | "fnValue") {
@@ -57347,6 +57364,61 @@ mod sink_context_tests {
         assert_eq!(
             ctx_of("f() { echo a; echo b; }\n{ f; echo g; } > /tmp/x\n", "f"),
             SinkContext::Always
+        );
+    }
+
+    /// The FRONTEND spelling of a command substitution — a `capture` CALL
+    /// whose argument is the body arrow — is a sink for the calls inside
+    /// it, exactly like the `Capture` node. Missing this arm made a
+    /// function called in a capture body look never-sinked, so the
+    /// renderer printed straight to stdout and the captured value came
+    /// back empty (t52's `for n in names: print(greet(n))` printed the
+    /// greeting twice plus a blank line).
+    #[test]
+    fn frontend_capture_call_is_a_sink() {
+        let prog = crate::ir::IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+                // x = capture(Arrow([Expr(exec("f", []))]))
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        indices: vec![],
+                        sigil: None,
+                    }],
+                    expr: IrExpr::Call {
+                        func: "capture".to_string(),
+                        args: vec![IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![]),
+                            ],
+                        })])],
+                    },
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        assert_eq!(
+            analyze_fn_sink_contexts(&prog).get("f").copied(),
+            Some(SinkContext::Always),
+            "a call inside capture(...) writes to the capture, not stdout"
         );
     }
 
