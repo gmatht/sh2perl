@@ -6928,6 +6928,11 @@ pub(crate) fn tokenize_test(s: &str) -> Vec<String> {
                     in_dq = false;
                     toks.push(std::mem::take(&mut cur));
                 } else {
+                    // A quoted run starting mid-token (`\>"$b"`) ends the
+                    // preceding word — `\>` must stay its own token.
+                    if !cur.is_empty() {
+                        toks.push(std::mem::take(&mut cur));
+                    }
                     in_dq = true;
                 }
             }
@@ -7012,6 +7017,11 @@ fn normalize_test_tokens(toks: Vec<String>) -> Vec<String> {
             } else if rest.starts_with('!') && !rest.starts_with("!=") {
                 out.push("!".to_string());
                 rest = &rest[1..];
+            } else if rest.starts_with("\\>") || rest.starts_with("\\<") {
+                // `[ a \> b ]` — the `>` is escaped so it is a string
+                // comparison, not a redirect.
+                out.push(rest[1..2].to_string());
+                rest = &rest[2..];
             } else if rest.ends_with("\\)") && rest.len() > 2 {
                 let (h, _) = rest.split_at(rest.len() - 2);
                 out.push(h.to_string());
@@ -7178,10 +7188,12 @@ fn perl_compare_op(op: &str) -> &'static str {
         "-le" => "<=",
         "-gt" => ">",
         "-ge" => ">=",
-        "<" => "<",
-        ">" => ">",
-        "<=" => "<=",
-        ">=" => ">=",
+        // `[ a > b ]` / `[[ a > b ]]` is a STRING comparison (the
+        // numeric forms are `-gt`/`-lt`).
+        "<" => "lt",
+        ">" => "gt",
+        "<=" => "le",
+        ">=" => "ge",
         _ => "==",
     }
 }

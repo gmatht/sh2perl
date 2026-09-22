@@ -194,6 +194,7 @@ fn transform_stmt(
             x |= native_echo_bc_stmt(st);
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
+            x |= native_eval_assign_stmt(st);
             x |= native_echo_or_chain(st);
             x |= native_if_test_cond(st);
             x |= native_test_exit_stmt(st);
@@ -959,6 +960,81 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
     false
 }
 
+/// `eval "NAME=…"` — a literal assignment. Bash's eval runs the expanded
+/// string as a command, so this is a STRING assignment (`y=5+1`, no
+/// arithmetic). A subprocess `eval` cannot affect the parent, so lower it
+/// to a native Perl assignment.
+fn native_eval_assign_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return false;
+    };
+    if cmd != "eval" {
+        return false;
+    }
+    let [word] = words.as_slice() else { return false; };
+    let Some((name, value)) = eval_assign_parts(word) else {
+        return false;
+    };
+    *st = IrStmt::Assign {
+        targets: vec![crate::ir::AssignTarget {
+            var: name,
+            sigil: None,
+            indices: vec![],
+        }],
+        expr: value,
+        asm: None,
+    };
+    true
+}
+
+fn eval_assign_parts(word: &IrExpr) -> Option<(String, IrExpr)> {
+    let is_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    match word {
+        IrExpr::Str(s, _) => {
+            let (n, v) = s.split_once('=')?;
+            if !is_ident(n) {
+                return None;
+            }
+            Some((
+                n.to_string(),
+                IrExpr::Str(v.to_string(), crate::ir::StrStyle::DoubleQuoted),
+            ))
+        }
+        IrExpr::Interpolate(parts) => {
+            for (i, p) in parts.iter().enumerate() {
+                if let crate::ir::InterpPart::Lit(l) = p {
+                    if let Some((pre, post)) = l.split_once('=') {
+                        if !is_ident(pre) {
+                            return None;
+                        }
+                        let mut vp: Vec<crate::ir::InterpPart> = Vec::new();
+                        if !post.is_empty() {
+                            vp.push(crate::ir::InterpPart::Lit(post.to_string()));
+                        }
+                        vp.extend(parts[i + 1..].iter().cloned());
+                        return Some((pre.to_string(), IrExpr::Interpolate(vp)));
+                    }
+                } else {
+                    break;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn render_test_words(words: &[&IrExpr]) -> IrExpr {
     let parts: Vec<String> = words.iter().filter_map(|w| {
         match w {
@@ -1202,6 +1278,16 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
             "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
             "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            // `[ a \\> b ]` — the escaped `>` is a STRING comparison
+            // (`gt`); the numeric form is `-gt`.
+            ">" | "\\>" => IrExpr::Str(
+                format!("({} gt {})", crate::ir::render_test_operand(left), crate::ir::render_test_operand(right)),
+                StrStyle::Raw,
+            ),
+            "<" | "\\<" => IrExpr::Str(
+                format!("({} lt {})", crate::ir::render_test_operand(left), crate::ir::render_test_operand(right)),
+                StrStyle::Raw,
+            ),
             // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
             // old catchall parsed it as "text contains a -flag", a bogus
             // truthiness). Perl accepts a STRING as the pattern, so the
