@@ -1882,6 +1882,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("}\n");
         }
         IrStmt::Redirect { inner, redirects } => {
+            // `mapfile [-t] VAR < FILE` / `readarray …` — read the file into
+            // `@VAR` natively. `mapfile` is a shell builtin: a `bash -c`
+            // child assigns the array in the CHILD (bash arrays cannot cross
+            // exec), leaving the parent's `@VAR` empty (012's mapfile line).
+            if let Some(code) = native_mapfile_read(inner, redirects) {
+                emit_indent(out, indent);
+                out.push_str(&code);
+                out.push('\n');
+                return;
+            }
             // `while …; do …; done < FILE` — open FILE on STDIN for the
             // loop body. `local *STDIN` restores the previous handle at
             // block exit (the read builtin consumes the redirected STDIN).
@@ -4995,6 +5005,106 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) 
 fn rewrite_heredoc_env(s: &str) -> String {
     let re = regex::Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
     re.replace_all(s, "$$ENV{$1}").to_string()
+}
+
+/// `mapfile [-t] [flags] VAR < FILE` / `readarray …` → a native Perl read
+/// into `@VAR`. `mapfile`/`readarray` are shell builtins; running them via
+/// `bash -c` populates the array in the child shell (bash arrays cannot
+/// cross exec), so the parent's array stays empty. Mirrors the C backend's
+/// `is_mapfile_redirect` handling (c_backend.rs). Returns the Perl
+/// statement, or None to fall back to the shell when the shape is exotic.
+fn native_mapfile_read(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "mapfile" && cmd != "readarray" {
+        return None;
+    }
+    // Exactly one stdin `r` redirect (the process-subst transform's form).
+    let mut r_iter = redirects
+        .iter()
+        .filter(|r| matches!(r.fd, None | Some(0)) && r.mode == "r");
+    let r = r_iter.next()?;
+    if r_iter.next().is_some() || redirects.len() != 1 {
+        return None;
+    }
+    let file = render_word(&r.target);
+    let mut strip = false;
+    let mut skip: Option<String> = None;
+    let mut count: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < words.len() {
+        let w = grep_lit_str(&words[i])?;
+        if w == "--" {
+            i += 1;
+            continue;
+        }
+        if w.starts_with('-') && w.len() > 1 {
+            let cs: Vec<char> = w[1..].chars().collect();
+            let mut k = 0;
+            while k < cs.len() {
+                match cs[k] {
+                    't' => strip = true,
+                    'n' | 's' | 'O' => {
+                        let rest: String = cs[k + 1..].iter().collect();
+                        let val = if !rest.is_empty() {
+                            rest
+                        } else {
+                            i += 1;
+                            grep_lit_str(words.get(i)?)?
+                        };
+                        match cs[k] {
+                            'n' => count = Some(val),
+                            's' => skip = Some(val),
+                            'O' => origin = Some(val),
+                            _ => {}
+                        }
+                        k = cs.len();
+                        continue;
+                    }
+                    'u' => {} // unbuffered — no-op
+                    _ => return None,
+                }
+                k += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if name.is_some() {
+            return None;
+        }
+        name = Some(w);
+        i += 1;
+    }
+    let name = name.unwrap_or_else(|| "MAPFILE".to_string());
+    // The array name is interpolated into Perl — refuse anything unsafe.
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let skip_n = skip.unwrap_or_else(|| "0".to_string());
+    let count_guard = match &count {
+        Some(c) => format!(" last if @__l >= {};", c),
+        None => String::new(),
+    };
+    let chomp = if strip { "chomp $__line; " } else { "" };
+    let body = format!(
+        "do {{ open(my $__mf, '<', {file}) or die \"mapfile: $ERRNO\"; my @__l; my $__i = 0; while (my $__line = <$__mf>) {{ if ($__i < {skip_n}) {{ $__i++; next; }} {chomp}push @__l, $__line;{count_guard} }} close($__mf); @__l }}"
+    );
+    let assign = match &origin {
+        Some(o) => format!("my @__mfr = {body}; splice(@{name}, {o}, scalar(@__mfr), @__mfr);"),
+        None => format!("@{name} = {body};"),
+    };
+    Some(format!(
+        "{assign} $main_exit_code = $CHILD_ERROR = 0;"
+    ))
 }
 
 fn cat_heredoc_body(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
