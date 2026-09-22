@@ -2441,6 +2441,27 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         out.push_str("die \"otranspilerl: shIR `!` expression not renderable (Perl backend)\\n\";\n");
                     }
                 }
+                // A `perl -e 'SCRIPT'` body flattened to native Perl
+                // (`native_perl_e_stmt`) — emit it as a statement. The
+                // `@ARGV = (…)` prelude and the script body are separate
+                // `RawExpr` statements.
+                IrExpr::RawExpr(code) => {
+                    emit_indent(out, indent);
+                    let body = code.trim_end();
+                    // The user's Perl runs without `use strict`; its
+                    // undeclared globals (`foreach $arg (…)`) would not
+                    // compile here. Scope the body with `no strict`.
+                    out.push_str("{ no strict 'vars'; no warnings; ");
+                    out.push_str(body);
+                    // The `perl -e 'SCRIPT'` body may omit the final `;`
+                    // (`print "hi\n"`); a `{…}` block needs none.
+                    if !(body.ends_with(';') || body.ends_with('}')) {
+                        out.push(';');
+                    }
+                    out.push_str(" }\n");
+                    emit_indent(out, indent);
+                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                }
                 // Non-Call expressions: bare `&&`/`||` chains of execs,
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
