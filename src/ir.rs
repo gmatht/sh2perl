@@ -8879,9 +8879,19 @@ sub __sh_pipe_load {
     }
     $__SH_PIPE;
 }
+sub __sh_pipe_unsupported_util {
+    my ($cmd) = @_;
+    # The reconstructed command quotes each stage's util name. These are not
+    # in the pipeline .so (non-uutils tools / shell builtins); routing them
+    # in-process is a race between rc 127 (unknown util) and rc 141 (SIGPIPE
+    # from the neighbour writing into the dead stage) — 141 is a real exit
+    # code, so the caller skipped the shell fallback and printed nothing
+    # (parse-sq-with-for, intermittently). Send them to the shell up front.
+    return $cmd =~ m{(?:^|\|)\s*'(?:perl|python3?|bc|find|strings|gunzip|gzip|zstd|bzip2|xz|tar|unzip|mapfile|readarray|ruby|node|php)'};
+}
 sub __sh_pipe_run {
     my ($cmd, $opts) = @_;
-    if (__sh_pipe_load()) {
+    if (__sh_pipe_load() && !__sh_pipe_unsupported_util($cmd)) {
         my $rc = __sh_pipe_run_str($cmd, defined $opts ? $opts : '');
         # `-2` parse / `-3` backend; `127` is the multicall's "unknown util"
         # (not a uutils command) — run those through the shell instead.
@@ -8894,7 +8904,7 @@ sub __sh_pipe_run {
 }
 sub __sh_pipe_capture {
     my ($cmd, $opts) = @_;
-    if (__sh_pipe_load()) {
+    if (__sh_pipe_load() && !__sh_pipe_unsupported_util($cmd)) {
         my $tmp = "/tmp/sh2_pipe_${$}_" . ($__SH_UU_SEQ++) . ".cap";
         my $rc = __sh_pipe_run_str($cmd . ' > ' . $tmp, defined $opts ? $opts : '');
         if ($rc >= 0 && $rc != 127) {
