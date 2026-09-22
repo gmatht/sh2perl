@@ -925,6 +925,8 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
         if cmd != "test" && cmd != "[" { return false; };
         let cond_words: Vec<&IrExpr> = words.iter().collect();
         let cond = render_test_words(&cond_words);
+        // `test COND || echo B` runs B when COND is FALSE — negate.
+        let cond = IrExpr::Str(format!("(!{})", crate::ir::ir_expr_to_perl(&cond)), StrStyle::Raw);
         let Some(else_) = single_always_true_exec(rhs) else { return false; };
         *st = IrStmt::If {
             cond,
@@ -948,7 +950,8 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
             cond,
             then: then_,
             elsifs: vec![],
-            else_: vec![],
+            // `test COND && echo` — a false COND leaves `$?` == 1.
+            else_: vec![IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 1;\n".to_string())],
         };
         return true;
     }
@@ -1214,17 +1217,17 @@ fn render_test_tokens(text: &str) -> IrExpr {
                 IrExpr::Str(format!("({} =~ '{}')", l, pat), StrStyle::Raw)
             }
             "-ef" => {
-                // Compare device and inode: (stat(f))[0] eq (stat(g))[0] && (stat(f))[1] eq (stat(g))[1]
-                let stat_left = IrExpr::Str(format!("(stat(\"{}\"))[0]", left), StrStyle::Raw);
-                let stat_right = IrExpr::Str(format!("(stat(\"{}\"))[0]", right), StrStyle::Raw);
-                let stat_left_ino = IrExpr::Str(format!("(stat(\"{}\"))[1]", left), StrStyle::Raw);
-                let stat_right_ino = IrExpr::Str(format!("(stat(\"{}\"))[1]", right), StrStyle::Raw);
-                IrExpr::BinOp {
-                    op: crate::ir::BinOpKind::And,
-                    lhs: Box::new(IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(stat_left), rhs: Box::new(stat_right) }),
-                    rhs: Box::new(IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(stat_left_ino), rhs: Box::new(stat_right_ino) }),
-                }
-            },
+                // Compare device and inode; either operand missing ⇒ false
+                // (bash does not treat two missing files as the same file).
+                let l = crate::ir::render_test_operand(left);
+                let r = crate::ir::render_test_operand(right);
+                IrExpr::Str(
+                    format!(
+                        "(-e {l} && -e {r} && (stat({l}))[0] == (stat({r}))[0] && (stat({l}))[1] == (stat({r}))[1])"
+                    ),
+                    StrStyle::Raw,
+                )
+            }
             _ => test_fallback(text),
         }
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
@@ -1235,6 +1238,8 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-e" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
             "-s" => IrExpr::Str(format!("-s {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
             "-S" => IrExpr::Str(format!("-S {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-h" | "-L" => IrExpr::Str(format!("-l {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-a" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             _ => test_fallback(text),

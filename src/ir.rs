@@ -6750,7 +6750,7 @@ fn render_test_expr(s: &str) -> String {
             }
         }
     }
-    let toks = tokenize_test(s);
+    let toks = normalize_test_tokens(tokenize_test(s));
     let mut i = 0;
     let expr = parse_test_or(&toks, &mut i);
     if expr.is_empty() {
@@ -6995,6 +6995,42 @@ fn test_next<'a>(toks: &'a [String], i: &mut usize) -> Option<&'a str> {
     t
 }
 
+/// The flattened test text loses spaces at line continuations, gluing
+/// `\(`/`\)`/`!` onto the next token (`\(!`, `"x"\)`). Split them into
+/// standalone operator tokens so the recursive parser sees the grouping.
+fn normalize_test_tokens(toks: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in toks {
+        let mut rest = t.as_str();
+        loop {
+            if let Some(r) = rest.strip_prefix("\\(") {
+                out.push("\\(".to_string());
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("\\)") {
+                out.push("\\)".to_string());
+                rest = r;
+            } else if rest.starts_with('!') && !rest.starts_with("!=") {
+                out.push("!".to_string());
+                rest = &rest[1..];
+            } else if rest.ends_with("\\)") && rest.len() > 2 {
+                let (h, _) = rest.split_at(rest.len() - 2);
+                out.push(h.to_string());
+                rest = "\\)";
+            } else if rest.ends_with("\\(") && rest.len() > 2 {
+                let (h, _) = rest.split_at(rest.len() - 2);
+                out.push(h.to_string());
+                rest = "\\(";
+            } else {
+                if !rest.is_empty() {
+                    out.push(rest.to_string());
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn parse_test_or(toks: &[String], i: &mut usize) -> String {
     let mut lhs = parse_test_and(toks, i);
     loop {
@@ -7036,10 +7072,10 @@ fn parse_test_not(toks: &[String], i: &mut usize) -> String {
 
 fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
     match test_peek(toks, *i) {
-        Some("(") => {
+        Some("(") | Some("\\(") => {
             *i += 1;
             let inner = parse_test_or(toks, i);
-            if test_peek(toks, *i) == Some(")") {
+            if matches!(test_peek(toks, *i), Some(")") | Some("\\)")) {
                 *i += 1;
             }
             format!("({})", inner)
@@ -7056,6 +7092,13 @@ fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
             *i += 1;
             let operand = test_next(toks, i).unwrap_or("''");
             let o = render_test_operand(operand);
+            // bash spells the symlink/exists tests `-h`/`-L`/`-a`; Perl
+            // uses `-l` and `-e`.
+            let op = match op {
+                "-h" | "-L" => "-l",
+                "-a" => "-e",
+                other => other,
+            };
             match op {
                 "-z" => format!("!length({})", o),
                 "-n" => format!("length({})", o),
@@ -7080,6 +7123,20 @@ fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
                         let r = render_test_operand(rhs);
                         return format!("({l} =~ {r})");
                     }
+                    // `-ef` / `-nt` / `-ot` compare inode+device / mtime;
+                    // either operand missing makes the test FALSE (bash
+                    // does not warn or treat two missing files as equal).
+                    if matches!(op, "-ef" | "-nt" | "-ot") {
+                        let l = render_test_operand(lhs);
+                        let r = render_test_operand(rhs);
+                        if op == "-ef" {
+                            return format!(
+                                "(-e {l} && -e {r} && (stat({l}))[0] == (stat({r}))[0] && (stat({l}))[1] == (stat({r}))[1])"
+                            );
+                        }
+                        let cmp = if op == "-nt" { ">" } else { "<" };
+                        return format!("(-e {l} && -e {r} && (stat({l}))[9] {cmp} (stat({r}))[9])");
+                    }
                     let perl_op = perl_compare_op(op);
                     let l = render_test_operand(lhs);
                     let r = render_test_operand(rhs);
@@ -7099,6 +7156,7 @@ fn is_file_test_op(op: &str) -> bool {
     matches!(
         op,
         "-f" | "-d" | "-e" | "-r" | "-w" | "-x" | "-s" | "-z" | "-n"
+            | "-h" | "-L" | "-a" | "-S" | "-p" | "-b" | "-c" | "-t" | "-g" | "-u" | "-k"
     )
 }
 
@@ -7106,6 +7164,7 @@ fn is_compare_op(op: &str) -> bool {
     matches!(
         op,
         "=" | "==" | "!=" | "=~" | "<" | ">" | "<=" | ">=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+            | "-ef" | "-nt" | "-ot"
     )
 }
 
