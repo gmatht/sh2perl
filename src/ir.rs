@@ -2087,20 +2087,36 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         Some(r) if matches!(r.mode.as_str(), "w" | "wc" | "a" | "r+") => {
                             let target = call_arg_str(&r.target).unwrap_or_default();
                             let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
+                            // `"$@" > FILE` (a non-command inner): the inner
+                            // statements shell out with a rebuilt command —
+                            // the redirected handle must be the REAL fd 1,
+                            // not just the Perl select() handle, or the child
+                            // writes past the capture (the `select` idiom is
+                            // still applied inside for Perl print output).
+                            emit_indent(out, indent);
+                            out.push_str(
+                                "my ($__redir_save, $__redir_sel) = (undef, undef);\n",
+                            );
+                            emit_indent(out, indent);
+                            out.push_str(
+                                "open(my $__redir_fh, '>&', \\*STDOUT) or die \"Cannot dup stdout: $!\\n\";\n",
+                            );
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "open my $__redir_fh, {}, {} or die \"Cannot write to {}: $!\\n\";\n",
+                                "close(STDOUT); open(STDOUT, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
                                 mode,
                                 render_word(&r.target),
                                 target
                             ));
                             emit_indent(out, indent);
-                            out.push_str("my $__saved_out = select($__redir_fh);\n");
+                            out.push_str("$__redir_sel = select(STDOUT);\n");
                             for s in inner {
                                 emit_stmt(out, s, indent);
                             }
                             emit_indent(out, indent);
-                            out.push_str("select($__saved_out); close $__redir_fh;\n");
+                            out.push_str(
+                                "select($__redir_sel); open(STDOUT, '>&', $__redir_fh) or die \"Cannot restore stdout: $!\\n\"; close($__redir_fh);\n",
+                            );
                         }
                         _ => {
                             emit_indent(out, indent);
@@ -2752,11 +2768,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         };
                         let open_expr = if let Some(cmd) = shell_cmd {
                             cmd_str_to_open_perl(&cmd)
-                        } else if matches!(inner_expr.as_ref(), IrExpr::Arrow(_)) {
-                            // A non-rebuildable closure (dynamic exec / assign
-                            // body): its Perl rendering is not shell — refuse
-                            // loudly rather than emit the broken `sub {}` text.
-                            "die \"otranspilerl: shIR capture not expressible as shell (Perl backend)\\n\"".to_string()
+                        } else if let IrExpr::Arrow(stmts) = inner_expr.as_ref() {
+                            // The shell-text rebuild refuses bodies whose
+                            // words bash cannot round-trip (a `perl -e '…'`
+                            // script arrives as a plain variable read — the
+                            // rebuilt `perl -e "$x"` would run the CONTENTS
+                            // as the program). The statements DO render as
+                            // Perl, so run them with fd 1 redirected into a
+                            // scalar: same capture, no shell round-trip.
+                            let mut body = String::new();
+                            for st in stmts.iter() {
+                                emit_stmt(&mut body, st, 1);
+                            }
+                            format!(
+                                "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            )
                         } else {
                             let mut inner_str = ir_expr_to_perl(inner_expr);
                             // Strip surrounding backticks from StrStyle::Command rendering
@@ -3326,6 +3352,14 @@ fn perl_lhs_for(var: &str) -> String {
 /// Render a variable read: getVar("x") / Var("x") → `$x` / `$ENV{x}`;
 /// bash positional params ($1 → $ARGV[0]) and specials ($#, $?, $@).
 fn var_read(name: &str) -> String {
+    // `$@` / `$*` — bash's positional list. In a SCALAR (string) context
+    // bash joins the positional parameters with the first IFS char (a
+    // space); `$*` with a quoted context does the same. Never a Perl
+    // variable read (`@ARGV` pasted into a rebuilt command ran as a
+    // command).
+    if name == "@" || name == "*" {
+        return "join(' ', @ARGV)".to_string();
+    }
     if is_env_style_var_name(name) {
         return format!("$ENV{{{}}}", name);
     }
@@ -3682,6 +3716,19 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
                 .unwrap_or_else(|| "''".to_string());
             format!("split(/\\s+/, {})", inner)
         }
+        // `"$@"` / `"$*"` as an exec word: bash expands to the positional
+        // LIST (each parameter its own word; `"$*"` joins with IFS). The
+        // scalar renderer would emit `join(' ', @ARGV)` — ONE word — and
+        // the rebuilt shell text would then lose the split.
+        IrExpr::Call { func, args } if func == "listVar" => match call_arg_str(
+            args.first().unwrap_or(&IrExpr::Str(String::new(), StrStyle::SingleQuoted)),
+        )
+        .as_deref()
+        {
+            Some("@") => "@ARGV".to_string(),
+            Some("*") => "join(' ', @ARGV)".to_string(),
+            _ => render_word(e),
+        },
         _ => render_word(e),
     }
 }
@@ -4248,6 +4295,19 @@ fn bash_word_for(w: &IrExpr) -> String {
         return parts.join(" ");
     }
     match w {
+        // `"$@"` / `"$*"` — the rebuilt text is handed to `bash -c` / the
+        // pipeline parser, so keep the NATIVE shell form: bash performs the
+        // expansion (every parameter its own word for `@`; IFS-joined for
+        // `*`). Rendering `@ARGV` here would paste a Perl name into shell
+        // text and bash would try to run it as a command.
+        IrExpr::Call { func, args } if func == "listVar" => {
+            let n = args.first().and_then(call_arg_str).unwrap_or_default();
+            match n.as_str() {
+                "@" => "\"$@\"".to_string(),
+                "*" => "\"$*\"".to_string(),
+                _ => format!("\"${{{}}}\"", n),
+            }
+        }
         IrExpr::Str(s, _) => {
             if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
                 // Shell glob — emit unquoted so bash -c expands it.
@@ -4275,6 +4335,17 @@ fn bash_word_for(w: &IrExpr) -> String {
                         if let IrExpr::Call { func, args } = e.as_ref() {
                             if func == "getVar" {
                                 if let Some(n) = args.first().and_then(call_arg_str) {
+                                    // `"$@"` / `"$*"` — bash expands the
+                                    // positional list here. The rebuilt text
+                                    // goes to bash, so keep the shell syntax
+                                    // (the enclosing `"…"` is already open;
+                                    // no extra quotes).
+                                    if n == "@" || n == "*" {
+                                        s.push_str("${");
+                                        s.push_str(&n);
+                                        s.push('}');
+                                        continue;
+                                    }
                                     // var_read: digits → $ARGV[0] (positional),
                                     // env-style → $ENV{VAR1}, locals → $x.
                                     // The bare `${}` emitted `$ENV{"1"}` for
@@ -4408,6 +4479,13 @@ fn var_exports_str(cmd: &str) -> String {
             // (e.g. an embedded `perl -e '…$i…'` script) — it must not be
             // exported (that referenced an undeclared Perl var).
             if c == '$' && !in_sq && i + 1 < chars.len() {
+                // `"$@"` / `"$*"` — bash's positional list. The Perl
+                // @ARGV is not a scalar to export; the rebuilt shell text
+                // must carry the words themselves (see `bash_word_for`).
+                if matches!(chars[i + 1], '@' | '*') {
+                    i += 2;
+                    continue;
+                }
                 let rest: String = chars[i + 1..].iter().collect();
                 if let Some(cap) = name_re.captures(&rest) {
                     let name = cap[1].to_string();
@@ -4435,7 +4513,9 @@ fn var_exports_str(cmd: &str) -> String {
 /// `$ENV{name} = $name;` lines + the bash -c system call + status tracking.
 fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
     // A linear pipeline / redirection the coreutils-ffi-pipeline C ABI can
-    // run in-process — no `bash -c` (check_qx).
+    // run in-process — no `bash -c` (check_qx). The rebuilt text carries the
+    // runtime values (`$n` inside the double-quoted words), not the Perl
+    // names, so the var-export prelude is unnecessary here.
     if let Some(expr) = pipeline_value_cmd(cmd) {
         emit_indent(out, indent);
         out.push_str(&format!(
@@ -5761,7 +5841,14 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             Some(p) => p,
             None => {
                 // Dynamic / unparseable command — shell out via bash -c.
-                let full = args.iter().map(render_word).collect::<Vec<_>>().join(" ");
+                // The rebuilt text goes to a shell, so the words must be
+                // SHELL syntax: `"$@"` stays `"$@"` (bash expands it), not
+                // the Perl `@ARGV`/`join(...)` rendering.
+                let full = args
+                    .iter()
+                    .map(bash_word_for)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 emit_shell_cmd(out, indent, &full);
                 return;
             }
@@ -7959,6 +8046,24 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     if let Some(cmd) = stmts_to_shell_cmd(stmts) {
                         return cmd_str_to_open_perl(&cmd);
                     }
+                    // The shell-text rebuild refuses bodies whose words the
+                    // bash spelling cannot round-trip (a `perl -e '…'` script
+                    // arrives as a plain variable read; rendering it would
+                    // hand bash `perl -e "$x"` and run the CONTENTS as the
+                    // program). The statements themselves DO render as Perl
+                    // (`system('perl','-e',$x)` / `open('-|','perl',…)`), so
+                    // run them with fd 1 redirected into a scalar — same
+                    // capture, no shell round-trip. REFUSE below would
+                    // otherwise emit a `die` that kills the whole program.
+                    {
+                        let mut body = String::new();
+                        for st in stmts.iter() {
+                            emit_stmt(&mut body, st, 1);
+                        }
+                        return format!(
+                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                        );
+                    }
                     // A PERL-SIDE capture: the C frontend's outparam
                     // channel (setVar(cap, capture(Arrow[fnCall(..)]))) —
                     // the callee ECHOES its out-param values and the
@@ -7978,10 +8083,22 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {body}close $__fh; select($__old); $__cap }}"
                         );
                     }
-                    // A non-rebuildable closure: its Perl rendering is
-                    // not shell — refuse loudly rather than emit the
-                    // broken `sub {}` text into bash -c.
-                    return "die \"otranspilerl: shIR capture not expressible as shell (Perl backend)\\n\"".to_string();
+                    // Last resort: the body renders as Perl (`system(...)` /
+                    // `open('-|', …)`) but not as round-trippable shell text
+                    // (the `perl -e '…'` word is a plain variable read, so
+                    // the rebuilt `perl -e "$x"` would run the CONTENTS as
+                    // the program). Run the statements with fd 1 redirected
+                    // into a scalar — same capture without the shell.
+                    // (`die` here killed the whole generated program.)
+                    {
+                        let mut body = String::new();
+                        for st in stmts.iter() {
+                            emit_stmt(&mut body, st, 1);
+                        }
+                        return format!(
+                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                        );
+                    }
                 }
             }
             // A NATIVE capture whose Arrow body the native-pipeline fold
@@ -8985,6 +9102,40 @@ sub __sh_pipe_capture {
 # __SH_RUN_EXT_END
 "#;
 
+/// A `$` that a shell would expand but that sits OUTSIDE a double-quoted
+/// word (single-quoted text is literal, and a `\'`-escaped quote inside a
+/// double-quoted word does not close it). The pipeline ABI and `__sh_q`
+/// have no expansion, so any such `$` must keep the bash -c path.
+fn has_unquoted_dollar(cmd: &str) -> bool {
+    let b = cmd.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'$' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Can `cmd` be parsed by the `coreutils-ffi-pipeline` grammar? That grammar
 /// supports `a | b | c` plus `> FILE` / `>> FILE` / `< FILE` / `<<< text` /
 /// `2>/dev/null`, and REJECTS `&&`, `||`, `;`, `$(...)`, backticks, `$VAR`,
@@ -9048,17 +9199,26 @@ fn dq_value_expr(content: &str) -> Option<String> {
                     j += 1;
                 }
                 (chars[i + 1..j].iter().collect::<String>(), j)
+            } else if matches!(chars[i + 1], '@' | '*') {
+                // `"$@"` / `"$*"` — the positional list. In a Perl string
+                // that is the IFS-joined parameters (var_read knows the
+                // spelling). Leaving the `$` in the literal text would feed
+                // bash a `'$@'` word (literal, not expanded).
+                (chars[i + 1].to_string(), i + 2)
             } else {
                 lit.push(chars[i]);
                 i += 1;
                 continue;
             };
-            // Only a plain name read (`$x` / `${x}`); an operator form
-            // (`${x:-y}`) is left for the `param` path.
+            // Only a plain name read (`$x` / `${x}`) or the positional
+            // list; an operator form (`${x:-y}`) is left for the `param`
+            // path.
             if name.is_empty()
-                || !name
+                || !(name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || name == "@"
+                    || name == "*")
             {
                 return None;
             }
@@ -9102,6 +9262,15 @@ fn pipeline_value_cmd(cmd: &str) -> Option<String> {
         .replace("2> /dev/null", "2>/dev/null");
     let cmd = cmd.as_str();
     if cmd.contains("||") || cmd.contains("|&") {
+        return None;
+    }
+    // A bare `$` outside double quotes (`"$@"`, `$var`, `${x}`) is a SHELL
+    // expansion this ABI has no grammar for. The word-builder emits the
+    // native shell form so a `bash -c` run expands it; routing that text
+    // through the pipeline parser (or `__sh_q`) would pass it literally.
+    // Only the `$` inside a double-quoted word is safe: `dq_value_expr`
+    // turns it into a Perl expression spliced as a runtime value.
+    if has_unquoted_dollar(cmd) {
         return None;
     }
     let reject = |c: char| {
@@ -9149,6 +9318,12 @@ fn pipeline_value_cmd(cmd: &str) -> Option<String> {
                 return None;
             }
             if content.contains('$') {
+                // `"$@"` / `"$*"` expand to MULTIPLE words (or the IFS join):
+                // `__sh_q` would quote the joined value into ONE argv. Keep
+                // the bash -c path, where the shell does the expansion.
+                if content.contains("$@") || content.contains("$*") {
+                    return None;
+                }
                 let expr = dq_value_expr(&content)?;
                 if !lit.is_empty() {
                     parts.push(safe_perl_q_string(&lit));
@@ -9489,6 +9664,9 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
         return e;
     }
     // A linear pipeline / redirection the pipeline C ABI can run + capture.
+    // The rebuilt argv holds the VALUES (`$n` inside the double-quoted
+    // words), not the Perl names — no ENV prelude is needed (and none would
+    // help: the command string is no longer reparsed by a shell).
     if let Some(expr) = pipeline_value_cmd(cmd) {
         return format!("__sh_pipe_capture({}, \"pipefail\")", expr);
     }
