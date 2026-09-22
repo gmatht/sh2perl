@@ -1557,8 +1557,23 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
             }
         }
         r.borrowable_vars = keep;
-        // a variable whose binding did NOT qualify keeps its owned form, so
-        // its reads must clone again — `read_str` consults exactly this set
+        // A variable whose binding did NOT qualify keeps its owned form, so
+        // its reads must clone again — `read_str` consults exactly this set.
+        //
+        // Finally, drop any Int-homed name (`is_num`): a numeric local is
+        // declared `: i64` by `local_write_stmt`, so it can never hold a
+        // borrowed `&str`. The two verdicts are computed independently, and
+        // when both fired the ternary/numeric path emitted arms as `&str`
+        // into an `: i64` binding — hard rustc E0308 (e.g. a numeric ternary
+        // `n = 10 if c else 20`, and the shell form
+        // `if [ c ]; then n=10; else n=20; fi`). Numeric wins.
+        {
+            let str_forced = str_forced_vars(&prog);
+            r.borrowable_vars.retain(|name| {
+                !(r.var_types.get(name).copied() == Some(IrType::Int)
+                    && !str_forced.contains(name))
+            });
+        }
     }
     r.fn_sink_never = crate::shir::analyze_fn_sink_contexts(&prog)
         .into_iter()
@@ -9370,9 +9385,10 @@ impl Render {
                         let bare = |x: &str| {
                             string_literal_word(x).map(|s| s.to_string()).unwrap_or_else(|| x.to_string())
                         };
+                        let ce = Self::unwrap_cond(&self.expr_bool(cond));
                         let binding = format!(
                             "if {} {{ {} }} else {{ {} }}",
-                            Self::unparen(&self.expr_bool(cond)),
+                            Self::unparen(&ce),
                             bare(&Self::unparen(&tc).to_string()),
                             bare(&Self::unparen(&ec).to_string())
                         );
@@ -9397,7 +9413,12 @@ impl Render {
                             _ => (tc, ec),
                         }
                     };
-                    let ce = self.expr_bool(cond);
+                    // the same condition-position cleanup the statement form
+                    // gets: a truthiness test renders as a bare bool, some
+                    // forms still carry a status wrapper. Also strip the
+                    // interpolator's identity `format!` for a whole-word
+                    // operand.
+                    let ce = Self::unwrap_cond(&self.expr_bool(cond));
                     let binding =
                         format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
                     let st = self.local_write_stmt(&name, &binding);

@@ -1354,6 +1354,14 @@ fn first_code_newline(s: &str) -> Option<usize> {
             }
         }
         for (name, sigil) in &vars {
+            // Infrastructure vars the emitter splices in itself (declared
+            // just above) — a second `my` masks the first.
+            if matches!(
+                name.as_str(),
+                "output" | "ls_success" | "__nocasematch" | "__argc" | "main_exit_code"
+            ) {
+                continue;
+            }
             let assigned = collect_assigned_vars_contains(&stmts, name);
             match sigil {
                 Sigil::Scalar => {
@@ -2099,14 +2107,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             // not just the Perl select() handle, or the child
                             // writes past the capture (the `select` idiom is
                             // still applied inside for Perl print output).
+                            // Unique names per site: a second `my` in the
+                            // same scope masks the first (warnings + a hidden
+                            // lexical).
+                            static RD2_SEQ: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let n = RD2_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let fh = format!("$__sh2_rfh{n}");
+                            let sel = format!("$__sh2_rsel{n}");
                             emit_indent(out, indent);
-                            out.push_str(
-                                "my ($__redir_save, $__redir_sel) = (undef, undef);\n",
-                            );
-                            emit_indent(out, indent);
-                            out.push_str(
-                                "open(my $__redir_fh, '>&', \\*STDOUT) or die \"Cannot dup stdout: $!\\n\";\n",
-                            );
+                            out.push_str(&format!(
+                                "open(my {fh}, '>&', \\*STDOUT) or die \"Cannot dup stdout: $!\\n\";\n"
+                            ));
                             emit_indent(out, indent);
                             out.push_str(&format!(
                                 "close(STDOUT); open(STDOUT, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
@@ -2115,14 +2127,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 target
                             ));
                             emit_indent(out, indent);
-                            out.push_str("$__redir_sel = select(STDOUT);\n");
+                            out.push_str(&format!("my {} = select(STDOUT);\n", sel));
                             for s in inner {
                                 emit_stmt(out, s, indent);
                             }
                             emit_indent(out, indent);
-                            out.push_str(
-                                "select($__redir_sel); open(STDOUT, '>&', $__redir_fh) or die \"Cannot restore stdout: $!\\n\"; close($__redir_fh);\n",
-                            );
+                            out.push_str(&format!(
+                                "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
+                            ));
                         }
                         _ => {
                             emit_indent(out, indent);
@@ -2753,7 +2765,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 }
                                 emit_indent(out, indent);
                                 out.push_str(&format!(
-                                    "{} = do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }};\n",
+                                    "{} = do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }};\n",
                                     lhs
                                 ));
                                 return;
@@ -2790,7 +2802,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 emit_stmt(&mut body, st, 1);
                             }
                             format!(
-                                "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                                "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                             )
                         } else {
                             let mut inner_str = ir_expr_to_perl(inner_expr);
@@ -3195,7 +3207,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 {
                     emit_indent(out, indent);
                     out.push_str(&format!(
-                        "my ${var} = do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }};\n"
+                        "my ${var} = do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; ; }} $__cap =~ s/\\n+\\z//; $__cap }};\n"
                     ));
                     return;
                 }
@@ -6671,7 +6683,12 @@ fn var_is_declarable(name: &str) -> bool {
         && name != "_" // Perl's `$_` default-arg global — `my $_` is fatal
         // Perl English/special lexicals and backend temporaries must never
         // be redeclared (`my $INPUT_RECORD_SEPARATOR` breaks `local $/`).
-        && !name.starts_with("__")
+        // `__ps_tmp*` / `__ps_doc*` are NOT backend temporaries: they are
+        // the process-substitution materialisation's OWN shell variables
+        // (visible in the source), so they do need hoisting.
+        && (!name.starts_with("__")
+            || name.starts_with("__ps_tmp")
+            || name.starts_with("__ps_doc"))
         && name != "main_exit_code"
         && !matches!(
             name,
@@ -8128,7 +8145,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         // fd-1 redirect (not select()) so child processes /
                         // UU-FFI runs that write to fd 1 are captured too.
                         return format!(
-                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                         );
                     }
                     if let Some(cmd) = stmts_to_shell_cmd(stmts) {
@@ -8149,7 +8166,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             emit_stmt(&mut body, st, 1);
                         }
                         return format!(
-                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                         );
                     }
                     // A PERL-SIDE capture: the C frontend's outparam
@@ -8184,7 +8201,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             emit_stmt(&mut body, st, 1);
                         }
                         return format!(
-                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                         );
                     }
                 }
@@ -8206,7 +8223,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 if let [IrStmt::Expr(e)] = stmts.as_slice() {
                     if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
                         return format!(
-                            "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; ; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                         );
                     }
                 }
@@ -8219,7 +8236,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // needs fd 1 CLOSED first (EBADF otherwise — verified
                     // on perl 5.38; the dup2 target must be free).
                     return format!(
-                        "do {{ my $__cap = ''; open(my $__oldout, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};open(STDOUT, '>&', $__oldout) or die \"capture: $!\\n\"; close($__oldout); $__cap =~ s/\\n+\\z//; $__cap }}"
+                        "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
                     );
                 }
             }

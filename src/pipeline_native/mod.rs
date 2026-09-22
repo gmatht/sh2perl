@@ -105,7 +105,7 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
             content_perl,
         };
         return match native_dispatch(&NativeCtx::Pipe(&ctx)) {
-            Some(NativeEmit::Stmt(s)) => Some(s),
+            Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
             _ => None,
         };
     }
@@ -127,7 +127,7 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
             content_perl,
         };
         let mid = match native_dispatch(&NativeCtx::Pipe(&mid_ctx)) {
-            Some(NativeEmit::Stmt(s)) => s,
+            Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
             _ => return None,
         };
         let (cmd, words) = pipe_consumer(s3)?;
@@ -138,7 +138,7 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
             content_perl: format!("${v}"),
         };
         let tail = match native_dispatch(&NativeCtx::Pipe(&final_ctx)) {
-            Some(NativeEmit::Stmt(s)) => s,
+            Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
             _ => return None,
         };
         // Run the first two stages with stdout captured (the same
@@ -164,9 +164,26 @@ pub(crate) fn native_exec_cond(call: &IrExpr) -> Option<String> {
 /// status assignment.
 pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Exec { call, cond: false }) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        // Scoped: the leaves declare their own `my` temporaries (`$__g`,
+        // `$__m`, `$__pl`, …). Two leaves in the same Perl scope would
+        // mask each other's lexicals (a warning, and the second's
+        // initialization would shadow the first's live value).
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
+}
+
+/// Wrap a leaf's statement in a `do { … }` so its `my` temporaries live in
+/// their own scope. Leaves that already open their own block (a leading
+/// `if`/`for`/`{`) are left alone.
+fn scope_stmt(s: &str) -> String {
+    let t = s.trim_start();
+    if t.starts_with("do {") || t.starts_with("if (") || t.starts_with("for ") {
+        return s.to_string();
+    }
+    // `do { … }` is an EXPRESSION: the statement needs its own terminator
+    // (the leaf's trailing `;` is inside the block).
+    format!("do {{ {s} }};")
 }
 
 /// Parent (capture): `x=$(cmd)` where `cmd` is a single simple command the
@@ -260,7 +277,7 @@ fn split_one_subst(s: &str) -> Option<(&str, &str, &str)> {
 /// native print statement.
 pub(crate) fn native_heredoc(body: &str) -> Option<String> {
     match native_dispatch(&NativeCtx::Heredoc(body)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
@@ -269,7 +286,7 @@ pub(crate) fn native_heredoc(body: &str) -> Option<String> {
 /// native if/else statement.
 pub(crate) fn native_chain(e: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Chain(e)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
