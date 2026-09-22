@@ -1230,7 +1230,16 @@ fn render_test_tokens(text: &str) -> IrExpr {
                 if has_glob && double_bracket && !rhs_quoted {
                     let lhs = crate::ir::render_test_operand(left);
                     if let Some(re) = crate::ir::glob_or_extglob_to_regex(&lhs, rhs) {
-                        return IrExpr::Str(format!("({lhs} =~ /{re}/)"), StrStyle::Raw);
+                        // `glob_or_extglob_to_regex` returns either a bare
+                        // regex FRAGMENT or (for the `!(P).S` extglob) a
+                        // COMPLETE boolean expression, which must not be
+                        // wrapped again — `($f1 =~ /(($f1) =~ /…/) && …/)`
+                        // was a syntax error.
+                        return if re.contains("=~") || re.contains("!~") {
+                            IrExpr::Str(re, StrStyle::Raw)
+                        } else {
+                            IrExpr::Str(format!("({lhs} =~ /{re}/)"), StrStyle::Raw)
+                        };
                     }
                 }
                 IrExpr::Str(
