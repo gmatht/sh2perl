@@ -3561,6 +3561,13 @@ fn render_word(e: &IrExpr) -> String {
                         {
                             return format!("join(' ', split(/\\s+/, {val}))");
                         }
+                        // `$(echo "sqrt($n)" | bc)` — the native pipeline
+                        // fold prints the result; capture the Perl prints.
+                        if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
+                            return format!(
+                                "join(' ', split(/\\s+/, do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {stmt} close $__fh; select($__old); $__cap =~ s/\\n+\\z//; $__cap }}))"
+                            );
+                        }
                     }
                 }
                 let cap = args.first().and_then(arrow_to_cmd);
