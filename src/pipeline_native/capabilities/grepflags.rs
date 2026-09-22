@@ -44,6 +44,7 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     let mut count = false;
     let mut number = false;
     let mut fixed = false;
+    let mut ere = false;
     let mut quiet = false;
     let mut only = false;
     let mut whole_line = false;
@@ -93,10 +94,15 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
                     'H' => filename = true,
                     'F' => fixed = true,
                     'q' => quiet = true,
-                    // `-E` selects ERE, which is the dialect we already
-                    // emit for a non-`-F` pattern — accept, and clear any
-                    // earlier `-F`.
-                    'E' => fixed = false,
+                    // `-E` selects ERE — Perl's own dialect. WITHOUT this
+                    // flag the pattern is BRE, where `|`/`(`/`+` are
+                    // LITERAL and only their backslashed forms are
+                    // operators (`grep -E "error|warning"` must not become
+                    // `error\|warning`).
+                    'E' => {
+                        fixed = false;
+                        ere = true;
+                    }
                     _ => return None,
                 }
             }
@@ -117,7 +123,7 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         return None;
     }
 
-    let mut rx = rx(pattern, fixed, word);
+    let mut rx = rx(pattern, fixed, ere, word);
     if whole_line {
         rx = format!("^(?:{rx})$");
     }
@@ -172,7 +178,7 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
 
 /// Build the Perl regex body for the pattern: `-F` quotes the
 /// metacharacters, `-w` adds word boundaries.
-fn rx(pat: &str, fixed: bool, word: bool) -> String {
+fn rx(pat: &str, fixed: bool, ere: bool, word: bool) -> String {
     let mut s = if fixed {
         pat.chars()
             .map(|c| {
@@ -183,6 +189,8 @@ fn rx(pat: &str, fixed: bool, word: bool) -> String {
                 }
             })
             .collect::<String>()
+    } else if ere {
+        pat.to_string()
     } else {
         bre_to_perl(pat)
     };

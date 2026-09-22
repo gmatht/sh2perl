@@ -178,11 +178,14 @@ pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
 /// `if`/`for`/`{`) are left alone.
 fn scope_stmt(s: &str) -> String {
     let t = s.trim_start();
+    let t = t.trim_end();
+    // A leaf that already opens its own block (`do {`, a control statement)
+    // needs only an explicit terminator — `do { … }` is an EXPRESSION, so
+    // without the `;` the next statement's first token parses as its
+    // operator (`}print`).
     if t.starts_with("do {") || t.starts_with("if (") || t.starts_with("for ") {
-        return s.to_string();
+        return format!("{t};");
     }
-    // `do { … }` is an EXPRESSION: the statement needs its own terminator
-    // (the leaf's trailing `;` is inside the block).
     format!("do {{ {s} }};")
 }
 

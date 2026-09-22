@@ -1720,8 +1720,17 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
         }
         IrStmt::RawText(text) => {
-            // Splice verbatim — no transformation
-            out.push_str(text);
+            // Splice verbatim — no transformation, EXCEPT a terminator: the
+            // native-statement transform emits whole `do { … }` blocks with
+            // no trailing `;` (valid as the last statement, a parse error
+            // when another statement follows — `}print`).
+            let t = text.trim_end();
+            if t.starts_with("do {") && !t.ends_with(';') {
+                out.push_str(t);
+                out.push_str(";\n");
+            } else {
+                out.push_str(text);
+            }
         }
 
         // goto/label must have been restructured by the shared
