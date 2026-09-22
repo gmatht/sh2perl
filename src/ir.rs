@@ -3425,18 +3425,32 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
 /// (caller falls back).
 fn arith_str_to_perl(s: &str) -> Option<String> {
     let mut t = String::new();
+    // `${…}` expansions are lowered to Perl text via `param_inner_perl`,
+    // but `parse_arith` cannot parse `scalar(@arr)`. Stash each expansion
+    // behind a sentinel ident and splice the Perl back after the AST walk.
+    let mut repls: Vec<(String, String)> = Vec::new();
     let ch: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < ch.len() {
         if ch[i] == '$' && i + 1 < ch.len() {
             if ch[i + 1] == '{' {
                 let mut j = i + 2;
-                while j < ch.len() && ch[j] != '}' {
-                    t.push(ch[j]);
+                let mut depth = 1;
+                while j < ch.len() && depth > 0 {
+                    if ch[j] == '{' {
+                        depth += 1;
+                    }
+                    if ch[j] == '}' {
+                        depth -= 1;
+                    }
                     j += 1;
                 }
-                if j < ch.len() {
-                    i = j + 1;
+                if depth == 0 {
+                    let inner: String = ch[i + 2..j - 1].iter().collect();
+                    let sentinel = format!("__sh2_arithpe_{}", repls.len());
+                    repls.push((sentinel.clone(), param_inner_perl(&inner)));
+                    t.push_str(&sentinel);
+                    i = j;
                     continue;
                 }
             } else if ch[i + 1].is_ascii_alphabetic() || ch[i + 1] == '_' {
@@ -3447,7 +3461,11 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
         t.push(ch[i]);
         i += 1;
     }
-    crate::shir::parse_arith(&t).map(|ast| arith_ast_to_perl(&ast))
+    let mut out = crate::shir::parse_arith(&t).map(|ast| arith_ast_to_perl(&ast))?;
+    for (sent, val) in repls {
+        out = out.replace(&format!("${}", sent), &format!("({})", val));
+    }
+    Some(out)
 }
 
 fn arith_ast_to_perl(ast: &ArithAst) -> String {
