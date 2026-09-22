@@ -1808,8 +1808,20 @@ impl Render {
     }
 
     fn emit(&mut self, s: &str) {
+        // `rc_strip` can reduce a whole unit to nothing — a status-store
+        // line is exactly `__SH_RC.store(0, Ordering::SeqCst);`, and with
+        // the register disabled (`rc_disabled` — a source with no `$?`,
+        // e.g. Python) every statement's trailing store is stripped. That
+        // is a REMOVED line, not an intentional blank separator: only an
+        // `emit("")` call is a separator. So remember whether the input
+        // was non-empty; an emptied unit is dropped instead of becoming a
+        // blank line.
+        let was_empty = s.is_empty();
         let s = self.rc_strip(s);
         let s = s.as_str();
+        if s.is_empty() && !was_empty {
+            return;
+        }
         // pass-4: collapse a dead `__SH_RC` store. Scan back over plain
         // lines; a store found with only plain lines between it and this
         // one is unobservable (its value is overwritten before any read,
@@ -17631,6 +17643,36 @@ mod tests {
         assert!(out.contains("print!("), "body lost:\n{out}");
         assert!(out.contains("yes"), "body lost:\n{out}");
         assert!(!out.contains("\n\n    }"), "stray blank before the brace:\n{out}");
+    }
+
+    /// A status-free source (Python: `rc_disabled`) must not leave a blank
+    /// line where each statement's stripped `__SH_RC.store(0, …)` used to
+    /// be — the t28 shape rendered `let a = …;\n\nlet b = …;\n\nif …`.
+    /// The stripped store is a REMOVED line, not a separator; the blanks
+    /// only survive as the intentional `emit("")` group separators.
+    #[test]
+    fn stripped_status_store_leaves_no_blank() {
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[{"name":"a","type":"Str"},{"name":"b","type":"Str"}],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"a","indices":[],"sigil":null}],"expr":{"type":"Str","value":"a","style":"DoubleQuoted"}},
+            {"type":"Assign","targets":[{"var":"b","indices":[],"sigil":null}],"expr":{"type":"Str","value":"b","style":"DoubleQuoted"}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"both","style":"DoubleQuoted"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("A1 ingress");
+        crate::shir::set_source_lang(Some("py"));
+        let out = shir_to_rust(&prog);
+        crate::shir::set_source_lang(None);
+        // the whole main body must be consecutive lines: no blank between
+        // the two `let`s or before the print
+        let body: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.contains("fn main()"))
+            .take_while(|l| l.trim() != "}")
+            .collect();
+        let blanks = body.iter().filter(|l| l.trim().is_empty()).count();
+        assert_eq!(blanks, 0, "stripped stores left blanks:\n{out}");
+        assert!(out.contains("let a = "), "binding lost:\n{out}");
+        assert!(out.contains("let b = "), "binding lost:\n{out}");
+        assert!(!out.contains("__SH_RC"), "status kept:\n{out}");
     }
 
     /// …but a SHELL source whose `$?` IS read keeps the arm: the false path
