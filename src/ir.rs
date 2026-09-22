@@ -1964,6 +1964,105 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     return;
                 }
             }
+            // A redirect-wrapped `"$@"` (the corpus's `capture` helper runs
+            // the caller's command with both streams tee'd to temp files).
+            // The rebuilt shell text `"$@" ` has NO positional parameters in
+            // the `bash -c` child (they are Perl's @ARGV), so the command
+            // never ran.  Dup the redirected fds to the REAL descriptors and
+            // run the argv directly.
+            if let [IrStmt::Expr(IrExpr::Call { args, .. })] = inner.as_slice() {
+                if let Some(IrExpr::Call { func: lf, args: la }) = args.first() {
+                    if lf == "listVar"
+                        && la.first().and_then(call_arg_str).as_deref() == Some("@")
+                    {
+                        let mut pre: Vec<String> = Vec::new();
+                        let mut post: Vec<String> = Vec::new();
+                        let mut n = 0usize;
+                        for r in redirects {
+                            if !matches!(r.mode.as_str(), "w" | "wc" | "a") {
+                                continue;
+                            }
+                            let fd = r.fd.unwrap_or(1);
+                            if !matches!(fd, 1 | 2) {
+                                continue;
+                            }
+                            let saved = format!("$__sh2_dup{n}");
+                            let fh = format!("$__sh2_dupfh{n}");
+                            n += 1;
+                            pre.push(format!(
+                                "open(my {fh}, '>&', \\*STD{}) or die; ",
+                                if fd == 1 { "OUT" } else { "ERR" }
+                            ));
+                            pre.push(format!(
+                                "open(STD{}, {}, {}) or die \"redirect: $!\\n\"; ",
+                                if fd == 1 { "OUT" } else { "ERR" },
+                                if r.mode == "a" { "'>>'" } else { "'>'" },
+                                render_word(&r.target)
+                            ));
+                            let _ = &saved;
+                            post.push(format!(
+                                "open(STD{}, '>&', {fh}) or die; close({fh}); ",
+                                if fd == 1 { "OUT" } else { "ERR" }
+                            ));
+                        }
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "{{ {pre}system(@ARGV); $main_exit_code = $CHILD_ERROR = $? >> 8; {post}}}\n",
+                            pre = pre.join(""),
+                            post = post.join(""),
+                        ));
+                        return;
+                    }
+                }
+            }
+            // A redirect-wrapped call to a PROGRAM-DEFINED function
+            // (`capture LBL tty < "$f"`): a Perl sub cannot be reached
+            // through a rebuilt shell command, so run the body with the
+            // REAL fd redirected. Both directions matter:
+            //   fd 1 (w/a) — `f LBL cmd > FILE`: the sub's prints/children
+            //                must land in FILE;
+            //   fd 0 (r)   — `f LBL cmd < FILE`: the sub's `read`s (and
+            //                any shell-out) must see FILE.
+            // `local *STDIN` makes the open unwind with the block, so a
+            // nest of redirects composes.
+            if let [IrStmt::Expr(IrExpr::Call { func, .. })] = inner.as_slice() {
+                if func == "$fn_call" || func == "fnCall" {
+                    let mut body = String::new();
+                    emit_stmt(&mut body, &inner[0], 2);
+                    let out_r = redirects.iter().find(|r| {
+                        matches!(r.fd, None | Some(1))
+                            && matches!(r.mode.as_str(), "w" | "wc" | "a")
+                    });
+                    let in_r = redirects
+                        .iter()
+                        .find(|r| matches!(r.fd, None | Some(0)) && r.mode == "r");
+                    if let Some(r) = out_r {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "{{ open(my $__fn_fh, {}, {}) or die \"redirect: $!\\n\"; my $__fn_sel = select($__fn_fh); {body} select($__fn_sel); close($__fn_fh); }}\n",
+                            if r.mode == "a" { "'>>'" } else { "'>'" },
+                            render_word(&r.target),
+                        ));
+                        return;
+                    }
+                    if let Some(r) = in_r {
+                        emit_indent(out, indent);
+                        out.push_str("{\n");
+                        emit_indent(out, indent + 1);
+                        out.push_str("local *STDIN;\n");
+                        emit_indent(out, indent + 1);
+                        out.push_str(&format!(
+                            "open(STDIN, '<', {}) or die \"Cannot read input: $!\\n\";\n",
+                            render_word(&r.target)
+                        ));
+                        emit_indent(out, indent + 1);
+                        out.push_str(&body.trim_start());
+                        emit_indent(out, indent);
+                        out.push_str("}\n");
+                        return;
+                    }
+                }
+            }
             // Rebuild the shell command with shell redirection syntax and
             // run it via bash -c — stdout matches bash exactly (redirects
             // are shell-level semantics).
@@ -7351,6 +7450,14 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                     .collect(),
             },
             IrStmt::Subshell(body) => IrStmt::Subshell(rewrite_fn_calls(body, fns)),
+            IrStmt::Redirect { inner, redirects } => IrStmt::Redirect {
+                // A redirect-wrapped call to a PROGRAM-DEFINED function
+                // (`capture LBL tty < "$f"`) is still a Perl sub call — the
+                // rebuilt shell text cannot see the sub (`bash: capture:
+                // command not found`).
+                inner: rewrite_fn_calls(inner, fns),
+                redirects: redirects.clone(),
+            },
             IrStmt::Background(body) => IrStmt::Background(rewrite_fn_calls(body, fns)),
             IrStmt::Block(body) => IrStmt::Block(rewrite_fn_calls(body, fns)),
             IrStmt::Pipeline {
