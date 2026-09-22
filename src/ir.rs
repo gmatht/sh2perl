@@ -3364,6 +3364,22 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if try_native_echo_tr_pipeline(out, &expr, indent) {
                         return;
                     }
+                    if try_native_while_read_sort(out, &expr, indent) {
+                        return;
+                    }
+                    if try_native_for_sort(out, &expr, indent) {
+                        return;
+                    }
+                    // No native fold — rebuild the SHELL TEXT and run the
+                    // pipeline as a real pipe (`cat f | tr a b | grep hi`
+                    // emitted three independent commands, so `tr` read the
+                    // script's stdin and `grep` saw no input). REFUSE on a
+                    // stage that cannot rebuild, so the per-stage fallback
+                    // below stays available for Perl-side stages.
+                    if let Some(cmd) = pipeline_call_to_cmd(&expr) {
+                        emit_shell_cmd(out, indent, &cmd);
+                        return;
+                    }
                 }
                 for stage in stages {
                     for s in stage {
