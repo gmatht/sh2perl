@@ -1287,14 +1287,6 @@ fn first_code_newline(s: &str) -> Option<usize> {
         }
     }
 
-    // The external-command seam (UU-FFI.md): emitted when the body calls
-    // __sh_uu_capture/__sh_uu_run — the helper probes for the uu-ffi .so
-    // at BEGIN and falls back to guarded fork/exec (with a one-time
-    // stderr warning) when absent.
-    if body.contains("__sh_uu_capture") || body.contains("__sh_uu_run") {
-        out.push_str(SH_RUN_EXT_PREAMBLE);
-        out.push('\n');
-    }
     // Emit the imports (every decision input — the body scan, `say`, and
     // the hostname analysis — is computed by now).
     for import in &imports {
@@ -1324,7 +1316,10 @@ fn first_code_newline(s: &str) -> Option<usize> {
         if body.contains("$main_exit_code") {
             out.push_str("my $main_exit_code = 0;\n");
         }
-        if body.contains("$CHILD_ERROR") {
+        if body.contains("$CHILD_ERROR")
+            || body.contains("__sh_uu_")
+            || body.contains("__sh_pipe_")
+        {
             out.push_str("our $CHILD_ERROR = 0;\n");
         }
         if body.contains("$__argc") {
@@ -1371,6 +1366,19 @@ fn first_code_newline(s: &str) -> Option<usize> {
         out.push('\n');
     }
 
+    // The external-command seam (UU-FFI.md): emitted when the body calls
+    // __sh_uu_capture/__sh_uu_run/__sh_pipe_* — the helpers probe for the
+    // uu-ffi `.so` at BEGIN and fall back to guarded fork/exec (with a
+    // one-time stderr warning) when absent. AFTER the preamble declarations
+    // (`our $CHILD_ERROR`) so the strict subs compile.
+    if body.contains("__sh_uu_capture")
+        || body.contains("__sh_uu_run")
+        || body.contains("__sh_pipe_run")
+        || body.contains("__sh_pipe_capture")
+    {
+        out.push_str(SH_RUN_EXT_PREAMBLE);
+        out.push('\n');
+    }
     // Append the rendered body (statements + subs + exit).
     out.push_str(&body);
 
@@ -4350,6 +4358,16 @@ fn var_exports_str(cmd: &str) -> String {
 
 /// `$ENV{name} = $name;` lines + the bash -c system call + status tracking.
 fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
+    // A linear pipeline / redirection the coreutils-ffi-pipeline C ABI can
+    // run in-process — no `bash -c` (check_qx).
+    if let Some(expr) = pipeline_value_cmd(cmd) {
+        emit_indent(out, indent);
+        out.push_str(&format!(
+            "$main_exit_code = $CHILD_ERROR = __sh_pipe_run({}, \"pipefail\");\n",
+            expr
+        ));
+        return;
+    }
     let exports = var_exports_str(cmd);
     for line in exports.lines() {
         emit_indent(out, indent);
@@ -8508,8 +8526,220 @@ sub __sh_uu_capture {
     $__sh_uu_rc = $? >> 8;
     return $out // '';
 }
+# ── pipeline front end (coreutils-ffi-pipeline C ABI) ──────────────
+# uu_pipeline_run_str runs a LINEAR pipeline (a|b|c) with redirections
+# in-process, so the Perl backend never emits `bash -c` for those shapes.
+my $__SH_PIPE = 0;
+my $__SH_PIPE_TRIED = 0;
+# Shell single-quote a runtime value so the pipeline parser sees one argv.
+sub __sh_q {
+    my $s = shift;
+    $s = '' unless defined $s;
+    $s =~ s/'/'\\''/g;
+    return "'$s'";
+}
+sub __sh_pipe_load {
+    return 1 if $__SH_PIPE;
+    return 0 if $__SH_PIPE_TRIED;
+    $__SH_PIPE_TRIED = 1;
+    my @cand;
+    push @cand, $ENV{SH2_UU_PIPELINE_LIB} if defined $ENV{SH2_UU_PIPELINE_LIB};
+    for my $up ('', '../', '../../', '../../../', '../../../../', '../../../../../') {
+        push @cand, "${up}runtime/lib/libcoreutils_ffi_pipeline.so";
+    }
+    push @cand, 'libcoreutils_ffi_pipeline.so';
+    for my $lib (@cand) {
+        next unless defined $lib && -e $lib;
+        my $ok = eval {
+            require FFI::Platypus;
+            my $ffi = FFI::Platypus->new(api => 2);
+            $ffi->lib($lib);
+            $ffi->attach([uu_pipeline_run_str => '__sh_pipe_run_str'] => ['string','string'] => 'int');
+            $ffi->attach([uu_pipeline_last_code => '__sh_pipe_last_code'] => [] => 'int');
+            $__SH_PIPE = 1;
+            1;
+        };
+        last if $ok;
+    }
+    # Point the process backends at the multicall helper shipped alongside.
+    if ($__SH_PIPE && !defined $ENV{UU_FFI_MULTICALL}) {
+        for my $up ('', '../', '../../', '../../../') {
+            my $m = "${up}runtime/lib/coreutils-ffi-multicall";
+            if (-x $m) { $ENV{UU_FFI_MULTICALL} = $m; last; }
+        }
+    }
+    $__SH_PIPE;
+}
+sub __sh_pipe_run {
+    my ($cmd, $opts) = @_;
+    if (__sh_pipe_load()) {
+        my $rc = __sh_pipe_run_str($cmd, defined $opts ? $opts : '');
+        # `-2` parse / `-3` backend; `127` is the multicall's "unknown util"
+        # (not a uutils command) — run those through the shell instead.
+        if ($rc >= 0 && $rc != 127) { $CHILD_ERROR = $rc; return $rc; }
+    }
+    # Not parseable / unknown util / no backend / no .so: run it via the shell.
+    system('bash', '-c', $cmd);
+    $CHILD_ERROR = $? >> 8;
+    return $CHILD_ERROR;
+}
+sub __sh_pipe_capture {
+    my ($cmd, $opts) = @_;
+    if (__sh_pipe_load()) {
+        my $tmp = "/tmp/sh2_pipe_${$}_" . ($__SH_UU_SEQ++) . ".cap";
+        my $rc = __sh_pipe_run_str($cmd . ' > ' . $tmp, defined $opts ? $opts : '');
+        if ($rc >= 0 && $rc != 127) {
+            my $out = '';
+            if (open(my $rf, '<', $tmp)) { $out = do { local $/; <$rf> } // ''; close $rf; }
+            unlink $tmp;
+            $CHILD_ERROR = $rc;
+            $out =~ s/\n+\z//;
+            return $out;
+        }
+        unlink $tmp;
+    }
+    my $out = do {
+        open(my $fh, '-|', 'bash', '-c', $cmd) or do { $CHILD_ERROR = 127; return ''; };
+        my $r = do { local $/; <$fh> };
+        close $fh;
+        $r;
+    };
+    $CHILD_ERROR = $? >> 8;
+    $out =~ s/\n+\z//;
+    return $out // '';
+}
 # __SH_RUN_EXT_END
 "#;
+
+/// Can `cmd` be parsed by the `coreutils-ffi-pipeline` grammar? That grammar
+/// supports `a | b | c` plus `> FILE` / `>> FILE` / `< FILE` / `<<< text` /
+/// `2>/dev/null`, and REJECTS `&&`, `||`, `;`, `$(...)`, backticks, `$VAR`,
+/// globs and subshells. Route only when the parser will not error (the
+/// parser would reject at runtime, but a `bash -c` fallback in the same
+/// emit would still trip check_qx).
+fn pipeline_grammar_ok(cmd: &str) -> bool {
+    if cmd.trim().is_empty() {
+        return false;
+    }
+    // Reject anything the parser would treat literally rather than expand:
+    // `$var` (the grammar has no expansion, so a `$` would be passed as the
+    // literal text — wrong), globs, control flow, subshells. A quoted
+    // `$`/glob is still wrong here, so reject regardless of quoting.
+    for c in cmd.chars() {
+        if matches!(
+            c,
+            '&' | ';' | '`' | '$' | '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}' | '!' | '~'
+                | '\n'
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build a PERL EXPRESSION that evaluates to a pipeline command string with
+/// runtime values substituted for `"$var"` arguments. The `coreutils-ffi`
+/// pipeline grammar has no expansion, so a `$var` in the reconstructed shell
+/// text would be passed literally; splice the VALUE in instead (shell-quoted
+/// by `__sh_q`, so a value with spaces stays one argv). None when the shape
+/// is not expressible (globs, `$(...)`, `&&`, `||`, subshells).
+fn pipeline_value_cmd(cmd: &str) -> Option<String> {
+    // The pipeline parser only accepts the fd-2 null redirect in its
+    // no-space form (`2>/dev/null`); the renderer emits `2> '/dev/null'`.
+    let cmd = cmd
+        .replace("2> '/dev/null'", "2>/dev/null")
+        .replace("2> /dev/null", "2>/dev/null");
+    let cmd = cmd.as_str();
+    if cmd.contains("||") || cmd.contains("|&") {
+        return None;
+    }
+    let reject = |c: char| {
+        matches!(
+            c,
+            '&' | ';' | '`' | '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}' | '!' | '~' | '\n'
+        )
+    };
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if reject(c) {
+            return None;
+        }
+        if c == '\'' {
+            lit.push(c);
+            i += 1;
+            while i < chars.len() {
+                lit.push(chars[i]);
+                if chars[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            let mut j = i + 1;
+            let mut content = String::new();
+            while j < chars.len() && chars[j] != '"' {
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    content.push(chars[j]);
+                    content.push(chars[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                content.push(chars[j]);
+                j += 1;
+            }
+            if j >= chars.len() {
+                return None;
+            }
+            if content.contains('$') {
+                let t = content.trim();
+                let name = if let Some(n) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
+                    n.to_string()
+                } else if let Some(n) = t.strip_prefix('$') {
+                    n.to_string()
+                } else {
+                    return None;
+                };
+                if name.is_empty()
+                    || !name.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || matches!(c, '_' | '?' | '#' | '@' | '*' | '$' | '!')
+                    })
+                {
+                    return None;
+                }
+                if !lit.is_empty() {
+                    parts.push(safe_perl_q_string(&lit));
+                    lit.clear();
+                }
+                parts.push(format!("__sh_q({})", var_read(&name)));
+                i = j + 1;
+                continue;
+            }
+            lit.push('"');
+            lit.push_str(&content);
+            lit.push('"');
+            i = j + 1;
+            continue;
+        }
+        lit.push(c);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        parts.push(safe_perl_q_string(&lit));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" . "))
+    }
+}
 
 /// Split a shell command string into argv (dq/sq aware, quotes stripped).
 /// REFUSE > GUESS: None on shell metacharacters (`| & ; < > ( )` backtick,
@@ -8821,6 +9051,10 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // a coreutils binary) and before the bash -c fallback.
     if let Some(e) = crate::pipeline_native::native_capture(cmd) {
         return e;
+    }
+    // A linear pipeline / redirection the pipeline C ABI can run + capture.
+    if let Some(expr) = pipeline_value_cmd(cmd) {
+        return format!("__sh_pipe_capture({}, \"pipefail\")", expr);
     }
     if uu_seam_enabled() {
         if let Some(argv) = sh_split_simple_cmd(cmd) {
