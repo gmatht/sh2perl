@@ -1840,7 +1840,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     // `*)` final clause — render as else.
                     emit_indent(out, indent);
                     if is_first {
-                        out.push_str(&format!("if ({} =~ /^.*$/) {{\n", d));
+                        out.push_str(&format!("if (({}) =~ /^.*$/) {{\n", d));
                     } else {
                         out.push_str("} else {\n");
                     }
@@ -1848,9 +1848,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     let re = format!("^(?:{})$", patterns.join("|"));
                     emit_indent(out, indent);
                     if is_first {
-                        out.push_str(&format!("if ({} =~ /{}/) {{\n", d, re));
+                        out.push_str(&format!("if (({}) =~ /{}/) {{\n", d, re));
                     } else {
-                        out.push_str(&format!("}} elsif ({} =~ /{}/) {{\n", d, re));
+                        out.push_str(&format!("}} elsif (({}) =~ /{}/) {{\n", d, re));
                     }
                 }
                 for s in &clause.body {
