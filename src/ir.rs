@@ -1973,8 +1973,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 ));
                             }
                             _ => match call_arg_str(&r.target) {
-                                Some(t) => {
-                                    if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &t) {
+                                Some(_) => {
+                                    if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &r.target) {
                                         ok = false;
                                         break;
                                     }
@@ -2363,13 +2363,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     .collect(),
                                 _ => Vec::new(),
                             };
-                            let stderr_only = !specs.is_empty()
-                                && specs.iter().all(|s| match redirect_spec_fields(s) {
-                                    Some((2, _, _)) => true,
-                                    Some((_, _, t)) => t == "/dev/null",
-                                    None => false,
-                                });
-                            if stderr_only {
+                            // A spec-less redirect wrapper (the process-subst
+                            // transform's producer materialisation leaves the
+                            // outer `redirect` Call with an empty spec array) is
+                            // a no-op — emit the inner statements. A `2>/dev/null`
+                            // or any `/dev/null` target is droppable (the gate
+                            // only compares stdout/exit); `all` on an empty set is
+                            // true, so the wrapper is handled too.
+                            let droppable = specs.iter().all(|s| match redirect_spec_fields(s) {
+                                Some((2, _, _)) => true,
+                                Some((_, _, t)) => {
+                                    call_arg_str(&t).as_deref() == Some("/dev/null")
+                                }
+                                None => false,
+                            });
+                            if droppable {
                                 for s in stmts {
                                     emit_stmt(out, s, indent);
                                 }
@@ -4856,11 +4864,11 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
 }
 
 /// Read the (fd, mode, target) of one redirect spec Object.
-fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, String)> {
+fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, IrExpr)> {
     if let IrExpr::Object(fields) = e {
         let mut fd: i64 = 1;
         let mut mode = String::new();
-        let mut target = String::new();
+        let mut target = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
         for (k, v) in fields {
             match k.as_str() {
                 "fd" => {
@@ -4869,7 +4877,9 @@ fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, String)> {
                     }
                 }
                 "mode" => mode = call_arg_str(v).unwrap_or_default(),
-                "target" => target = call_arg_str(v).unwrap_or_default(),
+                // Keep the target EXPRESSION: a Var target must render as a
+                // shell variable read, not a literal file named after it.
+                "target" => target = v.clone(),
                 _ => {}
             }
         }
@@ -4879,16 +4889,27 @@ fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, String)> {
     }
 }
 
+/// The variable read a redirect target refers to, if any (`Var("x")` or
+/// `getVar("x")`).
+fn var_ref_name(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Var(n, _) => Some(n.clone()),
+        IrExpr::Call { func, args } if func == "getVar" => args.first().and_then(call_arg_str),
+        _ => None,
+    }
+}
+
 /// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, ` <<< s`,
 /// ` <<DELIM\nbody\nDELIM`) to cmd. Returns false for unknown modes.
-fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> bool {
+fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) -> bool {
+    let tstr = call_arg_str(target).unwrap_or_default();
     match mode {
         "herestring" => {
-            cmd.push_str(&format!(" <<< '{}'", target.replace('\'', "'\\\\''")));
+            cmd.push_str(&format!(" <<< '{}'", tstr.replace('\'', "'\\\\''")));
             return true;
         }
         "heredoc" | "heredoc-tabs" => {
-            let body = target;
+            let body = &tstr;
             cmd.push_str(" <<'_SH2DOC_'");
             cmd.push('\n');
             cmd.push_str(body);
@@ -4901,11 +4922,11 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
         // Process substitution (core-request perl-shir-20260806-1930):
         // the target carries the inner command text; bash expands it.
         "process-in" => {
-            cmd.push_str(&format!(" <({})", target));
+            cmd.push_str(&format!(" <({})", tstr));
             return true;
         }
         "process-out" => {
-            cmd.push_str(&format!(" >({})", target));
+            cmd.push_str(&format!(" >({})", tstr));
             return true;
         }
         _ => {}
@@ -4920,7 +4941,7 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
     // fd N → target &M means N>&M / N<&M (fd dup) — the op is the DIRECTION
     // arrow, never the file mode (mode "w"/"a" would wrongly emit `2>>&1`,
     // which is not bash — syntax error).
-    if let Some(m) = target.strip_prefix('&') {
+    if let Some(m) = tstr.strip_prefix('&') {
         let arrow = if op == "<" { "<&" } else { ">&" };
         // NO space between the fd and the arrow: `2>&1` is the fd-dup
         // redirect; `2 >&1` would make `2` a FILE argument (verified:
@@ -4928,7 +4949,17 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
         cmd.push_str(&format!(" {}{}{}", fd, arrow, m));
         return true;
     }
-    let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
+    // A variable target (`< "$tmp"` from the process-subst transform, or a
+    // frontend `Redirect` with a Var) must stay a shell variable read —
+    // single-quoting it produced a literal file named after the Perl var
+    // (`mapfile < '__ps_tmp2'` read a nonexistent file instead of the temp).
+    let quoted = match var_ref_name(target) {
+        Some(name) => {
+            let v = var_read(&name);
+            format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+        None => format!("'{}'", tstr.replace('\'', "'\\\\''")),
+    };
     let frag = match fd {
         0 => format!(" < {}", quoted),
         // `op` not `>`: the old hardcode rebuilt `>>` (append) as `>`
@@ -5409,7 +5440,7 @@ fn try_native_while_read_sort(out: &mut String, call: &IrExpr, indent: usize) ->
                 for sp in specs {
                     if let Some((0, m, t)) = redirect_spec_fields(sp) {
                         if m == "r" {
-                            file = Some(t);
+                            file = call_arg_str(&t);
                         }
                     }
                 }
