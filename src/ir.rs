@@ -4018,10 +4018,60 @@ fn strip_re(var: &str, pat: &str) -> String {
 fn param_value(a: &IrExpr) -> String {
     if let IrExpr::Str(s, _) = a {
         let t = s.trim().trim_matches('"').trim_matches('\'');
+        // A NESTED expansion (`${a:-${b}}`, `${a:-$(cmd)}`) arrives as the
+        // literal text of the default; render it as a Perl value instead of
+        // a string literal (`"\${NAME}"` printed the raw `${NAME}`).
+        if t.contains("${") || t.contains("$(") {
+            if let Some(v) = nested_expansion_value(t) {
+                return v;
+            }
+        }
         render_str_literal(t, &StrStyle::DoubleQuoted)
     } else {
         render_word(a)
     }
+}
+
+/// Render a default/alternate VALUE that is itself an expansion:
+/// `${a:-${b}}` / `${a:-$(cmd)}` / `${a:-$b}`. None when the text is not a
+/// single expansion (mixed literal text keeps the string-literal path).
+fn nested_expansion_value(t: &str) -> Option<String> {
+    let t = t.trim();
+    if t.starts_with("${") && t.ends_with('}') {
+        // balanced check: the closing `}` must match the opening one
+        let mut depth = 0usize;
+        for (i, c) in t.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 && i != t.len() - 1 {
+                        return None; // trailing text after the expansion
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        if let Some(p) = param_text_to_perl(t) {
+            return Some(p);
+        }
+        // A default whose VALUE is a slice (`${a:-${arr[@]:0:2}}`)
+        return param_text_to_perl(&t.replace("[@]", "[@]"));
+    }
+    if let Some(inner) = t.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
+        if !inner.is_empty() && !inner.contains("$(") {
+            return Some(cmd_str_to_open_perl_stripped(inner));
+        }
+    }
+    if let Some(n) = t.strip_prefix('$') {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(var_read(n));
+        }
+    }
+    None
 }
 
 /// `${var…}` parameter expansion (Call param): op, var, value/pattern...
