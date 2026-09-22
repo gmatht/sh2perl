@@ -552,8 +552,12 @@ fn test_chain_to_if(st: &mut IrStmt) -> bool {
         return false;
     };
     if let Some(b) = static_truth {
-        // Statically known: keep only the taken branch (echo is pure).
-        *st = if b { then[0].clone() } else { else_[0].clone() };
+        // Statically known: keep only the taken branch (echo is pure). The
+        // pipeline itself still RUNS (its own output is observable —
+        // `echo LIT | grep PAT && echo OK` prints the matching lines AND
+        // OK), so it stays ahead of the taken branch.
+        let taken = if b { then[0].clone() } else { else_[0].clone() };
+        *st = IrStmt::Block(vec![IrStmt::Expr((**cond).clone()), taken]);
         return true;
     }
     *st = IrStmt::If {

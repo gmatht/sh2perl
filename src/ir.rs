@@ -2543,6 +2543,43 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 }
                                 None => false,
                             });
+                            // A single fd-1 FILE redirect around a body the
+                            // renderer emits as Perl can be honoured
+                            // natively: run the statements with stdout
+                            // redirected to the file (the fd-1 dance the
+                            // redirect sites use, so child processes are
+                            // captured too). Otherwise a file redirect stays
+                            // a refusal — dropping it would lose the output.
+                            let out_target = specs.iter().find_map(|sp| {
+                                match redirect_spec_fields(sp) {
+                                    Some((1, m, t))
+                                        if matches!(m.as_str(), "w" | "wc" | "a") =>
+                                    {
+                                        Some((m, t))
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            if let Some((mode, target)) = out_target {
+                                if capture_body_native(stmts)
+                                    || matches!(
+                                        stmts.as_slice(),
+                                        [IrStmt::Expr(_)] | [IrStmt::Block(_)]
+                                    )
+                                {
+                                    let mut body = String::new();
+                                    for s in stmts {
+                                        emit_stmt(&mut body, s, 1);
+                                    }
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!(
+                                        "{{ open(my $__red_fh, {}, {}) or die \"redirect: $!\\n\"; my $__red_sel = select($__red_fh); {body} select($__red_sel); close($__red_fh); }}\n",
+                                        if mode == "a" { "'>>'" } else { "'>'" },
+                                        render_word(&target),
+                                    ));
+                                    return;
+                                }
+                            }
                             if droppable {
                                 for s in stmts {
                                     emit_stmt(out, s, indent);
@@ -2821,6 +2858,26 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     ));
                                     return;
                                 }
+                            }
+                            // Natively emittable body (folded `Output`, the
+                            // `grepMatches` lift, `&&`/`||` chains): capture
+                            // the Perl prints in-process. Without this a
+                            // `Call{capture}` whose body has no shell
+                            // spelling fell to `ir_expr_to_perl`, which
+                            // renders the CALL itself — an empty string
+                            // (`matched=$(… | grep -o PAT)` lost every
+                            // match).
+                            if capture_body_native(arrow) {
+                                let mut body = String::new();
+                                for st in arrow.iter() {
+                                    emit_stmt(&mut body, st, 1);
+                                }
+                                emit_indent(out, indent);
+                                out.push_str(&format!(
+                                    "{} = do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }};\n",
+                                    lhs
+                                ));
+                                return;
                             }
                         }
                         if let Some(cmd) = capture_call_to_cmd(expr) {
@@ -8348,6 +8405,9 @@ fn capture_expr_native(e: &IrExpr) -> bool {
             // arith_str_to_perl) — capturable in-process.
             "test" => true,
             "arith" => true,
+            // `grep -o PAT` — the lift prints each match, so capturing its
+            // stdout in-process is exact (`x=$(… | grep -o PAT)`).
+            "grepMatches" => true,
             // `A && B` / `A || B` closures (the shell frontend's chain form).
             "and" | "or" => {
                 !args.is_empty()
