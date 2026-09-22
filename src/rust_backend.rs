@@ -2798,7 +2798,14 @@ impl Render {
             if m.chars().any(|c| c.is_ascii_uppercase()) {
                 attr.push_str("#[allow(non_snake_case)] ");
             }
-            return format!("{attr}{kw} {m} = {e};");
+            // An Int-homed local carries an explicit `: i64`. Without it
+            // the binding is INFERRED, and an unsuffixed literal `let x = 1;`
+            // would make every later `x + 1` i32-ambiguous — which is why
+            // the arith renderer had to suffix each literal operand. Pinning
+            // the type here lets those suffixes go, and is what makes
+            // `x = x + 1` compile whether or not a store widened it first.
+            let ty = if self.is_num(name) { ": i64" } else { "" };
+            return format!("{attr}{kw} {m}{ty} = {e};");
         }
         format!("{m} = {e};")
     }
@@ -4196,8 +4203,8 @@ impl Render {
                     // i64-typed.
                     ">>" | "<<" => format!(
                         "({} {op} {})",
-                        Self::arith_i64(&l),
-                        Self::arith_i64(&r)
+                        self.arith_i64(&l, rhs),
+                        self.arith_i64(&r, lhs)
                     ),
                     "/" => {
                         self.add_helper("div");
@@ -4207,7 +4214,11 @@ impl Render {
                         self.add_helper("mod");
                         format!("__sh_mod({l},{r})")
                     }
-                    _ => format!("({} {op} {})", Self::arith_i64(&l), Self::arith_i64(&r)),
+                    _ => format!(
+                        "({} {op} {})",
+                        self.arith_i64(&l, rhs),
+                        self.arith_i64(&r, lhs)
+                    ),
                 }
             }
             ArithAst::Un { op, arg } => {
@@ -4267,9 +4278,20 @@ impl Render {
     /// hard-error on overflow at compile time). Only a plain decimal
     /// literal is suffixed — anything else (a var, a call, a nested
     /// expression) is already i64-typed by construction.
-    fn arith_i64(s: &str) -> String {
+    ///
+    /// `other` is the SIBLING operand's AST: the suffix is needed unless
+    /// the sibling pins the operation's type to `i64`. A bare `Num`
+    /// sibling does NOT (both sides would default to `i32`); nor does a
+    /// pass-2 local, whose `let x = 2;` binding is itself inferred, so a
+    /// chain of locals and literals has no i64 anchor. Only a genuinely
+    /// i64-homed read (a `Cell<i64>` thread-local, an int-array element,
+    /// a numeric parameter, a cast) supplies the type.
+    fn arith_i64(&self, s: &str, other: &ArithAst) -> String {
         let t = s.trim();
         if t.is_empty() {
+            return t.to_string();
+        }
+        if self.arith_pins_i64(other) {
             return t.to_string();
         }
         let body = t.strip_prefix('-').unwrap_or(t);
@@ -4281,6 +4303,24 @@ impl Render {
             return format!("{t}i64");
         }
         t.to_string()
+    }
+
+    /// Does this operand pin the enclosing operation to `i64`? True only
+    /// for reads whose Rust type is i64 by construction:
+    ///   * a numeric var — a pass-2 local is declared `: i64`
+    ///     ([`Self::local_write_stmt`]), a thread-local home is a
+    ///     `Cell<i64>` (`read_num` emits `.get()`);
+    ///   * an int-homed array element (`Vec<i64>` / `[i64; N]`);
+    ///   * a cast names its type, `sizeof` is a sized literal.
+    /// A bare `Num` operand is NOT a pin: two literals would both default
+    /// to `i32` and a sum past that range would hard-error at compile time.
+    fn arith_pins_i64(&self, a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.is_num(name),
+            ArithAst::Index { var, .. } => self.is_int_array(var) || self.is_num(var),
+            ArithAst::Cast { .. } | ArithAst::Sizeof(_) => true,
+            _ => false,
+        }
     }
 
     fn arith_op(&self, op: &BinOpKind) -> &'static str {
@@ -18051,7 +18091,9 @@ mod tests {
         // pass 2: single-scope x is a plain local (`let` at first write)
         let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
-        assert!(out.contains("let mut x = 5;"), "{out}");
+        // an Int-homed local carries an explicit `: i64` so its binding is
+        // not inferred (that is what lets `x + 1` stay unsuffixed)
+        assert!(out.contains("let mut x: i64 = 5;"), "{out}");
         assert!(out.contains("x = 6;"), "{out}");
         assert!(!out.contains("__SHV_x"), "{out}");
         // single-word dynamic echo prints directly (no helper)
@@ -18066,16 +18108,47 @@ mod tests {
     fn if_arith_test() {
         let out = render("x=3\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
         assert!(out.contains("> 3"), "{out}");
-        // the arith lowering reads x numerically and adds 1; the literal
-        // is i64-suffixed (no whole-expression cast)
-        assert!(out.contains("x + 1i64"), "{out}");
+        // the arith lowering reads x numerically and adds 1. `x` is an i64
+        // read, so it supplies the operation's type: the literal stays
+        // UNSUFFIXED (`x + 1`, not `x + 1i64`). The suffix is only needed
+        // when BOTH sides are bare literals (see `literal_literal_ops_are_widened`).
+        assert!(out.contains("x + 1)"), "{out}");
+        assert!(!out.contains("1i64"), "needless i64 suffix:\n{out}");
         // `x` is read only through the test text `"$x"`; the borrow walk
         // reads those `$` references, so the verdict holds and x binds as a
         // plain local instead of a thread_local.
-        assert!(out.contains("let x = 3;"), "{out}");
+        assert!(out.contains("let x: i64 = 3;"), "{out}");
         assert!(!out.contains("__SHV_x"), "x should be a local:\n{out}");
         assert!(!out.contains("TODO"), "{out}");
         assert!(!out.contains("sh2"), "{out}");
+    }
+
+    /// A bare-literal operation WOULD infer as `i32` (and a sum past i32
+    /// range hard-errors at compile time), so those operands keep the
+    /// widening suffix. An operation with an i64-typed operand (`x + 1`,
+    /// `x << 2`) takes its type from it, so the literal stays plain.
+    ///
+    /// `-Os` (the literal-arith fold) is a process-global other tests
+    /// flip; force it OFF for the render so the asserted shapes are the
+    /// `-Og` ones this rule is about, then restore it.
+    #[test]
+    fn literal_literal_ops_are_widened() {
+        let was = crate::shir::size_opt_enabled();
+        crate::shir::set_size_opt(false);
+        let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
+        // the literal-only inner sum widens; the outer `+ x` takes `x`'s type
+        assert!(out.contains("2000000000i64 + 2000000000i64"), "{out}");
+        assert!(out.contains("+ x"), "{out}");
+        // a literal shift inside a variable expression: both operands widened
+        let sh = render("x=1\nz=$((x + (1 << 2)))\necho \"$z\"\n");
+        assert!(sh.contains("1i64 << 2i64"), "{sh}");
+        // an operation on an i64-homed var carries NO literal suffix (the
+        // local itself is declared `: i64`, which supplies the type)
+        let mixed = render("x=1\nz=$((x << 2))\necho \"$z\"\n");
+        assert!(mixed.contains("let x: i64 = 1;"), "{mixed}");
+        assert!(mixed.contains("x << 2"), "{mixed}");
+        assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
+        crate::shir::set_size_opt(was);
     }
 
     #[test]
