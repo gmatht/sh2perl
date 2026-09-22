@@ -8253,6 +8253,31 @@ use std::collections::{HashMap, HashSet};
     for s in &prog.stmts {
         walk_stmt(s, &mut acc, false);
     }
+    // A TERNARY is ONE definition, not two: the frontends lower
+    // `a if c else b` to an `If` whose branches each assign the same name.
+    // Exactly one branch runs, so the name has a single effective assignment
+    // site — without this the two sites make it `Var`, which blocks both the
+    // local verdict and the borrow verdict (t30's `y` then keeps an owned
+    // thread-local home).
+    {
+        let mut ternary: Vec<String> = Vec::new();
+        for s in &prog.stmts {
+            ternary_targets(s, &mut ternary);
+        }
+        for t in ternary {
+            if let Some(n) = acc.sites.get_mut(&t) {
+                if *n > 1 {
+                    *n -= 1;
+                }
+            }
+            if acc.sites.get(&t).copied().unwrap_or(0) <= 1 {
+                acc.multi_run.remove(&t);
+            }
+            acc.runtime_written.remove(&t);
+            acc.arith_written.remove(&t);
+            acc.index_written.remove(&t);
+        }
+    }
     for sub in &prog.subs {
         for s in &sub.body {
             walk_stmt(s, &mut acc, true);
@@ -12519,6 +12544,35 @@ pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
 /// [`analyze_param_use`], an unanalysable construct (`eval`/`source`, an
 /// opaque node) simply withholds the verdict, so a name absent from the
 /// set is the conservative answer, never a guess.
+/// Names bound by a TERNARY `If` (both branches assign the same name) — ONE
+/// definition rather than two, since the branches are exclusive.
+fn ternary_targets(s: &IrStmt, out: &mut Vec<String>) {
+    use crate::ir::IrStmt;
+    fn one(b: &[IrStmt]) -> Option<String> {
+        match b {
+            [IrStmt::Assign { targets, .. }] if targets.len() == 1 => Some(targets[0].var.clone()),
+            _ => None,
+        }
+    }
+    fn walk(list: &[IrStmt], out: &mut Vec<String>) {
+        for s in list {
+            if let IrStmt::If { then, elsifs, else_, .. } = s {
+                if elsifs.is_empty() {
+                    if let (Some(a), Some(b)) = (one(then), one(else_)) {
+                        if a == b {
+                            out.push(a);
+                        }
+                    }
+                }
+                for b in then.iter().chain(else_).chain(elsifs.iter().flat_map(|(_, b)| b.iter())) {
+                    walk(std::slice::from_ref(b), out);
+                }
+            }
+        }
+    }
+    walk(std::slice::from_ref(s), out);
+}
+
 pub fn analyze_var_borrowable(prog: &IrProgram) -> std::collections::HashSet<String> {
     use crate::ir::{InterpPart, IrExpr, IrStmt, VarKind};
     use std::collections::HashSet;

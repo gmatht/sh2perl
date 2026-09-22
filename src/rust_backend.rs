@@ -8672,6 +8672,58 @@ impl Render {
         false
     }
 
+    /// A ternary binding: `a if c else b` arrives as an `If` whose THEN and
+    /// ELSE are each a single assignment to the SAME name.
+    fn ternary_binding(
+        &self,
+        _cond: &IrExpr,
+        then: &[IrStmt],
+        elsifs: &[(IrExpr, Vec<IrStmt>)],
+        else_: &[IrStmt],
+    ) -> bool {
+        Self::ternary_rhs(then, else_).is_some() && elsifs.is_empty()
+    }
+
+    /// `(name, then-rhs, else-rhs)` for a ternary shape, the RHSs left as IR
+    /// so the caller can render them for the binding's own type.
+    fn ternary_rhs(then: &[IrStmt], else_: &[IrStmt]) -> Option<(String, IrExpr, IrExpr)> {
+        let get = |b: &[IrStmt]| -> Option<(String, IrExpr)> {
+            match b {
+                [IrStmt::Assign { targets, expr, .. }] if targets.len() == 1 => {
+                    Some((targets[0].var.clone(), expr.clone()))
+                }
+                _ => None,
+            }
+        };
+        let (a, ta) = get(then)?;
+        let (b2, eb) = get(else_)?;
+        (a == b2).then_some((a, ta, eb))
+    }
+
+    /// An expression rendered for a VALUE context: the String form plus
+    /// whether it is already numeric (no `.to_string()` needed).
+    fn expr_any2(&mut self, e: &IrExpr) -> (String, bool) {
+        match e {
+            IrExpr::Int(i) => (int_lit(*i), true),
+            _ => {
+                let num = matches!(e, IrExpr::Var(n, _) if self.is_num(n));
+                (self.expr_any(e), num)
+            }
+        }
+    }
+
+    /// One arm of a NUMERIC ternary, converted to the i64 its binding
+    /// declares: a numeric read is the number, a numeric string literal keeps
+    /// its text, anything else goes through the arith path.
+    fn num_arm(&mut self, e: &IrExpr) -> String {
+        match e {
+            IrExpr::Var(n, _) if self.is_num(n) => self.read_num(n),
+            IrExpr::Int(i) => int_lit(*i),
+            IrExpr::Str(s, _) if s.trim().parse::<i64>().is_ok() => s.trim().to_string(),
+            other => self.expr_num(other),
+        }
+    }
+
     /// Seed `out` with the names whose `let` the FIRST write in render order
     /// still owes. Render order is depth-first, so each statement is tested
     /// BEFORE descending into its blocks — recording a nested write first
@@ -9294,6 +9346,65 @@ impl Render {
                     self.emit(&format!("let _ = std::fs::write({p}, {c});"));
                 }
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            }
+            // A TERNARY: the frontends lower `a if c else b` to an `If` whose
+            // branches each assign the same name. Render it as the binding it
+            // is — `let y = if c { a } else { b };` — which is both the source
+            // shape and the only form that type-checks (a branch-local `let`
+            // would leave the name unbound on one path and out of scope after
+            // the `if`).
+            IrStmt::If { cond, then, elsifs, else_ }
+                if self.ternary_binding(cond, then, elsifs, else_) =>
+            {
+                let arms = Self::ternary_rhs(then, else_);
+                if let Some((name, (tc, tnum), (ec, enum_))) = arms.clone().map(|(n, ta, ea)| {
+                    let t = self.expr_any2(&ta);
+                    let e = self.expr_any2(&ea);
+                    (n, t, e)
+                }) {
+                    let borrowed = self.borrowable_vars.contains(&name);
+                    let numeric = !borrowed && self.is_num(&name);
+                    // A BORROWABLE local binds as `&str`, so both arms stay
+                    // bare literals.
+                    if borrowed {
+                        let bare = |x: &str| {
+                            string_literal_word(x).map(|s| s.to_string()).unwrap_or_else(|| x.to_string())
+                        };
+                        let binding = format!(
+                            "if {} {{ {} }} else {{ {} }}",
+                            Self::unparen(&self.expr_bool(cond)),
+                            bare(&Self::unparen(&tc).to_string()),
+                            bare(&Self::unparen(&ec).to_string())
+                        );
+                        let st = self.local_write_stmt(&name, &binding);
+                        self.emit(&st);
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        return;
+                    }
+                    // A NUMERIC binding declares `: i64`, so the arms must BE
+                    // i64 — rendered from the IR (a numeric read is the number,
+                    // where `expr_any` would have produced a parse-and-fail
+                    // arith wrap).
+                    let (tc, ec) = if numeric {
+                        match &arms {
+                            Some((_, ta, ea)) => (self.num_arm(ta), self.num_arm(ea)),
+                            None => (tc, ec),
+                        }
+                    } else {
+                        match (tnum, enum_) {
+                            (true, false) => (format!("({tc}).to_string()"), ec),
+                            (false, true) => (tc, format!("({ec}).to_string()")),
+                            _ => (tc, ec),
+                        }
+                    };
+                    let ce = self.expr_bool(cond);
+                    let binding =
+                        format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
+                    let st = self.local_write_stmt(&name, &binding);
+                    self.emit(&st);
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    return;
+                }
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 let c = Self::unwrap_cond(&self.expr_bool(cond));

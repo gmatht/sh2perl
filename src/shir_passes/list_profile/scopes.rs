@@ -192,6 +192,35 @@ impl<'a> Walker<'a> {
         self.top = save;
     }
 
+    /// A ternary is lowered by the frontends into an `If` whose THEN and
+    /// ELSE branches are a single assignment to the SAME name. That name is
+    /// not written twice in the shell sense — exactly one branch runs — so
+    /// the use walker records ONE write for it. Without this the two branch
+    /// writes look like a re-assignment (the name becomes a `let mut` local
+    /// written twice) and the branches render as separate statements.
+    fn ternary_target<'t>(
+        then: &'t [crate::ir::IrStmt],
+        elsifs: &[(crate::ir::IrExpr, Vec<crate::ir::IrStmt>)],
+        else_: &'t [crate::ir::IrStmt],
+    ) -> Option<&'t str> {
+        use crate::ir::IrStmt;
+        if !elsifs.is_empty() {
+            return None;
+        }
+        fn one(b: &[IrStmt]) -> Option<&str> {
+            match b {
+                [IrStmt::Assign { targets, .. }] if targets.len() == 1 => {
+                    Some(targets[0].var.as_str())
+                }
+                _ => None,
+            }
+        }
+        match (one(then), one(else_)) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        }
+    }
+
     fn stmt_inner(&mut self, st: &IrStmt) {
         match st {
             IrStmt::Ext(n) => {
@@ -256,6 +285,24 @@ impl<'a> Walker<'a> {
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 self.expr(cond);
+                if Self::ternary_target(then, elsifs, else_).is_some() {
+                    // A ternary: ONE definition, not two writes. Record the
+                    // RHS reads of BOTH branches and a single write for the
+                    // target, so `need_mut` sees one assignment (the branch
+                    // writes are exclusive).
+                    for b in [then, else_] {
+                        for stm in b {
+                            if let crate::ir::IrStmt::Assign { expr, .. } = stm {
+                                self.expr(expr);
+                            }
+                        }
+                    }
+                    if let Some(name) = Self::ternary_target(then, elsifs, else_) {
+                        let name = name.to_string();
+                        self.mention_write(&name);
+                    }
+                    return;
+                }
                 for b in then.iter().chain(else_) {
                     self.stmt(b);
                 }
