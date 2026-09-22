@@ -4865,6 +4865,11 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
             }
             "pipeline" => pipeline_call_to_cmd(e),
             "redirect" => redirect_call_to_cmd(e),
+            // The call-form subshell `( … )` (its body is an Arrow).
+            "subshell" => {
+                let inner = args.iter().find_map(|a| arrow_to_cmd(a))?;
+                Some(format!("( {inner} )"))
+            }
             // A test in command position reconstructs as bash `[ … ]` — but
             // only when the text is genuinely spaced (`-f x`); flattened
             // `[[ ]]`/`[ ]` forms (no-space `==`/`=~`/`=`) can't round-trip.
