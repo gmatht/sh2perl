@@ -12626,6 +12626,17 @@ pub fn analyze_var_borrowable(prog: &IrProgram) -> std::collections::HashSet<Str
                     walk(a, f);
                 }
             }
+            // A test TEXT (`-z "$x"`, `"$a" = "$b"`): the frontends bake the
+            // operand spelling into the arg string, so the `$` references
+            // live only there. The py frontend lowers `if not x:` to
+            // `test("-z \"$x\"")` — without this arm the read never
+            // registers, the borrow verdict silently withholds, and the
+            // variable stays an owned thread_local (t27).
+            IrExpr::Str(text, _) => {
+                for v in crate::shir_passes::list_profile::scopes::dollar_vars(text) {
+                    f(&IrExpr::Var(v, Some(crate::ir::Sigil::Scalar)));
+                }
+            }
             IrExpr::Capture { expr, .. } => walk(expr, f),
             IrExpr::Arrow(body) => {
                 for s in body {

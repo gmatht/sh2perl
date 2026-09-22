@@ -725,7 +725,15 @@ fn echo_mirror_ok(e: &IrExpr) -> bool {
 fn is_inline_call(func: &str) -> bool {
     matches!(
         func,
-        "getVar" | "setVar" | "assign" | "setArray" | "setArrayAppend"
+        // Pure test/truth forms: their ARGUMENTS are the only reads, and
+        // every backend renders them INLINE (a `!x.is_empty()` / `.len == 0`
+        // / `s2s(x) == ""` expression) rather than through a file-scope
+        // helper that would capture the argument. Without this a read inside
+        // one is marked RISKY, and `compute_local_vars` refuses the name — so
+        // the py frontend's `if not x:` (`test("-z \"$x\"")`) kept `x` a
+        // thread_local even once the borrow verdict named it (t27).
+        "test" | "testArith" | "not" | "truthy" | "isTruthy"
+            | "getVar" | "setVar" | "assign" | "setArray" | "setArrayAppend"
             | "arrayIndex" | "arrayLen" | "arrayItems" | "sortedIntJoin"
             | "sortedBigintJoin" | "max" | "min" | "sum" | "param"
             | "arith" | "arithEval" | "join" | "split" | "listVar"

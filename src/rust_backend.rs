@@ -2655,7 +2655,7 @@ impl Render {
                 if m.chars().any(|c| c.is_ascii_uppercase()) {
                     attr.push_str("#[allow(non_snake_case)] ");
                 }
-                if self.local_init.insert(name.to_string()) {
+                if self.local_init.remove(name) {
                     return format!("{attr}{kw} {m} = {rhs};");
                 }
                 return format!("{m} = {rhs};");
@@ -2668,7 +2668,11 @@ impl Render {
             // RHS qualifies).
         }
         let e = Self::unparen(e).to_string();
-        if self.local_init.insert(name.to_string()) {
+        // `local_init` holds the names whose `let` is still OWED (seeded by
+        // `mark_first_write`): consuming one emits the declaration. TWO
+        // paths emit one — here and `decl_words`' `local <name>=<val>` arm —
+        // and both must consume the slot.
+        if self.local_init.remove(name) {
             let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
             let mut attr = String::new();
             if self.local_dead_init.contains(name) {
@@ -4932,12 +4936,21 @@ impl Render {
                             let init = self.expr_any(e);
                             self.mark_written(&name.to_string());
                             // first write IS the `let`; `mut` only when
-                            // the local is written again later
+                            // the local is written again later.
+                            //
+                            // One of the TWO places a local's declaration
+                            // is emitted (the other is `local_write_stmt`),
+                            // so it must consume the deferred-`let` owner
+                            // slot too: `local factors=""` then
+                            // `if …; then factors=…` would otherwise hand
+                            // the declaration to the nested write, which
+                            // then shadows this binding.
                             let kw = if self.local_mut.contains(name) {
                                 "let mut"
                             } else {
                                 "let"
                             };
+                            self.local_init.remove(name);
                             self.emit(&format!("{kw} {m} = {init};"));
                             i += 1;
                             continue;
@@ -8034,7 +8047,12 @@ impl Render {
                 format!("{{ let __v = {var_expr}; if __v.is_empty() {{ String::new() }} else {{ {val} }} }}")
             }
             "-" | ":-" => {
-                format!("{{ let __v = {var_expr}; if __v.is_empty() {{ {val} }} else {{ __v }} }}")
+                // The two arms must agree in TYPE: a borrowable local reads
+                // as `&str` while `{val}` (a literal default) renders as an
+                // owned `String`, so stringify whichever arm wins.
+                format!(
+                    "{{ let __v = {var_expr}; if __v.is_empty() {{ {val} }} else {{ __v.to_string() }} }}"
+                )
             }
             "=" | ":=" => {
                 // assign the default back (declared runtime vars only)
@@ -8440,6 +8458,113 @@ impl Render {
 
     // ── statements ───────────────────────────────────────────────────
 
+    /// Does this statement WRITE `name`? Three shapes carry a write: an
+    /// `Assign` target, a `Declare` binding, and the frontends'
+    /// `local <name>=<val>` builtin call — which reaches the renderer as an
+    /// `Expr(Call(builtin, ["local", …]))`, NOT as an Assign. That last one
+    /// is the path a function's leading `local x=""` declarations take.
+    fn stmt_writes_var(s: &IrStmt, name: &str) -> bool {
+        match s {
+            IrStmt::Assign { targets, .. } => targets.iter().any(|t| t.var == name),
+            IrStmt::Declare { vars, .. } => vars.iter().any(|v| v.name == name),
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if matches!(func.as_str(), "setVar" | "assign") =>
+            {
+                matches!(args.first(), Some(IrExpr::Str(n, _)) if n == name)
+            }
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if matches!(func.as_str(), "builtin" | "exec" | "callDirect") =>
+            {
+                Self::decl_words_write(args, name)
+            }
+            _ => false,
+        }
+    }
+
+    /// `local x=""` / `declare x=v` / `export x=v` — the name-binding word
+    /// list nested under a builtin call's args.
+    fn decl_words_write(args: &[IrExpr], name: &str) -> bool {
+        let Some((IrExpr::Str(head, _), rest)) = args.split_first() else {
+            return false;
+        };
+        if !matches!(head.as_str(), "local" | "declare" | "typeset" | "export" | "readonly") {
+            return false;
+        }
+        for w in rest {
+            let items: Vec<&IrExpr> = match w {
+                IrExpr::Array(v) => v.iter().collect(),
+                other => vec![other],
+            };
+            for it in items {
+                if let IrExpr::Str(t, _) = it {
+                    let hit = match t.split_once('=') {
+                        Some((h, _)) => h == name,
+                        None => t == name,
+                    };
+                    if hit {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Seed `out` with the names whose `let` the FIRST write in render order
+    /// still owes. Render order is depth-first, so each statement is tested
+    /// BEFORE descending into its blocks — recording a nested write first
+    /// would hand the declaration to a branch body rather than to the write
+    /// that actually runs first.
+    fn mark_first_write(list: &[IrStmt], names: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+        for s in list {
+            for n in names {
+                if !out.contains(n) && Self::stmt_writes_var(s, n) {
+                    out.insert(n.clone());
+                }
+            }
+            match s {
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    Self::mark_first_write(then, names, out);
+                    for (_, b) in elsifs {
+                        Self::mark_first_write(b, names, out);
+                    }
+                    Self::mark_first_write(else_, names, out);
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    Self::mark_first_write(body, names, out);
+                    for e in excepts {
+                        Self::mark_first_write(&e.body, names, out);
+                    }
+                    Self::mark_first_write(else_body, names, out);
+                    Self::mark_first_write(finally_body, names, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::ForInit { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body) => Self::mark_first_write(body, names, out),
+                IrStmt::Function { body, named_blocks, .. } => {
+                    Self::mark_first_write(body, names, out);
+                    for (_, b) in named_blocks {
+                        Self::mark_first_write(b, names, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The deferred-`let` owner set for one statement list: main, or one
+    /// function body (each seeds its own — a body's first writes are its own
+    /// declarations).
+    fn owned_inits(&self, stmts: &[IrStmt]) -> BTreeSet<String> {
+        let names: BTreeSet<String> = self.local_vars.keys().cloned().collect();
+        let mut owned: BTreeSet<String> = BTreeSet::new();
+        Self::mark_first_write(stmts, &names, &mut owned);
+        owned
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // PLAN-4 STATUS LIVENESS: a statement whose status write the shared
         // verdict marks unread contributes no `__SH_RC.store(0, …)`. The
@@ -8823,10 +8948,17 @@ impl Render {
                         }
                     }
                     if is_i64 {
+                        // Gensymmed: `__n` is a plausible USER variable, and
+                        // binding it here would shadow the real one for the
+                        // rest of the block (a later `__n = __n + 1` then
+                        // hits an immutable rebind, E0384).
+                        let nv = self.gensym("__n");
                         self.emit(&format!(
-                            "let __n = if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ 0 }} else {{ {v} }};"
+                            "let {nv} = if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ 0 }} else {{ {v} }};"
                         ));
-                        self.emit("__SH_RC.store(if __n != 0 { 0 } else { 1 }, Ordering::SeqCst);");
+                        self.emit(&format!(
+                            "__SH_RC.store(if {nv} != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst);"
+                        ));
                     } else {
                         self.emit(&format!(
                             "let _ = {{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
@@ -9935,6 +10067,13 @@ impl Render {
         self.local_vars = locals;
         self.local_mut = local_mut;
         self.local_dead_init = dead_init;
+        // Deferred `let`s: pre-seed the statements that OWN each local's
+        // declaration (its first write in render order, at any nesting
+        // depth). Every other write of that name then renders as a plain
+        // assignment — without this a nested branch re-`let`s the binding
+        // and shadows the outer one (`local factors=""` at the function top,
+        // then `if …; then factors=…`).
+        self.local_init = self.owned_inits(&prog.stmts);
         collect_written(&prog.stmts, &mut self.assigned);
         for l in &self.local_vars {
             written.insert(l.0.clone());
@@ -9985,6 +10124,9 @@ impl Render {
                 // so the commit render emits them again
                 let saved_init = std::mem::take(&mut self.local_init);
                 self.probe = Some(FnProbe::default());
+                // this body's own deferred `let`s — the probe's emitted
+                // shapes must match the commit render's
+                self.local_init = self.owned_inits(body);
                 self.in_function = true;
                 self.depth = 1;
                 // the probe runs the rewrite too (so its recorded param
@@ -10250,6 +10392,12 @@ impl Render {
             // user-function bodies return VALUES via __SH_RET (the C
             // frontend's `return expr;` — strings are the value model)
             self.in_function = true;
+            // The deferred-`let` bookkeeping is per BODY: this body's first
+            // writes are its own declarations, and the module-wide set would
+            // otherwise hand them to whoever rendered first. Saved and
+            // restored so main's and sibling bodies' ownership lives on.
+            let saved_body_init = std::mem::take(&mut self.local_init);
+            self.local_init = self.owned_inits(body);
             self.active_fn = sig.as_ref().map(|_| name.clone());
             // arm the shift-offset rewrite for this body (the probe
             // recorded caller indices under the same arming)
@@ -10290,6 +10438,8 @@ impl Render {
             self.active_argv = false;
             self.shift_emitted = false;
             self.in_function = false;
+            // restore the enclosing scope's deferred-`let` set
+            self.local_init = saved_body_init;
             // value tail: fall-off-the-end yields the sticky cell (what
             // the legacy convention leaves in it). Skipped after an
             // unconditional divert (rustc would flag it unreachable).
@@ -12436,7 +12586,36 @@ impl<'a, 'r> TestParser<'a, 'r> {
         Some(inner.to_string())
     }
 
+    /// Drop a `format!("{}", X)` wrapper — the identity conversion. The
+    /// operand interpolator emits one per `$var` part, which is pure noise
+    /// when that part is the WHOLE word (`-z "$x"` → `format!("{}", x)`).
+    fn strip_identity_format(s: &str) -> String {
+        let t = s.trim();
+        if let Some(rest) = t.strip_prefix("format!(\"{}\", ") {
+            if let Some(inner) = rest.strip_suffix(')') {
+                // the arg must be self-contained: no top-level comma (a
+                // second format argument) and balanced parens, or the strip
+                // would truncate it
+                let mut depth = 0i32;
+                for ch in inner.chars() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        ',' if depth == 0 => return t.to_string(),
+                        _ => {}
+                    }
+                }
+                if depth == 0 {
+                    return inner.trim().to_string();
+                }
+            }
+        }
+        t.to_string()
+    }
+
     fn unary_test(&mut self, op: &str, operand: &str) -> String {
+        let operand = Self::strip_identity_format(operand);
+        let operand = operand.as_str();
         match op {
             "-n" => format!("(!{operand}.is_empty())"),
             "-z" => format!("({operand}.is_empty())"),
@@ -14843,6 +15022,19 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
                     && !matches!(args.first(), Some(IrExpr::Str(_, _)))
                 {
                     return false;
+                }
+                // The `builtin`/`exec` CALL form carries the command name as
+                // its first Str arg — the same shapes the Exec arm handles.
+                // `.`/`source`/`eval` can set ANY variable, so they must veto
+                // the whole analysis; a frontend that emits the builtin-call
+                // form would otherwise slip past and let a sourced name
+                // become a pass-2 local (then the post-render guard trips).
+                if matches!(func.as_str(), "builtin" | "exec" | "callDirect") {
+                    if let Some(IrExpr::Str(head, _)) = args.first() {
+                        if matches!(head.as_str(), "." | "source" | "eval") {
+                            return false;
+                        }
+                    }
                 }
                 for a in args {
                     if !walk_expr(a, out) {
@@ -17686,10 +17878,12 @@ mod tests {
         assert!(out.contains("> 3"), "{out}");
         // the arith lowering reads x numerically and adds 1; the literal
         // is i64-suffixed (no whole-expression cast)
-        assert!(
-            out.contains("__SHV_x.with(|v| v.get()) + 1i64"),
-            "{out}"
-        );
+        assert!(out.contains("x + 1i64"), "{out}");
+        // `x` is read only through the test text `"$x"`; the borrow walk
+        // reads those `$` references, so the verdict holds and x binds as a
+        // plain local instead of a thread_local.
+        assert!(out.contains("let x = 3;"), "{out}");
+        assert!(!out.contains("__SHV_x"), "x should be a local:\n{out}");
         assert!(!out.contains("TODO"), "{out}");
         assert!(!out.contains("sh2"), "{out}");
     }
