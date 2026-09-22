@@ -3532,6 +3532,32 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
     let mut i = 0;
     while i < ch.len() {
         if ch[i] == '$' && i + 1 < ch.len() {
+            // `$(…)` inside arithmetic — evaluate the command and splice its
+            // value as a numeric operand (bash does the same expansion
+            // before evaluating the expression; `int(" $(wc -l < f) ")`
+            // numified the LITERAL text instead).
+            if ch[i + 1] == '(' {
+                let mut j = i + 2;
+                let mut depth = 1;
+                while j < ch.len() && depth > 0 {
+                    if ch[j] == '(' {
+                        depth += 1;
+                    }
+                    if ch[j] == ')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let inner: String = ch[i + 2..j - 1].iter().collect();
+                    let sentinel = format!("__sh2_arithpe_{}", repls.len());
+                    let val = cmd_str_to_open_perl_stripped(&inner);
+                    repls.push((sentinel.clone(), val));
+                    t.push_str(&sentinel);
+                    i = j;
+                    continue;
+                }
+            }
             if ch[i + 1] == '{' {
                 let mut j = i + 2;
                 let mut depth = 1;
@@ -3554,6 +3580,27 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
                 }
             } else if ch[i + 1].is_ascii_alphabetic() || ch[i + 1] == '_' {
                 i += 1; // drop the '$' — the ident itself parses as Ident
+                continue;
+            } else if ch[i + 1].is_ascii_digit() {
+                // `$1` — a positional parameter. Splice its Perl read
+                // (`$ARGV[0]`) behind a sentinel so parse_arith sees an
+                // identifier (`int(" $1 + $1 ")` numified the LITERAL text).
+                let mut j = i + 1;
+                while j < ch.len() && ch[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let name: String = ch[i + 1..j].iter().collect();
+                let sentinel = format!("__sh2_arithpe_{}", repls.len());
+                repls.push((sentinel.clone(), var_read(&name)));
+                t.push_str(&sentinel);
+                i = j;
+                continue;
+            } else if matches!(ch[i + 1], '@' | '*' | '#' | '?') {
+                let name = ch[i + 1].to_string();
+                let sentinel = format!("__sh2_arithpe_{}", repls.len());
+                repls.push((sentinel.clone(), var_read(&name)));
+                t.push_str(&sentinel);
+                i += 2;
                 continue;
             }
         }
