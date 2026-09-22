@@ -53,6 +53,7 @@ pub mod mir_simple;
 pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
+pub mod fish_backend; // worktree-local: Fish shell backend renderer (branch backend/fish)
 pub mod glsl_backend;
 pub mod vulkan_backend;
 pub mod cuda_backend; // compute-shader emitter for bash-O4 autoshaderise (docs/BASH-O4.md §4.4)

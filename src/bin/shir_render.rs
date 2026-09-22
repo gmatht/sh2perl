@@ -58,7 +58,7 @@ fn main() {
         "py" | "python" => "python",
         "rs" | "rust" => "rust",
         "glslv" => "glslv",
-        "c" | "go" | "sh" | "java" | "zig" | "glsl" | "lint" | "shir" => {
+        "c" | "go" | "sh" | "java" | "zig" | "glsl" | "lint" | "shir" | "fish" => {
             target.as_str()
         }
         other => {
@@ -119,6 +119,13 @@ fn main() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("shir_render: sh: {e}");
+                std::process::exit(1);
+            }
+        },
+        "fish" => match debashl::fish_backend::shir_to_fish(&prog) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("shir_render: fish: {e}");
                 std::process::exit(1);
             }
         },
