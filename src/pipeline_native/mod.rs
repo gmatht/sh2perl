@@ -452,8 +452,81 @@ fn pipe_dynamic_content(s: &[IrStmt]) -> Option<String> {
         "strings" => strings_content(words),
         "paste" => paste_content(words),
         "find" => find_content(words),
+        // `printf '%s\n' <word>` — one line per expanded word. `%s\n` is the
+        // corpus's canonical "one element per line" producer (the shell
+        // would expand `${arr[@]}` / `${map[@]}` itself, which the rebuilt
+        // text cannot do for a Perl-side list).
+        "printf" => printf_lines_content(words),
         _ => None,
     }
+}
+
+/// `printf '%s\n' WORD` (also `printf "%s\n" "$@"`): the word (or list)
+/// joined by newlines — each element its own line.
+fn printf_lines_content(words: &[IrExpr]) -> Option<String> {
+    let [fmt, rest @ ..] = words else {
+        return None;
+    };
+    // The format may be a plain literal (`%s\n`) or a `"…"` Interpolate of
+    // literals; accept the simple shape only.
+    let f = crate::ir::grep_lit_str(fmt).or_else(|| match fmt {
+        IrExpr::Interpolate(parts)
+            if parts
+                .iter()
+                .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+        {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        crate::ir::InterpPart::Lit(t) => t.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>(),
+            )
+        }
+        _ => None,
+    })?;
+    // The corpus's per-line form only. Escapes decode like printf's.
+    if f != "%s\\n" && f != "%s\n" {
+        return None;
+    }
+    if rest.is_empty() {
+        return Some("''".to_string());
+    }
+    let vals: Vec<String> = rest.iter().map(printf_operand_list).collect();
+    Some(format!("join(\"\\n\", ({}))", vals.join(", ")))
+}
+
+/// A `printf '%s\n' …` operand as a LIST expression — each element on its
+/// own line. `${arr[@]}` / `${map[@]}` are element lists here (the joined
+/// scalar form would collapse them to one line).
+fn printf_operand_list(w: &IrExpr) -> String {
+    if let IrExpr::Call { func, args } = w {
+        if func == "param" {
+            let op = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let name = args.get(1).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let off = args.get(2).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let len = args.get(3).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if op == "slice" && off == "@" && len.is_empty() && !name.starts_with('#') {
+                // `${!map[@]}` keys, `${arr[@]}` elements, `${map[@]}` values.
+                if let Some(rest) = name.strip_prefix('!') {
+                    return format!("keys %{}", rest.trim_end_matches('*'));
+                }
+                if crate::ir::hash_var_pub(&name) {
+                    return format!("values %{name}");
+                }
+                return format!("@{name}");
+            }
+        }
+        if func == "listVar" {
+            let n = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if n == "@" {
+                return "@ARGV".to_string();
+            }
+        }
+    }
+    crate::ir::render_word_list(w)
 }
 
 /// `strings FILE` — the printable ASCII runs of length >= 4 (GNU default).

@@ -990,6 +990,12 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             collect_array_vars(&sub.body, &mut arrays);
         }
         ARRAY_VARS.with(|s| *s.borrow_mut() = arrays);
+        let mut hashes = std::collections::HashSet::new();
+        collect_hash_vars(&stripped.stmts, &mut hashes);
+        for sub in &stripped.subs {
+            collect_hash_vars(&sub.body, &mut hashes);
+        }
+        HASH_VARS.with(|s| *s.borrow_mut() = hashes);
     }
     // builtin-op native arm (shir-builtin-op-20260816): the A1 carries
     // `builtin(cmd, args)` ops (the exec-to-builtin transform). The perl
@@ -2278,6 +2284,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         if try_native_while_read_sort(out, e, indent) {
                             return;
                         }
+                        if try_native_for_sort(out, e, indent) {
+                            return;
+                        }
                         if let Some(cmd) = pipeline_call_to_cmd(e) {
                             emit_shell_cmd(out, indent, &cmd);
                         } else {
@@ -2897,7 +2906,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 _ => '$',
             };
             emit_indent(out, indent);
-            out.push_str(&format!("my {}{} = ({});\n", sigil_char, var, elems));
+            // The hoisted preamble declares every assigned var (use strict);
+            // a second `my` here triggers "masks earlier declaration in same
+            // scope" AND would hide the hoisted lexical from the reads.
+            out.push_str(&format!("{}{} = ({});\n", sigil_char, var, elems));
         }
 
         IrStmt::If {
@@ -3337,13 +3349,15 @@ fn perl_lhs_for(var: &str) -> String {
                 return format!("${}[{}]", base, sub);
             }
             // The subscript retains its source quotes (`info["os"]`); strip
-            // them before emitting the Perl hash key.
+            // them before emitting the Perl hash key. NOTE `$map{"k"}`, not
+            // `${map}{"k"}` — the latter derefs `$map` as a hashref (a
+            // scalar), which under `use strict` wrote to a different slot
+            // than the `$map{'k'}` reads.
             let key = i.trim_matches('"').trim_matches('\'');
-            format!(
-                "${{{}}}{{\"{}\"}}",
-                base,
-                key.replace('\\', "\\\\").replace('"', "\\\""),
-            )
+            if key.starts_with('$') || key.starts_with("${") {
+                return format!("${}{{{}}}", base, key);
+            }
+            format!("${}{{'{}'}}", base, key.replace('\'', "\\'"))
         }
         None => format!("${}", base),
     }
@@ -3926,7 +3940,15 @@ fn render_param(args: &[IrExpr]) -> String {
             // a space-joined string in scalar/print contexts.  The legacy
             // renderer joins; emit join here — callers that need the list
             // (for-iter) use a different node.
+            // An ASSOCIATIVE array's `${map[@]}` is its VALUES (`keys` for
+            // `${!map[@]}` above); `@map` would be an undeclared Perl array.
             if raw_off == "@" && raw_len.is_empty() && !name.starts_with('#') {
+                // Associative (`declare -A`) → VALUES; otherwise an indexed
+                // array (a name the census never saw is overwhelmingly an
+                // array here, and `@x` is at least declarable).
+                if hash_var(&name) {
+                    return format!("join(' ', values %{})", name);
+                }
                 return format!("join(' ', @{})", name);
             }
             let off = raw_off
@@ -5723,6 +5745,72 @@ fn try_native_while_read_sort(out: &mut String, call: &IrExpr, indent: usize) ->
     emit_indent(out, indent);
     out.push_str(&format!(
         "my @__wr = split(/\\n/, $__wr_buf); @__wr = sort {{ {cmp} }} @__wr; print \"$_\\n\" for @__wr; $main_exit_code = $CHILD_ERROR = 0;\n"
+    ));
+    true
+}
+
+/// `for VAR in LIST; do BODY; done | sort [flags]` — run the loop natively
+/// with STDOUT captured, then sort the lines. The rebuilt-shell fallback
+/// shelled the whole construct to `bash -c … | sort`, which check_qx flags
+/// (and which cannot see the Perl-side list the `for` iterates).
+fn try_native_for_sort(out: &mut String, call: &IrExpr, indent: usize) -> bool {
+    let IrExpr::Call { func, args } = call else {
+        return false;
+    };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return false;
+    };
+    // Consumer: `sort [flags]`.
+    let sort_flags: Vec<String> = match s2.as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func: sf, args: sa })]
+            if sf == "exec" || sf == "builtin" =>
+        {
+            let [IrExpr::Str(cmd, _), IrExpr::Array(sw)] = sa.as_slice() else {
+                return false;
+            };
+            if cmd != "sort" {
+                return false;
+            }
+            sw.iter()
+                .filter_map(crate::ir::grep_lit_str)
+                .collect()
+        }
+        _ => return false,
+    };
+    // Producer: a single `for` loop.
+    let (var, iter, body) = match s1.as_slice() {
+        [IrStmt::For { var, iter, body }] => (var.clone(), iter.clone(), body.clone()),
+        _ => return false,
+    };
+    let mut loop_buf = String::new();
+    emit_stmt(
+        &mut loop_buf,
+        &IrStmt::For {
+            var,
+            iter,
+            body,
+        },
+        0,
+    );
+    let cmp = if sort_flags.iter().any(|f| f == "-n") {
+        "$a <=> $b"
+    } else {
+        "$a cmp $b"
+    };
+    emit_indent(out, indent);
+    out.push_str(&format!(
+        "my $__fs_buf = do {{ my $__cap = ''; open(my $__fo, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {lp} open(STDOUT, '>&', $__fo) or die \"capture: $!\\n\"; close($__fo); $__cap }};\n",
+        lp = loop_buf.trim_start(),
+    ));
+    emit_indent(out, indent);
+    out.push_str(&format!(
+        "my @__fs = split(/\\n/, $__fs_buf); @__fs = sort {{ {cmp} }} @__fs; print \"$_\\n\" for @__fs; $main_exit_code = $CHILD_ERROR = 0;\n"
     ));
     true
 }
@@ -9421,10 +9509,120 @@ thread_local! {
     /// `${arr[@]:o:l}` vs `${s:o:l}`; this lets the renderer recover it.
     static ARRAY_VARS: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Variable names the program binds as ASSOCIATIVE arrays
+    /// (`declare -A`, `h[k]=v`). `${h[@]}` is the hash's VALUES.
+    static HASH_VARS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 fn array_var(name: &str) -> bool {
     ARRAY_VARS.with(|s| s.borrow().contains(name))
+}
+
+/// Whether the program binds `name` as an ASSOCIATIVE array. `${x[@]}` on a
+/// hash is its VALUES, not an array's elements; the A1 carries no
+/// array/hash distinction on `param("slice", …)`, so the census recovers it.
+fn hash_var(name: &str) -> bool {
+    HASH_VARS.with(|s| s.borrow().contains(name))
+}
+
+/// Names the program binds as associative arrays: `declare -A X`,
+/// `X[k]=v` writes (an `Assign` whose var carries a subscript), and an
+/// explicit Hash sigil on a declaration.
+fn collect_hash_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    fn one(s: &IrStmt, out: &mut std::collections::HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    if let (base, Some(_)) = split_indexed_var(&t.var) {
+                        out.insert(base.to_string());
+                    } else if t.sigil == Some(Sigil::Hash) {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    if d.sigil == Some(Sigil::Hash) {
+                        out.insert(d.name.clone());
+                    }
+                }
+            }
+            IrStmt::DeclareArray { var, sigil, .. } => {
+                if *sigil == Some(Sigil::Hash) {
+                    out.insert(var.clone());
+                }
+            }
+            // `declare -A name` / `local -A name` (a Call, not a Declare).
+            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                if matches!(func.as_str(), "exec" | "builtin") =>
+            {
+                if let Some(cmd) = args.first().and_then(crate::ir::call_arg_str) {
+                    if matches!(cmd.as_str(), "local" | "declare" | "typeset") {
+                        let mut is_hash = false;
+                        for w in crate::ir::exec_word_args(args) {
+                            if let Some(s) = crate::ir::call_arg_str(w) {
+                                if let Some(f) = s.strip_prefix('-') {
+                                    if f.contains('A') {
+                                        is_hash = true;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if is_hash {
+                                if let Some(name) = crate::ir::call_arg_str(w) {
+                                    let name = name.split('=').next().unwrap_or(&name);
+                                    if var_is_declarable(name) {
+                                        out.insert(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_hash_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_hash_vars(b, out);
+                }
+                collect_hash_vars(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => collect_hash_vars(body, out),
+            IrStmt::ForInit { init, step, body, .. } => {
+                collect_hash_vars(init, out);
+                collect_hash_vars(step, out);
+                collect_hash_vars(body, out);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                collect_hash_vars(body, out);
+                for (_, b) in named_blocks {
+                    collect_hash_vars(b, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => collect_hash_vars(inner, out),
+            _ => {}
+        }
+    }
+    for s in stmts {
+        one(s, out);
+    }
+}
+
+/// The array census, for the pipeline_native leaves (`${arr[@]}` elements
+/// vs `${map[@]}` hash values).
+pub(crate) fn array_var_pub(name: &str) -> bool {
+    array_var(name)
+}
+
+/// The associative-array census, for the pipeline_native leaves.
+pub(crate) fn hash_var_pub(name: &str) -> bool {
+    hash_var(name)
 }
 
 fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
