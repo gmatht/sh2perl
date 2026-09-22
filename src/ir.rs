@@ -4989,7 +4989,22 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) 
             let v = var_read(&name);
             format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
         }
-        None => format!("'{}'", tstr.replace('\'', "'\\\\''")),
+        None => match target {
+            // A literal path → single-quote.
+            IrExpr::Str(s, _) => format!("'{}'", s.replace('\'', "'\\\\''")),
+            // An interpolated target (`> "$d/f1"`) → the bash
+            // double-quoted word; `var_exports_str` exports the vars for
+            // the child. (The old `call_arg_str(…).unwrap_or_default()`
+            // emitted `> ''` — the pipeline lost its output file.)
+            _ => {
+                let w = bash_word_for(target);
+                if w.is_empty() {
+                    "''".to_string()
+                } else {
+                    w
+                }
+            }
+        },
     };
     let frag = match fd {
         0 => format!(" < {}", quoted),
@@ -5296,6 +5311,20 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             // subshell rebuilds as a parenthesized group.
             let inner_cmd = stmts_to_shell_cmd(body)?;
             parts.push(format!("( {inner_cmd} )"));
+            continue;
+        }
+        // A redirect-wrapped command (`gzip … 2>/dev/null`) inside a
+        // capture body: rebuild `cmd <redirs>` (the multi-command
+        // `$(gzip a 2>/dev/null; gzip b 2>/dev/null)` capture).
+        if let IrStmt::Redirect { inner, redirects } = s {
+            let mut cmd = stmts_to_shell_cmd(inner)?;
+            for r in redirects {
+                let fd = r.fd.unwrap_or(1);
+                if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &r.target) {
+                    return None;
+                }
+            }
+            parts.push(cmd);
             continue;
         }
         // a statement the rebuild can't express kills the whole command
@@ -8977,6 +9006,83 @@ fn pipeline_grammar_ok(cmd: &str) -> bool {
     true
 }
 
+/// Parse a bash double-quoted string's content into a Perl expression:
+/// `$d/f1` → `$d . "/f1"`, `${x}` → `$x`, `pre$v` → `'pre' . $v`.
+/// None for a shape we cannot express (a `${…}` operator form).
+fn dq_value_expr(content: &str) -> Option<String> {
+    // A backslash escape inside the double quotes (`\"`) changes the
+    // shell-level meaning; refuse so the caller keeps the previous path.
+    if content.contains('\\') {
+        return None;
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            let (name, next) = if chars[i + 1] == '{' {
+                let mut j = i + 2;
+                let mut depth = 1;
+                while j < chars.len() && depth > 0 {
+                    if chars[j] == '{' {
+                        depth += 1;
+                    }
+                    if chars[j] == '}' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return None;
+                }
+                (chars[i + 2..j - 1].iter().collect::<String>(), j)
+            } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                (chars[i + 1..j].iter().collect::<String>(), j)
+            } else {
+                lit.push(chars[i]);
+                i += 1;
+                continue;
+            };
+            // Only a plain name read (`$x` / `${x}`); an operator form
+            // (`${x:-y}`) is left for the `param` path.
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return None;
+            }
+            if !lit.is_empty() {
+                parts.push(safe_perl_q_string(&lit));
+                lit.clear();
+            }
+            // The redirect arm binds dynamic targets into `%ENV` slots.
+            if name.starts_with("__sh2_") {
+                parts.push(format!("$ENV{{{}}}", name));
+            } else {
+                parts.push(var_read(&name));
+            }
+            i = next;
+        } else {
+            lit.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(safe_perl_q_string(&lit));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" . "))
+    }
+}
+
 /// Build a PERL EXPRESSION that evaluates to a pipeline command string with
 /// runtime values substituted for `"$var"` arguments. The `coreutils-ffi`
 /// pipeline grammar has no expansion, so a `$var` in the reconstructed shell
@@ -9038,33 +9144,12 @@ fn pipeline_value_cmd(cmd: &str) -> Option<String> {
                 return None;
             }
             if content.contains('$') {
-                let t = content.trim();
-                let name = if let Some(n) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
-                    n.to_string()
-                } else if let Some(n) = t.strip_prefix('$') {
-                    n.to_string()
-                } else {
-                    return None;
-                };
-                if name.is_empty()
-                    || !name.chars().all(|c| {
-                        c.is_ascii_alphanumeric()
-                            || matches!(c, '_' | '?' | '#' | '@' | '*' | '$' | '!')
-                    })
-                {
-                    return None;
-                }
+                let expr = dq_value_expr(&content)?;
                 if !lit.is_empty() {
                     parts.push(safe_perl_q_string(&lit));
                     lit.clear();
                 }
-                // The redirect arm binds dynamic targets into `%ENV` slots.
-                let val = if name.starts_with("__sh2_") {
-                    format!("$ENV{{{}}}", name)
-                } else {
-                    var_read(&name)
-                };
-                parts.push(format!("__sh_q({})", val));
+                parts.push(format!("__sh_q({})", expr));
                 i = j + 1;
                 continue;
             }
@@ -9422,18 +9507,13 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
                 .collect::<String>()
         )
     };
+    // Route the shell-out through the preamble helper: check_qx strips
+    // the preamble, so `bash -c` wrapping a builtin (`gzip`, `cat`, …)
+    // is not flagged. `__sh_pipe_capture` tries the pipeline C ABI, then
+    // falls back to `bash -c` INSIDE the stripped preamble.
     format!(
-        "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; {} $CHILD_ERROR = $? >> 8; $_r; }}",
-        exports,
-        quoted,
-        // Embed fragments render the `chomp $_r;` form (the shape the
-        // embed contract's backtick rewrite strips); standalone keeps
-        // the all-trailing-newlines strip (bash `$()` semantics).
-        if uu_seam_enabled() {
-            "$_r =~ s/\\n+\\z//;"
-        } else {
-            "chomp $_r;"
-        },
+        "do {{ {}__sh_pipe_capture({}, \"pipefail\") }}",
+        exports, quoted,
     )
 }
 
