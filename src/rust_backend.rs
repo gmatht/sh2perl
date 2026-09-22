@@ -2086,21 +2086,126 @@ impl Render {
     /// `if`/`while`/`else if` resets `__SH_RC` itself, so the wrapper's
     /// store is dead and the expression reduces to `EXPR`.
     fn unwrap_cond(s: &str) -> String {
-        let t = s.trim();
-        let rest = match t
-            .strip_prefix("{ let __b = ")
-            .and_then(|r| r.strip_suffix("; __b }"))
-        {
-            Some(r) => r,
-            None => return s.to_string(),
-        };
-        let marker = "; __SH_RC.store(";
-        match rest.split_once(marker) {
-            Some((expr, tail)) if tail.contains("__b { 0 } else { 1 }") => {
-                Self::unparen(expr.trim()).to_string()
+        // Strip EVERY status wrapper at this condition's top level, not just
+        // a whole-condition one: in `A && B` each operand is wrapped
+        // separately (`{ let __b = A; store; __b } && { let __b = B; … }`),
+        // and both stores are dead because the `if` resets __SH_RC itself.
+        // The parts are the top-level `&&`/`||` operands; each may carry its
+        // own wrapper. A single part with no operator is just the whole
+        // expression, so this handles the bare case too.
+        let parts = Self::split_bool_ops(s);
+        let mut any = false;
+        let mut out = String::new();
+        for (piece, sep) in parts {
+            // Preserve the piece's own surrounding space so re-joining
+            // reproduces the original text: the LEADING space belongs
+            // before the expression, the TRAILING space before the
+            // operator that follows it.
+            let lead: &str = &piece[..piece.len() - piece.trim_start().len()];
+            let trail: &str = &piece[piece.trim_end().len()..];
+            let core = piece.trim();
+            out.push_str(lead);
+            match Self::strip_one_wrapper(core) {
+                Some((inner, rem)) => {
+                    any = true;
+                    out.push_str(&inner);
+                    let tail = rem.trim_start();
+                    if !tail.is_empty() {
+                        out.push_str(tail);
+                    }
+                }
+                // no wrapper here: a parenthesised group may still hold one
+                // (`(x || { let __b = q; … })`), and `&&`/`||` inside a
+                // group are not top-level, so recurse when the whole piece
+                // is one balanced group
+                None => {
+                    let bare = Self::unparen(core);
+                    if bare.len() != core.len() {
+                        let inner = Self::unwrap_cond(bare);
+                        if inner != bare {
+                            any = true;
+                        }
+                        out.push('(');
+                        out.push_str(&inner);
+                        out.push(')');
+                    } else {
+                        out.push_str(core);
+                    }
+                }
             }
-            _ => s.to_string(),
+            out.push_str(trail);
+            out.push_str(&sep);
         }
+        if any { out } else { s.to_string() }
+    }
+
+    /// Peel ONE leading `{ let __b = EXPR; __SH_RC.store(if __b { 0 } else
+    /// { 1 }, …); __b }` wrapper off `s`, returning `(EXPR, remainder)`.
+    fn strip_one_wrapper(s: &str) -> Option<(String, &str)> {
+        let t = s.trim_start();
+        let rest = t.strip_prefix("{ let __b = ")?;
+        let marker = "; __SH_RC.store(";
+        let (expr, after) = rest.split_once(marker)?;
+        // the store must be the `if __b { 0 } else { 1 }` status write …
+        let tail = after.strip_prefix("if __b { 0 } else { 1 }, Ordering::SeqCst); ")?;
+        // … and the block must close right there
+        let rem = tail.strip_prefix("__b }")?;
+        Some((Self::unparen(expr.trim()).to_string(), rem))
+    }
+
+    /// Split a boolean expression on its TOP-LEVEL `&&` / `||`, returning
+    /// each piece with the separator that followed it (the last piece gets
+    /// an empty separator). Quoting and parentheses are respected, so an
+    /// operator inside a nested expression or a string is left alone.
+    fn split_bool_ops(s: &str) -> Vec<(String, String)> {
+        let b = s.as_bytes();
+        let mut parts: Vec<(String, String)> = Vec::new();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < b.len() {
+            let c = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'&' | b'|' if depth == 0 && i + 1 < b.len() && b[i + 1] == c => {
+                    // the piece keeps the spacing that PRECEDES the
+                    // operator, so re-joining reproduces the original text
+                    // (minus the stripped wrappers) exactly
+                    let head = s[start..i].to_string();
+                    let mut j = i + 2;
+                    while j < b.len() && (b[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    let sep = s[i..j].to_string();
+                    parts.push((head, sep));
+                    i = j;
+                    start = i;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if parts.is_empty() {
+            return vec![(s.to_string(), String::new())];
+        }
+        parts.push((s[start..].to_string(), String::new()));
+        parts
     }
 
     fn unparen(s: &str) -> &str {
@@ -3564,7 +3669,12 @@ impl Render {
                         let norm = Self::norm_arith_text(sv);
                         if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
                             let r = self.arith_bool(&ast);
-                            return format!("{{ let __b = {r}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}");
+                            // The status write is a bare (unindented) line,
+                            // so `unwrap_cond` can strip it in condition
+                            // position — same contract as `test_call_bool`.
+                            return format!(
+                                "{{ let __b = {r};\n__SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}"
+                            );
                         }
                     }
                 }
@@ -12575,7 +12685,11 @@ impl<'a, 'r> TestParser<'a, 'r> {
         let tok = self.toks.get(self.pos)?.clone();
         let TTok::Operand(text) = tok else { return None };
         self.pos += 1;
-        Some(self.render.test_operand_expr(&text, self.style))
+        // Every operand goes through here — unary (`-z "$x"`) and binary
+        // (`"$a" = "a"`) alike — so the interpolator's identity wrapper is
+        // stripped once, in the one place, rather than per operator.
+        let (e, num) = self.render.test_operand_expr(&text, self.style);
+        Some((Self::strip_identity_format(&e), num))
     }
 
     /// The CONSTANT text of an operand, when it is a pure literal: a
@@ -12626,8 +12740,6 @@ impl<'a, 'r> TestParser<'a, 'r> {
     }
 
     fn unary_test(&mut self, op: &str, operand: &str) -> String {
-        let operand = Self::strip_identity_format(operand);
-        let operand = operand.as_str();
         match op {
             "-n" => format!("(!{operand}.is_empty())"),
             "-z" => format!("({operand}.is_empty())"),
@@ -12767,7 +12879,25 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     // string compare, not a pattern match) — fold it and
                     // skip the glob machinery entirely. A metachar-bearing
                     // constant still needs fnmatch.
+                    // A constant RHS that is compared against a BORROWED
+                    // read (`&str`) must not allocate: `a == "a"` not
+                    // `a == "a".to_string()`. `l` carries the lhs's own form
+                    // (a borrowable local reads bare), so pick the literal
+                    // spelling to match it.
+                    let l_borrowed = lhs_lit.is_none()
+                        && !lhs_num
+                        && lhs.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                        && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                     if let Some(rlit) = rhs_lit {
+                        if !glob_like(rlit) && l_borrowed {
+                            let ro = Render::rust_str(rlit);
+                            let lo = if lhs_lit.is_some() { l.clone() } else { lhs.to_string() };
+                            return if eq {
+                                format!("({lo} == {ro})")
+                            } else {
+                                format!("({lo} != {ro})")
+                            };
+                        }
                         if !glob_like(rlit) {
                             // Fully-constant comparison can fold to a
                             // plain bool (no String allocation). Numeric
@@ -16890,6 +17020,24 @@ mod tests {
         let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
         assert!(out.contains("print!(\"a\")"), "{out}");
         assert!(out.contains("print!(\"x\\ty\\n\")"), "{out}");
+    }
+
+    #[test]
+    fn unwrap_cond_strips_every_top_level_wrapper() {
+        let w = |e: &str| format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}");
+        // a whole-condition wrapper
+        assert_eq!(Render::unwrap_cond(&w("x")), "x");
+        // an `&&` tree: EACH operand is wrapped separately
+        let both = format!("{} && {}", w("a == 1"), w("b == 2"));
+        assert_eq!(Render::unwrap_cond(&both), "a == 1 && b == 2");
+        // a nested `||` under an `&&`, mixed with a bare part
+        let mixed = format!("{} && (x || {})", w("p"), w("q"));
+        assert_eq!(Render::unwrap_cond(&mixed), "p && (x || q)");
+        // operators inside strings / parens are not separators
+        let tricky = format!("{} && {}", w("s == \"a && b\""), w("t"));
+        assert_eq!(Render::unwrap_cond(&tricky), "s == \"a && b\" && t");
+        // no wrapper: unchanged
+        assert_eq!(Render::unwrap_cond("x > 1"), "x > 1");
     }
 
     #[test]

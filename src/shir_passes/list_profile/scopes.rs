@@ -110,12 +110,55 @@ impl<'a> Walker<'a> {
     }
 
     fn mentions_str(&mut self, text: &str) {
-        // Uniform string rule: exact identifier match (a bare name
-        // argument), a `name=value` head (a builtin write word), and
-        // `$` references. All conservative — a literal value that
-        // merely looks like a mention (e.g. `echo factors` printing
-        // the word) only ever widens toward global, never miscompiles.
+        // Command-WORD rule: exact identifier match (a bare name argument)
+        // and a `name=value` head (a builtin write word) — plus `$`
+        // references. Conservative: a literal that merely LOOKS like a
+        // mention (`echo factors` printing the word) only widens toward
+        // global, never miscompiles.
         str_mention_all(text, &mut |v| self.mention(v));
+    }
+
+    /// A string literal in VALUE position (`a = "a"`, `x="b"`). Only its
+    /// `$` references are reads; the bare text is DATA, so it must NOT be
+    /// matched as an identifier mention. Matching it would record a phantom
+    /// read of the assigned name BEFORE the write (`a = "a"` would mention
+    /// `a` first), and the "first mention is a write" rule that decides a
+    /// pass-2 local would then refuse the name — leaving a thread_local for
+    /// a program as simple as t28's `a = "a"; b = "b"; if a == "a" and …`.
+    /// A string in VALUE position (`a = "a"`, `x = "$y"`, the substituted
+    /// `echo "$x"` operand).
+    ///
+    /// A `$`-reference is a read — and so is a BARE identifier, because the
+    /// frontends hand some operands over already substituted (`"$x"` arrives
+    /// as `x`). What must NOT be reported is the plain-value case: `a = "a"`
+    /// would otherwise mention `a`, and that phantom read would precede the
+    /// write and defeat the "first mention is a write" rule that decides a
+    /// pass-2 local (t28's `a = "a"; b = "b"; if a == "a" and …`).
+    ///
+    /// So: mention an identifier only when it is NOT the text of a literal
+    /// being compared/bound — i.e. when the value looks like a reference
+    /// (`$v` present) or a `name=value` binding head. A bare word that is
+    /// neither is data.
+    fn mentions_value_str_style(&mut self, text: &str, quoted: bool) {
+        // a `name=value` head always names the variable being bound
+        if let Some((head, _)) = text.split_once('=') {
+            if is_ident_word(head) {
+                self.mention(head);
+            }
+        }
+        for v in dollar_vars(text) {
+            self.mention(&v);
+        }
+        // A bare identifier in VALUE position is a read when it is a
+        // SUBSTITUTED reference (`"$x"` reaches here as the text `x`), and
+        // DATA when the source quoted it literally (`a = "a"`). The two are
+        // indistinguishable from the text alone, so report the mention and
+        // let the Assign arm's ORDER rule decide: it records the target's
+        // write BEFORE walking a literal RHS, so a literal `a = "a"` still
+        // has the write as its first mention (see `stmt_inner`).
+        if is_ident_word(text) {
+            self.mention(text);
+        }
     }
 
     fn with_scope(&mut self, scope: Scope, body: impl FnOnce(&mut Self)) {
@@ -164,10 +207,19 @@ impl<'a> Walker<'a> {
                 self.expr(content);
             }
             IrStmt::Assign { targets, expr, .. } => {
-                // RHS first: `x = <expr reading x>` (e.g. an env default)
-                // reads the OLD value, so the read must precede the write
-                // mention (pass-2 deferral relies on this order).
-                self.expr(expr);
+                // A LITERAL RHS is DATA, not a reference: record the write
+                // first so `a = "a"` does not open with a phantom read of
+                // `a` (that would defeat the "first mention is a write" rule
+                // that decides a pass-2 local — t28). A COMPUTED RHS
+                // (`x = $x`, `x = $((x+1))`) genuinely reads the OLD value,
+                // so it is walked first as before.
+                let literal_rhs = matches!(
+                    expr,
+                    IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Bool(_)
+                );
+                if !literal_rhs {
+                    self.expr(expr);
+                }
                 for t in targets {
                     // baked subscript (`arr[$i]`): the base is written,
                     // `$i` inside is read
@@ -183,6 +235,9 @@ impl<'a> Walker<'a> {
                     for ix in &t.indices {
                         self.expr(ix);
                     }
+                }
+                if literal_rhs {
+                    self.expr(expr);
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
@@ -408,7 +463,15 @@ impl<'a> Walker<'a> {
     fn expr(&mut self, e: &IrExpr) {
         match e {
             IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Range { .. } => {}
-            IrExpr::Str(s, _) => self.mentions_str(s),
+            IrExpr::Str(s, style) => {
+                // QUOTED text is DATA: `a = "a"` must not mention `a` (a
+                // phantom read before the write defeats the pass-2 local
+                // rule). An UNQUOTED word is a reference — the frontends
+                // hand some operands over already substituted (`"$x"` can
+                // arrive as a bare `x`).
+                let quoted = !matches!(style, crate::ir::StrStyle::Raw);
+                self.mentions_value_str_style(s, quoted);
+            }
             IrExpr::Var(v, _) | IrExpr::Ident(v) => self.mention(v),
             IrExpr::Index { var, key } => {
                 self.mention(var);
