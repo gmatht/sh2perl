@@ -3378,7 +3378,7 @@ impl Render {
             // the arith renderer had to suffix each literal operand. Pinning
             // the type here lets those suffixes go, and is what makes
             // `x = x + 1` compile whether or not a store widened it first.
-            let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { ": i64" } else { "" };
+            let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { "" } else { "" };
             return format!("{attr}{kw} {m}{ty} = {e};");
         }
         format!("{m} = {e};")
@@ -3519,7 +3519,7 @@ impl Render {
                     );
                 }
                 return format!(
-                    "{{ let k: i64 = {key}; let n: i64 = {n}; \\
+                    "{{ let k = {key}; let n: i64 = {n}; \\
                        let i = if k < 0 {{ n + k }} else {{ k }}; \\
                        if i < 0 || i >= n {{ std::process::exit(1); }} \\
                        {m}[i as usize].to_string() }}"
@@ -3543,7 +3543,7 @@ impl Render {
                 );
             }
             return format!(
-                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                "{{ let k = {key}; let n: i64 = {n}; \
                    let i = if k < 0 {{ n + k }} else {{ k }}; \
                    if i < 0 || i >= n {{ std::process::exit(1); }} \
                    {m}[i as usize] }}"

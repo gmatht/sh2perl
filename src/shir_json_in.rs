@@ -89,7 +89,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     let contract_version = obj
         .get("contract_version")
         .and_then(|x| x.as_u64())
-        .ok_or_else(|| "Program: missing contract_version (plan §2.1)".to_string())?;
+        .ok_or_else(|| "Program: missing contract_version (plan §2.1)")?;
     if contract_version as u32 != super::shir_json::CONTRACT_VERSION {
         return Err(format!(
             "Program: contract_version {} != core {}",

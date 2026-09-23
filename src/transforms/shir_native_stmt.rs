@@ -3223,7 +3223,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
             while i < chars.len() {
                 match chars[i] {
                     'A' | 'B' | 'C' => {
-                        let n: i64 = if i + 1 < chars.len() {
+                        let n = if i + 1 < chars.len() {
                             let d: String = chars[i+1..].iter().collect();
                             let Ok(v) = d.parse() else { return false; };
                             i = chars.len();
@@ -5485,7 +5485,7 @@ fn native_test_exit_stmt(st: &mut IrStmt) -> bool {
         return false;
     }
     // the exit code: literal int (default 0)
-    let mut code_n: i64 = 0;
+    let mut code_n = 0;
     for w in words {
         let Some(t) = literal_text(w) else { return false; };
         let Ok(v) = t.parse() else { return false; };
