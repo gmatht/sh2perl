@@ -3587,7 +3587,7 @@ impl Render {
                 }
             }
             return format!(
-                "{{ let k = {key}; let n: i64 = {n}; \
+                "{{ let k = {key}; let n = {n}; \
                    let i = if k < 0 {{ n + k }} else {{ k }}; \
                    if i < 0 || i >= n {{ std::process::exit(1); }} \
                    {m}[i as usize] }}"
@@ -7066,7 +7066,7 @@ impl Render {
                 } else if let Some(r) = e.get("range").and_then(|r| r.as_array()) {
                     let start = r.first().and_then(|x| x.as_str()).unwrap_or("");
                     let end = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
-                    let step: i64 = r.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
+                    let step = r.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
                     if comma_list {
                         items.push(format!("{start}..{end}"));
                         continue;
@@ -11611,7 +11611,7 @@ impl Render {
                     let i = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
                     self.add_helper("arg");
                     self.emit(&format!(
-                        "let __pn_{n}: i64 = __sh_arg({i}).trim().parse::<i64>().unwrap_or(0);"
+                        "let __pn_{n} = __sh_arg({i}).trim().parse::<i64>().unwrap_or(0);"
                     ));
                 }
             }
@@ -12014,8 +12014,8 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r: i64 = 1;
-    let mut i: i64 = 0;
+    let mut r = 1;
+    let mut i = 0;
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
 }"#,
@@ -12228,7 +12228,7 @@ fn helper_source(h: &str) -> &'static str {
                 let w: usize = width.parse().unwrap_or(0);
                 let left = flags.contains('-');
                 let zero = flags.contains('0');
-                let p: i64 = prec.as_ref().map(|s| s.parse().unwrap_or(0)).unwrap_or(-1);
+                let p = prec.as_ref().map(|s| s.parse().unwrap_or(0)).unwrap_or(-1);
                 let mut piece = String::new();
                 match conv {
                     's' => {
