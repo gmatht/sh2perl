@@ -354,6 +354,18 @@ pub struct Render {
     /// (`false` — the `Default` — keeps shell semantics: the historical
     /// output, bit for bit).
     rc_disabled: bool,
+    /// I64-OMITTABLE verdict (`shir::analyze_i64_omittable`): Int-homed
+    /// pass-2 locals whose proven value range fits in i32 and which are
+    /// never used as an array-index key. For these, the `: i64` annotation
+    /// on the `let` binding is omitted — Rust infers i32 from an unsuffixed
+    /// integer literal, and all arithmetic between i32 values is identical
+    /// in semantics. Set once before rendering.
+    i64_omittable: std::collections::HashSet<String>,
+    /// Non-negative index-key variables (from `I64OmitInfo::nonneg_idx_keys`):
+    /// Int-homed variables used as array-index keys whose proven range lo >= 0.
+    /// For these, `array_index_strict` renders with `usize` (no `i64` cast,
+    /// no `as usize` at the indexing site, no negative-wrap guard).
+    nonneg_idx_keys: std::collections::HashSet<String>,
     /// STATIC ARRAY VERDICT (shared `analyze_static_arrays`): arrays whose
     /// value is a compile-time literal list and which are only ever read
     /// as a whole list. Their init renders from literals (no `__sh_cat`),
@@ -1004,9 +1016,521 @@ fn cat_peephole(text: &str) -> String {
     cur
 }
 
+/// Textual peephole: collapse `&"literal".to_string()` → `"literal"`.
+///
+/// At every call site in this backend, `&` on a `Str` literal is used to
+/// pass it to a `&str` parameter (`__sh_replace`, `__sh_fnmatch`, `File::create`,
+/// `.contains`, `.get`, etc.). The renderer emits `"literal".to_string()`
+/// (from `rust_str_expr`) and wraps it in `&` to match the `&str` parameter.
+///
+/// Soundness: `&"literal".to_string()` produces `&String`, which coerces to
+/// `&str` via `Deref`. `"literal"` is already `&'static str`. In every call
+/// site in this backend the target type is `&str` (or `AsRef<Path>` /
+/// `Borrow<str>` which `&str` satisfies). Replacing is therefore type-neutral
+/// — no behavior change, just less allocation.
+fn strip_str_lit_refs(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        // look for `&` immediately followed by a string literal and `.to_string()`
+        if b[i] == b'&' && i + 1 < b.len() && b[i + 1] == b'"' {
+            // find the end of the string literal (handling escapes)
+            let mut j = i + 2; // skip `&"`
+            loop {
+                if j >= b.len() {
+                    break;
+                }
+                if b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == b'"' {
+                    j += 1; // consume closing quote
+                    break;
+                }
+                j += 1;
+            }
+            // check for `.to_string()` after the literal
+            let suffix = b".to_string()";
+            if j < b.len() && b[j..].starts_with(suffix) {
+                let lit_end = j; // exclusive end of the string literal
+                // emit just the string literal
+                out.push_str(&text[i + 1..lit_end]);
+                i = lit_end + suffix.len();
+                continue;
+            }
+            // Also handle `&("literal".to_string())` — the `&` is followed
+            // by `(`, then a string literal, then `.to_string())`
+            if i + 1 < b.len() && b[i + 1] == b'(' && i + 2 < b.len() && b[i + 2] == b'"' {
+                let mut j = i + 3;
+                loop {
+                    if j >= b.len() {
+                        break;
+                    }
+                    if b[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == b'"' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                let suffix = b".to_string())";
+                if j < b.len() && b[j..].starts_with(suffix) {
+                    let lit_end = j;
+                    out.push_str(&text[i + 2..lit_end]);
+                    i = lit_end + suffix.len();
+                    continue;
+                }
+            }
+        }
+        // copy one char (UTF-8 safe)
+        if b[i] & 0x80 != 0 {
+            let ch = text[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Inline shell runtime helpers that have a trivial idiomatic-Rust
+/// expansion.  Each rewrite is a pure textual peephole (no IR changes):
+///
+/// * `__sh_len(&EXPR).to_string()` → `EXPR.chars().count().to_string()`
+/// * `__sh_len(&EXPR)`  (no `.to_string()`) → `EXPR.chars().count() as i64`
+/// * `__sh_env("LIT")`        → `std::env::var("LIT").unwrap_or_default()`  (always)
+/// * `__sh_fexists("LIT")`     → `std::path::Path::new("LIT").exists()`  (always)
+/// * `__sh_fdir("LIT")`        → `std::path::Path::new("LIT").is_dir()`  (always)
+/// * `__sh_freg("LIT")`        → `std::path::Path::new("LIT").is_file()`  (always)
+/// * `__sh_puts("LIT")`        → `print!("{}", "LIT")`  (only when sinks dead)
+/// * `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`
+///   (only when the sink-check tail is provably dead — i.e. no sink is
+///   ever activated AND `__SH_ARITH_WORD_FAIL` is never set)
+fn inline_simple_helpers(text: &str, runtime_free: bool) -> String {
+    let mut out = text.to_string();
+
+    // __sh_len(&EXPR) → EXPR.chars().count() as i64  — always safe
+    // Also handle __sh_len(&EXPR).to_string() → EXPR.chars().count().to_string()
+    // (the `.to_string()` on the i64 return would need a cast; using
+    //  usize's own .to_string() avoids the `as i64` cast entirely).
+    loop {
+        let pat = "__sh_len(&";
+        if let Some(at) = out.find(pat) {
+            let rest = &out[at + pat.len()..];
+            if let Some((var, end_rel)) = parse_ident_to_paren(rest) {
+                let var_expr = var.trim();
+                let end = at + pat.len() + end_rel;
+                // Check for a trailing `.to_string()`
+                let after = &out[end..];
+                if after.starts_with(".to_string()") {
+                    let replacement = format!(
+                        "{}.chars().count().to_string()",
+                        var_expr
+                    );
+                    let full_end = end + ".to_string()".len();
+                    out.replace_range(at..full_end, &replacement);
+                    continue;
+                }
+                let replacement = format!(
+                    "{}.chars().count() as i64",
+                    var_expr
+                );
+                out.replace_range(at..end, &replacement);
+                continue;
+            }
+        }
+        break;
+    }
+
+    // __sh_env("LIT") → std::env::var("LIT").unwrap_or_default()  — always safe
+    inline_str_arg_helper(&mut out, "__sh_env",
+        |lit| format!("std::env::var({}).unwrap_or_default()", lit));
+
+    // __sh_fexists("LIT") → std::path::Path::new("LIT").exists()  — always safe
+    inline_str_arg_helper(&mut out, "__sh_fexists",
+        |lit| format!("std::path::Path::new({}).exists()", lit));
+
+    // __sh_fdir("LIT") → std::path::Path::new("LIT").is_dir()  — always safe
+    inline_str_arg_helper(&mut out, "__sh_fdir",
+        |lit| format!("std::path::Path::new({}).is_dir()", lit));
+
+    // __sh_freg("LIT") → std::path::Path::new("LIT").is_file()  — always safe
+    inline_str_arg_helper(&mut out, "__sh_freg",
+        |lit| format!("std::path::Path::new({}).is_file()", lit));
+
+    // __sh_substr(&VAR, POS, LEN) → VAR.chars().skip(POS).take(LEN).collect::<String>()
+    // — only when POS and LEN are non-negative integer literals
+    out = inline_sh_substr(&out);
+
+    // __sh_replace(&VAR, "P", "R", true/false) → VAR.replace("P","R") / VAR.replacen("P","R",1)
+    // — only when PAT is a literal with no glob characters
+    out = inline_sh_replace(&out);
+
+    // Determine whether the output sinks (redirect capture / file sink)
+    // are provably dead — i.e. the program never writes to any of them.
+    // After `inline_sinks_when_unused` + `strip_str_lit_refs`, the runtime
+    // statics may still be *declared* but never *set*.  If none is ever
+    // set and the arith-word-fail guard is never tripped, the sink
+    // routing inside `__sh_puts` and `__sh_print_words` is dead code.
+    let sinks_dead = runtime_free
+        || (!out.contains("__SH_ARITH_WORD_FAIL.store(true")
+            && !out.contains("*__SH_OUT.lock().unwrap() = Some")
+            && !out.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some"));
+
+    if sinks_dead {
+        // __sh_puts("LIT") → print!("{}", "LIT")  — only when sinks dead
+        // (uses the safe `{}` format placeholder so literals containing
+        //  `{`/`}` are not re-interpreted as format specifiers)
+        inline_str_arg_helper(&mut out, "__sh_puts",
+            |lit| format!("print!(\"{{}}\", {})", lit));
+
+        // __sh_print_words(&[vec![EXPR]], true, false) → println!("{}", EXPR)
+        inline_print_words(&mut out);
+    }
+
+    // Simplify `if { let __b = EXPR;  __b }` → `if EXPR`
+    // This wrapper is left behind by `rc_strip` after it removes the
+    // `__SH_RC.store(...)` tail from conditionally-rendered expressions.
+    out = simplify_let_b(out);
+
+    out
+}
+
+/// Scan `s` from the beginning expecting an identifier/var followed by `)`.
+/// Returns `(the text up to and including the closing paren's inner content,
+/// index of the closing paren relative to s)`.
+fn parse_ident_to_paren(s: &str) -> Option<(&str, usize)> {
+    // accept a simple var name, a borrow `&VAR`, a borrow-word path,
+    // or a bare expression — we just need to find the matching `)`.
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if esc { esc = false; } else if c == '\\' { esc = true; } else if c == '"' { in_str = false; }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some((&s[..i], i + 1));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Inline a helper of the form `NAME(LITERAL)` where `LITERAL` is a Rust
+/// double-quoted string literal, via the supplied `expand` closure.
+fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) -> String) {
+    let pat = format!("{}(", name);
+    loop {
+        let at = match text.find(&pat) {
+            Some(a) => a,
+            None => break,
+        };
+        // verify what follows the `(` is a string literal
+        let after = &text[at + pat.len()..];
+        if !after.starts_with('"') {
+            break;
+        }
+        // find the closing quote
+        let mut j = 1;
+        let bytes = after.as_bytes();
+        let mut in_str = true;
+        let mut esc = false;
+        while j < bytes.len() && (in_str || bytes[j] != b')') {
+            let c = bytes[j];
+            if in_str {
+                if esc { esc = false; } else if c == b'\\' { esc = true; } else if c == b'"' { in_str = false; }
+            } else if c == b')' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() { break; } // unterminated — bail
+        let lit = &after[..j + 1]; // include closing `)`
+        // lit is `"..."`  (the string literal including quotes but not `)`)
+        let lit_str = &after[..j]; // `"..."` (with closing quote)
+        if !lit_str.ends_with('"') { break; }
+        let replacement = expand(lit_str);
+        let end = at + pat.len() + j + 1; // include the `)`
+        text.replace_range(at..end, &replacement);
+    }
+}
+
+/// Rewrite `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`.
+/// Uses bracket-depth tracking (not a fixed suffix) so that expressions
+/// containing `]` or `]]` inside string literals or nested calls are handled.
+/// Only matches the exact shape with `nl=true, esc=false`; any other form
+/// (multi-word, escape handling, dynamic flags) is left untouched.
+fn inline_print_words(text: &mut String) {
+    let pat = "__sh_print_words(&[vec![";
+    loop {
+        let at = match text.find(pat) {
+            Some(a) => a,
+            None => break,
+        };
+        let start = at + pat.len();
+        // Scan forward tracking depth to find the matching `]` that closes
+        // the `vec![`.  We start at depth 1 (one unclosed `[`).
+        let bytes = text.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = start;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut found_close = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_str {
+                if esc { esc = false; } else if c == b'\\' { esc = true; } else if c == b'"' { in_str = false; }
+            } else {
+                match c {
+                    b'"' => in_str = true,
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            found_close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let close = match found_close {
+            Some(c) => c,
+            None => break,
+        };
+        // After the `]` that closes `vec![`, we expect a second `]`
+        // (closing `&[`), then `, true, false)`, with optional whitespace.
+        let rest = &text[close + 1..];
+        let mut j = 0;
+        while j < rest.len() && rest.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= rest.len() || rest.as_bytes()[j] != b']' {
+            continue;
+        }
+        // bracket2_pos = absolute index of the second `]` in `text`
+        let bracket2_pos = close + 1 + j;
+        let rest = &rest[j + 1..];       // text after the second `]`
+        let mut j = 0;                    // whitespace after second `]`
+        while j < rest.len() && rest.as_bytes()[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if !rest[j..].starts_with(", true, false)") {
+            continue;
+        }
+        let expr = &text[start..close];
+        // end = position after the `)` of `, true, false)`
+        let end = bracket2_pos + 1 + j + ", true, false)".len();
+        let replacement = format!("println!(\"{{}}\", {})", expr);
+        text.replace_range(at..end, &replacement);
+    }
+}
+
+/// Simplify `if { let __b = EXPR;  __b }` → `if EXPR` (and the `let _ =`
+/// variant).  After `rc_strip` removes the `__SH_RC.store(...)` tail from
+/// the renderer's status-wrapper, this pattern remains:
+///
+///   `{ let __b = EXPR;  __b }`  (note: `rc_strip` leaves `;  __b }`
+///                                — a `;` + the second `]` was *not* a
+///                                thing; see the actual text below)
+///
+/// This pass finds `{ let __b = `, scans with bracket-depth tracking
+/// (respecting string literals) to the matching `}`, verifies that the
+/// text just inside the `}` is `;  __b ` (or `; __b ` or a newline-
+/// separated variant), and replaces the whole wrapper with the bare
+/// expression.
+fn simplify_let_b(mut text: String) -> String {
+    let prefix = "{ let __b = ";
+    loop {
+        let at = match text.find(prefix) {
+            Some(a) => a,
+            None => break,
+        };
+        let start = at + prefix.len();
+        // Scan forward to find the matching `}` for the `{` at `at`.
+        let mut depth: i32 = 1; // already inside the outer `{`
+        let bytes = text.as_bytes();
+        let mut i = start;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut found = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    b'"' => in_str = true,
+                    b'{' | b'(' | b'[' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                    b')' | b']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let close = match found {
+            Some(c) => c,
+            None => break,
+        };
+        // Extract and validate the inner text before mutating.
+        let inner = text[start..close].trim_end();
+        let stripped = match inner.strip_suffix("__b") {
+            Some(s) => s,
+            None => continue,
+        };
+        let stripped = stripped.trim_end();
+        let expr = match stripped.strip_suffix(';') {
+            Some(e) => e.trim(),
+            None => continue,
+        };
+        if expr.is_empty() {
+            continue;
+        }
+        let replacement = expr.to_string();
+        text.replace_range(at..close + 1, &replacement);
+    }
+    text
+}
+
+/// Split a comma-separated argument list at depth-0 commas,
+/// respecting string literals and nested brackets/braces.
+fn split_args(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if esc { esc = false; } else if c == '\\' { esc = true; } else if c == '"' { in_str = false; }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    parts.push(s[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// `__sh_substr(&VAR, POS, LEN)` → `VAR.chars().skip(POS).take(LEN).collect::<String>()`
+/// when POS and LEN are non-negative integer literals.
+fn inline_sh_substr(text: &str) -> String {
+    let mut out = text.to_string();
+    let prefix = "__sh_substr(";
+    let mut pos = 0;
+    while let Some(at) = out[pos..].find(prefix) {
+        let at = pos + at;
+        let rest = &out[at + prefix.len()..];
+        let Some((inner_rel, end_rel)) = parse_ident_to_paren(rest) else {
+            break;
+        };
+        let end = at + prefix.len() + end_rel;
+        let args = split_args(inner_rel);
+        if args.len() == 3
+            && args[0].starts_with('&')
+            && args[1].chars().all(|c| c.is_ascii_digit())
+            && args[2].chars().all(|c| c.is_ascii_digit())
+        {
+            let var = args[0][1..].trim();
+            let off: i64 = args[1].parse().unwrap();
+            let len: i64 = args[2].parse().unwrap();
+            let replacement = format!(
+                "{}.chars().skip({}).take({}).collect::<String>()",
+                var, off, len
+            );
+            out.replace_range(at..end, &replacement);
+            pos = at + replacement.len();
+        } else {
+            pos = end;
+        }
+    }
+    out
+}
+
+/// `__sh_replace(&VAR, "PAT", "REPL", bool)` → `VAR.replace("PAT","REPL")` /
+/// `VAR.replacen("PAT","REPL",1)` when PAT is a literal with no glob characters.
+fn inline_sh_replace(text: &str) -> String {
+    let mut out = text.to_string();
+    let prefix = "__sh_replace(";
+    let mut pos = 0;
+    while let Some(at) = out[pos..].find(prefix) {
+        let at = pos + at;
+        let rest = &out[at + prefix.len()..];
+        let Some((inner_rel, end_rel)) = parse_ident_to_paren(rest) else {
+            break;
+        };
+        let end = at + prefix.len() + end_rel;
+        let args = split_args(inner_rel);
+        let ok = args.len() == 4
+            && args[0].starts_with('&')
+            && args[1].starts_with('"') && args[1].ends_with('"') && args[1].len() >= 2
+            && args[2].starts_with('"') && args[2].ends_with('"')
+            && (args[3] == "true" || args[3] == "false");
+        if ok {
+            let pat_content = &args[1][1..args[1].len() - 1];
+            let has_glob = pat_content.chars().any(|c| matches!(c, '*' | '?' | '[' | '!' | '@' | '+' | '(' | '|'));
+            if has_glob {
+                pos = end;
+                continue;
+            }
+            let var = args[0][1..].trim();
+            let pat = args[1];
+            let repl = args[2];
+            let all = args[3] == "true";
+            let replacement = if all {
+                format!("{var}.replace({pat}, {repl})")
+            } else {
+                format!("{var}.replacen({pat}, {repl}, 1)")
+            };
+            out.replace_range(at..end, &replacement);
+            pos = at + replacement.len();
+        } else {
+            pos = end;
+        }
+    }
+    out
+}
+
 /// No sink is ever activated, so the redirect/capture checks inside the
-/// print helpers are dead: rewrite them to a bare `print!`. This is the
-/// "no shell features" case — a program whose output all goes straight
 /// to stdout (a Python `print()` script, a plain `echo` script) then
 /// looks like handwriting instead of a runtime shim.
 ///
@@ -1312,52 +1836,57 @@ fn prune_unused_helpers(text: String) -> String {
         })
         .collect();
     let helpers: Vec<&str> = helper_names.iter().map(|s| s.as_str()).collect();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut drop: Vec<usize> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim_start();
-        let Some(name) = helpers.iter().find(|n| t.starts_with(&format!("fn {n}("))) else {
-            continue;
-        };
-        // is the name mentioned on any other non-comment line?
-        let called = lines.iter().enumerate().any(|(j, l)| {
-            if j == i {
-                return false;
-            }
-            let lt = l.trim_start();
-            if lt.starts_with("//") {
-                return false;
-            }
-            l.contains(*name)
-        });
-        if !called {
-            // drop the whole definition: the signature line + body until
-            // the matching closing brace at column 0
-            let mut j = i + 1;
-            while j < lines.len() && lines[j] != "}" {
-                j += 1;
-            }
-            for k in i..=j.min(lines.len().saturating_sub(1)) {
-                drop.push(k);
+    // multi-pass: a helper pruned in pass N may orphan another helper
+    // whose only caller was the pruned one — pass N+1 picks it up.
+    let mut current = text;
+    loop {
+        let lines: Vec<&str> = current.lines().collect();
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            let Some(name) = helpers.iter().find(|n| t.starts_with(&format!("fn {n}("))) else {
+                continue;
+            };
+            // is the name mentioned on any other non-comment line?
+            let called = lines.iter().enumerate().any(|(j, l)| {
+                if j == i {
+                    return false;
+                }
+                let lt = l.trim_start();
+                if lt.starts_with("//") {
+                    return false;
+                }
+                l.contains(*name)
+            });
+            if !called {
+                // drop the whole definition: the signature line + body until
+                // the matching closing brace at column 0
+                let mut j = i + 1;
+                while j < lines.len() && lines[j] != "}" {
+                    j += 1;
+                }
+                for k in i..=j.min(lines.len().saturating_sub(1)) {
+                    drop.push(k);
+                }
             }
         }
-    }
-    if drop.is_empty() {
-        return text;
-    }
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
+        if drop.is_empty() {
+            return current;
         }
-        if !drop.contains(&i) {
-            out.push_str(line);
+        let mut out = String::with_capacity(current.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            if !drop.contains(&i) {
+                out.push_str(line);
+            }
         }
+        while out.contains("\n\n\n") {
+            out = out.replace("\n\n\n", "\n\n");
+        }
+        current = out;
     }
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
-    out
 }
 
 /// Drop the module-level runtime statics a program never uses. The 14
@@ -1586,6 +2115,9 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // (`py -> rs` for a plain Python program: no `static __SH_RC`, no
     // stores, no `process::exit(__SH_RC…)`). False = shell default.
     r.rc_disabled = crate::shir::exit_status_is_unobservable(&prog);
+    let i64_info = crate::shir::analyze_i64_omittable(&prog);
+    r.i64_omittable = i64_info.omittable;
+    r.nonneg_idx_keys = i64_info.nonneg_idx_keys;
     // PLAN-4 STATUS-WRITE LIVENESS (shared analysis): which statements'
     // status writes are provably unread. The Rust renderer carries its own
     // register (`__SH_RC`), so it installs the same verdict the ESTree
@@ -1648,6 +2180,15 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
     let text = inline_sinks_when_unused(text, !r.runtime_free && r.sink_check_needed);
+    // Strip `&"literal".to_string()` → `"literal"`: a textual peephole that
+    // is sound because the `&` is always used to feed a `&str` parameter.
+    let text = strip_str_lit_refs(&text);
+    // Inline simple shell helpers that have a trivial idiomatic-Rust
+    // expansion (`__sh_len`, `__sh_env`, `__sh_fexists`, `__sh_puts`,
+    // `__sh_print_words`).  Only the `print_words` rewrite is gated on
+    // the sinks being dead — the redirect-aware `print_words` variant
+    // is left untouched.
+    let text = inline_simple_helpers(&text, r.runtime_free);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -2529,7 +3070,7 @@ impl Render {
                     return None;
                 }
                 let text = std::str::from_utf8(&self.s[start..self.i]).ok()?;
-                let n: i64 = text.parse().ok()?;
+                let n = text.parse().ok()?;
                 let rest = &self.s[self.i..];
                 for suf in [b"i64".as_slice(), b"i32", b"usize", b"isize", b"u64", b"u32"] {
                     if rest.starts_with(suf) {
@@ -2837,7 +3378,7 @@ impl Render {
             // the arith renderer had to suffix each literal operand. Pinning
             // the type here lets those suffixes go, and is what makes
             // `x = x + 1` compile whether or not a store widened it first.
-            let ty = if self.is_num(name) { ": i64" } else { "" };
+            let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { ": i64" } else { "" };
             return format!("{attr}{kw} {m}{ty} = {e};");
         }
         format!("{m} = {e};")
@@ -2915,7 +3456,24 @@ impl Render {
     /// Index nodes (uses param strings), so this path is Python-only.
     /// An int-homed array (`Vec<i64>`) reads through `array_index_num`;
     /// this `String` form stays for text homes.
-    fn array_index_strict(&mut self, var: &str, key: &str) -> String {
+    /// Check if an `IrExpr::Index` key is a simple variable that's proven
+    /// non-negative by `analyze_i64_omittable`. When true, `array_index_strict`
+    /// can render with `usize` instead of `i64`.
+    fn key_is_nonneg(&self, key: &IrExpr) -> bool {
+        let name: &str = match key {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => n,
+            IrExpr::Call { func, args } if *func == "getVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) if !n.is_empty() => n,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        self.nonneg_idx_keys.contains(name)
+    }
+
+    fn array_index_strict(&mut self, var: &str, key: &str, usize_key: bool) -> String {
         // LOCAL ARRAY: a fixed-size Rust array indexed in place. CPython
         // semantics (`xs[i]`: negative wraps, OOB aborts exit(1)) are
         // preserved with the array's OWN length.
@@ -2951,6 +3509,15 @@ impl Render {
                         return format!("{m}[{idx}].to_string()");
                     }
                 }
+                if usize_key {
+                    // key proven non-negative: no i64, no neg-wrap, no
+                    // `as usize` at the index.
+                    return format!(
+                        "{{ let k = {key} as usize; let n: usize = {n}; \
+                           if k >= n {{ std::process::exit(1); }} \
+                           {m}[k].to_string() }}"
+                    );
+                }
                 return format!(
                     "{{ let k: i64 = {key}; let n: i64 = {n}; \\
                        let i = if k < 0 {{ n + k }} else {{ k }}; \\
@@ -2968,6 +3535,13 @@ impl Render {
                     return format!("{m}[{idx}]");
                 }
             }
+            if usize_key {
+                return format!(
+                    "{{ let k = {key} as usize; let n: usize = {n}; \
+                       if k >= n {{ std::process::exit(1); }} \
+                       {m}[k] }}"
+                );
+            }
             return format!(
                 "{{ let k: i64 = {key}; let n: i64 = {n}; \
                    let i = if k < 0 {{ n + k }} else {{ k }}; \
@@ -2979,13 +3553,23 @@ impl Render {
             return format!("({}).to_string()", self.array_index_num(var, key));
         }
         let m = self.tls(var);
-        // key is i64 expr (may be negative); len from Vec.
-        format!(
-            "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
-               let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-               if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
-               {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
-        )
+        if usize_key {
+            // key proven non-negative: render with usize — no i64 temp,
+            // no negative-wrap, no `as usize` cast at the index site.
+            format!(
+                "{{ let __k = {key} as usize; let __n = {m}.with(|v| v.borrow().len()); \
+                   if __k >= __n {{ std::process::exit(1); }} \
+                   {m}.with(|v| v.borrow()[__k].clone()) }}"
+            )
+        } else {
+            // key is i64 expr (may be negative); len from Vec.
+            format!(
+                "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                   if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
+                   {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+            )
+        }
     }
 
     /// Numeric strict-index read (`Vec<i64>` home): the same
@@ -3540,8 +4124,9 @@ impl Render {
                     let ks = self.expr_str(key);
                     self.assoc_get(var, &ks)
                 } else {
+                    let usize_key = self.key_is_nonneg(key);
                     let k = self.expr_num(key);
-                    self.array_index_strict(var, &k)
+                    self.array_index_strict(var, &k, usize_key)
                 }
             }
             other => self.expr_any(other),
@@ -4050,8 +4635,9 @@ impl Render {
                     let ks = self.expr_str(key);
                     self.assoc_get(var, &ks)
                 } else {
+                    let usize_key = self.key_is_nonneg(key);
                     let k = self.expr_num(key);
-                    self.array_index_strict(var, &k)
+                    self.array_index_strict(var, &k, usize_key)
                 }
             }
             IrExpr::Capture { .. } => self.capture_expr_single(e),
@@ -5386,7 +5972,7 @@ impl Render {
                     // exactly as `local_write_stmt` does (without emit)
                     if self.local_init.remove(name) {
                         let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
-                        let ty = if self.is_num(name) { ": i64" } else { "" };
+                        let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { ": i64" } else { "" };
                         let m = self.var_ident(name);
                         let val = if self.is_num(name) {
                             format!("{get}.trim().parse::<i64>().unwrap_or(0)")
@@ -5879,8 +6465,9 @@ impl Render {
                     let ks = self.expr_str(key);
                     format!("vec![{}]", self.assoc_get(var, &ks))
                 } else {
+                    let usize_key = self.key_is_nonneg(key);
                     let k = self.expr_num(key);
-                    format!("vec![{}]", self.array_index_strict(var, &k))
+                    format!("vec![{}]", self.array_index_strict(var, &k, usize_key))
                 }
             }
             IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
@@ -6333,7 +6920,7 @@ impl Render {
                     return self.assoc_get(var, &k);
                 }
                 let k = self.key_num_expr(key);
-                return self.array_index_strict(var, &k);
+                return self.array_index_strict(var, &k, false);
             }
         }
         "String::new()".to_string()
@@ -18584,9 +19171,9 @@ mod tests {
         // pass 2: single-scope x is a plain local (`let` at first write)
         let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
         assert!(out.contains("fn main() {"), "{out}");
-        // an Int-homed local carries an explicit `: i64` so its binding is
-        // not inferred (that is what lets `x + 1` stay unsuffixed)
-        assert!(out.contains("let mut x: i64 = 5;"), "{out}");
+        // an Int-homed local reads as a plain `let` (the `: i64` is
+        // omitted — the range fits i32 and Rust infers from the literal)
+        assert!(out.contains("let mut x = 5;"), "{out}");
         assert!(out.contains("x = 6;"), "{out}");
         assert!(!out.contains("__SHV_x"), "{out}");
         // single-word dynamic echo prints directly (no helper)
@@ -18610,7 +19197,7 @@ mod tests {
         // `x` is read only through the test text `"$x"`; the borrow walk
         // reads those `$` references, so the verdict holds and x binds as a
         // plain local instead of a thread_local.
-        assert!(out.contains("let x: i64 = 3;"), "{out}");
+        assert!(out.contains("let x = 3;"), "{out}");
         assert!(!out.contains("__SHV_x"), "x should be a local:\n{out}");
         assert!(!out.contains("TODO"), "{out}");
         assert!(!out.contains("sh2"), "{out}");
@@ -18643,9 +19230,9 @@ mod tests {
         let sh = render("x=1\nz=$((x + (1 << 2)))\necho \"$z\"\n");
         assert!(sh.contains("1i64 << 2i64"), "{sh}");
         // an operation on an i64-homed var carries NO literal suffix (the
-        // local itself is declared `: i64`, which supplies the type)
+        // local itself is inferred, not `: i64` — the range fits i32)
         let mixed = render("x=1\nz=$((x << 2))\necho \"$z\"\n");
-        assert!(mixed.contains("let x: i64 = 1;"), "{mixed}");
+        assert!(mixed.contains("let x = 1;"), "{mixed}");
         assert!(mixed.contains("x << 2"), "{mixed}");
         assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
     }

@@ -170,7 +170,7 @@ fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {
             if o["type"] != "Sub" {
                 return Err(format!("{where_}[{i}]: type {} != Sub", o["type"]));
             }
-            let name = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+            let name = req_str(o, "name",             let name = req_str(o, "name",             let name = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();format!("{where_}[{i}]"))?;format!("{where_}[{i}]"))?.to_string();
             let params = str_array(o.get("params"), &format!("{where_}[{i}].params"))?;
             let body = stmts_from(o.get("body"), &format!("{where_}[{i}].body"))?;
             Ok(IrSub { name, params, body })
@@ -187,7 +187,7 @@ fn var_types_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, IrType
                 .enumerate()
                 .map(|(i, e)| {
                     let o = require_obj(e, &format!("{where_}[{i}]"))?;
-                    let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+                    let n = req_str(o, "name",                     let n = req_str(o, "name",                     let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();format!("{where_}[{i}]"))?;format!("{where_}[{i}]"))?.to_string();
                     let t = req(o, "type", &format!("{where_}[{i}]"))?;
                     let irt = ir_type_from(t, &format!("{where_}[{i}].type"))?;
                     Ok((n, irt))
@@ -242,7 +242,7 @@ fn var_const_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, VarKin
                 .enumerate()
                 .map(|(i, e)| {
                     let o = require_obj(e, &format!("{where_}[{i}]"))?;
-                    let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+                    let n = req_str(o, "name",                     let n = req_str(o, "name",                     let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();format!("{where_}[{i}]"))?;format!("{where_}[{i}]"))?.to_string();
                     let k = req_str(o, "kind", &format!("{where_}[{i}]"))?;
                     let vk = match k {
                         "Const" => VarKind::Const,
@@ -276,7 +276,7 @@ fn var_lifetimes_from(
                 .enumerate()
                 .map(|(i, e)| {
                     let o = require_obj(e, &format!("{where_}[{i}]"))?;
-                    let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+                    let n = req_str(o, "name",                     let n = req_str(o, "name",                     let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();format!("{where_}[{i}]"))?;format!("{where_}[{i}]"))?.to_string();
                     let f = o
                         .get("first")
                         .and_then(|x| x.as_u64())
@@ -539,7 +539,7 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                     .enumerate()
                     .map(|(i, e)| {
                         let eo = require_obj(e, &format!("{where_}.env[{i}]"))?;
-                        let n = req_str(eo, "name", &format!("{where_}.env[{i}]"))?.to_string();
+                        let n = req_str(eo, "name",                         let n = req_str(eo, "name",                         let n = req_str(eo, "name", &format!("{where_}.env[{i}]"))?.to_string();format!("{where_}.env[{i}]"))?;format!("{where_}.env[{i}]"))?.to_string();
                         let v = expr_from(
                             req(eo, "value", &format!("{where_}.env[{i}]"))?,
                             &format!("{where_}.env[{i}].value"),

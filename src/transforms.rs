@@ -64,6 +64,7 @@ pub fn transform_applies(name: &str) -> bool {
 
 pub mod arith_forms;
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
+pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)

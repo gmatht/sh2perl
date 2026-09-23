@@ -1341,6 +1341,18 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-a" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
+            "-t" => {
+                // `-t N`: test whether fd N is a terminal. Map the common
+                // literal fds to Perl's -t filehandle form; fall back to
+                // the regex hack for variable/numeric fd operands.
+                let handle = match arg.trim_matches('"').trim_matches('\'') {
+                    "0" => "STDIN",
+                    "1" => "STDOUT",
+                    "2" => "STDERR",
+                    _ => return test_fallback(text),
+                };
+                IrExpr::Str(format!("(-t {})", handle), StrStyle::Raw)
+            }
             _ => test_fallback(text),
         }
     } else if tokens.len() == 1 {
@@ -1647,13 +1659,11 @@ fn native_bash_script(st: &mut IrStmt) -> bool {
         let Some(w) = literal_text(w) else { return false; };
         argv.push(w);
     }
-    // Read the script and check it matches the known arg-demo pattern.
-    let candidates = [script.to_string(), format!("sh2perl/{script}")];
-    let mut src = None;
-    for c in &candidates {
-        if let Ok(s) = std::fs::read_to_string(c) { src = Some(s); break; }
-    }
-    let Some(src) = src else { return false; };
+    // Read the script from the same path bash would resolve at runtime
+    // (relative to CWD). Do NOT add a `sh2perl/` prefix fallback — that
+    // would find files bash can't, producing output the reference run
+    // doesn't have.
+    let Ok(src) = std::fs::read_to_string(script) else { return false; };
     let normalized: String = src.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -3002,7 +3012,7 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
-        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or die \"sort: {fq}: $ERRNO\"; my $__c = <$__fh>; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
+        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__fh> // ''; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
     );
     *st = IrStmt::RawText(code);
     true
@@ -3615,7 +3625,7 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
         None => String::new(),
     };
     let mut code = format!(
-        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or die \"grep: {fq}: $ERRNO\"; my $__c = <$__f>; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
+        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__f> // ''; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
     );
     for op in &ops {
         code.push_str(op);
@@ -5380,22 +5390,58 @@ fn native_rm_rf_stmt(st: &mut IrStmt) -> bool {
     true
 }
 
-/// `If { cond: test(...), .. }` (perl-only): render the test condition
-/// natively (the renderer shells out unsupported flags like -S).
-fn native_if_test_cond(st: &mut IrStmt) -> bool {
-    let IrStmt::If { cond, .. } = st else { return false; };
-    let IrExpr::Call { func, args } = cond else { return false; };
-    if !matches!(func.as_str(), "test" | "[" | "[[" ) {
-        return false;
+/// Extract the test-command words from an `IrExpr::Call`, handling both
+/// `Call{func:"test"}` and `Call{func:"exec", args:[Str("test"), Array(words)]}`.
+fn extract_test_words(e: &IrExpr) -> Option<Vec<&IrExpr>> {
+    let IrExpr::Call { func, args } = e else { return None; };
+    match func.as_str() {
+        "test" | "[" | "[[" => match args.as_slice() {
+            [IrExpr::Str(_, _), IrExpr::Array(words)] => Some(words.iter().collect()),
+            _ => Some(args.iter().collect()),
+        },
+        "exec" | "builtin" => {
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                return None;
+            };
+            (cmd == "test" || cmd == "[").then(|| words.iter().collect())
+        }
+        _ => None,
     }
-    // the test args may be [Str("cmd"), Array(words)] or just the cond
-    // words ([Str(" -S /dev/null")]).
-    let cond_words: Vec<&IrExpr> = match args.as_slice() {
-        [IrExpr::Str(_, _), IrExpr::Array(words)] => words.iter().collect(),
-        _ => args.iter().collect(),
-    };
-    let new_cond = render_test_words(&cond_words);
-    *cond = new_cond;
+}
+
+/// `A && B` where A is a test command, and `If { cond: test(...), .. }`
+/// (perl-only): render the test condition natively (the renderer shells out
+/// unsupported flags like -S). `&&` chains are lowered to `RawText` with
+/// `$CHILD_ERROR` tracking so the non-zero failing status is preserved (a
+/// regular `if` with no else would reset it to 0), while `If` statements
+/// get their condition converted to an `IrExpr::Str` for the emitter to
+/// emit the tracking + `else { $CHILD_ERROR = 0; }` reset.
+fn native_if_test_cond(st: &mut IrStmt) -> bool {
+    // `test COND && B`: lower to RawText with $CHILD_ERROR tracking BEFORE
+    // test_and_to_if can rewrite it into an If that loses the failing status.
+    if let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::And,
+        lhs,
+        rhs,
+    }) = st
+    {
+        if let Some(cond_words) = extract_test_words(lhs) {
+            let new_cond = render_test_words(&cond_words);
+            let cond_p = crate::ir::ir_expr_to_perl(&new_cond);
+            let rhs_stmt = IrStmt::Expr((**rhs).clone());
+            let mut code = format!(
+                "$CHILD_ERROR = ({}) ? 0 : 1;\nif ({}) {{\n",
+                cond_p, cond_p
+            );
+            crate::ir::emit_stmt(&mut code, &rhs_stmt, 1);
+            code.push_str("}\n");
+            *st = IrStmt::RawText(code);
+            return true;
+        }
+    }
+    let IrStmt::If { cond, .. } = st else { return false; };
+    let Some(cond_words) = extract_test_words(cond) else { return false; };
+    *cond = render_test_words(&cond_words);
     true
 }
 
