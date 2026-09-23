@@ -3519,7 +3519,7 @@ impl Render {
                     );
                 }
                 return format!(
-                    "{{ let k = {key}; let n: i64 = {n}; \\
+                    "{{ let k = {key}; let n = {n}; \\
                        let i = if k < 0 {{ n + k }} else {{ k }}; \\
                        if i < 0 || i >= n {{ std::process::exit(1); }} \\
                        {m}[i as usize].to_string() }}"
@@ -3543,7 +3543,7 @@ impl Render {
                 );
             }
             return format!(
-                "{{ let k = {key}; let n: i64 = {n}; \
+                "{{ let k = {key}; let n = {n}; \
                    let i = if k < 0 {{ n + k }} else {{ k }}; \
                    if i < 0 || i >= n {{ std::process::exit(1); }} \
                    {m}[i as usize] }}"
@@ -3564,7 +3564,7 @@ impl Render {
         } else {
             // key is i64 expr (may be negative); len from Vec.
             format!(
-                "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
                    let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
                    if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
                    {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
@@ -3587,7 +3587,7 @@ impl Render {
                 }
             }
             return format!(
-                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                "{{ let k = {key}; let n: i64 = {n}; \
                    let i = if k < 0 {{ n + k }} else {{ k }}; \
                    if i < 0 || i >= n {{ std::process::exit(1); }} \
                    {m}[i as usize] }}"
@@ -3595,7 +3595,7 @@ impl Render {
         }
         let m = self.tls(var);
         format!(
-            "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+            "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
                let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
                if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
                {m}.with(|v| v.borrow()[__idx as usize]) }}"
@@ -3637,7 +3637,7 @@ impl Render {
                 if idx >= 0 && (idx as usize) < n {
                     if self.local_array_is_int(name) {
                         return format!(
-                            "{{ let v: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); {m}[{idx}] = v; }}"
+                            "{{ let v = ({val}).trim().parse::<i64>().unwrap_or(0); {m}[{idx}] = v; }}"
                         );
                     }
                     return format!("{m}[{idx}] = {val};");
@@ -3645,7 +3645,7 @@ impl Render {
             }
             if self.local_array_is_int(name) {
                 return format!(
-                    "{{ let v: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); let i: usize = {key} as usize; {m}[i] = v; }}"
+                    "{{ let v = ({val}).trim().parse::<i64>().unwrap_or(0); let i: usize = {key} as usize; {m}[i] = v; }}"
                 );
             }
             return format!("{{ let i: usize = {key} as usize; {m}[i] = {val}; }}");
@@ -3653,7 +3653,7 @@ impl Render {
         let m = self.tls(name);
         if self.is_int_array(name) {
             return format!(
-                "{{ let __val: i64 = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+                "{{ let __val = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
                  if b.len() <= i {{ b.resize(i + 1, 0); }} b[i] = __val; }}); }}"
             );
         }
@@ -5972,7 +5972,7 @@ impl Render {
                     // exactly as `local_write_stmt` does (without emit)
                     if self.local_init.remove(name) {
                         let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
-                        let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { ": i64" } else { "" };
+                        let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { "" } else { "" };
                         let m = self.var_ident(name);
                         let val = if self.is_num(name) {
                             format!("{get}.trim().parse::<i64>().unwrap_or(0)")

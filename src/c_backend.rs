@@ -11217,6 +11217,19 @@ impl Render {
                     // divergence shared with the int guard-0 choice)
                     return format!("(fmod((double)({l}), (double)({r})))");
                 } else if *op == "/" || *op == "%" {
+                    // Strength-reduce power-of-2 divisors: % 2^k -> & (2^k-1),
+                    // / 2^k -> >> k. Eliminates ~30-cycle div (1-cycle and/shift).
+                    if let crate::ir::ArithAst::Num(d) = rhs.as_ref() {
+                        if *d > 0 && (*d & (*d - 1)) == 0 {
+                            if *op == "%" {
+                                let mask = *d - 1;
+                                return format!("((unsigned long long)({l}) & {mask}ull)");
+                            } else {
+                                let shift = (*d as u64).trailing_zeros();
+                                return format!("((unsigned long long)({l}) >> {shift}u)");
+                            }
+                        }
+                    }
                     // bash survives division by zero (result: error, the
                     // expansion vanishes); C would SIGFPE — guard it.
                     // A BOUNDED-nonzero divisor (the shared range proof:
