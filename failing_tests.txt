@@ -10,14 +10,14 @@
 063_04_complex_parameter_expansion.sh	stdout mismatch, exit code (bash=1 perl=0)
 063_05_heredoc_with_complex_content.sh	stdout mismatch
 063_09_complex_function_parameter_handling.sh	stdout mismatch
-063_11_complex_while_loop.sh	stdout mismatch
 063_12_complex_eval.sh	stdout mismatch
+063_11_complex_while_loop.sh	stdout mismatch
 063_18_complex_here_string.sh	stdout mismatch
-063_hard_to_parse.sh	stdout mismatch
 064_01_complex_nested_subshells.sh	stdout mismatch
 064_07_complex_array_operations.sh	stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	stdout mismatch
 064_20_nested_subshells_environment_variables.sh	stdout mismatch
+063_hard_to_parse.sh	stdout mismatch
 065_yes_head_while.sh	stdout mismatch
 064_hard_to_generate.sh	stdout mismatch
 070_cmp_basic.sh	stdout mismatch
@@ -38,7 +38,6 @@ parse-bracket-subshell-pipe.sh	exit code (bash=1 perl=0)
 parse-dollar-in-arithmetic.sh	stdout mismatch
 parse-dollar-paren-pipe.sh	stdout mismatch
 parse-dollar-single-quote.sh	stdout mismatch
-096_head_procsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 parse-eval-multiline.sh	stdout mismatch
 parse-heredoc-tab.sh	stdout mismatch
 parse-multi-command-while-condition.sh	stdout mismatch
@@ -48,10 +47,11 @@ printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
 realpath-cmdsub.sh	stdout mismatch
-sqs-overlap-multiline-awk.sh	stdout mismatch
+096_head_procsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 sync-direct-call-await.sh	stdout mismatch
-parse-error-block-in-pipeline.sh	stdout mismatch, exit code (bash=0 perl=124)
+sqs-overlap-multiline-awk.sh	stdout mismatch
 typeset-cmdsub.sh	stdout mismatch
 tty-cmdsub.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 variable-plus-operator.sh	stdout mismatch
+parse-error-block-in-pipeline.sh	stdout mismatch, exit code (bash=0 perl=124)
