@@ -589,7 +589,7 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         // PureCpu (namespace spec): no I/O, no state beyond args
         "contains" | "join" | "brace" | "idiv" | "imod" | "arith" | "arithEval" | "trimCapture"
         | "dirname" | "basename" | "not" | "guard" | "caseMatch" | "split" | "param"
-        | "callDirect" => "PureCpu",
+        | "callDirect" | "lit" => "PureCpu",
         // Emulable: implementable in a backend runtime (state/string/glob/fs-tests)
         "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
