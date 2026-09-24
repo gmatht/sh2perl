@@ -8696,6 +8696,16 @@ impl Render {
             self.emit("static void _sh_export(const char *name, const char *val) {");
             self.emit("  setenv(name, val ? val : \"\", 1);");
             self.emit("}");
+            // getenv-or-empty as a HELPER, not an inline ternary. clang's
+            // analyzer cannot correlate the two separate getenv() calls in
+            // `(getenv(x) ? getenv(x) : "")`, so the result looks
+            // possibly-NULL at every consumer and the C gate's
+            // static-analysis step fails the file. A helper that RETURNS
+            // non-NULL removes the doubt at all sites at once.
+            self.emit("static const char *_sh_env(const char *name) {");
+            self.emit("  const char *v = getenv(name);");
+            self.emit("  return v ? v : \"\";");
+            self.emit("}");
             self.emit("/* `read` builtin: one line from stdin into a static buffer */");
             self.emit("static char *_sh_readline(void) {");
             self.emit("  static _sh_vbuf _sh_rd = {0, 0};");
@@ -11155,8 +11165,7 @@ impl Render {
                     } else {
                         self.need_sh = true;
                         format!(
-                            "(getenv({}) ? getenv({}) : \"\")",
-                            Self::cstr(name),
+                            "_sh_env({})",
                             Self::cstr(name)
                         )
                     };
@@ -13798,8 +13807,7 @@ fn param_copy_alias(
             self.store_ref(name)
         } else {
             format!(
-                "(getenv({}) ? getenv({}) : \"\")",
-                Self::cstr(name),
+                "_sh_env({})",
                 Self::cstr(name)
             )
         }
@@ -14712,8 +14720,7 @@ fn param_copy_alias(
                         self.store_ref(&name)
                     } else {
                         format!(
-                            "(getenv({}) ? getenv({}) : \"\")",
-                            Self::cstr(&name),
+                            "_sh_env({})",
                             Self::cstr(&name)
                         )
                     }
@@ -21729,10 +21736,10 @@ fn param_copy_alias(
         // `~` / `~/Documents` — home expansion (also `~user` is out of
         // scope: the gate runs as one user, $HOME is the same)
         if raw == "~" {
-            return "(getenv(\"HOME\") ? getenv(\"HOME\") : \"\")".into();
+            return "_sh_env(\"HOME\")".into();
         }
         if let Some(rest) = raw.strip_prefix("~/") {
-            let home = "(getenv(\"HOME\") ? getenv(\"HOME\") : \"\")";
+            let home = "_sh_env(\"HOME\")";
             if rest.is_empty() {
                 return home.into();
             }
@@ -21812,8 +21819,7 @@ fn param_copy_alias(
                 // in pass 1; an insert here yields an undeclared id)
                 self.need_sh = true;
                 format!(
-                    "(getenv({}) ? getenv({}) : \"\")",
-                    Self::cstr(stripped),
+                    "_sh_env({})",
                     Self::cstr(stripped)
                 )
             }
@@ -21836,8 +21842,7 @@ fn param_copy_alias(
                     self.store_ref(name)
                 } else {
                     format!(
-                        "(getenv({}) ? getenv({}) : \"\")",
-                        Self::cstr(name),
+                        "_sh_env({})",
                         Self::cstr(name)
                     )
                 };
@@ -22285,8 +22290,7 @@ fn param_copy_alias(
             // default/expansion handles it)
             self.need_sh = true;
             format!(
-                "(getenv({}) ? getenv({}) : \"\")",
-                Self::cstr(&name),
+                "_sh_env({})",
                 Self::cstr(&name)
             )
         };
@@ -22620,8 +22624,7 @@ fn param_copy_alias(
                     } else {
                         self.need_sh = true;
                         format!(
-                            "(getenv({}) ? getenv({}) : \"\")",
-                            Self::cstr(rest),
+                            "_sh_env({})",
                             Self::cstr(rest)
                         )
                     };
@@ -22642,7 +22645,7 @@ fn param_copy_alias(
                     // an environment variable (HOME, PATH, ...): read the
                     // real environment (the gate runs with the same env)
                     self.need_sh = true;
-                    format!("(getenv({}) ? getenv({}) : \"\")", Self::cstr(&name), Self::cstr(&name))
+                    format!("_sh_env({})", Self::cstr(&name))
                 }
             }
             "param" => self.param_call(args),
@@ -23417,8 +23420,7 @@ fn param_copy_alias(
                             // would be too late for the pass-1 hoist
                             self.need_sh = true;
                             format!(
-                                "(getenv({}) ? getenv({}) : \"\")",
-                                Self::cstr(&name),
+                                "_sh_env({})",
                                 Self::cstr(&name)
                             )
                         };
@@ -24408,9 +24410,10 @@ fn param_copy_alias(
                     self.emit(&format!(
                         "{id}_len = {ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
                     ));
-                    self.emit(&format!(
-                        "{ai} += ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0);"
-                    ));
+                    // no `{ai} += …` here: this branch `continue`s, so the
+                    // increment is never read again and clang's
+                    // deadcode.DeadStores rejects it (fails the C gate's
+                    // static-analysis step).
                     continue;
                 }
             }
@@ -24953,8 +24956,7 @@ fn param_copy_alias(
                         }
                         return vec![Part::Arg(
                             format!(
-                                "(getenv({}) ? getenv({}) : \"\")",
-                                Self::cstr(name),
+                                "_sh_env({})",
                                 Self::cstr(name)
                             ),
                             NumSpec::Str,
