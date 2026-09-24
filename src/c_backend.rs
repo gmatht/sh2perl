@@ -7907,7 +7907,7 @@ impl Render {
             self.emit("static void _sh_add(const char *s) {");
             self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + n + 1);");
-            self.emit("  memcpy(_sh_cmd + l, s, n + 1);");
+            self.emit("  if (_sh_cmd) memcpy(_sh_cmd + l, s, n + 1);");
             self.emit("}");
             self.emit("static void _sh_addc(char c) {");
             self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0;");
@@ -7918,7 +7918,7 @@ impl Render {
             self.emit("static void _sh_wb_add(const char *s) {");
             self.emit("  size_t l = _sh_wb ? strlen(_sh_wb) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_wb, &_sh_wcap, l + n + 1);");
-            self.emit("  memcpy(_sh_wb + l, s, n + 1);");
+            self.emit("  if (_sh_wb) memcpy(_sh_wb + l, s, n + 1);");
             self.emit("}");
             self.emit("static void _sh_wb_reset(void) { _sh_grow(&_sh_wb, &_sh_wcap, 1); _sh_wb[0] = 0; }");
             // native `printf '%s\\n' "${a[@]}" | sort -n -u | awk-join`:
@@ -8116,14 +8116,14 @@ impl Render {
             self.emit("static void _sh_badd(char **b, size_t *cap, const char *s) {");
             self.emit("  size_t l = *b ? strlen(*b) : 0, n = strlen(s);");
             self.emit("  _sh_grow(b, cap, l + n + 1);");
-            self.emit("  memcpy(*b + l, s, n + 1);");
+            self.emit("  if (*b) memcpy(*b + l, s, n + 1);");
             self.emit("}");
             self.emit("static void _sh_baddc(char **b, size_t *cap, char c) {");
             self.emit("  size_t l = *b ? strlen(*b) : 0;");
             self.emit("  _sh_grow(b, cap, l + 2);");
-            self.emit("  (*b)[l] = c; (*b)[l + 1] = 0;");
+            self.emit("  if (*b) { (*b)[l] = c; (*b)[l + 1] = 0; }");
             self.emit("}");
-            self.emit("static void _sh_bres(char **b, size_t *cap) { _sh_grow(b, cap, 1); (*b)[0] = 0; }");
+            self.emit("static void _sh_bres(char **b, size_t *cap) { _sh_grow(b, cap, 1); if (*b) (*b)[0] = 0; }");
             self.emit("static void _sh_bword(char **b, size_t *cap, const char *s) {");
             self.emit("  _sh_badd(b, cap, \" '\");");
             self.emit("  for (const char *p = s; *p; p++) {");
