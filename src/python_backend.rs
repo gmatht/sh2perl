@@ -291,6 +291,19 @@ impl Render {
     }
 }
 
+/// The shared handler registry's child-renderer hook for python: delegates
+/// to the backend's own `expr()`, so a shared handler emits a real python
+/// expression tree instead of a stub.
+struct PyChild<'a> {
+    r: &'a mut Render,
+}
+
+impl crate::render_ext_expr::ChildExprRenderer for PyChild<'_> {
+    fn render_child(&mut self, e: &IrExpr) -> Option<String> {
+        Some(self.r.expr(e))
+    }
+}
+
 fn scan_rc(stmts: &[IrStmt], out: &mut bool) {
     for s in stmts {
         match s {
@@ -930,6 +943,37 @@ impl Render {
                     "None".into()
                 }
             },
+            IrExpr::Ext(n) => {
+                // Transform-declared semantic nodes (text_ops' cut/tr/sed/
+                // head/tail/wc/basename compositions, and the frontend
+                // nodes). The SHARED handler registry owns the semantics;
+                // this backend supplies its own child-expression renderer so
+                // a handler can build a native python expression tree.
+                // No handler (or a handler that needs an unwired child) →
+                // the historical TODO stub, never a silently wrong value.
+                let mut child = PyChild { r: self };
+                if let Some(code) = crate::render_ext_expr::render_with(
+                    n.as_ref(),
+                    crate::render_ext_expr::Backend::Python,
+                    0,
+                    &mut child,
+                ) {
+                    // A handler that emitted a `re.` call needs the import
+                    // in the preamble — the handler cannot reach this
+                    // renderer's flags from the shared registry, so the
+                    // requirement is detected from the emitted text (the
+                    // same contract the hand-written arms honour by setting
+                    // need_re themselves).
+                    if code.contains("re.") {
+                        self.need_re = true;
+                    }
+                    // `posixpath` / `str.maketrans` etc. are stdlib imports
+                    // only where already emitted; nothing else to flag.
+                    return code;
+                }
+                self.mark_todo(&format!("{} → sh2.{}", n.tag(), n.tag()));
+                format!("sh2_{}(...)", n.tag())
+            }
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "None".into()

@@ -58,6 +58,18 @@ pub fn transform_applies(name: &str) -> bool {
             target().as_deref(),
             Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "zig" | "java" | "python")
         ),
+        // text-ops EMITS the rich Ext nodes (FieldExtract/RegSub/...). A
+        // backend whose manifest declares none of them would receive a node
+        // it cannot render — worse than the original command, which every
+        // backend already handles natively. So the transform is gated by
+        // the SAME manifest the §11.12 planner reads: the core declines to
+        // emit what the target cannot consume (the "or get the core to
+        // lower them to supported nodes" half of the node contract). An
+        // UNSET target keeps the historical behaviour (every backend).
+        "text-ops" => match target() {
+            None => true,
+            Some(t) => crate::transforms::planner::emits_renderable_nodes(&t),
+        },
         _ => true,
     }
 }

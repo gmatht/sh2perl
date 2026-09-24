@@ -98,3 +98,6 @@ runtime/lib/
 
 # AI scratchpad (debug output)
 scratchpad/
+
+# worktree-local CLI build for the Ext-node work (untracked)
+/otranspilerl/

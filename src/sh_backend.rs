@@ -3604,7 +3604,32 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
                 "\"$( {{ {c} && printf '%s\\n' {t}; }} || printf '%s\\n' {e} )\""
             ))
         }
+        IrExpr::Ext(n) => {
+            // Transform-declared semantic nodes (text_ops' cut/tr/sed/
+            // head/tail/wc/basename compositions). The SHARED handler
+            // registry owns the semantics; this backend supplies a child
+            // renderer so a handler can build a POSIX-shell word.
+            let mut child = ShChild;
+            crate::render_ext_expr::render_with(
+                n.as_ref(),
+                crate::render_ext_expr::Backend::Sh,
+                0,
+                &mut child,
+            )
+            .ok_or_else(|| format!("Ext node not renderable by the sh renderer: {}", n.tag()))
+        }
         other => Err(format!("word not renderable: {other:?}")),
+    }
+}
+
+/// The shared handler registry's child-renderer hook for the sh backend:
+/// delegates to this renderer's own `word_to_sh`, so a shared handler emits
+/// a real POSIX-shell word.
+struct ShChild;
+
+impl crate::render_ext_expr::ChildExprRenderer for ShChild {
+    fn render_child(&mut self, e: &IrExpr) -> Option<String> {
+        word_to_sh(e).ok()
     }
 }
 

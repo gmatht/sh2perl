@@ -684,10 +684,10 @@ impl Render {
                     self.need_readline = true;
                     return "__sh2_read_line()".to_string();
                 }
-                let ctx = crate::render_ext_expr::ExprRenderCtx {
-                    backend: crate::render_ext_expr::Backend::Perl,
-                    indent: 0,
-                };
+                let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                    crate::render_ext_expr::Backend::Perl,
+                    0,
+                );
                 if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                     code
                 } else {
