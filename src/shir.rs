@@ -7731,7 +7731,7 @@ pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
 
 pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
     let numeric = numeric_lift_vars(prog);
-    let string = string_lift_vars(prog, &numeric);
+    let (string, ascii) = string_lift_vars(prog, &numeric);
     let mut names: std::collections::HashSet<String> = numeric.iter().cloned().collect();
     for s in &string {
         names.insert(s.clone());
@@ -7743,6 +7743,8 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
         .map(|n| {
             let t = if numeric.contains(&n) {
                 crate::ir::IrType::Int
+            } else if ascii.contains(&n) {
+                crate::ir::IrType::AsciiStr
             } else {
                 crate::ir::IrType::Str
             };
@@ -31053,7 +31055,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
-        &string_lift_vars(prog, &numeric_lift_vars(prog)),
+        &string_lift_vars(prog, &numeric_lift_vars(prog)).0,
     );
     // `--true64`: slot vars are homed in the array — exclude them from
     // BOTH lifts (their reads/writes route through __t64[k]; a lifted
@@ -48853,7 +48855,10 @@ fn collect_local_decls(st: &IrStmt, out: &mut HashSet<String>) {
     }
 }
 
-pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+pub(crate) fn string_lift_vars(
+    prog: &IrProgram,
+    numeric: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut string_ctx: HashSet<String> = HashSet::new();
@@ -49066,7 +49071,35 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
             break;
         }
     }
-    lifted
+
+    // Subset of `lifted` whose every assignment is a pure ASCII literal
+    // or an already-identified ASCII var.  Command captures, interpolations,
+    // and getVar reads are excluded — their content is runtime-dependent.
+    let mut ascii: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &lifted {
+            if ascii.contains(name) {
+                continue;
+            }
+            if let Some(exprs) = assigns.get(name) {
+                let all_ascii = exprs.iter().all(|e| match e {
+                    IrExpr::Str(v, _) => v.is_ascii(),
+                    IrExpr::Var(n, _) => ascii.contains(n.as_str()),
+                    _ => false,
+                });
+                if all_ascii {
+                    ascii.insert(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    (lifted, ascii)
 }
 
 /// SH2_ASSUME_NO_ENV=0 — turn off the never-written-var read fold (see
