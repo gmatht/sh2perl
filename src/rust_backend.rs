@@ -1113,7 +1113,11 @@ fn strip_str_lit_refs(text: &str) -> String {
 /// * `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`
 ///   (only when the sink-check tail is provably dead — i.e. no sink is
 ///   ever activated AND `__SH_ARITH_WORD_FAIL` is never set)
-fn inline_simple_helpers(text: &str, runtime_free: bool) -> String {
+fn inline_simple_helpers(
+    text: &str,
+    runtime_free: bool,
+    var_types: &HashMap<String, crate::ir::IrType>,
+) -> String {
     let mut out = text.to_string();
 
     // __sh_len(&EXPR) → EXPR.chars().count() as i64  — always safe
@@ -1167,7 +1171,8 @@ fn inline_simple_helpers(text: &str, runtime_free: bool) -> String {
 
     // __sh_substr(&VAR, POS, LEN) → VAR.chars().skip(POS).take(LEN).collect::<String>()
     // — only when POS and LEN are non-negative integer literals
-    out = inline_sh_substr(&out);
+    // — for AsciiStr vars, emits &VAR[OFF..OFF+LEN] instead
+    out = inline_sh_substr(&out, var_types);
 
     // __sh_replace(&VAR, "P", "R", true/false) → VAR.replace("P","R") / VAR.replacen("P","R",1)
     // — only when PAT is a literal with no glob characters
@@ -1453,7 +1458,12 @@ fn split_args(s: &str) -> Vec<&str> {
 
 /// `__sh_substr(&VAR, POS, LEN)` → `VAR.chars().skip(POS).take(LEN).collect::<String>()`
 /// when POS and LEN are non-negative integer literals.
-fn inline_sh_substr(text: &str) -> String {
+/// For `AsciiStr`-typed variables, emits `&VAR[OFF..OFF+LEN]` instead
+/// (byte-indexed slice — safe because the string is known ASCII).
+fn inline_sh_substr(
+    text: &str,
+    var_types: &HashMap<String, crate::ir::IrType>,
+) -> String {
     let mut out = text.to_string();
     let prefix = "__sh_substr(";
     let mut pos = 0;
@@ -1473,10 +1483,18 @@ fn inline_sh_substr(text: &str) -> String {
             let var = args[0][1..].trim();
             let off: i64 = args[1].parse().unwrap();
             let len: i64 = args[2].parse().unwrap();
-            let replacement = format!(
-                "{}.chars().skip({}).take({}).collect::<String>()",
-                var, off, len
+            let is_ascii = matches!(
+                var_types.get(var),
+                Some(crate::ir::IrType::AsciiStr)
             );
+            let replacement = if is_ascii {
+                format!("&{}[{}..{}]", var, off, off + len)
+            } else {
+                format!(
+                    "{}.chars().skip({}).take({}).collect::<String>()",
+                    var, off, len
+                )
+            };
             out.replace_range(at..end, &replacement);
             pos = at + replacement.len();
         } else {
@@ -2188,7 +2206,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // `__sh_print_words`).  Only the `print_words` rewrite is gated on
     // the sinks being dead — the redirect-aware `print_words` variant
     // is left untouched.
-    let text = inline_simple_helpers(&text, r.runtime_free);
+    let text = inline_simple_helpers(&text, r.runtime_free, &r.var_types);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -11786,7 +11804,10 @@ impl Render {
 
 impl Render {
     fn is_str(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Str)
+        matches!(
+            self.var_types.get(name).copied(),
+            Some(IrType::Str | IrType::AsciiStr)
+        )
     }
 
     /// Assign statement for one target (used by decl_words).

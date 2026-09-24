@@ -36,7 +36,7 @@ impl super::Analysis for StringLift {
     fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
         // string lift is defined as "not numeric, but provably string"
         // and consults the numeric verdict (shir.rs:string_lift_vars).
-        ctx.lifted_string = crate::shir::string_lift_vars(prog, &ctx.lifted_numeric);
+        ctx.lifted_string = crate::shir::string_lift_vars(prog, &ctx.lifted_numeric).0;
     }
 }
 

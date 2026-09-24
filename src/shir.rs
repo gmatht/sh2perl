@@ -7731,7 +7731,7 @@ pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
 
 pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
     let numeric = numeric_lift_vars(prog);
-    let string = string_lift_vars(prog, &numeric);
+    let (string, ascii) = string_lift_vars(prog, &numeric);
     let mut names: std::collections::HashSet<String> = numeric.iter().cloned().collect();
     for s in &string {
         names.insert(s.clone());
@@ -7743,12 +7743,133 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
         .map(|n| {
             let t = if numeric.contains(&n) {
                 crate::ir::IrType::Int
+            } else if ascii.contains(&n) {
+                crate::ir::IrType::AsciiStr
             } else {
                 crate::ir::IrType::Str
             };
             (n, t)
         })
         .collect()
+}
+
+/// Promote `Str`-typed variables to `AsciiStr` when every assignment is
+/// a pure ASCII literal or an already-promoted `AsciiStr` var.  Call
+/// after the frontend's `var_types` are loaded (e.g. from ShIR JSON);
+/// the Go frontend sets `Str` for all string vars — this pass refines
+/// the ones that are provably ASCII-only.
+pub fn promote_ascii_vars(prog: &mut IrProgram) {
+    use std::collections::HashMap;
+    // Collect all assignment expressions per variable.
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn walk(stmts: &[IrStmt], assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        for st in stmts {
+            match st {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            assigns.entry(t.var.clone()).or_default().push(expr.clone());
+                        }
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Function { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, assigns),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, assigns);
+                    walk(else_, assigns);
+                    for (_, b) in elsifs {
+                        walk(b, assigns);
+                    }
+                }
+                IrStmt::For { var, body, .. } => {
+                    assigns.entry(var.clone()).or_default();
+                    walk(body, assigns);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, assigns);
+                    walk(step, assigns);
+                    walk(body, assigns);
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk(stage, assigns);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, assigns),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, assigns);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_expr(e, assigns);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_expr(e: &IrExpr, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match e {
+            IrExpr::Arrow(stmts) => walk(stmts, assigns),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_expr(a, assigns);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    collect_expr(el, assigns);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut assigns);
+
+    // Build a set of current Str-typed names.
+    let str_vars: std::collections::HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == IrType::Str)
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    // Fixed-point: promote to AsciiStr when all assigns are ASCII.
+    let mut ascii: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &str_vars {
+            if ascii.contains(name) {
+                continue;
+            }
+            if let Some(exprs) = assigns.get(name) {
+                let all_ascii = !exprs.is_empty()
+                    && exprs.iter().all(|e| match e {
+                        IrExpr::Str(v, _) => v.is_ascii(),
+                        IrExpr::Var(n, _) => ascii.contains(n.as_str()),
+                        _ => false,
+                    });
+                if all_ascii {
+                    ascii.insert(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Patch var_types.
+    for (name, ty) in &mut prog.var_types {
+        if *ty == IrType::Str && ascii.contains(name) {
+            *ty = IrType::AsciiStr;
+        }
+    }
 }
 
 /// Conservative const/var verdicts (the const-markup transform; sibling
@@ -31053,7 +31174,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
-        &string_lift_vars(prog, &numeric_lift_vars(prog)),
+        &string_lift_vars(prog, &numeric_lift_vars(prog)).0,
     );
     // `--true64`: slot vars are homed in the array — exclude them from
     // BOTH lifts (their reads/writes route through __t64[k]; a lifted
@@ -48853,7 +48974,10 @@ fn collect_local_decls(st: &IrStmt, out: &mut HashSet<String>) {
     }
 }
 
-pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+pub(crate) fn string_lift_vars(
+    prog: &IrProgram,
+    numeric: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut string_ctx: HashSet<String> = HashSet::new();
@@ -49066,7 +49190,35 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
             break;
         }
     }
-    lifted
+
+    // Subset of `lifted` whose every assignment is a pure ASCII literal
+    // or an already-identified ASCII var.  Command captures, interpolations,
+    // and getVar reads are excluded — their content is runtime-dependent.
+    let mut ascii: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &lifted {
+            if ascii.contains(name) {
+                continue;
+            }
+            if let Some(exprs) = assigns.get(name) {
+                let all_ascii = exprs.iter().all(|e| match e {
+                    IrExpr::Str(v, _) => v.is_ascii(),
+                    IrExpr::Var(n, _) => ascii.contains(n.as_str()),
+                    _ => false,
+                });
+                if all_ascii {
+                    ascii.insert(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    (lifted, ascii)
 }
 
 /// SH2_ASSUME_NO_ENV=0 — turn off the never-written-var read fold (see
