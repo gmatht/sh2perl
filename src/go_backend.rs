@@ -1294,35 +1294,39 @@ impl Render {
     /// Expand a `brace` Call into its string list (None → stub).
     /// args: [Str(pre), Json(groups), Json(?), Str(post)]
     fn brace_expand(&mut self, args: &[IrExpr]) -> Option<Vec<String>> {
-        let mut pre = String::new();
-        let mut groups: Option<Vec<Vec<String>>> = None;
-        let mut post = String::new();
-        for a in args {
-            match a {
-                IrExpr::Str(s, _) => {
-                    if pre.is_empty() {
-                        pre = s.clone();
-                    } else {
-                        post = s.clone();
-                    }
-                }
-                IrExpr::Json(v) => {
-                    // the first Json holds the expansion groups; later Jsons
-                    // (e.g. a trailing empty list) are padding
-                    if groups.is_none() {
-                        groups = Some(brace_groups(v)?);
-                    }
-                }
-                _ => return None,
-            }
-        }
-        let groups = groups?;
+        // prefix/suffix are the FIRST and LAST Str args positionally —
+        // an empty prefix must not be mistaken for "not yet seen" (the
+        // old is_empty() test made `{a,{b,c}}d` put "d" in the prefix).
+        let pre = args.first().and_then(|a| match a {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        })?;
+        let post = args.get(3).and_then(|a| match a {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        })?;
+        let groups = brace_groups(args.get(1).and_then(|a| match a {
+            IrExpr::Json(v) => Some(v),
+            _ => None,
+        })?)?;
+        let middles: Vec<String> = match args.get(2) {
+            Some(IrExpr::Json(serde_json::Value::Array(xs))) => xs
+                .iter()
+                .map(|x| x.as_str().unwrap_or("").to_string())
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut out = vec![pre.clone()];
-        for group in groups {
+        for (gi, group) in groups.iter().enumerate() {
+            let mid = middles.get(gi).cloned().unwrap_or_default();
             let mut next = Vec::new();
             for prefix in &out {
-                for s in &group {
-                    next.push(format!("{prefix}{s}"));
+                for s in group {
+                    let mut v = format!("{prefix}{s}");
+                    if gi + 1 < groups.len() {
+                        v.push_str(&mid);
+                    }
+                    next.push(v);
                 }
             }
             out = next;
@@ -2211,6 +2215,7 @@ impl Render {
             }
             IrStmt::Exec { .. } | IrStmt::Require(_) | IrStmt::RawText(_) => None,
             IrStmt::Label(_) | IrStmt::Goto(_) => None,
+            IrStmt::Shaderize { .. } => None,
         }
     }
 
@@ -3168,6 +3173,9 @@ impl Render {
                 } else {
                     self.mark_todo("break outside a loop");
                 }
+            }
+            IrStmt::Shaderize { .. } => {
+                self.mark_todo("shaderize (autoshaderization) not supported by the Go backend");
             }
         }
     }
@@ -5639,29 +5647,16 @@ fn brace_groups(v: &serde_json::Value) -> Option<Vec<Vec<String>>> {
 }
 
 fn brace_group_items(items: &[serde_json::Value]) -> Option<Vec<String>> {
-    let has_nested = items
-        .iter()
-        .any(|it| it.as_object().map_or(false, |o| o.contains_key("nested")));
-    if has_nested {
-        let mut seq = vec![String::new()];
-        for item in items {
-            let exps = brace_item(item)?;
-            let mut next = Vec::new();
-            for pre in &seq {
-                for s in &exps {
-                    next.push(format!("{pre}{s}"));
-                }
-            }
-            seq = next;
-        }
-        Some(seq)
-    } else {
-        let mut alts = Vec::new();
-        for item in items {
-            alts.extend(brace_item(item)?);
-        }
-        Some(alts)
+    // A group's items are ALTERNATIVES: a literal, a lone range, a nested
+    // brace (the union of its alternatives), or a `product` compound (a
+    // cartesian concatenation). Concatenation across items only ever
+    // happens inside a `product` — the parser wraps a multi-part
+    // alternative as one, so item order here is alternative order.
+    let mut alts = Vec::new();
+    for item in items {
+        alts.extend(brace_item(item)?);
     }
+    Some(alts)
 }
 
 fn brace_item(v: &serde_json::Value) -> Option<Vec<String>> {
@@ -5683,6 +5678,22 @@ fn brace_item(v: &serde_json::Value) -> Option<Vec<String>> {
     }
     if let Some(nested) = obj.get("nested") {
         return brace_group_items(nested.as_array()?);
+    }
+    if let Some(product) = obj.get("product") {
+        // a Compound alternative: cartesian concatenation of sub-groups
+        let subs = product.as_array()?;
+        let mut combos = vec![String::new()];
+        for g in subs {
+            let alts = brace_group_items(g.as_array()?)?;
+            let mut next = Vec::new();
+            for c in &combos {
+                for a in &alts {
+                    next.push(format!("{c}{a}"));
+                }
+            }
+            combos = next;
+        }
+        return Some(combos);
     }
     None
 }

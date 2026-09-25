@@ -19,14 +19,29 @@
 //!   `x / 1` → `x`, `x % 1` → `0`                      (/ or % of 1)
 //!   `x * 0` → `0`, `0 * x` → `0`, `0 / x` → `0`       — ONLY when the
 //!     OTHER side has no `/` or `%` (a hidden `(1/0)*0` must keep its
-//!     divide-by-zero behavior — folding would swallow the error);
+//!     divide-by-zero behavior — folding would swallow the error), AND
+//!     for `0 / x` the divisor must additionally be a POSITIVE nonzero
+//!     literal (`0 / 5` → `0`; a `0 / 0` divisor is itself divide-by-zero
+//!     and a negative divisor flips `-0.0` to `+0.0` — both refused);
 //!   `x - x` → `0`                                     — ONLY when x is pure
 //!     arithmetic with no `/`/`%` (no error, no side effect to duplicate).
 //! `x / x` and anything touching a capture/call is left alone.
 //!
 //! ## Placement
-//! Bundle for run_core_worker.sh (register + manifest). Registered in
-//! `transforms.rs` (SH2_TRANSFORMS gated).
+//! Bundle for run_core_worker.sh (register + manifest) — CURRENTLY
+//! UNREGISTERED (present as a module only; `all()` has no entry).
+//!
+//! 2026-09-09 registration review (estree lowering work): deliberately
+//! NOT registering yet — two gaps need var-type info this layer lacks:
+//!   1. (FIXED here) `0 / 0` folded to `0` — now requires a positive
+//!      nonzero literal divisor; `0 / x-var` and `0 / negative` refuse.
+//!   2. (OPEN, owner decision) float-domain rules (`x % 1 → 0` on 5.5,
+//!      `x * 0 → 0` on negatives/Inf, `x + 0 → x` on -0.0) assume
+//!      shell-int domain. Sound for shell-derived IR (bash ints have no
+//!      -0/fractions/Inf); needs var-type gating for C/go/rust/py-float
+//!      IR before general registration. The unconditionally-sound subset
+//!      (`* 1`, `/ 1`, `0 / positive-literal`) is pinned by unit tests
+//!      below for whoever registers.
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
@@ -142,7 +157,16 @@ fn simplify(a: &mut ArithAst) {
             "/" => {
                 if num(rhs) == Some(1) {
                     *a = lhs.as_ref().clone();
-                } else if num(lhs) == Some(0) && arith_no_err(rhs) {
+                } else if num(lhs) == Some(0)
+                    && matches!(num(rhs), Some(n) if n > 0)
+                    && arith_no_err(rhs)
+                {
+                    // `0 / positive-literal` → `0` (exact in every domain:
+                    // `0 / positive` is `+0` from ints through IEEE).
+                    // A zero divisor (`0 / 0`) is divide-by-zero (bash
+                    // abort / NaN / SIGFPE — never foldable), and a
+                    // negative one flips `-0.0` to `+0.0`; non-literals
+                    // stay (unprovable without var types at this layer).
                     *a = ArithAst::Num(0);
                 }
             }
@@ -168,5 +192,83 @@ fn arith_no_err(a: &ArithAst) -> bool {
             arith_no_err(test) && arith_no_err(then) && arith_no_err(else_)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ArithAst;
+
+    fn num(n: i64) -> ArithAst {
+        ArithAst::Num(n)
+    }
+    fn var(name: &str) -> ArithAst {
+        ArithAst::Var(name.to_string())
+    }
+    fn bin(op: &str, lhs: ArithAst, rhs: ArithAst) -> ArithAst {
+        ArithAst::Bin {
+            op: op.to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+    fn simplified(mut a: ArithAst) -> ArithAst {
+        simplify(&mut a);
+        a
+    }
+    fn is_num(a: &ArithAst, n: i64) -> bool {
+        matches!(a, ArithAst::Num(m) if *m == n)
+    }
+
+    #[test]
+    fn zero_divided_by_zero_refuses() {
+        // `0 / 0` is divide-by-zero in every domain (bash abort, NaN,
+        // SIGFPE) — folding it to `0` would swallow the error.
+        let out = simplified(bin("/", num(0), num(0)));
+        assert!(
+            matches!(out, ArithAst::Bin { .. }),
+            "0/0 must stay unfolded: {out:?}"
+        );
+    }
+
+    #[test]
+    fn zero_divided_by_positive_literal_folds() {
+        // `0 / 5` → `0`: exact from ints through IEEE (`+0` either way).
+        let out = simplified(bin("/", num(0), num(5)));
+        assert!(is_num(&out, 0), "0/5 folds to 0: {out:?}");
+    }
+
+    #[test]
+    fn zero_divided_by_var_or_negative_refuses() {
+        // Unprovable (var) or sign-flipping (negative divisor turns
+        // `-0.0` into `+0.0`) — keep the division.
+        let out = simplified(bin("/", num(0), var("x")));
+        assert!(
+            matches!(out, ArithAst::Bin { .. }),
+            "0/x-var stays unfolded: {out:?}"
+        );
+        let out = simplified(bin("/", num(0), num(-5)));
+        assert!(
+            matches!(out, ArithAst::Bin { .. }),
+            "0/-5 stays unfolded: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unconditional_identities_fold() {
+        // `* 1` and `/ 1` are exact in every domain (IEEE preserves -0,
+        // Inf and NaN through both) — no divisor/value proof needed
+        // beyond the literal itself.
+        let out = simplified(bin("*", var("x"), num(1)));
+        assert!(
+            matches!(out, ArithAst::Var(_)),
+            "x*1 folds to x: {out:?}"
+        );
+        let out = simplified(bin("/", var("x"), num(1)));
+        assert!(
+            matches!(out, ArithAst::Var(_)),
+            "x/1 folds to x: {out:?}"
+        );
     }
 }

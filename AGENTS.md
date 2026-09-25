@@ -14,7 +14,7 @@ self-contained).
   (parse shell → A1 → any backend). This repo builds as a library only:
   `cargo build` / `cargo test --lib`.
 - Unit tests: `cargo test --lib`
-- Corpus gate: the full 517-example suite runs from the workspace harness
+- Corpus gate: the full 552-example suite runs from the workspace harness
   (a `fail` script outside this repo); this repo only guarantees `cargo
   build`/`cargo test` pass standalone.
 - WASM demo: `bash build-wasm.sh` (wasm-pack → `www/pkg`).

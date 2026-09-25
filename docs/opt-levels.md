@@ -2,10 +2,12 @@
 
 Three axes, one mechanism. This document defines the level taxonomy, the
 pass classification behind it, and the testing contract per level. Status:
-**partially implemented** — `lastexit-call-sites` (cleanup class) and
-dual-loop versioning (speed class, `SH2_DUAL_LOOPS=1` opt-in until
-corpus-verified at scale) exist; the preset→gate plumbing and the
-sign/range analyses are still open work.
+**partially implemented** — the `-O0`/`-Og`/`-O3`/`-O4` CLI flags are
+wired (default `-Og`); `-O3` enables i53/BigInt dual-loop versioning on JS
+plus BigInt64Array-slot homing for i64 hot accumulators; `-O4` is `-O3`
+plus autoshaderization (JS target only — **not yet implemented**, see
+Honest limits). `lastexit-call-sites` (cleanup class) exists. The
+`-O2`/`-Os`/`-Oz` presets and the sign/range analyses are still open work.
 
 ## The axes and the firewall
 
@@ -23,12 +25,13 @@ sign/range analyses are still open work.
 
 | Level | Meaning | Build cost | Use |
 |---|---|---|---|
-| `-O0` | Literal lowering, fastest transpile. Cleanup off, analyses skipped. Correspondence-readable (maps line-to-line to input) but noisy. | Lowest | Debugging the transpiler itself |
-| `-Og` | **Readability mode**: `-O0` + full cleanup, minus everything that obscures (no inlining/versioning/unrolling, no intent-hiding strength reduction, names and structure preserved). The mode you audit translations in. | Medium | Human review, diffing |
-| `-O2` (default) | Today's pipeline, byte-stable. Balanced. | Medium | Everything (default) |
-| `-Os` | Size-first, speed-second: no duplication of any kind (single-wide loops, no unrolling/versioning/inlining-for-speed), shared helpers, keep shrink-and-speed peepholes. | Medium | Shipping where bytes matter |
-| `-Oz` | Size at (almost) any cost: `-Os` + outlining repeated bodies into helpers, prefer compact lowering even when slower (runtime call over inlined native), minimal temps. Build only if a size-constrained consumer appears (browser bundle?); otherwise defined-and-deferred. | Medium–high | Size-constrained shipping |
-| `-O3` / speed | Versioning (entry-guarded dual loops), unrolling/peeling where proven, aggressive inlining, strength reduction. | Highest | Hot programs, benchmarks |
+| `-O0` | Literal lowering, fastest transpile. Cleanup off, analyses skipped. Correspondence-readable (maps line-to-line to input) but noisy. Faithful true64 (BigInt) arithmetic. | Lowest | Debugging the transpiler itself |
+| `-Og` (**default**) | **Readability mode**: plain JS Number arithmetic (no BigInt wrapping), no versioning/unrolling/inlining, names and structure preserved. The mode you audit translations in. | Medium | Human review, diffing |
+| `-O2` | Today's pipeline, byte-stable. Balanced. (Not yet wired.) | Medium | Everything (default) |
+| `-Os` | Size-first, speed-second: no duplication of any kind (single-wide loops, no unrolling/versioning/inlining-for-speed), shared helpers, keep shrink-and-speed peepholes. (Not yet wired.) | Medium | Shipping where bytes matter |
+| `-Oz` | Size at (almost) any cost: `-Os` + outlining repeated bodies into helpers, prefer compact lowering even when slower (runtime call over inlined native), minimal temps. (Defined-and-deferred.) | Medium–high | Size-constrained shipping |
+| `-O3` / speed | Versioning (entry-guarded i53/BigInt dual loops on JS), i64 hot accumulators homed in BigInt64Array slots, unrolling/peeling where proven, aggressive inlining, strength reduction. | Highest | Hot programs, benchmarks |
+| `-O4` | `-O3` plus autoshaderization (JS target only): compute loops emitted in a shader-offloadable form. Autoshaderization is **not yet implemented** — `-O4` currently behaves as `-O3`. | Highest | Hot programs, GPU offload |
 
 Levels are **presets**, not orthogonal flags: `-Oz`-readable is a
 contradiction (outlining/minification hurts readability) and is not
@@ -112,12 +115,19 @@ machinery.
 
 ## Testing contract
 
-- **Default (`-O2`) stays byte-pinned**: whatever golden-output tests
-  exist keep passing unchanged.
-- **Every other level is tested purely behaviorally**: the existing
-  corpus gate runs at each level comparing stdout/exit against bash.
-  This is the project's testing policy (observable behavior, not golden
-  bytes) extended across the axis.
+- **Default (`-Og`) is the readable profile**: plain JS Number arithmetic,
+  no BigInt wrapping, no dual loops. It is NOT the correctness profile —
+  plain Number silently rounds past 2^53.
+- **The corpus gates run at `-O3`** (the correctness profile): the estree
+  gate (`fail-estree`) and the frontend stdout gate
+  (`harness/frontend-stdout.sh`) pass `-O3` explicitly, so exact 64-bit
+  bash arithmetic (BigInt-homed proven-big vars + i53/BigInt dual loops)
+  is what the gates compare against bash/python. This decouples the
+  readable default from correctness testing.
+- **Every level is tested purely behaviorally**: the existing corpus gate
+  runs at each level comparing stdout/exit against bash. This is the
+  project's testing policy (observable behavior, not golden bytes)
+  extended across the axis.
 - New transforms arrive gated (the `DEBASHC_TRANSFORMS` convention:
   empty/unset = on) with structural tests first — appearance/behavior
   assertions, never "did not crash" — then the gate flip is verified
@@ -125,10 +135,26 @@ machinery.
 
 ## Honest limits / open items
 
-- The preset→gate plumbing does not exist yet; neither do unrolling,
+- The `-O2`/`-Os`/`-Oz` presets are not wired; neither are unrolling,
   outlining, or the range/sign analyses. `i32_provable`,
   `analyze_true64` (+ loop fixpoints) and `lastexit-call-sites` are the
   models to copy.
+- **Autoshaderization (`-O4`) is not implemented.** There is no existing
+  support anywhere in the tree — the only shader machinery is the GLSL
+  backend (`glsl_backend.rs`), a separate `.glsl`/`.glslv` target that
+  renders the *entire* program as a fragment/vertex shader, not a
+  JS-target pass that offloads individual compute loops. `-O4` currently
+  behaves as `-O3`. The planned shape: a JS-target pass that detects a
+  compute loop (pure-arithmetic, side-effect-free counted loop), renders
+  its body through the GLSL backend's shader model, and emits JS that
+  invokes it via a `sh2.shaderize` runtime helper (which does not exist
+  yet either).
+- **JS dual loops are i53/BigInt, not i64/BigInt.** The narrow arm is
+  plain JS Number (fast path); the wide arm is exact BigInt. A loop that
+  is *specifically* i64 (every guard var proven out-of-±2^53) is NOT
+  dual-versioned — it is homed in a BigInt64Array slot (the int-array
+  trick) or BigInt values directly, since the `Number.isSafeInteger`
+  guard would never take the narrow arm.
 - Dual-versioning needs the hotness signal to avoid versioning cold loops
   (counted loops, nesting depth, provably-runs — all already computed
   somewhere; they need one shared query point).

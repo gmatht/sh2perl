@@ -28,6 +28,8 @@ wasm-opt = false
 
 [dependencies]
 logos = "0.15"
+# BigInt const-eval for Rust backend (t87 huge literals); cached offline.
+num-bigint = "0.4"
 thiserror = "2.0"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
@@ -54,4 +56,3 @@ strip = true     # Strip symbols
 
 [profile.release.package."*"]
 opt-level = "z"
-

@@ -383,6 +383,9 @@ fn walk_stmt(
             walk_stmts(finally_body, pos, first, last, escapes, in_closure, copied);
         }
         IrStmt::Expr(e) => walk_expr(e, p, first, last, escapes, in_closure),
+        IrStmt::Shaderize { body, .. } => {
+            walk_stmts(body, pos, first, last, escapes, in_closure, copied);
+        }
     }
 }
 
@@ -855,6 +858,7 @@ fn mark_stmt_vars_escape(
             mark_stmts_vars_escape(finally_body, first, escapes);
         }
         IrStmt::Expr(e) => mark_vars_escape(e, first, escapes),
+        IrStmt::Shaderize { body, .. } => mark_stmts_vars_escape(body, first, escapes),
     }
 }
 

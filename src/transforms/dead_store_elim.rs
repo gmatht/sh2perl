@@ -460,6 +460,49 @@ fn census_stmt(
                 census_stmt(s, reads, writes, escapes, true);
             }
         }
+        IrStmt::Pipeline { stages, .. } => {
+            // stages run as separate processes, but their READS see
+            // the parent's values (a var read only here must keep its
+            // store — BASHC_FIX t03: `name` read only inside a pipeline
+            // was dropped as dead). Ambient escaping (like Block):
+            // stage-local writes don't outlive the stage.
+            for st in stages {
+                for s in st {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body, .. } => {
+            for s in init {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            census_expr(cond, reads, writes, escapes, escaping);
+            for s in step {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    census_expr(m, reads, writes, escapes, escaping);
+                }
+                for s in &e.body {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+            for s in else_body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in finally_body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+        }
         IrStmt::Block(v) => {
             for s in v {
                 census_stmt(s, reads, writes, escapes, escaping);
@@ -505,6 +548,7 @@ fn census_expr(
                 func.as_str(),
                 "getVar" | "arrayIndex" | "param" | "byteAt" | "jsonGet" | "jsonSet"
                     | "jsonArrGet" | "jsonArrSet" | "jsonArrAppend"
+                    | "memLoad" | "memAdvance" | "memFree"
             ) {
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
@@ -537,6 +581,38 @@ fn census_expr(
             if matches!(func.as_str(), "jsonSet" | "jsonArrSet" | "jsonArrAppend") {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     writes.insert(n.clone());
+                }
+            }
+            // memStore/arrayStore write THROUGH their first-arg handle:
+            // the receiver name is both read (handle resolution) and
+            // written — its initializing stores stay live
+            if matches!(func.as_str(), "memStore" | "arrayStore") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    reads.insert(n.clone());
+                    writes.insert(n.clone());
+                }
+            }
+            // fnCall/fnValue/callDirect dispatch passes its string args
+            // as the callee's $1.. — and callees routinely use those as
+            // VARIABLE NAMES (array-by-name in-place ops: the arg "a"
+            // becomes getVar/param reads inside the body, invisible here).
+            // Mark every Str arg as a read: over-marking only shrinks
+            // elimination, never drops live stores.
+            if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                for a in args {
+                    match a {
+                        IrExpr::Str(n, _) => {
+                            reads.insert(n.clone());
+                        }
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(n, _) = it {
+                                    reads.insert(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             // a $name reference inside ANY string argument is a read —
@@ -847,3 +923,48 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, StrStyle};
+
+    fn str_(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// BASHC_FIX t03: a var read ONLY inside a pipeline stage must keep
+    /// its store (`name="world"; echo $name | tr` dropped the assign).
+    #[test]
+    fn pipeline_read_keeps_store() {
+        let prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "name".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("world"),
+                asm: None,
+            },
+            IrStmt::Pipeline {
+                stages: vec![vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        str_("echo"),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![str_("name")],
+                        }]),
+                    ],
+                })]],
+                last_output: None,
+                capture: None,
+                cmd_str: None,
+            },
+        ];
+        let mut stmts = prog;
+        transform(&mut stmts);
+        assert_eq!(stmts.len(), 2, "pipeline-read store dropped: {stmts:?}");
+    }
+}

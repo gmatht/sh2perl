@@ -433,14 +433,14 @@ impl ParserUtilities for Lexer {
         }
 
         if crate::debug::is_debug_enabled() {
-            eprintln!(
+            pdebug!(
                 "DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}",
                 content.len(),
                 self.current
             );
         }
         if crate::debug::is_debug_enabled() && content.len() > 50 {
-            eprintln!(
+            pdebug!(
                 "DEBUG capture_parenthetical_text: first 50 chars: {:?}",
                 &content[..50]
             );

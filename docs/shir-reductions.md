@@ -120,96 +120,63 @@ falls back to `sh2.*` / the original command otherwise.
 
 ## Implementation status (as-built)
 
-These reductions are implemented in `text_ops` and verified **byte-exact vs
-bash** at statement level:
+These reductions are implemented in `text_ops` (opt-in:
+`DEBASHC_TRANSFORMS=text-ops`), each backed by a unit test demonstrating
+the emitted composition. The **corpus** column reports where the reduction
+actually fires on the current corpus (measured by walking the `--shir`
+export of all 540 examples with text-ops enabled); "unit only" means the
+corpus has no occurrence of the idiom in reducible shape — the composition
+is verified by unit test, and the corpus occurrences (if any) fall back to
+the original command for the documented reason.
 
-| Idiom | Node | Status |
-|-------|------|--------|
-| `${#v}` | StrLen (param `len` / getVar `#v`) | ✅ |
-| `${v^^}`/`${v,,}` | CaseTransform | ✅ |
-| `${v:N:M}` | SubStrExtract | ✅ |
-| `${v##*/}`/`${v%/*}`, `basename`/`dirname` | PathName | ✅ (statement level) |
-| `cut -d, -fN` | FieldExtract | ✅ |
-| `tr 'A-Z' 'a-z'` | CaseTransform | ✅ |
-| `tr 'a' 'b'` | CharTranslate | ✅ |
-| `sed 's///'` | RegSub | ✅ |
-| `grep -q P` | StringContains | ✅ |
-| `wc -c` | StrLen | ✅ |
-| `wc -l` | RegCount(text+\"\\n\") | ✅ |
-| `wc -w` | ArrayLen(Split(/\s+/)) | ✅ |
-| `head`/`tail -n` | TakeLines | ✅ |
-| `xargs` | StringTrim | ✅ |
-| `yes X | head -n K` | RepeatStr("X\\n", K) | ✅ |
-| `head -n K F` | ForEachLine(F, Output(l), limit=K) — early-exit streaming head | ✅ |
-| `grep -c P F` | ForEachLine(F, guarded n+=1) → count | ✅ |
-| `printf 'X%.0s' ARGS…` | RepeatStr("X", static-count incl. brace ranges) | ✅ |
-| `x=$(echo X \| cut/tr/wc/sed …)` | capture-assign → value composition + SetChildError(0); grep excluded (status idiom) | ✅ |
-| `echo "$v" \| cut/tr/sed/wc/head/tail` | variable-source pipelines (single getVar/interpolated echo arg) reduce natively | ✅ |
-| `grep P F \| cut flags` / `cat F \| cut flags` | ForEachLine(F, if Contains(l,P) then Output(FieldExtract)) — ALL cut args passed (glued-flag filter used to drop ':','2') | ✅ |
-| `head/tail -c N` on static text | folds to the EXACT byte substring (already_nl=true — never re-append) | ✅ |
-| `tr -s SET` | squeeze = run collapse to ONE char (`replace(/c+/g,"c")`), identity translate when SET2 empty; `-d -s` and range squeeze sets refuse → runtime | ✅ |
-| `cut -dD -fN-M` / `-fN,M` | FieldExtract ranges: split + ascending index pick, no-delim line passes whole, missing trailing fields dropped — native in estree/java/perl | ✅ |
+| Idiom | Node | Status | Corpus |
+|-------|------|--------|--------|
+| `${#v}` | StrLen (param `len` / getVar `#v`) | ✅ | 010_substring_loop, 064_03, 064_hard_to_generate |
+| `${v^^}`/`${v,,}` | CaseTransform | ✅ | 013, 024, 058, … (22 sites) |
+| `tr 'a-z' 'A-Z'`, `tr '[:lower:]' '[:upper:]'` (and inverses) | CaseTransform | ✅ | 070_gnuisms |
+| `tr 'abc' 'xyz'` / `tr -d` / `tr -s` | CharTranslate | ✅ | 070_gnuisms, parse-error-regex-lookbehind |
+| `${p##*/}`/`${p%/*}`, `basename`/`dirname` | PathName | ✅ | 013, 025, 999_pwd, … (8 sites) |
+| `sed 's///'` (single-line literal source) | RegSub | ✅ | 070_gnuisms, assign-in-args |
+| `head`/`tail -n` (lines) | TakeLines | ✅ | 095_select_menu |
+| `wc -c` | StrLen | ✅ | unit only (corpus `wc` uses are stream/file sources) |
+| `wc -l` | RegCount(text+"\n" for newline-terminated sources; raw text for `echo -n`) | ✅ | unit only |
+| `wc -w` | ArrayLen(Split(/\s+/)) | ✅ | unit only |
+| `cut -dD -fN` (single-line literal source) | FieldExtract | ✅ | unit only (bench-cut uses a variable source → falls back; FieldExtract is single-line as-built) |
+| `grep -q P` (expression/condition position) | StringContains | ✅ | unit only |
+| `xargs` (bare, single-spaced literal) | StringTrim | ✅ | unit only (chown-through-xargs passes args → falls back) |
+| `yes X \| head -n K` | RepeatStr("X\n", K) | ✅ | unit only (corpus uses are 3-stage or capture-position) |
+| `${v:N:M}` | — | ❌ not reduced | `param("slice")` is shared by scalar and array slices — a string SubStr would be wrong for arrays; the runtime handles both |
 
-**Newline-exactness rule (as-built):** the stage-1 extractor records whether
-bash's source output ends with a terminal newline (echo: always; printf:
-last literal; bare literals: their own text). Line-oriented ops pass that
-through so the Output wrapper re-appends ONLY an echo-stripped newline; wc
-always prints its own terminating newline; byte-takes fold to exact bytes
-and never append.
+**Scope boundary:** reductions fire at **statement level only** (`emit=true`).
+Inside a `$(...)` capture the body must remain the original COMMAND (to
+produce stdout the capture collects) — reducing it to a bare value breaks
+the capture. Capture-internal constructs therefore fall back to `sh2.*` /
+the original command (correct, just not reduced). Verified over the corpus:
+no primitive node appears inside a Capture body.
 
-**Backend renderings of ForEachLine (all O(1) memory, zero fork/exec):**
+**Statement-position status commands:** `grep -q` prints NOTHING at
+statement level (its result is only `$?`), so it must not reduce into the
+printing `Output` wrapper — it reduces in expression/condition position
+only, and falls back to the original command as a statement (this fixed a
+live mis-render on parse-herestring.sh).
 
-| Backend | rendering | verified |
-|---|---|---|
-| js/estree | `sh2.eachLine(src, (l) => {…}, limit?)` — readline over createReadStream in the runtime | ✅ byte-exact vs bash |
-| perl | `open my $fh,'<',src or die; while (my $l = <$fh>) { chomp $l; … } close $fh;` — fresh per-loop handle, loop vars never scalar-hoisted | ✅ byte-exact vs bash |
-| java | `try (BufferedReader __r = new BufferedReader(new FileReader(src))) { String l; while ((l = __r.readLine()) != null) { … } }` (+ counter break for limit) | ✅ compiled + run, byte-exact vs bash |
-| zig | `openFile` + `takeDelimiter('\n')` reader loop (capture→loop-var bind; counter break for limit) + sh2* primitive helpers (Contains/Sub/Case/ReplaceLit-literal/Fields/TakeLines/Basename/Dirname/TrimSides); regex patterns refuse → runtime | ✅ compiled + run, byte-exact vs bash |
+**Source gates** (see docs/shir-primitives.md "Source policy"): `printf`
+heads refuse entirely; `echo -e` refuses; `echo -n` marks the missing
+trailing newline (wc counts raw; head/tail/tr/sed refuse); cut/sed require
+a single-line literal; bare-xargs requires a literal with no internal
+whitespace runs; `head -c`/`tail -c` (bytes) refuse — the as-built
+TakeLines renderers slice lines.
 
-**Scope boundary (updated):** capture-internal reduction NO LONGER falls
-back wholesale — `try_reduce_capture_assign` reduces the ASSIGN's
-expression (`x=$(echo X | cut/tr/wc/sed …)` → value composition +
-`SetChildError(0)`), preserving the trailing-newline strip and `$?`. grep
-stays excluded from captures by design (status idiom, not a value idiom).
-Dynamic-source pipelines reduce to ForEachLine streaming compositions;
-anything the core cannot reduce falls back explicitly to the runtime
-(`sh2.fieldExtract`, `sh2.pipelineSync`, …) — never an eager slurp.
+**Transform interaction:** under the default all-transforms set,
+statement-position pipelines are claimed first by `shir-pipeline-native`
+(the canonical `IrStmt::Pipeline` statement form — a core shape, not a
+bespoke rendering); `text_ops`'s pipeline reductions then apply to what
+remains (param ops, here-strings, bare basename/dirname). The censuses in
+this file are measured with `DEBASHC_TRANSFORMS=text-ops` alone — the
+transform's own opt-in contract.
 
-**Not yet reduced (fall back to original):** `tail F` (cannot stream), `sort`/`uniq`, `seq | head`,
-`awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
-dynamic source beyond the two-stage grep/cat forms above.
-
-## Normalisation transforms: cross-backend construct lifts (text-ops)
-
-Four constructs block multiple backends not for lack of renderers but
-because the A1 carries them as opaque `exec(...)` calls. Each gets an
-IR→IR normalisation that re-expresses it in vocabulary every backend
-already renders:
-
-| Construct | A1 shape | Normalised to |
-|---|---|---|
-| `(( x > 3 ))` / `let "x > 3"` | `Call{exec, ["let", ["x > 3"]]}` | `parse_arith(text)` → native **Arith** condition (or Assign for `let "i=…"` assignments) |
-| `local v=val …` | `Call{exec, ["local", […]]}` | NOT flattened — the runtime implements true call-frame locals (`builtins.local`); a flat Assign broke scope tests (fish t78). Falls through to the runtime on every backend |
-| `read line` | `Call{exec, ["read", ["line"]]}` | **Assign{var, ReadLine}** — new primitive: ONE newline-terminated line from stdin, newline stripped |
-| `eval STATIC` | `Call{exec, ["eval", [Str]]}` | parse+splice the parsed IR **only when the argument is a compile-time literal with no `$`/backquotes**; dynamic eval falls back explicitly |
-
-Not normalised (documented blockers):
-- **Dynamic eval** (`eval "$cmd"`): the payload is only known at run
-  time — splicing would change behaviour. Falls back to the runtime.
-- **trap HANDLER SIGNAL**: requires per-backend exit/error hooking
-  (process lifecycle), not a value transformation. Backend feature work.
-- **zsh arith-cond root cause**: the zsh-sh-go FRONTEND lowers
-  `(( x > 3 ))` to `exec("let", …)` — with the let normalisation above
-  the core now renders it natively on every backend, so the frontend gap
-  is closed WITHOUT touching the frontend.
-
-Semantics pinned:
-- `parse_arith` covers bash arithmetic syntax incl. comparisons;
-  a parse failure leaves the exec call untouched (explicit fallback).
-- `local` outside a function is a bash error — the transform does not
-  check context (the corpus only uses it inside functions); words without
-  `=` mark the name as written with an empty value (bash: local without
-  assignment keeps an inherited/unset value — the flat model picks "").
-- `read VAR` reads one line, strips the trailing newline, assigns the
-  WHOLE line to VAR (no IFS splitting — the subset's scripts use one
-  variable); `read` with no variable or multiple variables falls back.
+**Not yet reduced (fall back to original):** `sort`/`uniq`, `seq | head`,
+`awk`, `[[ $x == P* ]]` (test-string parsing → StringAffix is declared but
+nothing emits it yet), multi-stage pipelines, dynamic (file/grep) sources,
+variable-source `cut`/`sed` (single-line proof unavailable), `xargs` with
+arguments, `head -c`/`tail -c`, `printf`-headed pipelines.

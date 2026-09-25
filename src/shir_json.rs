@@ -360,6 +360,11 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
         IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
         IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
+        IrStmt::Shaderize { var, start, end, step, op, body } => json!({
+            "type": "Shaderize", "var": var, "start": start,
+            "end": end, "step": step, "op": op,
+            "body": body.iter().map(stmt_json).collect::<Vec<_>>(),
+        }),
     }
 }
 

@@ -3,7 +3,9 @@
 //! estree-20260813-201235 (hoist-pure-loop-invariants). The field hash
 //! in the texture generators is recomputed per pixel:
 //!
-//!     while [ "$y" -lt "$SIZE" ]; do … lat_hash $x 0 $SIZE 1; gph=$((lhn%3)); … done
+//! ```text
+//! while [ "$y" -lt "$SIZE" ]; do … lat_hash $x 0 $SIZE 1; gph=$((lhn%3)); … done
+//! ```
 //!
 //! ## Need
 //! The pseudorandom texture generators run ~256 pixels with ~2800
@@ -70,11 +72,15 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 /// If `st` is a loop with hoistable leading work, return (hoisted, new
 /// body); otherwise `(vec![], None)`.
 fn split_loop(st: &IrStmt, fns: &[(String, Vec<IrStmt>)]) -> (Vec<IrStmt>, Option<Vec<IrStmt>>) {
-    let body = match st {
-        IrStmt::While { body, .. } | IrStmt::For { body, .. } => body,
+    let (body, loop_vars): (&Vec<IrStmt>, Vec<String>) = match st {
+        IrStmt::While { body, .. } => (body, Vec::new()),
+        // The foreach counter is loop-carried by construction: a body
+        // write that reads it (RHS *or* an index embedded in the target
+        // text like `a[$i]`) must never execute once before the loop.
+        IrStmt::For { body, var, .. } => (body, vec![var.clone()]),
         _ => return (Vec::new(), None),
     };
-    let hoisted = hoist_body(body, fns);
+    let hoisted = hoist_body(body, fns, &loop_vars);
     if hoisted.is_empty() {
         return (Vec::new(), None);
     }
@@ -92,7 +98,9 @@ fn set_loop_body(st: &IrStmt, body: Vec<IrStmt>) -> IrStmt {
 
 /// Split the hoistable assignments out of a body (in body order, so a
 /// hoisted var is not read before its write in the same pass).
-fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)]) -> Vec<IrStmt> {
+/// `loop_vars` are the loop's own counters (the `For` variable): reads
+/// of them are loop-carried exactly like reads of body-written vars.
+fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[String]) -> Vec<IrStmt> {
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
@@ -123,6 +131,18 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)]) -> Vec<IrStmt> {
         let reads = read_set(expr);
         if reads.iter().any(|v| assigned.contains(v)) {
             continue; // loop-carried input (including self)
+        }
+        // The loop counter is loop-carried too (it is never in
+        // `assigned` — the loop machinery writes it, not the body): a
+        // read of it anywhere in the candidate pins it to the body.
+        if reads.iter().any(|v| loop_vars.iter().any(|lv| lv == v)) {
+            continue;
+        }
+        // ... as does a counter occurrence inside the target text
+        // (`a[$i]` — the index varies per iteration even when the RHS
+        // is constant).
+        if loop_vars.iter().any(|lv| str_maybe_reads(target, lv)) {
+            continue;
         }
         // `target` not read before this write in the body
         let read_before = body.iter().take(j).any(|s| stmt_reads(s, target));
@@ -773,6 +793,61 @@ mod tests {
         assert!(!transform(&mut stmts));
         if let IrStmt::While { body, .. } = &stmts[0] {
             assert_eq!(body.len(), 2, "no hoisting for a loop-carried accumulator");
+        }
+    }
+
+    fn foreach(body: Vec<IrStmt>) -> Vec<IrStmt> {
+        vec![IrStmt::For {
+            var: "i".to_string(),
+            iter: IrExpr::Range { start: 0, end: 7 },
+            body,
+        }]
+    }
+
+    /// `for i in ...; do a[$i]=$((i+1)); done` — RHS reads the foreach
+    /// counter → loop-carried, must stay in the body (found hoisted by
+    /// bash-O4 candidacy: the store executed once with unset `i`).
+    #[test]
+    fn refuses_foreach_counter_read() {
+        let mut stmts = foreach(vec![assign(
+            "a[$i]",
+            IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("i".to_string())),
+                rhs: Box::new(ArithAst::Num(1)),
+            })),
+        )]);
+        assert!(!transform(&mut stmts));
+        if let IrStmt::For { body, .. } = &stmts[0] {
+            assert_eq!(body.len(), 1, "counter-reading store stays in the body");
+        } else {
+            panic!("expected For");
+        }
+    }
+
+    /// `for i in ...; do a[$i]=5; done` — constant RHS but the INDEX
+    /// varies per iteration → hoisting executes once (wrong element).
+    #[test]
+    fn refuses_counter_indexed_target() {
+        let mut stmts = foreach(vec![assign("a[$i]", IrExpr::Int(5))]);
+        assert!(!transform(&mut stmts));
+        if let IrStmt::For { body, .. } = &stmts[0] {
+            assert_eq!(body.len(), 1, "indexed store stays in the body");
+        } else {
+            panic!("expected For");
+        }
+    }
+
+    /// `for i in ...; do y=5; done` — truly loop-independent → still hoists.
+    #[test]
+    fn hoists_counter_independent_write() {
+        let mut stmts = foreach(vec![assign("y", IrExpr::Int(5))]);
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts.len(), 2);
+        if let IrStmt::For { body, .. } = &stmts[1] {
+            assert!(body.is_empty(), "independent write hoisted");
+        } else {
+            panic!("expected For at index 1");
         }
     }
 }

@@ -45,5 +45,20 @@ the f64 Number path, which IS their native arithmetic.
 - [x] dual-loop versioning — shipped (`SH2_DUAL_LOOPS=1` opt-in)
 - [x] `--bigint` CLI wiring (maps to true64+exact boundary for the estree
       path; per-backend arms beyond JS land with the verdict flip)
-- [ ] verdict prior flip (Unknown-as-wide) + boundary-exact bindings
-- [ ] corpus gate → true64 default-on for shell input
+- [x] verdict prior flip (Unknown-as-wide): `analyze_true64` escalates
+      EVERY numeric var not proven within ±2^53 (numeric-lift set ∪
+      tracked assigns — untracked writes escalate too); the proof layer
+      still decides which vars prove narrow; 487/488 lib tests
+- [x] boundary-exact bindings: the estree binding emitters coerce string
+      sources (positional reads, captures) into Int64 targets via
+      `sh2.toI64` — BigInt-exact parse (past 2^53), empty/non-numeric →
+      0n (the runtime twin of the store's `Number(v) || 0`); plus the
+      render fixes the flip exposed: asIntN(64, BigInt(...)) at the
+      assign lift (bare asIntN(Number-sum) threw), the slot-homed
+      for-loop sync (the for-of/native-counter paths never wrote
+      __t64[k] — 002's `Number: 0` ×5), and the native-Number arm
+      (sh2.Number was a latent TypeError)
+- [x] corpus gate → true64 default-on for shell input (otranspilerl
+      sets it; SH2_TRUE64=0 / --no-true64 restores the f64 default for
+      bisecting): fail-estree 551/552 WITH the flip — the 32 differing
+      corpus files execute-equivalent, the grep_p red is pre-existing

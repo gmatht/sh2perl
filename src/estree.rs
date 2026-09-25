@@ -1363,7 +1363,7 @@ fn classify_array_call(
 ) {
     let Some(first) = args.first() else { return };
     let name = match fn_name {
-        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" => match lit_str(first) {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" | "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => match lit_str(first) {
             Some(n) => n,
             None => return,
         },
@@ -1474,6 +1474,7 @@ fn classify_array_call(
             _ => entry.index_bad = true,
         },
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let _target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1969,6 +1970,28 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                         }
                     }
                 }
+                "max" | "min" | "sum" => {
+                    // native array: reduce via the maxArr/minArr/sumArr twin
+                    if let Some((name, _)) = array_len_join(fn_name, arguments) {
+                        if natives.contains(name) {
+                            return sh2_call(
+                                &format!("{fn_name}Arr"),
+                                vec![Expr::Identifier { name: name.to_string() }],
+                            );
+                        }
+                    }
+                }
+                "sortedIntJoin" | "sortedBigintJoin" => {
+                    // native array: sorted-join via the *Arr twin
+                    if let Some((name, _)) = array_len_join(fn_name, arguments) {
+                        if natives.contains(name) {
+                            return sh2_call(
+                                &format!("{fn_name}Arr"),
+                                vec![Expr::Identifier { name: name.to_string() }],
+                            );
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2131,7 +2154,7 @@ fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Opt
 fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
     match fn_name {
         "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
-        "arrayItems" | "arrayValues" => lit_str(args.first()?).map(|n| (n, false)),
+        "arrayItems" | "arrayValues" | "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => lit_str(args.first()?).map(|n| (n, false)),
         "param" => {
             let op = lit_str(args.first()?)?;
             let mode = args.get(2).and_then(lit_str)?;
@@ -7518,13 +7541,13 @@ greet");
         // per level, `_g`-scratched) with the literal echo default. No
         // param call, no spawn.
         let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
-        // the never-written `var` level reads through the runtime getVar
-        // dispatch ONCE (the `_g`-scratched primary — the DCE-safety
-        // fallback: the optimizer may have eliminated the only write while
-        // preserving the param read, so a folded "" primary would be
-        // unsound); the nested default levels read via the native store
-        // read (env-fallback property reads — no getVar dispatch)
-        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 1);
+        // every level (including the never-written `var` primary) reads
+        // via the native store read (`sh2.vars.<n> ?? env.<n> ?? ''` — the
+        // exact value getVar yields for a plain name, without the dispatch;
+        // no_fold preserves the DCE-safety: the optimizer may have
+        // eliminated the only write while preserving the param read, so a
+        // folded "" primary would be unsound)
+        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 0);
         assert!(json.contains("computed"));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
@@ -7537,10 +7560,9 @@ greet");
         assert!(!json2.contains("\"name\":\"param\""));
         // a ${NAME} plain-ref default lowers to the native store read too
         let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
-        // the never-written MOUNTPOINT level reads through the same
-        // DCE-safety getVar fallback (once); the live NAME level reads
-        // natively
-        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 1);
+        // both levels (never-written MOUNTPOINT and live NAME) read
+        // natively — the no-fold store read is the DCE-safe path now
+        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 0);
         assert!(!json3.contains("\"name\":\"param\""));
     }
 

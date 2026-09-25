@@ -68,7 +68,7 @@ impl Render {
     /// The mem handles are the tagged strings `\x01mem:<id>:<off>`; the
     /// arena is a flat byte-slot array with the load/store offset scaled by
     /// the type's element size (p + n gets its sizeof(*p) semantics).
-    const RUNTIME: &[(&str, &str)] = &[
+    const RUNTIME: &'static [(&'static str, &'static str)] = &[
         (
             "getVar",
             "def sh2_getVar(name):\n    return __sh_store.get(name, \"\")\n",
@@ -1827,6 +1827,15 @@ impl Render {
                 }
                 self.sh2_stub("arith", args, "arith")
             }
+            "isqrt" => {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)`
+                // node — no arith-string detour). CPython parity by
+                // construction: int(x ** 0.5) in doubles, no import.
+                match args.first() {
+                    Some(IrExpr::Arith(a)) => format!("int(({}) ** 0.5)", self.arith(a)),
+                    _ => self.sh2_stub("isqrt", args, "isqrt"),
+                }
+            }
             // the C memory model (malloc/pointer arithmetic): the arena
             // runtime (subset of sh2-namespace.mjs slice 2).
             "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree"
@@ -3315,7 +3324,16 @@ impl Render {
         for (n, _) in &prog.var_types {
             vars.insert(n.clone());
         }
-
+        // A name that is BOTH a variable read and a function definition is
+        // the function, not a variable: hoisting `f = ""` before
+        // `def f(): ...` would rebind the function object and the later
+        // `f(...)` call would hit the string. (py frontend t22 — the
+        // `exec(f, [])` call registers as a var read of `f`.)
+        let mut fn_names: BTreeSet<String> = BTreeSet::new();
+        collect_fn_names(&prog.stmts, &mut fn_names);
+        for n in &fn_names {
+            vars.remove(n);
+        }
         // Pass 2: render the body first (helper flags known before preamble).
         // Pre-scan for `$?` test reads so the FIRST such statement's status
         // wrap (the Expr arm consults need_rc before rendering its own
@@ -3550,6 +3568,42 @@ impl Render {
                 "# {} construct(s) lowered to TODO markers",
                 self.todo
             ));
+        }
+    }
+}
+
+/// Collect every function-definition name (top-level and nested).
+fn collect_fn_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Function { name, body, .. } => {
+                out.insert(name.clone());
+                collect_fn_names(body, out);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_fn_names(b, out)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_fn_names(then, out);
+                for (_, b) in elsifs {
+                    collect_fn_names(b, out);
+                }
+                collect_fn_names(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => collect_fn_names(body, out),
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => collect_fn_names(body, out),
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_fn_names(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => collect_fn_names(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_fn_names(st, out);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -3981,5 +4035,22 @@ mod tests {
             expr,
             asm: None,
         }
+    }
+
+    /// A function name must not be hoisted as a `name = ""` variable
+    /// default: `__sh_exec(["f"])` registers as a read of `f`, and the
+    /// hoist would rebind the `def f` function object to a string before
+    /// the definition. Regression for py frontend t22
+    /// (`def f(): ...` + `f()`).
+    #[test]
+    fn function_name_is_not_hoisted_as_var() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[],"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"in-func","style":"DoubleQuoted"}]}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Spawn","args":[{"type":"Str","value":"f","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t22 A1 ingress");
+        let py = shir_to_python(&prog);
+        assert!(py.contains("def f():"), "function definition:\n{py}");
+        assert!(!py.contains("f = \"\""), "function name hoisted as var:\n{py}");
     }
 }

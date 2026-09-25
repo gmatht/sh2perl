@@ -42,6 +42,11 @@ pub(crate) enum NativeCtx<'a> {
     Pipe(&'a PipelineCtx),
     /// an exec call: `cond=true` in if/while condition, `false` as a statement
     Exec { call: &'a IrExpr, cond: bool },
+    /// an exec call in CAPTURE position (`x=$(cmd)`) — the leaf returns its
+    /// value in `$__sh_cap` instead of printing. Distinct from `Exec` so a
+    /// value-channel leaf can never be reached from statement position,
+    /// where `$__sh_cap` has no declaration and no output.
+    Capture { call: &'a IrExpr },
     /// a `cat <<'EOF' … EOF` heredoc body (already unescaped literal)
     Heredoc(&'a str),
     /// a `(grep -q PAT FILE && echo A) || echo B` control chain
@@ -65,23 +70,85 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
     let [IrExpr::Array(stages)] = args.as_slice() else {
         return None;
     };
-    if stages.len() != 2 {
-        return None;
+    // Two stages: producer → consumer.
+    if let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() {
+        // `yes [WORD] | head -N` — the only finite consumer of an infinite
+        // producer (examples 000__04d/04h/05).
+        if let Some(word) = yes_word(s1) {
+            if let Some(n) = head_n(s2) {
+                return Some(format!(
+                    "print(({} . \"\\n\") x {}); $main_exit_code = $CHILD_ERROR = 0;",
+                    crate::ir::safe_perl_q_string(&word),
+                    n
+                ));
+            }
+        }
+        // `echo EXPR | bc` — scale-0 integer arithmetic (the corpus uses
+        // `sqrt(N)` and `$a + $b`). Evaluate with Perl `int()`.
+        if let Some(w) = echo_single_word(s1) {
+            if is_bare_exec(s2, "bc") {
+                if let Some(expr) = bc_word_expr(w) {
+                    return Some(format!(
+                        "print int({expr}), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
+                    ));
+                }
+            }
+        }
+        let content_perl = match pipe_dynamic_content(s1) {
+            Some(expr) => expr,
+            None => crate::ir::safe_perl_q_string(&pipe_printf_content(s1)?),
+        };
+        let (cmd, words) = pipe_consumer(s2)?;
+        let ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl,
+        };
+        return match native_dispatch(&NativeCtx::Pipe(&ctx)) {
+            Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
+            _ => None,
+        };
     }
-    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
-        return None;
-    };
-    let content = pipe_printf_content(s1)?;
-    let (cmd, words) = pipe_consumer(s2)?;
-    let ctx = PipelineCtx {
-        cmd,
-        words,
-        content_perl: crate::ir::safe_perl_q_string(&content),
-    };
-    match native_dispatch(&NativeCtx::Pipe(&ctx)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
-        _ => None,
+    // Three stages (`echo … | grep … | wc -l`): the FIRST TWO are lowered
+    // as a native pipeline whose stdout is captured into a scalar, and
+    // that scalar expression becomes the final consumer's payload. The
+    // capability contract takes `content_perl` as a Perl EXPRESSION (the
+    // leaves splice it into `split(/\n/, {body})`), so a variable works
+    // exactly like a literal.
+    if let [IrExpr::Arrow(s1), IrExpr::Arrow(s2), IrExpr::Arrow(s3)] = stages.as_slice() {
+        let content_perl = match pipe_dynamic_content(s1) {
+            Some(expr) => expr,
+            None => crate::ir::safe_perl_q_string(&pipe_printf_content(s1)?),
+        };
+        let (mid_cmd, mid_words) = pipe_consumer(s2)?;
+        let mid_ctx = PipelineCtx {
+            cmd: mid_cmd,
+            words: mid_words,
+            content_perl,
+        };
+        let mid = match native_dispatch(&NativeCtx::Pipe(&mid_ctx)) {
+            Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
+            _ => return None,
+        };
+        let (cmd, words) = pipe_consumer(s3)?;
+        let v = "__sh_pv";
+        let final_ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl: format!("${v}"),
+        };
+        let tail = match native_dispatch(&NativeCtx::Pipe(&final_ctx)) {
+            Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
+            _ => return None,
+        };
+        // Run the first two stages with stdout captured (the same
+        // select()-redirect idiom the capture sites use), then the final
+        // consumer reads the captured text.
+        return Some(format!(
+            "my ${v} = do {{ my $__sh_pc = ''; open my $__sh_pf, '>', \\$__sh_pc or die; my $__sh_po = select($__sh_pf); {mid} close $__sh_pf; select($__sh_po); $__sh_pc =~ s/\\n+\\z//; $__sh_pc }}; {tail}"
+        ));
     }
+    None
 }
 
 /// Parent (exec-in-condition): `grep -q PAT FILE` / `cmp -s F1 F2` etc.
@@ -97,16 +164,123 @@ pub(crate) fn native_exec_cond(call: &IrExpr) -> Option<String> {
 /// status assignment.
 pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Exec { call, cond: false }) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        // Scoped: the leaves declare their own `my` temporaries (`$__g`,
+        // `$__m`, `$__pl`, …). Two leaves in the same Perl scope would
+        // mask each other's lexicals (a warning, and the second's
+        // initialization would shadow the first's live value).
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
+}
+
+/// Wrap a leaf's statement in a `do { … }` so its `my` temporaries live in
+/// their own scope. Leaves that already open their own block (a leading
+/// `if`/`for`/`{`) are left alone.
+fn scope_stmt(s: &str) -> String {
+    let t = s.trim_start();
+    let t = t.trim_end();
+    // A leaf that already opens its own block (`do {`, a control statement)
+    // needs only an explicit terminator — `do { … }` is an EXPRESSION, so
+    // without the `;` the next statement's first token parses as its
+    // operator (`}print`).
+    if t.starts_with("do {") || t.starts_with("if (") || t.starts_with("for ") {
+        return format!("{t};");
+    }
+    format!("do {{ {s} }};")
+}
+
+/// Parent (capture): `x=$(cmd)` where `cmd` is a single simple command the
+/// capability tree knows how to compute without a shell. Returns a Perl
+/// EXPRESSION for the captured value.
+///
+/// The shell text is split by `sh_split_simple_cmd` (which refuses shell
+/// metacharacters), then re-shaped as the exec call the leaves expect.
+/// `$__sh_cap` is the value channel: a leaf's statement assigns it, and
+/// this parent returns it as the expression.
+/// Parent (redirect-capture): the body of a `capture` whose expression is a
+/// `redirect(Arrow([exec …]), [{fd:0,in,FILE}])` — `x=$(wc -l < FILE)`.
+/// The shell-text view loses the redirect, so the capability tree is handed
+/// the IR call directly. Returns a Perl EXPRESSION for the captured value.
+pub(crate) fn native_capture_call(call: &IrExpr) -> Option<String> {
+    // The Capture shape first, then an Exec leaf that writes `$__sh_cap`
+    // (pathops' basename/dirname): both are value-channel leaves and the
+    // caller consumes the value as an expression.
+    for ctx in [
+        NativeCtx::Capture { call },
+        NativeCtx::Exec { call, cond: false },
+    ] {
+        if let Some(NativeEmit::Stmt(s)) = native_dispatch(&ctx) {
+            if s.contains("$__sh_cap") {
+                // bash's `$(…)` strips ALL trailing newlines — a leaf's value
+                // (e.g. `cat FILE`) keeps the file's final newline otherwise.
+                return Some(format!(
+                    "do {{ my $__sh_cap; {s} $__sh_cap =~ s/\\n+\\z// if defined $__sh_cap; $__sh_cap }}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn native_capture(cmd_text: &str) -> Option<String> {
+    // Single simple command only. A command carrying a nested `$(…)`, a
+    // glob, or any shell metacharacter is left to the uu-ffi seam / the
+    // `bash -c` fallback: `sh_split_simple_cmd` refuses those, and a
+    // spliced inner expression would have to be threaded through the
+    // leaves' literal-word contract (which `grep_lit_str` deliberately
+    // restricts to literals).
+    let argv = crate::ir::sh_split_simple_cmd(cmd_text)?;
+    let (name, words) = argv.split_first()?;
+    let call = IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![
+            IrExpr::Str(name.clone(), crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Array(
+                words
+                    .iter()
+                    .map(|w| IrExpr::Str(w.clone(), crate::ir::StrStyle::DoubleQuoted))
+                    .collect(),
+            ),
+        ],
+    };
+    match native_dispatch(&NativeCtx::Exec { call: &call, cond: false }) {
+        // the leaf wrote the value into $__sh_cap
+        Some(NativeEmit::Stmt(s)) if s.contains("$__sh_cap") => {
+            Some(format!("do {{ my $__sh_cap; {s} $__sh_cap }}"))
+        }
+        _ => None,
+    }
+}
+
+/// Split out the FIRST `$(...)` from `s`, returning
+/// `(before, inner, after)`. Nested parens inside the substitution are
+/// balanced; `None` when there is no substitution.
+fn split_one_subst(s: &str) -> Option<(&str, &str, &str)> {
+    let start = s.find("$(")?;
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start + 1; // at '('
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..start], &s[start + 2..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parent (cat-heredoc): the body of a verified `cat <<'EOF' … EOF` → a
 /// native print statement.
 pub(crate) fn native_heredoc(body: &str) -> Option<String> {
     match native_dispatch(&NativeCtx::Heredoc(body)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
@@ -115,13 +289,72 @@ pub(crate) fn native_heredoc(body: &str) -> Option<String> {
 /// native if/else statement.
 pub(crate) fn native_chain(e: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Chain(e)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
 
 /// The literal payload of a `printf LITERAL` first stage (single no-`%`
 /// format: escapes interpreted, no conversions).
+/// `yes [WORD]` producer — the repeated word (`y` by default).
+fn yes_word(s: &[IrStmt]) -> Option<String> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "yes" {
+        return None;
+    }
+    match words.as_slice() {
+        [] => Some("y".to_string()),
+        [w] => crate::ir::grep_lit_str(w),
+        _ => None,
+    }
+}
+
+/// `head -N` / `head -n N` consumer line count.
+fn head_n(s: &[IrStmt]) -> Option<i64> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "head" {
+        return None;
+    }
+    match words.as_slice() {
+        [w] => {
+            let t = crate::ir::grep_lit_str(w)?;
+            let n = t.strip_prefix('-')?.parse::<i64>().ok()?;
+            (n >= 0).then_some(n)
+        }
+        [a, b] => {
+            let a = crate::ir::grep_lit_str(a)?;
+            if a == "-n" {
+                crate::ir::grep_lit_str(b)?.parse::<i64>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
     let [IrStmt::Expr(e)] = s else {
         return None;
@@ -135,17 +368,370 @@ fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
     let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
         return None;
     };
-    if cmd != "printf" || words.len() != 1 {
-        return None;
+    // `echo [flags] words…` — the corpus's dominant producer. Join the
+    // literal words with spaces. NOTE the payload convention shared with
+    // the `printf` path: NO trailing newline. The consumers add it back
+    // where it matters (`wc -c`'s `length(body) + 1`), so `echo -n` —
+    // which suppresses it — must refuse rather than be mis-counted.
+    // `-e` interprets backslash escapes (`echo -e "a\nb"`).
+    if cmd == "echo" {
+        let mut escapes = false;
+        let mut parts: Vec<String> = Vec::new();
+        let mut seen_word = false;
+        for w in words {
+            let lit = crate::ir::grep_lit_str(w)?;
+            // leading flags only (bash: `echo -n x`, but `echo x -n`
+            // prints `x -n`)
+            if !seen_word && lit.starts_with('-') && lit.len() > 1 {
+                for c in lit[1..].chars() {
+                    match c {
+                        'e' => escapes = true,
+                        'E' => escapes = false,
+                        // `-n` drops the trailing newline the consumers
+                        // assume is there
+                        _ => return None,
+                    }
+                }
+                continue;
+            }
+            seen_word = true;
+            parts.push(lit);
+        }
+        let mut payload = parts.join(" ");
+        if escapes {
+            payload = printf_unescape(&payload);
+        }
+        return Some(payload);
     }
-    let fmt = crate::ir::grep_lit_str(&words[0])?;
-    if fmt.contains('%') {
-        return None;
+    if cmd == "printf" {
+        if words.len() != 1 {
+            return None;
+        }
+        let fmt = crate::ir::grep_lit_str(&words[0])?;
+        if fmt.contains('%') {
+            return None;
+        }
+        return Some(printf_unescape(&fmt));
     }
-    Some(printf_unescape(&fmt))
+    // `seq [first [step]] last` — the ascending integer sequence, joined
+    // by newlines. The consumers split on `\n`, and the payload
+    // convention is no trailing newline (same as printf/echo), so a
+    // `seq 1 10 | wc -l` counts 10 lines. Descending (`seq 3 1`) prints
+    // nothing, matching bash. Non-integer or >3 operands refuse.
+    if cmd == "seq" {
+        let nums: Vec<i64> = words
+            .iter()
+            .map(|w| crate::ir::grep_lit_str(w)?.trim().parse::<i64>().ok())
+            .collect::<Option<_>>()?;
+        let (first, step, last) = match nums.as_slice() {
+            [last] => (1, 1, *last),
+            [first, last] => (*first, 1, *last),
+            [first, step, last] => (*first, *step, *last),
+            _ => return None,
+        };
+        if step == 0 {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::new();
+        if step > 0 {
+            let mut v = first;
+            while v <= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        } else {
+            let mut v = first;
+            while v >= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        }
+        return Some(out.join("\n"));
+    }
+    None
 }
 
 /// The consumer command + option words of the second stage.
+/// A pipeline PRODUCER whose content is computed at runtime (a file read or
+/// directory walk), returned as a Perl expression. These feed the existing
+/// consumers (`head`/`sort`/`wc`/`sed`) without a shell.
+fn pipe_dynamic_content(s: &[IrStmt]) -> Option<String> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    match cmd.as_str() {
+        "strings" => strings_content(words),
+        "paste" => paste_content(words),
+        "find" => find_content(words),
+        // `printf '%s\n' <word>` — one line per expanded word. `%s\n` is the
+        // corpus's canonical "one element per line" producer (the shell
+        // would expand `${arr[@]}` / `${map[@]}` itself, which the rebuilt
+        // text cannot do for a Perl-side list).
+        "printf" => printf_lines_content(words),
+        _ => None,
+    }
+}
+
+/// `printf '%s\n' WORD` (also `printf "%s\n" "$@"`): the word (or list)
+/// joined by newlines — each element its own line.
+fn printf_lines_content(words: &[IrExpr]) -> Option<String> {
+    let [fmt, rest @ ..] = words else {
+        return None;
+    };
+    // The format may be a plain literal (`%s\n`) or a `"…"` Interpolate of
+    // literals; accept the simple shape only.
+    let f = crate::ir::grep_lit_str(fmt).or_else(|| match fmt {
+        IrExpr::Interpolate(parts)
+            if parts
+                .iter()
+                .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+        {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        crate::ir::InterpPart::Lit(t) => t.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>(),
+            )
+        }
+        _ => None,
+    })?;
+    // The corpus's per-line form only. Escapes decode like printf's.
+    if f != "%s\\n" && f != "%s\n" {
+        return None;
+    }
+    if rest.is_empty() {
+        return Some("''".to_string());
+    }
+    let vals: Vec<String> = rest.iter().map(printf_operand_list).collect();
+    Some(format!("join(\"\\n\", ({}))", vals.join(", ")))
+}
+
+/// A `printf '%s\n' …` operand as a LIST expression — each element on its
+/// own line. `${arr[@]}` / `${map[@]}` are element lists here (the joined
+/// scalar form would collapse them to one line).
+fn printf_operand_list(w: &IrExpr) -> String {
+    if let IrExpr::Call { func, args } = w {
+        if func == "param" {
+            let op = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let name = args.get(1).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let off = args.get(2).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let len = args.get(3).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if op == "slice" && off == "@" && len.is_empty() && !name.starts_with('#') {
+                // `${!map[@]}` keys, `${arr[@]}` elements, `${map[@]}` values.
+                if let Some(rest) = name.strip_prefix('!') {
+                    return format!("keys %{}", rest.trim_end_matches('*'));
+                }
+                if crate::ir::hash_var_pub(&name) {
+                    return format!("values %{name}");
+                }
+                return format!("@{name}");
+            }
+        }
+        if func == "listVar" {
+            let n = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if n == "@" {
+                return "@ARGV".to_string();
+            }
+        }
+    }
+    crate::ir::render_word_list(w)
+}
+
+/// `strings FILE` — the printable ASCII runs of length >= 4 (GNU default).
+fn strings_content(words: &[IrExpr]) -> Option<String> {
+    let [w] = words else {
+        return None;
+    };
+    let file = crate::ir::grep_lit_str(w)?;
+    if file.contains('*') || file.contains('?') {
+        return None;
+    }
+    let f = crate::ir::safe_perl_q_string(&file);
+    Some(format!(
+        "do {{ local $/; if (open(my $__f, '<', {f})) {{ my $__c = <$__f>; close $__f; join(\"\\n\", ($__c =~ /([\\x20-\\x7e]{{4,}})/g)) }} else {{ '' }} }}"
+    ))
+}
+
+/// `paste FILE1 FILE2` — corresponding lines joined by a tab.
+fn paste_content(words: &[IrExpr]) -> Option<String> {
+    let [a, b] = words else {
+        return None;
+    };
+    let fa = crate::ir::safe_perl_q_string(&crate::ir::grep_lit_str(a)?);
+    let fb = crate::ir::safe_perl_q_string(&crate::ir::grep_lit_str(b)?);
+    Some(format!(
+        "do {{ my @__r; if (open(my $__a, '<', {fa}) && open(my $__b, '<', {fb})) {{ while (1) {{ my $__x = <$__a>; my $__y = <$__b>; last unless defined $__x || defined $__y; $__x = '' unless defined $__x; $__y = '' unless defined $__y; chomp $__x; chomp $__y; push @__r, \"$__x\\t$__y\"; }} close $__a; close $__b; }} join(\"\\n\", @__r) }}"
+    ))
+}
+
+/// `find DIR [-maxdepth N] [-type f|d] [-name GLOB]` — a directory walk via
+/// core File::Find.
+fn find_content(words: &[IrExpr]) -> Option<String> {
+    let mut dir = ".".to_string();
+    let mut maxdepth: Option<i64> = None;
+    let mut typ: Option<char> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < words.len() {
+        let w = crate::ir::grep_lit_str(&words[i])?;
+        match w.as_str() {
+            "-maxdepth" => {
+                i += 1;
+                maxdepth = Some(crate::ir::grep_lit_str(&words[i])?.trim().parse().ok()?);
+            }
+            "-type" => {
+                i += 1;
+                typ = crate::ir::grep_lit_str(&words[i])?.chars().next();
+            }
+            "-name" => {
+                i += 1;
+                name = Some(crate::ir::grep_lit_str(&words[i])?);
+            }
+            s if s.starts_with('-') => return None,
+            _ => dir = w,
+        }
+        i += 1;
+    }
+    let dq = crate::ir::safe_perl_q_string(&dir);
+    let max = maxdepth.map(|n| n.to_string()).unwrap_or_else(|| "-1".to_string());
+    let type_check = match typ {
+        Some('f') => "return unless -f $__p;",
+        Some('d') => "return unless -d $__p;",
+        _ => "",
+    };
+    let name_check = match name {
+        Some(pat) => format!(
+            "require File::Basename; return unless File::Basename::basename($__p) =~ /{}/;",
+            glob_re(&pat)
+        ),
+        None => String::new(),
+    };
+    Some(format!(
+        "do {{ require File::Find; my @__r; my $__max = {max}; File::Find::find({{ no_chdir => 1, wanted => sub {{ my $__p = $File::Find::name; my $__dep = ($__p =~ tr{{/}}{{/}}); return if $__max >= 0 && $__dep > $__max; {type_check} {name_check} push @__r, $__p; }} }}, {dq}); join(\"\\n\", @__r) }}"
+    ))
+}
+
+/// Glob → anchored Perl regex (for `find -name`).
+fn glob_re(pat: &str) -> String {
+    let mut out = String::from("^");
+    for c in pat.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('$');
+    out
+}
+
+/// The single word of `echo WORD` (no flags).
+fn echo_single_word(s: &[IrStmt]) -> Option<&IrExpr> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "echo" {
+        return None;
+    }
+    match words.as_slice() {
+        [w] if !matches!(w, IrExpr::Str(s, _) if s.starts_with('-')) => Some(w),
+        _ => None,
+    }
+}
+
+/// `s` is `[Expr(exec NAME)]` with no operands.
+fn is_bare_exec(s: &[IrStmt], name: &str) -> bool {
+    let [IrStmt::Expr(e)] = s else {
+        return false;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return false;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    matches!(args.as_slice(), [IrExpr::Str(c, _), IrExpr::Array(w)] if c == name && w.is_empty())
+}
+
+/// `bc` arithmetic text → a Perl numeric expression. Only digits, `+ - * / %`
+/// `( )`, spaces and `sqrt(` are lifted; `int()` truncation matches scale 0.
+fn bc_word_expr(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Str(s, _) => bc_text(s),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(t) => out.push_str(&bc_text(t)?),
+                    crate::ir::InterpPart::Expr(e) => {
+                        out.push('(');
+                        out.push_str(&crate::ir::ir_expr_to_perl(e));
+                        out.push(')');
+                    }
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn bc_text(t: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = t.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '0'..='9' | '+' | '-' | '*' | '/' | '%' | '(' | ')' | ' ' | '^' => out.push(c),
+            's' | 'q' | 'r' | 't' => {
+                let mut word = String::from(c);
+                while let Some(&d) = it.peek() {
+                    if d.is_ascii_alphabetic() {
+                        word.push(d);
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                if word != "sqrt" {
+                    return None;
+                }
+                out.push_str(&word);
+            }
+            _ => return None,
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn pipe_consumer(s: &[IrStmt]) -> Option<(String, Vec<String>)> {
     let [IrStmt::Expr(e)] = s else {
         return None;

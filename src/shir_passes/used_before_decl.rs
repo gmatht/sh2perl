@@ -518,6 +518,9 @@ fn analyze_stmt(
 
         // `Require` / `RawText` carry no dataflow we can see.
         IrStmt::Require(_) | IrStmt::RawText(_) => false,
+        IrStmt::Shaderize { body, .. } => {
+            body.iter().any(|s| analyze_stmt(s, pos, must_def, globals, report))
+        }
     }
 }
 

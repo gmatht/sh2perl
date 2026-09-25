@@ -258,6 +258,11 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     walk(else_body, names);
                     walk(finally_body, names);
                 }
+                IrStmt::Shaderize { body, .. } => {
+                    for s in body {
+                        walk(std::slice::from_ref(s), names);
+                    }
+                }
             }
         }
     }
@@ -454,6 +459,9 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                         })
                         || walk(else_body)
                         || walk(finally_body)
+                }
+                IrStmt::Shaderize { body, .. } => {
+                    body.iter().any(|s| walk(std::slice::from_ref(s)))
                 }
             };
             if hit {
@@ -1037,6 +1045,10 @@ fn grep_q_lift_sh(stages: &[Vec<IrStmt>]) -> Result<Option<String>, String> {
                 match it {
                     IrExpr::Str(s, _) if s == "-q" => {}
                     IrExpr::Str(s, _) if s == "-v" => invert = true,
+                    // any OTHER flag (-oP, -E, -i, …) means the case-glob
+                    // emulation cannot express the semantics — bail to the
+                    // general grep rendering (the grep_p polyfill for -P)
+                    IrExpr::Str(s, _) if s.starts_with('-') => return Ok(None),
                     IrExpr::Str(s, _) => pat = Some(s.clone()),
                     _ => return Ok(None),
                 }
@@ -1515,6 +1527,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(()),
+        IrStmt::Shaderize { .. } => Ok(()),
     }
 }
 
@@ -2320,6 +2333,44 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                 // a pipeline's stages are per-stage stmt lists — descend so
                 // `echo x | grep -oP …` (stage 2) is visible to the
                 // polyfill-prologue decision (pipeline_grep_p_emits_polyfill)
+                IrStmt::Assign { expr, .. } => {
+                    if has_grep_p(expr) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) {
+                        return true;
+                    }
+                    for r in redirects {
+                        if has_grep_p(&r.target) {
+                            return true;
+                        }
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                    ..
+                } => {
+                    if has_grep_p(discriminant) {
+                        return true;
+                    }
+                    for c in clauses {
+                        if walk(&c.body) {
+                            return true;
+                        }
+                    }
+                }
+                // The structured pipeline stmt (shir-pipeline-native) holds
+                // its stage bodies as stmt lists — the grep -P exec lives
+                // inside them, so the scan must descend or the prologue is
+                // never emitted while the render still calls grep_p.
                 IrStmt::Pipeline { stages, .. } => {
                     if stages.iter().any(|s| walk(s)) {
                         return true;
@@ -4347,36 +4398,32 @@ fn brace_groups(args: &[IrExpr], idx: usize) -> Result<Vec<Vec<String>>, String>
         };
         let single_range = items.len() == 1
             && matches!(items[0], serde_json::Value::Object(ref o) if o.contains_key("range"));
-        if !single_range {
-            // a LIST: bash expands the braces but treats every item as a
-            // LITERAL — ranges only expand in a pure `{x..y}` sequence
-            // (`{1..10,20,30..40}` -> `1..10 20 30..40`)
-            let mut alts = Vec::new();
-            for it in items {
-                match it {
-                    serde_json::Value::String(s) => alts.push(s.clone()),
-                    serde_json::Value::Object(o) => {
-                        if let Some(serde_json::Value::Array(r)) = o.get("range") {
-                            let s0 = r[0].as_str().unwrap_or("");
-                            let s1 = r[1].as_str().unwrap_or("");
-                            let step = r.get(2).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-                            match step {
-                                Some(st) => alts.push(format!("{s0}..{s1}..{st}")),
-                                None => alts.push(format!("{s0}..{s1}")),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            out.push(alts);
-            continue;
-        }
-        let mut expanded = Vec::new();
+        // Every item is an ALTERNATIVE: a literal string, a nested group
+        // (`{a,{b,c}}` → the nested alternatives), a `product` compound,
+        // or a range. Ranges are the one exception — in a comma list bash
+        // keeps them LITERAL (`{1..3,7..9}` → `1..3 7..9`), only a lone
+        // range expands.
+        let mut alts = Vec::new();
         for it in items {
-            expanded.extend(brace_item(it)?);
+            let is_range = matches!(it, serde_json::Value::Object(o) if o.contains_key("range"));
+            if is_range && !single_range {
+                let serde_json::Value::Object(o) = it else {
+                    unreachable!()
+                };
+                if let Some(serde_json::Value::Array(r)) = o.get("range") {
+                    let s0 = r[0].as_str().unwrap_or("");
+                    let s1 = r[1].as_str().unwrap_or("");
+                    let step = r.get(2).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                    match step {
+                        Some(st) => alts.push(format!("{s0}..{s1}..{st}")),
+                        None => alts.push(format!("{s0}..{s1}")),
+                    }
+                }
+                continue;
+            }
+            alts.extend(brace_item(it)?);
         }
-        out.push(expanded);
+        out.push(alts);
     }
     Ok(out)
 }
@@ -4486,6 +4533,30 @@ fn brace_item(it: &serde_json::Value) -> Result<Vec<String>, String> {
                     out.extend(brace_item(el)?);
                 }
                 Ok(out)
+            } else if let Some(serde_json::Value::Array(subs)) = o.get("product") {
+                // A Compound alternative: cartesian concatenation of the
+                // sub-groups (`x/{p,q}` → `x/p`, `x/q`).
+                let mut combos = vec![String::new()];
+                for sub in subs {
+                    let alts = match sub {
+                        serde_json::Value::Array(items) => {
+                            let mut a = Vec::new();
+                            for el in items {
+                                a.extend(brace_item(el)?);
+                            }
+                            a
+                        }
+                        other => brace_item(other)?,
+                    };
+                    let mut next = Vec::new();
+                    for c in &combos {
+                        for a in &alts {
+                            next.push(format!("{c}{a}"));
+                        }
+                    }
+                    combos = next;
+                }
+                Ok(combos)
             } else {
                 Err(format!("brace item not understood: {it:?}"))
             }
@@ -5137,6 +5208,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         }
         // inline asm has no sh rendering — refuse loudly
         IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
+        IrStmt::Shaderize { .. } => Err("shaderize (autoshaderization) has no sh rendering".into()),
     }
 }
 

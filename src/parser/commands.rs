@@ -399,7 +399,7 @@ impl Parser {
                     Some(Token::TestBracket) => {
                         // Check for double-bracket test [[ ... ]] before parsing as single bracket
                         if matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) {
-                            //                         eprintln!("DEBUG: Found double brackets in parse_command, parsing as test expression");
+                            //                         pdebug!("DEBUG: Found double brackets in parse_command, parsing as test expression");
                             // Consume the first two [[ tokens
                             self.lexer.next();
                             self.lexer.next();
@@ -407,11 +407,11 @@ impl Parser {
                             // After parsing the test expression, check if there's a pipeline operator
                             self.lexer.skip_whitespace_and_comments();
                             let next_token = self.lexer.peek();
-                            //                         eprintln!("DEBUG: After test expression, next token: {:?}", next_token);
+                            //                         pdebug!("DEBUG: After test expression, next token: {:?}", next_token);
                             if let Some(token) = next_token {
                                 match token {
                                     Token::And | Token::Or | Token::Pipe => {
-                                        //                                     eprintln!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
+                                        //                                     pdebug!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
                                         // This is part of a pipeline, parse it as such
                                         // For test expressions, we don't need to capture source text
                                         let dummy_start = 0;
@@ -419,17 +419,17 @@ impl Parser {
                                             test_command,
                                             dummy_start,
                                         )?;
-                                        //                                     eprintln!("DEBUG: Pipeline parsing result: {:?}", result);
+                                        //                                     pdebug!("DEBUG: Pipeline parsing result: {:?}", result);
                                         result
                                     }
                                     _ => {
-                                        //                                     eprintln!("DEBUG: No pipeline operator, returning test expression");
+                                        //                                     pdebug!("DEBUG: No pipeline operator, returning test expression");
                                         // Just a test expression, return it
                                         test_command
                                     }
                                 }
                             } else {
-                                //                             eprintln!("DEBUG: No more tokens, returning test expression");
+                                //                             pdebug!("DEBUG: No more tokens, returning test expression");
                                 test_command
                             }
                         } else {
@@ -934,7 +934,7 @@ impl Parser {
                     if let Some((start, _end)) = self.lexer.get_span() {
                         let (line, col) = self.lexer.offset_to_line_col(start);
                         if crate::debug::is_debug_enabled() {
-                            eprintln!(
+                            pdebug!(
                                 "DEBUG After operator, token at {}:{} = {:?}",
                                 line,
                                 col,
@@ -2541,7 +2541,7 @@ impl Parser {
         // If we're called from double bracket detection, the [[ tokens have already been consumed
         // If we're called for single bracket, we should see a [ token
         let is_double_bracket = !matches!(self.lexer.peek(), Some(Token::TestBracket));
-        //                     eprintln!("DEBUG: parse_test_expression called, is_double_bracket: {}, current token: {:?}", is_double_bracket, self.lexer.peek());
+        //                     pdebug!("DEBUG: parse_test_expression called, is_double_bracket: {}, current token: {:?}", is_double_bracket, self.lexer.peek());
 
         // If this is a double bracket test, we don't need to consume the opening brackets
         // If this is a single bracket test, we need to consume the opening [
@@ -2552,7 +2552,7 @@ impl Parser {
         // Capture the content between brackets
         let mut expression_parts = Vec::new();
 
-        //         eprintln!("DEBUG: Starting to capture expression content, current token: {:?}", self.lexer.peek());
+        //         pdebug!("DEBUG: Starting to capture expression content, current token: {:?}", self.lexer.peek());
 
         loop {
             let current_token = self.lexer.peek();
@@ -3421,7 +3421,7 @@ impl Parser {
         }
     }
 
-    fn get_current_shopt_state(&self) -> TestModifiers {
+    pub(crate) fn get_current_shopt_state(&self) -> TestModifiers {
         self.shopt_state.to_owned()
     }
 }

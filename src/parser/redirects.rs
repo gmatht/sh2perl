@@ -11,7 +11,7 @@ use logos::Logos;
 /// line have been collected.
 pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     if crate::debug::is_debug_enabled() {
-        eprintln!("DEBUG parse_redirect_header: peek={:?}", lexer.peek());
+        pdebug!("DEBUG parse_redirect_header: peek={:?}", lexer.peek());
     }
     let fd = if let Some(Token::Number) = lexer.peek() {
         let fd_str = lexer.get_number_text()?;
@@ -83,14 +83,14 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
     // Check for process substitution syntax: <(...)
     if matches!(operator, RedirectOperator::Input) && matches!(lexer.peek(), Some(Token::ParenOpen))
     {
-        //         eprintln!("DEBUG: Found process substitution: <(...)");
+        //         pdebug!("DEBUG: Found process substitution: <(...)");
         // This is a process substitution: <(...)
         let inner_text = lexer.capture_parenthetical_text()?;
-        //         eprintln!("DEBUG: Inner text: '{}'", inner_text);
+        //         pdebug!("DEBUG: Inner text: '{}'", inner_text);
 
         // Parse the inner command text to extract command name and arguments
         let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
-        //         eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+        //         pdebug!("DEBUG: Parsed inner command: {:?}", inner_cmd);
 
         // Return a process substitution redirect
         return Ok(Redirect {
@@ -107,15 +107,15 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
         && matches!(lexer.peek(), Some(Token::RedirectIn))
         && matches!(lexer.peek_n(1), Some(Token::ParenOpen))
     {
-        //         eprintln!("DEBUG: Found process substitution with extra <: < <(...)");
+        //         pdebug!("DEBUG: Found process substitution with extra <: < <(...)");
         // This is a process substitution: < <(...)
         lexer.next(); // consume the extra '<'
         let inner_text = lexer.capture_parenthetical_text()?;
-        //         eprintln!("DEBUG: Inner text: '{}'", inner_text);
+        //         pdebug!("DEBUG: Inner text: '{}'", inner_text);
 
         // Parse the inner command text to extract command name and arguments
         let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
-        //         eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+        //         pdebug!("DEBUG: Parsed inner command: {:?}", inner_cmd);
 
         // Return a process substitution redirect
         return Ok(Redirect {
@@ -181,7 +181,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                 if truncated.starts_with('\\') {
                     heredoc_quoted = true;
                     if crate::debug::is_debug_enabled() {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'",
                             truncated,
                             &truncated[1..]
@@ -201,7 +201,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                 {
                     heredoc_quoted = true;
                     if crate::debug::is_debug_enabled() {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: stripped single quotes from heredoc delimiter '{}' -> '{}'",
                             truncated,
                             &truncated[1..truncated.len() - 1]
@@ -215,7 +215,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                 {
                     heredoc_quoted = true;
                     if crate::debug::is_debug_enabled() {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: stripped double quotes from heredoc delimiter '{}' -> '{}'",
                             truncated,
                             &truncated[1..truncated.len() - 1]
@@ -236,7 +236,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                     heredoc_quoted = true;
                     let clean = truncated[..truncated.len() - 1].to_string();
                     if crate::debug::is_debug_enabled() {
-                        eprintln!(
+                        pdebug!(
                             "DEBUG: stripped trailing quote from heredoc delimiter '{}' -> '{}'",
                             truncated, clean
                         );
@@ -320,7 +320,7 @@ pub fn parse_heredoc_body(
 /// Full redirect parsing: header + heredoc body (if applicable).
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     if crate::debug::is_debug_enabled() {
-        eprintln!(
+        pdebug!(
             "DEBUG parse_redirect called, lexer.current={}",
             lexer.current
         );
@@ -437,7 +437,7 @@ fn parse_heredoc(
         }
     };
     if crate::debug::is_debug_enabled() {
-        eprintln!("DEBUG parse_heredoc: delim='{}'", delim);
+        pdebug!("DEBUG parse_heredoc: delim='{}'", delim);
     }
 
     // Find the start of the heredoc body in the raw input.
@@ -484,7 +484,7 @@ fn parse_heredoc(
         })
     };
     if crate::debug::is_debug_enabled() {
-        eprintln!(
+        pdebug!(
             "DEBUG parse_heredoc: start_pos={}, input[..]={:?}",
             start_pos,
             &lexer.input[start_pos..start_pos + 40.min(lexer.input.len() - start_pos)]
@@ -677,7 +677,7 @@ fn parse_heredoc(
         }
     }
 
-    //     eprintln!("DEBUG: Final heredoc body: '{}'", body);
+    //     pdebug!("DEBUG: Final heredoc body: '{}'", body);
     Ok(Some(body))
 }
 

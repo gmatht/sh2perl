@@ -3532,6 +3532,7 @@ impl Render {
             IrStmt::SetChildError(_) => self.mark_todo("set-child-error"),
             IrStmt::Label(_) | IrStmt::Goto(_) => self.mark_todo("goto"),
             IrStmt::RawText(_) => self.mark_todo("raw-text"),
+            IrStmt::Shaderize { .. } => self.mark_todo("shaderize (autoshaderization) not supported by the GLSL backend"),
         }
     }
 
@@ -4774,7 +4775,8 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
         | IrStmt::RawText(_)
         | IrStmt::DeclareArray { .. }
         | IrStmt::Continue
-        | IrStmt::Break => false,
+        | IrStmt::Break
+        | IrStmt::Shaderize { .. } => false,
     }
 }
 

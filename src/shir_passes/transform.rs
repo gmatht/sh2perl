@@ -52,7 +52,7 @@ impl super::Transform for StoreToNative {
 /// Names referenced by literal-name setVar/getVar calls, and names that
 /// must stay store-bound (any non-setVar/getVar reference). A dynamic
 /// name argument marks ALL vars unsafe (it could alias any of them).
-fn analyze_store_only(
+pub fn analyze_store_only(
     prog: &IrProgram,
 ) -> (
     std::collections::HashSet<String>,
@@ -208,6 +208,13 @@ fn analyze_store_only(
                     walk_expr(&r.target, store, unsafe_v, any_dynamic);
                 }
             }
+            // function bodies are their own scope — the setVar/getVar
+            // refs inside (the A1 frontends' locals) must be seen
+            IrStmt::Function { body, .. } => {
+                for s in body {
+                    walk_stmt(s, store, unsafe_v, any_dynamic);
+                }
+            }
             IrStmt::Case {
                 discriminant,
                 clauses,
@@ -244,6 +251,9 @@ fn analyze_store_only(
     }
     for s in &prog.stmts {
         walk_stmt(s, &mut store, &mut unsafe_v, &mut any_dynamic);
+    }
+    if std::env::var("SH2_DBG_SO").is_ok() {
+        eprintln!("DBG any_dynamic = {}", any_dynamic);
     }
     if any_dynamic {
         unsafe_v.extend(store.iter().cloned());
@@ -403,10 +413,12 @@ impl super::Transform for ConstantFold {
         "constant_fold"
     }
     fn run(&self, prog: &mut IrProgram, _ctx: &PassContext) {
-        // Stage 0: the real fold is still in `ir::optimize_stmts`, called
-        // from `shir_to_perl` and from `shir::ast_to_ir`. The M3 guardrail
-        // proves the output is unchanged when the migration lands.
-        let _ = prog;
+        // Size-oriented fold: `1 + 2` → `3` (see `fold_arith_literals`).
+        // Gated on `-Os`: at the `-Og` default the output must resemble
+        // the input, so a faithful `1 + 2` stays as written.
+        if crate::shir::size_opt_enabled() {
+            crate::shir_passes::optimize::fold_arith_literals(prog);
+        }
     }
 }
 

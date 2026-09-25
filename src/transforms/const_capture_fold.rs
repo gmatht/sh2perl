@@ -72,6 +72,24 @@ fn stmt_pass(st: &mut IrStmt) -> bool {
 
 fn expr_pass(e: &mut IrExpr) -> bool {
     match e {
+        // the FRONTEND spelling of a command substitution: a `capture`
+        // Call whose single argument is the body arrow. The py-sh-go
+        // frontend emits this for `subprocess.run(…, capture_output=True)`
+        // / `$(…)`, with the body an `exec` call rather than an `Output`.
+        IrExpr::Call { func, args, .. } if func == "capture" => {
+            let mut changed = false;
+            if let Some(inner) = args.first() {
+                if let Some(s) = fold_const_echo(inner) {
+                    let style = crate::ir::StrStyle::DoubleQuoted;
+                    *e = IrExpr::Str(s, style);
+                    return true;
+                }
+            }
+            for a in args.iter_mut() {
+                changed |= expr_pass(a);
+            }
+            changed
+        }
         IrExpr::Capture { expr, native } => {
             if *native {
                 return false; // already a native value — leave it
@@ -126,22 +144,153 @@ fn arith_pass(a: &mut ArithAst) -> bool {
 /// If `expr` (the capture's inner Arrow) is exactly one literal-echo
 /// Output, return the folded string (trailing newlines stripped); else
 /// None.
+///
+/// TWO spellings of "one literal echo" are recognised:
+///   * `Output { value: Str, newline, target: None }` — the lowered form
+///     (`echo foo` after echo-fold, or a shell-source capture);
+///   * `Expr(Call { func: "exec", args: [Str("echo"), Array(literals)] })`
+///     — the FRONTEND form (py-sh-go lowers `subprocess.run(["echo", …],
+///     capture_output=True)` and command substitution this way, before any
+///     echo lowering has run on the body).
 fn fold_const_echo(expr: &IrExpr) -> Option<String> {
     let body = match expr {
         IrExpr::Arrow(body) => body,
         _ => return None,
     };
-    let output = match body.as_slice() {
-        [IrStmt::Output { value, newline, target: None }] => (value, newline),
+    match body.as_slice() {
+        [IrStmt::Output { value, newline, target: None }] => match value {
+            IrExpr::Str(s, _) => Some(if *newline {
+                strip_all_trailing_newlines(s)
+            } else {
+                s.clone()
+            }),
+            // not a literal — maybe an Interpolate of consts? refuse
+            _ => None,
+        },
+        // the frontend exec shape: `echo <literal words…>`
+        [IrStmt::Expr(IrExpr::Call { func, args, .. })] if func == "exec" => {
+            // echo joins its arguments with a space and ends the line
+            Some(const_echo_words(args)?.join(" "))
+        }
+        _ => None,
+    }
+}
+
+/// The literal words of an `exec` echo, when EVERY argument is a constant
+/// (the command must be `echo`; a `-n`/`-e` flag disables the fold since
+/// it changes the output). Returns None on anything with a variable, a
+/// capture, an interpolation or a flag.
+fn const_echo_words(args: &[IrExpr]) -> Option<Vec<String>> {
+    let cmd = match args.first() {
+        Some(IrExpr::Str(s, _)) => s.as_str(),
         _ => return None,
     };
-    let s = match output.0 {
-        IrExpr::Str(s, _) => s,
-        _ => return None, // not a literal — maybe an Interpolate of consts? refuse
+    if cmd != "echo" {
+        return None;
+    }
+    let items = match args.get(1) {
+        Some(IrExpr::Array(items)) => items,
+        _ => return None,
     };
-    Some(strip_all_trailing_newlines(s))
+    let mut words = Vec::with_capacity(items.len());
+    for w in items {
+        match w {
+            IrExpr::Str(s, _) => {
+                // an echo FLAG (`-n`, `-e`, `-E`) changes the output
+                if s.starts_with('-') && s.len() > 1 && s[1..].chars().all(|c| "neE".contains(c)) {
+                    return None;
+                }
+                words.push(s.clone());
+            }
+            _ => return None,
+        }
+    }
+    Some(words)
 }
 
 fn strip_all_trailing_newlines(s: &str) -> String {
     s.trim_end_matches('\n').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn call(func: &str, args: Vec<IrExpr>) -> IrExpr {
+        IrExpr::Call { func: func.to_string(), args }
+    }
+    fn s(x: &str) -> IrExpr {
+        IrExpr::Str(x.to_string(), StrStyle::DoubleQuoted)
+    }
+    /// The py-frontend capture shape:
+    /// `capture(Arrow([Expr(exec(echo, [words]))]))`.
+    fn frontend_capture(words: Vec<IrExpr>) -> IrStmt {
+        let body = IrExpr::Arrow(vec![IrStmt::Expr(call(
+            "exec",
+            vec![s("echo"), IrExpr::Array(words)],
+        ))]);
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "x".into(),
+                indices: vec![],
+                sigil: None,
+            }],
+            expr: call("capture", vec![body]),
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn frontend_constant_echo_capture_folds() {
+        let mut stmts = vec![frontend_capture(vec![s("hi")])];
+        assert!(transform(&mut stmts));
+        match &stmts[0] {
+            IrStmt::Assign { expr: IrExpr::Str(v, _), .. } => assert_eq!(v, "hi"),
+            other => panic!("not folded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_word_echo_joins_with_a_space() {
+        let mut stmts = vec![frontend_capture(vec![s("a"), s("b")])];
+        assert!(transform(&mut stmts));
+        match &stmts[0] {
+            IrStmt::Assign { expr: IrExpr::Str(v, _), .. } => assert_eq!(v, "a b"),
+            other => panic!("not folded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_word_refuses() {
+        let mut stmts = vec![frontend_capture(vec![call("getVar", vec![s("v")])])];
+        assert!(!transform(&mut stmts), "a var word must not fold");
+    }
+
+    #[test]
+    fn echo_flag_refuses() {
+        // `echo -n hi`: the flag changes the output, so refuse
+        let mut stmts = vec![frontend_capture(vec![s("-n"), s("hi")])];
+        assert!(!transform(&mut stmts), "an echo flag must not fold");
+    }
+
+    #[test]
+    fn non_echo_command_refuses() {
+        let body = IrExpr::Arrow(vec![IrStmt::Expr(call(
+            "exec",
+            vec![s("printf"), IrExpr::Array(vec![s("hi")])],
+        ))]);
+        let mut stmts = vec![IrStmt::Expr(call("capture", vec![body]))];
+        assert!(!transform(&mut stmts), "printf must not fold as echo");
+    }
+
+    #[test]
+    fn multi_statement_body_refuses() {
+        let body = IrExpr::Arrow(vec![
+            IrStmt::Expr(call("exec", vec![s("echo"), IrExpr::Array(vec![s("a")])])),
+            IrStmt::Expr(call("exec", vec![s("echo"), IrExpr::Array(vec![s("b")])])),
+        ]);
+        let mut stmts = vec![IrStmt::Expr(call("capture", vec![body]))];
+        assert!(!transform(&mut stmts), "two statements must not fold");
+    }
 }
