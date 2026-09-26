@@ -217,6 +217,7 @@ pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
                 },
                 Some("Int32") => Ok(IrType::Int32),
                 Some("Int64") => Ok(IrType::Int64),
+                Some("AsciiStr") => Ok(IrType::AsciiStr),
                 Some("UInt32") => Ok(IrType::UInt32),
                 Some("UInt64") => Ok(IrType::UInt64),
                 _ => Err(format!(

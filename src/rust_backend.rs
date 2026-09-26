@@ -3027,6 +3027,40 @@ impl Render {
                 "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
+        // LOCAL ARRAY: the value lives in a plain fixed-size local, not in
+        // the thread-local home. Reading it through the home would be wrong
+        // on both counts: the home is never populated for a local, and its
+        // element type differs (String vs i64), so `get(..).cloned()` fails
+        // to compile or reads an empty cell. Same shape as
+        // `array_index_strict`'s local arm — a compile-time key proven in
+        // range collapses to a bare index, anything else keeps the
+        // negative-wrap/exit(1) guard (a Rust panic would exit 101, but
+        // bash's "bad array subscript" exits 1 with prior output standing).
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            let elem = if self.local_array_is_int(name) {
+                format!("{m}[i as usize].to_string()")
+            } else {
+                format!("{m}[i as usize].clone()")
+            };
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                if idx >= 0 && (idx as usize) < n {
+                    return if self.local_array_is_int(name) {
+                        format!("{m}[{idx}].to_string()")
+                    } else {
+                        format!("{m}[{idx}].clone()")
+                    };
+                }
+            }
+            return format!(
+                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                   let i = if k < 0 {{ n + k }} else {{ k }}; \
+                   if i < 0 || i >= n {{ std::process::exit(1); }} \
+                   {elem} }}"
+            );
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
     }

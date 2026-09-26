@@ -58,6 +58,12 @@ pub enum Sigil {
 pub enum IrType {
     Int,
     Str,
+    /// String known to contain only ASCII bytes. Additive: a backend that
+    /// ignores the annotation treats it as `Str`. Serialized as
+    /// `{"kind": "AsciiStr"}` by the A1 emitter, so the hand-rolled
+    /// ingress in `shir_json_in::ir_type_from` MUST accept that shape or
+    /// every program with an ASCII verdict fails to load.
+    AsciiStr,
     Any,
     /// IEEE-754 bit width (32 = float, 64 = double). Serialized as
     /// `{"kind": "Float", "width": 64}` so the width survives the A1
@@ -94,6 +100,12 @@ impl serde::Serialize for IrType {
             IrType::Int => s.serialize_unit_variant("IrType", 0, "Int"),
             IrType::Str => s.serialize_unit_variant("IrType", 1, "Str"),
             IrType::Any => s.serialize_unit_variant("IrType", 2, "Any"),
+            IrType::AsciiStr => {
+                use serde::ser::SerializeStruct;
+                let mut st = s.serialize_struct("IrType", 1)?;
+                st.serialize_field("kind", "AsciiStr")?;
+                st.end()
+            }
             IrType::Float(w) => {
                 use serde::ser::SerializeStruct;
                 let mut st = s.serialize_struct("IrType", 2)?;
@@ -160,6 +172,7 @@ impl<'de> serde::Deserialize<'de> for IrType {
                     },
                     Some("Int32") => Ok(IrType::Int32),
                     Some("Int64") => Ok(IrType::Int64),
+                    Some("AsciiStr") => Ok(IrType::AsciiStr),
                     Some("UInt32") => Ok(IrType::UInt32),
                     Some("UInt64") => Ok(IrType::UInt64),
                     _ => Err(serde::de::Error::custom(
