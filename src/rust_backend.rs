@@ -1283,9 +1283,10 @@ fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) ->
 /// (multi-word, escape handling, dynamic flags) is left untouched.
 fn inline_print_words(text: &mut String) {
     let pat = "__sh_print_words(&[vec![";
+    let mut search_from = 0usize;
     loop {
-        let at = match text.find(pat) {
-            Some(a) => a,
+        let at = match text[search_from..].find(pat) {
+            Some(a) => search_from + a,
             None => break,
         };
         let start = at + pat.len();
@@ -1329,6 +1330,11 @@ fn inline_print_words(text: &mut String) {
             j += 1;
         }
         if j >= rest.len() || rest.as_bytes()[j] != b']' {
+            // Not the shape we inline. Advance past THIS occurrence so the
+            // loop makes progress; a bare `continue` would re-find the same
+            // offset forever and hang the whole renderer (and with it the
+            // core gate's `cargo test --lib`).
+            search_from = at + pat.len();
             continue;
         }
         // bracket2_pos = absolute index of the second `]` in `text`
@@ -1339,6 +1345,7 @@ fn inline_print_words(text: &mut String) {
             j += 1;
         }
         if !rest[j..].starts_with(", true, false)") {
+            search_from = at + pat.len();
             continue;
         }
         let expr = &text[start..close];
@@ -1346,6 +1353,9 @@ fn inline_print_words(text: &mut String) {
         let end = bracket2_pos + 1 + j + ", true, false)".len();
         let replacement = format!("println!(\"{{}}\", {})", expr);
         text.replace_range(at..end, &replacement);
+        // The replacement may itself contain `pat`-adjacent text; resume the
+        // scan at the end of what we just wrote so the loop always advances.
+        search_from = at + replacement.len();
     }
 }
 
@@ -1364,9 +1374,10 @@ fn inline_print_words(text: &mut String) {
 /// expression.
 fn simplify_let_b(mut text: String) -> String {
     let prefix = "{ let __b = ";
+    let mut search_from = 0usize;
     loop {
-        let at = match text.find(prefix) {
-            Some(a) => a,
+        let at = match text[search_from..].find(prefix) {
+            Some(a) => search_from + a,
             None => break,
         };
         let start = at + prefix.len();
@@ -1412,18 +1423,28 @@ fn simplify_let_b(mut text: String) -> String {
         let inner = text[start..close].trim_end();
         let stripped = match inner.strip_suffix("__b") {
             Some(s) => s,
-            None => continue,
+            None => {
+                // Not the wrapper shape — skip THIS occurrence and keep going
+                // (a bare `continue` would re-find the same offset forever).
+                search_from = at + prefix.len();
+                continue;
+            }
         };
         let stripped = stripped.trim_end();
         let expr = match stripped.strip_suffix(';') {
             Some(e) => e.trim(),
-            None => continue,
+            None => {
+                search_from = at + prefix.len();
+                continue;
+            }
         };
         if expr.is_empty() {
+            search_from = at + prefix.len();
             continue;
         }
         let replacement = expr.to_string();
         text.replace_range(at..close + 1, &replacement);
+        search_from = at + replacement.len();
     }
     text
 }
