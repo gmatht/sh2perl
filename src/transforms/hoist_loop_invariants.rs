@@ -1055,4 +1055,111 @@ mod tests {
         }
     }
 
+
+    /// `step() { px=$1; }` called from a loop BODY: the assignment that
+    /// reads `px` must stay in the loop. Before the fix `px` looked
+    /// loop-invariant (nothing in the body assigns it) and the
+    /// assignment ran once before the loop, freezing the value.
+    #[test]
+    fn refuses_when_a_called_fn_in_the_body_writes_the_read_var() {
+        let fns = vec![(
+            "step".to_string(),
+            vec![assign("px", IrExpr::Str("$1".into(), StrStyle::DoubleQuoted))],
+        )];
+        let stmts = vec![
+            IrStmt::Function {
+                name: "step".to_string(),
+                body: fns[0].1.clone(),
+                named_blocks: vec![],
+            },
+            IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "test".to_string(),
+                    args: vec![IrExpr::Str("$i -lt 3".into(), StrStyle::DoubleQuoted)],
+                },
+                body: vec![
+                    IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: vec![
+                            IrExpr::Str("step".into(), StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Str("5".into(), StrStyle::DoubleQuoted)]),
+                        ],
+                    }),
+                    assign("cx", IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Var("px".to_string())),
+                        rhs: Box::new(ArithAst::Num(1000)),
+                    }))),
+                    assign("i", inc("i")),
+                ],
+            },
+        ];
+        let mut stmts = stmts;
+        transform(&mut stmts);
+        let inside = stmts.iter().any(|st| match st {
+            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
+                b,
+                IrStmt::Assign { targets, .. } if targets[0].var == "cx"
+            )),
+            _ => false,
+        });
+        assert!(inside, "cx=$(( px * 1000 )) was hoisted out of a loop whose only writer of `px` is the called function `step`");
+    }
+
+    /// Same, but the call sits in the loop's CONDITION —
+    /// `if ! step 5; then break; fi` — which is how MIMEcroft's game loop
+    /// moves the player. The condition arms must be censused too, or the
+    /// camera uniforms (`dpcx_ms=$((px*1000))`) are hoisted and the view
+    /// freezes at the starting cell.
+    #[test]
+    fn refuses_when_a_called_fn_in_the_condition_writes_the_read_var() {
+        let fns = vec![(
+            "apply".to_string(),
+            vec![assign("px", IrExpr::Str("$1".into(), StrStyle::DoubleQuoted))],
+        )];
+        let stmts = vec![
+            IrStmt::Function {
+                name: "apply".to_string(),
+                body: fns[0].1.clone(),
+                named_blocks: vec![],
+            },
+            IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "test".to_string(),
+                    args: vec![IrExpr::Str("$i -lt 3".into(), StrStyle::DoubleQuoted)],
+                },
+                body: vec![
+                    IrStmt::If {
+                        cond: IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("apply".into(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![IrExpr::Str("5".into(), StrStyle::DoubleQuoted)]),
+                            ],
+                        },
+                        then: vec![IrStmt::Break],
+                        elsifs: vec![],
+                        else_: vec![],
+                    },
+                    assign("cx", IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Var("px".to_string())),
+                        rhs: Box::new(ArithAst::Num(1000)),
+                    }))),
+                    assign("i", inc("i")),
+                ],
+            },
+        ];
+        let mut stmts = stmts;
+        transform(&mut stmts);
+        let inside = stmts.iter().any(|st| match st {
+            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
+                b,
+                IrStmt::Assign { targets, .. } if targets[0].var == "cx"
+            )),
+            _ => false,
+        });
+        assert!(inside, "cx=$(( px * 1000 )) was hoisted even though `px` is written by `apply` from the loop CONDITION");
+    }
+
 }
