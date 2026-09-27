@@ -37403,6 +37403,14 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
     if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
         return None;
     }
+    // bash only globs an UNQUOTED pattern operand (see
+    // [`test_operand_is_quoted`]): `[ "abc" = "a*" ]` is a literal compare
+    // and `[[ "abc" == "a*" ]]` is too (only the unquoted `[[ ]]` pattern
+    // globs). A quoted operand must stay on the exact-equality path, so
+    // refuse here and let the caller emit `===`.
+    if test_operand_is_quoted(rhs) {
+        return None;
+    }
     let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
     let build = |operand: Expr, pat: &CasePat| {
         let mut value = Expr::CallExpression {
@@ -44832,6 +44840,33 @@ fn regex_test_pattern(rhs: &str) -> Option<String> {
 /// `[ -f x ]` followed by `echo $?` printed the PREVIOUS status).
 fn try_native_test(s: &str) -> Option<Expr> {
     try_native_test_unstatused(s).map(native_test_statused)
+}
+
+/// Is the `=`/`==`/`!=` RHS operand QUOTED in the source test string?
+///
+/// This is the `[[ ]]` vs `[ ]` glob rule. bash's `[` (the `test` BUILTIN)
+/// does NOT glob its operands at all: it receives them as already-expanded
+/// argv, and an unquoted `a*` reaches it as the LITERAL two-character-plus
+/// string `a*` (bash 5 reports "too many arguments" for the split form and
+/// never matches). Only `[[ ]]` — a KEYWORD — performs pathname expansion on
+/// an unquoted pattern, so `[[ abc == a* ]]` is true while `[[ abc == "a*" ]]`
+/// is a literal compare.
+///
+/// The emitter therefore must not lower a `[ ]` equality to a glob regex
+/// (`startsWith`/`includes`/`^…$`) unless the source operand is genuinely an
+/// unquoted pattern. This was the `test-glob-rhs-fallback.sh` failure:
+/// `[ "abc" = "a*" ]` and `[[ "abc" == "a*" ]]` both emitted
+/// `String("abc").startsWith("a")` and took the `bad` branch (a quoted
+/// pattern must compare literally), and `[ "abc" = "[ab]*" ]` emitted the
+/// char-class regex `(/^[ab].*$/s).test("abc")` — also `bad`.
+///
+/// A quoted operand is a fully-quoted string (`"a*"`), possibly built by
+/// concatenating quoted runs and literal text (`"a"\*`, `a"*"`). Any quote
+/// character anywhere in the operand makes it quoted: bash removes the quote
+/// and suppresses globbing for the WHOLE word, so a single quoted character
+/// anywhere in it is enough.
+fn test_operand_is_quoted(op: &str) -> bool {
+    op.contains('"') || op.contains('\'')
 }
 
 /// The value-only native test (no lastExit write): the single-op scans,
