@@ -7547,6 +7547,21 @@ impl Render {
                 && fvars.contains(name)
                 && self.is_heap_store_var(name)
                 && !exclude.contains(&name.as_str())
+                // NEVER free a FILE-SCOPE var here. `fvars` is "assigned
+                // in this body and not assigned at top level", which is
+                // NOT the same as "owned by this function": a var that
+                // is only ever written inside shell functions is still
+                // a single global. Freeing it on return left the global
+                // dangling, and the next caller read freed heap —
+                // measured on
+                //     get_cell() { gv=$2; a=$1; }
+                //     p() { get_cell 1 7; echo "gv=$gv a=$a"; }
+                //     p
+                // where bash prints `gv=7 a=1` and the native binary
+                // printed `gv=<garbage> a=<garbage>`. A function frees
+                // only what it declares (`local`/param aliases), and
+                // those are exactly the vars NOT hoisted to file scope.
+                && !self.site_file_vars.contains(name)
             {
                 self.emit(&format!("free({});", self.c_ident(name)));
             }
