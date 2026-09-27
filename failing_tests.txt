@@ -73,6 +73,7 @@ positional-dollar-at-params.sh	otranspilerl failed to generate code
 printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
+readonly-cmdsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 realpath-cmdsub.sh	otranspilerl failed to generate code
 single-quote-embed-escape.sh	otranspilerl failed to generate code
 sqs-overlap-multiline-awk.sh	otranspilerl failed to generate code
