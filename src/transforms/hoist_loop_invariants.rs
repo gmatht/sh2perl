@@ -388,6 +388,9 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
         // knew that. The call is an `IrStmt::Exec` (a bare command), so
         // the `Expr(Call)` arm above never sees it.
         IrStmt::Exec { cmd, .. } => {
+            if std::env::var("SH2_TRACE_HOIST").is_ok() {
+                eprintln!("[hoist] Exec cmd={:?} fns={:?}", cmd, fns.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
+            }
             if let IrExpr::Str(name, _) = cmd {
                 if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
                     let mut inner: HashSet<String> = HashSet::new();
