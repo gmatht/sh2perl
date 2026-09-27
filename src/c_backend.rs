@@ -390,6 +390,13 @@ pub struct Render {
     /// genuinely-external command when SH2_UU_FFI env is set. Never
     /// changes default (env-unset) output.
     need_uu: bool,
+    /// fb0 framebuffer device needed: emit `#include <fbdev.h>` and
+    /// direct `fb_*` calls instead of a `bash -c` shell-out site.
+    /// Without this, EVERY draw lowers to `system("bash -c 'fb_blocks
+    /// ...'")` — a fork+exec per draw call, and the fb_* commands are
+    /// not executables, so the call fails outright. Set by
+    /// `fb_call_opt` when a script names an fb_* primitive.
+    need_fb: bool,
     /// index range in self.out covering the need_sh runtime helper block
     /// (recorded at emit_runtime; trim_sh_runtime drops unreferenced
     /// helpers from it after the body is rendered)
@@ -7835,6 +7842,13 @@ impl Render {
             // runtime/uu_run.c + runtime/lib/libcoreutils_ffi.so
             // (runtime/build_uu_ffi.sh).
             self.emit("#include <uu_run.h>");
+        }
+        if self.need_fb {
+            // The fb0 framebuffer device (runtime/fbdev.{h,c}). The
+            // program must be linked with fbdev.c (-I$SH2PERL/runtime
+            // and runtime/fbdev.c on the command line) — bash-O4 does
+            // that automatically when the render references <fbdev.h>.
+            self.emit("#include <fbdev.h>");
         }
         self.emit("");
         if self.need_sh {
@@ -18401,7 +18415,11 @@ fn param_copy_alias(
                 }
             }
             _ => {
-                if let Some(uu) = self.uu_run_opt(&cmd, &args) {
+                if let Some(fb) = self.fb_call_opt(&cmd, &args) {
+                    // the fb device returns 0 on success, so the shell
+                    // status is 0 (like any other successful builtin)
+                    format!("({fb}, _sh_rc = 0, _sh_rc == 0)")
+                } else if let Some(uu) = self.uu_run_opt(&cmd, &args) {
                     self.need_sh = true;
                     format!("(_sh_rc = {uu}, _sh_rc == 0)")
                 } else {
@@ -18409,6 +18427,69 @@ fn param_copy_alias(
                 }
             }
         }
+    }
+
+    /// The fb0 framebuffer device (runtime/fbdev.{h,c}).
+    ///
+    /// Why this exists: an unknown command lowers to a `bash -c` shell
+    /// site, i.e. `system("bash -c 'fb_blocks ...'")`. That is a
+    /// fork+exec PER DRAW CALL, and the fb_* names are not executables,
+    /// so the child bash fails outright ("fb_blocks: command not
+    /// found") and the frame stays empty. This hook turns the call into
+    /// a direct in-process `fb_blocks(payload)`.
+    ///
+    /// Opt-in by NAMING, not by env var: a script with no fb_* call
+    /// emits byte-identical C with or without the device linked, so
+    /// adding the device can never change an unrelated program's
+    /// output. (Same shape as the uu_run_opt hook above.)
+    ///
+    /// Conservative, like uu: no env-prefix Object arg, no glob words,
+    /// and every word must lower to exactly one C value — a draw
+    /// payload is a plain word in practice.
+    fn fb_primitive(cmd: &str) -> Option<&'static str> {
+        match cmd {
+            "fb_open" => Some("fb_open"),
+            "fb_clear" => Some("fb_clear"),
+            "fb_set_camera" => Some("fb_set_camera"),
+            "fb_blocks" => Some("fb_blocks"),
+            "fb_present" => Some("fb_present"),
+            "fb_dump_ppm" => Some("fb_dump_ppm"),
+            _ => None,
+        }
+    }
+
+    fn fb_call_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let cname = Self::fb_primitive(cmd)?;
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+            return None;
+        }
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        if words.is_empty() {
+            return None;
+        }
+        if words.iter().any(Self::word_needs_glob) {
+            return None;
+        }
+        if words.iter().any(|w| !Self::word_single_argv(w)) {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for w in words {
+            match w {
+                IrExpr::Str(s, _) => {
+                    if Self::static_needs_shell(s) {
+                        return None;
+                    }
+                    parts.push(Self::cstr(s))
+                }
+                _ => parts.push(self.value_c(w)),
+            }
+        }
+        self.need_fb = true;
+        Some(format!("{cname}({})", parts.join(", ")))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
