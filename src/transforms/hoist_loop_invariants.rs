@@ -107,6 +107,10 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
         stmt_writes(s, &mut assigned, fns);
     }
 
+    if std::env::var("SH2_TRACE_HOIST").is_ok() {
+        eprintln!("[hoist] body={} assigned={:?} fns={:?}", body.len(),
+                  assigned, fns.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
+    }
     let mut hoisted: Vec<IrStmt> = Vec::new();
     for (j, st) in body.iter().enumerate() {
         let (target, expr) = match st {
