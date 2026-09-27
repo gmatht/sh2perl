@@ -2,7 +2,6 @@
 005_args.sh	otranspilerl failed to generate code
 008_simple_backup.sh	stdout mismatch
 009_arrays.sh	otranspilerl failed to generate code
-018_grep_params.sh	stdout mismatch, exit code (bash=0 perl=124)
 028_arrays_indexed.sh	otranspilerl failed to generate code
 029_arrays_associative.sh	otranspilerl failed to generate code
 043_home.sh	stdout mismatch
