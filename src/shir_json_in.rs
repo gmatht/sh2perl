@@ -215,6 +215,7 @@ pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
                     Some(w) if w <= 255 => Ok(IrType::Float(w as u8)),
                     _ => Err(format!("{where_}: expected {{{{kind: Float, width: N}}}}")),
                 },
+                Some("AsciiStr") => Ok(IrType::AsciiStr),
                 Some("Int32") => Ok(IrType::Int32),
                 Some("Int64") => Ok(IrType::Int64),
                 Some("UInt32") => Ok(IrType::UInt32),
