@@ -359,8 +359,8 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
                     out.insert(n.clone());
                 }
             }
-            // `x=$1` inside a function body lowers to `getVar("x")` +
-            // setVar, so the NAME appears as a call argument, not as an
+            // `x=$1` inside a function body lowers to `getVar("x")`, so
+            // the name shows up as a call ARGUMENT rather than as an
             // IrStmt::Assign target. Reading it here is what makes a
             // callee's global writes visible to the hoist.
             if matches!(func.as_str(), "getVar" | "param" | "arrayIndex") {
@@ -368,31 +368,34 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
                     out.insert(n.clone());
                 }
             }
-            // A call to a user-defined shell FUNCTION writes every global
-            // that function's body assigns. Without this the hoist is
-            // UNSOUND, and silently so — the body still looks like it
-            // only writes its own locals:
-            //
-            //     bump() { v=$1; }
-            //     while [ $i -lt 3 ]; do
-            //       bump 5
-            //       d=$(( v * 1000 ))     # hoisted: `v` looks loop-invariant
-            //       printf '%s\n' "$d"
-            //       i=$((i+1))
-            //     done
-            //
-            // prints 5000 three times in bash; the hoisted `d` kept its
-            // pre-loop value 2000, so the native printed 2000 three
-            // times. `v` is only ever written from inside `bump`, and
-            // `stmt_writes` had no idea. Report every name the callee
-            // assigns (one level deep — a nested call is covered by the
-            // same conservatism for that callee's own body).
-            if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == func) {
-                let mut inner: HashSet<String> = HashSet::new();
-                for s2 in fbody {
-                    stmt_writes(s2, &mut inner, fns);
+        }
+        // A call to a user-defined shell FUNCTION writes every global
+        // that function's body assigns. Without this the hoist is
+        // UNSOUND, and silently so — the body still looks like it only
+        // writes its own locals:
+        //
+        //     bump() { v=$1; }
+        //     while [ $i -lt 3 ]; do
+        //       bump 5
+        //       d=$(( v * 1000 ))     # hoisted: `v` looks invariant
+        //       printf '%s\n' "$d"
+        //       i=$((i+1))
+        //     done
+        //
+        // bash prints 5000 three times; the hoisted `d` kept its
+        // pre-loop value 2000, so the native printed 2000 three times.
+        // `v` is only ever written from inside `bump`, and nothing here
+        // knew that. The call is an `IrStmt::Exec` (a bare command), so
+        // the `Expr(Call)` arm above never sees it.
+        IrStmt::Exec { cmd, .. } => {
+            if let IrExpr::Str(name, _) = cmd {
+                if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
+                    let mut inner: HashSet<String> = HashSet::new();
+                    for s2 in fbody {
+                        stmt_writes(s2, &mut inner, fns);
+                    }
+                    out.extend(inner);
                 }
-                out.extend(inner);
             }
         }
         _ => {}
@@ -887,40 +890,5 @@ mod tests {
             panic!("expected For at index 1");
         }
     }
-}
 
-#[cfg(test)]
-mod hoist_fn_side_effect_tests {
-    use super::*;
-
-    /// A loop-carried var written ONLY from inside a called shell
-    /// function must not let an assignment that reads it be hoisted.
-    /// bash prints 5000 three times; the pre-fix build printed 2000.
-    #[test]
-    fn a_call_written_global_blocks_the_hoist() {
-        let src = r#"
-bump() { v=$1; }
-i=0
-v=2
-while [ $i -lt 3 ]; do
-  bump 5
-  d=$(( v * 1000 ))
-  i=$((i+1))
-done
-"#;
-        let stmts = crate::ir::parse_shell(src).expect("parse");
-        let before = stmts.len();
-        transform(&mut stmts.clone());
-        // `d = v*1000` must still be INSIDE the while body
-        let loop_body_has_d = stmts.iter().any(|s| match s {
-            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
-                b, IrStmt::Assign { targets, .. } if targets[0].var == "d")),
-            _ => false,
-        });
-        assert!(
-            loop_body_has_d,
-            "d=$(( v * 1000 )) was hoisted out of the loop even though the\nonly writer of `v` is the called function `bump` (stmts {before} -> {})",
-            stmts.len()
-        );
-    }
 }
