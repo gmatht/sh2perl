@@ -10063,6 +10063,19 @@ impl Render {
                     let st = self.write_num(&t.var, &n);
                     self.emit(&st);
                 } else {
+                    // A native string loop binding is handed over BARE (a
+                    // `&str` borrowed from the literal list) — correct for
+                    // `{}`-format reads, but the shell cell IS a `String`
+                    // (E0308 otherwise). Own it at the sink, exactly as
+                    // printf/the word printer do. tty-cmdsub's
+                    // `TTY_DEV="$dev"` inside `for dev in /dev/pts/*` wrote
+                    // the borrow into the thread-local and the whole file
+                    // failed to compile.
+                    let rhs = if self.needs_owned_str(expr) {
+                        format!("{}.to_string()", Self::atom_or_paren(&rhs))
+                    } else {
+                        rhs
+                    };
                     let v = self.case_attr(&t.var, &rhs);
                     let st = self.write_str(&t.var, &v);
                     self.emit(&st);
