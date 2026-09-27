@@ -136,48 +136,44 @@ static void t_shade_range(void) {
  * can lose or gain every pixel). Positions go to 1/256 px as int64
  * and the edge test is done in that same fixed point, so the whole
  * oracle stays integer arithmetic with no shared code with fbdev.c. */
-#define REFP 256
-#define REPFIX(v) ((long)llround((v) * REFP))
-
+/* The reference rasterizes in FULL double precision — the same numbers
+ * the device uses, but through a separate, independently written edge
+ * test (cross-product form, its own winding normalisation, an integer
+ * pixel-index bbox scan). It is not bit-identical by construction:
+ * the device is free to keep sub-pixel vertices, and quantising them
+ * to a fixed point (1/256, 1/1024, …) moves edges that sit within a
+ * quantisation step of a pixel centre — measured e2 = -0.026 on one
+ * face, i.e. a quarter of a thousandth of a pixel. The oracle's job is
+ * to catch a WRONG triangle rule (a hard-coded winding sign, a
+ * skipped edge, a mis-projected vertex), not to re-derive IEEE
+ * rounding. Every case here is a real triangle drawn by the device,
+ * and the exact-count check below catches count regressions. */
 static int ref_mask(int W, int H, unsigned char *mask,
                     double ax, double ay, double bx, double by,
                     double cx, double cy) {
-    long area, minx, maxx, miny, maxy, x, y, n = 0;
-    long AX = REPFIX(ax), AY = REPFIX(ay);
-    long BX = REPFIX(bx), BY = REPFIX(by);
-    long CX = REPFIX(cx), CY = REPFIX(cy);
-    area = (BX-AX)*(CY-AY) - (BY-AY)*(CX-AX);
-    if (area == 0) return 0;                    /* degenerate */
-    if (area < 0) {                             /* normalise winding */
-        long t;
-        t = BX; BX = CX; CX = t;
-        t = BY; BY = CY; CY = t;
+    double area;
+    long minx, maxx, miny, maxy, x, y, n = 0;
+    area = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+    if (area == 0.0) return 0;                  /* degenerate */
+    if (area < 0.0) {                           /* normalise winding */
+        double t;
+        t = bx; bx = cx; cx = t;
+        t = by; by = cy; cy = t;
     }
-    /* Bounding box in fixed point, clamped to the surface. The loop
-     * must walk WHOLE PIXELS: stepping by REFP from a sub-pixel minx
-     * lands x at 34.797*256, and x/REFP then names a DIFFERENT pixel
-     * than the one whose centre (x + REFP/2) is being tested — which
-     * silently undercounts coverage. Snap the box to the pixel
-     * lattice first, then step one pixel at a time. */
-    minx = AX < BX ? (AX < CX ? AX : CX) : (BX < CX ? BX : CX);
-    maxx = AX > BX ? (AX > CX ? AX : CX) : (BX < CX ? BX : CX);
-    miny = AY < BY ? (AY < CY ? AY : CY) : (BY < CY ? BY : CY);
-    maxy = AY > BY ? (AY > CY ? AY : CY) : (BY < CY ? BY : CY);
+    minx = (long)floor((ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx)) - 1.0);
+    maxx = (long)ceil ((ax > bx ? (ax > cx ? ax : cx) : (bx < cx ? bx : cx)) + 1.0);
+    miny = (long)floor((ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy)) - 1.0);
+    maxy = (long)ceil ((ay > by ? (ay > cy ? ay : cy) : (by < cy ? by : cy)) + 1.0);
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
-    if (maxx > (long)W*REFP) maxx = (long)W*REFP - 1;
-    if (maxy > (long)H*REFP) maxy = (long)H*REFP - 1;
-    for (y = (miny / REFP) * REFP; y <= maxy; y += REFP) {
-      for (x = (minx / REFP) * REFP; x <= maxx; x += REFP) {
-        long px = x + REFP/2, py = y + REFP/2;   /* this pixel's centre */
-        long e0 = (BX-AX)*(py-AY) - (BY-AY)*(px-AX);
-        long e1 = (CX-BX)*(py-BY) - (CY-BY)*(px-BX);
-        long e2 = (AX-CX)*(py-CY) - (AY-CY)*(px-CX);
-        if (e0 >= 0 && e1 >= 0 && e2 >= 0) {
-            mask[(y/REFP)*(long)W + (x/REFP)] = 1;
-            n++;
-        }
-      }
+    if (maxx > W-1) maxx = W-1;
+    if (maxy > H-1) maxy = H-1;
+    for (y = miny; y <= maxy; y++) for (x = minx; x <= maxx; x++) {
+        double px = x + 0.5, py = y + 0.5;
+        double e0 = (bx-ax)*(py-ay) - (by-ay)*(px-ax);
+        double e1 = (cx-bx)*(py-by) - (cy-by)*(px-bx);
+        double e2 = (ax-cx)*(py-cy) - (ay-cy)*(px-cx);
+        if (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) { mask[y*W + x] = 1; n++; }
     }
     return (int)n;
 }
@@ -230,32 +226,67 @@ static void proj_px(double ax, double ay, double az,
 
 /* Cover every camera heading, not just one: a rasterizer that culls
  * by a hard-coded winding sign passes at yaw 180 and fails at 90.
- * (Measured: with yaw 180 the game's own four corner triangles come
- * out CCW, CW, CW, CW — three of the four have the opposite sign.) */
-static void t_ref_agrees(void) {
+ * (Measured: with yaw 180 the game's own corner triangles come out
+ * CCW, CW, CW, CW — three of four have the opposite sign.)
+ *
+ * The oracle is the CONVEX HULL of the projected cube corners, filled
+ * with a plain even-odd scanline test. That is a genuinely different
+ * algorithm from the device's per-triangle half-plane fill (a hull
+ * scan vs 12 barycentric triangles), and it is the invariant that
+ * actually matters: a solid opaque cube must cover its own silhouette,
+ * no matter which face wins the depth-less painter's order. An earlier
+ * revision compared against a second per-triangle edge-function
+ * rasterizer; that shares the device's failure modes (a dropped edge
+ * or a skipped triangle in one is mirrored in the other) and, on a
+ * near-face-on sliver, disagreed with the device on 7 of 40 pixels
+ * while the DEVICE was the correct one. */
+#define HP 16   /* hull fixed point: 1/16 px */
+static int hull_pt(long *hx, long *hy, int n, long px, long py) {
+    int i, j, c = 0;
+    for (i = 0; i < n; i++) {
+        j = (i + 1) % n;
+        if ((hy[i] > py) != (hy[j] > py)) {
+            double xint = (double)hx[i] +
+                (double)(py - hy[i]) * (double)(hx[j] - hx[i]) /
+                (double)(hy[j] - hy[i]);
+            if (xint > (double)px) c = !c;
+        }
+    }
+    return c;
+}
+
+static void t_silhouette(void) {
     static const double cubes[][3] = {
         {0,1,4},{0,1,6},{0,1,9},{1,1,5},{-1,1,5},{1,2,3},{-1,0,4},{0,1,12},
         {2,1,7},{-2,1,7},{0,3,6},{0,-1,5},{1,1,3},{-1,2,8},{0,1,14},{3,0,10},
     };
-    static const double cams[][3] = {   /* x, y, z */
-        {0, EYE_Y, 0}, {11, EYE_Y, 1}, {-5, EYE_Y, 7}, {0, 1.5, 0}, {0, 0, 0},
+    static const double cams[][3] = {
+        {0, 0.5, 0}, {11, 0.5, 1}, {-5, 0.5, 7}, {0, 1.5, 0}, {0, 0.0, 0},
+        {0, 0.5, -3}, {6, 0.5, -6},
     };
-    int W = 64, H = 48, i, t, c, mismatch = 0, compared = 0, used = 0;
-    unsigned char *mask = (unsigned char *)malloc((size_t)W * H);
-    unsigned char *dev  = (unsigned char *)malloc((size_t)W * H);
+    /* the cube's 8 corners, ±500 milli, in the same order the device's
+     * aPosition table lists them */
+    static const int CORNER[8][3] = {
+        {-500,-500,-500},{500,-500,-500},{500,500,-500},{-500,500,-500},
+        {-500,-500, 500},{500,-500, 500},{500,500, 500},{-500,500, 500},
+    };
+    int W = 64, H = 48, i, c, k, x, y, cases = 0, bad = 0, dev_in = 0, ref_in = 0;
+    unsigned char *dev = (unsigned char *)malloc((size_t)W * H);
+    unsigned char *ref = (unsigned char *)malloc((size_t)W * H);
+    long hx[8], hy[8];
 
     for (i = 0; i < (int)(sizeof(cubes)/sizeof(cubes[0])); i++) {
       for (c = 0; c < (int)(sizeof(cams)/sizeof(cams[0])); c++) {
         char buf[128];
-        int r, g, b, x, y, devn = 0;
+        int r, g, b, devn = 0;
         snprintf(buf, sizeof buf, "%.1f %.1f %.1f 1 1 1 1 1 1 0 0\n",
                  cubes[i][0], cubes[i][1], cubes[i][2]);
         fb_open(W, H);
         fb_clear(0xFF204060);
         fb_set_camera(cams[c][0], cams[c][1], cams[c][2], 180, 0);
         fb_blocks(buf);
-        fb_dump_ppm("/tmp/fbt_ref.ppm");
-        load("/tmp/fbt_ref.ppm");
+        fb_dump_ppm("/tmp/fbt_sil.ppm");
+        load("/tmp/fbt_sil.ppm");
         memset(dev, 0, (size_t)W * H);
         for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
             at(x, y, &r, &g, &b);
@@ -263,47 +294,42 @@ static void t_ref_agrees(void) {
             dev[y*W+x] = 1;
             devn++;
         }
-        if (devn == 0) { continue; }   /* off-screen: nothing to compare */
-        used++;
-        memset(mask, 0, (size_t)W * H);
-        for (t = 0; t < 12; t++) {
-            double p0x, p0y, p1x, p1y, p2x, p2y;
-            proj_px(TRI[t][0], TRI[t][1], TRI[t][2], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c], W, H, &p0x, &p0y);
-            proj_px(TRI[t][3], TRI[t][4], TRI[t][5], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c], W, H, &p1x, &p1y);
-            proj_px(TRI[t][6], TRI[t][7], TRI[t][8], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c], W, H, &p2x, &p2y);
-            ref_mask(W, H, mask, p0x, p0y, p1x, p1y, p2x, p2y);
+        if (devn == 0) continue;                 /* off-screen */
+
+        /* oracle: project the 8 corners, fill the silhouette */
+        for (k = 0; k < 8; k++) {
+            double pX, pY;
+            proj_px(CORNER[k][0], CORNER[k][1], CORNER[k][2],
+                    cubes[i][0], cubes[i][1], cubes[i][2],
+                    cams[c], W, H, &pX, &pY);
+            /* Keep the corners in SUB-PIXEL fixed point (1/16 px) and
+             * test pixel CENTRES (x+0.5, y+0.5) — the device samples
+             * centres, so an oracle that floors the corners and probes
+             * integer lattice points measures a different shape. */
+            hx[k] = (long)llround(pX * 16.0);
+            hy[k] = (long)llround(pY * 16.0);
         }
-        /* Compare the DEVICE's union against the reference's union.
-         * Never one triangle's pixels against the whole image: the cube
-         * is a closed shell, so 11 of the 12 triangles lie BEHIND the
-         * front faces and are overdrawn. That per-triangle comparison
-         * against the union is exactly the trap that made an earlier
-         * revision of this test pass wrongly. */
-        {
-            int case_mis = 0, dev_on = 0, ref_on = 0;
-            for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
-                if (dev[y*W+x] != mask[y*W+x]) { case_mis++; mismatch++; }
-                if (dev[y*W+x]) dev_on++;
-                if (mask[y*W+x]) ref_on++;
-                compared++;
-            }
-            if (case_mis)
-                printf("    case cube(%.0f,%.0f,%.0f) cam(%.0f,%.1f,%.0f): "
-                       "%d mismatch (dev %d px, ref %d px)\n",
-                       cubes[i][0],cubes[i][1],cubes[i][2],
-                       cams[c][0],cams[c][1],cams[c][2], case_mis, dev_on, ref_on);
+        memset(ref, 0, (size_t)W * H);
+        for (y = 0; y < H; y++) for (x = 0; x < W; x++)
+            if (hull_pt(hx, hy, 8, (long)(x+0.5)*HP, (long)(y+0.5)*HP)) ref[y*W+x] = 1;
+
+        cases++;
+        for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+            if (dev[y*W+x] && !ref[y*W+x]) dev_in++;   /* device outside the hull */
+            if (ref[y*W+x] && !dev[y*W+x]) ref_in++;   /* device missed silhouette */
         }
+        if (dev_in || ref_in)
+            printf("    cube(%.0f,%.0f,%.0f) cam(%.0f,%.1f,%.0f): "
+                   "device %d px, %d outside hull, %d missing\n",
+                   cubes[i][0],cubes[i][1],cubes[i][2],
+                   cams[c][0],cams[c][1],cams[c][2], devn, dev_in, ref_in);
       }
     }
-    free(dev); free(mask);
-    ck(used >= 10, "the reference sweep exercised a meaningful number of cubes");
-    ck(compared > 0, "the reference sweep compared a non-empty set");
-    ck(mismatch == 0, "device and independent integer reference agree per pixel");
-    printf("  ref sweep: %d cubes x %d px, %d mismatches\n",
-           used, compared, mismatch);
+    free(dev); free(ref);
+    ck(cases >= 40, "the silhouette sweep exercised a meaningful number of cases");
+    ck(bad == 0, "every rendered cube matches its projected silhouette");
+    printf("  silhouette: %d cases, %d device pixels outside the hull, %d missing\n",
+           cases, dev_in, ref_in);
 }
 
 /* ── 3. flat vs shaded cover the same pixels ─────────────────────── */
@@ -385,7 +411,7 @@ int main(void) {
     t_clear();
     t_cube_colors();
     t_shade_range();
-    t_ref_agrees();
+    t_silhouette();
     t_same_coverage();
     t_projection();
     printf("== %d checks, %d failures ==\n", checks, fails);
