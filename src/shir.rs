@@ -34854,13 +34854,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::If {
             cond,
             then,
-            elsifs: _,
+            elsifs,
             else_,
         } => {
             let consequent = Box::new(Stmt::BlockStatement {
                 body: then.iter().filter_map(stmt_to_estree).collect(),
             });
-            let alternate: Option<Box<Stmt>> = if else_.is_empty() {
+            let alternate: Option<Box<Stmt>> = if else_.is_empty() && elsifs.is_empty() {
                 if lastexit_write_is_dead(stmt) {
                     // Plan 4: the if's status write is provably unread
                     // (no `$?` reader before the next writer; the runner
@@ -34889,14 +34889,57 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }))
                 }
             } else {
-                Some(match else_.as_slice() {
-                    [IrStmt::If { .. }] => Box::new(
-                        stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
-                    ),
-                    _ => Box::new(Stmt::BlockStatement {
-                        body: else_.iter().filter_map(stmt_to_estree).collect(),
-                    }),
-                })
+                // The else-if ladder. `elsifs` is a flat `[cond, body]`
+                // list; JS has no `elif`, so it lowers to the SAME nesting
+                // the AST already uses for `else { if … }` — each arm's
+                // alternate is the next arm (or the final `else`).
+                //
+                // This arm previously bound `elsifs: _` and DROPPED every
+                // `elif` in the corpus — `if A; then …; elif B; then …; fi`
+                // rendered as `if (A) { … }` with the whole `elif` chain
+                // silently discarded (param-expand-default-operator.sh:
+                // the `[ "${BASH_VERSION-}" ]` arm and its `echo bash` never
+                // reached the output, so the program printed nothing).
+                //
+                // `$?` for a failing elif: bash leaves the LAST evaluated
+                // condition's status, which the chain reproduces because
+                // every arm is an ordinary `if` whose test writes the
+                // status (the dead-status unwrap applies per arm exactly as
+                // it does for a top-level if).
+                let mut tail: Option<Box<Stmt>> = if else_.is_empty() {
+                    None
+                } else {
+                    Some(match else_.as_slice() {
+                        [IrStmt::If { .. }] => Box::new(
+                            stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                        ),
+                        _ => Box::new(Stmt::BlockStatement {
+                            body: else_.iter().filter_map(stmt_to_estree).collect(),
+                        }),
+                    })
+                };
+                for (econd, ebody) in elsifs.iter().rev() {
+                    let arm_consequent = Box::new(Stmt::BlockStatement {
+                        body: ebody.iter().filter_map(stmt_to_estree).collect(),
+                    });
+                    // Each elif arm is an ordinary `if` whose test is
+                    // evaluated for truthiness only — the same
+                    // `unwrap_test_bool` treatment the outer condition gets
+                    // (see the `test:` arm below). The dead-status elision
+                    // (`test_cond_write_is_dead`) is keyed by the enclosing
+                    // `IrStmt::If` POINTER, not per-arm, so an arm is not
+                    // given the unstatused form here: the statused sequence
+                    // is the byte-identical behavior-preserving choice, and
+                    // `$?` after a failing elif is exactly the last arm's
+                    // condition status.
+                    let ealt = tail.take();
+                    tail = Some(Box::new(Stmt::IfStatement {
+                        test: unwrap_test_bool(cond_to_estree(econd)),
+                        consequent: arm_consequent,
+                        alternate: ealt,
+                    }));
+                }
+                tail
             };
             Stmt::IfStatement {
                 test: {
