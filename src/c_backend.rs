@@ -18466,6 +18466,42 @@ fn param_copy_alias(
         }
     }
 
+    /// A word that is exactly ONE value in a C argument position.
+    /// Unlike `word_single_argv` this ACCEPTS `split($x)` (a variable
+    /// read, one value) and REFUSES only genuine multi-word expansions
+    /// — glob, brace, command substitution.
+    fn fb_word_one_value(w: &IrExpr) -> bool {
+        match w {
+            IrExpr::Str(..) | IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
+            IrExpr::Arith(..) => true,
+            IrExpr::Index { key, .. } => Self::fb_word_one_value(key),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(..) => true,
+                InterpPart::Expr(x) => Self::fb_word_one_value(x),
+            }),
+            IrExpr::Capture { .. } => false,
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::fb_word_one_value(lhs) && Self::fb_word_one_value(rhs)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::fb_word_one_value(cond)
+                    && Self::fb_word_one_value(then)
+                    && Self::fb_word_one_value(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                Self::fb_word_one_value(expr) && Self::fb_word_one_value(default)
+            }
+            IrExpr::Call { func, args } => match func.as_str() {
+                // multi-word in a child bash, one value here
+                "split" | "captureWords" => args.iter().all(Self::fb_word_one_value),
+                // real expansion / capture: refuse
+                "brace" | "listVar" | "arrayItems" | "pipeline" | "capture" => false,
+                _ => args.iter().all(Self::fb_word_one_value),
+            },
+            _ => false,
+        }
+    }
+
     fn fb_call_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
         let sig = Self::fb_sig(cmd)?;
         if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
@@ -18481,7 +18517,16 @@ fn param_copy_alias(
         if words.iter().any(Self::word_needs_glob) {
             return None;
         }
-        if words.iter().any(|w| !Self::word_single_argv(w)) {
+        // Device arguments are VALUES, not argv entries, so the argv
+        // rule does not apply: a `split($x)` lowering (how a bare `$x`
+        // word reaches IrExpr) expands to N words in a child bash but
+        // is exactly one value here. Reusing word_single_argv made
+        // every fb_set_camera with a variable fall back to the shell
+        // site — which is a fork+exec that cannot work, since fb_* are
+        // not executables, so the frame came out black. What must still
+        // be refused is shell-level expansion: glob, brace, and any
+        // word that lowers to a multi-word construct.
+        if words.iter().any(|w| !Self::fb_word_one_value(w)) {
             return None;
         }
         let mut parts: Vec<String> = Vec::new();
