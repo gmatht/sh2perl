@@ -49,7 +49,6 @@ parse-redirect-in-case-pattern.sh	stdout mismatch
 printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
-readonly-cmdsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 realpath-cmdsub.sh	stdout mismatch
 sqs-overlap-multiline-awk.sh	stdout mismatch
 sync-direct-call-await.sh	stdout mismatch
