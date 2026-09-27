@@ -18456,12 +18456,12 @@ fn param_copy_alias(
     fn fb_sig(cmd: &str) -> Option<&'static [char]> {
         // 'i' = int, 'd' = double, 's' = const char*
         match cmd {
-            "fb_open" => Some("ii"),           // w, h
-            "fb_clear" => Some("i"),           // packed ARGB
-            "fb_set_camera" => Some("ddddd"), // x, y, z, yaw, shift
-            "fb_blocks" => Some("s"),          // the batched payload
-            "fb_present" => Some(""),          // no args
-            "fb_dump_ppm" => Some("s"),        // path
+            "fb_open" => Some(&['i', 'i']),           // w, h
+            "fb_clear" => Some(&['i']),                // packed ARGB
+            "fb_set_camera" => Some(&['d'; 5]),        // x, y, z, yaw, shift
+            "fb_blocks" => Some(&['s']),               // the batched payload
+            "fb_present" => Some(&[]),                 // no args
+            "fb_dump_ppm" => Some(&['s']),             // path
             _ => None,
         }
     }
