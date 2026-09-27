@@ -6,6 +6,7 @@
 029_arrays_associative.sh	otranspilerl failed to generate code
 043_home.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
+046_cd..sh	stdout mismatch
 051_primes.sh	stdout mismatch
 058_advanced_bash_idioms.sh	otranspilerl failed to generate code
 062_09_complex_function.sh	stdout mismatch
