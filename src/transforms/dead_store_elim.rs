@@ -667,6 +667,16 @@ fn census_expr(
         IrExpr::Str(s, _) => {
             string_read_names(s, reads);
         }
+        // A getVar nested inside an ext node IS a read. Without this arm the
+        // catch-all below swallowed every `Ext` child, so `p = &x` (the
+        // go-sh AddressOf node) recorded no read of `x`, DSE judged `x`
+        // write-never-read and purged its store — the program printed the
+        // empty string instead of the value (go t101/t108).
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                census_expr(c, reads, writes, escapes, escaping);
+            }
+        }
         _ => {}
     }
 }
@@ -966,5 +976,43 @@ mod tests {
         let mut stmts = prog;
         transform(&mut stmts);
         assert_eq!(stmts.len(), 2, "pipeline-read store dropped: {stmts:?}");
+    }
+
+    /// go-sh t101: `x := "hello"; p := &x; print(*p)` — the ONLY read of
+    /// `x` is the `getVar` nested inside the `AddressOf` ext node. Without
+    /// an `IrExpr::Ext` arm the census never saw that read, judged `x`
+    /// write-never-read and purged the store, so the program printed the
+    /// empty string instead of `hello`.
+    #[test]
+    fn ext_node_nested_getvar_keeps_store() {
+        let address_of = Box::new(crate::shir_nodes::AddressOf {
+            operand: IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![str_("x")],
+            },
+        });
+        let prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("hello"),
+                asm: None,
+            },
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "p".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Ext(address_of),
+                asm: None,
+            },
+        ];
+        let mut stmts = prog;
+        transform(&mut stmts);
+        assert_eq!(stmts.len(), 2, "AddressOf-nested read did not keep the store: {stmts:?}");
     }
 }

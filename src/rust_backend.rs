@@ -4008,7 +4008,18 @@ impl Render {
                         }
                     }
                     let rs_op = self.cmp_op(op);
-                    if self.static_num(lhs) && self.static_num(rhs) {
+                    // An `Arith` operand pins the comparison to NUMBERS.
+                    // The shell `[ a OP b ]` form is a string compare, but a
+                    // BinOp that mixes an arithmetic sub-expression with a
+                    // plain word is the lowered form of an arithmetic
+                    // comparison (`$(( c >= 97 ))`): bash evaluates both
+                    // sides in arithmetic context, so `112` must compare
+                    // against `97` numerically, not as text (go t111's
+                    // `c >= 'a'` read "112" >= "97" and answered false).
+                    let numeric = matches!(lhs.as_ref(), IrExpr::Arith(_))
+                        || matches!(rhs.as_ref(), IrExpr::Arith(_))
+                        || (self.static_num(lhs) && self.static_num(rhs));
+                    if numeric {
                         let (l, r) = (self.expr_num(lhs), self.expr_num(rhs));
                         format!("({l} {rs_op} {r})")
                     } else {
@@ -9314,21 +9325,33 @@ impl Render {
             return "String::new()".to_string();
         };
         let op = str_arg(args, 1).unwrap_or("=").to_string();
+        // a num-typed target keeps the arith write (`x=$(…)` where x is
+        // Int); everything else gets the string value
+        //
+        // The value is rendered ONLY on the branch that consumes it. An eager
+        // `expr_str` followed by the num branch ran the value's side effects
+        // twice (once for the discarded text, once for the num re-render).
+        if self.is_num(&name) || op != "=" {
+            let n = self.assign_call_num(args);
+            self.mark_written(&name);
+            return format!("({n}).to_string()");
+        }
         let val = args
             .get(2)
             .map(|v| self.expr_str(v))
             .unwrap_or_else(|| "String::new()".to_string());
         self.mark_written(&name);
-        // a num-typed target keeps the arith write (`x=$(…)` where x is
-        // Int); everything else gets the string value
-        if self.is_num(&name) || op != "=" {
-            let n = self.assign_call_num(args);
-            format!("({n}).to_string()")
-        } else if self.is_array(&name) {
-            let stmt = self.array_elem_set(&name, "0", &val);
+        if self.is_array(&name) {
+            let stmt = self.array_elem_set(&name, "0", "__v.clone()");
             format!("{{ let __v = {val}; {stmt} __v }}")
         } else {
-            let stmt = self.write_str(&name, &val);
+            // The value is spliced ONCE. `write_str` embeds the expression it
+            // is handed, so naming it in both `let __v = …` and the store
+            // re-evaluated it: a `$(fn)` capture's block runs the function a
+            // second time, and the second run's rc/ret clobbered the first
+            // (`__rc_N = $(f) && …` invoked `f` twice — go t111/t115 read a
+            // verdict the replay had already overwritten). Write the binding.
+            let stmt = self.write_str(&name, "__v.clone()");
             format!("{{ let __v = {val}; {stmt} __v }}")
         }
     }
