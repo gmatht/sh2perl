@@ -1,6 +1,5 @@
 000__04h_complex_examples.sh	stdout mismatch
 008_simple_backup.sh	stdout mismatch
-018_grep_params.sh	stdout mismatch
 043_home.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
 051_primes.sh	stdout mismatch
@@ -50,6 +49,7 @@ parse-redirect-in-case-pattern.sh	stdout mismatch
 printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
+readonly-cmdsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 realpath-cmdsub.sh	stdout mismatch
 sqs-overlap-multiline-awk.sh	stdout mismatch
 sync-direct-call-await.sh	stdout mismatch
