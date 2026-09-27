@@ -31,7 +31,7 @@
 070_cmp_basic.sh	stdout mismatch
 070_gnuisms_thorough.sh	otranspilerl failed to generate code
 091_while_pipe_var.sh	stdout mismatch
-096_head_procsub.sh	stdout mismatch
+096_head_procsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 103_pipeline_failure_multi.sh	stdout mismatch
 arithmetic-vs-command-subshell.sh	stdout mismatch
 at-in-test.sh	otranspilerl failed to generate code
