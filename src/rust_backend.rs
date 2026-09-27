@@ -7001,6 +7001,12 @@ impl Render {
             // is E0507.
             self.emit("let __cap = __SH_RET.lock().unwrap().clone();");
             self.emit("*__SH_RET.lock().unwrap() = String::new();");
+            // retire the capture buffer even on this path: leaving it `Some`
+            // LATCHES __SH_OUT for the rest of the program, so every later
+            // print appends to a dead buffer instead of stdout (t94/t115
+            // printed nothing at all). The restore is unconditional — it was
+            // only ever an artifact of the by-ret branch being added later.
+            self.emit("*__SH_OUT.lock().unwrap() = __old;");
         } else {
             self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
             self.emit("*__SH_OUT.lock().unwrap() = __old;");
