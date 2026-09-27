@@ -31139,6 +31139,15 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         eprintln!("DBG unsafe: {:?}", unsafe_v);
         eprintln!("DBG store_only_var(__fl0) = {}", store_only_var("__fl0"));
     }
+    // Same JS-identifier rule as the LIFTED_NUMERIC/LIFTED_STRING filter
+    // below: a store-only var gets a native `let <name> = null;`
+    // binding, so a reserved-word name (`var`, `let`, `class`, …) would
+    // be a JS syntax error that loses the whole program. Un-lifted, the
+    // var keeps the string-keyed `sh2.vars` store and is unaffected.
+    let store_only: std::collections::HashSet<String> = store_only
+        .into_iter()
+        .filter(|v| is_plain_fn_name_safe(v))
+        .collect();
     *STORE_ONLY_VARS.lock().unwrap() = Some(store_only);
     // Int64 leaf wrapping (the `--true64` machinery, now also the i53
     // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
@@ -31200,6 +31209,25 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let persist_fd1 = ir_has_persist_fd1(prog);
     let mut functions = HashSet::new();
     collect_program_functions(&prog.stmts, &mut functions);
+    // A native binding is emitted as `let <name> = …` / the store-only
+    // prologue's `let <name> = null;`. A shell variable whose name is a
+    // JS reserved word (`var`, `let`, `class`, `in`, …) is perfectly legal
+    // bash — `var=test; eval "$var"` — but `let var = null;` is a JS
+    // SYNTAX ERROR, so the WHOLE program fails to parse and every
+    // statement is lost (heredoc-subshell-redirects.sh,
+    // subshell-heredoc-close.sh, which both name their variable `var`).
+    //
+    // The fix is to NOT lift such a name: a non-lifted var keeps the
+    // `sh2.vars` store protocol, whose key is a string and is therefore
+    // immune to identifier rules. `is_plain_fn_name_safe` is exactly the
+    // existing predicate for "safe as a bare JS identifier" (reserved
+    // words, shadowed globals, generated `__` temps); the function-binding
+    // path already routes through `direct_binding_name`, which renames
+    // rather than refuses — but a VARIABLE cannot be renamed, because its
+    // reads are the bare `Var(name)` expressions. So refuse, don't rename.
+    let js_bindable = |v: &String| is_plain_fn_name_safe(v);
+    let num: HashSet<String> = num.iter().filter(|v| js_bindable(v)).cloned().collect();
+    let str: HashSet<String> = str.iter().filter(|v| js_bindable(v)).cloned().collect();
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     // C typed vars (frontend-emitted var_types): the arith read coercion
