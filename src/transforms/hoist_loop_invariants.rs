@@ -104,15 +104,7 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
-        if std::env::var("SH2_TRACE_HOIST").is_ok() {
-            eprintln!("[hoist] stmt variant={}", variant_name(s));
-        }
         stmt_writes(s, &mut assigned, fns);
-    }
-
-    if std::env::var("SH2_TRACE_HOIST").is_ok() {
-        eprintln!("[hoist] body={} assigned={:?} fns={:?}", body.len(),
-                  assigned, fns.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
     }
     let mut hoisted: Vec<IrStmt> = Vec::new();
     for (j, st) in body.iter().enumerate() {
@@ -133,15 +125,9 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
         // not be hoisted once before the loop. Refuse every body-written
         // input, including the candidate's own name.
         if !expr_pure(expr, fns) {
-            if std::env::var("SH2_TRACE_HOIST").is_ok() {
-                eprintln!("[hoist]   target={} NOT PURE", target);
-            }
             continue;
         }
         let reads = read_set(expr);
-        if std::env::var("SH2_TRACE_HOIST").is_ok() {
-            eprintln!("[hoist]   target={} reads={:?} assigned={:?}", target, reads, assigned);
-        }
         if reads.iter().any(|v| assigned.contains(v)) {
             continue; // loop-carried input (including self)
         }
@@ -439,9 +425,6 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
         // knew that. The call is an `IrStmt::Exec` (a bare command), so
         // the `Expr(Call)` arm above never sees it.
         IrStmt::Exec { cmd, .. } => {
-            if std::env::var("SH2_TRACE_HOIST").is_ok() {
-                eprintln!("[hoist] Exec cmd={:?}", cmd);
-            }
             if let IrExpr::Str(name, _) = cmd {
                 if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
                     let mut inner: HashSet<String> = HashSet::new();
