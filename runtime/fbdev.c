@@ -342,7 +342,55 @@ static void draw_cube(double ox, double oy, double oz,
     if (cb > 255) cb = 255;
     rgb = ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
 
-    for (i = 0; i < 12; i++) {
+    /* PAINTER'S ALGORITHM: draw far faces first.
+     *
+     * The game's /dev/webgl/buffer/cube index order is a fixed
+     * face list, NOT a depth order — with a real depth buffer the GPU
+     * resolves it per pixel, but this device has none. Emitting the
+     * faces in index order therefore lets whichever face happens to
+     * come last in the table paint over the nearer ones, and a cube
+     * collapses to its 0.6/0.8 side faces no matter which way the
+     * camera looks (measured: 2 distinct shades for every camera
+     * position tried — the top and bottom faces are always lost).
+     *
+     * Sorting the 12 triangles by their centroid's view-space depth,
+     * far to near, makes the payload order the draw order, which is
+     * exactly the contract render_frame already relies on when it
+     * emits cubes far-to-near. A stable insertion sort: 12 items. */
+    {
+        int order[12], a, b;
+        double depth[12];
+        for (i = 0; i < 12; i++) {
+            double sx3 = 0, sy3 = 0, sz3 = 0, dsum = 0;
+            int k;
+            for (k = 0; k < 3; k++) {
+                double vx, vy, vz, vw;
+                int vi = CUBE_I[i*3+k];
+                vx = CUBE_P[vi*3+0] * sx / 1000000.0 + ox;
+                vy = CUBE_P[vi*3+1] * sy / 1000000.0 + oy;
+                vz = CUBE_P[vi*3+2] * sz / 1000000.0 + oz;
+                sx3 += vx; sy3 += vy; sz3 += vz;
+            }
+            sx3 /= 3.0; sy3 /= 3.0; sz3 /= 3.0;
+            {
+                double dx = sx3 - C_x, dy = sy3 - (C_y + 0.5), dz = sz3 - C_z;
+                double relz = -dx * C_sin + dz * C_cos;
+                dsum = -relz;                     /* the shader's w */
+            }
+            depth[i] = dsum;
+            order[i] = i;
+        }
+        for (i = 1; i < 12; i++) {              /* descending depth */
+            int t = order[i];
+            double td = depth[t];
+            for (a = i - 1; a >= 0 && depth[order[a]] < td; a--)
+                order[a + 1] = order[a];
+            order[a + 1] = t;
+        }
+        (void)b;
+        for (b = 0; b < 12; b++) {
+            i = order[b];
+            {
         int i0 = CUBE_I[i*3+0] * 3;
         int i1 = CUBE_I[i*3+1] * 3;
         int i2 = CUBE_I[i*3+2] * 3;
@@ -358,6 +406,8 @@ static void draw_cube(double ox, double oy, double oz,
         s1 = CUBE_SHADE[CUBE_I[i*3+1]] / 1000.0;
         s2 = CUBE_SHADE[CUBE_I[i*3+2]] / 1000.0;
         tri_shaded(p0x, p0y, s0, p1x, p1y, s1, p2x, p2y, s2, rgb);
+            }
+        }
     }
 }
 
