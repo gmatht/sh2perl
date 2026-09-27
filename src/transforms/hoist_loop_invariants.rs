@@ -104,7 +104,7 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
-        stmt_writes(s, &mut assigned);
+        stmt_writes(s, &mut assigned, fns);
     }
 
     let mut hoisted: Vec<IrStmt> = Vec::new();
@@ -325,7 +325,9 @@ fn stmt_assigns(st: &IrStmt, var: &str) -> bool {
     }
 }
 
-fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>) {
+/// `fns` are the user-defined shell functions: a CALL to one can write
+/// any global its body assigns, so those names count as body-written.
+fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStmt>)]) {
     match st {
         IrStmt::Assign { targets, expr, .. } => {
             for t in targets {
@@ -356,6 +358,32 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.insert(n.clone());
                 }
+            }
+            // A call to a user-defined shell FUNCTION writes every global
+            // that function's body assigns. Without this the hoist is
+            // UNSOUND, and silently so — the body still looks like it
+            // only writes its own locals:
+            //
+            //     bump() { v=$1; }
+            //     while [ $i -lt 3 ]; do
+            //       bump 5
+            //       d=$(( v * 1000 ))     # hoisted: `v` looks loop-invariant
+            //       printf '%s\n' "$d"
+            //       i=$((i+1))
+            //     done
+            //
+            // prints 5000 three times in bash; the hoisted `d` kept its
+            // pre-loop value 2000, so the native printed 2000 three
+            // times. `v` is only ever written from inside `bump`, and
+            // `stmt_writes` had no idea. Report every name the callee
+            // assigns (one level deep — a nested call is covered by the
+            // same conservatism for that callee's own body).
+            if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == func) {
+                let mut inner: HashSet<String> = HashSet::new();
+                for s2 in fbody {
+                    stmt_writes(s2, &mut inner, fns);
+                }
+                out.extend(inner);
             }
         }
         _ => {}
