@@ -130,42 +130,73 @@ static void t_shade_range(void) {
  * shares no code with fbdev.c (integer arithmetic, no doubles, its
  * own winding normalisation) so a shared bug cannot make the two agree
  * wrongly. */
+/* The reference keeps SUB-PIXEL vertex positions: quantising to whole
+ * pixels first collapses a 34.797-wide triangle onto a 35-pixel
+ * lattice, which changes its coverage entirely (a few-pixel triangle
+ * can lose or gain every pixel). Positions go to 1/256 px as int64
+ * and the edge test is done in that same fixed point, so the whole
+ * oracle stays integer arithmetic with no shared code with fbdev.c. */
+#define REFP 256
+#define REPFIX(v) ((long)llround((v) * REFP))
+
 static int ref_mask(int W, int H, unsigned char *mask,
-                    long ax, long ay, long bx, long by, long cx, long cy) {
+                    double ax, double ay, double bx, double by,
+                    double cx, double cy) {
     long area, minx, maxx, miny, maxy, x, y, n = 0;
-    area = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+    long AX = REPFIX(ax), AY = REPFIX(ay);
+    long BX = REPFIX(bx), BY = REPFIX(by);
+    long CX = REPFIX(cx), CY = REPFIX(cy);
+    area = (BX-AX)*(CY-AY) - (BY-AY)*(CX-AX);
     if (area == 0) return 0;                    /* degenerate */
     if (area < 0) {                             /* normalise winding */
         long t;
-        t = bx; bx = cx; cx = t;
-        t = by; by = cy; cy = t;
+        t = BX; BX = CX; CX = t;
+        t = BY; BY = CY; CY = t;
     }
-    minx = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
-    maxx = ax > bx ? (ax > cx ? ax : cx) : (bx < cx ? bx : cx);
-    miny = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
-    maxy = ay > by ? (ay > cy ? ay : cy) : (by < cy ? by : cy);
+    /* Bounding box in fixed point, clamped to the surface. The loop
+     * must walk WHOLE PIXELS: stepping by REFP from a sub-pixel minx
+     * lands x at 34.797*256, and x/REFP then names a DIFFERENT pixel
+     * than the one whose centre (x + REFP/2) is being tested — which
+     * silently undercounts coverage. Snap the box to the pixel
+     * lattice first, then step one pixel at a time. */
+    minx = AX < BX ? (AX < CX ? AX : CX) : (BX < CX ? BX : CX);
+    maxx = AX > BX ? (AX > CX ? AX : CX) : (BX < CX ? BX : CX);
+    miny = AY < BY ? (AY < CY ? AY : CY) : (BY < CY ? BY : CY);
+    maxy = AY > BY ? (AY > CY ? AY : CY) : (BY < CY ? BY : CY);
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
-    if (maxx > W-1) maxx = W-1;
-    if (maxy > H-1) maxy = H-1;
-    for (y = miny; y <= maxy; y++) for (x = minx; x <= maxx; x++) {
-        long px = x*2+1, py = y*2+1;             /* pixel centre, x2 */
-        long ax2 = ax*2, ay2 = ay*2, bx2 = bx*2, by2 = by*2, cx2 = cx*2, cy2 = cy*2;
-        long e0 = (bx2-ax2)*(py-ay2) - (by2-ay2)*(px-ax2);
-        long e1 = (cx2-bx2)*(py-by2) - (cy2-by2)*(px-bx2);
-        long e2 = (ax2-cx2)*(py-cy2) - (ay2-cy2)*(px-cx2);
-        if (e0 >= 0 && e1 >= 0 && e2 >= 0) { mask[y*W+x] = 1; n++; }
+    if (maxx > (long)W*REFP) maxx = (long)W*REFP - 1;
+    if (maxy > (long)H*REFP) maxy = (long)H*REFP - 1;
+    for (y = (miny / REFP) * REFP; y <= maxy; y += REFP) {
+      for (x = (minx / REFP) * REFP; x <= maxx; x += REFP) {
+        long px = x + REFP/2, py = y + REFP/2;   /* this pixel's centre */
+        long e0 = (BX-AX)*(py-AY) - (BY-AY)*(px-AX);
+        long e1 = (CX-BX)*(py-BY) - (CY-BY)*(px-BX);
+        long e2 = (AX-CX)*(py-CY) - (AY-CY)*(px-CX);
+        if (e0 >= 0 && e1 >= 0 && e2 >= 0) {
+            mask[(y/REFP)*(long)W + (x/REFP)] = 1;
+            n++;
+        }
+      }
     }
     return (int)n;
 }
 
 /* MIMEcroft's 4 distinct corner triangles, verbatim from the
  * aPosition table (the 24-entry index buffer draws each twice). */
-static const int TRI[4][9] = {
-  {-500, 500, 500,  500, 500, -500, -500, -500,  500},
-  { 500,-500,-500, -500, 500,  500,  500, -500,  500},
-  {-500,-500,-500,  500, 500, -500,  500, -500,  500},
-  { 500, 500,-500, -500,-500,  500, -500,  500, -500},
+static const int TRI[12][9] = {
+  {-500,500,500,500,500,500,500,500,-500},
+  {-500,500,500,500,500,-500,-500,500,-500},
+  {-500,-500,500,500,-500,500,500,-500,-500},
+  {-500,-500,500,500,-500,-500,-500,-500,-500},
+  {-500,500,500,500,500,500,500,-500,500},
+  {-500,500,500,500,-500,500,-500,-500,500},
+  {-500,-500,-500,500,-500,-500,500,500,-500},
+  {-500,-500,-500,500,500,-500,-500,500,-500},
+  {500,-500,500,500,500,500,500,500,-500},
+  {500,-500,500,500,500,-500,500,-500,-500},
+  {-500,-500,500,-500,500,500,-500,500,-500},
+  {-500,-500,500,-500,500,-500,-500,-500,-500},
 };
 
 #define EYE_Y 0.5
@@ -177,10 +208,15 @@ static const int TRI[4][9] = {
  * CAMY is the y passed to fb_set_camera; the shader adds a further
  * 0.5 for the eye height, so a hard-coded constant here is a silent
  * half-block vertical error in the REFERENCE only. */
-static void proj_px(double ax, double ay, double ox, double oy, double oz,
-                    double camy, double W, double H, double *X, double *Y) {
-    double wx = ax/1000.0 + ox, wy = ay/1000.0 + oy, wz = oz/1000.0 + oz;
-    double dx = wx - 0.0, dy = wy - (camy + 0.5), dz = wz - 0.0;
+static void proj_px(double ax, double ay, double az,
+                    double ox, double oy, double oz,
+                    const double *cam, double W, double H, double *X, double *Y) {
+    double wx = ax/1000.0 + ox, wy = ay/1000.0 + oy, wz = az/1000.0 + oz;
+    /* The eye sits at (camPos + (0, 1/2, 0)) — all THREE components.
+     * Hard-coding the x/z at 0 (a plausible-looking shortcut) makes the
+     * reference project every off-centre camera to the origin, so the
+     * oracle silently "disagrees" on exactly the cases that matter. */
+    double dx = wx - cam[0], dy = wy - (cam[1] + 0.5), dz = wz - cam[2];
     double rad = 180.0 * 3.14159265358979323846 / 180.0;
     double c = cos(rad), s = sin(rad);
     double relx = dx*c + dz*s, relz = -dx*s + dz*c, w = -relz;
@@ -230,27 +266,35 @@ static void t_ref_agrees(void) {
         if (devn == 0) { continue; }   /* off-screen: nothing to compare */
         used++;
         memset(mask, 0, (size_t)W * H);
-        for (t = 0; t < 4; t++) {
+        for (t = 0; t < 12; t++) {
             double p0x, p0y, p1x, p1y, p2x, p2y;
-            proj_px(TRI[t][0], TRI[t][1], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c][1], W, H, &p0x, &p0y);
-            proj_px(TRI[t][3], TRI[t][4], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c][1], W, H, &p1x, &p1y);
-            proj_px(TRI[t][6], TRI[t][7], cubes[i][0], cubes[i][1], cubes[i][2],
-                    cams[c][1], W, H, &p2x, &p2y);
-            ref_mask(W, H, mask,
-                    (long)floor(p0x+0.5), (long)floor(p0y+0.5),
-                    (long)floor(p1x+0.5), (long)floor(p1y+0.5),
-                    (long)floor(p2x+0.5), (long)floor(p2y+0.5));
+            proj_px(TRI[t][0], TRI[t][1], TRI[t][2], cubes[i][0], cubes[i][1], cubes[i][2],
+                    cams[c], W, H, &p0x, &p0y);
+            proj_px(TRI[t][3], TRI[t][4], TRI[t][5], cubes[i][0], cubes[i][1], cubes[i][2],
+                    cams[c], W, H, &p1x, &p1y);
+            proj_px(TRI[t][6], TRI[t][7], TRI[t][8], cubes[i][0], cubes[i][1], cubes[i][2],
+                    cams[c], W, H, &p2x, &p2y);
+            ref_mask(W, H, mask, p0x, p0y, p1x, p1y, p2x, p2y);
         }
-        /* The device draws each of the 4 triangles TWICE (the 24-entry
-         * index table), so compare the DEVICE's union against the
-         * reference's union. Comparing one triangle's pixels against
-         * the union image is the trap that made an earlier revision of
-         * this test pass wrongly. */
-        for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
-            if (dev[y*W+x] != mask[y*W+x]) mismatch++;
-            compared++;
+        /* Compare the DEVICE's union against the reference's union.
+         * Never one triangle's pixels against the whole image: the cube
+         * is a closed shell, so 11 of the 12 triangles lie BEHIND the
+         * front faces and are overdrawn. That per-triangle comparison
+         * against the union is exactly the trap that made an earlier
+         * revision of this test pass wrongly. */
+        {
+            int case_mis = 0, dev_on = 0, ref_on = 0;
+            for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+                if (dev[y*W+x] != mask[y*W+x]) { case_mis++; mismatch++; }
+                if (dev[y*W+x]) dev_on++;
+                if (mask[y*W+x]) ref_on++;
+                compared++;
+            }
+            if (case_mis)
+                printf("    case cube(%.0f,%.0f,%.0f) cam(%.0f,%.1f,%.0f): "
+                       "%d mismatch (dev %d px, ref %d px)\n",
+                       cubes[i][0],cubes[i][1],cubes[i][2],
+                       cams[c][0],cams[c][1],cams[c][2], case_mis, dev_on, ref_on);
         }
       }
     }

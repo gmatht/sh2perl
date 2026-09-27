@@ -61,37 +61,42 @@ static double   C_x, C_y, C_z, C_yaw, C_shift;
 static double   C_cos, C_sin;
 
 /* ── MIMEcroft's cube geometry ──────────────────────────────────────
- * aPosition and aShade transcribed VERBATIM from MIMEcroft.sh's
- * /dev/webgl/buffer/aPosition and aShade writes (12 vertices =
- * 4 faces x 3, indexed by the 24-entry /dev/webgl/buffer/cube table),
- * both ×1000.
+ * Generated VERBATIM from MIMEcroft.sh's own buffer writes:
+ *   /dev/webgl/buffer/aPosition  24 verts x (x,y,z), x1000
+ *   /dev/webgl/buffer/aShade     24 verts x (r,g,b), x1000 (grey)
+ *   /dev/webgl/buffer/cube       36 uint16 indices = 12 triangles
+ * Transcribing these by hand is how the first version came out with 12
+ * vertices and 12 triangles drawing an open wedge instead of a cube.
  *
- * SIGNED, and int16 not char: these are ±500, so a signed char wraps
- * +500 to -12 and every vertex lands on garbage. The C backend's
- * emit path uses %hhu for uint8_t — a coordinate must never travel in
- * a narrow type.
+ * SIGNED, and int16 not char: aPosition is +/-500, and a signed char
+ * wraps +500 to -12, so every vertex lands on garbage. The C backend's
+ * emit path uses %hhu for uint8_t — a coordinate must never travel in a
+ * narrow type.
  *
- * aShade is 0..1000, NOT 0..1. Clamping a 0..1 range is what flattens
- * every face to solid white. */
-static const int16_t CUBE_P[36] = {
-  -500,  500,  500,  500,  500, -500, -500, -500,  500,
-   500, -500, -500, -500,  500,  500,  500, -500,  500,
-  -500, -500, -500,  500,  500, -500,  500, -500,  500,
-   500,  500, -500, -500, -500,  500, -500,  500, -500,
+ * aShade is 0..1000, NOT 0..1. Clamping a 0..1 range flattens every
+ * face to solid white; the real span here is 500..1000 (the 0.5
+ * bottom, 0.6/0.8 sides, 1.0 top). */
+static const int16_t CUBE_P[72] = {
+  -500, 500, 500, 500, 500, 500, 500, 500, -500,
+  -500, 500, -500, -500, -500, 500, 500, -500, 500,
+  500, -500, -500, -500, -500, -500, -500, 500, 500,
+  500, 500, 500, 500, -500, 500, -500, -500, 500,
+  -500, -500, -500, 500, -500, -500, 500, 500, -500,
+  -500, 500, -500, 500, -500, 500, 500, 500, 500,
+  500, 500, -500, 500, -500, -500, -500, -500, 500,
+  -500, 500, 500, -500, 500, -500, -500, -500, -500,
 };
 
-static const int16_t CUBE_SHADE[36] = {
-  1000, 1000, 1000, 1000, 1000, 1000,  500, 500, 500,
-   500,  500,  500,  600,  600, 600,  600, 600, 600,
-   800,  800,  800,  800,  800, 800,  800, 800, 800,
-   800,  800,  800,  600,  600, 600,  600, 600, 600,
+static const int16_t CUBE_SHADE[24] = {
+  1000, 1000, 1000, 1000, 500, 500, 500, 500, 600,
+  600, 600, 600, 800, 800, 800, 800, 800, 800,
+  800, 800, 600, 600, 600, 600,
 };
 
-/* The 24 index pairs that turn those 12 vertices into 12 triangles:
- * verbatim from /dev/webgl/buffer/cube. */
-static const uint8_t CUBE_I[48] = {
-  0,1,2, 0,2,3,  4,5,6, 4,6,7,  8,9,10, 8,10,11,
-  0,1,2, 0,2,3,  4,5,6, 4,6,7,  8,9,10, 8,10,11,
+static const uint8_t CUBE_I[36] = {
+  0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7,
+  8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15,
+  16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
 };
 
 /* ── backend open/close ───────────────────────────────────────────── */
@@ -287,16 +292,22 @@ static void tri_shaded(double x0, double y0, double s0,
     }
 }
 
-/* Project one vertex: aPosition(±500, ×1000) + obj centre, through the
- * game's own pipeline, to a pixel. Returns 0 when the vertex is behind
- * the near plane (culled by the caller). */
+/* Project one vertex through the game's pipeline, to a pixel.
+ *
+ * SCALE CONTRACT — this is the shader's arithmetic exactly
+ * (www/examples/mimecroft-vertex.sh:45):
+ *     wx = ap_x * usc_x / 1000000.0 + uop_x / 1000.0
+ * aPosition is MILLI (±500 = half a block) and uScale is MILLI (1000 =
+ * a full block), so the product needs 1e6, not 1e3. Dividing by 1e3
+ * makes every cube 1000x too big: one block at 4 deep then spans the
+ * whole screen and a 320x240 frame comes out 76800 lit pixels. */
 static int project(double apx, double apy, double apz,
                    double ox, double oy, double oz,
                    double sx, double sy, double sz,
                    double *outx, double *outy) {
-    double wx = apx * sx / 1000.0 + ox;
-    double wy = apy * sy / 1000.0 + oy;
-    double wz = apz * sz / 1000.0 + oz;
+    double wx = apx * sx / 1000000.0 + ox;
+    double wy = apy * sy / 1000000.0 + oy;
+    double wz = apz * sz / 1000000.0 + oz;
     double dx = wx - C_x, dy = wy - (C_y + 0.5), dz = wz - C_z;
     double relx = dx * C_cos + dz * C_sin;
     double rely = dy;
@@ -343,9 +354,9 @@ static void draw_cube(double ox, double oy, double oz,
                      ox, oy, oz, sx, sy, sz, &p1x, &p1y)) continue;
         if (!project(CUBE_P[i2+0], CUBE_P[i2+1], CUBE_P[i2+2],
                      ox, oy, oz, sx, sy, sz, &p2x, &p2y)) continue;
-        s0 = CUBE_SHADE[i0+0] / 1000.0;
-        s1 = CUBE_SHADE[i1+0] / 1000.0;
-        s2 = CUBE_SHADE[i2+0] / 1000.0;
+        s0 = CUBE_SHADE[CUBE_I[i*3+0]] / 1000.0;
+        s1 = CUBE_SHADE[CUBE_I[i*3+1]] / 1000.0;
+        s2 = CUBE_SHADE[CUBE_I[i*3+2]] / 1000.0;
         tri_shaded(p0x, p0y, s0, p1x, p1y, s1, p2x, p2y, s2, rgb);
     }
 }
@@ -368,10 +379,10 @@ void fb_blocks(const char *payload) {
             v[n++] = d;
             p = end;
         }
-        /* v[0..2] centre, v[3..5] scale, v[6..8] colour, v[9] tex,
-         * v[10] damage. The scale is ×1000 in the payload? NO — the
-         * payload carries WORLD-UNIT scale (1 for a full block), and
-         * project() takes ×1000, so multiply here. */
+        /* v[0..2] centre (world units), v[3..5] scale (world units: 1 =
+         * a full block), v[6..8] colour 0..1, v[9] block type, v[10]
+         * damage. The scale crosses into project() as MILLI (×1000),
+         * matching the shader's usc_* — the one place it converts. */
         draw_cube(v[0], v[1], v[2], v[3] * 1000.0, v[4] * 1000.0, v[5] * 1000.0,
                   v[6], v[7], v[8]);
     }
