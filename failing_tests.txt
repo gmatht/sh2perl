@@ -49,6 +49,7 @@ for-loop-dollar-at.sh	otranspilerl failed to generate code
 grep_p.sh	stdout mismatch
 heredoc-binary-data.sh	stdout mismatch, exit code (bash=0 perl=4)
 heredoc-unclosed.sh	stdout mismatch
+id-cmdsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 mixed-quoting.sh	otranspilerl failed to generate code
 param-expand-hashhash.sh	otranspilerl failed to generate code
 parse-arithmetic-extra-paren.sh	stdout mismatch
