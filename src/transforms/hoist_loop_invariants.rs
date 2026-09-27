@@ -104,6 +104,9 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
+        if std::env::var("SH2_TRACE_HOIST").is_ok() {
+            eprintln!("[hoist] stmt variant={}", variant_name(s));
+        }
         stmt_writes(s, &mut assigned, fns);
     }
 
@@ -332,6 +335,17 @@ fn stmt_assigns(st: &IrStmt, var: &str) -> bool {
         IrStmt::Declare { vars, .. } => vars.iter().any(|v| v.name == var),
         IrStmt::DeclareArray { var: v, .. } => v == var,
         _ => false,
+    }
+}
+
+pub(crate) fn variant_name(s: &IrStmt) -> &'static str {
+    match s {
+        IrStmt::Expr(_) => "Expr",
+        IrStmt::Exec { .. } => "Exec",
+        IrStmt::Assign { .. } => "Assign",
+        IrStmt::While { .. } => "While",
+        IrStmt::If { .. } => "If",
+        _ => "other",
     }
 }
 
