@@ -529,6 +529,40 @@ impl<'a> Walker<'a> {
                 self.expr(rhs);
             }
             IrExpr::Call { func, args } => {
+                // A TEXTUAL arithmetic body: the frontend keeps `(( … ))` /
+                // `$(( … ))` as a source string (`arith("i++ + ++i")`)
+                // when it has not been parsed into an `ArithAst`. An
+                // assignment target or `++`/`--` operand in that text is
+                // a WRITE — `let i` plus a later `i = …` needs
+                // `let mut`, or the store is E0384. `arith_text` re-parses
+                // it and attributes both shapes; it must be tested before
+                // the generic arms below, which only see a string.
+                if func == "arith" || func == "arithEval" {
+                    for a in args {
+                        self.arith_text(a);
+                    }
+                    return;
+                }
+                // A value-position assignment word (`echo … || X=0`,
+                // `(( … X=1 ))`): the frontend lowers a bare `NAME=val`
+                // to `assign(NAME, "=", val)` rather than an `Assign`
+                // statement. args[0] is the TARGET, so it is a WRITE —
+                // recorded here the way the `Assign` arm records its
+                // targets. Walking it as an ordinary argument mentioned
+                // it as a plain read, so a name written twice (`X="test"`
+                // then `X=0`) saw a single write and was declared
+                // immutable (E0384).
+                if func == "assign" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if is_ident_word(name) {
+                            self.mention_write(name);
+                        }
+                    }
+                    for a in args.iter().skip(1) {
+                        self.expr(a);
+                    }
+                    return;
+                }
                 // `local x=...` / `declare x=...` (and friends): the
                 // `name=` head word BINDS the name — route through the
                 // decl walk so the write is attributed to the current
@@ -658,6 +692,29 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Walk a TEXTUAL arithmetic body (`arith("i++ + ++i")`). The shared
+    /// `parse_arith` recovers the same AST the renderer sees, so
+    /// assignment targets and `++`/`--` operands are attributed as WRITES.
+    /// An unparseable body degrades to plain reads (conservative: it can
+    /// only widen a name toward global storage, never miscompile).
+    fn arith_text(&mut self, e: &IrExpr) {
+        if let IrExpr::Str(t, _) = e {
+            match crate::shir::parse_arith(t) {
+                Some(a) => {
+                    self.arith(&a);
+                    return;
+                }
+                None => {
+                    for v in all_idents(t) {
+                        self.mention(&v);
+                    }
+                    return;
+                }
+            }
+        }
+        self.expr(e);
+    }
+
     fn arith(&mut self, a: &ArithAst) {
         match a {
             ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
@@ -677,10 +734,19 @@ impl<'a> Walker<'a> {
                 self.arith(else_);
             }
             ArithAst::Assign { var, rhs, .. } => {
-                self.mention(var);
+                self.mention_write(var);
                 self.arith(rhs);
             }
-            ArithAst::IncDec { var, .. } => self.mention(var),
+            // `i++` / `++i` MUTATES i: a pass-2 local bound by an earlier
+            // assignment must be declared `let mut`, or the later store
+            // fails to compile (E0384). Both a write AND a read (the
+            // postfix form yields the old value), so record the write
+            // first — a bare `mention` under-counted writes and dropped
+            // the name from `need_mut`.
+            ArithAst::IncDec { var, .. } => {
+                self.mention_write(var);
+                self.mention(var);
+            }
             ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }

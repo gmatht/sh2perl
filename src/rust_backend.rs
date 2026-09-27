@@ -135,6 +135,17 @@ fn borrow_word(w: &str) -> String {
     format!("&{}", Render::unparen(w))
 }
 
+/// A rendered word that yields a `&str` rather than an owned `String` —
+/// the shape the renderer emits for a binding over a literal array
+/// (`for n in a b; do` → `for n in ["a", "b"]` binds `n: &'static str`).
+/// Such a word cannot be handed to a `String` parameter directly, and the
+/// non-direct (`Vec<String>` assembly) call path is not taken either — the
+/// whole call is elided there. Coerce at the boundary instead: the
+/// parameter type is what forces the copy, and it happens once per call.
+fn owned_str_word(w: &str) -> String {
+    format!("{}.to_string()", Render::unparen(w))
+}
+
 /// The bare literal text when a rendered word is `<"…">.to_string()` (the
 /// form the renderer emits for a string constant), else None. A literal is
 /// `&'static str`, so it needs no allocation and no borrow of a temporary
@@ -1501,6 +1512,28 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
                             out.entry(v.name.clone()).or_insert_with(|| key.clone());
                         }
                     }
+                    IrStmt::If { cond, then, elsifs, else_ }
+                        if Render::ternary_binding_shape(cond, then, elsifs, else_) =>
+                    {
+                        // A TERNARY binding (`if c { a } else { b }`) is not a
+                        // `let x = "lit"` binding, so it has no entry above and
+                        // survives the filter below by default — but the const
+                        // verdict still calls it immutable, and the ternary path
+                        // then binds it as `&str` from bare arms. The name must
+                        // record a NON-literal key so it is dropped from
+                        // `borrowable_vars`: the arms are a computed `if`
+                        // expression, not a borrowed literal, and the value is
+                        // read straight into a `String` sink
+                        // (`__sh_print_words(&[vec![ok]], …)` — E0308).
+                        if let Some(name) = Render::ternary_binding_name(then, else_) {
+                            out.entry(name).or_insert_with(|| "ternary".to_string());
+                        }
+                        find_bindings(then, out);
+                        for (_, b) in elsifs {
+                            find_bindings(b, out);
+                        }
+                        find_bindings(else_, out);
+                    }
                     IrStmt::If { then, elsifs, else_, .. } => {
                         find_bindings(then, out);
                         for (_, b) in elsifs {
@@ -2109,6 +2142,40 @@ impl Render {
         } else {
             base
         }
+    }
+
+    /// A BARE `return` (no value) in the function currently being rendered.
+    /// A function whose value is consumed carries `-> String`, where a plain
+    /// `return;` is E0069 — yield the sticky `__SH_RET` cell instead, which
+    /// is exactly what the value-tail below the body already returns. Every
+    /// other context (a `()` function, a thread/procsub body) keeps `return;`.
+    fn bare_return(&self) -> String {
+        if self.in_function
+            && self.in_closure == 0
+            && self
+                .active_fn
+                .as_deref()
+                .is_some_and(|n| self.fn_value_used.contains(n))
+        {
+            "return __SH_RET.lock().unwrap().clone();".to_string()
+        } else {
+            "return;".to_string()
+        }
+    }
+
+    /// The function currently being rendered carries a `-> String`
+    /// signature, so a trailing `echo V` is the function's RETURN VALUE,
+    /// not output. Mirrors `bare_return`'s guard — the C frontend lowers
+    /// `return V` to a trailing `echo V`, so the value has to land in the
+    /// sticky `__SH_RET` cell (a plain print would both lose the value
+    /// and emit a spurious line — t107's `pair()`).
+    fn in_value_fn(&self) -> bool {
+        self.in_function
+            && self.in_closure == 0
+            && self
+                .active_fn
+                .as_deref()
+                .is_some_and(|n| self.fn_value_used.contains(n))
     }
 
     /// Strip one fully-enclosing matched `( … )` pair (safe in any
@@ -2752,11 +2819,75 @@ impl Render {
         format!("{m}.with(|v| v.borrow().clone())")
     }
 
+    /// True when `expr_str` will hand back a BARE native loop binding
+    /// (a `&str` borrowed from a static list) rather than an owned
+    /// `String`. Sinks with a `&[String]` / `Vec<String>` signature
+    /// (printf, the word printer) must `.to_string()` those; `{}`-format
+    /// contexts must not, so the coercion lives at the sink.
+    fn needs_owned_str(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => self
+                .active_loop
+                .iter()
+                .rev()
+                .any(|(v, b, k)| v == name && *k == LoopBind::Str && v == b),
+            IrExpr::Call { func, args } if func == "getVar" => args
+                .first()
+                .and_then(|a| match a {
+                    IrExpr::Str(n, _) => Some(n.as_str()),
+                    _ => None,
+                })
+                .is_some_and(|n| {
+                    self.active_loop
+                        .iter()
+                        .rev()
+                        .any(|(v, b, k)| v == n && *k == LoopBind::Str && v == b)
+                }),
+            _ => false,
+        }
+    }
+
+    /// A positional parameter read in an OWNED-`String` sink, when the
+    /// shared borrow verdict made it a `&str` parameter. `getvar_str` yields
+    /// the bare borrow (`p0`) for a `StrRef` param — correct for `{}`-format
+    /// and `&s` contexts, but `__sh_print_words` takes `&[Vec<String>]`, so
+    /// the word must own its `String` (E0308, t83's `echo "$1"` in a
+    /// borrow-only body). `.to_string()` at the sink; the core verdict
+    /// stays untouched because the same borrow is right everywhere else.
+    fn owned_positional_word(&mut self, e: &IrExpr) -> Option<String> {
+        let name = match e {
+            IrExpr::Str(n, _) | IrExpr::Var(n, _) | IrExpr::Ident(n) => n.as_str(),
+            IrExpr::Call { func, args } if func == "getVar" || func == "param" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => n.as_str(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let i: usize = name.parse().ok()?;
+        if i == 0 {
+            return None; // $0 is the script name, not a parameter
+        }
+        let i = i - 1;
+        let ci = self.shifted_param(i).unwrap_or(i);
+        self.probe_str(ci);
+        match self.fn_param(ci) {
+            // the borrowed case: the sink needs an owned String
+            Some((b, FnParamTy::StrRef)) => Some(format!("{b}.to_string()")),
+            // owned params already clone; Num already stringifies
+            _ => None,
+        }
+    }
+
     /// A string read where an OWNED `String` is required (a `Vec<String>`
     /// element, a store) rather than a borrow. `read_str` returns a `&str`
     /// for a borrowable local; this converts it back for the contexts that
-    /// need ownership (`vec![…]` word lists, the runtime helpers that take
-    /// `String`).
+    /// need ownership.
     fn read_str_owned(&mut self, name: &str) -> String {
         let s = self.read_str(name);
         if self.local_vars.contains_key(name) && self.borrowable_vars.contains(name) {
@@ -2857,6 +2988,24 @@ impl Render {
         }
         let m = self.tls(name);
         format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
+    }
+
+    /// Store a ternary binding (`if c { a } else { b }`) into the name's
+    /// SHELL storage. The name may be a pass-2 local OR a thread-local
+    /// static, so this must go through the same dispatcher every other
+    /// write uses — `local_write_stmt` alone emits a bare `name = …;`,
+    /// which for a static is E0070 (invalid left-hand side) plus an
+    /// E0308 against the `LocalKey`. That mismatch is exactly what a
+    /// lowered `switch`/`case` flag hit: the IR names the flag
+    /// `__sw_0`, its only write is the ternary, and it never becomes a
+    /// local (a conditional write can't be proven single-scope), so the
+    /// binding fell through to the static path as a bare assignment.
+    fn ternary_store(&mut self, name: &str, binding: &str, numeric: bool) -> String {
+        if numeric {
+            self.write_num(name, binding)
+        } else {
+            self.write_str(name, binding)
+        }
     }
 
     /// Bind a string loop variable from a STATIC word list: the element
@@ -3113,10 +3262,25 @@ impl Render {
         )
     }
 
-    /// Assoc-map read.
+    /// Assoc-map read. The map is `BTreeMap<String, String>`, so `get`
+    /// takes `&Q` where `String: Borrow<Q>` — that admits `Q = str` (a
+    /// `&str` key) and `Q = String` (an owned key), but NOT `Q = &str`.
+    /// The blanket `&` this used to emit was E0277 for every key. A
+    /// `&str` key is a bare `rust_str` literal (`"name"`); anything the
+    /// key builders actually produce is an owned `String`
+    /// (`rust_str_expr` appends `.to_string()`, `getvar_str` returns a
+    /// `String`), and a temporary one must be borrowed as a WHOLE
+    /// expression — `&k.to_string()` would be a borrow of the `&str`
+    /// receiver, not of the `String` the key is.
     fn assoc_get(&mut self, name: &str, key: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().get(&{key}).cloned().unwrap_or_default())")
+        let k = Self::unparen(key);
+        let arg = if k.starts_with('"') && !k.ends_with(".to_string()") {
+            k.to_string()
+        } else {
+            format!("&({k})")
+        };
+        format!("{m}.with(|v| v.borrow().get({arg}).cloned().unwrap_or_default())")
     }
 
     fn assoc_set(&mut self, name: &str, key: &str, val: &str) -> String {
@@ -3413,8 +3577,16 @@ impl Render {
                         self.add_helper("len");
                         // `__sh_len` takes `&str`; a borrowable local IS a
                         // `&str` already, so hand it over without a
-                        // `.to_string()` round-trip.
-                        let s = self.read_str(name);
+                        // `.to_string()` round-trip. A NUMERIC local is
+                        // the exception: `read_str` returns its i64
+                        // binding, so `&x` would be `&i64` (E0308, t04's
+                        // `len=${#x}` over `x=42`). Route it through
+                        // `getvar_str`, which stringifies a numeric local.
+                        let s = if self.is_num(name) {
+                            self.getvar_str(name)
+                        } else {
+                            self.read_str(name)
+                        };
                         return format!("__sh_len(&{})", Render::unparen(&s));
                     }
                 }
@@ -3941,6 +4113,22 @@ impl Render {
             IrExpr::Call { func, args } if func == "assign" => {
                 // run the assignment; the lhs's rc (e.g. a capture's)
                 // decides the condition
+                //
+                // A write hidden in a CONDITION (`if __rc_0 = $(f) && [ … ]`)
+                // targets a pass-2 local, so the write renders as the
+                // STATEMENT `let __rc_0 = …;`. `assign_call_str` splices that
+                // between `let __v =` and `__v`, which buries the declaration
+                // inside the value's own block — it dies at that block's
+                // closing brace and the `&&` chain that follows can't name it
+                // (E0425). Force the target to a `__SHV_` cell here: the write
+                // is a `.with(…)` statement, so no declaration is owed and the
+                // binding survives the block.
+                if let Some(name) = str_arg(args, 0).map(|s| s.to_string()) {
+                    if self.is_local(&name) {
+                        self.local_vars.remove(&name);
+                        self.local_init.remove(&name);
+                    }
+                }
                 let block = self.assign_call_str(args);
                 format!("{{ let _ = {block}; __SH_RC.load(Ordering::SeqCst) == 0 }}")
             }
@@ -3951,16 +4139,17 @@ impl Render {
                 // the original behaviour.
                 if let Some(v) = args.first() {
                     let v = self.expr_str(v);
-                    // evaluate the value BEFORE locking __SH_RET — a
-                    // value that is itself a fnValue call (recursive
-                    // param/… dispatch) would re-lock __SH_RET while the
-                    // outer assignment holds it (Mutex re-entrancy
-                    // deadlock — polyfills brace/param)
+                    // evaluate the value BEFORE locking __SH_RET — a value
+                    // that is itself a fnValue call (recursive param/…)
+                    // dispatch would re-lock __SH_RET while the outer
+                    // assignment holds it (Mutex re-entrancy deadlock —
+                    // polyfills brace/param)
                     format!(
-                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst); return; }}"
+                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst); {} }}",
+                        self.bare_return()
                     )
                 } else {
-                    "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                    format!("{{ __SH_RC.store(0, Ordering::SeqCst); {} }}", self.bare_return())
                 }
             }
             IrExpr::Call { func, args: _ } if func == "break" => {
@@ -4162,6 +4351,31 @@ impl Render {
                         }
                     }
                     "String::new()".into()
+                }
+                // A dynamic type assertion is a CHECKED PASSTHROUGH
+                // (type_assert.node): the value flows through unchanged
+                // and `kind` names the expected dynamic kind. The
+                // comma-ok boolean is NOT here — the frontend emits its
+                // own `typeof(x) == kind` comparison (folded by the
+                // `typeof` arm above), so the assert itself only has to
+                // carry the value. t100's `s, ok := v.(string)` needs
+                // `s` = the dynamic value, not an empty string.
+                "TypeAssert" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::TypeAssert>()
+                        .expect("tag/type agree");
+                    self.expr_str(&x.expr)
+                }
+                // Value-only passthrough — see the word-context arm for the
+                // rationale (address_of.node / deref.node).
+                "Deref" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::Deref>()
+                        .expect("tag/type agree");
+                    self.expr_str(&x.pointer)
+                }
+                "AddressOf" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::AddressOf>()
+                        .expect("tag/type agree");
+                    self.expr_str(&x.operand)
                 }
                 _ => "String::new()".into(),
             }
@@ -4987,8 +5201,23 @@ impl Render {
             }
             "printf" => {
                 let fmt = words.first().map(|w| self.expr_str(w)).unwrap_or_default();
-                let arg_exprs: Vec<String> =
-                    words.iter().skip(1).map(|w| self.expr_str(w)).collect();
+                // `__sh_printf` takes `&[String]`, but a native loop
+                // binding is handed over BARE (a `&str` borrowed from the
+                // literal list, which `{}` formats directly). Coerce
+                // those at the sink so the borrow stays borrow.
+                let arg_exprs: Vec<String> = words
+                    .iter()
+                    .skip(1)
+                    .map(|w| {
+                        let owned = self.needs_owned_str(w);
+                        let e = self.expr_str(w);
+                        if owned {
+                            format!("{e}.to_string()")
+                        } else {
+                            e
+                        }
+                    })
+                    .collect();
                 self.add_helper("printf");
                 // see printf_stmt: __sh_printf always references __sh_printf_b
                 self.add_helper("printf_b");
@@ -5516,7 +5745,12 @@ impl Render {
                 }
             }
             IrExpr::Call { func, .. } if func == "return" => {
-                self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
+                // A function whose value is consumed carries `-> String`,
+                // so the trailing bare `return;` after the value-producing
+                // statement is E0069 — `bare_return()` yields the sticky
+                // __SH_RET cell instead. A `()` function keeps `return;`.
+                let br = self.bare_return();
+                self.emit(&format!("__SH_RC.store(0, Ordering::SeqCst); {br}"));
             }
             _ => {
                 let x = self.expr_any(e);
@@ -5856,6 +6090,11 @@ impl Render {
             }
             IrExpr::Int(i) => format!("vec![{}.to_string()]", Self::atom_or_paren(&int_lit(*i))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                // a borrowed `&str` POSITIONAL param needs an owned String in
+                // this `Vec<String>` sink (see owned_positional_word)
+                if let Some(w) = self.owned_positional_word(e) {
+                    return format!("vec![{w}]");
+                }
                 if self.declared(name) || self.captured.contains_key(name) {
                     if self.is_num(name) {
                         format!("vec![{}.to_string()]", self.read_num(name))
@@ -5894,6 +6133,22 @@ impl Render {
                 let _ = b;
                 "Vec::new()".to_string()
             }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                // a borrowed `&str` POSITIONAL param needs an owned String in
+                // this `Vec<String>` sink (see owned_positional_word)
+                if let Some(w) = self.owned_positional_word(e) {
+                    return format!("vec![{w}]");
+                }
+                args.first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(name, _) => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .map_or_else(
+                        || "vec![String::new()]".to_string(),
+                        |name| format!("vec![{}]", self.getvar_str(name)),
+                    )
+            }
             IrExpr::Call { func, args } => self.call_words(func, args),
             IrExpr::Capture { .. } => {
                 let c = self.capture_expr_single(e);
@@ -5916,6 +6171,22 @@ impl Render {
                     let k = self.expr_num(key);
                     format!("vec![{}]", self.array_index_strict(var, &k))
                 }
+            }
+            // `*p` on a value-only backend is a PASSTHROUGH (deref.node):
+            // rust is a value language here — the store holds the value
+            // itself, so a read through the reference is the read of the
+            // slot. `AddressOf` is the same by construction (it stores
+            // the value under the pointer's name), so `&x` also just
+            // yields `x`.
+            IrExpr::Ext(n) if n.tag() == "Deref" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::Deref>()
+                    .expect("tag/type agree");
+                format!("vec![{}]", self.expr_str(&x.pointer))
+            }
+            IrExpr::Ext(n) if n.tag() == "AddressOf" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::AddressOf>()
+                    .expect("tag/type agree");
+                format!("vec![{}]", self.expr_str(&x.operand))
             }
             IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
@@ -5947,7 +6218,18 @@ impl Render {
                     "vec![String::new()]".to_string()
                 }
             }
-            "param" => self.param_words(args),
+            "param" => {
+                // a borrowed `&str` POSITIONAL param needs an owned String in
+                // this `Vec<String>` sink (see owned_positional_word)
+                let p = IrExpr::Call {
+                    func: "param".to_string(),
+                    args: args.to_vec(),
+                };
+                if let Some(w) = self.owned_positional_word(&p) {
+                    return format!("vec![{w}]");
+                }
+                self.param_words(args)
+            }
             "listVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     self.listvar_words(name)
@@ -6124,6 +6406,29 @@ impl Render {
                         "vec![String::new()]".to_string()
                     }
                 }
+            }
+            "strReplaceAll" => {
+                // word context: the same total replacement, as a 1-word list
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let from = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                let to = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("vec![{text}.replace(&{from}, &{to})]")
+            }
+            "chr" => {
+                // Go `string(c)` over a byte/rune is chr, not identity
+                // (t111): a code point becomes the one-character string.
+                // The out-of-range value is Go's replacement char, which
+                // `char::from_u32` already yields as None -> U+FFFD.
+                let c = args.first().map(|a| self.expr_num(a)).unwrap_or_default();
+                format!("vec![char::from_u32(({c}) as u32).map_or('\\u{{fffd}}'.to_string(), |c| c.to_string())]")
+            }
+            "byteAt" => {
+                // Go `s[i]` on a string indexes BYTES; the result is the
+                // byte's numeric value, so t111's `s[0] == 'a'` compares
+                // 97 with 97 rather than comparing text.
+                let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let i = args.get(1).map(|a| self.expr_num(a)).unwrap_or_default();
+                format!("vec![{s}.as_bytes().get(({i}) as usize).map_or(0i64, |b| *b as i64).to_string()]")
             }
             _ => {
                 self.mark_todo(&format!("word call {func}"));
@@ -6665,6 +6970,13 @@ impl Render {
 
     /// Native capture: run the statements with the output buffer active.
     fn capture_block(&mut self, stmts: &[IrStmt]) -> String {
+        // A USER-FUNCTION call does not write `__SH_OUT` — its value is
+        // handed back through the sticky `__SH_RET` cell (see
+        // `fn_call_value`). Reading `__SH_OUT` here therefore captured an
+        // empty buffer and silently produced "" for `q=$(f)`, dropping the
+        // whole assignment (t94's `q, _ := divmod(17, 5)` printed a blank
+        // line). Read the seam the callee actually wrote.
+        let via_ret = self.is_fn_capture(stmts);
         let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
@@ -6682,10 +6994,28 @@ impl Render {
             self.stmt(s);
         }
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
-        self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
-        self.emit("*__SH_OUT.lock().unwrap() = __old;");
+        if via_ret {
+            // the callee returned through __SH_RET, not the output buffer.
+            // clone out of the guard: `__SH_RET.lock().unwrap()` yields a
+            // MutexGuard<String>, and moving the String out of the guard
+            // is E0507.
+            self.emit("let __cap = __SH_RET.lock().unwrap().clone();");
+            self.emit("*__SH_RET.lock().unwrap() = String::new();");
+        } else {
+            self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
+            self.emit("*__SH_OUT.lock().unwrap() = __old;");
+        }
         self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
-        self.emit("let mut __s = String::from_utf8_lossy(&__cap).to_string();");
+        // __cap is a String on the __SH_RET path and a Vec<u8> on the
+        // output-buffer path — only the latter needs the lossy decode
+        // (the former is already text; calling from_utf8_lossy on it was
+        // E0308, and the by-ret captures are the common case for a
+        // Go-shaped `f() string` callee).
+        if via_ret {
+            self.emit("let mut __s = __cap;");
+        } else {
+            self.emit("let mut __s = String::from_utf8_lossy(&__cap).to_string();");
+        }
         self.emit("while __s.ends_with('\\n') { __s.pop(); }");
         self.emit("__s");
         let block = self.out.join("\n");
@@ -6885,7 +7215,7 @@ impl Render {
         let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
-        let cond_block = self.cond_block(&cond);
+        let cond_block = Self::unwrap_cond(&self.cond_block(&cond));
         // bash: a while whose condition never tests true exits 0;
         // otherwise the loop's rc = the last body command's rc (the cond
         // eval clobbers __SH_RC, so the body's rc is captured + restored)
@@ -7587,8 +7917,7 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            // the param is String: hand over the rendered word
-                            FnParamTy::Str => (*w).to_string(),
+                            FnParamTy::Str => owned_str_word(w),
                             FnParamTy::StrRef => borrow_word(w),
                             // the param is i64: the word is a String expr — the
                             // callee's signature forces a parse at the boundary
@@ -7613,7 +7942,18 @@ impl Render {
         let constr = if cat {
             format!("__sh_cat(&[{}])", ws.join(", "))
         } else {
-            format!("vec![{}]", ws.join(", "))
+            // Every argument is a SINGLE-element `vec![word]`, and
+            // `__a` is a flat `Vec<String>`: `vec![a, b]` over the
+            // un-unwrapped vecs would NEST them into
+            // `Vec<Vec<String>>` (E0308, 063_19's multi-line
+            // `complex_function --opt=v …` argv). Unwrap each to its
+            // lone element instead. A multi-element vec is a SPLAT and
+            // never reaches here — that sets `cat` above.
+            let words: Option<Vec<&str>> = ws.iter().map(|w| Self::vec_of_one(w)).collect();
+            match words {
+                Some(unwrapped) => format!("vec![{}]", unwrapped.join(", ")),
+                None => format!("vec![{}]", ws.join(", ")),
+            }
         };
         let args = Self::fn_call_args(sig);
         format!("{{ let __a: Vec<String> = {constr}; {m}({args}) }}")
@@ -7648,7 +7988,7 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            FnParamTy::Str => (*w).to_string(),
+                            FnParamTy::Str => owned_str_word(w),
                             FnParamTy::StrRef => borrow_word(w),
                             FnParamTy::Num => {
                                 format!("({w}).trim().parse::<i64>().unwrap_or(0)")
@@ -8067,6 +8407,45 @@ impl Render {
         Some(s)
     }
 
+    /// The value a value-function's trailing `echo` produces: the words
+    /// joined by a space, with the trailing newline INCLUDED. The C
+    /// reference strips the trailing newline in `_sh_ret_val` because
+    /// `$( )` had already eaten it; here the cell is read directly by
+    /// the caller, so keep the same bytes the print path would have
+    /// written and let `fn_value_used`'s consumers strip as needed.
+    fn join_parts_as_value(parts: &[Part], nl: bool, esc: bool) -> String {
+        // Every word a single element (the common `echo "$x"` shape):
+        // concatenate directly, no Vec<Vec<String>> round-trip.
+        if let Some(s) = parts.iter().map(|p| match p {
+            Part::Lit(t) => Some(Self::rust_str_expr(t)),
+            Part::Words(_) => None,
+        }).collect::<Option<Vec<_>>>() {
+            let mut expr = s.join(" + \" \" + ");
+            if nl {
+                expr.push_str(" + \"\\n\"");
+            }
+            return format!("String::from({expr})");
+        }
+        // Mixed/array words: build the same `Vec<Vec<String>>` the print
+        // path would, join it exactly as `__sh_print_words` does, and
+        // append the newline.
+        let ws: Vec<String> = parts
+            .iter()
+            .map(|p| match p {
+                Part::Lit(t) => format!("vec![{}]", Self::rust_str_expr(t)),
+                Part::Words(w) => w.clone(),
+            })
+            .collect();
+        let mut expr = format!(
+            "__sh_join_words(&[{}])",
+            ws.join(", ")
+        );
+        if nl {
+            expr.push_str(" + \"\\n\"");
+        }
+        format!("String::from({expr})")
+    }
+
     /// Compile-time `-e` unescape — delegates to the SHARED definition
     /// ([`crate::shir_passes::echo_fold::echo_esc`]) so the renderer and
     /// the `--shir` contract can never drift.
@@ -8175,6 +8554,21 @@ impl Render {
 
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
         self.word_fail_guard = false;
+        // In a value-convention function this `echo V` IS the return
+        // value (the C frontend lowers `return V` to a trailing echo).
+        // Materialise the words into __SH_RET instead of printing them.
+        if self.in_value_fn() {
+            let (parts, nl, _esc) = self.echo_parts(words);
+            let needs_helper = parts.iter().any(|p| matches!(p, Part::Words(_)));
+            if needs_helper {
+                self.add_helper("join_words");
+            }
+            let joined = Self::join_parts_as_value(&parts, nl, false);
+            self.emit(&format!(
+                "let __v = {joined}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst);"
+            ));
+            return;
+        }
         let (parts, nl, esc) = self.echo_parts(words);
         // Constant-echo fast path: when every word is a compile-time
         // literal (no expansion, no glob, no arith guard), the whole
@@ -8313,7 +8707,17 @@ impl Render {
                     self.add_helper("split_ifs");
                     format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
                 }
-                w => format!("vec![{}]", self.expr_str(w)),
+                w => {
+                    // `vec![…]` is a `Vec<String>`, so a bare native
+                    // loop binding (a `&str`) must be owned here
+                    let owned = self.needs_owned_str(w);
+                    let e = self.expr_str(w);
+                    if owned {
+                        format!("vec![{e}.to_string()]")
+                    } else {
+                        format!("vec![{e}]")
+                    }
+                }
             })
             .collect();
         self.add_helper("printf");
@@ -8673,10 +9077,48 @@ impl Render {
             ),
             "join" => self.join_str(args),
             "listVar" => self.listvar_joined(args),
+            // `listGet(coll, i)` — the LIST is carried as one string joined
+            // on \x1e (the renderer-wide list convention, same separator
+            // the multi-return seam writes). Reading element `i` is a
+            // native `split('\x1e')` + index; an out-of-range index yields
+            // the empty string, which is what a Go index panic prints as
+            // the zero value for the String case. Lowering this natively
+            // turns the most common corpus stub (11 occurrences) into a
+            // real element read instead of a dropped statement.
+            "listGet" => {
+                let coll = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let idx = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "0".into());
+                // The `coll` String is bound to a `let` first: collecting
+                // `&str` out of a temporary would leave the `Vec<&str>`
+                // borrowing a value dropped at the end of the statement
+                // (E0716). Owning it keeps the borrow live to the `.len()`.
+                format!(
+                    "({{ let __lc: String = {coll}; \
+                     let __l: Vec<&str> = __lc.split('\\u{{1e}}').collect(); \
+                     let __i: i64 = {idx}.trim().parse::<i64>().unwrap_or(0); \
+                     if __i >= 0 && (__i as usize) < __l.len() {{ __l[__i as usize].to_string() }} \
+                     else {{ String::new() }} }})"
+                )
+            }
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 self.add_helper("split_ifs");
                 format!("__sh_split_ifs(&{s}, \" \\t\\n\").join(\" \")")
+            }
+            // `strSplit(s, sep)` — the list-producing half of the \x1e list
+            // convention. Its result is consumed by `listGet` (and the
+            // `\x1e`-joined rendering of a list), so it must rejoin on \x1e
+            // here or the index read above would look at the wrong string.
+            // An empty separator is a Go error, not a per-char split; keep
+            // the whole string as the single element.
+            "strSplit" => {
+                let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let sep = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!(
+                    "({{ let __ss: String = {s}; let __sp: String = {sep}; \
+                     if __sp.is_empty() {{ __ss }} \
+                     else {{ __ss.split(&__sp as &str).collect::<Vec<&str>>().join(\"\\u{{1e}}\") }} }})"
+                )
             }
             "brace" => {
                 let w = self.brace_words(args);
@@ -8728,6 +9170,15 @@ impl Render {
                 let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 let suffix = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
                 format!("(if {text}.ends_with(&{suffix}) {{ \"1\" }} else {{ \"0\" }}).to_string()")
+            }
+            "strReplaceAll" => {
+                // Go's strings.ReplaceAll(s, old, new) — every occurrence.
+                // Rust's `str::replace` is the same total-function
+                // replacement, so it lowers directly.
+                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let from = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                let to = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
+                format!("{text}.replace(&{from}, &{to})")
             }
             "setArray" | "setArrayAppend" => {
                 // an array assign in expr context — run it, yield ""
@@ -8919,6 +9370,35 @@ impl Render {
             {
                 Self::decl_words_write(args, name)
             }
+            // A write hidden in a CONDITION (`if __rc_0 = $(f)`) runs in
+            // statement position — the `assign` renders inline in the `if`
+            // header, so the `let` is owed HERE, not in any block body. The
+            // frontend lowers a Go `bool`-valued call used as a condition
+            // to exactly this shape, so without this arm the name is a
+            // pass-2 local whose declaration is never seeded and every
+            // later write is a bare assignment to an undeclared binding
+            // (E0425).
+            IrStmt::If { cond, .. } => Self::expr_writes_var(cond, name),
+            IrStmt::While { cond, .. } => Self::expr_writes_var(cond, name),
+            IrStmt::ForInit { cond, .. } | IrStmt::DoWhile { cond, .. } => {
+                Self::expr_writes_var(cond, name)
+            }
+            _ => false,
+        }
+    }
+
+    /// The `setVar`/`assign` target of an EXPRESSION-position write — the
+    /// condition-position counterpart of [`Self::stmt_writes_var`].
+    fn expr_writes_var(e: &IrExpr, name: &str) -> bool {
+        match e {
+            IrExpr::Call { func, args } if matches!(func.as_str(), "setVar" | "assign") => {
+                matches!(args.first(), Some(IrExpr::Str(n, _)) if n == name)
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::expr_writes_var(lhs, name) || Self::expr_writes_var(rhs, name)
+            }
+            IrExpr::Call { args, .. } => args.iter().any(|a| Self::expr_writes_var(a, name)),
+            IrExpr::Array(items) => items.iter().any(|a| Self::expr_writes_var(a, name)),
             _ => false,
         }
     }
@@ -8962,6 +9442,23 @@ impl Render {
         else_: &[IrStmt],
     ) -> bool {
         Self::ternary_rhs(then, else_).is_some() && elsifs.is_empty()
+    }
+
+    /// The `&self`-free shape half of [`Self::ternary_binding`], for the
+    /// binding-analysis pass (which has no renderer to borrow).
+    fn ternary_binding_shape(
+        cond: &IrExpr,
+        then: &[IrStmt],
+        elsifs: &[(IrExpr, Vec<IrStmt>)],
+        else_: &[IrStmt],
+    ) -> bool {
+        let _ = cond;
+        Self::ternary_rhs(then, else_).is_some() && elsifs.is_empty()
+    }
+
+    /// The name a ternary binds, if the arms are a ternary binding.
+    fn ternary_binding_name(then: &[IrStmt], else_: &[IrStmt]) -> Option<String> {
+        Self::ternary_rhs(then, else_).map(|(n, _, _)| n)
     }
 
     /// `(name, then-rhs, else-rhs)` for a ternary shape, the RHSs left as IR
@@ -9303,7 +9800,11 @@ impl Render {
                     }
                 }
                 IrExpr::Call { func, args: _ } if func == "return" => {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
+                    // same E0069 guard as the other statement dispatcher:
+                    // a value-convention function (`-> String`) needs the
+                    // sticky __SH_RET return, not a bare `return;`.
+                    let br = self.bare_return();
+                    self.emit(&format!("__SH_RC.store(0, Ordering::SeqCst); {br}"));
                 }
                 _ => {
                     let x = self.expr_any(e);
@@ -9666,7 +10167,7 @@ impl Render {
                             bare(&Self::unparen(&tc).to_string()),
                             bare(&Self::unparen(&ec).to_string())
                         );
-                        let st = self.local_write_stmt(&name, &binding);
+                        let st = self.ternary_store(&name, &binding, numeric);
                         self.emit(&st);
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         return;
@@ -9690,7 +10191,7 @@ impl Render {
                     let ce = self.expr_bool(cond);
                     let binding =
                         format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
-                    let st = self.local_write_stmt(&name, &binding);
+                    let st = self.ternary_store(&name, &binding, numeric);
                     self.emit(&st);
                     self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                     return;
@@ -9837,7 +10338,12 @@ impl Render {
                 }
             }
             IrStmt::While { cond, body } => {
-                let c = self.expr_bool(cond);
+                // same as `if`: the loop head consumes the condition as a
+                // BOOLEAN, so the `{ let __b = …; store; __b }` status
+                // wrapper is dead and must be peeled — kept, it leaves a
+                // half-open block (`while (cond); store; __b {`) that does
+                // not compile.
+                let c = Self::unwrap_cond(&self.expr_bool(cond));
                 // bash: a while whose condition never tests true exits 0;
                 // otherwise the loop's rc = the last body command's rc —
                 // the cond eval stores its own rc every iteration, so the
@@ -10176,6 +10682,16 @@ impl Render {
                                     "for {b} in {iter}.iter().map(|__s| __s.trim().parse::<i64>().unwrap_or(0)) {{"
                                 )),
                                 (Some(b), false) => {
+                                    // The loop var binds the element
+                                    // DIRECTLY — no Vec, no store, no
+                                    // per-iteration clone. `iter` is a
+                                    // borrowed `[&str; N]` literal (or
+                                    // `a.iter()` for a local), so `b` is a
+                                    // REFERENCE; a `&str` is what every
+                                    // read wants (`{}` formats it), and the
+                                    // sinks that genuinely need ownership
+                                    // (printf's `&[String]`) coerce it there
+                                    // — see `needs_owned_str`.
                                     self.emit(&format!("{attr}for {b} in {iter} {{"))
                                 }
                                 (None, _) => self.emit(&format!("for {elem_g} in {iter} {{")),
@@ -10184,11 +10700,18 @@ impl Render {
                             self.loop_depth += 1;
                             self.depth += 1;
                             // the value handed to the shell variable's
-                            // storage (only needed when it escapes)
-                            let elem_expr = if is_num {
-                                format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)")
-                            } else {
+                            // storage (only needed when it escapes). An
+                            // int-list iterable already binds i64, so its
+                            // element needs no parse — and it is bound
+                            // under the var/gensym name, NOT the
+                            // `elem_g` that only exists on the
+                            // non-native (write-back) path.
+                            let elem_expr = if !is_num {
                                 format!("{elem_g}.to_string()")
+                            } else if int_list {
+                                binding.clone().unwrap_or_else(|| elem_g.clone())
+                            } else {
+                                format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)")
                             };
                             // The per-iteration write-back keeps the shell
                             // variable's value (bash leaves the loop var
@@ -10299,6 +10822,30 @@ impl Render {
                     // pass-3: the sticky __SH_RET cell becomes the return
                     // value (nested calls observe identical state: stores
                     // still land in the cell, bare returns re-read it)
+                    //
+                    // A function NOTHING consumes the value of is a
+                    // STATUS-returning function (`is_prime`'s `return 1` /
+                    // `return 0`, read by `if is_prime $n` through $?).
+                    // The frontend emits that `Return` exactly like a
+                    // value return, so the verdict decides: with no
+                    // `-> String` on the signature a `return __v` cannot
+                    // compile (E0308), and `return 0` is a status, not a
+                    // string. Store it as the exit code instead.
+                    let value_used = self
+                        .active_fn
+                        .as_deref()
+                        .is_some_and(|n| self.fn_value_used.contains(n));
+                    if !value_used {
+                        if let Some(x) = e {
+                            let n = self.expr_num(x);
+                            self.emit(&format!(
+                                "__SH_RC.store(({n}) as i32, Ordering::SeqCst); return;"
+                            ));
+                        } else {
+                            self.emit("return;");
+                        }
+                        return;
+                    }
                     if let Some(x) = e {
                         let r = self.expr_str(x);
                         self.emit(&format!(
@@ -10311,9 +10858,13 @@ impl Render {
                 }
                 if let Some(x) = e {
                     let n = self.expr_num(x);
-                    self.emit(&format!("__SH_RC.store(({n}) as i32, Ordering::SeqCst); return;"));
+                    self.emit(&format!(
+                        "__SH_RC.store(({n}) as i32, Ordering::SeqCst); {}",
+                        self.bare_return()
+                    ));
                 } else {
-                    self.emit("return;");
+                    let r = self.bare_return();
+                    self.emit(&r);
                 }
             }
             IrStmt::Continue => {
@@ -11280,7 +11831,7 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "join_words", "puts", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
@@ -11564,6 +12115,24 @@ fn helper_source(h: &str) -> &'static str {
         return;
     }
     print!("{}", s);
+}"#,
+        // The value-only half of `__sh_print_words`: the same word join,
+        // returned instead of written. A value-function's trailing `echo`
+        // produces its RETURN VALUE (the C frontend lowers `return V` to
+        // a trailing echo), so the value must be materialised without
+        // touching stdout or any redirect sink. Callers append the
+        // trailing newline themselves.
+        "join_words" => r#"fn __sh_join_words(ws: &[Vec<String>]) -> String {
+    let mut s = String::new();
+    let mut first = true;
+    for w in ws {
+        for x in w {
+            if !first { s.push(' '); }
+            first = false;
+            s.push_str(x);
+        }
+    }
+    s
 }"#,
         // Same signature and call sites as `print_words`, but with the
         // `-e` branch compiled out: emitted when no echo in the program
@@ -13443,9 +14012,14 @@ impl<'a, 'r> TestParser<'a, 'r> {
                                 format!("({l} != {r})")
                             };
                         }
-                    } else {
-                        self.render.add_helper("globlike");
                     }
+                    // BOTH the constant-metachar fold above and the
+                    // fall-through below emit a `__sh_glob_like` call, so the
+                    // helper must be registered unconditionally — a
+                    // constant-with-metachar RHS (which falls through the
+                    // fold) never entered the old `else` arm and produced a
+                    // call to an unemitted fn (E0425).
+                    self.render.add_helper("globlike");
                     self.render.add_helper("fnmatch");
                     if eq {
                         format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ __sh_fnmatch(&__r, &{l}) }} else {{ {l} == __r }} }}")
@@ -17096,10 +17670,43 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
         ambiguous: &std::collections::HashSet<String>,
         used: &mut std::collections::HashSet<String>,
     ) {
+        walk_stmts_in(stmts, defined, ambiguous, used, false)
+    }
+
+    /// A capture body is a VALUE position, but one statement deeper: a bare
+    /// `exec(f, …)` line inside `$( … )` / ` ` ` ` / a pipeline stage IS the
+    /// captured text, and the renderer lowers such a body as an in-process
+    /// value call (`is_fn_capture` → `fn_call_value` → reads `__SH_RET`).
+    /// Without this, `value_used` would be false, the signature would drop
+    /// `-> String`, and the body's `return __v` would not compile (E0308).
+    fn walk_stmts_in(
+        stmts: &[IrStmt],
+        defined: &std::collections::HashSet<String>,
+        ambiguous: &std::collections::HashSet<String>,
+        used: &mut std::collections::HashSet<String>,
+        in_capture: bool,
+    ) {
         for s in stmts {
             match s {
-                // a bare statement-position call: the value is discarded
+                // a bare statement-position call: the value is discarded —
+                // UNLESS this statement IS a capture body (see
+                // `walk_stmts_in`), where the call is the captured text.
                 IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    if in_capture {
+                        if matches!(func.as_str(), "fnValue" | "fnCall") {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                if defined.contains(n) {
+                                    used.insert(n.clone());
+                                }
+                            }
+                        } else if matches!(func.as_str(), "exec" | "builtin") {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                if defined.contains(n) {
+                                    used.insert(n.clone());
+                                }
+                            }
+                        }
+                    }
                     if matches!(func.as_str(), "exec" | "builtin") {
                         if let Some(IrExpr::Str(n, _)) = args.first() {
                             // …but its ARGUMENTS are value positions
@@ -17178,8 +17785,9 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
                     }
                 }
                 IrStmt::Pipeline { stages, .. } => {
+                    // a stage is a capture body: `f | …` consumes f's value
                     for st in stages {
-                        walk_stmts(st, defined, ambiguous, used);
+                        walk_stmts_in(st, defined, ambiguous, used, true);
                     }
                 }
                 IrStmt::Case { discriminant, clauses } => {
@@ -17237,7 +17845,7 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
                 if func == "capture" {
                     if let Some(a) = args.first() {
                         if let IrExpr::Arrow(body) = a {
-                            walk_stmts(body, defined, ambiguous, used);
+                            walk_stmts_in(body, defined, ambiguous, used, true);
                         }
                     }
                 }
@@ -17248,7 +17856,7 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
             IrExpr::Capture { expr, .. } => {
                 match &**expr {
                     // the capture's body value IS the captured text
-                    IrExpr::Arrow(body) => walk_stmts(body, defined, ambiguous, used),
+                    IrExpr::Arrow(body) => walk_stmts_in(body, defined, ambiguous, used, true),
                     other => walk_expr(other, defined, ambiguous, used),
                 }
             }

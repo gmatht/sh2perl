@@ -1146,9 +1146,20 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
     })
 }
 
+/// An explicit JSON `null` means the same as an absent list: the A1
+/// emitter serialises an empty `IrExpr::Array` as `{"type":"Array",
+/// "elements":null}` (serde's `Vec` → `null` for empty), and a command
+/// with no words (`pair()` capturing an empty tail) hits that shape.
+/// Refusing it made every such program RENDER-ERR before the renderer
+/// ever ran — t107/t108/t110.
+fn null_is_empty(x: &Value) -> bool {
+    x.is_null()
+}
+
 fn exprs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrExpr>, String> {
     match v {
         None => Ok(vec![]),
+        Some(x) if null_is_empty(x) => Ok(vec![]),
         Some(x) => arr(Some(x), where_)?
             .iter()
             .enumerate()

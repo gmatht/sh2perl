@@ -15,6 +15,10 @@ wasi-lib = []
 name = "convert_examples"
 path = "src/bin/convert_examples.rs"
 
+[[bin]]
+name = "rust_backend"
+path = "src/bin/rust_backend.rs"
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
