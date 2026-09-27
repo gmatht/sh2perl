@@ -1,7 +1,5 @@
 000__04h_complex_examples.sh	stdout mismatch
 008_simple_backup.sh	stdout mismatch
-012_process_substitution.sh	exit code (bash=0 perl=124)
-018_grep_params.sh	exit code (bash=0 perl=124)
 043_home.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
 051_primes.sh	stdout mismatch

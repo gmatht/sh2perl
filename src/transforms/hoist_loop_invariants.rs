@@ -388,12 +388,27 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
             // `Exec` arm. The call reaches the hoist in BOTH shapes: a
             // bare command inside a loop is `IrStmt::Exec`, and a call
             // in an expression/`if` position is `IrStmt::Expr(Call)`.
-            if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == func) {
-                let mut inner: HashSet<String> = HashSet::new();
-                for s2 in fbody {
-                    stmt_writes(s2, &mut inner, fns);
+            // The command name is `args[0]` for the `exec` lowering
+            // (a bare command in an expression position), and `func`
+            // itself for a direct call.
+            {
+                let callee: Option<String> = if func == "exec" {
+                    match args.first() {
+                        Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                        _ => None,
+                    }
+                } else {
+                    Some(func.clone())
+                };
+                if let Some(name) = callee {
+                    if let Some((_, fbody)) = fns.iter().find(|(n, _)| *n == name) {
+                        let mut inner: HashSet<String> = HashSet::new();
+                        for s2 in fbody {
+                            stmt_writes(s2, &mut inner, fns);
+                        }
+                        out.extend(inner);
+                    }
                 }
-                out.extend(inner);
             }
             // `x=$1` inside a function body lowers to `getVar("x")`, so
             // the name shows up as a call ARGUMENT rather than as an
