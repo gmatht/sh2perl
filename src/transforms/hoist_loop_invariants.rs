@@ -130,9 +130,15 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
         // not be hoisted once before the loop. Refuse every body-written
         // input, including the candidate's own name.
         if !expr_pure(expr, fns) {
+            if std::env::var("SH2_TRACE_HOIST").is_ok() {
+                eprintln!("[hoist]   target={} NOT PURE", target);
+            }
             continue;
         }
         let reads = read_set(expr);
+        if std::env::var("SH2_TRACE_HOIST").is_ok() {
+            eprintln!("[hoist]   target={} reads={:?} assigned={:?}", target, reads, assigned);
+        }
         if reads.iter().any(|v| assigned.contains(v)) {
             continue; // loop-carried input (including self)
         }
@@ -393,7 +399,7 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
         // the `Expr(Call)` arm above never sees it.
         IrStmt::Exec { cmd, .. } => {
             if std::env::var("SH2_TRACE_HOIST").is_ok() {
-                eprintln!("[hoist] Exec cmd={:?} fns={:?}", cmd, fns.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
+                eprintln!("[hoist] Exec cmd={:?}", cmd);
             }
             if let IrExpr::Str(name, _) = cmd {
                 if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
