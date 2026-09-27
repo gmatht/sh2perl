@@ -422,7 +422,7 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
         // `v` is only ever written from inside `bump`, and nothing here
         // knew that. The call is an `IrStmt::Exec` (a bare command), so
         // the `Expr(Call)` arm above never sees it.
-        IrStmt::Exec { cmd, .. } => {
+        IrStmt::Exec { cmd, args, .. } => {
             if let IrExpr::Str(name, _) = cmd {
                 if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
                     let mut inner: HashSet<String> = HashSet::new();
@@ -431,6 +431,135 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
                     }
                     out.extend(inner);
                 }
+            }
+            for a in args {
+                writes_of_expr(a, out, fns);
+            }
+        }
+        // Recurse into the COMPOUND statements. Without these a call
+        // nested in a CONDITION is invisible, and `if ! step 5; then
+        // break; fi` writes through `step` exactly as `step 5` does.
+        // That is the shape MIMEcroft's game loop uses: the per-frame
+        // state (`px`, `pz`, `dyaw`) is written by a called function
+        // from inside an `if` condition, so `dpcx_ms=$((px*1000))` looked
+        // loop-invariant, ran ONCE before the loop, and the camera
+        // stayed frozen at its starting cell for the whole run (the
+        // maze drew, but 14 culled cubes differed from real bash on
+        // every frame).
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            writes_of_expr(cond, out, fns);
+            for b in then {
+                stmt_writes(b, out, fns);
+            }
+            for (_, b) in elsifs {
+                for x in b {
+                    stmt_writes(x, out, fns);
+                }
+            }
+            for b in else_ {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::While { cond, body } => {
+            writes_of_expr(cond, out, fns);
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+            writes_of_expr(cond, out, fns);
+        }
+        IrStmt::For { iter, body, .. } => {
+            writes_of_expr(iter, out, fns);
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::Case { discriminant, clauses, .. } => {
+            writes_of_expr(discriminant, out, fns);
+            for c in clauses {
+                for s in &c.body {
+                    stmt_writes(s, out, fns);
+                }
+            }
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            for x in b {
+                stmt_writes(x, out, fns);
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for x in inner {
+                stmt_writes(x, out, fns);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The write set of an EXPRESSION, as far as the hoist is concerned:
+/// the store calls and user-function calls it contains. Conditions are
+/// exactly where a `step`/`apply` call hides in a game-loop body, so
+/// this path is what keeps the hoist sound there.
+fn writes_of_expr(e: &IrExpr, out: &mut HashSet<String>, fns: &[(String, Vec<IrStmt>)]) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if matches!(func.as_str(), "setVar" | "setArray" | "setArrayAppend" | "assign") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+            }
+            // the command name is `func` for a direct call and `args[0]`
+            // for the `exec` lowering of a bare command
+            let callee: Option<String> = if func == "exec" {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                    _ => None,
+                }
+            } else {
+                Some(func.clone())
+            };
+            if let Some(name) = callee {
+                if let Some((_, fbody)) = fns.iter().find(|(n, _)| *n == name) {
+                    let mut inner: HashSet<String> = HashSet::new();
+                    for s2 in fbody {
+                        stmt_writes(s2, &mut inner, fns);
+                    }
+                    out.extend(inner);
+                }
+            }
+            for a in args {
+                writes_of_expr(a, out, fns);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            writes_of_expr(lhs, out, fns);
+            writes_of_expr(rhs, out, fns);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            writes_of_expr(cond, out, fns);
+            writes_of_expr(then, out, fns);
+            writes_of_expr(else_, out, fns);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            writes_of_expr(expr, out, fns);
+            writes_of_expr(default, out, fns);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    writes_of_expr(x, out, fns);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => writes_of_expr(expr, out, fns),
+        IrExpr::Index { key, .. } => writes_of_expr(key, out, fns),
+        IrExpr::Array(items) => {
+            for it in items {
+                writes_of_expr(it, out, fns);
             }
         }
         _ => {}
