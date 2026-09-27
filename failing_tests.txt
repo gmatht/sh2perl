@@ -1,4 +1,3 @@
-000__04c_text_processing_commands.sh	stdout mismatch
 000__04h_complex_examples.sh	otranspilerl failed to generate code
 005_args.sh	otranspilerl failed to generate code
 008_simple_backup.sh	stdout mismatch
@@ -74,6 +73,7 @@ positional-dollar-at-params.sh	otranspilerl failed to generate code
 printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
+readonly-cmdsub.sh	stdout mismatch
 realpath-cmdsub.sh	otranspilerl failed to generate code
 single-quote-embed-escape.sh	otranspilerl failed to generate code
 sqs-overlap-multiline-awk.sh	otranspilerl failed to generate code
