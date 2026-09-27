@@ -18446,20 +18446,28 @@ fn param_copy_alias(
     /// Conservative, like uu: no env-prefix Object arg, no glob words,
     /// and every word must lower to exactly one C value — a draw
     /// payload is a plain word in practice.
-    fn fb_primitive(cmd: &str) -> Option<&'static str> {
+    ///
+    /// ARGUMENT TYPES ARE PER-PRIMITIVE, not all-strings. A shell word
+    /// is a string, so the generic `value_c` path renders `fb_open("64",
+    /// "48")` — passing string literals to `int` parameters. That
+    /// compiles (tcc is permissive) and then silently does the wrong
+    /// thing at runtime. Each primitive declares its C signature here
+    /// and every argument goes through the matching coercion.
+    fn fb_sig(cmd: &str) -> Option<&'static [char]> {
+        // 'i' = int, 'd' = double, 's' = const char*
         match cmd {
-            "fb_open" => Some("fb_open"),
-            "fb_clear" => Some("fb_clear"),
-            "fb_set_camera" => Some("fb_set_camera"),
-            "fb_blocks" => Some("fb_blocks"),
-            "fb_present" => Some("fb_present"),
-            "fb_dump_ppm" => Some("fb_dump_ppm"),
+            "fb_open" => Some("ii"),           // w, h
+            "fb_clear" => Some("i"),           // packed ARGB
+            "fb_set_camera" => Some("ddddd"), // x, y, z, yaw, shift
+            "fb_blocks" => Some("s"),          // the batched payload
+            "fb_present" => Some(""),          // no args
+            "fb_dump_ppm" => Some("s"),        // path
             _ => None,
         }
     }
 
     fn fb_call_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
-        let cname = Self::fb_primitive(cmd)?;
+        let sig = Self::fb_sig(cmd)?;
         if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
             return None;
         }
@@ -18467,7 +18475,7 @@ fn param_copy_alias(
             Some(IrExpr::Array(items)) => items,
             _ => return None,
         };
-        if words.is_empty() {
+        if words.len() != sig.len() {
             return None;
         }
         if words.iter().any(Self::word_needs_glob) {
@@ -18477,19 +18485,23 @@ fn param_copy_alias(
             return None;
         }
         let mut parts: Vec<String> = Vec::new();
-        for w in words {
-            match w {
-                IrExpr::Str(s, _) => {
-                    if Self::static_needs_shell(s) {
-                        return None;
-                    }
-                    parts.push(Self::cstr(s))
-                }
-                _ => parts.push(self.value_c(w)),
+        for (w, ty) in words.iter().zip(sig.iter()) {
+            match (ty, w) {
+                ('i', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
+                ('s', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
+                // integers: fb_open's w/h and the packed clear colour
+                // are written as plain decimal words in the script.
+                ('i', _) => parts.push(self.value_num(w)),
+                // doubles: the camera uniforms. atof-style coercion, so
+                // "0.5" and "$cy" both work.
+                ('d', _) => parts.push(format!("atof({})", self.value_c(w))),
+                ('s', IrExpr::Str(s, _)) => parts.push(Self::cstr(s)),
+                ('s', _) => parts.push(self.value_c(w)),
+                _ => return None,
             }
         }
         self.need_fb = true;
-        Some(format!("{cname}({})", parts.join(", ")))
+        Some(format!("{}({})", cmd, parts.join(", ")))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
