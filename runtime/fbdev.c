@@ -364,7 +364,7 @@ static void draw_cube(double ox, double oy, double oz,
             double sx3 = 0, sy3 = 0, sz3 = 0, dsum = 0;
             int k;
             for (k = 0; k < 3; k++) {
-                double vx, vy, vz, vw;
+                double vx, vy, vz;
                 int vi = CUBE_I[i*3+k];
                 vx = CUBE_P[vi*3+0] * sx / 1000000.0 + ox;
                 vy = CUBE_P[vi*3+1] * sy / 1000000.0 + oy;
@@ -373,7 +373,7 @@ static void draw_cube(double ox, double oy, double oz,
             }
             sx3 /= 3.0; sy3 /= 3.0; sz3 /= 3.0;
             {
-                double dx = sx3 - C_x, dy = sy3 - (C_y + 0.5), dz = sz3 - C_z;
+                double dx = sx3 - C_x, dz = sz3 - C_z;
                 double relz = -dx * C_sin + dz * C_cos;
                 dsum = -relz;                     /* the shader's w */
             }
