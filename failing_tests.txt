@@ -20,7 +20,6 @@
 063_hard_to_parse.sh	stdout mismatch
 064_01_complex_nested_subshells.sh	stdout mismatch
 064_07_complex_array_operations.sh	stdout mismatch
-064_08_heredocs_with_variable_interpolation.sh	stdout mismatch, exit code (bash=124 perl=0)
 064_10_nested_function_definitions.sh	otranspilerl failed to generate code
 064_16_function_complex_argument_handling.sh	otranspilerl failed to generate code
 064_19_complex_pattern_matching_extended_globs.sh	otranspilerl failed to generate code
