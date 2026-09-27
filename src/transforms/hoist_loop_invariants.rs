@@ -324,16 +324,6 @@ fn stmt_assigns(st: &IrStmt, var: &str) -> bool {
     }
 }
 
-pub(crate) fn variant_name(s: &IrStmt) -> &'static str {
-    match s {
-        IrStmt::Expr(_) => "Expr",
-        IrStmt::Exec { .. } => "Exec",
-        IrStmt::Assign { .. } => "Assign",
-        IrStmt::While { .. } => "While",
-        IrStmt::If { .. } => "If",
-        _ => "other",
-    }
-}
 
 /// `fns` are the user-defined shell functions: a CALL to one can write
 /// any global its body assigns, so those names count as body-written.
