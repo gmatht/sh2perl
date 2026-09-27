@@ -359,6 +359,15 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
                     out.insert(n.clone());
                 }
             }
+            // `x=$1` inside a function body lowers to `getVar("x")` +
+            // setVar, so the NAME appears as a call argument, not as an
+            // IrStmt::Assign target. Reading it here is what makes a
+            // callee's global writes visible to the hoist.
+            if matches!(func.as_str(), "getVar" | "param" | "arrayIndex") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+            }
             // A call to a user-defined shell FUNCTION writes every global
             // that function's body assigns. Without this the hoist is
             // UNSOUND, and silently so — the body still looks like it
