@@ -34,6 +34,7 @@ dq-hashbang-multiline-assign.sh	stdout mismatch
 grep_p.sh	stdout mismatch
 heredoc-binary-data.sh	stdout mismatch, exit code (bash=0 perl=4)
 heredoc-unclosed.sh	stdout mismatch
+id-cmdsub.sh	stdout mismatch, exit code (bash=124 perl=0)
 parse-arithmetic-extra-paren.sh	stdout mismatch
 parse-at-slice-param.sh	stdout mismatch
 parse-bracket-subshell-pipe.sh	exit code (bash=1 perl=0)
