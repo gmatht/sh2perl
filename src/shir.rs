@@ -37048,18 +37048,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Warn { expr, carp: _ } => {
-            // Warning: `console.warn(value)` or fallback `sh2.warn(value)`.
+            // Warning: `sh2.warn(value)` — the runtime writes it to stderr.
+            // It must go through the `sh2.*` namespace like every other
+            // builtin: the structural gate rejects ANY non-sh2 callee
+            // (harness/estree_gate.pl check (b)), so a raw
+            // `console.warn` fails the gate by construction.
             Stmt::ExpressionStatement {
-                expression: Expr::CallExpression {
-                    callee: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier { name: "console".to_string() }),
-                        property: Box::new(Expr::Identifier { name: "warn".to_string() }),
-                        computed: false,
-                        optional: false,
-                    }),
-                    arguments: vec![expr_to_estree(expr)],
-                    optional: false,
-                },
+                expression: sh2_call("warn", vec![expr_to_estree(expr)]),
             }
         }
         IrStmt::SetChildError(e) => {

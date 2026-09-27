@@ -62,26 +62,17 @@ parse-dollars-in-string.sh	otranspilerl failed to generate code
 parse-double-semicolon-in-case.sh	otranspilerl failed to generate code
 parse-error-block-in-pipeline.sh	stdout mismatch, exit code (bash=0 perl=124)
 parse-eval-multiline.sh	stdout mismatch
-parse-for-fi-keyword.sh	otranspilerl failed to generate code
-parse-glob-question-in-arg.sh	otranspilerl failed to generate code
-parse-heredoc-dollar-paren.sh	otranspilerl failed to generate code
 parse-heredoc-tab.sh	stdout mismatch
 parse-multi-command-while-condition.sh	stdout mismatch
-parse-param-pattern-match.sh	otranspilerl failed to generate code
+parse-param-pattern-match.sh	stdout mismatch
 parse-redirect-in-case-pattern.sh	stdout mismatch
-positional-dollar-at-params.sh	otranspilerl failed to generate code
 printf-format-and-v.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
-realpath-cmdsub.sh	otranspilerl failed to generate code
-single-quote-embed-escape.sh	otranspilerl failed to generate code
-sqs-overlap-multiline-awk.sh	otranspilerl failed to generate code
+realpath-cmdsub.sh	stdout mismatch
+sqs-overlap-multiline-awk.sh	stdout mismatch
 sync-direct-call-await.sh	stdout mismatch
-test-glob-rhs-fallback.sh	otranspilerl failed to generate code
-test-literal-string-compare.sh	otranspilerl failed to generate code
-tty-cmdsub.sh	otranspilerl failed to generate code
+tty-cmdsub.sh	stdout mismatch
 typeset-cmdsub.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
-variable-apostrophe-concat.sh	otranspilerl failed to generate code
-variable-default-with-hash.sh	otranspilerl failed to generate code
 variable-plus-operator.sh	stdout mismatch
