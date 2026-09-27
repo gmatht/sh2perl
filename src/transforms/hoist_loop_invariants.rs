@@ -104,7 +104,15 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
+        if std::env::var("SH2_T").is_ok() {
+            eprintln!("[hb] body stmt keys={:?}", match s {
+                IrStmt::If{..} => "If", IrStmt::Expr(_)=>"Expr", IrStmt::Exec{..}=>"Exec",
+                IrStmt::Assign{..}=>"Assign", IrStmt::While{..}=>"While", _=>"other" });
+        }
         stmt_writes(s, &mut assigned, fns);
+    }
+    if std::env::var("SH2_T").is_ok() {
+        eprintln!("[hb] assigned={:?}", assigned);
     }
     let mut hoisted: Vec<IrStmt> = Vec::new();
     for (j, st) in body.iter().enumerate() {
