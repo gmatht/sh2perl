@@ -888,3 +888,39 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hoist_fn_side_effect_tests {
+    use super::*;
+
+    /// A loop-carried var written ONLY from inside a called shell
+    /// function must not let an assignment that reads it be hoisted.
+    /// bash prints 5000 three times; the pre-fix build printed 2000.
+    #[test]
+    fn a_call_written_global_blocks_the_hoist() {
+        let src = r#"
+bump() { v=$1; }
+i=0
+v=2
+while [ $i -lt 3 ]; do
+  bump 5
+  d=$(( v * 1000 ))
+  i=$((i+1))
+done
+"#;
+        let stmts = crate::ir::parse_shell(src).expect("parse");
+        let before = stmts.len();
+        transform(&mut stmts.clone());
+        // `d = v*1000` must still be INSIDE the while body
+        let loop_body_has_d = stmts.iter().any(|s| match s {
+            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
+                b, IrStmt::Assign { targets, .. } if targets[0].var == "d")),
+            _ => false,
+        });
+        assert!(
+            loop_body_has_d,
+            "d=$(( v * 1000 )) was hoisted out of the loop even though the\nonly writer of `v` is the called function `bump` (stmts {before} -> {})",
+            stmts.len()
+        );
+    }
+}
