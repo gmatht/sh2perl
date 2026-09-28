@@ -22,7 +22,7 @@
 064_hard_to_generate.sh	stdout mismatch
 065_yes_head_while.sh	stdout mismatch
 070_cmp_basic.sh	stdout mismatch
-070_gnuisms_thorough.sh	stdout mismatch, exit code (bash=124 perl=0)
+070_gnuisms_thorough.sh	stdout mismatch
 091_while_pipe_var.sh	stdout mismatch
 096_head_procsub.sh	stdout mismatch, exit code (bash=0 perl=124)
 103_pipeline_failure_multi.sh	stdout mismatch
