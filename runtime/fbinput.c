@@ -52,12 +52,39 @@ static char   KF_path[512] = "";   /* the file KF_fd is reading */
 static int    EV_fd = -1;
 static int    EV_open_rc = 0;
 
-/* the tty source: /dev/tty if we can have it, else stdin. O_NONBLOCK
- * is set on our OWN descriptor, so the terminal's own line discipline
- * is never touched — see t_next. */
+/* the tty source: the game's own stdin. O_NONBLOCK is set on OUR OWN
+ * descriptor, so the terminal's own line discipline is never touched
+ * from the read side — see t_next. */
 static int    T_fd = -1;
 static int    T_open_rc = 0;
 static int    T_isatty = 0;
+
+/* Is this terminal SAFE for us to read from and reconfigure? (see
+ * t_open for why it is a question at all).
+ *
+ * The rule is the job-control one, exactly: the kernel raises SIGTTOU
+ * (tcsetattr) and SIGTTIN (read) for a member of a BACKGROUND process
+ * group of a terminal, and the default action for both is to STOP — a
+ * game that touched such a terminal froze on its first frame and never
+ * woke, so a harness saw no image, no message and no exit. That is
+ * what this check exists to prevent, and a foreground process is the
+ * only one that is safe.
+ *
+ * A terminal with NO session is safe regardless: the signals are
+ * raised for a background group OF A SESSION, so a pty pair nobody
+ * owns (a test's openpty, a descriptor opened by a process that has no
+ * controlling terminal) cannot stop us. Checking that is what keeps
+ * the pty test working: a child forked straight from a process with no
+ * controlling terminal has tcgetpgrp() == -1, and refusing that would
+ * break the tty source in the one place it is legitimately exercised.
+ *
+ * Note that "same session" is NOT enough — a shell's background job
+ * (`cmd &`) shares the session's terminal and is still background on
+ * it. Only the foreground process group may touch it. */
+static int t_terminal_is_safe(int fd) {
+    if (tcgetsid(fd) == (pid_t)-1) return 1;  /* unowned: no one can stop us */
+    return tcgetpgrp(fd) == getpgrp();       /* ours and in the foreground */
+}
 
 /* An evdev KEY_* name we could not map. The shell gets this (never
  * the device code, which is architecture-specific and 2 bytes wide —
@@ -305,28 +332,50 @@ static int t_open(void) {
     int fd;
     const char *no = getenv("FB_NO_TTY");
     if (no && no[0] == '1') return 0;
-    t = getenv("FB_TTY");
-    if (t && *t) {
-        fd = open(t, O_RDWR | O_NONBLOCK);
+    /* The game's own stdin, NOT /dev/tty. /dev/tty names the
+     * controlling terminal of the SESSION, which is the whole point
+     * and also the trap: a process launched by a test harness, a CI
+     * job or a pipeline has no controlling terminal of its own, and
+     * /dev/tty resolves to whatever terminal that harness's session
+     * leader happens to own. The game then read — and reconfigured —
+     * a terminal no human is ever typing into, while its actual
+     * input sat unread on stdin. stdin is the descriptor the game was
+     * GIVEN, so it is the one that is real for this run. */
+    if (getenv("FB_TTY") == NULL) {
+        fd = dup(STDIN_FILENO);
         if (fd < 0) return 0;
     } else {
-        /* /dev/tty is the TERMINAL, and a keystroke typed into it is
-         * read from the OTHER end of the pty pair — the caller's
-         * terminal master. So the right handle is a read/write open of
-         * the terminal itself with its discipline set to
-         * non-canonical: that is precisely a game keyboard. Reading a
-         * cooked /dev/tty instead blocks until a NEWLINE, which is why
-         * the first tty implementation delivered nothing at all — a
-         * game loop that waits for Enter is not a game. */
-        fd = open("/dev/tty", O_RDWR | O_NONBLOCK);
-        if (fd < 0) return 0;
+        t = getenv("FB_TTY");
+        if (t && *t) {
+            fd = open(t, O_RDWR | O_NONBLOCK);
+            if (fd < 0) return 0;
+        } else {
+            fd = dup(STDIN_FILENO);
+            if (fd < 0) return 0;
+        }
     }
     T_fd = fd;
     T_isatty = isatty(fd);
+    if (!T_isatty) {
+        /* not a terminal (a pipe, a file, /dev/null): nothing to
+         * reconfigure and no user to read a keystroke from */
+        close(fd);
+        T_fd = -1;
+        return 0;
+    }
+    if (!t_terminal_is_safe(fd)) {
+        /* A terminal owned by another job: every call we make to it is
+         * answered with SIGTTOU (tcsetattr) or SIGTTIN (read), and
+         * the default action for both is to STOP. A test harness that
+         * ran a game would hang with no image and no message. Use no
+         * keyboard rather than freeze. */
+        close(fd);
+        T_fd = -1;
+        return 0;
+    }
     (void)t_set_game_mode();
     return 1;
 }
-
 /* Put the terminal into the non-canonical, non-echoing mode a game
  * wants. Done ONCE, at open, and deliberately not restored afterwards.
  *
@@ -340,7 +389,9 @@ static int t_open(void) {
  * The change touches only the terminal this process opened, for as
  * long as the game runs; the kernel restores the termios when the
  * session's last descriptor closes, and a parent shell that inherited
- * a copy of the slave keeps its own settings. */
+ * a copy of the slave keeps its own settings. Returns 1 when it
+ * actually changed something, so the caller can leave the terminal
+ * alone when it did not (a non-tty, or an ioctl that failed). */
 static int t_set_game_mode(void) {
     struct termios a;
     if (T_fd < 0 || !T_isatty) return 0;
@@ -403,6 +454,16 @@ int fb_input_count(void) { return I_count; }
  * The cost is paid only while NO source exists; once one is open the
  * retry is skipped entirely. */
 static int I_calls = 0;
+static int T_refused = 0;   /* a tty exists but must not be touched */
+
+/* Is there a tty to speak of at all? Only used to tell "nothing to
+ * read" (retry next call, cheaply) from "there is one but it is not
+ * ours" (remember the refusal and stop asking). */
+static int tty_exists(void) {
+    const char *t = getenv("FB_TTY");
+    if (t && *t) return access(t, R_OK) == 0;
+    return isatty(STDIN_FILENO);
+}
 
 const char *fb_input_line(const char *keyfile) {
     int got = 0;
@@ -422,12 +483,21 @@ const char *fb_input_line(const char *keyfile) {
         (void)EV_open_rc;
         if (EV_fd >= 0 && ev_next(I_line, sizeof I_line)) got = 1;
     }
-    /* 3. the tty */
-    if (!got) {
-        if (T_fd < 0) T_open_rc = t_open();
+    /* 3. the tty. Re-decided while it is not open, so a test (or a
+     * game that sets FB_TTY itself before its first key) can still
+     * turn the source on later. It is deliberately NOT retried after
+     * a FAILED attempt at a tty that exists: whether this process may
+     * touch that terminal is fixed for the whole run, and re-deciding
+     * it per frame only re-asks a question whose answer cannot change
+     * — while a background process pays a tcgetpgrp syscall for the
+     * rest of the game. So the refusal is remembered; "there is no
+     * tty here at all" is not. */
+    if (!got && T_fd < 0 && !T_refused) {
+        T_open_rc = t_open();
         (void)T_open_rc;
-        if (T_fd >= 0 && t_next(I_line, sizeof I_line)) got = 1;
+        if (T_fd < 0 && tty_exists()) T_refused = 1;
     }
+    if (!got && T_fd >= 0 && t_next(I_line, sizeof I_line)) got = 1;
 
     if (got) I_count++;
     return I_line;

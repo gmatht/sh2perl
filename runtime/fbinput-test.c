@@ -37,8 +37,11 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <poll.h>
 #if defined(__linux__)
 #include <pty.h>
+#include <sys/ioctl.h>
 #include <linux/input.h>
 #endif
 
@@ -350,7 +353,152 @@ static void t_noblock(void) {
     unlink(p);
 }
 
-int main(void) {
+/* ── 7. a terminal owned by ANOTHER job is refused ────────────────────
+ * THE HANG THIS GUARDS AGAINST. The device used to open /dev/tty and
+ * reconfigure whatever terminal the session leader owned, with no
+ * regard for who that terminal belonged to. A game run by a test
+ * harness, a CI job or a background shell is in a DIFFERENT process
+ * group from that terminal, so the kernel answers its tcsetattr with
+ * SIGTTOU and its read with SIGTTIN — and the default action for both
+ * is to STOP. The process froze on the first frame and never woke: the
+ * harness saw no image, no message and no exit, only a hang. Twenty
+ * three equivalence cases died that way and looked like transpiler
+ * failures.
+ *
+ * THE JOB-CONTROL SETUP IS THE WHOLE TEST, and getting it wrong makes
+ * the check pass for the wrong reason. A terminal only produces
+ * SIGTTOU when the calling process is in a background process group
+ * OF THAT TERMINAL'S SESSION. So the shape is three levels:
+ *
+ *   parent                      -> forks the "session" child
+ *     session child: setsid()   -> owns the pty as its controlling
+ *                                    terminal, adopts it as foreground
+ *       fg child:               -> the game, in its OWN process group,
+ *                                    therefore BACKGROUND on that pty
+ *
+ * An earlier version of this test forked once and called setpgid on the
+ * child. The child was then in a group that owned no terminal at all,
+ * tcgetpgrp failed, and the device — correctly — treated the terminal
+ * as unowned and used it. The check passed with the guard compiled
+ * OUT, which is the failure mode a regression test exists to prevent.
+ * It has to fail when the guard is removed; that is verified by
+ * building this file against a guard-less fbinput.c.
+ *
+ * The parent waits with a deadline, because a STOPped child never
+ * writes to the pipe and an alarm does not fire for a stopped
+ * process. */
+static void t_foreign_tty(void) {
+    int mfd, sfd, pipefd[2];
+    pid_t sess, kid;
+    char link[64], target[128];
+    char got = '?';
+    ssize_t n;
+    int status = 0;
+
+    if (openpty(&mfd, &sfd, NULL, NULL, NULL) != 0) {
+        printf("  FAIL openpty (skipping foreign-tty check)\n");
+        return;
+    }
+    snprintf(link, sizeof link, "/proc/self/fd/%d", sfd);
+    n = readlink(link, target, sizeof target - 1);
+    if (n <= 0) { close(mfd); close(sfd); return; }
+    target[n] = 0;
+    if (pipe(pipefd) != 0) { close(mfd); close(sfd); return; }
+
+    /* THE DEVICE'S OWN STATE MUST NOT LEAK INTO THE CHILD. T_fd, the
+     * key-file descriptor and the refusal flag are process globals,
+     * and check 5 above deliberately leaves a tty OPEN. A kid forked
+     * from this process inherits all of it, so fb_input_line short-
+     * circuits on the earlier pty and never re-decides the terminal
+     * under test — the check then passes no matter what the guard
+     * says, which is exactly how the first version of this test was
+     * found to be worthless. The child below therefore EXECs a fresh
+     * copy of this binary rather than forking, so the only state it
+     * can have is what it sets up itself. */
+    sess = fork();
+    if (sess < 0) { close(mfd); close(sfd); return; }
+    if (sess == 0) {
+        char self[512];
+        ssize_t m;
+        close(pipefd[0]);
+        setsid();                       /* our own session */
+        if (ioctl(sfd, TIOCSCTTY, 0) < 0) _exit(3);
+        kid = fork();
+        if (kid < 0) _exit(4);
+        if (kid == 0) {
+            /* the game: its own process group, so the terminal it is
+             * holding belongs to the session but NOT to it */
+            setpgid(0, 0);
+            usleep(150000);             /* let the session adopt the pty */
+            /* the report channel is a FIXED descriptor: exec keeps
+             * fds open across it, and the pipe's number here is not
+             * predictable in the new image */
+            if (pipefd[1] != 3) {
+                if (dup2(pipefd[1], 3) < 0) _exit(7);
+                close(pipefd[1]);
+            }
+            m = readlink("/proc/self/exe", self, sizeof self - 1);
+            if (m <= 0) _exit(5);
+            self[m] = 0;
+            setenv("FB_TTY", target, 1);
+            setenv("FB_NO_TTY", "0", 1);
+            unsetenv("FB_KEYS");
+            unsetenv("FB_INPUT");
+            execl(self, self, "--foreign-tty-child", (char *)0);
+            _exit(6);
+        }
+        /* the session: make the pty ours, so the game is background */
+        tcsetpgrp(sfd, getpgrp());
+        usleep(600000);
+        /* the game is now stopped or done: reap and report nothing */
+        kill(kid, SIGCONT);             /* in case it was STOPped */
+        kill(kid, SIGKILL);
+        waitpid(kid, &status, 0);
+        (void)!write(pipefd[1], "S", 1);   /* 'S' = the game never spoke */
+        _exit(0);
+    }
+    close(pipefd[1]);
+    {
+        struct pollfd pfd;
+        int r, done = 0;
+        double waited = 0;
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        for (;;) {
+            r = poll(&pfd, 1, 20);
+            waited += 20;
+            if (r == 1) { done = 1; break; }
+            if (waited > 3000) break;
+        }
+        if (done) {
+            ssize_t g = read(pipefd[0], &got, 1);
+            ck(g == 1 && got == 'E',
+               "a terminal owned by another job -> \"\" and RETURNS");
+        } else {
+            ck(0, "a terminal owned by another job -> \"\" and RETURNS");
+        }
+    }
+    close(pipefd[0]);
+    close(mfd);
+    waitpid(sess, &status, 0);
+    unsetenv("FB_TTY");
+}
+
+/* The re-executed half of check 7. A fresh process whose only source is
+ * a pty it is BACKGROUND on: it must answer "" and exit, rather than
+ * be stopped by the kernel the first time it touches that terminal. */
+static int foreign_tty_child(void) {
+    const char *kf = 0;
+    const char *k = fb_input_line(kf);
+    char r = k[0] ? 'K' : 'E';   /* K = it read a key, E = nothing */
+    (void)!write(3, &r, 1);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--foreign-tty-child") == 0)
+        return foreign_tty_child();
     printf("fbinput-test\n");
     t_nosource();
     t_keyfile();
@@ -359,6 +507,7 @@ int main(void) {
 #endif
     t_tty();
     t_noblock();
+    t_foreign_tty();
     printf("  %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

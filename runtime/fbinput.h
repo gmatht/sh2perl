@@ -34,9 +34,23 @@
  *                      work on a box with no input at all)
  *   2. $FB_TTY / $FB_INPUT (default /dev/input/event0) — evdev, which
  *      is a real character stream (unlike /dev/input/mice)
- *   3. stdin, when it is a tty — cooked mode, so the terminal ECHOes
- *      the keypress exactly as a normal shell prompt would (a raw-mode
- *      read would eat the echo and the tty would look broken)
+ *   3. stdin, when it is a tty this process is the FOREGROUND process
+ *      of. Two deliberate details:
+ *        - stdin, not /dev/tty. /dev/tty is the controlling terminal
+ *          of the SESSION, so a process with no terminal of its own (a
+ *          test harness, a CI job, a pipeline) resolves it to whatever
+ *          terminal its session leader owns — a terminal no human is
+ *          typing into, while the run's real input sits on stdin.
+ *        - foreground only. The kernel answers a background process
+ *          group's terminal calls with SIGTTOU (tcsetattr) and SIGTTIN
+ *          (read), and the default action for both is to STOP, so a
+ *          background game would freeze on its first frame and never
+ *          wake — a hang with no image, no message and no exit. A
+ *          terminal with no session at all (a pty pair nobody owns)
+ *          cannot do that and is used.
+ *      The terminal is switched to non-canonical, non-echoing for the
+ *      game's lifetime; see fbinput.c for why saving and restoring
+ *      around each call cannot work.
  *
  * Both the file and evdev sources are non-blocking; the tty source
  * uses VMIN=0/VTIME=0 via poll, so a call with nothing pending costs
