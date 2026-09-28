@@ -5972,12 +5972,51 @@ fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
     }
 }
 
+/// True when `s` names a POSITIONAL parameter: `$1`..`$9` (a plain
+/// positional value) or `#1`..`#9` (its length). The frontends emit
+/// those as `getVar("1")` / `getVar("#1")` rather than as a
+/// `sh2.positional` member read, so the direct-call pass has to see them
+/// too — otherwise it drops the positional bridge and the body reads
+/// positionals off the caller's (empty) frame.
+fn is_positional_name(s: &str) -> bool {
+    let rest = s.strip_prefix('#').unwrap_or(s);
+    matches!(rest, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
 fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
     match e {
         Expr::MemberExpression { object, property, computed: false, .. }
             if is_ident_expr(object, "sh2") && is_ident_expr(property, "positional") =>
         {
             *pos_refs = true;
+        }
+        // `sh2.getVar("1")` / `sh2.getVar("#1")` — a positional value /
+        // length read in the getVar convention.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "getVar")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
+        }
+        // `sh2.param(op, "1", …)` — a positional slice/len/case-op read
+        // addressed BY NUMBER rather than by a live binding.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "param")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.get(1) {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -6057,6 +6096,48 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    /// Build the post-`direct_shell_fn_calls` program for `src` and report
+    /// whether the positional bridge survived the rewrite.
+    fn direct_call_keeps_positional_bridge(input: &str) -> bool {
+        let commands = Parser::new(input).parse().unwrap();
+        let prog = direct_shell_fn_calls(ast_to_estree(&commands));
+        // The bridge is the `sh2.positional = [args]` save/restore around
+        // the direct call. If it is gone, the body's positional reads
+        // resolve against the CALLER's frame instead of the arguments.
+        serde_json::to_string(&prog).unwrap().contains("sh2.positional")
+    }
+
+    #[test]
+    fn direct_call_bridges_getvar_positional_reads() {
+        // A fnCall-rewritten call to a function that reads `$1` through
+        // the getVar convention MUST keep the positional bridge — without
+        // it the body reads the caller's (empty) positional frame and the
+        // argument is silently dropped.
+        for src in [
+            // plain positional value read
+            "f() { a=$1; return $a; }; g=$(f hi); echo $g",
+            // positional LENGTH read (`#1`)
+            "f() { n=${#1}; return $n; }; g=$(f hi); echo $g",
+            // positional slice
+            "f() { a=${1:0:1}; return $a; }; g=$(f hi); echo $g",
+        ] {
+            assert!(
+                direct_call_keeps_positional_bridge(src),
+                "positional bridge dropped for: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_without_positional_read_stays_direct() {
+        // The negative half: a function with NO positional read must not
+        // pay the save/restore bridge (that is the whole point of the
+        // direct-call rewrite).
+        assert!(!direct_call_keeps_positional_bridge(
+            "f() { a=7; return $a; }; g=$(f hi); echo $g"
+        ));
     }
 
     #[test]
