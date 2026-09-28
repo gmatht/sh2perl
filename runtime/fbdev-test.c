@@ -333,6 +333,31 @@ static void t_short_record(void) {
         if (r != 0 || g != 0 || b != 0) n++;
     }
     ck(n > 0, "the records before a truncated one are still drawn");
+
+    /* AN 8-FIELD RECORD IS NOT A RECORD. The block type and the damage
+     * field are parsed and ignored — this device has no texture table
+     * and no mining damage — but they are still REQUIRED. That is not
+     * an accident of the parser: an 8-field payload used to be read as
+     * a desynchronised stream, drawing a frame that belonged to no
+     * payload at all. A record must hold 11 or it is not one. */
+    {
+        FILE *d2;
+        fflush(stdout);
+        d2 = freopen("/tmp/fbdev-short.log", "w", stderr);
+        if (!d2) { printf("  FAIL cannot capture stderr\n"); fails++; return; }
+        fb_clear(0xFF000000);
+        fb_blocks("5 1 5 1 1 1 1 0 0\n5 1 4 1 1 1 1 0 0\n");
+        fflush(stderr);
+        freopen("/dev/tderr", "w", stderr);
+        fb_dump_ppm("/tmp/fbt_short2.ppm");
+        load("/tmp/fbt_short2.ppm");
+        n = 0;
+        for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+            at(x, y, &r, &g, &b);
+            if (r != 0 || g != 0 || b != 0) n++;
+        }
+        ck(n == 0, "an 8-field record draws nothing rather than desynchronising");
+    }
 }
 
 int main(void) {

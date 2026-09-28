@@ -461,7 +461,22 @@ void fb_blocks(const char *payload) {
             /* v[0..2] centre (world units), v[3..5] scale (world units: 1 =
              * a full block), v[6..8] colour 0..1, v[9] block type, v[10]
              * damage. The scale crosses into project() as MILLI (×1000),
-             * matching the shader's usc_* — the one place it converts. */
+             * matching the shader's usc_* — the one place it converts.
+             *
+             * v[9] and v[10] are PARSED AND IGNORED, deliberately. The
+             * block type selects a texture on the WebGL path, and the
+             * damage field accumulates mining damage upstream
+             * (www/bin/mimecroft.sh:942, damage_cell). This device
+             * shades cubes from the 6 face shades in CUBE_SHADE and has
+             * no notion of either, so the colour in v[6..8] is the whole
+             * truth it can draw.
+             *
+             * They are still REQUIRED, and that is the point worth
+             * recording: the payload contract is 11 fields, and a caller
+             * that emitted only 8 got a silently desynchronised frame for
+             * as long as the parser took fields across a newline. Making
+             * them required-but-unused is honest — dropping them would
+             * change the record's shape and re-open that door. */
             draw_cube(v[0], v[1], v[2], v[3] * 1000.0, v[4] * 1000.0,
                       v[5] * 1000.0, v[6], v[7], v[8]);
         } else if (n > 0 && !complained) {
