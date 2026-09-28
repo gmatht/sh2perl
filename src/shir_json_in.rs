@@ -1500,10 +1500,10 @@ mod tests {
                 {"type":"Str","value":"hi","style":"DoubleQuoted"},
                 {"type":"Array","elements":null}]}}]}"#;
         let prog = shir_json_to_ir(src).expect("null elements = empty word list");
-        let IrStmt::Expr { expr, .. } = &prog.stmts[0] else {
+        let IrStmt::Expr(expr) = &prog.stmts[0] else {
             panic!("expected an Expr stmt, got {:?}", prog.stmts[0]);
         };
-        let crate::ir::IrExpr::Call(_, _, args) = expr else {
+        let crate::ir::IrExpr::Call { args, .. } = expr else {
             panic!("expected a Call expr, got {expr:?}");
         };
         let crate::ir::IrExpr::Array(elements) = &args[1] else {
@@ -1548,7 +1548,7 @@ mod tests {
         let IrStmt::Function { params: p2, .. } = &prog2.stmts[0] else {
             panic!("expected a Function stmt on re-ingest");
         };
-        assert_eq!(&params, p2, "params must round-trip, not be dropped");
+        assert_eq!(p2, params, "params must round-trip, not be dropped");
     }
 
     /// `params` is optional: absent (bash functions, every existing
