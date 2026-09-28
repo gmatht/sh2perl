@@ -7864,6 +7864,14 @@ impl Render {
             // and runtime/fbdev.c on the command line) — bash-O4 does
             // that automatically when the render references <fbdev.h>.
             self.emit("#include <fbdev.h>");
+            // The keyboard half of the same native device
+            // (runtime/fbinput.{h,c}). A SEPARATE include, and a
+            // separate link input, so a script that only draws
+            // (fb_open/fb_blocks) does not pull in the terminal and
+            // evdev code at all — fbdev.c has no input in it, and
+            // adding input to a drawing device would make every
+            // headless render depend on it.
+            self.emit("#include <fbinput.h>");
         }
         self.emit("");
         if self.need_sh {
@@ -18564,6 +18572,48 @@ fn param_copy_alias(
         Some(format!("{}({})", cmd, parts.join(", ")))
     }
 
+    /// A CAPTURE of an fb_* primitive — `key=$(fb_input_line)` — turned
+    /// into an in-process value instead of a `bash -c` site.
+    ///
+    /// Why the capture form and not a `read` builtin lowering: a game
+    /// loop wants "the next key if there is one, else nothing", which
+    /// is exactly what a command substitution of a zero-argument
+    /// device call expresses, and it is the shape the game already has
+    /// (`rk=$(head -n 1 "$KEYS")` before this device existed). Routing
+    /// it through the shell site would fork+exec a bash PER FRAME —
+    /// the device exists to remove that.
+    ///
+    /// Signature rule: only a primitive whose RESULT is a single string
+    /// may be captured. `fb_input_line` returns the `const char *` the
+    /// device hands back, and it is stable until the next call, which
+    /// is the lifetime a capture helper's returned buffer has. A
+    /// primitive returning `void` (fb_present) or `int` (fb_open) has
+    /// no printable value, so it is REFUSED here and stays a statement
+    /// call — a capture of it is a shell error, not a number to guess
+    /// at.
+    fn fb_capture_sig(cmd: &str) -> Option<&'static str> {
+        match cmd {
+            // the keyboard: the one primitive a game captures per frame
+            "fb_input_line" => Some("fb_input_line()"),
+            _ => None,
+        }
+    }
+
+    fn fb_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let call = Self::fb_capture_sig(cmd)?;
+        // exactly as fb_call_opt: no env prefix, no capture/brace/glob
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+            return None;
+        }
+        match args.get(1) {
+            None => {}
+            Some(IrExpr::Array(items)) if items.is_empty() => {}
+            _ => return None,
+        }
+        self.need_fb = true;
+        Some(format!("_sh_xstrdup({call})"))
+    }
+
     /// UU-FFI.md: lower a genuinely-external command to an in-process
     /// `sh2_uu_run(argv)` call instead of `bash -c`. ON by default
     /// (opt OUT with env SH2_UU_FFI=0 at RENDER time). Conservative:
@@ -19940,6 +19990,9 @@ fn param_copy_alias(
                 if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(cmd) = Self::str_arg(cargs, 0) {
                         if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                        if let Some(v) = self.fb_capture_opt(&cmd, cargs) {
                             return v;
                         }
                     }
