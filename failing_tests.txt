@@ -1,3 +1,4 @@
+000__04c_text_processing_commands.sh	stdout mismatch
 000__04h_complex_examples.sh	stdout mismatch
 008_simple_backup.sh	stdout mismatch
 043_home.sh	stdout mismatch
@@ -12,7 +13,6 @@
 063_09_complex_function_parameter_handling.sh	stdout mismatch
 063_11_complex_while_loop.sh	stdout mismatch
 063_12_complex_eval.sh	stdout mismatch
-063_14_complex_redirects.sh	stdout mismatch
 063_18_complex_here_string.sh	stdout mismatch
 063_hard_to_parse.sh	stdout mismatch
 064_01_complex_nested_subshells.sh	stdout mismatch
