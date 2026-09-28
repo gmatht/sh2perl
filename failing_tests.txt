@@ -52,7 +52,7 @@ qx-var-builtin-cd.sh	stdout mismatch
 realpath-cmdsub.sh	stdout mismatch
 sqs-overlap-multiline-awk.sh	stdout mismatch
 sync-direct-call-await.sh	stdout mismatch
-tty-cmdsub.sh	stdout mismatch
+tty-cmdsub.sh	stdout mismatch, exit code (bash=124 perl=0)
 typeset-cmdsub.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 variable-plus-operator.sh	stdout mismatch
