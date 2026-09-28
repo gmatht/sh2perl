@@ -47,27 +47,25 @@ fn main() {
     std::fs::write("/home/llm/sh2loop/tmp_run/t73dbg/estree.json", &s).unwrap();
     println!("estree(ingest) written: {} bytes", s.len());
 
-    // render_ingested(): set_source_lang + promote_ascii_vars
-    let mut q = p.clone();
-    debashl::shir::promote_ascii_vars(&mut q);
-    dump("ascii_vars  ", &q);
-    let est2 = debashl::shir::shir_to_estree(&q);
-    let s2 = serde_json::to_string(&est2).unwrap();
-    std::fs::write("/home/llm/sh2loop/tmp_run/t73dbg/estree2.json", &s2).unwrap();
-    println!("estree(after ascii_vars): {} bytes", s2.len());
-
-    // render_with_source(): set_source_lang(SOME) before rendering
-    for lang in ["zsh", "sh", "fish", "py", "go", "c", "pl"] {
-        debashl::shir::set_source_lang(Some(lang));
-        let est3 = debashl::shir::shir_to_estree(&q);
-        let s3 = serde_json::to_string(&est3).unwrap();
-        std::fs::write(
-            format!("/home/llm/sh2loop/tmp_run/t73dbg/estree_{lang}.json"),
-            &s3,
-        )
-        .unwrap();
-        let has = s3.contains("\"x\"");
-        println!("src_lang={lang}: {} bytes, mentions x={has}", s3.len());
-    }
-    debashl::shir::set_source_lang(None);
+    // shir_to_estree_json() = optimize{const_fold_arith, const_prop, dead_store_elim} + emit
+    let mut r = p.clone();
+    debashl::shir::const_fold_arith(&mut r);
+    dump("cf_arith     ", &r);
+    let mut r2 = p.clone();
+    debashl::shir_passes::optimize::const_prop(&mut r2);
+    dump("const_prop   ", &r2);
+    let mut r3 = p.clone();
+    debashl::shir_passes::optimize::dead_store_elim(&mut r3);
+    dump("dead_store_  ", &r3);
+    let mut r4 = p.clone();
+    debashl::shir_passes::optimize::optimize(&mut r4);
+    dump("optimize(all)", &r4);
+    let est4 = debashl::shir::shir_to_estree(&r4);
+    let s4 = serde_json::to_string(&est4).unwrap();
+    std::fs::write(
+        "/home/llm/sh2loop/tmp_run/t73dbg/estree_opt.json",
+        &s4,
+    )
+    .unwrap();
+    println!("estree(after optimize): {} bytes", s4.len());
 }
