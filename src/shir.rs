@@ -31416,18 +31416,6 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // (the getVar arms consult it) and after the transforms (the write
     // scan must see the same shape the emitter will emit).
     *NEVER_WRITTEN.lock().unwrap() = collect_never_written(prog);
-    if std::env::var("SH2_DBG_NW").is_ok() {
-        let nw = NEVER_WRITTEN.lock().unwrap();
-        eprintln!(
-            "DBGNW has_x={:?} lifted_num={:?} lifted_str={:?}",
-            nw.as_ref().map(|s| s.contains("x")),
-            *LIFTED_NUMERIC.lock().unwrap(),
-            *LIFTED_STRING.lock().unwrap()
-        );
-        for (i, s) in prog.stmts.iter().enumerate() {
-            eprintln!("DBGNW stmt[{i}] = {s:?}");
-        }
-    }
     // Provably-array-only-written names (SH2_ASSUME_ARRAY_SLICE — the
     // plain-name `${arr:off:len}` slice lowering's array-vs-scalar
     // proof). Set alongside NEVER_WRITTEN (same shape the emitter sees).
