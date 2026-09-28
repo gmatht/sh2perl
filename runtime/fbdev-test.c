@@ -273,6 +273,68 @@ static void t_projection(void) {
     ck(maxx - minx > 20, "a 4-block-distant cube is wider than 20px");
 }
 
+/* ── 5. a SHORT record is reported, not silently dropped ─────────────
+ * fb_blocks parses 11 fields per record and used to `return` quietly
+ * when it hit a short tail. A payload that is short one field in every
+ * record therefore drew only whatever came before the first bad tail —
+ * typically nothing — and the frame kept whatever the previous draw
+ * left, which reads as a clean but empty image rather than an error.
+ * That is the failure the MIMEcroft game hit: its world arrays were
+ * half the size the cells index to, so every cube record lost its
+ * damage field, and 23 equivalence cases passed byte-for-byte over a
+ * flat grey screen.
+ *
+ * The check is on the DIAGNOSTIC, not the pixels: a caller has no other
+ * way to tell a truncated payload from an empty one. */
+static void t_short_record(void) {
+    int W = 320, H = 240, x, y, n = 0, r, g, b;
+    FILE *devnull;
+
+    /* one good record, then a truncated one, then a good one */
+    const char *payload =
+        "5 1 5 1 1 1 1 0 0 0 0\n"      /* complete: 11 fields */
+        "5 1 4 1 1 1 1 0 0 0\n"        /* TRUNCATED: 10 fields */
+        "5 1 3 1 1 1 1 0 0 0 0\n";     /* complete: after the damage */
+
+    fb_open(W, H);
+    fb_clear(0xFF000000);
+    fb_set_camera(5, 0.5, 5, 180, 0);
+
+    /* capture stderr so the check can see the complaint */
+    fflush(stdout);
+    devnull = freopen("/tmp/fbdev-short.log", "w", stderr);
+    if (!devnull) { printf("  FAIL cannot capture stderr\n"); fails++; checks++; return; }
+    fb_blocks(payload);
+    fflush(stderr);
+    freopen("/dev/tderr", "w", stderr);
+
+    /* the diagnostic must name the field count it stopped at */
+    {
+        char buf[512];
+        FILE *f = fopen("/tmp/fbdev-short.log", "r");
+        int saw = 0;
+        if (!f) { printf("  FAIL cannot read the captured stderr\n"); fails++; checks++; return; }
+        buf[0] = 0;
+        if (fgets(buf, sizeof buf, f)) {
+            /* "ended after 10 of 11 fields" */
+            if (strstr(buf, "10 of 11")) saw = 1;
+            printf("  short-record diagnostic: %s", buf);
+        }
+        fclose(f);
+        ck(saw, "a record short of 11 fields is reported on stderr");
+    }
+
+    /* and the cubes BEFORE the bad record still drew: the parser
+     * consumes what it can rather than discarding the whole payload */
+    fb_dump_ppm("/tmp/fbt_short.ppm");
+    load("/tmp/fbt_short.ppm");
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+        at(x, y, &r, &g, &b);
+        if (r != 0 || g != 0 || b != 0) n++;
+    }
+    ck(n > 0, "the records before a truncated one are still drawn");
+}
+
 int main(void) {
     printf("== fbdev tests ==\n");
     t_clear();
@@ -281,6 +343,7 @@ int main(void) {
     t_silhouette();
     t_same_coverage();
     t_projection();
+    t_short_record();
     printf("== %d checks, %d failures ==\n", checks, fails);
     return fails ? 1 : 0;
 }

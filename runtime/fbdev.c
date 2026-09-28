@@ -417,24 +417,68 @@ void fb_blocks(const char *payload) {
     for (;;) {
         double v[11];
         int n = 0;
-        /* read up to 11 fields; a short tail is not a record */
+        int complained = 0;
+        /* A RECORD IS A LINE. Parsing with a bare strtod loop over the
+         * whole buffer cannot tell a truncated record from a complete
+         * one: a record short one field simply borrows the next
+         * record's first number as its own, and the parser desynchronises
+         * for the rest of the payload without ever seeing a short tail.
+         * That is not a hypothetical — it is exactly what happened when
+         * MIMEcroft's world arrays were half the size the cells index to,
+         * so every cube record lost its damage field. The frame came out
+         * a flat grey and 23 equivalence cases passed byte for byte,
+         * because both sides replay the same malformed payload through
+         * the same device.
+         *
+         * So the record boundary is the line, and a line that does not
+         * hold 11 fields is REPORTED rather than quietly absorbed. The
+         * fields are still drawn if there are enough of them, because a
+         * caller with one bad record should see the rest of the frame.
+         */
         while (n < 11) {
             char *end;
             double d;
             const char *q = p;
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            if (*q == 0) return;
+            /* the field separator is a space or a TAB, never a newline:
+             * letting strtod cross a line break is what let one record
+             * eat the next one's first field */
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == 0 || *q == '\n' || *q == '\r') break;
             d = strtod(q, &end);
-            if (end == q) return;
+            if (end == q) {
+                if (!complained) {
+                    fprintf(stderr,
+                            "fb_blocks: unparseable field at \"%.16s\";"
+                            " the rest of this payload is not drawn\n", q);
+                    complained = 1;
+                }
+                return;
+            }
             v[n++] = d;
             p = end;
         }
-        /* v[0..2] centre (world units), v[3..5] scale (world units: 1 =
-         * a full block), v[6..8] colour 0..1, v[9] block type, v[10]
-         * damage. The scale crosses into project() as MILLI (×1000),
-         * matching the shader's usc_* — the one place it converts. */
-        draw_cube(v[0], v[1], v[2], v[3] * 1000.0, v[4] * 1000.0, v[5] * 1000.0,
-                  v[6], v[7], v[8]);
+        if (n == 11) {
+            /* v[0..2] centre (world units), v[3..5] scale (world units: 1 =
+             * a full block), v[6..8] colour 0..1, v[9] block type, v[10]
+             * damage. The scale crosses into project() as MILLI (×1000),
+             * matching the shader's usc_* — the one place it converts. */
+            draw_cube(v[0], v[1], v[2], v[3] * 1000.0, v[4] * 1000.0,
+                      v[5] * 1000.0, v[6], v[7], v[8]);
+        } else if (n > 0 && !complained) {
+            /* A SHORT LINE, with fields on it. Reported, because from the
+             * caller's side a truncated payload and an empty one are the
+             * same picture: a frame that never changed. n == 0 is the
+             * payload simply ending (a trailing newline is normal) and
+             * stays silent. */
+            fprintf(stderr,
+                    "fb_blocks: record ended after %d of 11 fields"
+                    " (at \"%.16s\"); the rest of this payload is"
+                    " not drawn\n", n, p);
+        }
+        /* advance to the next line, so the desync cannot continue */
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        else return;
     }
 }
 
