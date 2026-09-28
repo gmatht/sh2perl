@@ -18572,46 +18572,62 @@ fn param_copy_alias(
         Some(format!("{}({})", cmd, parts.join(", ")))
     }
 
-    /// A CAPTURE of an fb_* primitive — `key=$(fb_input_line)` — turned
-    /// into an in-process value instead of a `bash -c` site.
+    /// A CAPTURE of an fb_* primitive — `key=$(fb_input_line "$KEYS")` —
+    /// turned into an in-process value instead of a `bash -c` site.
     ///
     /// Why the capture form and not a `read` builtin lowering: a game
     /// loop wants "the next key if there is one, else nothing", which
-    /// is exactly what a command substitution of a zero-argument
-    /// device call expresses, and it is the shape the game already has
+    /// is exactly what a command substitution of a device call
+    /// expresses, and it is the shape the game already had
     /// (`rk=$(head -n 1 "$KEYS")` before this device existed). Routing
     /// it through the shell site would fork+exec a bash PER FRAME —
     /// the device exists to remove that.
     ///
+    /// WHY THE KEY FILE IS AN ARGUMENT, not just $FB_KEYS: a game
+    /// keeps its key queue in a shell variable, and `export` never
+    /// reaches a C device — in the emitted C an export is a plain
+    /// assignment, and nothing in the render calls setenv, so a
+    /// getenv-based device sees only the environment the process was
+    /// STARTED with. The whole program then silently got "" for every
+    /// key (0 steps in every walk) while the same script under real
+    /// bash worked. An argument keeps the value in the program's own
+    /// data, where no export plumbing can lose it.
+    ///
     /// Signature rule: only a primitive whose RESULT is a single string
     /// may be captured. `fb_input_line` returns the `const char *` the
-    /// device hands back, and it is stable until the next call, which
-    /// is the lifetime a capture helper's returned buffer has. A
-    /// primitive returning `void` (fb_present) or `int` (fb_open) has
-    /// no printable value, so it is REFUSED here and stays a statement
-    /// call — a capture of it is a shell error, not a number to guess
-    /// at.
+    /// device hands back, stable until the next call, which is the
+    /// lifetime a capture helper's returned buffer has. A primitive
+    /// returning `void` (fb_present) or `int` (fb_open) has no
+    /// printable value, so it is REFUSED here and stays a statement
+    /// call — a capture of it is a shell error, not a number to guess.
     fn fb_capture_sig(cmd: &str) -> Option<&'static str> {
         match cmd {
-            // the keyboard: the one primitive a game captures per frame
-            "fb_input_line" => Some("fb_input_line()"),
+            // the keyboard: the one primitive a game captures per
+            // frame. The argument is the key FILE (see above).
+            "fb_input_line" => Some("fb_input_line"),
             _ => None,
         }
     }
 
     fn fb_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
         let call = Self::fb_capture_sig(cmd)?;
-        // exactly as fb_call_opt: no env prefix, no capture/brace/glob
+        // exactly as fb_call_opt: no env prefix Object arg
         if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
             return None;
         }
-        match args.get(1) {
-            None => {}
-            Some(IrExpr::Array(items)) if items.is_empty() => {}
+        // exactly ONE argument, the key file, and it must be one value.
+        // A split word is fine — that is a variable read, not a glob —
+        // so fb_word_one_value is the right gate, not word_single_argv.
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
             _ => return None,
+        };
+        if words.len() != 1 || !Self::fb_word_one_value(&words[0]) {
+            return None;
         }
+        let path = self.value_c(&words[0]);
         self.need_fb = true;
-        Some(format!("_sh_xstrdup({call})"))
+        Some(format!("_sh_xstrdup({call}({path}))"))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
