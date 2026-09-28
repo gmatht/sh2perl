@@ -23,11 +23,26 @@ fn main() {
     let (_ctx, prog2, _m) = debashl::shir_passes::Pipeline::canonical().run(&prog);
     dump("after-pipe  ", &prog2);
 
-    let est = debashl::shir::shir_to_estree(&prog2);
-    let s = serde_json::to_string(&est).unwrap();
-    println!("estree(raw): {}", &s[..s.len().min(600)]);
+    // Mirror otranspilerl ingest() step by step.
+    let mut p = prog2.clone();
+    debashl::transforms::process_subst::transform_program(&mut p);
+    dump("proc_subst  ", &p);
+    debashl::transforms::arith_normalize::transform(&mut p.stmts);
+    dump("arith_norm  ", &p);
+    debashl::shir_passes::restructure_goto_only(&mut p);
+    dump("restructure ", &p);
+    debashl::shir_passes::strip_cfor(&mut p);
+    dump("strip_cfor  ", &p);
+    {
+        use debashl::shir_passes::Transform;
+        let ctx = debashl::shir_passes::PassContext::default();
+        debashl::shir_passes::transform::ConstantFold.run(&mut p, &ctx);
+        dump("const_fold  ", &p);
+        debashl::shir_passes::echo_fold::EchoFold.run(&mut p, &ctx);
+        dump("echo_fold   ", &p);
+    }
 
-    let comp = debashl::shir::shir_to_estree_compiled(&prog2);
-    let s2 = serde_json::to_string(&comp).unwrap();
-    println!("estree(comp): {}", &s2[..s2.len().min(800)]);
+    let est = debashl::shir::shir_to_estree(&p);
+    let s = serde_json::to_string(&est).unwrap();
+    println!("estree(ingest): {}", &s[..s.len().min(700)]);
 }
