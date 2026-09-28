@@ -1,4 +1,3 @@
-000__04c_text_processing_commands.sh	stdout mismatch
 000__04h_complex_examples.sh	stdout mismatch
 008_simple_backup.sh	stdout mismatch
 043_home.sh	stdout mismatch
