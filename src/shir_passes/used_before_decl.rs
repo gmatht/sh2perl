@@ -1398,6 +1398,7 @@ mod tests {
                 assign("x", IrExpr::Int(5)),
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Output {
                         value: read("x"),
                         newline: true,
@@ -1417,6 +1418,7 @@ mod tests {
         let prog = IrProgram {
             stmts: vec![IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![IrStmt::Output {
                     value: IrExpr::Var("typo".to_string(), None),
                     newline: true,

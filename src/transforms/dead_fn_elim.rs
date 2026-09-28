@@ -349,7 +349,7 @@ mod tests {
     use crate::ir::{IrExpr, IrStmt, StrStyle};
 
     fn fn_def(name: &str, body: Vec<IrStmt>) -> IrStmt {
-        IrStmt::Function { name: name.to_string(), body, named_blocks: vec![] }
+        IrStmt::Function { name: name.to_string(), params: vec![], body, named_blocks: vec![] }
     }
     fn exec_call(name: &str) -> IrStmt {
         IrStmt::Expr(IrExpr::Call {

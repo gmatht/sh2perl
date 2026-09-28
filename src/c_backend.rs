@@ -39076,6 +39076,7 @@ mod tests {
         fn fn_stmt(name: &str) -> IrStmt {
             IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body: vec![],
                 named_blocks: vec![],
             }
@@ -39289,11 +39290,13 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "tfn_a".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
                 IrStmt::Function {
                     name: "tfn_g".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
                         args: vec![
@@ -39327,6 +39330,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "tfn_g".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
                         args: vec![
@@ -39344,6 +39348,7 @@ mod tests {
                 },
                 IrStmt::Function {
                     name: "tfn_a".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -39405,6 +39410,7 @@ mod tests {
     fn fn_named(name: &str, body: Vec<IrStmt>) -> IrStmt {
         IrStmt::Function {
             name: name.to_string(),
+            params: vec![],
             body,
             named_blocks: vec![],
         }
@@ -41186,6 +41192,7 @@ mod tests {
             requires: vec![],
             stmts: vec![IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body,
                 named_blocks: vec![],
             }],
@@ -41367,6 +41374,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "add".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         assign("a", "1"),
@@ -41430,6 +41438,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         IrStmt::Assign {
@@ -41492,6 +41501,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         IrStmt::Assign {
@@ -43295,6 +43305,7 @@ mod tests {
         fn def(name: &str, body: Vec<IrStmt>) -> IrStmt {
             IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body,
                 named_blocks: vec![],
             }
@@ -43334,6 +43345,7 @@ mod tests {
         // nested callee mentioning it disqualifies (observes the global).
         let nested = vec![IrStmt::Function {
             name: "g".to_string(),
+            params: vec![],
             body: vec![IrStmt::Expr(IrExpr::Var("_t".to_string(), None))],
             named_blocks: vec![],
         }];
@@ -43438,6 +43450,7 @@ mod tests {
             assign("_t", IrExpr::Int(7)),
             IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![echo_var("g")],
                 named_blocks: vec![],
             },

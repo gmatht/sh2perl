@@ -18793,6 +18793,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![echo],
                     named_blocks: vec![],
                 },

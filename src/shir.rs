@@ -57997,6 +57997,7 @@ mod sink_context_tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -58047,6 +58048,7 @@ mod sink_context_tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -59596,7 +59598,7 @@ mod whole_argv_tests {
     }
 
     fn fn_stmt(name: &str, body: Vec<IrStmt>) -> IrStmt {
-        IrStmt::Function { name: name.to_string(), body, named_blocks: vec![] }
+        IrStmt::Function { name: name.to_string(), params: vec![], body, named_blocks: vec![] }
     }
 
     fn prog(stmts: Vec<IrStmt>) -> IrProgram {
@@ -59714,6 +59716,7 @@ mod shift_offset_tests {
         body.extend(rest);
         IrStmt::Function {
             name: name.to_string(),
+            params: vec![],
             body,
             named_blocks: vec![],
         }
@@ -59742,6 +59745,7 @@ mod shift_offset_tests {
     fn no_shift_is_offset_zero() {
         let p = prog(vec![IrStmt::Function {
             name: "g".to_string(),
+            params: vec![],
             body: vec![getvar("1")],
             named_blocks: vec![],
         }]);
@@ -59773,6 +59777,7 @@ mod shift_offset_tests {
     fn double_shift_vetoes() {
         let p = prog(vec![IrStmt::Function {
             name: "dd".to_string(),
+            params: vec![],
             body: vec![
                 IrStmt::Expr(IrExpr::Call {
                     func: "builtin".to_string(),
@@ -59799,6 +59804,7 @@ mod shift_offset_tests {
     fn positional_write_vetoes() {
         let p = prog(vec![IrStmt::Function {
             name: "w".to_string(),
+            params: vec![],
             body: vec![
                 IrStmt::Expr(IrExpr::Call {
                     func: "builtin".to_string(),

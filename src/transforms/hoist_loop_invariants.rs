@@ -1069,6 +1069,7 @@ mod tests {
         let stmts = vec![
             IrStmt::Function {
                 name: "step".to_string(),
+                params: vec![],
                 body: fns[0].1.clone(),
                 named_blocks: vec![],
             },
@@ -1120,6 +1121,7 @@ mod tests {
         let stmts = vec![
             IrStmt::Function {
                 name: "apply".to_string(),
+                params: vec![],
                 body: fns[0].1.clone(),
                 named_blocks: vec![],
             },
