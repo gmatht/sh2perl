@@ -6194,16 +6194,6 @@ mod tests {
     }
 
     #[test]
-    fn zz_probe_a1() {
-        let a1 = a1_fn_call(a1_assign_getvar("1"));
-        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("ingress");
-        let estree = crate::shir::shir_to_estree(&ir);
-        println!("PRE : {}", serde_json::to_string(&estree).unwrap());
-        let done = compile_head_passes(estree);
-        println!("POST: {}", serde_json::to_string(&done).unwrap());
-    }
-
-    #[test]
     fn json_writer_matches_serde() {
         // the hand-rolled writer must produce JSON the browser parses
         // identically to serde's — compare the parsed VALUES (object
