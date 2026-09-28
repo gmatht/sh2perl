@@ -44,5 +44,6 @@ fn main() {
 
     let est = debashl::shir::shir_to_estree(&p);
     let s = serde_json::to_string(&est).unwrap();
-    println!("estree(ingest): {}", &s[..s.len().min(700)]);
+    std::fs::write("/home/llm/sh2loop/tmp_run/t73dbg/estree.json", &s).unwrap();
+    println!("estree(ingest) written: {} bytes", s.len());
 }
