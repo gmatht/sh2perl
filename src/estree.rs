@@ -6140,6 +6140,19 @@ mod tests {
         ));
     }
 
+
+    #[test]
+    fn zz_dump_probe() {
+        for src in ["f() { a=$1; return $a; }; g=$(f hi); echo $g",
+                    "f() { n=${#1}; return $n; }; g=$(f hi); echo $g",
+                    "f() { a=${1:0:1}; return $a; }; g=$(f hi); echo $g"] {
+            let c = Parser::new(src).parse().unwrap();
+            let p = ast_to_estree(&c);
+            println!("=== {} ===", src);
+            println!("{}", serde_json::to_string_pretty(&p).unwrap());
+        }
+    }
+
     #[test]
     fn json_writer_matches_serde() {
         // the hand-rolled writer must produce JSON the browser parses
