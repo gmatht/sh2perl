@@ -302,9 +302,27 @@ static void tri_shaded(double x0, double y0, double s0,
  * dividing a w <= 0 vertex is what turns a wall the eye is inside into
  * a triangle smeared across the whole screen. */
 typedef struct {
-    double x, y, z;        /* view-space position (already rotated) */
-    double w;              /* depth = -z after the yaw rotation */
+    double x, y;          /* view-space position (already rotated) */
+    double w;             /* depth = -rel.z, the shader's w */
 } Vtx;
+
+/* THE NEAR PLANE, in world units.
+ *
+ * It has to be a real distance, not an epsilon, because a clipped
+ * vertex LANDS ON IT and then gets divided: at w = 1e-4 a point half a
+ * block to the side projects 560000 px off a 320-px screen, so the
+ * triangle keeps a full-screen bounding box and the clip saves the
+ * arithmetic but none of the fill cost. (Measured: 0.0001 gave 23
+ * ms/frame for the cube pass, essentially the unclipped cost.)
+ *
+ * It also has to stay well clear of anything real. In MIMEcroft the
+ * eye sits at the PLAYER CELL'S CENTRE and a block spans +/-0.5, so the
+ * nearest real surface is 0.5 units away; can_enter refuses any cell
+ * that is not air, so the eye is never inside a wall. 0.01 is fifty
+ * times closer than that, which is margin enough that no cube the game
+ * can draw is ever clipped, while bounding a clipped vertex to ~5600 px
+ * off screen. */
+#define W_NEAR 0.01
 
 /* object-space vertex -> view space. The world transform (aPosition *
  * uScale + uObjPos) and the yaw rotation are the shader's, verbatim;
@@ -331,12 +349,9 @@ static void to_view(double apx, double apy, double apz,
  * makes every cube 1000x too big: one block at 4 deep then spans the
  * whole screen and a 320x240 frame comes out 76800 lit pixels.
  *
- * The caller has already clipped w > W_NEAR, so the clamp below never
- * fires in the normal path; it is kept so a degenerate vertex cannot
- * produce a NaN coordinate that would poison the bounding box. */
-#define W_NEAR 1e-4
-
-static int project(const Vtx *v, double *outx, double *outy) {
+ * The clamp only guards a degenerate vertex: the near-plane clip has
+ * already run, so w >= W_NEAR and the divide is finite. */
+static void project(const Vtx *v, double *outx, double *outy) {
     double w = v->w, ndcx, ndcy;
     if (w < W_NEAR) w = W_NEAR;
     ndcx = v->x * 0.7 + C_shift * w;
@@ -344,7 +359,6 @@ static int project(const Vtx *v, double *outx, double *outy) {
     /* NDC -> pixel. +y is up in NDC, down in a framebuffer row. */
     *outx = (ndcx / w * 0.5 + 0.5) * S_w;
     *outy = (0.5 - ndcy / w * 0.5) * S_h;
-    return 1;
 }
 
 /* Lerp a vertex against the near plane, in view space. Linear in every
@@ -424,68 +438,123 @@ static void draw_cube(double ox, double oy, double oz,
         (void)b;
         for (b = 0; b < 12; b++) {
             int fi = order[b];
-            Vtx vin[3];
-            double vshade[3];
-            Vtx poly[8];          /* a triangle clipped by one plane
-                                   * is at most a quad; 8 is slack */
-            double shade[8];
+            double px[8], py[8], sh[8];  /* the clipped screen-space polygon */
+            double gx0 = -1.0, gy0 = -1.0;
+            double gx1 = (double)S_w + 1.0, gy1 = (double)S_h + 1.0;
             int np = 0, k;
-            for (k = 0; k < 3; k++) {
-                int vi = CUBE_I[fi*3+k];
-                to_view(CUBE_P[vi*3+0], CUBE_P[vi*3+1], CUBE_P[vi*3+2],
-                        ox, oy, oz, sx, sy, sz, &vin[k]);
-                vshade[k] = CUBE_SHADE[vi] / 1000.0;
-            }
-            /* NEAR-PLANE CLIP, against w > W_NEAR.
+
+            /* NEAR-PLANE CLIP, in view space and then in screen space.
              *
-             * A face that straddles the camera plane has to be clipped
+             * A face that straddles the camera plane must be clipped
              * before anything is divided by w, exactly as the GPU clips
              * gl_Position against z_clip = -w. Dividing first and then
              * clamping w to a tiny positive number (what this used to
-             * do) sends any w <= 0 vertex to infinity, and the face
+             * do) sends every w <= 0 vertex to infinity, and the face
              * comes out as a triangle smeared across the entire
              * viewport — a wall the eye is inside paints the whole
              * screen with one face's colour.
              *
-             * It was not only wrong, it was the frame's whole cost: at
-             * the player cell the near wall is 0.5 units away, so most
-             * of its faces straddle, and 74 of a 310-cube payload had a
-             * projected bounding box larger than the full 320x240
-             * screen. Each one rasterized all 76800 pixels. Measured
-             * 23 ms/frame for the cube pass, of which almost all was
-             * filling triangles that should never have existed.
+             * It was not only wrong, it was the frame's whole cost. At
+             * the player cell the nearest wall is 0.5 units away, so
+             * most of its faces straddle, and 74 of a 310-cube payload
+             * had a projected bounding box larger than the whole
+             * 320x240 screen — each rasterizing all 76800 pixels.
              *
-             * Sutherland–Hodgman against the single plane w = W_NEAR.
-             * A triangle wholly in front passes through untouched, so
-             * every pixel of the unclipped path is bit-identical. */
+             * TWO CLIPS, because one is not enough:
+             *
+             *   1. view space, w > W_NEAR — Sutherland-Hodgman against
+             *      the single near plane. A face wholly in front passes
+             *      through untouched, so every pixel of the unclipped
+             *      path is bit-identical.
+             *   2. screen space, a GUARD BAND around the viewport. The
+             *      vertex this clip just created sits ON the near
+             *      plane, and dividing by a near distance is exactly
+             *      what makes it enormous: at W_NEAR = 0.01 it is still
+             *      ~5600 px off a 320-px screen, so the rasterizer
+             *      still walks a full-screen bounding box. (At
+             *      W_NEAR = 1e-4 it was 560000 px, and the clip bought
+             *      nothing at all: 23.0 -> 21.6 ms/frame.) Clipping the
+             *      polygon to a small margin of the viewport shrinks
+             *      that bounding box to the margin, so a face at the eye
+             *      costs a few thousand pixels instead of 76800.
+             *
+             * The margin is 1 px, and it is there so the bounding-box
+             * clamp in tri_shaded is not the thing that decides
+             * coverage: the band lies strictly OUTSIDE the viewport, so
+             * no pixel inside it changes. A face whose crossing is
+             * off-screen loses the sliver it would have contributed
+             * there — the same call a GPU makes with a finite
+             * rasterizer guard band.
+             *
+             * A triangle clipped by five planes has at most 3 + 5 = 8
+             * corners, so the 8 slots below are the exact bound. */
             for (k = 0; k < 3; k++) {
-                const Vtx *a = &vin[k];
-                const Vtx *b2 = &vin[(k + 1) % 3];
-                int ain = a->w > W_NEAR, bin = b2->w > W_NEAR;
-                if (ain) {
-                    if (np < 8) { poly[np] = *a; shade[np] = vshade[k]; np++; }
+                int vi = CUBE_I[fi*3+k];
+                int vj = CUBE_I[fi*3+(k + 1) % 3];
+                Vtx a, b2, iv;
+                double s0 = CUBE_SHADE[vi] / 1000.0;
+                double s1 = CUBE_SHADE[vj] / 1000.0;
+                to_view(CUBE_P[vi*3+0], CUBE_P[vi*3+1], CUBE_P[vi*3+2],
+                        ox, oy, oz, sx, sy, sz, &a);
+                to_view(CUBE_P[vj*3+0], CUBE_P[vj*3+1], CUBE_P[vj*3+2],
+                        ox, oy, oz, sx, sy, sz, &b2);
+                if (a.w > W_NEAR && np < 8) {
+                    project(&a, &px[np], &py[np]);
+                    sh[np] = s0;
+                    np++;
                 }
-                if (ain != bin) {
-                    double t = (W_NEAR - a->w) / (b2->w - a->w);
-                    Vtx iv;
-                    if (np < 8) {
-                        lerp_v(a, b2, t, &iv);
-                        poly[np] = iv;
-                        shade[np] = vshade[k] + (vshade[(k + 1) % 3]
-                                                 - vshade[k]) * t;
-                        np++;
+                if ((a.w > W_NEAR) != (b2.w > W_NEAR) && np < 8) {
+                    double u = (W_NEAR - a.w) / (b2.w - a.w);
+                    lerp_v(&a, &b2, u, &iv);
+                    project(&iv, &px[np], &py[np]);
+                    sh[np] = s0 + (s1 - s0) * u;
+                    np++;
+                }
+            }
+            if (np < 3) continue;
+
+            /* The guard band: four in-place Sutherland-Hodgman passes,
+             * one per edge, each keeping the half-plane
+             *     dot(n, p) + d >= 0
+             * where n is the OUTWARD normal of the edge. The `d` sign
+             * is what makes it an upper bound: for `x <= gx1` the
+             * outward normal is (-1, 0) and the plane passes through
+             * (gx1, 0), so d = gx1 — not -gx1, which would be the
+             * half-plane `x <= -gx1` and silently discard the entire
+             * polygon. (It did: every face vanished, and the
+             * silhouette oracle reported 816 missing pixels, 0
+             * outside the hull.) */
+            for (k = 0; k < 4 && np >= 3; k++) {
+                double nx, ny, d;
+                int m = 0, e;
+                switch (k) {
+                case 0: nx =  1.0; ny =  0.0; d = -gx0; break; /* x >= gx0 */
+                case 1: nx = -1.0; ny =  0.0; d =  gx1; break; /* x <= gx1 */
+                case 2: nx =  0.0; ny =  1.0; d = -gy0; break; /* y >= gy0 */
+                default:nx =  0.0; ny = -1.0; d =  gy1; break; /* y <= gy1 */
+                }
+                for (e = 0; e < np; e++) {
+                    int e2 = (e + 1) % np;
+                    double d0 = px[e] * nx + py[e] * ny + d;
+                    double d1 = px[e2] * nx + py[e2] * ny + d;
+                    if (d0 >= 0.0 && m < 8) {
+                        px[m] = px[e]; py[m] = py[e]; sh[m] = sh[e]; m++;
+                    }
+                    if ((d0 >= 0.0) != (d1 >= 0.0) && m < 8) {
+                        double u = d0 / (d0 - d1);
+                        px[m] = px[e] + (px[e2] - px[e]) * u;
+                        py[m] = py[e] + (py[e2] - py[e]) * u;
+                        sh[m] = sh[e] + (sh[e2] - sh[e]) * u;
+                        m++;
                     }
                 }
+                np = m;
             }
-            /* fan-triangulate the (3- or 4-)gon */
-            for (k = 2; k < np; k++) {
-                double p0x, p0y, p1x, p1y, p2x, p2y;
-                if (!project(&poly[0], &p0x, &p0y)) continue;
-                if (!project(&poly[k - 1], &p1x, &p1y)) continue;
-                if (!project(&poly[k], &p2x, &p2y)) continue;
-                tri_shaded(p0x, p0y, shade[0], p1x, p1y, shade[k - 1],
-                           p2x, p2y, shade[k], rgb);
-            }
+            /* fan-triangulate */
+            for (k = 2; k < np; k++)
+                tri_shaded(px[0], py[0], sh[0],
+                           px[k - 1], py[k - 1], sh[k - 1],
+                           px[k], py[k], sh[k], rgb);
         }
     }
 }
