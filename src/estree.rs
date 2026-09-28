@@ -6098,21 +6098,23 @@ mod tests {
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
     }
 
-    /// Feed an A1 program through the A1→estree entry (the path a
-    /// frontend's raw shIR actually takes) and report whether the
-    /// positional bridge survived `direct_shell_fn_calls`.
+    /// Lower an A1 body to estree and run `direct_shell_fn_calls` on it,
+    /// reporting whether the positional bridge survived.
     ///
-    /// The A1 ingress is the path that matters here: a frontend (go-sh's
+    /// This is the pass boundary the request names. A frontend (go-sh's
     /// `len($1)`, any raw A1 producer) emits positional reads as
-    /// `getVar("1")` / `param("len","1")`, NOT as a `sh2.positional`
-    /// member read. The parse-tree path lifts `$1` into a real JS
-    /// parameter during `normalize_functions`, so it never needed the
-    /// bridge — but an A1 body that still reads positionally through the
-    /// store convention does, or the rewritten direct call silently drops
-    /// the arguments.
+    /// `getVar("1")` / `param("len","1")`; if the A1→estree lowering has
+    /// NOT already turned those into a `sh2.positional` member read, the
+    /// direct-call rewrite must not drop the bridge — otherwise the body
+    /// reads the CALLER's positional frame and the argument is dropped.
+    ///
+    /// The pass is driven directly (not through `compile_head_passes`)
+    /// because the earlier `normalize_functions` pass rewrites some
+    /// positional shapes into real JS parameters, which would mask what
+    /// this pass does on its own.
     fn direct_call_keeps_positional_bridge(a1: serde_json::Value) -> bool {
         let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
-        let prog = crate::shir::shir_to_estree_compiled(&ir);
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
         serde_json::to_string(&prog).unwrap().contains("sh2.positional")
     }
 
