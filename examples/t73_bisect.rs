@@ -46,4 +46,28 @@ fn main() {
     let s = serde_json::to_string(&est).unwrap();
     std::fs::write("/home/llm/sh2loop/tmp_run/t73dbg/estree.json", &s).unwrap();
     println!("estree(ingest) written: {} bytes", s.len());
+
+    // render_ingested(): set_source_lang + promote_ascii_vars
+    let mut q = p.clone();
+    debashl::shir::promote_ascii_vars(&mut q);
+    dump("ascii_vars  ", &q);
+    let est2 = debashl::shir::shir_to_estree(&q);
+    let s2 = serde_json::to_string(&est2).unwrap();
+    std::fs::write("/home/llm/sh2loop/tmp_run/t73dbg/estree2.json", &s2).unwrap();
+    println!("estree(after ascii_vars): {} bytes", s2.len());
+
+    // render_with_source(): set_source_lang(SOME) before rendering
+    for lang in ["zsh", "sh", "fish", "py", "go", "c", "pl"] {
+        debashl::shir::set_source_lang(Some(lang));
+        let est3 = debashl::shir::shir_to_estree(&q);
+        let s3 = serde_json::to_string(&est3).unwrap();
+        std::fs::write(
+            format!("/home/llm/sh2loop/tmp_run/t73dbg/estree_{lang}.json"),
+            &s3,
+        )
+        .unwrap();
+        let has = s3.contains("\"x\"");
+        println!("src_lang={lang}: {} bytes, mentions x={has}", s3.len());
+    }
+    debashl::shir::set_source_lang(None);
 }
