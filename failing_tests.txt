@@ -1,6 +1,5 @@
 000__04h_complex_examples.sh	stdout mismatch
 008_simple_backup.sh	stdout mismatch
-012_process_substitution.sh	exit code (bash=0 perl=124)
 043_home.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
 051_primes.sh	stdout mismatch
@@ -19,7 +18,6 @@
 064_07_complex_array_operations.sh	stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	stdout mismatch
 064_20_nested_subshells_environment_variables.sh	stdout mismatch
-064_26_nested_brace_alternatives.sh	stdout mismatch
 064_hard_to_generate.sh	stdout mismatch
 065_yes_head_while.sh	stdout mismatch
 070_cmp_basic.sh	stdout mismatch
