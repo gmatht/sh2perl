@@ -17,7 +17,7 @@
  *      whose FIRST record is a SYN yields the key that is in it; an
  *      unmapped key is skipped, and a mapped key after it still lands
  *   5. the tty source, over a pty pair, echoes and delivers one byte
- *   6. fb_input_line() never blocks when there is nothing pending
+ *   6. fb_input_line(kf) never blocks when there is nothing pending
  */
 /* _GNU_SOURCE FIRST, before even the local header: openpty() is a GNU
  * addition, and with only the default feature macros the implicit
@@ -74,43 +74,65 @@ static void append_file(const char *path, const char *text) {
 
 /* ── 1. nothing configured ────────────────────────────────────────── */
 static void t_nosource(void) {
+    const char *kf = 0;   /* no key file: only a real keyboard */
     unsetenv("FB_KEYS");
     unsetenv("FB_INPUT");
     unsetenv("FB_TTY");
     setenv("FB_NO_TTY", "1", 1);
-    ckstr(fb_input_line(), "", "no source -> empty key");
-    ckstr(fb_input_line(), "", "no source -> still empty (no crash)");
+    ckstr(fb_input_line(kf), "", "no source -> empty key");
+    ckstr(fb_input_line(kf), "", "no source -> still empty (no crash)");
     ck(!fb_input_ready(), "no source -> ready() is false");
     setenv("FB_NO_TTY", "0", 1);
 }
 
 /* ── 2/3. the key file ───────────────────────────────────────────── */
 static void t_keyfile(void) {
+    const char *kf;   /* the device is given the queue as a PARAMETER */
     const char *p = "/tmp/fbinput-keys";
     unlink(p);
     write_file(p, "w\na\ns\n\nd\n");
-    setenv("FB_KEYS", p, 1);
+    kf = p;              /* the game passes its key-file var by value */
     setenv("FB_NO_TTY", "1", 1);
 
     /* keys come back in order, one per call */
-    ckstr(fb_input_line(), "w", "keyfile 1st key");
-    ckstr(fb_input_line(), "a", "keyfile 2nd key");
-    ckstr(fb_input_line(), "s", "keyfile 3rd key");
+    ckstr(fb_input_line(kf), "w", "keyfile 1st key");
+    ckstr(fb_input_line(kf), "a", "keyfile 2nd key");
+    ckstr(fb_input_line(kf), "s", "keyfile 3rd key");
     /* a blank line is a REAL key: the game treats "" as "no key", so a
      * scripted run paces itself with blank lines. It must not be
      * swallowed (that would silently drop a frame's worth of time). */
-    ckstr(fb_input_line(), "", "keyfile blank line is a key");
-    ckstr(fb_input_line(), "d", "keyfile key after a blank line");
+    ckstr(fb_input_line(kf), "", "keyfile blank line is a key");
+    ckstr(fb_input_line(kf), "d", "keyfile key after a blank line");
     /* end of file is "" forever, not a hang and not a stale repeat */
-    ckstr(fb_input_line(), "", "keyfile EOF -> empty");
-    ckstr(fb_input_line(), "", "keyfile EOF -> empty again");
+    ckstr(fb_input_line(kf), "", "keyfile EOF -> empty");
+    ckstr(fb_input_line(kf), "", "keyfile EOF -> empty again");
 
     /* a key appended AFTER the first read must be seen: the file is
      * held open, so a run that queues keys progressively works */
     append_file(p, "q\n");
-    ckstr(fb_input_line(), "q", "keyfile sees an appended key");
+    ckstr(fb_input_line(kf), "q", "keyfile sees an appended key");
 
-    unsetenv("FB_KEYS");
+    /* POINTING THE DEVICE AT A DIFFERENT QUEUE. The game passes its
+     * key-file variable on every call, so a run that changes the file
+     * must be served the NEW file. Caching the descriptor forever
+     * would keep handing out keys from the first one — which is
+     * exactly what happened when the file came from the environment
+     * instead and a test pointed $FB_KEYS at a fresh file.
+     *
+     * Switching back re-opens the original and therefore RESTARTS it:
+     * a queue has one cursor, and a cursor is per (device, file)
+     * rather than global. The key is the new file's first line — a
+     * stale key from the old queue would be the bug. */
+    {
+        const char *p2 = "/tmp/fbinput-keys2";
+        unlink(p2);
+        write_file(p2, "z\ny\n");
+        ckstr(fb_input_line(p2), "z", "a different queue is served, not the cached one");
+        ckstr(fb_input_line(p2), "y", "the new queue continues in order");
+        ckstr(fb_input_line(kf), "w", "switching back restarts that queue from its first key");
+        unlink(p2);
+    }
+
     unlink(p);
 }
 
@@ -137,6 +159,7 @@ static void wr_events(int fd, const struct input_event *ev, int n) {
 }
 
 static void t_evdev(void) {
+    const char *kf = 0;   /* the event stream is the source, not a file */
     const char *fifo = "/tmp/fbinput-evdev";
     struct input_event evs[8];
     int wfd;
@@ -167,7 +190,7 @@ static void t_evdev(void) {
     put_evt(&evs[1], EV_KEY, KEY_W, 0);
     put_evt(&evs[2], EV_SYN, SYN_REPORT, 0);
     wr_events(wfd, evs, 3);
-    ckstr(fb_input_line(), "w", "evdev press+release -> one key 'w'");
+    ckstr(fb_input_line(kf), "w", "evdev press+release -> one key 'w'");
 
     /* the same key again in the SAME batch: the second press is a
      * repeat, and the game's one-key-per-frame rule means a held key
@@ -175,7 +198,7 @@ static void t_evdev(void) {
     put_evt(&evs[0], EV_KEY, KEY_W, 1);
     put_evt(&evs[1], EV_KEY, KEY_W, 0);
     wr_events(wfd, evs, 2);
-    ckstr(fb_input_line(), "w", "evdev second press in its own batch -> 'w'");
+    ckstr(fb_input_line(kf), "w", "evdev second press in its own batch -> 'w'");
 
     /* a batch whose FIRST record is a SYN. Reading one record per call
      * would return "" here and drop the keypress entirely. */
@@ -183,7 +206,7 @@ static void t_evdev(void) {
     put_evt(&evs[1], EV_KEY, KEY_A, 1);
     put_evt(&evs[2], EV_KEY, KEY_A, 0);
     wr_events(wfd, evs, 3);
-    ckstr(fb_input_line(), "a", "evdev key behind a leading SYN -> 'a'");
+    ckstr(fb_input_line(kf), "a", "evdev key behind a leading SYN -> 'a'");
 
     /* an UNMAPPED key (F13) then a mapped one in the same batch: the
      * unmapped press is skipped, and the mapped key behind it still
@@ -194,13 +217,13 @@ static void t_evdev(void) {
     put_evt(&evs[2], EV_KEY, KEY_E, 1);
     put_evt(&evs[3], EV_KEY, KEY_E, 0);
     wr_events(wfd, evs, 4);
-    ckstr(fb_input_line(), "e", "evdev skips an unmapped key, keeps 'e'");
+    ckstr(fb_input_line(kf), "e", "evdev skips an unmapped key, keeps 'e'");
 
     /* a batch of only unmapped keys yields no key at all */
     put_evt(&evs[0], EV_KEY, KEY_F13, 1);
     put_evt(&evs[1], EV_KEY, KEY_F13, 0);
     wr_events(wfd, evs, 2);
-    ckstr(fb_input_line(), "", "evdev a batch of only unmapped keys -> none");
+    ckstr(fb_input_line(kf), "", "evdev a batch of only unmapped keys -> none");
 
     /* three keys inside one batch: the frame consumes ONE. A game must
      * not teleport three cells because the keyboard delivered a burst
@@ -212,12 +235,12 @@ static void t_evdev(void) {
     put_evt(&evs[4], EV_KEY, KEY_D, 1);
     put_evt(&evs[5], EV_KEY, KEY_D, 0);
     wr_events(wfd, evs, 6);
-    ckstr(fb_input_line(), "w", "evdev a 3-key burst yields the FIRST key only");
-    ckstr(fb_input_line(), "", "evdev the rest of the burst is consumed");
+    ckstr(fb_input_line(kf), "w", "evdev a 3-key burst yields the FIRST key only");
+    ckstr(fb_input_line(kf), "", "evdev the rest of the burst is consumed");
 
     /* nothing left: "" without blocking */
-    ckstr(fb_input_line(), "", "evdev drained -> empty, no block");
-    ckstr(fb_input_line(), "", "evdev still empty");
+    ckstr(fb_input_line(kf), "", "evdev drained -> empty, no block");
+    ckstr(fb_input_line(kf), "", "evdev still empty");
 
     ck(fb_input_ready(), "evdev: ready() once a source is open");
 
@@ -229,6 +252,7 @@ static void t_evdev(void) {
 
 /* ── 5/6. the tty source over a pty ───────────────────────────────── */
 static void t_tty(void) {
+    const char *kf = 0;   /* the terminal is the source, not a file */
     int mfd, sfd;
     pid_t pid;
     int status = 0;
@@ -292,9 +316,9 @@ static void t_tty(void) {
     unsetenv("FB_INPUT");
     setenv("FB_NO_TTY", "0", 1);
 
-    ckstr(fb_input_line(), "w", "tty delivers the first typed key");
-    ckstr(fb_input_line(), "a", "tty delivers the second typed key");
-    ckstr(fb_input_line(), "", "tty with nothing pending -> empty");
+    ckstr(fb_input_line(kf), "w", "tty delivers the first typed key");
+    ckstr(fb_input_line(kf), "a", "tty delivers the second typed key");
+    ckstr(fb_input_line(kf), "", "tty with nothing pending -> empty");
 
     waitpid(pid, &status, 0);
     close(mfd);
@@ -305,16 +329,17 @@ static void t_tty(void) {
 /* ── 6. it never blocks ───────────────────────────────────────────── */
 static void t_noblock(void) {
     const char *p = "/tmp/fbinput-empty";
+    const char *kf;
     unlink(p);
     write_file(p, "");
-    setenv("FB_KEYS", p, 1);
+    kf = p;
     setenv("FB_NO_TTY", "1", 1);
     {
         struct timespec a, b;
         clock_gettime(CLOCK_MONOTONIC, &a);
-        fb_input_line();
-        fb_input_line();
-        fb_input_line();
+        fb_input_line(kf);
+        fb_input_line(kf);
+        fb_input_line(kf);
         clock_gettime(CLOCK_MONOTONIC, &b);
         {
             double ms = (double)(b.tv_sec - a.tv_sec) * 1000.0
@@ -322,7 +347,6 @@ static void t_noblock(void) {
             ck(ms < 50.0, "an empty key file answers in well under 50ms");
         }
     }
-    unsetenv("FB_KEYS");
     unlink(p);
 }
 

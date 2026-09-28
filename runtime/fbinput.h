@@ -56,8 +56,18 @@ void  fb_input_timeout(int ms);
  * newline stripped (so a line-oriented key file and a keystroke look
  * the same to the script). Returns a pointer to a static buffer,
  * valid until the next call. Returns "" when nothing is pending, and
- * "\x1b" (a lone ESC) for an unrecognised or unmapped device key. */
-const char *fb_input_line(void);
+ * "\x1b" (a lone ESC) for an unrecognised or unmapped device key.
+ *
+ * `keyfile` is the scripted-input queue (the device's FB_KEYS env var
+ * is used when this is NULL, and when neither is set only a real
+ * keyboard is read). It is a PARAMETER and not just an env var
+ * because a game keeps its key queue in a shell variable, and an
+ * `export` in a transpiled program does not reach a C device: the
+ * emitted C assigns a variable and never calls setenv, so the device's
+ * getenv would always see the pre-run environment and the game would
+ * silently never receive a key. An argument keeps the value in the
+ * program's own data, where no export plumbing can lose it. */
+const char *fb_input_line(const char *keyfile);
 
 /* The byte the last fb_input_line() saw from the tty, or 0 when the
  * key came from a file/evdev mapping (or there was no key). Lets a

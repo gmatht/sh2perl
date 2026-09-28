@@ -46,6 +46,7 @@ static int    KF_fd = -1;
 static int    KF_eof = 0;
 static char   KF_buf[256];
 static size_t KF_len = 0, KF_pos = 0;
+static char   KF_path[512] = "";   /* the file KF_fd is reading */
 
 /* the evdev source */
 static int    EV_fd = -1;
@@ -70,15 +71,27 @@ static int    T_isatty = 0;
  * device. The file is opened lazily and kept open: a scripted run
  * appends keys while the game runs, and re-opening per key would both
  * cost a syscall pair and race an append. */
-static int kf_open(void) {
-    const char *p = getenv("FB_KEYS");
+static int kf_open(const char *want) {
+    const char *p = (want && *want) ? want : getenv("FB_KEYS");
     if (!p || !*p) return 0;
+    if (KF_fd < 0 || strcmp(KF_path, p) != 0) {
+        /* a different queue: drop the old descriptor. Without this, a
+         * program that changes $FB_KEYS between runs (or a test that
+         * points the device at a new file) kept consuming the FIRST
+         * file forever, because the fd was cached forever. */
+        if (KF_fd >= 0) close(KF_fd);
+        KF_fd = -1;
+        KF_eof = 0;
+        KF_len = 0;
+        KF_pos = 0;
+    }
     if (KF_fd < 0) {
         /* O_NONBLOCK: a named pipe or an empty regular file must not
          * park the game inside open() waiting for a writer that may
          * never come. */
         KF_fd = open(p, O_RDONLY | O_NONBLOCK);
         if (KF_fd < 0) return 0;
+        snprintf(KF_path, sizeof KF_path, "%s", p);
     }
     return 1;
 }
@@ -391,7 +404,7 @@ int fb_input_count(void) { return I_count; }
  * retry is skipped entirely. */
 static int I_calls = 0;
 
-const char *fb_input_line(void) {
+const char *fb_input_line(const char *keyfile) {
     int got = 0;
 
     I_line[0] = 0;
@@ -400,7 +413,7 @@ const char *fb_input_line(void) {
 
     /* 1. the key file wins: a scripted run must be reproducible even
      *    on a box that also has a live keyboard attached */
-    if (kf_open()) {
+    if (kf_open(keyfile)) {
         if (kf_next(I_line, sizeof I_line)) got = 1;
     }
     /* 2. evdev */
