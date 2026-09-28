@@ -6098,48 +6098,100 @@ mod tests {
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
     }
 
-    /// Build the post-`direct_shell_fn_calls` program for `src` and report
-    /// whether the positional bridge survived the rewrite.
-    fn direct_call_keeps_positional_bridge(input: &str) -> bool {
-        let commands = Parser::new(input).parse().unwrap();
-        let prog = direct_shell_fn_calls(ast_to_estree(&commands));
-        // The bridge is the `sh2.positional = [args]` save/restore around
-        // the direct call. If it is gone, the body's positional reads
-        // resolve against the CALLER's frame instead of the arguments.
+    /// Feed an A1 program through the A1→estree entry (the path a
+    /// frontend's raw shIR actually takes) and report whether the
+    /// positional bridge survived `direct_shell_fn_calls`.
+    ///
+    /// The A1 ingress is the path that matters here: a frontend (go-sh's
+    /// `len($1)`, any raw A1 producer) emits positional reads as
+    /// `getVar("1")` / `param("len","1")`, NOT as a `sh2.positional`
+    /// member read. The parse-tree path lifts `$1` into a real JS
+    /// parameter during `normalize_functions`, so it never needed the
+    /// bridge — but an A1 body that still reads positionally through the
+    /// store convention does, or the rewritten direct call silently drops
+    /// the arguments.
+    fn direct_call_keeps_positional_bridge(a1: serde_json::Value) -> bool {
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = crate::shir::shir_to_estree_compiled(&ir);
         serde_json::to_string(&prog).unwrap().contains("sh2.positional")
+    }
+
+    /// An A1 program with one `f` function and one `fnCall("f", …)` site.
+    /// `body` is the function body; it decides whether the bridge is needed.
+    fn a1_fn_call(body: serde_json::Value) -> serde_json::Value {
+        let s = |v: &str| serde_json::json!({"type":"Str","value":v,"style":"DoubleQuoted"});
+        serde_json::json!({
+            "contract_version": 1,
+            "type": "Program",
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type":"Function","name":"f","body":[body],"named_blocks":{}},
+                {"type":"Expr","expr":{
+                    "type":"Call","func":"builtin","purity":"Emulable",
+                    "args":[s("echo"), {"type":"Array","elements":[
+                        {"type":"Call","func":"fnCall","purity":"Emulable",
+                         "args":[s("f"), {"type":"Array","elements":[s("hi")]}]}
+                    ]}]}}
+            ]
+        })
+    }
+
+    /// An Assign of `getVar(<name>)` to `a` — the store-convention read.
+    fn a1_assign_getvar(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":"Assign",
+            "targets":[{"var":"a","indices":[],"sigil":null}],
+            "expr":{"type":"Call","func":"getVar","purity":"Emulable",
+                    "args":[{"type":"Str","value":name,"style":"DoubleQuoted"}]}
+        })
     }
 
     #[test]
     fn direct_call_bridges_getvar_positional_reads() {
-        // A fnCall-rewritten call to a function that reads `$1` through
-        // the getVar convention MUST keep the positional bridge — without
-        // it the body reads the caller's (empty) positional frame and the
+        // `a = getVar("1")` — the getVar convention for `$1`. Without the
+        // bridge the body reads the CALLER's positional frame and the
         // argument is silently dropped.
-        for src in [
-            // plain positional value read
-            "f() { a=$1; return $a; }; g=$(f hi); echo $g",
-            // positional LENGTH read (`#1`)
-            "f() { n=${#1}; return $n; }; g=$(f hi); echo $g",
-            // positional slice
-            "f() { a=${1:0:1}; return $a; }; g=$(f hi); echo $g",
-        ] {
+        for name in ["1", "2", "9", "#1"] {
             assert!(
-                direct_call_keeps_positional_bridge(src),
-                "positional bridge dropped for: {src}"
+                direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "positional bridge dropped for getVar({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_bridges_param_positional_reads() {
+        // `n = param("len","1")` — go-sh's `len($1)`, the shape the
+        // request names: a positional read addressed BY NUMBER, with the
+        // name in the SECOND argument.
+        for op in ["len", "slice", ""] {
+            let body = serde_json::json!({
+                "type":"Assign",
+                "targets":[{"var":"a","indices":[],"sigil":null}],
+                "expr":{"type":"Call","func":"param","purity":"Emulable",
+                        "args":[{"type":"Str","value":op,"style":"DoubleQuoted"},
+                                {"type":"Str","value":"1","style":"DoubleQuoted"}]}
+            });
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(body)),
+                "positional bridge dropped for param({op:?},\"1\")"
             );
         }
     }
 
     #[test]
     fn direct_call_without_positional_read_stays_direct() {
-        // The negative half: a function with NO positional read must not
-        // pay the save/restore bridge (that is the whole point of the
-        // direct-call rewrite).
-        assert!(!direct_call_keeps_positional_bridge(
-            "f() { a=7; return $a; }; g=$(f hi); echo $g"
-        ));
+        // The negative half: a body with NO positional read must not pay
+        // the save/restore bridge — that is the point of the rewrite.
+        // `getVar("a")` names a store var; `getVar("0")` is not a
+        // positional ($0 is argv0, read through a different channel).
+        for name in ["a", "0", "#0", "10", "x1"] {
+            assert!(
+                !direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "bridge emitted for the non-positional read getVar({name:?})"
+            );
+        }
     }
-
 
     #[test]
     fn json_writer_matches_serde() {
