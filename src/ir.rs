@@ -756,6 +756,16 @@ pub enum IrStmt {
     },
     /// Shell function definition (positional args via the runtime).
     ///
+    /// `params` — the frontends' NAMED parameter list (`func add(a, b int)`,
+    /// core request rust-20260927-121500-function-params-ingress). EMPTY
+    /// for bash, whose functions take positional args only (`$1`, `$2`) and
+    /// so carry no names. A non-empty list is authoritative: a backend
+    /// renders the definition with those parameters bound in order. Before
+    /// this field existed the deserializer had nowhere to put a `params`
+    /// key, so a Go function's parameter names were DROPPED SILENTLY at
+    /// ingress and every read of a parameter inside the body degraded to a
+    /// read of an unbound name.
+    ///
     /// `named_blocks` — PowerShell-style named blocks (`dynamicparam` /
     /// `begin` / `process` / `end` / `clean`), as `(block_name, stmts)`
     /// pairs (core-request powershell-sh-go). EMPTY for bash functions
@@ -767,6 +777,8 @@ pub enum IrStmt {
     /// backend (the A1-ingress oracle is `otranspilerl-cli --source-lang shir --target estree`).
     Function {
         name: String,
+        /// Named parameters, bound in order. Empty for bash functions.
+        params: Vec<String>,
         body: Vec<IrStmt>,
         named_blocks: Vec<(String, Vec<IrStmt>)>,
     },
@@ -1035,7 +1047,7 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         fn collect_fn_names(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
             for s in stmts {
                 match s {
-                    IrStmt::Function { name, body, named_blocks } => {
+                    IrStmt::Function { name, body, named_blocks, .. } => {
                         out.insert(name.clone());
                         collect_fn_names(body, out);
                         for (_, nb) in named_blocks {
@@ -7662,10 +7674,12 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
             },
             IrStmt::Function {
                 name,
+                params,
                 body,
                 named_blocks,
             } => IrStmt::Function {
                 name: name.clone(),
+                params: params.clone(),
                 body: rewrite_fn_calls(body, fns),
                 named_blocks: named_blocks
                     .iter()

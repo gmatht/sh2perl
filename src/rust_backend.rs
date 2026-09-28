@@ -16658,7 +16658,7 @@ fn loop_var_scan(stmts: &[IrStmt], var: &str, u: &mut LoopVarUse) {
                     loop_var_scan_expr(&r.target, var, u);
                 }
             }
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 // deferred execution: any mention of var inside vetoes
                 // (reads would miss loop-top values, writes the static)
                 u.bad = true;
@@ -17635,7 +17635,7 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
                 IrStmt::Function {
                     name,
                     body,
-                    named_blocks,
+                    named_blocks, ..
                 } => {
                     if !defined.insert(name.clone()) {
                         ambiguous.insert(name.clone());
@@ -17914,7 +17914,7 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
 fn collect_fn_defs(stmts: &[IrStmt], out: &mut Vec<(String, Vec<IrStmt>, bool)>) {
     for s in stmts {
         match s {
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 out.push((name.clone(), body.clone(), !named_blocks.is_empty()));
                 collect_fn_defs(body, out);
             }

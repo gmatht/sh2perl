@@ -443,7 +443,7 @@ impl<'a> Walker<'a> {
                     }
                 });
             }
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 // nested function: its own scope (a use inside is NOT a
                 // use of the outer scope, even for same-named bindings —
                 // merging would only ever widen toward global, sound)

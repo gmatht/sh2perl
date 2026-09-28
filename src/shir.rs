@@ -11547,7 +11547,7 @@ pub fn analyze_fn_sink_contexts(prog: &IrProgram) -> HashMap<String, SinkContext
                 IrStmt::Function {
                     name,
                     body,
-                    named_blocks,
+                    named_blocks, ..
                 } => {
                     if !defined.insert(name.clone()) {
                         ambiguous.insert(name.clone());
@@ -12914,7 +12914,7 @@ pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
     ) {
         for s in stmts {
             match s {
-                IrStmt::Function { name, body, named_blocks } => {
+                IrStmt::Function { name, body, named_blocks, .. } => {
                     if defs.insert(name.clone(), body).is_some() {
                         ambiguous.insert(name.clone());
                     }
@@ -16928,6 +16928,10 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         }
         Command::Function(f) => IrStmt::Function {
             name: f.name.clone(),
+            // bash functions take POSITIONAL args only ($1, $2) and carry
+            // no parameter names; the named-`params` list is for the
+            // frontends (core request rust-20260927-121500).
+            params: vec![],
             body: body_stmts(&Command::Block(f.body.clone())),
             named_blocks: vec![],
         },
@@ -36094,6 +36098,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             name,
             body,
             named_blocks,
+            ..
         } => {
             // Per-function `local` native lift (see [`local_lift_analysis`]):
             // push the function's frame so the body's `local` decls lower

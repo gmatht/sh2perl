@@ -914,8 +914,9 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
         IrStmt::Background(v) => Some(IrStmt::Background(
             v.into_iter().filter_map(|s| purge(s, dead)).collect(),
         )),
-        IrStmt::Function { name, body, .. } => Some(IrStmt::Function {
+        IrStmt::Function { name, params, body, .. } => Some(IrStmt::Function {
             name,
+            params,
             body: body.into_iter().filter_map(|s| purge(s, dead)).collect(),
             named_blocks: Vec::new(),
         }),

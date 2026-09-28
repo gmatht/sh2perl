@@ -658,6 +658,32 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Function" => {
             let name = req_str(o, "name", where_)?.to_string();
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            // Named parameters (`func add(a, b int) int`, core request
+            // rust-20260927-121500-function-params-ingress): an optional
+            // `params` list of parameter-name strings, bound in order.
+            //
+            // Same optional-field convention as `typeParams` directly
+            // below: absent or null = no named parameters (bash
+            // functions, which take positional args only, and every
+            // existing frontend emit — all parse unchanged). A non-string
+            // entry is a hard ingress error rather than a silent drop:
+            // the field used to be dropped entirely, which is how a Go
+            // function's parameter names went missing and every read of a
+            // parameter became a read of an unbound name.
+            let params = match o.get("params") {
+                None | Some(serde_json::Value::Null) => vec![],
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| match e.as_str() {
+                        Some(s) => Ok(String::from(s)),
+                        None => Err(format!("{where_}.params[{i}]: not a string")),
+                    })
+                    .collect::<Result<Vec<String>, String>>()?,
+                Some(other) => {
+                    return Err(format!("{where_}.params: not an array ({other})"));
+                }
+            };
             // Go generic declarations (`func id[T any](...)`, core request
             // go-sh-typeargs): an optional `typeParams` list of
             // type-parameter strings. Same ERASURE contract as Call's
@@ -705,6 +731,7 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             }
             IrStmt::Function {
                 name,
+                params,
                 body,
                 named_blocks,
             }
@@ -1146,9 +1173,26 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
     })
 }
 
+/// Optional element lists — the word/operand lists of the A1 nodes that
+/// are legitimately EMPTY: `Call.args`, `Expr.args`, `Redirect.redirects`,
+/// `Target.indices` and `Array.elements`.
+///
+/// A missing key and an explicit JSON `null` both mean "no elements".
+/// The `null` tolerance is the fix for core requests
+/// rust-20260926-105700-empty-array-elements-null / rust-20260926-140000:
+/// a Go frontend that builds its word list with `make([]any, len(words))`
+/// marshals the zero-length slice to `null`, not `[]`, so an empty exec
+/// word list (`a, b := pair()` — the synthetic call carries no words) used
+/// to be rejected here with "elements: not an array" before ANY backend
+/// renderer could run.
+///
+/// A non-null, non-array value is still a hard error: only `null`/absent
+/// are accepted as empty, so a genuinely malformed list still fails loudly
+/// rather than being silently coerced.
 fn exprs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrExpr>, String> {
     match v {
         None => Ok(vec![]),
+        Some(Value::Null) => Ok(vec![]),
         Some(x) => arr(Some(x), where_)?
             .iter()
             .enumerate()

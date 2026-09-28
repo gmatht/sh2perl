@@ -86,7 +86,7 @@ fn is_dead_function(st: &IrStmt, dead: &HashSet<&str>) -> bool {
 fn collect_function_names(stmts: &[IrStmt], out: &mut HashSet<String>) {
     for st in stmts {
         match st {
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 out.insert(name.clone());
                 collect_function_names(body, out);
                 for (_, nb) in named_blocks {

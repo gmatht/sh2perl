@@ -2036,7 +2036,7 @@ fn count_stmt(st: &IrStmt, name: &str, n: &mut usize) {
                 count_expr(&r.target, name, n);
             }
         }
-        IrStmt::Function { name: fname, body, named_blocks } => {
+        IrStmt::Function { name: fname, body, named_blocks, .. } => {
             if fname == name {
                 *n += 1;
             }
@@ -13069,7 +13069,7 @@ fn param_copy_alias(
                 // mentioned anywhere outside F's own direct subtree?
                 let mut outside = false;
                 for st in stmts {
-                    if let IrStmt::Function { name, body, named_blocks } = st {
+                    if let IrStmt::Function { name, body, named_blocks, .. } = st {
                         if name == fname {
                             if nested_hits(body, x)
                                 || named_blocks.iter().any(|(_, b)| nested_hits(b, x))
