@@ -99,6 +99,37 @@ static const uint8_t CUBE_I[36] = {
   16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
 };
 
+/* THE SIX FACE OUTWARD NORMALS, indexed by face number (face f is
+ * CUBE_I[6f .. 6f+5], the two triangles of one face).
+ *
+ * Needed for back-face culling. A cube is CONVEX and CLOSED, so a face
+ * whose outward normal points away from the eye is behind the cube's
+ * own body and cannot be seen from anywhere outside it. Culling those
+ * is exact, not an approximation, and it is the single largest cost
+ * saving in the frame: 73% of a 252-cube payload (2221 of 3024
+ * triangles) is back-facing at the player's cell, and each was being
+ * rasterized over its full projected area only to be painted over.
+ *
+ * THE ORDER IS TOP, BOTTOM, +z, -z, +x, -x — the cube table's own, not
+ * the +x/-x/+y/-y/+z/-z that reads more naturally, and the first table
+ * written here WAS that guess. It cost 118 lit pixels across the
+ * silhouette oracle's 112 cases, because a face culled as "facing away"
+ * was in fact a visible one. A hand-written table of face properties is
+ * a second transcription of the same geometry, and this file already
+ * has one transcription bug on record (see CUBE_P).
+ *
+ * So this one is generated: the derivation is the three lines below,
+ * and tools/fbdev-faces.py re-derives it from CUBE_P/CUBE_I and diffs
+ * the result against this array. Regenerate rather than edit. */
+static const int8_t FACE_N[6][3] = {
+    { 0,  1,  0},   /* top    */
+    { 0, -1,  0},   /* bottom */
+    { 0,  0,  1},   /* +z     */
+    { 0,  0, -1},   /* -z     */
+    { 1,  0,  0},   /* +x     */
+    {-1,  0,  0},   /* -x     */
+};
+
 /* ── backend open/close ───────────────────────────────────────────── */
 static int fb_try_dev(const char *dev, int w, int h) {
 #ifdef FBDEV_HAVE_FBIO
@@ -488,6 +519,43 @@ static void draw_cube(double ox, double oy, double oz,
              *
              * A triangle clipped by five planes has at most 3 + 5 = 8
              * corners, so the 8 slots below are the exact bound. */
+
+            /* BACK-FACE CULL, before any of that. See FACE_N: a closed
+             * convex cube's rear faces are behind its own body, so this
+             * drops 73% of a typical frame's triangles and changes not
+             * one pixel. The two triangles of a face always agree,
+             * because the test is per face and never per triangle, so a
+             * face is never half-drawn.
+             *
+             * CULLED ONLY WHEN ALL THREE VERTICES FACE AWAY. A test on
+             * the face's CENTROID was the obvious version and it is
+             * wrong at the silhouette: the centroid of a face seen
+             * edge-on sits at dot ~= 0 while the face still owns a
+             * one-pixel-wide sliver of the outline, and culling it left
+             * a hole — the silhouette oracle reported exactly one
+             * missing pixel, at the corner of a cube whose +x and -z
+             * faces were being dropped while the top face's own sliver
+             * fell a third of a pixel short of covering it. Requiring
+             * all three vertices is also what a GPU does, and it is
+             * still exact: a face of a convex solid with every vertex
+             * facing away is behind the body, full stop. */
+            {
+                const int8_t *n = FACE_N[fi / 2];
+                double nvx = n[0] * C_cos + n[2] * C_sin;
+                double nvz = -n[0] * C_sin + n[2] * C_cos;
+                int front = 0, e;
+                for (e = 0; e < 3; e++) {
+                    int vi = CUBE_I[fi*3+e];
+                    double fx = CUBE_P[vi*3+0] * sx / 1000000.0 + ox - C_x;
+                    double fy = CUBE_P[vi*3+1] * sy / 1000000.0 + oy - (C_y + 0.5);
+                    double fz = CUBE_P[vi*3+2] * sz / 1000000.0 + oz - C_z;
+                    double dx = fx * C_cos + fz * C_sin;
+                    double dz = -fx * C_sin + fz * C_cos;
+                    if (nvx * dx + n[1] * fy + nvz * dz >= 0.0) front = 1;
+                }
+                if (!front) continue;
+            }
+
             for (k = 0; k < 3; k++) {
                 int vi = CUBE_I[fi*3+k];
                 int vj = CUBE_I[fi*3+(k + 1) % 3];
@@ -513,42 +581,58 @@ static void draw_cube(double ox, double oy, double oz,
             }
             if (np < 3) continue;
 
-            /* The guard band: four in-place Sutherland-Hodgman passes,
-             * one per edge, each keeping the half-plane
+            /* The guard band: four Sutherland-Hodgman passes, one per
+             * edge, each keeping the half-plane
              *     dot(n, p) + d >= 0
              * where n is the OUTWARD normal of the edge. The `d` sign
              * is what makes it an upper bound: for `x <= gx1` the
              * outward normal is (-1, 0) and the plane passes through
              * (gx1, 0), so d = gx1 — not -gx1, which would be the
              * half-plane `x <= -gx1` and silently discard the entire
-             * polygon. (It did: every face vanished, and the
-             * silhouette oracle reported 816 missing pixels, 0
-             * outside the hull.) */
-            for (k = 0; k < 4 && np >= 3; k++) {
-                double nx, ny, d;
-                int m = 0, e;
-                switch (k) {
-                case 0: nx =  1.0; ny =  0.0; d = -gx0; break; /* x >= gx0 */
-                case 1: nx = -1.0; ny =  0.0; d =  gx1; break; /* x <= gx1 */
-                case 2: nx =  0.0; ny =  1.0; d = -gy0; break; /* y >= gy0 */
-                default:nx =  0.0; ny = -1.0; d =  gy1; break; /* y <= gy1 */
-                }
-                for (e = 0; e < np; e++) {
-                    int e2 = (e + 1) % np;
-                    double d0 = px[e] * nx + py[e] * ny + d;
-                    double d1 = px[e2] * nx + py[e2] * ny + d;
-                    if (d0 >= 0.0 && m < 8) {
-                        px[m] = px[e]; py[m] = py[e]; sh[m] = sh[e]; m++;
+             * polygon. (It did: every face vanished, and the silhouette
+             * oracle reported 816 missing pixels, 0 outside the hull.)
+             *
+             * THE OUTPUT GOES IN A SECOND BUFFER, not in place. Doing it
+             * in place is the tempting one-line version and it is
+             * wrong: an edge can emit a kept vertex AND a crossing, so
+             * the write index overtakes the read index, and the write
+             * lands on a corner the pass has not read yet. It showed up
+             * as one face whose polygon collapsed to four copies of a
+             * single point — a fan of degenerate slivers — and the
+             * silhouette oracle reported one missing pixel at exactly
+             * that face's corner. Clipping into a scratch array and
+             * copying back costs one 8-element struct copy per pass. */
+            {
+                double qx[8], qy[8], qs[8];
+                for (k = 0; k < 4 && np >= 3; k++) {
+                    double nx, ny, d;
+                    int m = 0, e;
+                    switch (k) {
+                    case 0: nx =  1.0; ny =  0.0; d = -gx0; break; /* x >= gx0 */
+                    case 1: nx = -1.0; ny =  0.0; d =  gx1; break; /* x <= gx1 */
+                    case 2: nx =  0.0; ny =  1.0; d = -gy0; break; /* y >= gy0 */
+                    default:nx =  0.0; ny = -1.0; d =  gy1; break; /* y <= gy1 */
                     }
-                    if ((d0 >= 0.0) != (d1 >= 0.0) && m < 8) {
-                        double u = d0 / (d0 - d1);
-                        px[m] = px[e] + (px[e2] - px[e]) * u;
-                        py[m] = py[e] + (py[e2] - py[e]) * u;
-                        sh[m] = sh[e] + (sh[e2] - sh[e]) * u;
-                        m++;
+                    for (e = 0; e < np; e++) {
+                        int e2 = (e + 1) % np;
+                        double d0 = px[e] * nx + py[e] * ny + d;
+                        double d1 = px[e2] * nx + py[e2] * ny + d;
+                        if (d0 >= 0.0 && m < 8) {
+                            qx[m] = px[e]; qy[m] = py[e]; qs[m] = sh[e]; m++;
+                        }
+                        if ((d0 >= 0.0) != (d1 >= 0.0) && m < 8) {
+                            double u = d0 / (d0 - d1);
+                            qx[m] = px[e] + (px[e2] - px[e]) * u;
+                            qy[m] = py[e] + (py[e2] - py[e]) * u;
+                            qs[m] = sh[e] + (sh[e2] - sh[e]) * u;
+                            m++;
+                        }
+                    }
+                    np = m;
+                    for (e = 0; e < np; e++) {
+                        px[e] = qx[e]; py[e] = qy[e]; sh[e] = qs[e];
                     }
                 }
-                np = m;
             }
             /* fan-triangulate */
             for (k = 2; k < np; k++)

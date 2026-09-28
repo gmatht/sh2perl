@@ -12,6 +12,14 @@ set -e
 cd "$(dirname "$0")"
 
 rc=0
+
+# FACE_N (the back-face-cull normals) is a second statement about the
+# cube geometry CUBE_P/CUBE_I already carry, and a wrong one removes
+# VISIBLE faces rather than drawing bad ones — the silhouette oracle
+# catches it, but only after a full build and 112 renders. This is the
+# check that says so directly, and it runs before either.
+if ! python3 tools/fbdev-faces.py fbdev.c; then rc=1; fi
+
 for CC in cc tcc; do
     echo "== $CC =="
     rm -f /tmp/fbdev-test-$CC
