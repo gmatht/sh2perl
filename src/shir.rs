@@ -31419,7 +31419,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     if std::env::var("SH2_DBG_NW").is_ok() {
         let nw = NEVER_WRITTEN.lock().unwrap();
         eprintln!(
-            "DBGNW has_x={} lifted_num={:?} lifted_str={:?}",
+            "DBGNW has_x={:?} lifted_num={:?} lifted_str={:?}",
             nw.as_ref().map(|s| s.contains("x")),
             *LIFTED_NUMERIC.lock().unwrap(),
             *LIFTED_STRING.lock().unwrap()
