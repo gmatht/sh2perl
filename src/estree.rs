@@ -6196,6 +6196,24 @@ mod tests {
     }
 
     #[test]
+    fn zz_probe3() {
+        for (nm, body) in [("getvar1", a1_assign_getvar("1")),
+                           ("param_len1", serde_json::json!({
+                             "type":"Assign",
+                             "targets":[{"var":"a","indices":[],"sigil":null}],
+                             "expr":{"type":"Call","func":"param","purity":"Emulable",
+                                     "args":[{"type":"Str","value":"len","style":"DoubleQuoted"},
+                                             {"type":"Str","value":"1","style":"DoubleQuoted"}]}}))] {
+            let a1 = a1_fn_call(body);
+            let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("ingress");
+            let e = crate::shir::shir_to_estree(&ir);
+            let s = serde_json::to_string(&e).unwrap();
+            println!("### {nm}: has_positional={} has_getVar={} has_param={}",
+                s.contains("sh2.positional"), s.contains("getVar"), s.contains(r#""param""#));
+        }
+    }
+
+    #[test]
     fn json_writer_matches_serde() {
         // the hand-rolled writer must produce JSON the browser parses
         // identically to serde's — compare the parsed VALUES (object
