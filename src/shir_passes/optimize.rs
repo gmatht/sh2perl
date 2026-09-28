@@ -2412,6 +2412,52 @@ mod tests {
     }
 
     #[test]
+    fn dce_keeps_store_read_only_by_a_let_arith_string() {
+        // x=5; if (( x > 3 )); then echo big; fi
+        //
+        // The `(( ))` / `let` condition reaches the DCE as a BARE-IDENTIFIER
+        // arithmetic string: `Call("exec", ["let", Array(["x > 3"])])`. The
+        // Str read scan only collects `$name` / `${name}` refs, so it saw NO
+        // read of `x`, judged the store dead and dropped `x=5` — which then
+        // made `never_written_read("x")` fold the cond's own read to `""`,
+        // so `(( x > 3 ))` evaluated `Number("") || 0` and the native zsh
+        // `echo big` became `echo small` (zsh-sh-go t73_zsh_arith_cond).
+        let prog = prog_of(vec![
+            assign("x", IrExpr::Int(5)),
+            IrStmt::If {
+                cond: IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("let".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "x > 3".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                },
+                then: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "big".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                })],
+                elsifs: vec![],
+                else_: vec![],
+            },
+        ]);
+        let mut prog = prog;
+        assert!(
+            !dead_store_elim(&mut prog),
+            "a `let` arith string reads its bare identifiers — the x store must survive"
+        );
+        assert_eq!(prog.stmts.len(), 2);
+    }
+
+    #[test]
     fn const_prop_folds_straight_line_arith_read() {
         // x=5; y=$(( x + 1 )); echo $y — the read of x is a NUMERIC
         // context (arith), the honesty rule allows the const fold; the
