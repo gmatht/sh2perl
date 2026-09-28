@@ -40,7 +40,12 @@ pub mod shir_json;
 pub mod transforms;
 
 pub mod bc;
-pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
+// REMOVED 2026-09-29: `pub mod perl_backend` — the partial renderer rewrite
+// that aa583efab swept in inside an unrelated estree/C commit. It was never
+// finished: 60 `# TODO(unsupported)` punt markers across 30 corpus examples
+// (ir.rs: 0), and it shell-outs rather than lowering — 7/20 vs 19/20 against
+// bash. `ir::shir_to_perl` is the only Perl renderer. See
+// src/bin/perl_backend.rs for the full measurement.
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees
 // (branch backend/<lang>). Each consumes the ShIR in-process and emits
