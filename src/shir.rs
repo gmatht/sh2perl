@@ -108,13 +108,71 @@ pub fn shaderize_enabled() -> bool {
 /// output resembles the input — a human should see `1 + 2` there.
 static SIZE_OPT: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// Per-RENDER override of `-Os`.
+    ///
+    /// The process global alone is not enough for a test suite: a test that
+    /// wants to assert the `-Os` shape does `set_size_opt(true); render(..);
+    /// set_size_opt(false)`, and under `cargo test`'s default PARALLEL
+    /// threads a sibling test reading `size_opt_enabled()` mid-render
+    /// observes that transient value. Measured 2026-09-28: `cargo test
+    /// --lib` on a clean, unmodified tree reported 15, 16, 15, 15, 15
+    /// failures, with `rust_backend::tests::literal_literal_ops_are_widened`
+    /// and `...::const_string_test_folds_only_with_size_opt` trading places
+    /// between runs. A non-deterministic gate cannot be gated on — the core
+    /// worker's `lib_fails <= baseline` check then discards EVERY candidate
+    /// (44 consecutive rollbacks).
+    ///
+    /// A thread-local fixes it without changing any signature: the override
+    /// is visible only to the thread that asked for it, so a parallel test
+    /// can neither observe nor clobber it, and no lock serialises the
+    /// renders. `OptScope` restores on drop, including on panic.
+    ///
+    /// The process global is still read as the fallback, so the production
+    /// path (otranspilerl sets the level once, from the CLI flag, before any
+    /// render) is unchanged.
+    static SIZE_OPT_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Render-scoped `-Os` override. Drop restores the previous value.
+///
+///     let _opt = shir::size_opt_scope(true);
+///     let out = shir_to_rust(&prog);
+pub struct SizeOptScope {
+    prev: bool,
+}
+
+impl SizeOptScope {
+    pub fn new(on: bool) -> Self {
+        let prev = SIZE_OPT_TL.with(|c| c.replace(on));
+        Self { prev }
+    }
+}
+
+impl Drop for SizeOptScope {
+    fn drop(&mut self) {
+        let p = self.prev;
+        SIZE_OPT_TL.with(|c| c.set(p));
+    }
+}
+
+pub fn size_opt_scope(on: bool) -> SizeOptScope {
+    SizeOptScope::new(on)
+}
+
 /// Enable/disable `-Os` size-oriented lowering (default off).
+///
+/// This sets the PROCESS-WIDE level: the production entry point
+/// (otranspilerl's `--target`/opt-level dispatch) calls it once before any
+/// rendering. A TEST that needs a specific level for one render must use
+/// `size_opt_scope` instead — setting the global mid-suite races every other
+/// test running in parallel.
 pub fn set_size_opt(on: bool) {
     SIZE_OPT.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn size_opt_enabled() -> bool {
-    SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
+    SIZE_OPT_TL.with(|c| c.get()) || SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// `-Oz`: golf for output SIZE. `-Os` plus a renderer text pass that

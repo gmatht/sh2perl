@@ -18157,18 +18157,24 @@ mod tests {
         // The shrinking fold to a bare `true` is `-Os`/`-Oz` only (like
         // `1 + 2` -> `3`): at the `-Og` default the output must resemble
         // the input.
-        crate::shir::set_size_opt(false);
-        let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
-        assert!(!out.contains("__sh_glob_like"), "glob probe kept at -Og:\n{out}");
-        assert!(!out.contains("__sh_fnmatch"), "fnmatch kept at -Og:\n{out}");
-        // Both operands are constant, so the compare needs no owned
-        // Strings — it renders like the source (`"a" == "a"`), as every
-        // other backend does (String("a") === String("a"), mem.eql(u8,..)).
-        assert!(out.contains("if \"a\" == \"a\""), "{out}");
-        assert!(!out.contains("to_string()"), "needless String alloc at -Og:\n{out}");
+        // Each level gets its OWN render-scoped override. The scope restores
+        // on drop, so no test can leave the level flipped for a sibling —
+        // that was the flake (see shir::size_opt_scope).
+        {
+            let _opt = crate::shir::size_opt_scope(false);
+            let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
+            assert!(!out.contains("__sh_glob_like"), "glob probe kept at -Og:\n{out}");
+            assert!(!out.contains("__sh_fnmatch"), "fnmatch kept at -Og:\n{out}");
+            // Both operands are constant, so the compare needs no owned
+            // Strings — it renders like the source (`"a" == "a"`), as every
+            // other backend does (String("a") === String("a"), mem.eql(u8,..)).
+            assert!(out.contains("if \"a\" == \"a\""), "{out}");
+            assert!(!out.contains("to_string()"), "needless String alloc at -Og:\n{out}");
+        }
 
-        crate::shir::set_size_opt(true);
-        let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
+        {
+            let _opt = crate::shir::size_opt_scope(true);
+            let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
         // The whole `if` is gone: the branch runs inline, so at -Os the
         // program is literally the body of the taken branch.
         assert!(!out.contains("if "), "constant `if` not elided at -Os:\n{out}");
@@ -18180,7 +18186,7 @@ mod tests {
         let out = render("if [ \"a\" = \"b\" ]; then echo x; else echo y; fi\n");
         assert!(!out.contains("if "), "constant `if` not elided:\n{out}");
         assert!(out.contains("print!(\"y\\n\")") && !out.contains("print!(\"x\\n\")"), "{out}");
-        crate::shir::set_size_opt(false);
+        }
     }
 
     #[test]
@@ -18189,12 +18195,11 @@ mod tests {
         // VARIABLE rhs is only decidable at runtime — both keep the probe
         // (the sh2 evalTest contract; the go-sh frontend lowers
         // strings.Contains to `"$s"=*world*`).
-        crate::shir::set_size_opt(true);
+        let _opt = crate::shir::size_opt_scope(true);
         let out = render("if [ \"abc\" = \"a*\" ]; then echo m; fi\n");
         assert!(out.contains("__sh_glob_like") && out.contains("__sh_fnmatch"), "{out}");
         let out = render("pat='a*'\nif [ \"abc\" = \"$pat\" ]; then echo m; fi\n");
         assert!(out.contains("__sh_glob_like"), "variable rhs lost the probe:\n{out}");
-        crate::shir::set_size_opt(false);
     }
 
     #[test]
@@ -18202,14 +18207,13 @@ mod tests {
         // the `{ let __b = E; __SH_RC.store(..); __b }` wrapper exists to
         // land the test's status in `$?`; an `if` resets __SH_RC itself,
         // so in condition position the store is dead and the wrapper goes.
-        crate::shir::set_size_opt(false);
+        let _opt = crate::shir::size_opt_scope(false);
         let out = render("if [ \"$x\" = \"hi\" ]; then echo y; fi\n");
         assert!(!out.contains("let __b"), "dead status wrapper kept:\n{out}");
         assert!(!out.contains("__SH_RC"), "dead rc register kept:\n{out}");
         // ...but the status IS observable after a bare test, so it stays.
         let out = render("[ \"a\" = \"b\" ]\necho \"$?\"\n");
         assert!(out.contains("__SH_RC"), "observable status dropped:\n{out}");
-        crate::shir::set_size_opt(false);
     }
 
     #[test]
@@ -19643,5 +19647,31 @@ mod tok2_tests {
         eprintln!("TOKS: {:?}", toks);
         assert_eq!(toks.len(), 2, "{toks:?}");
         assert!(matches!(&toks[0], TTok::Unary(u) if u == "-h"), "{toks:?}");
+    }
+}
+
+#[cfg(test)]
+mod size_opt_scope_regression {
+    /// The PRODUCTION path sets the process global (otranspilerl does it
+    /// from the opt-level dispatch, before any render). A render-scoped
+    /// override must not shadow it once the scope is dropped.
+    #[test]
+    fn global_level_still_honoured_with_no_scope() {
+        let src = "echo $((1 + 2))\n";
+        let commands = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&commands);
+
+        crate::shir::set_size_opt(true);
+        let folded = crate::rust_backend::shir_to_rust(&prog);
+        assert!(folded.contains('3') && !folded.contains("1 + 2"),
+            "global -Os no longer folds:\n{folded}");
+
+        crate::shir::set_size_opt(false);
+        let plain = crate::rust_backend::shir_to_rust(&prog);
+        // -Og does not restore the literal SPELLING (`1 + 2`); it renders the
+        // same sum in the widened, unfolded form. What matters is that the
+        // fold did not happen — the operands are still there.
+        assert!(plain.contains("1i64 + 2i64"),
+            "global -Og no longer keeps the unfolded sum:\n{plain}");
     }
 }
