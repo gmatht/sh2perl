@@ -19950,11 +19950,22 @@ fn param_copy_alias(
         }
         // `$(uu-cmd args)` of a genuinely-external command: capture
         // in-process (no fork/exec, no bash). Single-stmt shape only.
+        // The fb device's CAPTURED primitives (the keyboard) are
+        // lowered the same way. This is the arm a real
+        // `$(fb_input_line …)` reaches: capture_call, not
+        // capture_expr. Hooking only capture_expr left every capture on
+        // the shell site — the generated C called
+        // system("bash -c 'fb_input_line …'"), a fork+exec per frame,
+        // and since fb_input_line is not an executable the child failed
+        // and the game silently never received a key.
         if let [IrExpr::Arrow(stmts)] = args {
             if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
                 if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(cmd) = Self::str_arg(cargs, 0) {
                         if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                        if let Some(v) = self.fb_capture_opt(&cmd, cargs) {
                             return v;
                         }
                     }
