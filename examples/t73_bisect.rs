@@ -25,5 +25,9 @@ fn main() {
 
     let est = debashl::shir::shir_to_estree(&prog2);
     let s = serde_json::to_string(&est).unwrap();
-    println!("estree: {}", &s[..s.len().min(600)]);
+    println!("estree(raw): {}", &s[..s.len().min(600)]);
+
+    let comp = debashl::shir::shir_to_estree_compiled(&prog2);
+    let s2 = serde_json::to_string(&comp).unwrap();
+    println!("estree(comp): {}", &s2[..s2.len().min(800)]);
 }
