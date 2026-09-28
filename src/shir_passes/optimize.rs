@@ -1929,7 +1929,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         }
                     }
                 }
-            } else if func == "test" || func == "let" {
+            } else if func == "test" {
                 // `ternary` (the C frontend's `cond ? a : b`): args[0] is
                 // the cond TEST-STRING — try_native_test lowers it by
                 // scanning `$name` operands natively, so a store write a
@@ -1946,6 +1946,52 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         }
                     } else {
                         collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "let" {
+                // `let "a+1" "i++"` — ARITHMETIC TEXT the runtime evaluates
+                // via evalArith: its refs are BARE identifiers, not `$name`
+                // tokens, so the `$`-scan above sees nothing. Same
+                // rationale (and the same over-mark-is-safe asymmetry) as
+                // the arith/arithEval arm below; a store whose only read
+                // lives in a `let` arg must survive DCE, or the never-written
+                // "" fold answers the arithmetic instead of the variable.
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        for nm in bare_arith_idents(s) {
+                            out.push(nm);
+                        }
+                    } else {
+                        collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "exec"
+                && matches!(
+                    args.first(),
+                    Some(IrExpr::Str(n, _)) if n == "let"
+                )
+            {
+                // `(( ))` and the bash `let` builtin LOWER to
+                // `Call("exec", ["let", Array([...arith words...])])` — the
+                // exec/builtin command form, NOT `func == "let"`. The arith
+                // words live in the arg-list Array, so scan those
+                // (bare_dollar_names would miss every one — a bare ident is
+                // not a `$name` token). Without this the read set stayed
+                // empty, DCE deleted the only store, and the emitter's
+                // never-written fold then blanked the operand IN THE SAME
+                // CONDITION: `x=5; if (( x > 3 ))` rendered
+                // `Number("") || 0 > 3` and took the else branch
+                // (zsh-sh-go t73_zsh_arith_cond). Over-marking only shrinks
+                // the elimination set.
+                if let Some(IrExpr::Array(words)) = args.get(1) {
+                    for w in words {
+                        if let IrExpr::Str(s, _) = w {
+                            for nm in bare_arith_idents(s) {
+                                out.push(nm);
+                            }
+                        } else {
+                            collect_expr_read_names(w, out);
+                        }
                     }
                 }
             } else if matches!(func.as_str(), "cstyleFor" | "arith" | "arithEval") {
