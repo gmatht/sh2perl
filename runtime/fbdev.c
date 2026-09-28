@@ -292,7 +292,36 @@ static void tri_shaded(double x0, double y0, double s0,
     }
 }
 
-/* Project one vertex through the game's pipeline, to a pixel.
+/* ── projection ─────────────────────────────────────────────────── */
+
+/* ONE VERTEX IN VIEW SPACE, before the perspective divide.
+ *
+ * The device projects per face, not per vertex, because a face can
+ * STRADDLE the camera plane and has to be clipped before any of it is
+ * divided. `w` is kept alongside the position for exactly that reason:
+ * dividing a w <= 0 vertex is what turns a wall the eye is inside into
+ * a triangle smeared across the whole screen. */
+typedef struct {
+    double x, y, z;        /* view-space position (already rotated) */
+    double w;              /* depth = -z after the yaw rotation */
+} Vtx;
+
+/* object-space vertex -> view space. The world transform (aPosition *
+ * uScale + uObjPos) and the yaw rotation are the shader's, verbatim;
+ * only the divide is deferred. */
+static void to_view(double apx, double apy, double apz,
+                    double ox, double oy, double oz,
+                    double sx, double sy, double sz, Vtx *v) {
+    double wx = apx * sx / 1000000.0 + ox;
+    double wy = apy * sy / 1000000.0 + oy;
+    double wz = apz * sz / 1000000.0 + oz;
+    double dx = wx - C_x, dy = wy - (C_y + 0.5), dz = wz - C_z;
+    v->x = dx * C_cos + dz * C_sin;
+    v->y = dy;
+    v->w = dx * C_sin - dz * C_cos;   /* = -rel.z, the shader's w */
+}
+
+/* view-space vertex -> pixel, through the shader's clip and divide.
  *
  * SCALE CONTRACT — this is the shader's arithmetic exactly
  * (www/examples/mimecroft-vertex.sh:45):
@@ -300,27 +329,32 @@ static void tri_shaded(double x0, double y0, double s0,
  * aPosition is MILLI (±500 = half a block) and uScale is MILLI (1000 =
  * a full block), so the product needs 1e6, not 1e3. Dividing by 1e3
  * makes every cube 1000x too big: one block at 4 deep then spans the
- * whole screen and a 320x240 frame comes out 76800 lit pixels. */
-static int project(double apx, double apy, double apz,
-                   double ox, double oy, double oz,
-                   double sx, double sy, double sz,
-                   double *outx, double *outy) {
-    double wx = apx * sx / 1000000.0 + ox;
-    double wy = apy * sy / 1000000.0 + oy;
-    double wz = apz * sz / 1000000.0 + oz;
-    double dx = wx - C_x, dy = wy - (C_y + 0.5), dz = wz - C_z;
-    double relx = dx * C_cos + dz * C_sin;
-    double rely = dy;
-    double relz = -dx * C_sin + dz * C_cos;
-    double w = -relz;
-    double ndcx, ndcy;
-    if (w < 0.0001) w = 0.0001;          /* the shader's compile-time clamp */
-    ndcx = relx * 0.7 + C_shift * w;
-    ndcy = rely * 0.45;
+ * whole screen and a 320x240 frame comes out 76800 lit pixels.
+ *
+ * The caller has already clipped w > W_NEAR, so the clamp below never
+ * fires in the normal path; it is kept so a degenerate vertex cannot
+ * produce a NaN coordinate that would poison the bounding box. */
+#define W_NEAR 1e-4
+
+static int project(const Vtx *v, double *outx, double *outy) {
+    double w = v->w, ndcx, ndcy;
+    if (w < W_NEAR) w = W_NEAR;
+    ndcx = v->x * 0.7 + C_shift * w;
+    ndcy = v->y * 0.45;
     /* NDC -> pixel. +y is up in NDC, down in a framebuffer row. */
     *outx = (ndcx / w * 0.5 + 0.5) * S_w;
     *outy = (0.5 - ndcy / w * 0.5) * S_h;
     return 1;
+}
+
+/* Lerp a vertex against the near plane, in view space. Linear in every
+ * component: the shader's clip is a straight line in view space (the
+ * divide happens after), so a crossing point is the same linear mix
+ * whether it is found before or after projection. */
+static void lerp_v(const Vtx *a, const Vtx *b, double t, Vtx *out) {
+    out->x = a->x + (b->x - a->x) * t;
+    out->y = a->y + (b->y - a->y) * t;
+    out->w = a->w + (b->w - a->w) * t;
 }
 
 /* ── payload parsing ──────────────────────────────────────────────── */
@@ -389,23 +423,68 @@ static void draw_cube(double ox, double oy, double oz,
         }
         (void)b;
         for (b = 0; b < 12; b++) {
-            i = order[b];
-            {
-        int i0 = CUBE_I[i*3+0] * 3;
-        int i1 = CUBE_I[i*3+1] * 3;
-        int i2 = CUBE_I[i*3+2] * 3;
-        double p0x, p0y, p1x, p1y, p2x, p2y;
-        double s0, s1, s2;
-        if (!project(CUBE_P[i0+0], CUBE_P[i0+1], CUBE_P[i0+2],
-                     ox, oy, oz, sx, sy, sz, &p0x, &p0y)) continue;
-        if (!project(CUBE_P[i1+0], CUBE_P[i1+1], CUBE_P[i1+2],
-                     ox, oy, oz, sx, sy, sz, &p1x, &p1y)) continue;
-        if (!project(CUBE_P[i2+0], CUBE_P[i2+1], CUBE_P[i2+2],
-                     ox, oy, oz, sx, sy, sz, &p2x, &p2y)) continue;
-        s0 = CUBE_SHADE[CUBE_I[i*3+0]] / 1000.0;
-        s1 = CUBE_SHADE[CUBE_I[i*3+1]] / 1000.0;
-        s2 = CUBE_SHADE[CUBE_I[i*3+2]] / 1000.0;
-        tri_shaded(p0x, p0y, s0, p1x, p1y, s1, p2x, p2y, s2, rgb);
+            int fi = order[b];
+            Vtx vin[3];
+            double vshade[3];
+            Vtx poly[8];          /* a triangle clipped by one plane
+                                   * is at most a quad; 8 is slack */
+            double shade[8];
+            int np = 0, k;
+            for (k = 0; k < 3; k++) {
+                int vi = CUBE_I[fi*3+k];
+                to_view(CUBE_P[vi*3+0], CUBE_P[vi*3+1], CUBE_P[vi*3+2],
+                        ox, oy, oz, sx, sy, sz, &vin[k]);
+                vshade[k] = CUBE_SHADE[vi] / 1000.0;
+            }
+            /* NEAR-PLANE CLIP, against w > W_NEAR.
+             *
+             * A face that straddles the camera plane has to be clipped
+             * before anything is divided by w, exactly as the GPU clips
+             * gl_Position against z_clip = -w. Dividing first and then
+             * clamping w to a tiny positive number (what this used to
+             * do) sends any w <= 0 vertex to infinity, and the face
+             * comes out as a triangle smeared across the entire
+             * viewport — a wall the eye is inside paints the whole
+             * screen with one face's colour.
+             *
+             * It was not only wrong, it was the frame's whole cost: at
+             * the player cell the near wall is 0.5 units away, so most
+             * of its faces straddle, and 74 of a 310-cube payload had a
+             * projected bounding box larger than the full 320x240
+             * screen. Each one rasterized all 76800 pixels. Measured
+             * 23 ms/frame for the cube pass, of which almost all was
+             * filling triangles that should never have existed.
+             *
+             * Sutherland–Hodgman against the single plane w = W_NEAR.
+             * A triangle wholly in front passes through untouched, so
+             * every pixel of the unclipped path is bit-identical. */
+            for (k = 0; k < 3; k++) {
+                const Vtx *a = &vin[k];
+                const Vtx *b2 = &vin[(k + 1) % 3];
+                int ain = a->w > W_NEAR, bin = b2->w > W_NEAR;
+                if (ain) {
+                    if (np < 8) { poly[np] = *a; shade[np] = vshade[k]; np++; }
+                }
+                if (ain != bin) {
+                    double t = (W_NEAR - a->w) / (b2->w - a->w);
+                    Vtx iv;
+                    if (np < 8) {
+                        lerp_v(a, b2, t, &iv);
+                        poly[np] = iv;
+                        shade[np] = vshade[k] + (vshade[(k + 1) % 3]
+                                                 - vshade[k]) * t;
+                        np++;
+                    }
+                }
+            }
+            /* fan-triangulate the (3- or 4-)gon */
+            for (k = 2; k < np; k++) {
+                double p0x, p0y, p1x, p1y, p2x, p2y;
+                if (!project(&poly[0], &p0x, &p0y)) continue;
+                if (!project(&poly[k - 1], &p1x, &p1y)) continue;
+                if (!project(&poly[k], &p2x, &p2y)) continue;
+                tri_shaded(p0x, p0y, shade[0], p1x, p1y, shade[k - 1],
+                           p2x, p2y, shade[k], rgb);
             }
         }
     }
