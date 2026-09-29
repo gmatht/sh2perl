@@ -215,6 +215,15 @@ pub struct Render {
     depth: usize,
     /// inside a hoisted user-function body: Return writes __SH_RET
     in_function: bool,
+    /// The `__bt_N` verdict cell of the function body being rendered, when
+    /// that body is a Go-style predicate (`func f() bool` lowered to a
+    /// verdict cell plus `return 0` / `return 1`). The cell — not the
+    /// numeric status — is the value the caller reads.
+    active_fn_bool: Option<String>,
+    /// The predicate body being rendered, so a status `return` can resolve
+    /// the verdict cell live AT ITS OWN POSITION (a body with several
+    /// verdict cells returns the one its own branch wrote — t115).
+    active_fn_body: Vec<IrStmt>,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_storage: std::collections::HashMap<String, crate::ir::StorageClass>,
     var_types: HashMap<String, IrType>,
@@ -249,6 +258,32 @@ pub struct Render {
     /// function whose body is commit-rendering (digit reads become its
     /// params); None in main and for legacy-convention functions
     active_fn: Option<String>,
+    /// For the function body currently rendering, its DECLARED named
+    /// parameters mapped to their positional binding (name -> index, 0-based).
+    ///
+    /// A shell function (`f() { ... }`) has NO named params — its body reads
+    /// `$1`/`$2`, so the positional protocol (FnSig) is the whole story. A
+    /// FRONTEND-DECLARED function (the Go frontend's `func isYes(s string)`)
+    /// carries `params: ["s"]`, and its body reads the name as an ordinary
+    /// store var (`getVar("s")`). Without this map a `getVar("s")` that was
+    /// never written in the body falls through the `written` check and renders
+    /// as an ENV read — the parameter silently becomes the environment
+    /// variable of the same name, so the function ignores its own argument.
+    ///
+    /// Only set for a body that has a probed signature (the name must map to
+    /// a real `pN` binding); without a signature the map is empty and the
+    /// store-var read keeps its old (env) meaning.
+    active_named_params: HashMap<String, usize>,
+    /// Rendering the statements of ONE pipeline stage. The stage's status
+    /// write must survive: `pipeline_stmt` reads `__SH_RC` right after the
+    /// stage to push `PIPESTATUS[i]`, a read the shared liveness verdict
+    /// cannot see (it is emitted by the backend, not present in the shIR)
+    /// — so the verdict marks the write unread and `stmt` would strip it,
+    /// leaving the push recording the PREVIOUS stage's status. That is
+    /// how `false | true` reported `PIPESTATUS=(1,1)`: `true` emits
+    /// `store(0)`, which the strip removes, while `false`'s `store(1)`
+    /// is not the stripped literal and survived.
+    in_pipeline_stage: bool,
     /// shift-offset rewrite is ACTIVE for the current function body: the
     /// body's positionals live in params (pre-shift reads at `i`, post-shift
     /// at `i + off`) and the whole argv after the shift is the trailing
@@ -1039,6 +1074,17 @@ fn cat_peephole(text: &str) -> String {
 /// site in this backend the target type is `&str` (or `AsRef<Path>` /
 /// `Borrow<str>` which `&str` satisfies). Replacing is therefore type-neutral
 /// — no behavior change, just less allocation.
+///
+/// The rewrite is only sound when the `.to_string()` ENDS the borrow
+/// expression. If any postfix operation follows it the `&` binds to the
+/// whole chain (`&x.to_string().to_lowercase()` is `&(String)`), so
+/// dropping the `&` also drops the borrow and leaves an owned `String`
+/// where a `&str` parameter is expected (`[[ ]]` + `nocasematch`:
+/// `__sh_fnmatch("a".to_lowercase(), …)` → E0308).
+fn ends_borrow(b: &[u8], at: usize) -> bool {
+    !matches!(b.get(at), Some(b'.') | Some(b'[') | Some(b'?'))
+}
+
 fn strip_str_lit_refs(text: &str) -> String {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -1066,10 +1112,13 @@ fn strip_str_lit_refs(text: &str) -> String {
             let suffix = b".to_string()";
             if j < b.len() && b[j..].starts_with(suffix) {
                 let lit_end = j; // exclusive end of the string literal
-                // emit just the string literal
-                out.push_str(&text[i + 1..lit_end]);
-                i = lit_end + suffix.len();
-                continue;
+                let after = lit_end + suffix.len();
+                if ends_borrow(b, after) {
+                    // emit just the string literal
+                    out.push_str(&text[i + 1..lit_end]);
+                    i = after;
+                    continue;
+                }
             }
             // Also handle `&("literal".to_string())` — the `&` is followed
             // by `(`, then a string literal, then `.to_string())`
@@ -1092,9 +1141,12 @@ fn strip_str_lit_refs(text: &str) -> String {
                 let suffix = b".to_string())";
                 if j < b.len() && b[j..].starts_with(suffix) {
                     let lit_end = j;
-                    out.push_str(&text[i + 2..lit_end]);
-                    i = lit_end + suffix.len();
-                    continue;
+                    let after = lit_end + suffix.len();
+                    if ends_borrow(b, after) {
+                        out.push_str(&text[i + 2..lit_end]);
+                        i = after;
+                        continue;
+                    }
                 }
             }
         }
@@ -1432,6 +1484,20 @@ fn simplify_let_b(mut text: String) -> String {
         };
         // Extract and validate the inner text before mutating.
         let inner = text[start..close].trim_end();
+        // The store must ALREADY be gone — that is the precondition this
+        // pass documents, and it is what makes the wrapper redundant. When
+        // the program keeps `__SH_RC` live (`rc_strip` is a no-op), the inner
+        // text is `EXPR; __SH_RC.store(if __b { … }); __b`: suffix-stripping
+        // then yields `EXPR; __SH_RC.store(…)`, so the replacement is a
+        // statement spliced where an operand belongs — the `;` ends the
+        // operand (E0658, or "closure bodies must be braced" inside an
+        // `&&` chain) and the store's `__b` no longer resolves (E0425).
+        // Leave the wrapper whole; `unwrap_cond` strips the store properly
+        // where the expression is consumed as a condition.
+        if inner.contains("__SH_RC.store(") {
+            search_from = at + prefix.len();
+            continue;
+        }
         let stripped = match inner.strip_suffix("__b") {
             Some(s) => s,
             None => {
@@ -2052,6 +2118,11 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // other construct — the sink check is dead code in them. `Sometimes`
     // (the conservative default) stays out of the set.
     r.fn_value_used = fn_value_used(&prog);
+    if std::env::var("SH2_DEBUG_FNVU").is_ok() {
+        let mut v: Vec<_> = r.fn_value_used.iter().cloned().collect();
+        v.sort();
+        eprintln!("SH2_DEBUG_FNVU = {v:?}");
+    }
     // BORROWABLE LOCALS (shared analysis): a single-assignment variable
     // whose every read is a borrow binds as `&str` — `let a = "foo";` and
     // `println!("{}{}", a, b)` instead of `let a = "foo".to_string();`
@@ -2181,6 +2252,15 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         .filter(|(_, v)| *v == crate::shir::SinkContext::Never)
         .map(|(k, _)| k)
         .collect();
+    // …but `Never` is a verdict on the CALL SITES: a function that is never
+    // called under a redirect can still redirect inside its OWN body, and a
+    // bare `print!` there would bypass its own capture/redirect sink. Drop
+    // those — see `sink_owning_fns`.
+    {
+        let mut own_sink = std::collections::HashSet::new();
+        sink_owning_fns(&prog.stmts, &mut own_sink);
+        r.fn_sink_never.retain(|f| !own_sink.contains(f));
+    }
     // SOURCE-LANGUAGE STATUS VERDICT (shared): the source has no `$?` and
     // the program reads no status — so the register this renderer carries
     // for shell semantics is unreachable and is not emitted at all
@@ -2316,6 +2396,16 @@ impl Render {
     }
 
     fn rc_plain(&self, line: &str) -> bool {
+        // A store whose VALUE is a runtime helper call is not a plain
+        // status store: the effect lives in the stored expression, not in
+        // the register. `__SH_RC.store(__sh_spawn(…), …)` runs the command
+        // and prints its output, and `__SH_RC.store(__sh_run_*, …)` runs a
+        // user function — collapsing either as a "dead status write" drops
+        // the command outright. Only an effect-free stored expression (a
+        // literal or a variable read) may be elided.
+        if line.contains("__SH_RC.store(") && line.contains("__sh_") {
+            return false;
+        }
         if line.contains("__SH_RC.load")
             || line.contains('{')
             || line.contains('}')
@@ -2365,7 +2455,7 @@ impl Render {
     /// overwritten or the program exits) carries no store — the same
     /// verdict the ESTree emitter uses to drop `sh2.lastExit`.
     fn status_store(&mut self, s: &IrStmt) {
-        if crate::shir::stmt_status_write_is_unread(s) {
+        if !self.in_pipeline_stage && crate::shir::stmt_status_write_is_unread(s) {
             return;
         }
         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
@@ -2654,6 +2744,26 @@ impl Render {
             return Some((base, FnParamTy::StrRef));
         }
         Some((base, sig.tys[i]))
+    }
+
+    /// A DECLARED function parameter read by NAME, as a String-typed Rust
+    /// expression. `None` when `name` is not a parameter of the body being
+    /// rendered (the overwhelming common case: a shell function has no named
+    /// params, and main has no function at all).
+    ///
+    /// The value IS the positional binding `fn_param(i)` renders — a name is
+    /// just a label the frontend hung on the same slot. Delegating keeps the
+    /// shift-offset rewrite, the borrow verdict and the numeric typing in one
+    /// place instead of duplicating them here.
+    fn named_param_str(&mut self, name: &str) -> Option<String> {
+        let i = *self.active_named_params.get(name)?;
+        match self.fn_param(i) {
+            Some((b, FnParamTy::Str)) => Some(format!("{b}.clone()")),
+            // a `&str` param IS the borrow — no clone needed here either
+            Some((b, FnParamTy::StrRef)) => Some(b),
+            Some((b, FnParamTy::Num)) => Some(format!("{b}.to_string()")),
+            None => None,
+        }
     }
 
     /// Translate a positional index for the active shift-offset rewrite:
@@ -3061,23 +3171,40 @@ impl Render {
 
     // ── literals ─────────────────────────────────────────────────────
 
+    /// The source byte a byte-preserving marker stands for. The core has
+    /// TWO, from different readers: U+E000+byte (`bytes_to_marked_lossy`)
+    /// and U+F800+byte (`read_source`, which the C backend and estree
+    /// both decode). Both mean "bash passed this invalid-UTF-8 byte
+    /// through verbatim" — U+F800 is what `read_source` produces for a
+    /// Latin-1 byte in a literal (`"acc\xE9nt"` → U+F8E9).
+    fn raw_byte_of(c: char) -> Option<u8> {
+        let u = c as u32;
+        if (0xE000..=0xE0FF).contains(&u) {
+            Some((u - 0xE000) as u8)
+        } else if (0xF800..=0xF8FF).contains(&u) {
+            Some((u - 0xF800) as u8)
+        } else {
+            None
+        }
+    }
+
     /// A Rust string literal (value context — callers append
     /// `.to_string()` where a `String` value is required).
     fn rust_str(s: &str) -> String {
-        // lossy-read markers (U+E000 + source byte, the core's
-        // bytes_to_marked_lossy): bash passes invalid UTF-8 bytes
-        // through, so re-emit the RAW byte — a Rust str literal can't
-        // hold it, so build the value byte-wise (unsafe: the invariant
-        // is deliberately violated, the same tradeoff as perl's \xNN)
-        if s.chars().any(|c| (0xE000..=0xE0FF).contains(&(c as u32))) {
+        // lossy-read markers (U+E000 / U+F800 + source byte): bash passes
+        // invalid UTF-8 bytes through, so re-emit the RAW byte — a Rust
+        // str literal can't hold it, so build the value byte-wise
+        // (unsafe: the invariant is deliberately violated, the same
+        // tradeoff as perl's \xNN)
+        if s.chars().any(|c| Self::raw_byte_of(c).is_some()) {
             let mut out = String::from("(&unsafe { String::from_utf8_unchecked(vec![");
             for c in s.chars() {
-                if (0xE000..=0xE0FF).contains(&(c as u32)) {
-                    out.push_str(&format!("0x{:02X},", (c as u32 - 0xE000) as u8));
+                if let Some(b) = Self::raw_byte_of(c) {
+                    out.push_str(&format!("0x{b:02X},"));
                 } else {
                     let mut b = [0u8; 4];
                     for x in c.encode_utf8(&mut b).bytes() {
-                        out.push_str(&format!("0x{:02X},", x));
+                        out.push_str(&format!("0x{x:02X},"));
                     }
                 }
             }
@@ -3103,6 +3230,21 @@ impl Render {
 
     fn rust_str_expr(s: &str) -> String {
         format!("{}.to_string()", Self::rust_str(s))
+    }
+
+    /// A bare `print!` statement for a render-time constant string.
+    /// `rust_str` gives a Rust literal only when the text is valid UTF-8;
+    /// for raw bytes it gives a byte-vector expression, and `print!`
+    /// requires a LITERAL format argument — so the byte case must take the
+    /// `{}` form (which prints the same bytes, matching the runtime-String
+    /// path `print!("{}", s)`).
+    fn print_str_stmt(s: &str) -> String {
+        let lit = Self::rust_str(s);
+        if s.chars().any(|c| Self::raw_byte_of(c).is_some()) {
+            format!("print!(\"{{}}\", {lit});")
+        } else {
+            format!("print!({lit});")
+        }
     }
 
     // ── var classification ───────────────────────────────────────────
@@ -3760,6 +3902,76 @@ impl Render {
         }
     }
 
+    /// `${arr[i]}` — the SHELL element read, and the ONE place bash's
+    /// subscript semantics live. They are NOT the strict Python/Go ones
+    /// of `array_index_strict`: a POSITIVE out-of-range subscript yields
+    /// the EMPTY string and execution continues. Bash only complains about
+    /// a NEGATIVE subscript that wraps past the start — to stderr, with
+    /// the expansion still empty — so no subscript is ever a hard exit.
+    ///
+    /// `exit(1)` here killed whole programs at their first `${unset[i]}`:
+    /// `echo "${array[${index}]:-…}"` aborted instead of reaching its `:-`
+    /// default, `case "${words[$counter]}" in` never ran a branch, and
+    /// `echo "ps=${PIPESTATUS[0]}…"` died before printing. The Python/Go
+    /// strict path (`IrExpr::Index`) keeps its exit(1) — that is a
+    /// genuine IndexError/panic there.
+    ///
+    /// Returns a String expression, the contract the previous caller had
+    /// with `array_index_strict`.
+    fn array_index_shell(&mut self, var: &str, key: &str) -> String {
+        // PIPESTATUS has its own home and its own bounds policy: a stage
+        // that never ran reads 0.
+        if var == "PIPESTATUS" {
+            return self.array_elem(var, key);
+        }
+        if self.is_local_array(var) {
+            let m = self.ident_base(var);
+            let n = self.const_len_arrays.get(var).copied().unwrap_or(0);
+            let is_int = self.local_array_is_int(var);
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                if idx >= 0 && (idx as usize) < n {
+                    return if is_int {
+                        format!("{m}[{idx}].to_string()")
+                    } else {
+                        format!("{m}[{idx}].clone()")
+                    };
+                }
+                // a proven-missing element: the empty value, not a trap
+                return if is_int {
+                    "String::from(\"0\")".to_string()
+                } else {
+                    "String::new()".to_string()
+                };
+            }
+            // `.get` on the fixed array is the bounds check — a negative
+            // wrap underflows to a huge usize, which misses and defaults.
+            let elem = if is_int {
+                format!("{m}.get(i as usize).copied().unwrap_or(0).to_string()")
+            } else {
+                format!("{m}.get(i as usize).cloned().unwrap_or_default()")
+            };
+            return format!(
+                "{{ let k: i64 = {key}; let n: i64 = {n}; \
+                   let i = if k < 0 {{ n + k }} else {{ k }}; {elem} }}"
+            );
+        }
+        if self.is_int_array(var) {
+            let m = self.tls(var);
+            return format!(
+                "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                   ({m}.with(|v| v.borrow().get(__idx as usize).copied().unwrap_or(0))).to_string() }}"
+            );
+        }
+        let m = self.tls(var);
+        format!(
+            "{{ let __k: i64 = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+               let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+               {m}.with(|v| v.borrow().get(__idx as usize).cloned().unwrap_or_default()) }}"
+        )
+    }
+
     /// Numeric strict-index read (`Vec<i64>` home): the same
     /// negative-wrap / OOB-exit(1) semantics as `array_index_strict`,
     /// yielding the i64 element directly (Copy — no clone, no parse).
@@ -3885,6 +4097,163 @@ impl Render {
         )
     }
 
+    /// A `&[String]` argument expression for the composite helpers, built
+    /// from an `Array` of element expressions. An EMPTY list needs the
+    /// element type spelled out (`vec![]` alone cannot infer it).
+    fn string_vec_expr(&mut self, e: Option<&IrExpr>) -> String {
+        let mut items: Vec<String> = Vec::new();
+        if let Some(IrExpr::Array(xs)) = e {
+            for x in xs {
+                items.push(self.expr_str(x));
+            }
+        }
+        if items.is_empty() {
+            "Vec::<String>::new()".to_string()
+        } else {
+            format!("vec![{}]", items.join(", "))
+        }
+    }
+
+    /// The VALUE side of an `objNew(type, fields, values)`. Positional, and
+    /// a 1:1 map with `fields`: a struct literal `rec{keys: []string{"a","b"},
+    /// vals: []string{"1","2"}}` arrives as fields=["keys","vals"] against
+    /// values=[Array(["a","b"]), Array(["1","2"])].
+    ///
+    /// A field whose value is a SLICE arrives as a nested `Array`. The field
+    /// must then hold a real list id — `objGet` hands that id straight to
+    /// `list_len`/`list_get`/`list_items` (t104 `ln.toks`, t105 `r.keys`), so
+    /// stringifying the elements into one value would leave the list
+    /// operations reading a bare id with nothing to index.
+    fn obj_field_value_vec(&mut self, e: Option<&IrExpr>) -> String {
+        let Some(IrExpr::Array(xs)) = e else {
+            return self.string_vec_expr(e);
+        };
+        let mut items: Vec<String> = Vec::new();
+        for x in xs {
+            if let IrExpr::Array(elems) = x {
+                self.add_helper("list_new");
+                let mut el: Vec<String> = Vec::new();
+                for it in elems {
+                    el.push(self.expr_str(it));
+                }
+                let v = if el.is_empty() {
+                    "Vec::<String>::new()".to_string()
+                } else {
+                    format!("vec![{}]", el.join(", "))
+                };
+                items.push(format!("__sh_list_new(&({v}))"));
+            } else {
+                items.push(self.expr_str(x));
+            }
+        }
+        if items.is_empty() {
+            "Vec::<String>::new()".to_string()
+        } else {
+            format!("vec![{}]", items.join(", "))
+        }
+    }
+
+    /// Read a STORE VARIABLE named by a builtin arg, as a `String` expr.
+    ///
+    /// The go-sh runtime builtins (`byteAt`, `jsonGet`, `jsonArrGet`, …)
+    /// pass their operands as BARE NAMES — `byteAt("src", "i")` is a read
+    /// of the store slots `src` and `i`, not of the two literals "src"/"i".
+    /// The core's own passes (dead_store_elim, shir's store-read marking,
+    /// optimize) all assume exactly this contract, so a backend that
+    /// stringifies the arg reads the wrong thing. `getVar("x")` and `x`
+    /// therefore both mean "the variable x".
+    fn store_read_str(&mut self, e: Option<&IrExpr>) -> String {
+        match self.store_arg_name(e) {
+            Some(name) => self.read_str(&name),
+            None => "String::new()".to_string(),
+        }
+    }
+
+    /// `store_read_str` for an arithmetic operand (`byteAt`'s index arg).
+    fn store_read_num(&mut self, e: Option<&IrExpr>) -> String {
+        // An all-digits arg is the LITERAL index, not a slot name: the
+        // frontend writes `byteAt("s", "0")` for a constant subscript but
+        // `byteAt("src", "i")` for a loop one, and both arrive as bare
+        // strings. Reading a slot named "0" would invent a variable.
+        if let Some(name) = self.store_arg_name(e) {
+            if name.trim().chars().all(|c| c.is_ascii_digit()) && !name.trim().is_empty() {
+                return name.trim().to_string();
+            }
+            return self.read_num(&name);
+        }
+        "0".to_string()
+    }
+
+    /// The variable NAME a store-builtin arg denotes: a bare `Str`/`Var`/
+    /// `Ident` name, or the name inside a `getVar`/`param` call. `None` for
+    /// anything else (a computed expression is evaluated as written).
+    fn store_arg_name(&self, e: Option<&IrExpr>) -> Option<String> {
+        match e {
+            Some(IrExpr::Str(n, _)) | Some(IrExpr::Var(n, _)) | Some(IrExpr::Ident(n)) => {
+                Some(n.clone())
+            }
+            Some(IrExpr::Call { func, args }) if func == "getVar" || func == "param" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A Go composite VALUE expression. The value is the opaque store id
+    /// the ctor allocates — an ordinary `String`, so it rides variables,
+    /// call arguments, `echo` and `capture` unchanged (which is what
+    /// makes a struct survive a function return: the callee echoes the
+    /// id and the caller reads the fields back out of the store).
+    fn composite_value(&mut self, func: &str, args: &[IrExpr]) -> String {
+        match func {
+            "objNew" => {
+                self.add_helper("obj_new");
+                let ty = args
+                    .first()
+                    .map(|a| self.expr_str(a))
+                    .unwrap_or_else(|| "String::new()".to_string());
+                let f = self.string_vec_expr(args.get(1));
+                let v = self.obj_field_value_vec(args.get(2));
+                format!("__sh_obj_new(&({ty}), &({f}), &({v}))")
+            }
+            "jsonObject" => {
+                self.add_helper("json_obj");
+                let k = self.string_vec_expr(args.first());
+                let v = self.string_vec_expr(args.get(1));
+                format!("__sh_json_obj(&({k}), &({v}))")
+            }
+            "listNew" => {
+                self.add_helper("list_new");
+                let mut items: Vec<String> = Vec::new();
+                for a in args {
+                    items.push(self.expr_str(a));
+                }
+                let v = if items.is_empty() {
+                    "Vec::<String>::new()".to_string()
+                } else {
+                    format!("vec![{}]", items.join(", "))
+                };
+                format!("__sh_list_new(&({v}))")
+            }
+            _ => {
+                self.mark_todo(&format!("composite ctor {func}"));
+                "String::new()".to_string()
+            }
+        }
+    }
+
+    /// The ID string of a composite COLLECTION argument — `getVar("r")`
+    /// reads the variable, anything else is an anonymous value.
+    fn composite_id_str(&mut self, e: Option<&IrExpr>) -> String {
+        match e {
+            Some(x) => self.expr_str(x),
+            None => "String::new()".to_string(),
+        }
+    }
+
     /// Assoc-map read. The map is `BTreeMap<String, String>`, so `get`
     /// takes `&Q` where `String: Borrow<Q>` — that admits `Q = str` (a
     /// `&str` key) and `Q = String` (an owned key), but NOT `Q = &str`.
@@ -3944,6 +4313,11 @@ impl Render {
             } else {
                 l.clone()
             };
+        }
+        // a DECLARED function parameter read by name: it IS the positional
+        // binding, not an env var (see `active_named_params`)
+        if let Some(s) = self.named_param_str(name) {
+            return s;
         }
         if self.declared(name) {
             if self.is_assoc(name) {
@@ -4035,6 +4409,11 @@ impl Render {
                 format!("{l}.trim().parse::<i64>().unwrap_or(0)")
             };
         }
+        // a DECLARED function parameter read by name (see
+        // `active_named_params`)
+        if let Some(s) = self.named_param_str(name) {
+            return format!("{s}.trim().parse::<i64>().unwrap_or(0)");
+        }
         if self.declared(name) {
             if self.is_num(name) {
                 self.read_num(name)
@@ -4090,6 +4469,13 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if self.is_num(name))
             }
+            // The go-sh byte/rune code builtins are NUMERIC, like their Go
+            // originals: `s[i]` is the byte's code and `string(c)` is chr.
+            // Without this, `s[0] == 'a'` lowers to a TEXT compare of the
+            // decimal rendering — the shIR's `"97"` rhs is a numeric
+            // literal, so `static_num` already agrees the rhs is a number
+            // and the whole comparison must be numeric (t111).
+            IrExpr::Call { func, .. } if matches!(func.as_str(), "byteAt" | "chr") => true,
             _ => false,
         }
     }
@@ -4318,25 +4704,15 @@ impl Render {
                 "String::new()".to_string()
             }
             IrExpr::Call { func, args } if func == "typeof" => {
-                // Go `x.(type)` dispatch (core request
+                // Go `x.(T)` dispatch (core request
                 // go-sh-20260813-154009): the A1 type-name vocabulary
-                // ("string"/"int"/"float"/"bool"/"array" — sh2.typeOf's
-                // names). The renderer knows each var's slot type, so
-                // typeof(getVar(x)) folds to the type NAME.
-                let name = args.first().and_then(|a| match a {
-                    IrExpr::Str(n, _) => Some(n.clone()),
-                    IrExpr::Call { func: f, args: fa } if f == "getVar" => {
-                        str_arg(fa, 0).map(|s| s.to_string())
-                    }
-                    _ => None,
-                }).unwrap_or_default();
-                if self.is_assoc(&name) || self.is_array(&name) {
-                    "\"array\"".to_string()
-                } else if self.is_num(&name) {
-                    "\"int\"".to_string()
-                } else {
-                    "\"string\"".to_string()
-                }
+                // (sh2.typeOf's names) — the operand is a VALUE, so the
+                // kind is queried at RUN time. Folding to the declared
+                // slot type answers "string" for an `any` slot carrying a
+                // map and makes the comma-ok arm false (t113).
+                self.add_helper("type_of");
+                let v = args.first().map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
+                format!("__sh_type_of(&({v}))")
             }
             IrExpr::Call { func, args: _ } if func == "arrayLen" => {
                 format!("{}.to_string()", Self::atom_or_paren(&self.expr_num(e)))
@@ -4554,7 +4930,19 @@ impl Render {
                     let is_test_op = t.len() >= 2
                         && t.starts_with('-')
                         && t.as_bytes()[1].is_ascii_alphabetic();
-                    if !is_test_op {
+                    // A `[[ ]]` test is NEVER arithmetic: its text is a test
+                    // EXPRESSION, where `=~` is regex-match and `|` inside the
+                    // pattern is alternation. `parse_arith` reads the same text
+                    // as an assignment (`$release=~a|b` → `release = ~a | b`)
+                    // and wins before `test_call_bool` can see it, so
+                    // `[[ $release =~ bullseye|bookworm ]]` silently assigned
+                    // `release` and tested the wrong value (test-expr-pipe).
+                    let is_double_bracket = args
+                        .get(1)
+                        .and_then(|a| str_arg(&[(*a).clone()], 0).map(|s| s.to_string()))
+                        .map(|s| s == "[[")
+                        .unwrap_or(false);
+                    if !is_test_op && !is_double_bracket {
                         let norm = Self::norm_arith_text(sv);
                         if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
                             let r = self.arith_bool(&ast);
@@ -4877,7 +5265,13 @@ impl Render {
                         | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge
                     ) =>
             {
-                format!("({} as i64).to_string()", self.expr_bool(e))
+                // A Go bool is the STRING "true"/"false" in a word, not the
+                // shell test's 1/0: `fmt.Println(s[0] == 'a')` prints
+                // `true`, and stringifying the bool as an integer printed
+                // `1` (go t111). The sh2 runtime is string-typed, so the
+                // bool is spelled out here instead of coerced to i64.
+                let b = self.expr_bool(e);
+                format!("(if {b} {{ \"true\".to_string() }} else {{ \"false\".to_string() }})")
             }
             IrExpr::BinOp { lhs, op, rhs } if *op == BinOpKind::Pow => {
                 format!("__sh_pow({}, {}).to_string()", self.expr_num(lhs), self.expr_num(rhs))
@@ -5012,6 +5406,17 @@ impl Render {
                     let x = n.as_any().downcast_ref::<crate::shir_nodes::AddressOf>()
                         .expect("tag/type agree");
                     self.expr_str(&x.operand)
+                }
+                // `m["key"]` / `arr[i]` on an anonymous composite VALUE
+                // (element_read.node): the coll is a store id at runtime,
+                // and only the runtime knows which store it names.
+                "ElementRead" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::ElementRead>()
+                        .expect("tag/type agree");
+                    let coll = self.expr_str(&x.coll);
+                    let key = self.expr_str(&x.key);
+                    self.add_helper("ele_read");
+                    format!("__sh_ele_read(&({coll}), &({key}))")
                 }
                 _ => "String::new()".into(),
             }
@@ -6815,6 +7220,17 @@ impl Render {
             // slot. `AddressOf` is the same by construction (it stores
             // the value under the pointer's name), so `&x` also just
             // yields `x`.
+            // `f(xs...)` — a spread into a call's word list. In word context
+            // the value IS the expansion: an `arrayItems` word is already a
+            // `Vec<String>`, so the spread is transparent and the elements
+            // land in the same positional vec the surrounding words use.
+            IrExpr::Ext(n) if n.tag() == "Spread" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::Spread>()
+                    .expect("tag/type agree");
+                self.words_expr(&x.expr)
+            }
             IrExpr::Ext(n) if n.tag() == "Deref" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::Deref>()
                     .expect("tag/type agree");
@@ -6837,6 +7253,16 @@ impl Render {
                 }
                 self.mark_todo("word FieldExtract (complex fields)");
                 "vec![String::new()]".to_string()
+            }
+            // `m["key"]` on an anonymous composite VALUE — one word
+            // (element_read.node; see the scalar arm).
+            IrExpr::Ext(n) if n.tag() == "ElementRead" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::ElementRead>()
+                    .expect("tag/type agree");
+                let coll = self.expr_str(&x.coll);
+                let key = self.expr_str(&x.key);
+                self.add_helper("ele_read");
+                format!("vec![__sh_ele_read(&({coll}), &({key}))]")
             }
             other => {
                 self.mark_todo(&format!("word {:?}", other));
@@ -6900,9 +7326,19 @@ impl Render {
                 func: func.to_string(),
                 args: args.to_vec(),
             })),
+            // In WORD context this arm is reached only through a splat
+            // (`f(xs...)` / `"$@"`) — `is_splat_word` routes a BARE
+            // `arrayItems` here too, but a bare one is the `${arr@P}`
+            // prefix form and stays on `array_items_str` below in
+            // `expr_str`. Here the value IS the element list: splicing
+            // the space-joined string would yield ONE word ("alpha beta
+            // gamma") instead of three (t102's `show(words...)`).
             "arrayItems" => {
-                let s = self.array_items_str(args);
-                format!("vec![{s}]", )
+                if let Some(name) = str_arg(args, 0).map(|s| s.to_string()) {
+                    let m = self.tls(&name);
+                    return format!("{m}.with(|v| v.borrow().clone())");
+                }
+                "Vec::<String>::new()".to_string()
             }
             "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
@@ -7062,10 +7498,89 @@ impl Render {
             "byteAt" => {
                 // Go `s[i]` on a string indexes BYTES; the result is the
                 // byte's numeric value, so t111's `s[0] == 'a'` compares
-                // 97 with 97 rather than comparing text.
-                let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                let i = args.get(1).map(|a| self.expr_num(a)).unwrap_or_default();
+                // 97 with 97 rather than comparing text. Both args name
+                // STORE variables (`byteAt("src", "i")`), not literals.
+                let s = self.store_read_str(args.first());
+                let i = self.store_read_num(args.get(1));
                 format!("vec![{s}.as_bytes().get(({i}) as usize).map_or(0i64, |b| *b as i64).to_string()]")
+            }
+            // ── Go composite values (structs / maps / slices) ─────────
+            // Word context: the value is the store id (one word), which is
+            // exactly what a `$(f)` / `echo $ref` round-trip must carry.
+            "objNew" | "jsonObject" | "listNew" => {
+                let v = self.composite_value(func, args);
+                format!("vec![{v}]")
+            }
+            "objGet" => {
+                self.add_helper("obj_get");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                format!("vec![__sh_obj_get(&({id}), &({f}))]")
+            }
+            "objSet" => {
+                self.add_helper("obj_set");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                let v = self.composite_id_str(args.get(2));
+                format!("{{ __sh_obj_set(&({id}), &({f}), &({v})); Vec::<String>::new() }}")
+            }
+            "objAdd" => {
+                self.add_helper("obj_add");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                let d = self.composite_id_str(args.get(2));
+                format!("{{ __sh_obj_add(&({id}), &({f}), &({d})); Vec::<String>::new() }}")
+            }
+            "listLen" => {
+                self.add_helper("list_len");
+                let id = self.composite_id_str(args.first());
+                format!("vec![__sh_list_len(&({id}))]")
+            }
+            "listGet" => {
+                // The indexed element of a list, as a single word. The list
+                // is a store id ("list#N") or a `\x1e`-joined list string;
+                // `__sh_list_read` dispatches on the id prefix (t105's
+                // `r.vals[i]` inside a range loop).
+                let coll = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                let idx = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "0".into());
+                self.add_helper("list_read");
+                format!("vec![__sh_list_read(&({coll}), &({idx}))]")
+            }
+            // listItems in word context IS the item list (the splice /
+            // setArray consumers want the elements, not a joined string).
+            "listItems" => {
+                self.add_helper("list_items");
+                let id = self.composite_id_str(args.first());
+                format!("__sh_list_items(&({id}))")
+            }
+            "listPush" => {
+                self.add_helper("list_push");
+                let id = self.composite_id_str(args.first());
+                let mut items: Vec<String> = Vec::new();
+                for a in args.iter().skip(1) {
+                    items.push(self.expr_str(a));
+                }
+                let v = if items.is_empty() {
+                    "Vec::<String>::new()".to_string()
+                } else {
+                    format!("vec![{}]", items.join(", "))
+                };
+                format!("vec![__sh_list_push(&({id}), &({v}))]")
+            }
+            "toAssocInto" => {
+                if let Some(name) = str_arg(args, 0).map(|s| s.to_string()) {
+                    let v = self.composite_id_str(args.get(1));
+                    let dst = self.tls(&name);
+                    self.assoc.insert(name.clone());
+                    self.mark_written(&name);
+                    self.add_helper("to_assoc");
+                    // The assoc store is the caller's own `thread_local`;
+                    // the helper only decodes the payload, and the
+                    // `borrow_mut()` stays INSIDE `.with()` (a `Ref`
+                    // borrowed out of the closure would escape it).
+                    return format!("{{ {dst}.with(|c| *c.borrow_mut() = __sh_to_assoc_payload(&({v}))); Vec::<String>::new() }}");
+                }
+                "Vec::<String>::new()".to_string()
             }
             _ => {
                 self.mark_todo(&format!("word call {func}"));
@@ -7309,7 +7824,7 @@ impl Render {
                     return self.assoc_get(var, &k);
                 }
                 let k = self.key_num_expr(key);
-                return self.array_index_strict(var, &k, false);
+                return self.array_index_shell(var, &k);
             }
         }
         "String::new()".to_string()
@@ -7627,33 +8142,62 @@ impl Render {
         // the captured commands must NOT consume the stage's stdin (a
         // nested mktemp would eat the pipeline buffer)
         self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
-        for s in stmts {
-            self.stmt(s);
+        // A value-returning user function called in STATEMENT position
+        // (`$(isYes "y")` lowers to capture{ exec("isYes") }) discards
+        // the `-> String` result: `self.stmt` renders the bare call, so
+        // `$?` stays whatever the callee last stored and `__SH_RET` never
+        // receives the value. Go's t109/t111 boolean funcs return their
+        // verdict as the call's value, so bind it — assign the call's
+        // result to `__SH_RET` exactly as a value-context call would.
+        let stmt_call = match stmts {
+            [IrStmt::Expr(IrExpr::Call { func, args })] => Some((func.as_str(), args)),
+            _ => None,
+        };
+        if let Some((func, args)) = stmt_call {
+            let is_value = matches!(func, "fnValue" | "fnCall")
+                || ((func == "exec" || func == "builtin")
+                    && matches!(args.first(), Some(IrExpr::Str(n, _))
+                        if self.functions.contains(n) && self.fn_value_used.contains(n)));
+            if is_value {
+                let r = self.fn_value_stmt_call(func, args);
+                self.emit(&format!("let __cap_v = {r}; *__SH_RET.lock().unwrap() = __cap_v;"));
+            } else {
+                self.stmt(&stmts[0]);
+            }
+        } else {
+            for s in stmts {
+                self.stmt(s);
+            }
         }
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
         if via_ret {
-            // the callee returned through __SH_RET, not the output buffer.
-            // clone out of the guard: `__SH_RET.lock().unwrap()` yields a
-            // MutexGuard<String>, and moving the String out of the guard
-            // is E0507.
-            self.emit("let __cap = __SH_RET.lock().unwrap().clone();");
-            self.emit("*__SH_RET.lock().unwrap() = String::new();");
-            // retire the capture buffer even on this path: leaving it `Some`
+            // A user-function call can hand its value back two ways, and
+            // which one is used is the CALLEE's choice:
+            //   * through the sticky __SH_RET cell (a callee lowered to a
+            //     value-returning Rust fn — t94's `q, _ := divmod(17,5)`);
+            //   * by PRINTING it — the Go-shaped `f() T` lowering builds
+            //     the value, `echo`s it and returns nothing (t116's
+            //     `p := mk2()`), so the value is the callee's stdout,
+            //     exactly as `$(f)` is in the source language.
+            // Prefer the stdout when the callee wrote any, else the cell:
+            // reading only __SH_RET silently dropped every echoed object
+            // id, and reading only __SH_OUT loses the by-value callee.
+            // Both must be drained — leaving the capture buffer `Some`
             // LATCHES __SH_OUT for the rest of the program, so every later
-            // print appends to a dead buffer instead of stdout (t94/t115
-            // printed nothing at all). The restore is unconditional — it was
-            // only ever an artifact of the by-ret branch being added later.
+            // print would append to a dead buffer instead of stdout
+            // (t94/t115 printed nothing at all).
+            self.emit("let __cap_out = __SH_OUT.lock().unwrap().take().unwrap();");
+            self.emit("let __cap_ret = __SH_RET.lock().unwrap().clone();");
+            self.emit("*__SH_RET.lock().unwrap() = String::new();");
             self.emit("*__SH_OUT.lock().unwrap() = __old;");
+            self.emit("let __cap = if __cap_out.is_empty() { __cap_ret } else { String::from_utf8_lossy(&__cap_out).to_string() };");
         } else {
             self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
             self.emit("*__SH_OUT.lock().unwrap() = __old;");
         }
         self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
-        // __cap is a String on the __SH_RET path and a Vec<u8> on the
-        // output-buffer path — only the latter needs the lossy decode
-        // (the former is already text; calling from_utf8_lossy on it was
-        // E0308, and the by-ret captures are the common case for a
-        // Go-shaped `f() string` callee).
+        // __cap is a String on the by-ret path and a Vec<u8> on the
+        // output-buffer path — only the latter needs the lossy decode.
         if via_ret {
             self.emit("let mut __s = __cap;");
         } else {
@@ -7765,7 +8309,10 @@ impl Render {
                 // native stage
                 let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
+                let old_stage = self.in_pipeline_stage;
                 self.depth = 1;
+                // the stage's status is READ (the `PIPESTATUS` push below)
+                self.in_pipeline_stage = true;
                 if idx > 0 {
                     self.emit(&format!(
                         "let __oldin = __SH_STDIN.lock().unwrap().take();"
@@ -7802,6 +8349,7 @@ impl Render {
                 let block = self.out.join("\n");
                 self.out = saved;
                 self.depth = old_depth;
+                self.in_pipeline_stage = old_stage;
                 self.emit(&format!("{{\n{block}\n}}"));
             }
             idx += 1;
@@ -9202,9 +9750,32 @@ impl Render {
         // Materialise the words into __SH_RET instead of printing them.
         if self.in_value_fn() {
             let (parts, nl, _esc) = self.echo_parts(words);
-            let needs_helper = parts.iter().any(|p| matches!(p, Part::Words(_)));
-            if needs_helper {
-                self.add_helper("join_words");
+            // A composite-returning value function (Go `func f() []tok`)
+            // must hand the store ID back intact — see `__sh_join_value`.
+            // Only the multi-element (array/glob) shape can need the
+            // join; a single-word return is a plain value in every other
+            // case, so keep the old cheap concatenation there.
+            if parts.iter().any(|p| matches!(p, Part::Words(_))) {
+                self.add_helper("join_value");
+                let ws: Vec<String> = parts
+                    .iter()
+                    .map(|p| match p {
+                        Part::Lit(t) => format!("vec![{}]", Self::rust_str_expr(t)),
+                        Part::Words(w) => w.clone(),
+                    })
+                    .collect();
+                let mut expr = format!("__sh_join_value(&[{}])", ws.join(", "));
+                if nl {
+                    expr.push_str(" + \"\\n\"");
+                }
+                // The newline a capture leaves on the value is stripped
+                // again here, so a composite id survives the round trip
+                // (t108 `mktoks2`). Text values keep theirs.
+                let expr = format!("String::from(__sh_shave_nl({expr}))");
+                self.emit(&format!(
+                    "let __v = {expr}; *__SH_RET.lock().unwrap() = __v; __SH_RC.store(0, Ordering::SeqCst);"
+                ));
+                return;
             }
             let joined = Self::join_parts_as_value(&parts, nl, false);
             self.emit(&format!(
@@ -9227,8 +9798,9 @@ impl Render {
             if let Some(text) = Self::const_echo_text(&parts, nl, esc) {
                 if self.sink_free_here() {
                     // `print!("…")` — the string is a Rust literal, so the
-                    // `{}` placeholder is unnecessary
-                    self.emit(&format!("print!({});", Self::rust_str(&text)));
+                    // `{}` placeholder is unnecessary (print_str_stmt falls
+                    // back to the `{}` form for raw bytes)
+                    self.emit(&Self::print_str_stmt(&text));
                 } else {
                     self.sink_check_needed = true;
                     self.add_helper("puts");
@@ -9650,6 +10222,44 @@ impl Render {
 
     // ── call (expr context) ──────────────────────────────────────────
 
+    /// A value-returning user-function call rendered from STATEMENT
+    /// position — the `exec("f", …)` form `capture_block` sees. `call_str`
+    /// cannot serve it: on the `exec` arm it builds shell-out text, so the
+    /// call would shell out to a binary that does not exist instead of
+    /// reaching the rendered Rust fn. Route the known-function case
+    /// through the same `fnValue` value path.
+    fn fn_value_stmt_call(&mut self, func: &str, args: &[IrExpr]) -> String {
+        let (name, call_args) = match func {
+            "fnValue" | "fnCall" => (
+                args.first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(n, _) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                args.get(1).cloned().unwrap_or_else(|| IrExpr::Array(vec![])),
+            ),
+            _ => (
+                args.first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(n, _) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                IrExpr::Array(args.iter().skip(1).cloned().collect()),
+            ),
+        };
+        let (ws, _splat) = self.call_arg_words(Some(&call_args));
+        if let Some(sig) = self.fn_sigs.get(&name).cloned() {
+            return self.fn_call_value(&name, ws, &sig, false);
+        }
+        let m = self.fn_ident(&name);
+        let constr = format!("vec![{}]", ws.join(", "));
+        format!(
+            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {m}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RET.lock().unwrap().clone() }}"
+        )
+    }
+
     /// Non-exec Calls in String context.
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
@@ -9729,19 +10339,30 @@ impl Render {
             // turns the most common corpus stub (11 occurrences) into a
             // real element read instead of a dropped statement.
             "listGet" => {
+                // The LIST is one of two runtime shapes, and only the
+                // value says which: a store id ("list#N", the Go slice /
+                // any-slice model) or the renderer-wide `\x1e`-joined
+                // list string a `strSplit` yields. `__sh_list_read`
+                // dispatches on the id prefix.
+                //
+                // `listGet(strSplit(cap, "\x1e"), 0)` is the multi-return
+                // destructuring seam, and there slot 0 of a composite
+                // return IS the composite — so this index-0 read of a
+                // split collection must yield the id whole. Unwrapping to
+                // element 0 would bind one joined element and silently
+                // shorten the iteration that follows (t108 `t2, _ :=
+                // mktoks2()`).
                 let coll = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 let idx = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "0".into());
-                // The `coll` String is bound to a `let` first: collecting
-                // `&str` out of a temporary would leave the `Vec<&str>`
-                // borrowing a value dropped at the end of the statement
-                // (E0716). Owning it keeps the borrow live to the `.len()`.
-                format!(
-                    "({{ let __lc: String = {coll}; \
-                     let __l: Vec<&str> = __lc.split('\\u{{1e}}').collect(); \
-                     let __i: i64 = {idx}.trim().parse::<i64>().unwrap_or(0); \
-                     if __i >= 0 && (__i as usize) < __l.len() {{ __l[__i as usize].to_string() }} \
-                     else {{ String::new() }} }})"
-                )
+                self.add_helper("list_read");
+                self.add_helper("join_value");
+                let is_slot0 = matches!(args.get(1), Some(IrExpr::Int(0)));
+                let from_split = matches!(args.first(), Some(IrExpr::Call { func, .. }) if func == "strSplit");
+                if is_slot0 && from_split {
+                    format!("__sh_destruct_slot0(&({coll}))")
+                } else {
+                    format!("__sh_list_read(&({coll}), &({idx}))")
+                }
             }
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
@@ -9757,9 +10378,10 @@ impl Render {
             "strSplit" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
                 let sep = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
+                self.add_helper("join_value");
                 format!(
                     "({{ let __ss: String = {s}; let __sp: String = {sep}; \
-                     if __sp.is_empty() {{ __ss }} \
+                     if __sp.is_empty() || __sh_is_composite_id(&__ss) {{ __ss }} \
                      else {{ __ss.split(&__sp as &str).collect::<Vec<&str>>().join(\"\\u{{1e}}\") }} }})"
                 )
             }
@@ -9909,6 +10531,112 @@ impl Render {
                     }
                     None => "String::new()".to_string(),
                 }
+            }
+            "chr" => {
+                // Go `string(c)` over a byte/rune is chr, not identity
+                // (t111): a code point becomes the one-character string.
+                // The out-of-range value is Go's replacement char, which
+                // `char::from_u32` already yields as None -> U+FFFD.
+                // String context (call_str), so the one-char String itself
+                // — no vec![] wrapper (the word path wraps the same value).
+                let c = args.first().map(|a| self.expr_num(a)).unwrap_or_default();
+                format!("char::from_u32(({c}) as u32).map_or('\\u{{fffd}}'.to_string(), |c| c.to_string())")
+            }
+            "byteAt" => {
+                // Go `s[i]` on a string indexes BYTES; the result is the
+                // byte's numeric value, so t111's `s[0] == 'a'` compares
+                // 97 with 97 rather than comparing text. String context:
+                // the numeric code as a decimal String.
+                //
+                // Both args NAME STORE VARIABLES, not literal values —
+                // `byteAt("src", "i")` reads `src` and `i` out of the
+                // runtime store (the same contract the core's
+                // dead_store_elim / shir passes assume when they mark the
+                // name arg as a store-read).
+                let s = self.store_read_str(args.first());
+                let i = self.store_read_num(args.get(1));
+                format!("({s}).as_bytes().get(({i}) as usize).map_or(0i64, |b| *b as i64).to_string()")
+            }
+            // ── Go composite values (structs / maps / slices) ─────────
+            // The variable (and every channel the value crosses) carries
+            // an opaque store id; see `composite_value` and the
+            // `__sh_obj_*` / `__sh_list_*` helpers.
+            "objNew" | "jsonObject" | "listNew" => self.composite_value(func, args),
+            // jsonMarshal(x) — serialize a store id to JSON. The arg is
+            // read from the var store, not the literal string: a map-typed
+            // arg carries its ASSOC NAME while the value lives in the
+            // composite store, and a slice var carries its list id.
+            "jsonMarshal" => {
+                self.add_helper("json_marshal");
+                let v = self.store_read_str(args.first());
+                format!("__sh_json_marshal(&({v}))")
+            }
+            "objGet" => {
+                self.add_helper("obj_get");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                format!("__sh_obj_get(&({id}), &({f}))")
+            }
+            "objSet" => {
+                self.add_helper("obj_set");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                let v = self.composite_id_str(args.get(2));
+                format!("{{ __sh_obj_set(&({id}), &({f}), &({v})); String::new() }}")
+            }
+            // objAdd: `p.n++` / `p.n += d` — numeric RMW over a field.
+            "objAdd" => {
+                self.add_helper("obj_add");
+                let id = self.composite_id_str(args.first());
+                let f = self.composite_id_str(args.get(1));
+                let d = self.composite_id_str(args.get(2));
+                format!("{{ __sh_obj_add(&({id}), &({f}), &({d})); String::new() }}")
+            }
+            "listLen" => {
+                self.add_helper("list_len");
+                let id = self.composite_id_str(args.first());
+                format!("__sh_list_len(&({id}))")
+            }
+            "listItems" => {
+                self.add_helper("list_items");
+                let id = self.composite_id_str(args.first());
+                format!("__sh_list_items(&({id})).join(\"\\u{{1e}}\")")
+            }
+            "listSet" => {
+                // `out[i] = v` — the list already exists (listNew'd), so this
+                // is an in-place element store, not a re-allocation (t113).
+                self.add_helper("list_set");
+                let id = self.composite_id_str(args.first());
+                let i = self.composite_id_str(args.get(1));
+                let v = self.composite_id_str(args.get(2));
+                format!("{{ __sh_list_set(&({id}), &({i}), &({v})); String::new() }}")
+            }
+            "listPush" => {
+                self.add_helper("list_push");
+                let id = self.composite_id_str(args.first());
+                let mut items: Vec<String> = Vec::new();
+                for a in args.iter().skip(1) {
+                    items.push(self.expr_str(a));
+                }
+                let v = if items.is_empty() {
+                    "Vec::<String>::new()".to_string()
+                } else {
+                    format!("vec![{}]", items.join(", "))
+                };
+                format!("__sh_list_push(&({id}), &({v}))")
+            }
+            // `m := <map-ish value>` — materialize the value into the NAMED
+            // assoc store that assocGet/assocSet address.
+            "toAssocInto" => {
+                if let Some(name) = str_arg(args, 0).map(|s| s.to_string()) {
+                    let v = self.composite_id_str(args.get(1));
+                    let dst = self.tls(&name);
+                    self.assoc.insert(name.clone());
+                    self.mark_written(&name);
+                    self.add_helper("to_assoc");
+                    return format!("{{ {dst}.with(|c| *c.borrow_mut() = __sh_to_assoc_payload(&({v}))); String::new() }}");
+                }
+                "String::new()".to_string()
             }
             _ => {
                 self.mark_todo(&format!("call {func}"));
@@ -10218,7 +10946,7 @@ impl Render {
         // setVar/…), so strip the store from whatever the arm emitted —
         // exact, because the renderer only ever emits the literal
         // `__SH_RC.store(0, Ordering::SeqCst);` line for a status write.
-        if crate::shir::stmt_status_write_is_unread(s) {
+        if !self.in_pipeline_stage && crate::shir::stmt_status_write_is_unread(s) {
             let mark = self.out.len();
             self.stmt_inner(s);
             let tail: Vec<String> = self.out.drain(mark..).collect();
@@ -10532,6 +11260,40 @@ impl Render {
                 if targets.len() > 1 {
                     self.mark_todo("multi-target assign");
                 }
+                // ── Go composite values (structs / maps / slices) ────────
+                // `r := &rec{n: 1, s: "a"}` — the ctor allocates a store
+                // entry and yields an opaque id, so the assignment is a
+                // plain string write of that id. Handled BEFORE the
+                // generic RHS render: `expr_any` would TODO the ctor.
+                if t.indices.is_empty() {
+                    if let IrExpr::Call { func, args } = expr {
+                        match func.as_str() {
+                            "objNew" | "jsonObject" | "listNew" => {
+                                let v = self.composite_value(func, args);
+                                self.mark_written(&t.var);
+                                let st = self.write_str(&t.var, &v);
+                                self.emit(&st);
+                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                return;
+                            }
+                            // `m := <map-ish value>` (t113's
+                            // `m0 := out[0].(map[string]any)`) — the named
+                            // ASSOC store takes the value's entries.
+                            "toAssocInto" => {
+                                let name = t.var.clone();
+                                let v = self.composite_id_str(args.get(1));
+                                self.assoc.insert(name.clone());
+                                self.mark_written(&name);
+                                self.add_helper("to_assoc");
+                                let dst = self.tls(&name);
+                                self.emit(&format!("{dst}.with(|c| *c.borrow_mut() = __sh_to_assoc_payload(&({v})));"));
+                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let has_capture = expr_mentions_capture(expr);
                 // `((i++))` arrives as Assign{i, Arith(IncDec)} — the
                 // arith block ALREADY writes the var; the outer write
@@ -10770,11 +11532,14 @@ impl Render {
                 // redirect/capture sink is active.
                 if let IrExpr::Str(s, _) = value {
                     if self.runtime_free {
-                        // `Output.newline` carries the trailing newline
-                        self.emit(&format!(
-                            "print!({});",
-                            Self::rust_str(&format!("{s}{}", if *newline { "\n" } else { "" }))
-                        ));
+                        // `Output.newline` carries the trailing newline.
+                        // print_str_stmt picks the literal vs `{}` form —
+                        // a raw-byte string renders as a byte-vector
+                        // expression, which `print!` rejects as a format arg.
+                        self.emit(&Self::print_str_stmt(&format!(
+                            "{s}{}",
+                            if *newline { "\n" } else { "" }
+                        )));
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         return;
                     }
@@ -10831,7 +11596,7 @@ impl Render {
                         };
                         let binding = format!(
                             "if {} {{ {} }} else {{ {} }}",
-                            Self::unparen(&self.expr_bool(cond)),
+                            Self::unparen(&Self::unwrap_cond(&self.expr_bool(cond))),
                             bare(&Self::unparen(&tc).to_string()),
                             bare(&Self::unparen(&ec).to_string())
                         );
@@ -10856,7 +11621,15 @@ impl Render {
                             _ => (tc, ec),
                         }
                     };
-                    let ce = self.expr_bool(cond);
+                    // The ternary's condition is consumed as a BOOLEAN by
+                    // `if CE { … }`, so the `{ let __b = EXPR; store; __b }`
+                    // status wrapper is dead and must be peeled. Without this
+                    // the wrapper is baked into the arm, `rc_strip` then
+                    // deletes its store, and `simplify_let_b` folds what is
+                    // left — `if EXPR; __SH_RC.store(…) { "true" } else { … }`
+                    // — into a ternary whose condition is the STORE (E0658,
+                    // "expected `{`, found `;`").
+                    let ce = Self::unwrap_cond(&self.expr_bool(cond));
                     let binding =
                         format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
                     let st = self.ternary_store(&name, &binding, numeric);
@@ -11515,6 +12288,58 @@ impl Render {
                         return;
                     }
                     if let Some(x) = e {
+                        // `return <numeric literal>` is bash's return CODE,
+                        // not a value: the reference runtime folds it into
+                        // the status and leaves the value channel alone
+                        // (sh2-namespace.mjs fnCall: `r === '0' || r === '1'`
+                        // → lastExit; the capture keeps the callee's stdout).
+                        // Publishing it on __SH_RET instead both left `$?`
+                        // stale AND handed the code to the caller AS the
+                        // captured value — go t109/t115's bool-function
+                        // condition (`$? == 0 && ("$__rc" == "" || ==
+                        // "true")`) read the "0" the callee returned where
+                        // bash leaves the capture empty, so every predicate
+                        // read false. The echo→value rewrite
+                        // (transforms/echo_return) never emits a bare
+                        // numeric literal, so here it is always a status.
+                        if is_numeric_literal(x) {
+                            // …EXCEPT for a predicate body: the Go frontend
+                            // lowers `func isYes(s string) bool` to a `__bt_N`
+                            // verdict cell plus `return 0` / `return 1` to
+                            // signal status, but the CALLER reads the
+                            // boolean (t109 `fmt.Println(isYes("y"))` wants
+                            // "true"). The verdict cell is the function's
+                            // real value — publish THAT, keeping the status
+                            // store so `$?` still works for `if isYes …`.
+                            // A body with SEVERAL verdict cells returns the
+                            // one live at its first status return (t115);
+                            // a single-cell body keeps the global verdict.
+                            // the FIRST status return in execution order
+                            let bt = verdict_cells_at_return(&self.active_fn_body)
+                                .into_iter()
+                                .next()
+                                .or_else(|| self.active_fn_bool.clone());
+                            if let Some(bt) = bt {
+                                // Read the cell THROUGH the storage verdict:
+                                // the cell is a `thread_local` (`__SHV___bt_N`)
+                                // unless pass-2 proved it a plain local, so a
+                                // bare `{bt}.clone()` only compiled by accident
+                                // — it named a binding that exists in NEITHER
+                                // storage (t115) or cloned the wrong thing.
+                                let r = self.read_str(&bt);
+                                let n = self.expr_num(x);
+                                self.emit(&format!(
+                                    "let __v = {r}; __SH_RC.store(({n}) as i32, Ordering::SeqCst); *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
+                                ));
+                                return;
+                            }
+                            let r = self.expr_str(x);
+                            let n = self.expr_num(x);
+                            self.emit(&format!(
+                                "let __v = {r}; __SH_RC.store(({n}) as i32, Ordering::SeqCst); return __v;"
+                            ));
+                            return;
+                        }
                         let r = self.expr_str(x);
                         self.emit(&format!(
                             "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
@@ -11657,7 +12482,14 @@ impl Render {
                     }
                 }
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{full}), Ordering::SeqCst);"));
+                if ps_cleanup_tmps(cmd, args).is_some() {
+                    // the CORE's procsub cleanup: run it (it must still unlink
+                    // the temps), but leave `$?` alone — bash never runs it, so
+                    // the consumer command's status is what the source observes
+                    self.emit(&format!("let _ = __sh_run(&{full});"));
+                } else {
+                    self.emit(&format!("__SH_RC.store(__sh_run(&{full}), Ordering::SeqCst);"));
+                }
             }
             IrStmt::Pipeline { stages, .. } => {
                 self.pipeline_stmt(stages);
@@ -11896,7 +12728,11 @@ impl Render {
         collect_functions(&prog.stmts, &mut self.functions);
         let mut defs = Vec::new();
         collect_fn_defs(&prog.stmts, &mut defs);
-        self.fn_defs = defs;
+        // `typeset -f` only re-prints name + body
+        self.fn_defs = defs
+            .into_iter()
+            .map(|(n, _p, b, named)| (n, b, named))
+            .collect();
         for (n, _) in &prog.var_types {
             // positional params ($1, $2, ...) read from argv (never
             // declared as thread-locals; cf. getvar_str/num digit arms).
@@ -11915,11 +12751,23 @@ impl Render {
         }
         // Pass 2: pick the pass-2 locals (scalar vars confined to one
         // non-risky scope) and the assigned set (drives `let`/`let mut`).
+        // The Go-predicate verdict cells are read from the numeric-literal
+        // return arm (across branches), so their storage must be a single
+        // `thread_local` — a pass-2 local `let` would only be in scope on the
+        // path that first writes it, and a verdict cell's first mention may be
+        // a nested write (`__bt_0` in t115) that the local pass rejects while a
+        // sibling cell (`__bt_1`) is accepted. Forcing every cell global makes
+        // the read arm and the write arm agree on one store.
+        let verdict_cells = collect_predicate_verdict_cells(prog);
         let (locals, local_mut, dead_init) =
-            compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written);
+            compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written, &verdict_cells);
         self.local_vars = locals;
         self.local_mut = local_mut;
         self.local_dead_init = dead_init;
+        // the forced-global cells still need their `thread_local` declared
+        for c in &verdict_cells {
+            written.insert(c.clone());
+        }
         // Deferred `let`s: pre-seed the statements that OWN each local's
         // declaration (its first write in render order, at any nesting
         // depth). Every other write of that name then renders as a plain
@@ -11960,7 +12808,7 @@ impl Render {
         // into a throwaway buffer; only the recording survives (todo
         // count restored — the commit render re-adds each marker once).
         {
-            let mut pfns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
+            let mut pfns: Vec<(String, Vec<String>, Vec<IrStmt>, bool)> = Vec::new();
             collect_fn_defs(&prog.stmts, &mut pfns);
             // shared shIR verdict: fn name -> constant argv shift offset
             // (present only for the narrow qualifying shapes)
@@ -11969,7 +12817,7 @@ impl Render {
             // (`$@`/`$*`/`$#`) without rebinding it — eligible for the
             // argv-slice rewrite
             let whole_argv = crate::shir::analyze_whole_argv_fns(prog);
-            for (name, body, _named) in &pfns {
+            for (name, params, body, _named) in &pfns {
                 let saved_out = std::mem::take(&mut self.out);
                 let saved_depth = self.depth;
                 let saved_todo = self.todo;
@@ -12014,13 +12862,21 @@ impl Render {
                 if probe.wild {
                     continue;
                 }
-                let arity = probe
+                // A DECLARED named parameter occupies a positional slot even
+                // when the body never reads `$N`: the frontend bound the
+                // caller's i-th argument to it, and the body reads the NAME
+                // (`getVar("s")`). Without the floor the signature would be
+                // zero-arity, the caller would pass nothing, and the name read
+                // would fall through to the environment — the function would
+                // silently ignore its own argument (t109).
+                let mut arity = probe
                     .num
                     .iter()
                     .chain(probe.str_.iter())
                     .max()
                     .map(|m| m + 1)
                     .unwrap_or(0);
+                arity = arity.max(params.len());
                 let mut tys = Vec::new();
                 let mut used = Vec::new();
                 for i in 0..arity {
@@ -12029,7 +12885,7 @@ impl Render {
                     } else {
                         FnParamTy::Str
                     });
-                    used.push(probe.num.contains(&i) || probe.str_.contains(&i));
+                    used.push(probe.num.contains(&i) || probe.str_.contains(&i) || i < params.len());
                 }
                 // a param name must not collide with a pass-2 local of the
                 // same function scope (the local would shadow it): `p7`
@@ -12187,12 +13043,12 @@ impl Render {
         // Pass 3: render the functions (after main). Nested function
         // definitions (a fn inside a fn body) are still GLOBAL in bash —
         // collected from the whole tree and emitted at module level.
-        let mut fns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
+        let mut fns: Vec<(String, Vec<String>, Vec<IrStmt>, bool)> = Vec::new();
         collect_fn_defs(&prog.stmts, &mut fns);
         let mut fn_out = Vec::new();
         std::mem::swap(&mut self.out, &mut fn_out);
         self.depth = 0;
-        for (name, body, named) in &fns {
+        for (name, decl_params, body, named) in &fns {
             if *named {
                 self.mark_todo(&format!("function {name} named blocks"));
             }
@@ -12245,6 +13101,12 @@ impl Render {
             // user-function bodies return VALUES via __SH_RET (the C
             // frontend's `return expr;` — strings are the value model)
             self.in_function = true;
+            // A Go-style predicate body writes its verdict into a `__bt_N`
+            // cell and signals only through `return 0` / `return 1`; the
+            // caller reads the CELL. Record it so the numeric-literal return
+            // arm publishes the verdict as the value.
+            self.active_fn_bool = find_predicate_verdict(body);
+            self.active_fn_body = body.clone();
             // The deferred-`let` bookkeeping is per BODY: this body's first
             // writes are its own declarations, and the module-wide set would
             // otherwise hand them to whoever rendered first. Saved and
@@ -12252,6 +13114,20 @@ impl Render {
             let saved_body_init = std::mem::take(&mut self.local_init);
             self.local_init = self.owned_inits(body);
             self.active_fn = sig.as_ref().map(|_| name.clone());
+            // A declared named parameter IS the positional binding the
+            // signature just emitted: map name -> slot so the body's
+            // `getVar("s")` reads `p0` instead of the environment. Only the
+            // slots the signature actually has (a param past the arity floor
+            // has no binding, so the read keeps its env meaning).
+            self.active_named_params = match &sig {
+                Some(s) => decl_params
+                    .iter()
+                    .enumerate()
+                    .take(s.arity)
+                    .map(|(i, p)| (p.clone(), i))
+                    .collect(),
+                None => HashMap::new(),
+            };
             // arm the shift-offset rewrite for this body (the probe
             // recorded caller indices under the same arming)
             self.active_shift = sig.as_ref().and_then(|s| s.rest);
@@ -12286,6 +13162,9 @@ impl Render {
             }
             self.num_param_cache.clear();
             self.active_fn = None;
+            self.active_fn_bool = None;
+            self.active_fn_body.clear();
+            self.active_named_params.clear();
             self.active_shift = None;
             self.active_rest = None;
             self.active_argv = false;
@@ -12346,6 +13225,16 @@ impl Render {
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
     self.emit("static __SH_RET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());");
+        // Reference-type store for the Go composite values (structs /
+        // maps / slices): an object is an opaque ID string that rides the
+        // ordinary value channels (vars, call args, echo/capture), and
+        // the payload lives here. Emitted only when a composite op was
+        // actually lowered, so a plain shell program carries neither the
+        // statics nor a dead-code warning.
+        if COMPOSITE_HELPERS.iter().any(|h| self.helpers.contains(*h)) {
+            self.emit("static __SH_OBJ: std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>> = std::sync::Mutex::new(Vec::new());");
+            self.emit("static __SH_LIST: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());");
+        }
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
@@ -12502,13 +13391,17 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "join_words", "puts", "printf",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "join_words", "join_value", "puts", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "capture", "run_traps", "lines",
+    // Go composite-value store (structs/maps/slices) — see `composite_value`
+    "obj_new", "obj_get", "obj_set", "obj_add", "json_obj", "to_assoc", "ele_read",
+    "list_new", "list_get", "list_set", "list_len", "list_read", "list_push", "list_items",
+    "json_marshal", "type_of",
 ];
 
 /// `__sh_*` names that are NOT in `HELPER_ORDER` but still own an
@@ -12619,9 +13512,33 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "rand" => &["cap_bytes"],
         "capture" => &[],
         "grepmatches" => &["cap_bytes"],
+        // composite-value store: each op needs the shared __SH_OBJ /
+        // __SH_LIST statics, which are emitted when ANY of these is
+        // requested (COMPOSITE_HELPERS).
+        "obj_add" => &["obj_get", "obj_set"],
+        "obj_get" | "obj_set" | "to_assoc" => &["obj_new"],
+        "json_obj" => &["obj_new"],
+        "ele_read" => &["obj_get", "list_get"],
+        "list_get" | "list_set" | "list_len" | "list_items" => &["list_new"],
+        "list_read" => &["list_get"],
+        // json_marshal walks both stores, so it needs every accessor they
+        // are built from; it recurses through its own body.
+        "json_marshal" => &["list_get"],
+        // the composite-preserving value join falls back to the plain
+        // text join, so it must drag it along. `split_ifs` needs only
+        // the `__sh_is_composite_id` predicate that ships with it.
+        "join_value" => &["join_words"],
+        "split_ifs" => &["join_value"],
         _ => &[],
     }
 }
+
+/// The helper names that own the composite-value store's statics.
+const COMPOSITE_HELPERS: &[&str] = &[
+    "obj_new", "obj_get", "obj_set", "obj_add", "json_obj", "to_assoc", "ele_read",
+    "list_new", "list_get", "list_set", "list_len", "list_read", "list_push", "list_items",
+    "json_marshal", "type_of",
+];
 
 fn helper_source(h: &str) -> &'static str {
     match h {
@@ -12683,8 +13600,8 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r = 1;
-    let mut i = 0;
+    let mut r: i64 = 1;
+    let mut i: i64 = 0;
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
 }"#,
@@ -12804,6 +13721,37 @@ fn helper_source(h: &str) -> &'static str {
         }
     }
     s
+}"#,
+        // Value-function return path. A composite (Go struct/slice/map)
+        // is an OPAQUE store id — `list#3` / `obj#7` — that only the
+        // `__sh_list_*` / `__sh_obj_*` helpers understand. Joining it
+        // into text destroys the identity: the caller re-reads the id as
+        // a plain string, `__sh_list_len` then finds no list and returns
+        // 0, and every `range` over the returned value iterates zero
+        // times (t108 `mktoks() []tok`). So when the whole return value
+        // is ONE word and that word is a composite id, hand the id
+        // through untouched. A multi-word echo is real text, not an id,
+        // so it still joins normally.
+        "join_value" => r#"fn __sh_is_composite_id(s: &str) -> bool {
+    // tolerate the trailing newline a `$( )` capture (or the value
+    // function's own trailing echo) leaves on the id
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    if s.len() < 6 { return false; }
+    if !(s.starts_with("list#") || s.starts_with("obj#")) { return false; }
+    s[5..].parse::<usize>().is_ok()
+}
+fn __sh_shave_nl(s: String) -> String {
+    if __sh_is_composite_id(&s) {
+        s.strip_suffix('\n').unwrap_or(&s).to_string()
+    } else {
+        s
+    }
+}
+fn __sh_join_value(ws: &[Vec<String>]) -> String {
+    if ws.len() == 1 && ws[0].len() == 1 && __sh_is_composite_id(&ws[0][0]) {
+        return ws[0][0].clone();
+    }
+    __sh_join_words(ws)
 }"#,
         // Same signature and call sites as `print_words`, but with the
         // `-e` branch compiled out: emitted when no echo in the program
@@ -13111,6 +14059,12 @@ fn helper_source(h: &str) -> &'static str {
     fields
 }"#,
         "split_ifs" => r#"fn __sh_split_ifs(s: &str, ifs: &str) -> Vec<String> {
+    // A composite store id (`list#3` / `obj#7`) is an OPAQUE token, not
+    // text: word-splitting it would shred the id into "list#" and "3" and
+    // lose the reference (t108 `mktoks2() ([]tok, error)`, whose return
+    // value rides a capture that word-splits). Such a value is already a
+    // single field, so the split is the identity on it.
+    if __sh_is_composite_id(s) { return vec![s.to_string()]; }
     if ifs.is_empty() { return vec![s.to_string()]; }
     let ws = ifs.chars().all(|c| c == ' ' || c == '\t' || c == '\n');
     let ch: Vec<char> = s.chars().collect();
@@ -13523,6 +14477,261 @@ fn helper_source(h: &str) -> &'static str {
         "aindex" => r#"fn __sh_aindex(v: &[String], k: i64) -> String {
     v.get(k as usize).cloned().unwrap_or_default()
 }"#,
+        // ── Go composite-value store ─────────────────────────────────────
+        // A struct/map/slice is a REFERENCE value: the variable (and every
+        // channel it crosses — call args, echo, capture, function return)
+        // carries an opaque ID string; the payload lives in __SH_OBJ /
+        // __SH_LIST. IDs are never reused, so a stale id reads as absent
+        // rather than as another object. Nil / the zero id is "" (Go's
+        // `p != nil` lowers to `!= ""`).
+        "obj_new" => r#"fn __sh_obj_new(type_name: &str, fields: &[String], vals: &[String]) -> String {
+    if type_name == "list" {
+        let mut l = __SH_LIST.lock().unwrap();
+        l.push(vals.to_vec());
+        return format!("list#{}", l.len());
+    }
+    let _ = type_name;
+    let mut m = std::collections::BTreeMap::new();
+    for (i, f) in fields.iter().enumerate() {
+        m.insert(f.clone(), vals.get(i).cloned().unwrap_or_default());
+    }
+    let mut o = __SH_OBJ.lock().unwrap();
+    o.push(m);
+    format!("obj#{}", o.len())
+}"#,
+        "obj_get" => r#"fn __sh_obj_get(id: &str, field: &str) -> String {
+    let o = __SH_OBJ.lock().unwrap();
+    match id.strip_prefix("obj#").and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) if n >= 1 && n <= o.len() => o[n - 1].get(field).cloned().unwrap_or_default(),
+        _ => String::new(),
+    }
+}"#,
+        "obj_set" => r#"fn __sh_obj_set(id: &str, field: &str, val: &str) {
+    let mut o = __SH_OBJ.lock().unwrap();
+    if let Some(n) = id.strip_prefix("obj#").and_then(|n| n.parse::<usize>().ok()) {
+        if n >= 1 && n <= o.len() {
+            o[n - 1].insert(field.to_string(), val.to_string());
+        }
+    }
+}"#,
+        // objAdd: numeric read-modify-write over an object field
+        // (`p.n++`, `p.n += d`). A non-numeric field counts as 0, the
+        // way the JS reference runtime's `Number(...) || 0` does.
+        "obj_add" => r#"fn __sh_obj_add(id: &str, field: &str, delta: &str) {
+    let cur: i64 = __sh_obj_get(id, field).trim().parse().unwrap_or(0);
+    let d: i64 = delta.trim().parse().unwrap_or(0);
+    __sh_obj_set(id, field, &(cur + d).to_string());
+}"#,
+        "json_obj" => r#"fn __sh_json_obj(keys: &[String], vals: &[String]) -> String {
+    __sh_obj_new("map", keys, vals)
+}"#,
+        // toAssocInto(name, v): materialize a map-ish VALUE into the NAMED
+        // assoc store that `assocGet`/`assocSet` address. The store is
+        // replaced, not merged (the frontend's `m := <map value>`).
+        //
+        // This DECODES the payload only; the caller writes it into its own
+        // `thread_local` via `dst.with(|c| *c.borrow_mut() = …)`. The helper
+        // must NOT take the `LocalKey` by reference: `LocalKey::with` is
+        // `for<'a> FnOnce(&'a T)`, so a helper holding `&'1 LocalKey<_>`
+        // would need `'1: 'static` (E0521) and no such free function exists.
+        "to_assoc" => r#"fn __sh_to_assoc_payload(v: &str) -> std::collections::BTreeMap<String, String> {
+    let mut payload: Vec<(String, String)> = Vec::new();
+    if let Some(n) = v.strip_prefix("obj#").and_then(|n| n.parse::<usize>().ok()) {
+        let o = __SH_OBJ.lock().unwrap();
+        if n >= 1 && n <= o.len() {
+            payload = o[n - 1].iter().map(|(k, x)| (k.clone(), x.clone())).collect();
+        }
+    }
+    payload.into_iter().collect()
+}"#,
+        "list_new" => r#"fn __sh_list_new(items: &[String]) -> String {
+    let mut l = __SH_LIST.lock().unwrap();
+    l.push(items.to_vec());
+    format!("list#{}", l.len())
+}"#,
+        "list_get" => r#"fn __sh_list_get(id: &str, i: &str) -> String {
+    let l = __SH_LIST.lock().unwrap();
+    match id.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) if n >= 1 && n <= l.len() => {
+            let idx: i64 = i.trim().parse().unwrap_or(0);
+            if idx >= 0 { l[n - 1].get(idx as usize).cloned().unwrap_or_default() } else { String::new() }
+        }
+        _ => String::new(),
+    }
+}"#,
+        "list_set" => r#"fn __sh_list_set(id: &str, i: &str, val: &str) {
+    let mut l = __SH_LIST.lock().unwrap();
+    if let Some(n) = id.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+        if n >= 1 && n <= l.len() {
+            let idx: i64 = i.trim().parse().unwrap_or(-1);
+            if idx >= 0 {
+                let v = &mut l[n - 1];
+                while v.len() <= idx as usize { v.push(String::new()); }
+                v[idx as usize] = val.to_string();
+            }
+        }
+    }
+}"#,
+        "list_len" => r#"fn __sh_list_len(id: &str) -> String {
+    {
+        let l = __SH_LIST.lock().unwrap();
+        if let Some(n) = id.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+            if n >= 1 && n <= l.len() {
+                return l[n - 1].len().to_string();
+            }
+        }
+    }
+    // the `\x1e`-joined list convention (a strSplit result)
+    if id.is_empty() { "0".to_string() } else { id.split('\u{1e}').count().to_string() }
+}"#,
+        // listGet: the LIST is a store id ("list#N") OR the renderer-wide
+        // `\x1e`-joined list string — dispatch on the prefix. Owning the
+        // coll in a `let` first keeps the borrow of the split alive.
+        "list_read" => r#"fn __sh_list_read(coll: &str, i: &str) -> String {
+    if coll.starts_with("list#") {
+        return __sh_list_get(coll, i);
+    }
+    let lc: String = coll.to_string();
+    let l: Vec<&str> = lc.split('\u{1e}').collect();
+    let idx: i64 = i.trim().parse().unwrap_or(0);
+    if idx >= 0 && (idx as usize) < l.len() { l[idx as usize].to_string() } else { String::new() }
+}
+/// Slot-0 read of a multi-target destructuring. `t2, _ := mktoks2()`
+/// lowers to a slot-0 read of the capture, but slot 0 of a composite
+/// return IS the whole composite — the trailing Go `error` slot is the
+/// dropped one. Unwrapping to element 0 would hand the caller one joined
+/// element and silently shorten the `range` that follows (t108). Any
+/// other index, and every real element read, still goes through
+/// `__sh_list_read`.
+fn __sh_destruct_slot0(coll: &str) -> String {
+    if (coll.starts_with("list#") || coll.starts_with("obj#")) && __sh_is_composite_id(coll) {
+        return coll.to_string();
+    }
+    __sh_list_read(coll, "0")
+}"#,
+
+        // jsonMarshal(v) - `json.Marshal(x)` in the Go frontend: encode a
+        // store id structurally, with encoding/json's rules. Object keys are
+        // emitted in SORTED order (BTreeMap already iterates that way, so the
+        // walk needs no extra sort).
+        //
+        // A composite id nests; a bare scalar follows the reference runtime's
+        // _scalar: the empty string encodes as `[]` (an empty store list, not
+        // ""), the true/false/null words encode as their JSON literals, and
+        // everything else is a JSON string - including digit strings, because
+        // numeric restoration is schema-driven upstream, never inferred here.
+        "json_marshal" => r#"fn __sh_json_str(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+fn __sh_json_scalar(s: &str) -> String {
+    if s.is_empty() { return "[]".to_string(); }
+    if s == "true" { return "true".to_string(); }
+    if s == "false" { return "false".to_string(); }
+    if s == "null" { return "null".to_string(); }
+    __sh_json_str(s)
+}
+fn __sh_json_marshal(v: &str) -> String {
+    if v.starts_with("list#") {
+        let items = __SH_LIST.lock().unwrap().clone();
+        if let Some(n) = v.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+            if n >= 1 && n <= items.len() {
+                let parts: Vec<String> = items[n - 1].iter().map(|it| __sh_json_marshal(it)).collect();
+                return format!("[{}]", parts.join(","));
+            }
+        }
+        return "[]".to_string();
+    }
+    if v.starts_with("obj#") {
+        let o = __SH_OBJ.lock().unwrap().clone();
+        if let Some(n) = v.strip_prefix("obj#").and_then(|n| n.parse::<usize>().ok()) {
+            if n >= 1 && n <= o.len() {
+                let parts: Vec<String> = o[n - 1].iter().map(|(k, x)| format!("{}:{}", __sh_json_str(k), __sh_json_marshal(x))).collect();
+                return format!("{{{}}}", parts.join(","));
+            }
+        }
+        return "{}".to_string();
+    }
+    __sh_json_scalar(v)
+}"#,
+        // sh2.typeOf(v) — the runtime type query behind a Go type assertion.
+        //
+        // The KIND is a property of the VALUE, not of the variable: the A2
+        // var_types verdict only knows what the frontend inferred at the
+        // declaration, and an `any` slot is declared string while carrying a
+        // map at the assertion site (t113's `m0 := out[0].(map[string]any)`).
+        // A render-time fold therefore answers "string" for a map and the
+        // comma-ok arm prints false. Querying the store id the value actually
+        // carries is the only faithful lowering.
+        //
+        // A `list#`/`obj#` id is a composite; a map asserts as "map" (the
+        // kind go-sh stamps on `map[K]V` assertions) and a slice as "array";
+        // the remaining scalars report the declared kind.
+        "type_of" => r#"fn __sh_type_of(v: &str) -> String {
+    if v.starts_with("obj#") { return "map".to_string(); }
+    if v.starts_with("list#") { return "array".to_string(); }
+    if v == "true" || v == "false" { return "bool".to_string(); }
+    match v.trim().parse::<i64>() {
+        Ok(_) => "int".to_string(),
+        Err(_) => "string".to_string(),
+    }
+}"#,
+        // listPush on a nil slice auto-vivifies (Go append semantics): an
+        // unknown id allocates a fresh list and the caller stores the
+        // returned id. A pushed id that names a LIST is spread one level
+        // (an `append(dst, src...)` or a callee echoing its result list).
+        "list_push" => r#"fn __sh_list_push(id: &str, vals: &[String]) -> String {
+    let mut flat: Vec<String> = Vec::new();
+    {
+        let store = __SH_LIST.lock().unwrap();
+        for v in vals {
+            match v.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) if n >= 1 && n <= store.len() => flat.extend(store[n - 1].iter().cloned()),
+                _ => flat.push(v.clone()),
+            }
+        }
+    }
+    let mut l = __SH_LIST.lock().unwrap();
+    match id.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) if n >= 1 && n <= l.len() => { l[n - 1].extend(flat); id.to_string() }
+        _ => { l.push(flat); format!("list#{}", l.len()) }
+    }
+}"#,
+        // ElementRead: index an anonymous composite value, where only the
+        // runtime knows which store the coll id names (a map/object id,
+        // a list id, or the renderer-wide `\x1e`-joined list string).
+        "ele_read" => r#"fn __sh_ele_read(coll: &str, key: &str) -> String {
+    if coll.starts_with("obj#") { return __sh_obj_get(coll, key); }
+    if coll.starts_with("list#") { return __sh_list_get(coll, key); }
+    match key.trim().parse::<i64>() {
+        Ok(i) if i >= 0 => coll.split('\u{1e}').nth(i as usize).unwrap_or("").to_string(),
+        _ => String::new(),
+    }
+}"#,
+        "list_items" => r#"fn __sh_list_items(id: &str) -> Vec<String> {
+    {
+        let l = __SH_LIST.lock().unwrap();
+        if let Some(n) = id.strip_prefix("list#").and_then(|n| n.parse::<usize>().ok()) {
+            if n >= 1 && n <= l.len() {
+                return l[n - 1].clone();
+            }
+        }
+    }
+    // the `\x1e`-joined list convention (a strSplit result)
+    if id.is_empty() { Vec::new() } else { id.split('\u{1e}').map(|x| x.to_string()).collect() }
+}"#,
         _ => "fn __sh_unused() {}",
     }
 }
@@ -13650,6 +14859,17 @@ fn str_arg(args: &[IrExpr], i: usize) -> Option<&str> {
     match args.get(i) {
         Some(IrExpr::Str(s, _)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// A `return` argument that is a bare integer literal — bash's `return N`
+/// STATUS form, as opposed to the value channel the echo→value rewrite uses
+/// (`return <expression>`). See the IrStmt::Return arm.
+fn is_numeric_literal(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        IrExpr::Str(s, _) => !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+        _ => false,
     }
 }
 
@@ -14088,6 +15308,46 @@ fn extglob_tok(ch: &[char], i: &mut usize) -> TTok {
     TTok::Operand(ch[start..*i].iter().collect())
 }
 
+/// Is this the CORE's process-substitution cleanup (`transforms/process_subst.rs`:
+/// a synthetic trailing `rm -f __ps_tmpN …` appended after the consumer command)?
+///
+/// It is not in the source, so it must NOT become `$?`: `diff <(a) <(b)` leaves
+/// bash's status as diff's, and the core's own comment calls the trailing rm
+/// "the last status (accepted caveat)". The temp names are core-generated and
+/// deterministic, so the renderer can compensate exactly, the way the C backend
+/// does (`ps_cleanup_tmps`). Some(list) iff the command is `rm` and every
+/// non-flag word is a `__ps_tmp*` ref; anything else → None (an ordinary `rm`
+/// keeps the normal status path).
+fn ps_cleanup_tmps(cmd: &IrExpr, args: &[IrExpr]) -> Option<Vec<String>> {
+    match cmd {
+        IrExpr::Str(s, _) if s == "rm" => {}
+        _ => return None,
+    }
+    let mut tmps = Vec::new();
+    for a in args {
+        match a {
+            IrExpr::Str(s, _) if s.starts_with('-') => {}
+            IrExpr::Str(s, _)
+                if s.starts_with("__ps_tmp")
+                    && s["__ps_tmp".len()..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                tmps.push(s.clone());
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+                tmps.push(n.clone());
+            }
+            _ => return None,
+        }
+    }
+    if tmps.is_empty() {
+        None
+    } else {
+        Some(tmps)
+    }
+}
+
 fn test_tokens(s: &str) -> Option<Vec<TTok>> {
     let ch: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
@@ -14419,9 +15679,13 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 if let Some(TTok::Bin(op)) = self.toks.get(self.pos).cloned() {
                     self.pos += 1;
                     let rhs_lit = self.operand_literal();
+                    // quoting the RHS suppresses pattern matching (see
+                    // `binary_test`) — read it before `operand()` advances
+                    let rhs_quoted = self.operand_quoted();
                     let (rhs, rhs_num) = self.operand()?;
                     Some(self.binary_test_lit(
                         &op, &lhs, lhs_num, lhs_lit.as_deref(), &rhs, rhs_num, rhs_lit.as_deref(),
+                        rhs_quoted,
                     ))
                 } else {
                     // single operand — non-empty string
@@ -14442,6 +15706,21 @@ impl<'a, 'r> TestParser<'a, 'r> {
         // stripped once, in the one place, rather than per operator.
         let (e, num) = self.render.test_operand_expr(&text, self.style);
         Some((Self::strip_identity_format(&e), num))
+    }
+
+    /// Whether the operand token at the cursor was QUOTED in the source
+    /// (`"…"`, `'…'` or `$'…'`). bash: quoting suppresses pattern matching, so
+    /// a quoted RHS of `=`/`==`/`!=` is a literal string compare — `[ "abc" =
+    /// "a*" ]` and `[[ "abc" == "a*" ]]` are both FALSE (the corpus file
+    /// test-glob-rhs-fallback.sh pins this). Only an unquoted RHS is a pattern.
+    fn operand_quoted(&self) -> bool {
+        let Some(TTok::Operand(text)) = self.toks.get(self.pos) else {
+            return false;
+        };
+        let t = text.trim();
+        (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+            || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+            || (t.starts_with("$'") && t.ends_with('\'') && t.len() >= 3)
     }
 
     /// The CONSTANT text of an operand, when it is a pure literal: a
@@ -14584,6 +15863,7 @@ impl<'a, 'r> TestParser<'a, 'r> {
         rhs_num: bool,
         lhs_lit: Option<&str>,
         rhs_lit: Option<&str>,
+        rhs_quoted: bool,
     ) -> String {
         match op {
             "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
@@ -14601,11 +15881,81 @@ impl<'a, 'r> TestParser<'a, 'r> {
             }
             "=" | "==" | "!=" => {
                 let eq = op != "!=";
+                let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
+                let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
+                // bash: a QUOTED rhs of `=`/`==`/`!=` is ALWAYS a literal
+                // string compare — quoting suppresses pattern matching, in
+                // `[ ]` and in `[[ ]]` alike (`[ "abc" = "a*" ]` is FALSE; the
+                // corpus file test-glob-rhs-fallback.sh pins this). Only an
+                // UNQUOTED rhs is a pattern. When it is, `[[ ]]` globs it
+                // directly, and `[ ]` applies the sh2.* evalTest glob fallback
+                // (harness/sh2-namespace.mjs) that the go-sh frontend relies on
+                // — it lowers strings.Contains/HasPrefix to `"$s"=*world*`.
+                let pattern = !rhs_quoted;
+                if !pattern {
+                    // `nocasematch` applies to a literal compare too, in `[[ ]]`.
+                    // The `!=` form must negate the WHOLE comparison: `!` binds
+                    // tighter than `==` in Rust, so `! a == b` is `(!a) == b` —
+                    // E0600 (String has no `Not`) — not `!(a == b)`.
+                    if self.style == "[[" && self.render.nocasematch && !lhs_num && !rhs_num {
+                        let cmp = format!("{l}.to_lowercase() == {r}.to_lowercase()");
+                        return if eq { format!("({cmp})") } else { format!("!({cmp})") };
+                    }
+                    // A constant RHS compared against a BORROWED read (`&str`)
+                    // must not allocate: `a == "a"` not
+                    // `a == "a".to_string()`. `l` carries the lhs's own form (a
+                    // borrowable local reads bare), so pick the literal
+                    // spelling to match it.
+                    let l_borrowed = lhs_lit.is_none()
+                        && !lhs_num
+                        && lhs.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                        && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if let Some(rlit) = rhs_lit {
+                        if l_borrowed {
+                            let ro = Render::rust_str(rlit);
+                            let lo = if lhs_lit.is_some() { l.clone() } else { lhs.to_string() };
+                            return if eq {
+                                format!("({lo} == {ro})")
+                            } else {
+                                format!("({lo} != {ro})")
+                            };
+                        }
+                        // Fully-constant comparison can fold to a
+                        // plain bool (no String allocation). Numeric
+                        // operands keep their string rendering. Gated on
+                        // `-Os`/`-Oz` like the other shrinking folds: at
+                        // the `-Og` default the output must resemble the
+                        // input, so the compare stays visible — matching
+                        // every other backend.
+                        if let (Some(ll), false, false) = (lhs_lit, lhs_num, rhs_num) {
+                            if crate::shir::size_opt_enabled() {
+                                let same = ll == rlit;
+                                return if same == eq { "true".to_string() } else { "false".to_string() };
+                            }
+                            // Both operands are CONSTANT, so the compare
+                            // needs no owned Strings: compare the literal
+                            // texts directly (`&str == &str`), as the
+                            // source reads and as every other backend
+                            // renders it (`String("a") === String("a")`,
+                            // `mem.eql(u8, "a", "a")`, `shEq("a","a")`).
+                            let lo = Render::rust_str(ll);
+                            let ro = Render::rust_str(rlit);
+                            return if eq {
+                                format!("({lo} == {ro})")
+                            } else {
+                                format!("({lo} != {ro})")
+                            };
+                        }
+                    }
+                    return if eq {
+                        format!("({l} == {r})")
+                    } else {
+                        format!("({l} != {r})")
+                    };
+                }
                 if self.style == "[[" {
                     // pattern match (glob) in [[ ]]
                     self.render.add_helper("fnmatch");
-                    let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
-                    let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
                     if self.render.nocasematch {
                         format!(
                             "({} __sh_fnmatch(&{r}.to_lowercase(), &{l}.to_lowercase()))",
@@ -14615,27 +15965,13 @@ impl<'a, 'r> TestParser<'a, 'r> {
                         format!("({} __sh_fnmatch(&{r}, &{l}))", if eq { "" } else { "!" })
                     }
                 } else {
-                    // the sh2.* runtime's evalTest contract
-                    // (harness/sh2-namespace.mjs): `=`/`==`/`!=` falls
-                    // back to GLOB matching when the RHS carries glob
-                    // metachars — the go-sh frontend lowers
-                    // strings.Contains/HasPrefix to `"$s"=*world*` and
-                    // the corpus relies on the fallback (plain `[ ]`
-                    // bash would compare literally). The metachar test
-                    // runs on the EVALUATED rhs (it may be a variable),
-                    // mirroring the JS side exactly.
-                    let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
-                    let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
-                    // When the RHS is a CONSTANT the metachar decision is
-                    // known at render time (`"a" == "a"` is the literal
-                    // string compare, not a pattern match) — fold it and
-                    // skip the glob machinery entirely. A metachar-bearing
-                    // constant still needs fnmatch.
-                    // A constant RHS that is compared against a BORROWED
-                    // read (`&str`) must not allocate: `a == "a"` not
-                    // `a == "a".to_string()`. `l` carries the lhs's own form
-                    // (a borrowable local reads bare), so pick the literal
-                    // spelling to match it.
+                    // `[ ]` with an UNQUOTED rhs: an rhs CONSTANT without
+                    // metachars is still decidable at render time (`"a" == "a"`
+                    // is the literal string compare, not a pattern match) —
+                    // fold it and skip the glob machinery entirely. A
+                    // metachar-bearing constant, and a runtime rhs, keep the
+                    // probe. The metachar test runs on the EVALUATED rhs (it may
+                    // be a variable), mirroring the JS side exactly.
                     let l_borrowed = lhs_lit.is_none()
                         && !lhs_num
                         && lhs.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
@@ -14651,24 +15987,11 @@ impl<'a, 'r> TestParser<'a, 'r> {
                             };
                         }
                         if !glob_like(rlit) {
-                            // Fully-constant comparison can fold to a
-                            // plain bool (no String allocation). Numeric
-                            // operands keep their string rendering. Gated on
-                            // `-Os`/`-Oz` like the other shrinking folds: at
-                            // the `-Og` default the output must resemble the
-                            // input, so the compare stays visible — matching
-                            // every other backend.
                             if let (Some(ll), false, false) = (lhs_lit, lhs_num, rhs_num) {
                                 if crate::shir::size_opt_enabled() {
                                     let same = ll == rlit;
                                     return if same == eq { "true".to_string() } else { "false".to_string() };
                                 }
-                                // Both operands are CONSTANT, so the compare
-                                // needs no owned Strings: compare the literal
-                                // texts directly (`&str == &str`), as the
-                                // source reads and as every other backend
-                                // renders it (`String("a") === String("a")`,
-                                // `mem.eql(u8, "a", "a")`, `shEq("a","a")`).
                                 let lo = Render::rust_str(ll);
                                 let ro = Render::rust_str(rlit);
                                 return if eq {
@@ -14730,8 +16053,9 @@ impl<'a, 'r> TestParser<'a, 'r> {
         rhs: &str,
         rhs_num: bool,
         rhs_lit: Option<&str>,
+        rhs_quoted: bool,
     ) -> String {
-        self.binary_test(op, lhs, lhs_num, rhs, rhs_num, lhs_lit, rhs_lit)
+        self.binary_test(op, lhs, lhs_num, rhs, rhs_num, lhs_lit, rhs_lit, rhs_quoted)
     }
 
     fn peek_is(&self, t: &TTok) -> bool {
@@ -16456,9 +17780,89 @@ fn collect_written_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Go COMPOSITE-VALUE storage classes (go-sh's `obj*` / `list*` family).
+/// A `&T{…}` struct literal binds through `Assign` to an `objNew(type,
+/// fields, values)` value, and a `[]T{…}` slice binds to `listNew()`. Both
+/// names must be classified BEFORE `decl_stmt` picks a storage family, or
+/// the composite lands in a `String` cell and every field read is a TODO.
+///
+/// A struct is a STRING-KEYED map — the same shape as a shell assoc array
+/// (`BTreeMap<String, String>`), so it reuses `assoc` storage. A slice is
+/// an ordered list of stringified elements — the `Vec<String>` `arrays`
+/// family. Splitting on the two keeps `decl_stmt`, `assoc_get` and the
+/// element readers unchanged.
+fn collect_composite_vars(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut BTreeSet<String>) {
+    for s in stmts {
+        // `m := <map-ish>` / `m = toAssocInto(m, v)` — the named ASSOC
+        // store (assocSet/assocGet address it by NAME). A `objNew` /
+        // `listNew` target is NOT one of these: a composite value is an
+        // opaque store id riding the ordinary string channels (see
+        // `composite_value`), so its variable stays a plain string cell.
+        if let IrStmt::Assign { expr, .. } = s {
+            if let IrExpr::Call { func, args } = expr {
+                if func == "toAssocInto" {
+                    if let Some(n) = str_arg(args, 0) {
+                        assoc.insert(n.to_string());
+                    }
+                }
+            }
+        }
+        // Descend: a composite built inside a loop/branch still needs its
+        // storage declared, and the nested bodies hold the field writes.
+        match s {
+            IrStmt::For { iter, body, .. } => {
+                collect_composite_vars_expr(iter, arrays, assoc);
+                collect_composite_vars(body, arrays, assoc);
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                collect_composite_vars(init, arrays, assoc);
+                collect_composite_vars_expr(cond, arrays, assoc);
+                collect_composite_vars(step, arrays, assoc);
+                collect_composite_vars(body, arrays, assoc);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_composite_vars_expr(cond, arrays, assoc);
+                collect_composite_vars(body, arrays, assoc);
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_composite_vars_expr(cond, arrays, assoc);
+                collect_composite_vars(then, arrays, assoc);
+                for (c, t) in elsifs {
+                    collect_composite_vars_expr(c, arrays, assoc);
+                    collect_composite_vars(t, arrays, assoc);
+                }
+                collect_composite_vars(else_, arrays, assoc);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_composite_vars_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BTreeSet<String>) {
+    if let IrExpr::Call { func, args } = e {
+        // `m0 := <any>(); toAssocInto(m0, v)` / `listPush(out, v)` name
+        // their target as a literal first arg — classify it directly.
+        match func.as_str() {
+            "toAssocInto" => {
+                if let Some(n) = str_arg(args, 0) {
+                    assoc.insert(n.to_string());
+                }
+            }
+            "listSet" | "listPush" | "listGet" | "listLen" | "listItems" => {}
+            _ => {}
+        }
+        for a in args {
+            collect_composite_vars_expr(a, arrays, assoc);
+        }
+    }
+}
+
 /// Collect array/assoc vars from setArray / DeclareArray / declare -A /
 /// arrayIndex / listVar / param array forms.
 fn collect_arrays(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut BTreeSet<String>) {
+    // Composite (struct/slice) names first: a name is a composite BEFORE
+    // any shell-array verdict can claim it.
+    collect_composite_vars(stmts, arrays, assoc);
     for s in stmts {
         match s {
             IrStmt::Expr(e) => collect_arrays_expr(e, arrays, assoc),
@@ -16654,7 +18058,14 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                         assoc.insert(name.to_string());
                     }
                 }
-                "listVar" => {
+                "listVar" | "arrayItems" => {
+                    // `listVar` is `${arr[@]}`; `arrayItems` is the same
+                    // element-list read in word context (and the `${!prefix*}`
+                    // name-list form). Either way the renderer reads the name
+                    // as `${arr[@]}`, so its `__SHV_` cell must be declared
+                    // even when the program never writes it — `${!var*}` on an
+                    // unwritten prefix otherwise emitted a read of an
+                    // undeclared `__SHV_var` (E0425).
                     if let Some(name) = str_arg(args, 0) {
                         if name != "@" && name != "*" {
                             arrays.insert(name.to_string());
@@ -17545,6 +18956,7 @@ fn compute_local_vars(
     assoc: &BTreeSet<String>,
     functions: &BTreeSet<String>,
     declared: &BTreeSet<String>,
+    force_global: &BTreeSet<String>,
 ) -> (
     HashMap<String, crate::shir_passes::list_profile::Scope>,
     BTreeSet<String>,
@@ -17570,6 +18982,7 @@ fn compute_local_vars(
             || arrays.contains(&name)
             || assoc.contains(&name)
             || dyns.contains(&name)
+            || force_global.contains(&name)
         {
             continue;
         }
@@ -18268,6 +19681,336 @@ fn collect_attrs(
 /// a dynamic dispatch, an ambiguous redefinition), because a dropped value
 /// home on a live path is a miscompile while a kept one is only dead
 /// weight.
+/// The `__bt_N` verdict cell of a Go-style predicate body, if this function
+/// IS one. The Go frontend lowers `func isYes(s string) bool` to a chain
+/// that writes "true"/"false" into a `__bt_N` cell and then branches on it
+/// with `return 0` / `return 1` — status signalling, with the boolean
+/// living in the cell. A body that returns a real value (t115's
+/// `return true` / `return false`) has no such cell-only verdict, and must
+/// keep returning its own expression.
+fn find_predicate_verdict(body: &[IrStmt]) -> Option<String> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    // DISCRIMINATOR: a status-signalling predicate returns numeric
+    // literals (`return 0` / `return 1`). t115's `return true` /
+    // `return false` body also uses a `__bt_N` cell, but its returns
+    // ARE the value — publishing the cell there would break it. Require a
+    // numeric-literal return before claiming the body is a predicate.
+    fn returns_status(stmts: &[IrStmt]) -> bool {
+        use crate::ir::IrStmt;
+        for s in stmts {
+            match s {
+                IrStmt::Return(Some(e)) if is_numeric_literal(e) => return true,
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if returns_status(then) {
+                        return true;
+                    }
+                    for (_, b) in elsifs {
+                        if returns_status(b) {
+                            return true;
+                        }
+                    }
+                    if returns_status(else_) {
+                        return true;
+                    }
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::ForInit { body: b, .. } => {
+                    if returns_status(b) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    if !returns_status(body) {
+        return None;
+    }
+
+    // the cell the final status test reads (`[ "$__bt_N" == "true" ]`)
+    let mut read_cell: Option<String> = None;
+    fn find_tested(stmts: &[IrStmt], out: &mut Option<String>) {
+        use crate::ir::{IrExpr, IrStmt};
+        for s in stmts {
+            match s {
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if let IrExpr::Call { func, args } = cond {
+                        if func == "test" {
+                            if let Some(t) = args.first().and_then(|a| match a {
+                                IrExpr::Str(t, _) => Some(t.clone()),
+                                _ => None,
+                            }) {
+                                for part in ["$__bt_", "__bt_"] {
+                                    if let Some(i) = t.find(part) {
+                                        let rest = &t[i + part.len()..];
+                                        let num: String =
+                                            rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                                        if !num.is_empty() {
+                                            *out =
+                                                Some(format!("__bt_{num}"));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    find_tested(then, out);
+                    for (_, b) in elsifs {
+                        find_tested(b, out);
+                    }
+                    find_tested(else_, out);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::ForInit { body: b, .. } => find_tested(b, out),
+                IrStmt::Function { body, .. } => find_tested(body, out),
+                _ => {}
+            }
+        }
+    }
+    find_tested(body, &mut read_cell);
+    let cell = read_cell?;
+
+    // …and it must be WRITTEN by the body, else it is a free variable we
+    // would read out of scope.
+    let mut written = false;
+    fn find_write(stmts: &[IrStmt], name: &str) -> bool {
+        use crate::ir::{IrExpr, IrStmt};
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    if targets.iter().any(|t| t.var == name) {
+                        return true;
+                    }
+                }
+                IrStmt::Declare { vars, .. } => {
+                    if vars.iter().any(|v| v.name == name) {
+                        return true;
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if find_write(then, name) {
+                        return true;
+                    }
+                    for (_, b) in elsifs {
+                        if find_write(b, name) {
+                            return true;
+                        }
+                    }
+                    if find_write(else_, name) {
+                        return true;
+                    }
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::ForInit { body: b, .. } => {
+                    if find_write(b, name) {
+                        return true;
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if find_write(body, name) {
+                        return true;
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
+                    if args.iter().any(|a| matches!(a, IrExpr::Str(v, _) if v == name)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    written = find_write(body, &cell);
+    if written {
+        Some(cell)
+    } else {
+        None
+    }
+}
+
+/// The `__bt_N` verdict cell a Go-predicate body has assigned at the point a
+/// `return 0` / `return 1` executes — the cell that return must publish.
+///
+/// `find_predicate_verdict` returns ONE cell for the whole function, which is
+/// right when the body writes a single verdict (t109's `return s == "y"`) and
+/// wrong when an early branch returns before the later cell is ever written
+/// (t115's `isYes`: `if s == "y" { __bt_0 = true; … return 0 }` then
+/// `__bt_1 = false; … return 0` — the first return must read `__bt_0`, but a
+/// single-cell verdict published `__bt_1`, which is still empty on that path,
+/// so `isYes("y")` read `""` and every `if isYes(…)` was false).
+///
+/// Walks the body in execution order carrying the LAST-assigned `__bt_N`
+/// cell. A branch is a fork: the state entering it is restored for the
+/// fall-through, so a write inside one arm cannot leak into the next. A return
+/// resolves against the state at its own position.
+fn verdict_cells_at_return(body: &[IrStmt]) -> Vec<String> {
+    use crate::ir::{IrStmt};
+
+    /// The `__bt_N` cell a statement writes, if any. The Go frontend writes
+    /// the verdict through a plain `Assign` to that name (it may also arrive
+    /// as a `setVar` call, hence both shapes).
+    fn cell_written_by(s: &IrStmt) -> Option<String> {
+        match s {
+            IrStmt::Assign { targets, .. } => targets
+                .iter()
+                .find_map(|t| t.var.starts_with("__bt_").then(|| t.var.clone())),
+            IrStmt::Expr(crate::ir::IrExpr::Call { func, args }) if func == "setVar" => args
+                .iter()
+                .find_map(|a| match a {
+                    crate::ir::IrExpr::Str(v, _) if v.starts_with("__bt_") => Some(v.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        }
+    }
+
+    /// Walk EVERY status return, reporting the cell live at each one. Each
+    /// branch arm inherits the state at the branch point and its writes do
+    /// NOT survive into a sibling arm or the join.
+    ///
+    /// Every cell is collected, not just the first: a body can return from
+    /// several verdicts (`if s == "y" { __bt_0 = true; ...; return 0 }`
+    /// then `__bt_1 = false; ...; return 0`), and EACH of those cells gets
+    /// its own read arm in the emitted function, so each needs a store.
+    fn walk(stmts: &[IrStmt], state: &mut Option<String>, hit: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Return(Some(e)) if is_numeric_literal(e) => {
+                    if let Some(c) = state.clone() {
+                        if !hit.contains(&c) {
+                            hit.push(c);
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    for arm in std::iter::once(then)
+                        .chain(elsifs.iter().map(|(_, b)| b))
+                        .chain(std::iter::once(else_))
+                    {
+                        let mut inner = state.clone();
+                        walk(arm, &mut inner, hit);
+                    }
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::ForInit { body: b, .. } => {
+                    let mut inner = state.clone();
+                    walk(b, &mut inner, hit);
+                }
+                other => {
+                    if let Some(c) = cell_written_by(other) {
+                        *state = Some(c);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut state = None;
+    let mut hit = Vec::new();
+    walk(body, &mut state, &mut hit);
+    hit
+}
+
+
+/// Every Go-predicate verdict cell in the program. These names are read by
+/// the numeric-literal return arm from INSIDE a branch, so they must live in a
+/// `thread_local` (one store, readable from any path) rather than a pass-2
+/// `let` (only in scope after its first top-level write — and a verdict cell's
+/// first mention is often a nested write, so the local pass may reject the
+/// cell while accepting a sibling).
+fn collect_predicate_verdict_cells(prog: &IrProgram) -> BTreeSet<String> {
+    use crate::ir::{IrStmt, IrSub};
+    let mut out = BTreeSet::new();
+    // A predicate body may return from SEVERAL verdicts (t115's `isYes`:
+    // `__bt_0 = true; ...; return 0` in the early branch, then
+    // `__bt_1 = false; ...; return 0`). Each cell gets its own read arm in
+    // the emitted function, so each needs a store — collecting only the
+    // first left the rest to the pass-2 local pass, which declared them as
+    // `let` AFTER the read that referenced them (E0425).
+    //
+    // `find_predicate_verdict` is the gate (it requires a numeric-literal
+    // return, so t115's value-returning body is NOT claimed); the per-return
+    // walk then names every cell actually published.
+    let mut add = |body: &[crate::ir::IrStmt], out: &mut BTreeSet<String>| {
+        if find_predicate_verdict(body).is_some() {
+            out.extend(verdict_cells_at_return(body));
+        }
+    };
+    for st in &prog.stmts {
+        if let IrStmt::Function { body, .. } = st {
+            add(body, &mut out);
+            // nested named functions carry their own predicates
+            scan_nested_functions(body, &mut out);
+        }
+    }
+    for s in &prog.subs {
+        if let IrSub { body, .. } = s {
+            add(body, &mut out);
+            scan_nested_functions(body, &mut out);
+        }
+    }
+    out
+}
+
+fn scan_nested_functions(body: &[crate::ir::IrStmt], out: &mut BTreeSet<String>) {
+    use crate::ir::IrStmt;
+    fn rec(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Function { body, named_blocks, .. } => {
+                    if find_predicate_verdict(body).is_some() {
+                        out.extend(verdict_cells_at_return(body));
+                    }
+                    rec(body, out);
+                    for (_, nb) in named_blocks {
+                        rec(nb, out);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    rec(then, out);
+                    for (_, b) in elsifs {
+                        rec(b, out);
+                    }
+                    rec(else_, out);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::ForInit { body: b, .. } => rec(b, out),
+                _ => {}
+            }
+        }
+    }
+    rec(body, out);
+}
+
 fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
 
@@ -18594,12 +20337,28 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
     used
 }
 
-/// Collect every function DEFINITION (top-level and nested).
-fn collect_fn_defs(stmts: &[IrStmt], out: &mut Vec<(String, Vec<IrStmt>, bool)>) {
+/// Collect every function DEFINITION (top-level and nested). The tuple is
+/// (name, declared named params, body, has-named-blocks) — the params drive
+/// the named-parameter-to-positional binding (`active_named_params`).
+fn collect_fn_defs(
+    stmts: &[IrStmt],
+    out: &mut Vec<(String, Vec<String>, Vec<IrStmt>, bool)>,
+) {
     for s in stmts {
         match s {
-            IrStmt::Function { name, body, named_blocks, .. } => {
-                out.push((name.clone(), body.clone(), !named_blocks.is_empty()));
+            IrStmt::Function {
+                name,
+                params,
+                body,
+                named_blocks,
+                ..
+            } => {
+                out.push((
+                    name.clone(),
+                    params.clone(),
+                    body.clone(),
+                    !named_blocks.is_empty(),
+                ));
                 collect_fn_defs(body, out);
             }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
@@ -18782,6 +20541,214 @@ fn collect_reads_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Does this statement list open an fd-1 sink around code it runs INLINE —
+/// a `$( )` capture, a `{ … } > f` redirect, an `echo > f`, a non-last
+/// pipeline stage? Inside such a region a print written straight to stdout
+/// lands on the WRONG stream: it bypasses the buffer the surrounding code
+/// reads back (or the file the redirect opened). Measured: 051_primes
+/// prints `sqrt(3)`, `sqrt(5)`, … — an `echo "sqrt($n)" | bc` inside
+/// `local sqrt_n=$( … )` leaked the echo's text to the terminal while the
+/// capture read back an empty buffer.
+///
+/// A nested function DEFINITION is skipped: its body runs when it is
+/// called, and its own verdict governs its own prints.
+fn opens_output_sink(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(stmt_opens_sink)
+}
+
+fn stmt_opens_sink(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Function { .. } => false,
+        // a redirect region IS the sink: fd-1 is remapped for `inner`
+        IrStmt::Redirect { .. } => true,
+        IrStmt::Output { value, target, .. } => target.is_some() || expr_opens_sink(value),
+        IrStmt::WriteFile { path, content, .. } => {
+            expr_opens_sink(path) || expr_opens_sink(content)
+        }
+        IrStmt::Exec {
+            cmd, args, redirects, env, ..
+        } => {
+            !redirects.is_empty()
+                || expr_opens_sink(cmd)
+                || args.iter().any(expr_opens_sink)
+                || env.iter().any(|(_, e)| expr_opens_sink(e))
+        }
+        // every stage but the LAST writes into the pipe (a sink, unless the
+        // pipeline is captured as a whole); a one-stage pipeline is not one
+        IrStmt::Pipeline { stages, .. } => {
+            stages.len() > 1 || stages.iter().any(|st| opens_output_sink(st))
+        }
+        IrStmt::Assign { expr, .. } => expr_opens_sink(expr),
+        IrStmt::Declare { init, .. } => init.as_ref().is_some_and(expr_opens_sink),
+        IrStmt::DeclareArray { elements, .. } => elements.iter().any(expr_opens_sink),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_opens_sink(expr),
+        IrStmt::SetChildError(e) | IrStmt::Expr(e) => expr_opens_sink(e),
+        IrStmt::Return(e) | IrStmt::Exit(e) => e.as_ref().is_some_and(expr_opens_sink),
+        IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+            expr_opens_sink(cond) || opens_output_sink(body)
+        }
+        IrStmt::For { iter, body, .. } => expr_opens_sink(iter) || opens_output_sink(body),
+        IrStmt::ForInit {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            opens_output_sink(init)
+                || expr_opens_sink(cond)
+                || opens_output_sink(step)
+                || opens_output_sink(body)
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => opens_output_sink(b),
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            expr_opens_sink(cond)
+                || opens_output_sink(then)
+                || elsifs
+                    .iter()
+                    .any(|(c, a)| expr_opens_sink(c) || opens_output_sink(a))
+                || opens_output_sink(else_)
+        }
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => expr_opens_sink(discriminant) || clauses.iter().any(|c| opens_output_sink(&c.body)),
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            opens_output_sink(body)
+                || excepts.iter().any(|e| opens_output_sink(&e.body))
+                || opens_output_sink(else_body)
+                || opens_output_sink(finally_body)
+        }
+        _ => false,
+    }
+}
+
+fn expr_opens_sink(e: &IrExpr) -> bool {
+    match e {
+        // command substitution — an implicit fd-1 sink
+        IrExpr::Capture { .. } => true,
+        IrExpr::Call { func, args } => {
+            if func == "capture" || func == "captureWords" {
+                return true;
+            }
+            if func == "pipeline" {
+                if let Some(IrExpr::Array(stages)) = args.first() {
+                    if stages.len() > 1 {
+                        return true;
+                    }
+                }
+            }
+            args.iter().any(expr_opens_sink)
+        }
+        IrExpr::Arrow(stmts) => opens_output_sink(stmts),
+        IrExpr::BinOp { lhs, rhs, .. } => expr_opens_sink(lhs) || expr_opens_sink(rhs),
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_opens_sink(cond) || expr_opens_sink(then) || expr_opens_sink(else_)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Expr(x) => expr_opens_sink(x),
+            _ => false,
+        }),
+        IrExpr::Index { key, .. } => expr_opens_sink(key),
+        IrExpr::DefinedOr { expr, default } => {
+            expr_opens_sink(expr) || expr_opens_sink(default)
+        }
+        IrExpr::Array(items) => items.iter().any(expr_opens_sink),
+        IrExpr::MethodCall { obj, args, .. } => {
+            expr_opens_sink(obj) || args.iter().any(expr_opens_sink)
+        }
+        IrExpr::Splice(inner) => expr_opens_sink(inner),
+        _ => false,
+    }
+}
+
+/// The functions whose own body opens an fd-1 sink — see
+/// [`opens_output_sink`]. `analyze_fn_sink_contexts` classifies the CALL
+/// SITES only, so a function that is never called under a redirect still
+/// earns a `Never` verdict, and the renderer treats that as a licence to
+/// print straight to stdout in the body. The licence is invalid when the
+/// BODY is what redirects: the sink is active around the print, so the
+/// print must go through the sink-aware helper. Those names are dropped
+/// from `fn_sink_never`. The verdict is per function (not per print), so
+/// the whole body is disqualified — one extra runtime sink check costs
+/// nothing; a print on the wrong stream is a wrong result.
+fn sink_owning_fns(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Function {
+                name,
+                body,
+                named_blocks,
+                ..
+            } => {
+                if opens_output_sink(body)
+                    || named_blocks.iter().any(|(_, b)| opens_output_sink(b))
+                {
+                    out.insert(name.clone());
+                }
+                sink_owning_fns(body, out);
+                for (_, b) in named_blocks {
+                    sink_owning_fns(b, out);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => sink_owning_fns(body, out),
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                sink_owning_fns(body, out)
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                sink_owning_fns(then, out);
+                for (_, arm) in elsifs {
+                    sink_owning_fns(arm, out);
+                }
+                sink_owning_fns(else_, out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    sink_owning_fns(&c.body, out);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                sink_owning_fns(body, out);
+                for e in excepts {
+                    sink_owning_fns(&e.body, out);
+                }
+                sink_owning_fns(else_body, out);
+                sink_owning_fns(finally_body, out);
+            }
+            IrStmt::Redirect { inner, .. } => sink_owning_fns(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    sink_owning_fns(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18845,6 +20812,7 @@ mod tests {
         // on drop, so no test can leave the level flipped for a sibling —
         // that was the flake (see shir::size_opt_scope).
         {
+            let _level = crate::rust_backend::size_opt_lock::hold();
             let _opt = crate::shir::size_opt_scope(false);
             let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
             assert!(!out.contains("__sh_glob_like"), "glob probe kept at -Og:\n{out}");
@@ -18857,6 +20825,7 @@ mod tests {
         }
 
         {
+            let _level = crate::rust_backend::size_opt_lock::hold();
             let _opt = crate::shir::size_opt_scope(true);
             let out = render("if [ \"a\" = \"a\" ]; then echo same; fi\n");
         // The whole `if` is gone: the branch runs inline, so at -Os the
@@ -18874,16 +20843,51 @@ mod tests {
     }
 
     #[test]
-    fn glob_rhs_keeps_the_runtime_probe() {
-        // A metachar-bearing RHS still needs the glob fallback, and a
-        // VARIABLE rhs is only decidable at runtime — both keep the probe
-        // (the sh2 evalTest contract; the go-sh frontend lowers
-        // strings.Contains to `"$s"=*world*`).
-        let _opt = crate::shir::size_opt_scope(true);
-        let out = render("if [ \"abc\" = \"a*\" ]; then echo m; fi\n");
-        assert!(out.contains("__sh_glob_like") && out.contains("__sh_fnmatch"), "{out}");
-        let out = render("pat='a*'\nif [ \"abc\" = \"$pat\" ]; then echo m; fi\n");
-        assert!(out.contains("__sh_glob_like"), "variable rhs lost the probe:\n{out}");
+    fn quoted_rhs_is_a_literal_compare() {
+        // bash: quoting the RHS suppresses pattern matching, in `[ ]` and in
+        // `[[ ]]` alike. `[ "abc" = "a*" ]` compares "abc" against the literal
+        // 3-char string "a*" — FALSE. The corpus file
+        // test-glob-rhs-fallback.sh pins every one of these; the old renderer
+        // globbed the constant RHS and took the wrong branch ("bad").
+        let _level = crate::rust_backend::size_opt_lock::hold();
+        let _opt = crate::shir::size_opt_scope(false);
+        for src in [
+            "if [ \"abc\" = \"a*\" ]; then echo bad; else echo lit; fi\n",
+            "pat='a*'\nif [ \"abc\" = \"$pat\" ]; then echo bad; else echo lit; fi\n",
+            "if [[ \"abc\" == \"a*\" ]]; then echo bad; else echo lit; fi\n",
+            "if [ \"abc\" = \"[ab]*\" ]; then echo bad; else echo lit; fi\n",
+        ] {
+            let out = render(src);
+            assert!(!out.contains("__sh_glob_like"), "quoted rhs globbed:\n{out}");
+            assert!(!out.contains("__sh_fnmatch"), "quoted rhs fnmatched:\n{out}");
+            // the compare stays an `==` against the literal — no pattern path
+            assert!(out.contains("== \"") || out.contains("== pat"), "{src}\n{out}");
+        }
+        // ...and a constant quoted rhs still elides the whole `if` at -Os
+        // (the fold sees through the quoting)
+        {
+            // the level lock is already held at function scope
+            let _opt = crate::shir::size_opt_scope(true);
+            let out = render("if [ \"abc\" = \"a*\" ]; then echo bad; else echo lit; fi\n");
+            assert!(!out.contains("if ") && out.contains("print!(\"lit\\n\")"), "{out}");
+        }
+    }
+
+    #[test]
+    fn unquoted_rhs_keeps_the_pattern_probe() {
+        // Only an UNQUOTED rhs is a pattern. `[[ ]]` globs it directly, and
+        // `[ ]` keeps the sh2 evalTest glob fallback — the go-sh frontend
+        // lowers strings.Contains to `"$s"=*world*` with an UNQUOTED rhs, so
+        // that contract must survive the quoting rule above.
+        let _level = crate::rust_backend::size_opt_lock::hold();
+        let _opt = crate::shir::size_opt_scope(false);
+        let out = render("if [[ \"$s\" == [ab]* ]]; then echo m; fi\n");
+        assert!(out.contains("__sh_fnmatch"), "unquoted [[ ]] rhs lost the glob:\n{out}");
+        let out = render("if [ \"$s\" = [ab]* ]; then echo m; fi\n");
+        assert!(
+            out.contains("__sh_glob_like") && out.contains("__sh_fnmatch"),
+            "unquoted `[ ]` rhs lost the evalTest probe:\n{out}"
+        );
     }
 
     #[test]
@@ -18891,6 +20895,7 @@ mod tests {
         // the `{ let __b = E; __SH_RC.store(..); __b }` wrapper exists to
         // land the test's status in `$?`; an `if` resets __SH_RC itself,
         // so in condition position the store is dead and the wrapper goes.
+        let _level = crate::rust_backend::size_opt_lock::hold();
         let _opt = crate::shir::size_opt_scope(false);
         let out = render("if [ \"$x\" = \"hi\" ]; then echo y; fi\n");
         assert!(!out.contains("let __b"), "dead status wrapper kept:\n{out}");
@@ -19032,6 +21037,27 @@ mod tests {
         assert!(
             out.contains("__rest.to_vec().join(\" \")"),
             "post-shift $@ not served from the rest param:\n{out}"
+        );
+    }
+
+    #[test]
+    fn effect_store_is_not_a_dead_status_write() {
+        // A store whose VALUE is a runtime helper call carries the effect:
+        // `__SH_RC.store(__sh_spawn(…), …)` runs the command and prints its
+        // output. The pass-4 "dead status store" collapse scanned back over
+        // plain lines and removed the preceding store — so a later
+        // statement's `__SH_RC.store(…)` deleted the whole command and the
+        // heredoc body was never printed (`007_cat_EOF.sh`).
+        let out = render("cat <<EOF\nalpha\nEOF\n\ncat <<FISH\noyster\nFISH\n\necho done\n");
+        let calls = out.matches("__SH_RC.store(__sh_spawn(").count();
+        assert_eq!(calls, 2, "a heredoc cat was dropped ({calls} spawn calls):\n{out}");
+        assert!(out.contains("\"alpha\\n\""), "first heredoc body lost:\n{out}");
+        assert!(out.contains("\"oyster\\n\""), "second heredoc body lost:\n{out}");
+        // the shell-out form is the same shape (`__sh_run`), not just spawn
+        let out = render("whoami\nfalse\n");
+        assert!(
+            out.contains("__SH_RC.store(__sh_run("),
+            "a shell-out was dropped as a dead status write:\n{out}"
         );
     }
 
@@ -19944,10 +21970,12 @@ mod tests {
     /// `-Og` ones this rule is about, then restore it.
     #[test]
     fn literal_literal_ops_are_widened() {
-        // NOTE: `-Os` is a process-global other tests flip, and the
-        // literal-only subtree below FOLDS under it. Both accepted shapes
-        // therefore carry the suffix — the invariant pinned is that a
+        // `-Os` is a process-global other tests flip, and the literal-only
+        // subtree below FOLDS under it. Both accepted shapes therefore
+        // carry the suffix — the invariant pinned is that a
         // literal-only operation never loses its widening either way.
+        let _level = crate::rust_backend::size_opt_lock::hold();
+        let _opt = crate::shir::size_opt_scope(false);
         let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
         assert!(
             out.contains("2000000000i64 + 2000000000i64") || out.contains("4000000000i64"),
@@ -20169,6 +22197,75 @@ mod tests {
         assert!(out.contains("for x in a "), "not iterating the local:
 {out}");
     }
+
+    /// `strip_str_lit_refs` may only drop the `&` of `&"lit".to_string()`
+    /// when the `.to_string()` ENDS the borrow expression. With a postfix
+    /// operation after it the `&` binds the whole chain, so collapsing
+    /// leaves an owned `String` where a `&str` is expected.
+    #[test]
+    fn str_lit_ref_strip_stops_before_postfix() {
+        // the borrow ends here -> collapse (the existing contract)
+        assert_eq!(strip_str_lit_refs("f(&\"a\".to_string())"), "f(\"a\")");
+        assert_eq!(
+            strip_str_lit_refs("&\"a\".to_string(), x"),
+            "\"a\", x"
+        );
+        // a following method call / index / `?` keeps the `&`
+        assert_eq!(
+            strip_str_lit_refs("__sh_fnmatch(&\"a\".to_string().to_lowercase(), x)"),
+            "__sh_fnmatch(&\"a\".to_string().to_lowercase(), x)"
+        );
+        assert_eq!(
+            strip_str_lit_refs("&\"a\".to_string()[0]"),
+            "&\"a\".to_string()[0]"
+        );
+    }
+
+    /// `[[ a == B ]]` under `nocasematch` lowers to `__sh_fnmatch` with BOTH
+    /// operands lowercased. The two arguments must stay `&str` (E0308).
+    #[test]
+    fn nocasematch_fnmatch_args_stay_borrowed() {
+        let out = render("shopt -s nocasematch\nif [[ abc == ABC ]]; then echo y; fi\n");
+        let calls: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("__sh_fnmatch(") && !l.contains("fn __sh_fnmatch("))
+            .collect();
+        assert!(!calls.is_empty(), "no fnmatch call:\n{out}");
+        for l in calls {
+            assert!(
+                l.contains("__sh_fnmatch(&\"ABC\".to_string().to_lowercase(), &\"abc\".to_string().to_lowercase())"),
+                "operand lost its borrow:\n{l}"
+            );
+        }
+    }
+
+    /// `[[ $x =~ a|b ]]` is a REGEX test: `=~` is match and `|` is pattern
+    /// alternation. `parse_arith` reads the same text as the assignment
+    /// `x = ~a | b`, so the arithmetic fallback must not fire for `[[ ]]`.
+    #[test]
+    fn double_bracket_regex_alternation_is_not_arith() {
+        let out = render("if [[ $release =~ bullseye|bookworm|jammy ]]; then echo match; fi\n");
+        assert!(out.contains("__sh_regex("), "no regex test:
+{out}");
+        assert!(
+            out.contains("bullseye|bookworm|jammy"),
+            "pattern split into an arith disjunction:
+{out}"
+        );
+    }
+
+    /// `${!var*}` (the `${!prefix*}` name list) reaches the renderer as
+    /// `arrayItems("var")`, which reads the name as `${var[@]}` — the
+    /// `__SHV_var` cell has to be declared even though nothing writes it.
+    #[test]
+    fn indirect_name_list_declares_its_array() {
+        let out = render("echo {1..5}\necho ${!var*}\n");
+        assert!(
+            out.contains("static __SHV_var:"),
+            "undeclared array read:
+{out}"
+        );
+    }
 }
 #[cfg(test)]
 mod tok_tests {
@@ -20335,6 +22432,29 @@ mod tok2_tests {
     }
 }
 
+/// Test-only serialisation of the `-Os`/`-Og` level.
+///
+/// `shir::size_opt_enabled()` is a THREAD-LOCAL override falling back to a
+/// process GLOBAL. The render-scoped override is race-free, but
+/// `size_opt_scope_regression::global_level_still_honoured_with_no_scope`
+/// exercises the GLOBAL on purpose (that IS its subject) — so while its
+/// `true`→render→`false` window is open, any sibling that renders under an
+/// explicit `-Og` scope sees `size_opt_enabled() == true`, gets the folded
+/// output, and its assertion flips. This suite finishes in ~90 ms, so all
+/// ~101 tests overlap and the window is wide: measured 2 runs in 3 failing
+/// before this lock. Both sides hold it: the global-flipping test and every
+/// test that renders at an explicit level. No sleep, no `#[ignore]`.
+#[cfg(test)]
+mod size_opt_lock {
+    use std::sync::{Mutex, MutexGuard};
+
+    pub(crate) fn hold() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        // a panicking sibling must not wedge the rest of the suite
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod size_opt_scope_regression {
     /// The PRODUCTION path sets the process global (otranspilerl does it
@@ -20342,6 +22462,7 @@ mod size_opt_scope_regression {
     /// override must not shadow it once the scope is dropped.
     #[test]
     fn global_level_still_honoured_with_no_scope() {
+        let _level = crate::rust_backend::size_opt_lock::hold();
         let src = "echo $((1 + 2))\n";
         let commands = crate::Parser::new(src).parse().expect("parse");
         let prog = crate::shir::ast_to_ir(&commands);
