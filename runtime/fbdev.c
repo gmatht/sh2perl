@@ -26,6 +26,7 @@
  */
 #define _GNU_SOURCE
 #include "fbdev.h"
+#include "fbwin.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -729,7 +730,67 @@ void fb_blocks(const char *payload) {
     }
 }
 
-int fb_present(void) { return 0; }
+int fb_window_open(void) {
+    /* LAZY, AND THE SIZE IS THE SURFACE'S OWN. A real /dev/fb0 is the
+     * display already, so there is nothing to open and nothing to
+     * report. */
+    if (S_fb_map) return 1;
+    if (!S_px) return 0;
+    return fbwin_open(S_w, S_h);
+}
+
+const char *fb_window_key(void) {
+    static char k[8];
+    k[0] = 0;
+    if (S_fb_map) return k;
+    fbwin_key(k, (int)sizeof k);
+    return k;
+}
+
+/* Non-zero when the window manager asked the window to close. Returns
+ * ZERO when there is no window at all, so the shell test that reads it
+ * is `if fb_window_closed` — "if the window was closed" — and never
+ * fires on a headless run.
+ *
+ * THE POLARITY IS THE WHOLE POINT and it is a measurement, not a
+ * preference. Returning 1 for "there is no window" (which is what the
+ * name can be read to mean, and what a caller wanting "is there a
+ * window" would want) makes every headless game quit on its FIRST
+ * frame: the shell test `if fb_window_closed` is true, the game treats
+ * it as the quit key, and a run that should have drawn 5 frames drew
+ * 1 — the same symptom as a crashed device, and the worst possible
+ * place for it. Two predicates, opposite senses, both about a window:
+ * fb_window_open asks "is there one", fb_window_closed asks "did it
+ * go away". A game that needs the first gets a non-zero only when a
+ * window EXISTS. */
+int fb_window_closed(void) {
+    if (S_fb_map) return 0;
+    return fbwin_quit_p();
+}
+
+int fb_present(void) {
+    /* THE FRAME LEAVES THE DEVICE HERE, or nowhere at all.
+     *
+     * This used to be `return 0` with a comment saying the display was
+     * somebody else's business, and the RAM path's only output was a
+     * PPM written at the END of the run. That is right on a box with a
+     * real /dev/fb0 and wrong everywhere else: without it there was no
+     * frame on screen at ANY point, so a one-frame run drew a maze,
+     * wrote a file and exited, and a game loop ran to its budget with
+     * nothing to look at. The fbwin window (fbwin.{h,c}) is the
+     * virtual framebuffer that presents it, and it opens lazily HERE
+     * rather than in fb_open: opening at fb_open would make every
+     * program that only ever wanted a PPM connect to the X server,
+     * which is a round trip, a lock, and on a busy display a stall,
+     * for a window nobody asked for.
+     *
+     * Returns 1 when a blit happened, so a caller can tell a drawn
+     * frame from an undrawn one without keeping its own state. */
+    if (S_px) {
+        fbwin_present(S_px, S_w, S_h);
+    }
+    return 0;
+}
 
 int fb_dump_ppm(const char *path) {
     FILE *f;

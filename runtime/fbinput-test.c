@@ -42,6 +42,7 @@
 #if defined(__linux__)
 #include <pty.h>
 #include <sys/ioctl.h>
+#include <termios.h>   /* the terminal-restore check (check 8) */
 #include <linux/input.h>
 #endif
 
@@ -496,6 +497,133 @@ static int foreign_tty_child(void) {
     return 0;
 }
 
+/* THE RE-EXECUTED HALF OF CHECK 8. A fresh process whose only source
+ * is a pty it is the session leader on: it will put that terminal into
+ * raw mode, so the parent gets to ask what the terminal looks like
+ * AFTERWARDS. Written as a separate process on purpose — atexit only
+ * fires when a process exits, so a same-process check would be testing
+ * something that cannot happen. */
+static int raw_tty_child(void) {
+    const char *kf = 0;
+    (void)fb_input_line(kf);   /* this is what makes it raw */
+    return 0;
+}
+
+/* CHECK 8: A GAME MUST NOT LEAVE THE TERMINAL IN RAW MODE.
+ *
+ * The bug this exists for is not a crash and not a wrong frame: it is
+ * the user's shell coming back with no echo and no line editing, which
+ * they fix by typing `stty sane` by hand. A test suite that only checks
+ * what the game DREW would report this device as perfectly healthy
+ * while it was breaking the terminal on every run.
+ *
+ * The child puts the pty slave into raw mode via the device and then
+ * exits. The parent — which still holds the pty MASTER open, exactly as
+ * a login shell holds the session's terminal — checks the slave's
+ * settings afterwards. Holding the master open is the point: the device
+ * used to justify leaving the terminal raw on the grounds that "the
+ * kernel restores the termios when the session's last descriptor
+ * closes", and that only happens when there is no other holder. With
+ * the master held open, nothing is left to close and the settings
+ * persist — so this check fails against that claim, which is what it
+ * should do.
+ *
+ * ECHO AND ICANON ARE CHECKED SEPARATELY because they are cleared by
+ * the same line and a test that only looked at one of them would pass
+ * against a device that cleared the other.
+ *
+ * THE ORIGINAL SETTINGS ARE ROUND-TRIPPED, not compared against a
+ * hard-coded "sane": a device that restores a hand-built tcsetattr
+ * instead of the struct it saved would pass an ECHO/ICANON check while
+ * quietly resetting the user's flow control and IUTF8. */
+static void t_restore_tty(void) {
+    int mfd, sfd;
+    pid_t pid;
+    int status = 0;
+    struct termios before, after;
+
+    if (openpty(&mfd, &sfd, NULL, NULL, NULL) != 0) {
+        printf("  FAIL openpty (skipping the restore check)\n");
+        return;
+    }
+    if (tcgetattr(sfd, &before) != 0) {
+        printf("  FAIL tcgetattr before\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    /* Give the pty a distinctive state to be restored TO, so a device
+     * that writes back a generic "sane" mode is caught rather than
+     * passed by accident. IEXTEN off is unusual in the wild but
+     * entirely legal, and no hard-coded restore would reproduce it.
+     * ICANON and ECHO are deliberately left ON: they are the bits the
+     * device clears, and the check below asserts they come back, so
+     * the starting state has to have had them set for that to mean
+     * anything. */
+    struct termios custom = before;
+    custom.c_lflag &= (tcflag_t)~IEXTEN;
+    if (tcsetattr(sfd, TCSANOW, &custom) != 0) {
+        printf("  FAIL tcsetattr (skipping the restore check)\n");
+        close(mfd); close(sfd);
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) { printf("  FAIL fork\n"); fails++; close(mfd); close(sfd); return; }
+    if (pid == 0) {
+        close(mfd);
+        /* become the session leader so the slave is OUR controlling
+         * terminal — the device refuses to touch a terminal owned by
+         * another job, and would then correctly do nothing */
+        if (setsid() < 0) _exit(70);
+        if (ioctl(sfd, TIOCSCTTY, 0) < 0) _exit(71);
+        dup2(sfd, STDIN_FILENO);
+        /* NOT closed: the device's own dup of stdin is what it
+         * restores through, and the restore must happen while that
+         * descriptor is still a live terminal. */
+        (void)!close(sfd);
+        /* exit(), NOT _exit(). _exit skips atexit, and the whole point
+         * of the check is that the restore is an atexit handler — a
+         * child that bypasses it would report a failure the device
+         * cannot have caused. (Measured: with _exit here the parent
+         * saw ECHO still off and the check failed for a reason that
+         * was entirely the test's.) */
+        exit(raw_tty_child());
+    }
+    /* The SLAVE stays open in the parent. tcgetattr on the pty MASTER
+     * returns the master's own settings, not the line discipline the
+     * device changed, so reading mfd here answers a different question
+     * than the one being asked — and answers it wrongly, which is how
+     * a correct restore reports as a failure. (Measured: the same
+     * child under a master-read gave ECHO off; reading the slave gave
+     * ECHO on.) Holding the slave open is also what a login shell
+     * does — it keeps the terminal's own end for the session. */
+    waitpid(pid, &status, 0);
+
+    if (tcgetattr(sfd, &after) != 0) {
+        printf("  FAIL tcgetattr after\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    /* ECHO AND ICANON ARE CHECKED SEPARATELY, and each is checked
+     * against a value the test KNOWS, not against a boolean it
+     * asserted itself. Getting that backwards is easy and produces a
+     * check that can only ever pass: `ck(after & ECHO ? 0 : 1, ...)`
+     * says "fail iff ECHO is set", which is a second opinion, not a
+     * measurement. Here the parent put ICANON and ECHO ON and IEXTEN
+     * OFF before forking, so the answer after the game is known. */
+    ck(after.c_lflag & ECHO ? 1 : 0, "ECHO is back after the game exits");
+    ck(after.c_lflag & ICANON ? 1 : 0, "ICANON is back after the game exits");
+    /* the distinctive bit: a hand-written "sane" would restore ECHO
+     * and ICANON and quietly reset IEXTEN, so this is the check that
+     * can tell a saved struct from a synthesised one */
+    ck(after.c_lflag & IEXTEN ? 0 : 1,
+       "the user's OWN settings come back, not a generic sane mode");
+    close(mfd);
+    close(sfd);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--foreign-tty-child") == 0)
         return foreign_tty_child();
@@ -508,6 +636,7 @@ int main(int argc, char **argv) {
     t_tty();
     t_noblock();
     t_foreign_tty();
+    t_restore_tty();
     printf("  %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

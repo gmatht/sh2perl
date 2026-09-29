@@ -24,7 +24,12 @@ for CC in cc tcc; do
     echo "== $CC =="
     rm -f /tmp/fbdev-test-$CC
     # shellcheck disable=SC2086
-    $CC -Wall -O2 fbdev.c fbdev-test.c -lm -o /tmp/fbdev-test-$CC
+    # fbwin.c is on the line because fbdev.c now CALLS it: fb_present
+    # blits to the window and fb_window_* asks about it, so the fb0
+    # rasterizer suite links the window half too. The suite still runs
+    # with FBWIN=0, so no window is opened here — the window's own
+    # tests are in fbwin-test.sh, which needs a DISPLAY.
+    $CC -Wall -O2 fbdev.c fbwin.c fbdev-test.c -lm -o /tmp/fbdev-test-$CC
     rm -rf /tmp/fbsil && mkdir -p /tmp/fbsil
     /tmp/fbdev-test-$CC || rc=1
     if [ -f /tmp/fbsil/cases.txt ]; then

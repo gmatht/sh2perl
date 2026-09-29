@@ -1766,6 +1766,24 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
     }
 }
 
+/// A `name[*]` expansion reads IFS at RUNTIME.
+///
+/// The `[*]` join is not computed during lowering — the backend runtime
+/// joins the elements with the FIRST IFS character (bash uses IFS for `*`
+/// even when the expansion is quoted), so an `IFS=` store is live whenever
+/// a `[*]` is read. Without this, `dead_store_elim` sees only the array name
+/// and drops `IFS=$'\n'` as never-read; the join then falls back to a space
+/// and `IFS=$'\n'; ... ${config[*]}` emits "admin localhost" where bash
+/// emits the newline-joined (sort-able) string — the
+/// 064_07_complex_array_operations failure.
+///
+/// `[@]` joins with a hard space and does NOT read IFS.
+fn star_join_reads_ifs(name: &str, out: &mut Vec<String>) {
+    if name.ends_with("[*]") {
+        out.push("IFS".to_string());
+    }
+}
+
 fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
     match e {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => out.push(n.clone()),
@@ -1863,6 +1881,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     if let Some(pos) = n.find('[') {
                         out.push(n[..pos].to_string());
                     }
+                    star_join_reads_ifs(n, out);
                 }
             } else if matches!(
                 func.as_str(),
@@ -1873,6 +1892,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     if let Some(pos) = n.find('[') {
                         out.push(n[..pos].to_string());
                     }
+                    star_join_reads_ifs(n, out);
                 }
             } else if func == "arrayIndex"
                 || func == "addrVar"
@@ -2455,6 +2475,85 @@ mod tests {
         let mut prog = prog;
         assert!(!dead_store_elim(&mut prog), "redirect-target getVar read must keep the f store");
         assert_eq!(prog.stmts.len(), 2);
+    }
+
+    #[test]
+    fn dce_keeps_ifs_store_read_by_a_star_join() {
+        // IFS=$'\n'; echo "${config[*]}"
+        //
+        // The `[*]` join is computed by the BACKEND RUNTIME, not here: it
+        // joins the elements with the FIRST IFS character. Static liveness
+        // saw only getVar("config[*]") → reads {config[*], config} and
+        // judged the IFS store dead, so it dropped `IFS=$'\n'` and the join
+        // fell back to a space — estree printed "admin localhost" where bash
+        // printed the newline-joined, sort-able string
+        // (064_07_complex_array_operations).
+        //
+        // The `[@]` arm is the control: it joins with a hard space and must
+        // NOT keep a dead IFS store alive, or DCE silently stops working.
+        let star_read = || IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("config[*]".to_string(), StrStyle::DoubleQuoted)],
+                }]),
+            ],
+        });
+        let mut prog = prog_of(vec![assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)), star_read()]);
+        assert!(
+            !dead_store_elim(&mut prog),
+            "a [*] join reads IFS at runtime — its store must survive DCE"
+        );
+        assert_eq!(prog.stmts.len(), 2, "the IFS store must still be present");
+
+        let at_read = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("config[@]".to_string(), StrStyle::DoubleQuoted)],
+                }]),
+            ],
+        });
+        let mut prog2 = prog_of(vec![
+            assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)),
+            at_read,
+        ]);
+        assert!(
+            dead_store_elim(&mut prog2),
+            "[@] joins with a hard space and does not read IFS — the store stays dead"
+        );
+
+        // The shape the 064_07 corpus case actually lowers to: an expansion
+        // inside an Interpolate becomes `param("", "config[*]")`, not
+        // getVar — so the param arm needs the same rule.
+        let param_read = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Interpolate(vec![InterpPart::Expr(
+                    Box::new(IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![
+                            IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                            IrExpr::Str("config[*]".to_string(), StrStyle::DoubleQuoted),
+                        ],
+                    }),
+                )])]),
+            ],
+        });
+        let mut prog3 = prog_of(vec![
+            assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)),
+            param_read,
+        ]);
+        assert!(
+            !dead_store_elim(&mut prog3),
+            "the param(\"\", \"x[*]\") expansion shape must also keep the IFS store"
+        );
+        assert_eq!(prog3.stmts.len(), 2, "param-shaped [*] must keep the IFS store");
     }
 
     #[test]

@@ -563,6 +563,18 @@ fn census_expr(
                             escapes.insert(base.to_string());
                         }
                     }
+                    // A `name[*]` expansion reads IFS at RUNTIME: the `[*]`
+                    // join is performed by the backend runtime, which joins
+                    // the elements with the FIRST IFS character (bash uses
+                    // IFS for `*` even when quoted). Without this the
+                    // `IFS=$'\n'` store is culled and the join falls back to
+                    // a space — 064_07_complex_array_operations printed
+                    // "admin localhost" where bash printed the
+                    // newline-joined, sort-able string. `[@]` joins with a
+                    // hard space and does not read IFS.
+                    if n.ends_with("[*]") {
+                        reads.insert("IFS".to_string());
+                    }
                 }
                 // byteAt's index arg is arithmetic text naming vars
                 // (`byteAt("src", "i+1")`) — read those too.
@@ -967,5 +979,45 @@ mod tests {
         let mut stmts = prog;
         transform(&mut stmts);
         assert_eq!(stmts.len(), 2, "pipeline-read store dropped: {stmts:?}");
+    }
+
+    /// `IFS=$'\n'; echo "${config[*]}"` must keep the IFS store.
+    ///
+    /// The `[*]` join runs in the backend runtime and uses the FIRST IFS
+    /// character, so a static census that only records the array name
+    /// culls the IFS store and the join silently degrades to a space
+    /// (064_07_complex_array_operations). `[@]` is the control: it joins
+    /// with a hard space, so its store is still dead.
+    #[test]
+    fn star_join_keeps_ifs_store() {
+        let read_of = |n: &str| {
+            IrStmt::Expr(IrExpr::Call {
+                func: "builtin".to_string(),
+                args: vec![
+                    str_("echo"),
+                    IrExpr::Array(vec![IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![str_(""), str_(n)],
+                    }]),
+                ],
+            })
+        };
+        let ifs_store = IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "IFS".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_("\n"),
+            asm: None,
+        };
+
+        let mut star = vec![ifs_store.clone(), read_of("config[*]")];
+        transform(&mut star);
+        assert_eq!(star.len(), 2, "[*] join must keep the IFS store: {star:?}");
+
+        let mut at = vec![ifs_store, read_of("config[@]")];
+        transform(&mut at);
+        assert_eq!(at.len(), 1, "[@] does not read IFS — its store is dead: {at:?}");
     }
 }

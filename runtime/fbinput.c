@@ -59,6 +59,16 @@ static int    T_fd = -1;
 static int    T_open_rc = 0;
 static int    T_isatty = 0;
 
+/* The terminal's settings as we FOUND them, and whether we are the ones
+ * who changed them. See t_restore_game_mode — a game that leaves the
+ * user's shell in raw mode is a game that broke their terminal. */
+static struct termios T_orig;
+static int           T_saved = 0;
+static int    T_raw_set = 0;
+
+/* Defined below t_set_game_mode, which registers it with atexit. */
+static void   t_restore_game_mode(void);
+
 /* Is this terminal SAFE for us to read from and reconfigure? (see
  * t_open for why it is a question at all).
  *
@@ -377,30 +387,78 @@ static int t_open(void) {
     return 1;
 }
 /* Put the terminal into the non-canonical, non-echoing mode a game
- * wants. Done ONCE, at open, and deliberately not restored afterwards.
+ * wants. Done ONCE, at open. The ORIGINAL settings are saved and put
+ * back on exit (t_restore_game_mode) — that part was missing, and its
+ * absence is why a one-frame run left the user's shell echo-less and
+ * line-less, needing `stty sane` by hand every time.
  *
- * Saving and restoring the discipline around each call was the other
- * design, and it cannot work: in canonical mode the kernel withholds
- * bytes from a reader until a full LINE has arrived, so a game reading
- * one key per frame saw nothing until the user pressed Enter. Cooked
- * mode is right for a shell (it wants the echo and the line) and
- * useless for a game loop.
+ * Why the mode is still set once and kept for the whole run (rather
+ * than toggled around each read): in canonical mode the kernel
+ * withholds bytes from a reader until a full LINE has arrived, so a
+ * game reading one key per frame saw nothing until the user pressed
+ * Enter. Cooked mode is right for a shell (it wants the echo and the
+ * line) and useless for a game loop.
  *
- * The change touches only the terminal this process opened, for as
- * long as the game runs; the kernel restores the termios when the
- * session's last descriptor closes, and a parent shell that inherited
- * a copy of the slave keeps its own settings. Returns 1 when it
- * actually changed something, so the caller can leave the terminal
- * alone when it did not (a non-tty, or an ioctl that failed). */
+ * "THE KERNEL RESTORES IT" IS NOT TRUE, and believing that is exactly
+ * how the bug shipped. The claim this comment used to make — that the
+ * kernel restores the termios when the session's last descriptor
+ * closes — only holds when the pty has no other holder. A terminal
+ * session keeps the pty open for the life of the shell, so nothing is
+ * left to close when the game exits and the settings simply persist.
+ * Measured on this host with pty.openpty(): a child puts the slave
+ * into raw mode and exits; the master is still open; the slave is
+ * still ICANON-off, ECHO-off afterwards. Restoring is the only thing
+ * that works.
+ *
+ * The change touches only the terminal this process opened, and only
+ * while the game runs. Returns 1 when it actually changed something,
+ * so the caller can leave the terminal alone when it did not (a
+ * non-tty, or an ioctl that failed). */
 static int t_set_game_mode(void) {
     struct termios a;
     if (T_fd < 0 || !T_isatty) return 0;
     if (tcgetattr(T_fd, &a) != 0) return 0;
+    /* Save BEFORE the first modification, and only once: a re-open
+     * must not overwrite the user's settings with raw ones, or the
+     * restore would faithfully put raw mode back. */
+    if (!T_saved) {
+        T_orig = a;
+        T_saved = 1;
+        atexit(t_restore_game_mode);
+    }
     a.c_lflag &= (tcflag_t)~(ICANON | ECHO | ECHOE | ECHOK | ECHONL);
     a.c_cc[VMIN] = 0;
     a.c_cc[VTIME] = 0;
     if (tcsetattr(T_fd, TCSANOW, &a) != 0) return 0;
+    T_raw_set = 1;
     return 1;
+}
+
+/* Put the terminal back the way we found it. Registered with atexit
+ * by t_set_game_mode, and safe to call when we never changed anything.
+ *
+ * ATEXIT, NOT AN EXPLICIT CALL, and the reason is that a game can leave
+ * by routes the game does not know about: `exit` from a device, a
+ * signal that kills it, the transpiled binary's own exit-time code. An
+ * explicit restore in the game's cleanup would be skipped by every one
+ * of those, and the user's terminal would be left raw. atexit runs for
+ * exit() and return-from-main, which covers the normal path, and the
+ * common abnormal path (a terminal killed by a signal) is a crash
+ * either way.
+ *
+ * Restoring the SAVED struct rather than re-deriving a "sane" mode
+ * matters: it puts back this user's actual settings, including the
+ * ones we never touched (flow control, IUTF8, the erase character),
+ * where a hand-built tcsetattr would quietly reset them. */
+static void t_restore_game_mode(void) {
+    if (T_fd < 0 || !T_saved || !T_raw_set) return;
+    /* TCSADRAIN, not TCSANOW: TCSANOW can drop output the game has
+     * written but the tty has not yet transmitted, which on a fast
+     * final frame is the difference between the last line appearing
+     * and being swallowed. The game is exiting, so the wait is short
+     * and bounded by what is already in the line discipline. */
+    (void)tcsetattr(T_fd, TCSADRAIN, &T_orig);
+    T_raw_set = 0;
 }
 
 /* Fetch one byte from the tty. `cap` is unused because a tty yields

@@ -1359,6 +1359,11 @@ fn first_code_newline(s: &str) -> Option<usize> {
             // scalar(@ARGV)).
             out.push_str("my $__argc = @ARGV;\n");
         }
+        // `$!` — the pid of the most recent background job. The `Background`
+        // arm assigns each fork's pid here, and `var_read("!")` reads it.
+        if body.contains("$__sh2_last_bg") {
+            out.push_str("our $__sh2_last_bg = 0;\n");
+        }
         if body.contains("$ls_success") {
             out.push_str("my $ls_success = 0;\n");
         }
@@ -1835,6 +1840,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             );
             emit_indent(out, indent);
             out.push_str(&format!("my ${pid} = fork();\n"));
+            // `$!` — bash's "pid of the last background job". Recorded in a
+            // stable variable (not the per-fork `$__sh2_bgN`, whose name
+            // depends on how many Background nodes the program has) so
+            // `var_read("!")` can resolve a `$!` read anywhere in the body.
+            emit_indent(out, indent);
+            out.push_str(&format!("$__sh2_last_bg = ${pid};\n"));
             emit_indent(out, indent);
             out.push_str(&format!("if (defined ${pid} && ${pid} == 0) {{\n"));
             for s in body.iter() {
@@ -1955,6 +1966,43 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     out.push_str(&format!(
                         "open(STDIN, '<', {}) or die \"Cannot read input: $!\\n\";\n",
                         render_word(&r.target)
+                    ));
+                    for s in inner {
+                        emit_stmt(out, s, indent + 1);
+                    }
+                    emit_indent(out, indent);
+                    out.push_str("}\n");
+                    return;
+                }
+            }
+            // `while …; do …; done <<< "text"` — a herestring feeding the
+            // loop's STDIN (the bat-sh-go `for /f %%a in ("lit")` lowering).
+            // bash appends a trailing newline to the herestring, so build the
+            // scalar with one and open an in-memory filehandle over it; `read`
+            // then consumes it line-wise exactly as under bash.
+            if let [IrStmt::While { .. }] = inner.as_slice() {
+                if let Some(r) = redirects
+                    .iter()
+                    .find(|r| matches!(r.fd, None | Some(0)) && r.mode == "herestring")
+                {
+                    static HS_SEQ: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let hs = format!(
+                        "__sh2_hs{}",
+                        HS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
+                    emit_indent(out, indent);
+                    out.push_str("{\n");
+                    emit_indent(out, indent + 1);
+                    out.push_str("local *STDIN;\n");
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!(
+                        "my ${hs} = {} . \"\\n\";\n",
+                        render_word(&r.target)
+                    ));
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!(
+                        "open(STDIN, '<', \\${hs}) or die \"Cannot read herestring: $!\\n\";\n"
                     ));
                     for s in inner {
                         emit_stmt(out, s, indent + 1);
@@ -2860,6 +2908,65 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             return;
                         }
                     }
+                    if func == "assign" {
+                        // `assign(NAME, OP, VALUE)` — the `y+=2` / `n-=1`
+                        // compound write. Without this the whole call fell
+                        // through to `ir_expr_to_perl`'s generic `_ =>` arm,
+                        // which renders `assign("y", "+=", "2")` as a call to
+                        // a sub that is never defined in the preamble — a
+                        // runtime death, not a bad render (examples/051_primes,
+                        // 062_hard_to_lex).
+                        //
+                        // The two forms differ by whether the TARGET is an
+                        // array: an array `+=` appends (`push`), a scalar
+                        // `+=` is numeric. The Assign target carries no sigil
+                        // for this shape (the frontend emits `assign` for
+                        // BOTH `y+=2` and `z+=(a b)`), so ask the program-wide
+                        // array census — a value-shape test misreads
+                        // `z+=${primes[@]:0:1}` (a single-word RHS appending
+                        // to an ARRAY) as a scalar add.
+                        if let IrExpr::Call { args, .. } = expr {
+                            let inner = args.first().and_then(call_arg_str).unwrap_or(var.clone());
+                            let op = match args.get(1).and_then(call_arg_str) {
+                                Some(o) if o != "=" => o,
+                                _ => "=".to_string(),
+                            };
+                            let value = args
+                                .get(2)
+                                .or_else(|| args.get(1))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    IrExpr::Str(String::new(), StrStyle::DoubleQuoted)
+                                });
+                            emit_indent(out, indent);
+                            if op == "+=" && array_var(&inner) {
+                                let items: Vec<String> = match &value {
+                                    IrExpr::Array(elems) => {
+                                        elems.iter().map(|e| render_word_list(e)).collect()
+                                    }
+                                    other => vec![render_word_list(other)],
+                                };
+                                out.push_str(&format!(
+                                    "push @{0}, ({1});\n",
+                                    inner,
+                                    items.join(", ")
+                                ));
+                            } else {
+                                // The numeric ops (`-=`, `*=`, `/=`) and
+                                // `+=` on a scalar are the same in both
+                                // languages — Perl's `+=` is numeric like
+                                // bash's on an integer.
+                                let rhs = ir_expr_to_perl(&value);
+                                out.push_str(&format!(
+                                    "{} {} {};\n",
+                                    perl_lhs_for(&inner),
+                                    op,
+                                    rhs
+                                ));
+                            }
+                            return;
+                        }
+                    }
                     if func == "capture" {
                         // Modern-IR command substitution: Assign{var, capture(…)}
                         // — rebuild the shell command and capture its stdout.
@@ -3669,6 +3776,11 @@ fn var_read(name: &str) -> String {
         "#" => "$__argc".to_string(),
         "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
         "?" => "$CHILD_ERROR".to_string(),
+        // `$!` — the pid of the most recent background job. The Background
+        // arm writes it; without this arm the name fell through to the
+        // generic branch and rendered `${!}` (an undefined Perl symbolic
+        // ref) — examples/grep_p.
+        "!" => "$__sh2_last_bg".to_string(),
         "@" => "@ARGV".to_string(),
         // `$*` is the positional params joined by the first IFS char (space
         // in the default IFS) — in scalar context `@ARGV` gave the COUNT.
@@ -4295,6 +4407,17 @@ fn render_param(args: &[IrExpr]) -> String {
             // A NON-`@` offset on a SCALAR variable is a substring
             // `${s:off:len}`: `substr`. The A1 drops `[@]`, so consult the
             // program's array census (`numbers[@]:3:4` stays a slice).
+            //
+            // `${arr[@]:off:len}` reaches here with the `[@]` still on the
+            // NAME, so `array_var("primes[@]")` is false and the census is
+            // asked about the wrong name — the slice took the substring branch
+            // and emitted `substr($primes[$@], 0, 1)` ("Argument "" isn't
+            // numeric in array or hash lookup", examples/051_primes line 9).
+            // Drop the subscript suffix first so the census sees `primes`.
+            let name = name
+                .strip_suffix("[@]")
+                .or_else(|| name.strip_suffix("[0]"))
+                .unwrap_or(&name);
             if raw_off != "@" && !array_var(&name) {
                 // The offset/length may be VARIABLES — `${flags:j:1}` is the
                 // bash idiom for `substr($flags, $j, 1)`; emitting the bare
@@ -4370,10 +4493,12 @@ fn render_param(args: &[IrExpr]) -> String {
                 }
                 _ => i64::MAX, // unbounded → to the last element
             };
+            // `${arr[@]:off:len}` — the `[@]` was already stripped from `name`
+            // above so the census (and this interpolation) see the bare array.
             if end == i64::MAX {
-                format!("@{}[{}..$#{}]", name, off, name)
+                format!("@{0}[{1}..$#{0}]", name, off)
             } else {
-                format!("@{}[{}..{}]", name, off, end)
+                format!("@{0}[{1}..{2}]", name, off, end)
             }
         }
         _ => {
@@ -6627,6 +6752,29 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             let has_split = words[1..]
                 .iter()
                 .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+            // bash `printf %c` prints the FIRST CHARACTER of the argument
+            // (`printf '%c' 65` → `6`, `printf '%c' hello` → `h`); Perl's
+            // `%c` NUMIFIES the argument instead (`"hello"` → NUL). When the
+            // format is a literal and the args are positional (one per
+            // conversion), wrap each `%c` operand in `substr(…, 0, 1)` so the
+            // emitted Perl matches bash (c-sh-go t10_string_pointer:
+            // `printf("%c\n", s[0])` printed a NUL, not `h`).
+            let mut rest = rest;
+            let c_convs: Option<Vec<char>> = literal_printf_conversions(&words[0]);
+            if !has_split {
+                if let Some(convs) = &c_convs {
+                    if !rest.is_empty() && rest.len() == convs.len() {
+                        for (i, c) in convs.iter().enumerate() {
+                            if *c == 'c' {
+                                // Perl's `%c` takes a CODE POINT: `ord` of the
+                                // first character (`"h"` → 104 → `h`); bash's
+                                // `%c` prints that same first character.
+                                rest[i] = format!("ord(substr({}, 0, 1))", rest[i]);
+                            }
+                        }
+                    }
+                }
+            }
             // placeholder count in the (rendered) format: a `%` not part of
             // a `%%` pair is one conversion. Computed on the RENDERED literal
             // so Interpolate formats (`"%s-%s\n"` → Interpolate Lit) count
@@ -7102,10 +7250,15 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
-                    // setArray RHS → the target is an array even if the sigil
-                    // annotation is absent.
-                    let is_array_rhs =
-                        matches!(expr, IrExpr::Call { func, .. } if func == "setArray");
+                    // setArray/setArrayAppend RHS → the target is an array even
+                    // if the sigil annotation is absent. `z+=(a b)` lowers to
+                    // setArrayAppend, and the emit_stmt `+=` arm renders it as
+                    // `push @z, (...)`; declaring `my $z` instead makes the
+                    // program die at compile time with "Global symbol @z
+                    // requires explicit package name" (examples/051_primes
+                    // line 9).
+                    let is_array_rhs = matches!(expr, IrExpr::Call { func, .. }
+                        if func == "setArray" || func == "setArrayAppend");
                     // An uppercase ARRAY is not an env var: the env-style
                     // heuristic must not skip its declaration (`LIST=()` left
                     // `@LIST` undeclared — examples/parse-array-plusassign).
@@ -7160,7 +7313,22 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
             IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "assign" => {
                 if let Some(name) = args.first().and_then(call_arg_str) {
                     if !is_env_style_var_name(&name) && !out.iter().any(|(n, _)| n == &name) {
-                        out.push((name, Sigil::Scalar));
+                        // `z+=(a b)` is an ARRAY append — the emitter lowers
+                        // it to `push @z, (...)`, so declaring `my $z` here
+                        // emits a program that dies at compile time ("Global
+                        // symbol @z requires explicit package name",
+                        // examples/051_primes line 9). The frontend emits
+                        // `assign` for both `y+=2` and `z+=(a b)`, so ask the
+                        // same program-wide census the emitter's `+=` arm uses
+                        // rather than a value-shape test (which misreads
+                        // `z+=${primes[@]:0:1}`, a single-word RHS appending
+                        // to an array).
+                        let sigil = if array_var(&name) {
+                            Sigil::Array
+                        } else {
+                            Sigil::Scalar
+                        };
+                        out.push((name, sigil));
                     }
                 }
                 for a in args {
@@ -7285,6 +7453,63 @@ fn var_is_declarable(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A `read VAR…` target is a variable the SCRIPT assigns, so it must be
+/// declared even when it carries the reserved `__` prefix: a frontend may
+/// name a scratch variable `__frest` (the bat `for /f` "rest of line"
+/// lowering), and `var_is_declarable` refuses `__*` to protect the backend's
+/// own temporaries — leaving the rendered `$__frest` an undeclared global
+/// under `use strict` (bat t24_forf2). The backend's internal prefix
+/// (`__sh2*`) stays excluded.
+fn read_target_is_declarable(name: &str) -> bool {
+    var_is_declarable(name)
+        || (name.starts_with("__")
+            && !name.starts_with("__sh2")
+            && !is_env_style_var_name(name)
+            && name != "main_exit_code"
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The ordered printf conversion characters of a LITERAL format word
+/// (`%c`/`%s`/`%d`…; `%%` is not a conversion), or `None` when the format is
+/// not a single literal (a dynamic `$fmt` cannot be mapped to its args).
+/// Used to give a positional `%c` operand bash's first-character semantics.
+fn literal_printf_conversions(fmt: &IrExpr) -> Option<Vec<char>> {
+    let text: String = match fmt {
+        IrExpr::Str(s, _) => s.clone(),
+        IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(t) => t.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        }
+        _ => return None,
+    };
+    let mut convs = Vec::new();
+    let mut cs = text.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c != '%' {
+            continue;
+        }
+        if cs.peek() == Some(&'%') {
+            cs.next();
+            continue;
+        }
+        // Skip flags/width/precision, then take the conversion letter.
+        let mut conv = None;
+        for c2 in cs.by_ref() {
+            if c2.is_ascii_alphabetic() {
+                conv = Some(c2);
+                break;
+            }
+        }
+        convs.push(conv.unwrap_or('?'));
+    }
+    Some(convs)
+}
+
 /// Collect vars READ via getVar/param/Var (recursively) so the preamble can
 /// declare them too — `use strict` fails on any undeclared read, and bash
 /// reads of unset vars yield empty strings (a `my $x;` matches that).
@@ -7365,7 +7590,7 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                                 if n.starts_with('-') {
                                     continue;
                                 }
-                                if var_is_declarable(&n)
+                                if read_target_is_declarable(&n)
                                     && !out.iter().any(|(name, _)| name == &n)
                                 {
                                     out.push((n, Sigil::Scalar));
@@ -7623,6 +7848,54 @@ fn collect_vars_from_test_string(s: &str, out: &mut Vec<(String, Sigil)>) {
     }
 }
 
+/// The expression-position twin of [`rewrite_fn_calls`]: rewrite
+/// `exec(foo, …)` to the `$fn_call` marker when `foo` is a function defined in
+/// the program. `if is_prime $n; then` puts the call in the CONDITION, and the
+/// statement-level pass cannot see it (it only matches `IrStmt::Expr`).
+fn rewrite_fn_calls_in_expr(e: &IrExpr, fns: &std::collections::HashSet<String>) -> IrExpr {
+    match e {
+        IrExpr::Call { func, args } => {
+            let args: Vec<IrExpr> = args.iter().map(|a| rewrite_fn_calls_in_expr(a, fns)).collect();
+            if func == "exec" {
+                if let Some(name) = args.first().and_then(call_arg_str) {
+                    if fns.contains(&name) {
+                        return IrExpr::Call {
+                            func: "$fn_call".to_string(),
+                            args,
+                        };
+                    }
+                }
+            }
+            IrExpr::Call {
+                func: func.clone(),
+                args,
+            }
+        }
+        IrExpr::BinOp { lhs, op, rhs } => IrExpr::BinOp {
+            lhs: Box::new(rewrite_fn_calls_in_expr(lhs, fns)),
+            op: op.clone(),
+            rhs: Box::new(rewrite_fn_calls_in_expr(rhs, fns)),
+        },
+        IrExpr::Ternary { cond, then, else_ } => IrExpr::Ternary {
+            cond: Box::new(rewrite_fn_calls_in_expr(cond, fns)),
+            then: Box::new(rewrite_fn_calls_in_expr(then, fns)),
+            else_: Box::new(rewrite_fn_calls_in_expr(else_, fns)),
+        },
+        IrExpr::DefinedOr { expr, default } => IrExpr::DefinedOr {
+            expr: Box::new(rewrite_fn_calls_in_expr(expr, fns)),
+            default: Box::new(rewrite_fn_calls_in_expr(default, fns)),
+        },
+        IrExpr::Array(elems) => {
+            IrExpr::Array(elems.iter().map(|a| rewrite_fn_calls_in_expr(a, fns)).collect())
+        }
+        IrExpr::Capture { expr, native } => IrExpr::Capture {
+            expr: Box::new(rewrite_fn_calls_in_expr(expr, fns)),
+            native: *native,
+        },
+        other => other.clone(),
+    }
+}
+
 /// Rewrite `exec(foo, …)` calls to the `$fn_call` marker when `foo` is a
 /// function defined in the program (recursively into compound bodies).
 fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -> Vec<IrStmt> {
@@ -7640,27 +7913,34 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                 }
                 s.clone()
             }
+            // A call in CONDITION position — `if is_prime $n; then`
+            // (examples/051_primes line 50) — is as common as the statement
+            // form and was NOT rewritten: the arm cloned `cond` verbatim, so
+            // the exec fell through emit_exec_call's shell-out and became
+            // `system('bash','-c','"is_prime" $candidate')` → "bash: line 1:
+            // is_prime: command not found", even though `sub is_prime` was
+            // emitted a few lines above. Descend into the condition.
             IrStmt::If {
                 cond,
                 then,
                 elsifs,
                 else_,
             } => IrStmt::If {
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 then: rewrite_fn_calls(then, fns),
                 elsifs: elsifs
                     .iter()
-                    .map(|(c, b)| (c.clone(), rewrite_fn_calls(b, fns)))
+                    .map(|(c, b)| (rewrite_fn_calls_in_expr(c, fns), rewrite_fn_calls(b, fns)))
                     .collect(),
                 else_: rewrite_fn_calls(else_, fns),
             },
             IrStmt::While { cond, body } => IrStmt::While {
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 body: rewrite_fn_calls(body, fns),
             },
             IrStmt::DoWhile { body, cond, until } => IrStmt::DoWhile {
                 body: rewrite_fn_calls(body, fns),
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 until: *until,
             },
             IrStmt::For { var, iter, body } => IrStmt::For {
@@ -7743,6 +8023,24 @@ fn render_test_expr(s: &str) -> String {
         "0".to_string()
     } else {
         expr
+    }
+}
+
+/// Parse an already-tokenized test expression (the `[ ]`/`[[ ]]` tokenizer's
+/// output, with any trailing `[[` marker already removed) with the recursive
+/// `!`/`(`/`&&`/`||` parser. Returns `None` for an empty token list.
+///
+/// Shared with the native-stmt transform's test fallback so COMPOUND tests
+/// (`! ( "$name" == "x" )` — a perl-sh-go `unless` lowering) render natively
+/// instead of the historic always-truthy `$t =~ /-\w+/` heuristic.
+pub(crate) fn render_test_token_list(toks: &[String]) -> Option<String> {
+    let toks = normalize_test_tokens(toks.to_vec());
+    let mut i = 0;
+    let expr = parse_test_or(&toks, &mut i);
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr)
     }
 }
 
@@ -9273,6 +9571,21 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             .unwrap_or_else(|| "0".to_string())
                     }),
                 "brace" => render_brace_word(args),
+                "$fn_call" | "fnCall" => {
+                    // Call to a shell function defined in this program, in
+                    // EXPRESSION position — `if is_prime $n; then`
+                    // (examples/051_primes line 50). The statement emitter has
+                    // had a `$fn_call` arm for a while, but the expression
+                    // renderer did not, so the call in the if-CONDITION fell
+                    // through to the generic `_` arm and emitted a literal
+                    // `$fn_call(...)` → "Global symbol "$fn_call" requires
+                    // explicit package name". A Perl sub call is a valid
+                    // expression; the status is `$?` for the caller.
+                    let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                    let words = exec_word_args(args);
+                    let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
+                    format!("{}({})", name, rest.join(", "))
+                }
                 "capture" | "captureWords" => {
                     // Expression/interpolated context (e.g. inside a
                     // double-quoted word): the raw chomped value, NOT a
@@ -10262,6 +10575,21 @@ fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Stri
                 {
                     for t in targets {
                         out.insert(t.var.clone());
+                    }
+                }
+                // `assign(NAME, "+=", <word list>)` is the array append the
+                // frontend emits for `arr+=(a b)`. When it is the FIRST
+                // mention of the name nothing else has bound it as an array,
+                // so without this the renderer would take the scalar branch
+                // and emit `$z += ...` (examples/051_primes: `z+=(a b)` then
+                // `z+=${primes[@]:0:1}`).
+                if let IrExpr::Call { func, args } = expr {
+                    if func == "assign"
+                        && args.get(2).map(|v| matches!(v, IrExpr::Array(_))).unwrap_or(false)
+                    {
+                        for t in targets {
+                            out.insert(t.var.clone());
+                        }
                     }
                 }
             }
