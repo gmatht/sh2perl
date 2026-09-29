@@ -50,8 +50,73 @@ void fb_set_camera(double x, double y, double z, double yaw, double shift);
 /* Batched cubes: one "x y z sx sy sz r g b tx dam" record per line of
  * `payload`. Records are drawn in order (painter's algorithm).
  * r/g/b are 0..1; tx is the block-type (texture slot) and dam the
- * damage (ignored by the flat-shaded fb path). */
+ * damage (the block shader's crack mix). */
 void fb_blocks(const char *payload);
+
+/* ── the block textures, and the per-pixel fragment stage ────────────
+ *
+ * On the WebGL path a block is NOT a flat colour: the fragment shader
+ * (www/bin/mimecroft.sh, emit_fragment_shader) samples a block
+ * texture with fract(vUv), multiplies the per-face tint by it, mixes a
+ * crack texture in by the damage level, and optionally applies CRT
+ * scanlines, corruption streaks and a vignette. That is what makes the
+ * blocks look like stone rather than like painted boxes, and it is the
+ * largest fidelity gap a flat-shaded port has.
+ *
+ * So the device keeps the textures and runs the same integer
+ * arithmetic per covered pixel, in the same ORDER. The order is
+ * load-bearing and is not a cosmetic detail: the original dims for the
+ * CRT scanline BEFORE the crack blend, so the crack is not dimmed with
+ * the texture, and a port that reorders the two is a different game.
+ *
+ * The arithmetic is transcribed, not reimplemented. Every divide is the
+ * original's integer divide (the shader generator's `/` on a mediump
+ * int is an integer divide), so a /128 or /256 is a shift or a
+ * truncating divide and NOT a float. A float reimplementation is
+ * smooth and wrong, and wrong by one unit on a lot of pixels — which
+ * is exactly the class of difference a byte-exact comparison against
+ * real bash is there to catch. */
+
+/* One texture: `size` × `size` RGB triples, row-major, plus the alpha
+ * the crack texture carries (cr_a). Stored as four bytes per texel so
+ * the fragment stage reads one row of an RGBA image rather than three
+ * interleaved planes. */
+int  fb_texture(int idx, const char *r, const char *g, const char *b,
+                int n, int size, int rgba);
+
+/* Non-zero once fb_texture has been called at all, so a caller can
+ * tell "no textures loaded" from "textures loaded, all zero". */
+int  fb_tex_count(void);
+
+/* The fragment program: which optional stages are compiled in, and the
+ * canvas size the vignette centres on. Set once per frame from the
+ * settings (CRT_ON / CORRUPT_ON) and the surface size; the C path has
+ * no shader to recompile, so this is just state. */
+void fb_frag_flags(int crt_on, int corrupt_on);
+
+/* The canvas the fragment program's vignette is centred on. The
+ * original bakes disp_w/disp_h into the GENERATED program, so it is
+ * fixed until the program is re-emitted; 0 (the default) means "the
+ * surface", which is correct for a game that never resizes. A caller
+ * that changes the DISPLAY row re-emits the shader, and so sets this. */
+void fb_frag_view(int w, int h);
+
+/* The colour of ONE point of a block face, through the whole fragment
+ * program. `u`/`v` are 0..1 across the face, `shade` is the face's
+ * aShade ×1000 (500..1000), and tint is the record's r/g/b ×255.
+ *
+ * This is not a test-only hook. The settings menu draws a THUMBNAIL of
+ * each block texture (draw_settings_menu's sm_tex_thumb_line), and a
+ * thumbnail is the fragment program sampled at a handful of points —
+ * asking the device for the colour is the only way to get one that
+ * matches what the world will actually look like, cracks and all. It is
+ * also how the fragment arithmetic is checked against an independent
+ * oracle (tools/fbdev-frag.py): a test that has to model the whole
+ * rasterizer to ask "what colour is this pixel" is testing the wrong
+ * thing, and would agree with a broken device by sharing its bug. */
+void fb_frag_color(int texidx, int shade, int tr, int tg, int tb,
+                   int damage, double u, double v, int px, int py,
+                   int *outr, int *outg, int *outb);
 
 /* Present the frame: copy RAM -> /dev/fb0 when a real device is open
  * (fb_flush does it lazily on close for the RAM path, so this is the

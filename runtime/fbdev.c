@@ -61,6 +61,295 @@ static int      S_fb_line;
 static double   C_x, C_y, C_z, C_yaw, C_shift;
 static double   C_cos, C_sin;
 
+/* ── the block textures + the per-pixel fragment stage ─────────────
+ *
+ * The WebGL path's block appearance is a FRAGMENT SHADER, not a vertex
+ * colour (www/bin/mimecroft.sh, emit_fragment_shader, line 1312). It
+ * samples a block texture with fract(vUv), multiplies the per-face
+ * tint by it, mixes a crack texture in by the damage level, then
+ * optionally applies a CRT scanline, corruption streaks and a
+ * vignette. Reproducing that per pixel is what makes a block look
+ * like stone instead of a painted box, and it is the single largest
+ * fidelity gap a flat-shaded port has.
+ *
+ * THE ARITHMETIC IS TRANSCRIBED, NOT REIMPLEMENTED, and every value is
+ * an int for the same reason the original's is: the sh2glsl generator
+ * emits mediump ints, so `/` is an INTEGER divide there. A float
+ * version is smooth and wrong — wrong by one unit on many pixels,
+ * which is precisely the class of difference a byte-exact comparison
+ * against real bash exists to catch.
+ *
+ * AND THE ORDER IS LOAD-BEARING. It is, in the original's words, dim
+ * first then blend, so the crack does NOT get dimmed with the texture:
+ *
+ *     r = tint·tex/128          the block texture through the tint
+ *     r = r·90/100              CRT scanline  (fy % 6 == 0)   ← BEFORE
+ *     r -= (r-cr)·mix/128       the crack, mixed by damage     ← the crack
+ *     corruption streaks
+ *     r -= r·dim/256            the vignette, multiplicative
+ *     clamp to 0
+ *
+ * The original comments record that moving the scanline after the
+ * crack is "a 1-step visual difference on damaged blocks", which is
+ * the sort of thing that survives a port and shows up later as a
+ * pixel diff nobody can explain. */
+#define FB_TEX_MAX   80
+#define FB_TEX_MAXSZ 64
+
+typedef struct {
+    int   used;
+    int   size;
+    int   rgba;                 /* the crack texture carries alpha */
+    uint8_t *px;                /* size*size*4, row-major RGBA */
+} Tex;
+
+static Tex      T_tex[FB_TEX_MAX];
+static int      T_n = 0;
+static int      T_crt = 0, T_corrupt = 0;
+
+/* The texture slot and damage of the cube being drawn RIGHT NOW.
+ * tri_shaded is four call levels below draw_cube and threading two more
+ * parameters through the face loop and the guard-band clip for them
+ * would mean touching the innermost rasterizer — the one piece of this
+ * file that is already right and is covered by a 112-case silhouette
+ * oracle. The alternative is a pair of file-scope values set once per
+ * cube, which is exactly the "global state is fine" argument except
+ * that the writer is a single function and the reader is single-
+ * threaded by construction: fb_blocks walks one record at a time and
+ * no other thread exists in the device. */
+static int      FB_TEX_IDX = -1;
+static int      FB_TEX_ACTIVE = 0;
+
+/* The canvas the fragment program was generated for, for the vignette's
+ * centre. 0 = "the surface", which is right for a game that never
+ * resizes. See frag_vignette for why this is a parameter. */
+static int      T_vw = 0, T_vh = 0;
+
+int fb_tex_count(void) { return T_n; }
+
+int fb_texture(int idx, const char *r, const char *g, const char *b,
+               int n, int size, int rgba) {
+    const char *src[3];
+    int i, total;
+    Tex *t;
+    if (idx < 0 || idx >= FB_TEX_MAX || size <= 0 || size > FB_TEX_MAXSZ)
+        return -1;
+    if (n <= 0) return -1;
+    src[0] = r; src[1] = g; src[2] = b;
+    t = &T_tex[idx];
+    total = n * n;
+    /* The 4th channel of an RGB texture is OPAQUE, and that is not a
+     * detail: the crack branch reads the texture's own alpha, so an
+     * uninitialised byte there is a random crack on every block. */
+    free(t->px);
+    /* `rgba` says the caller's three planes are R,G,A rather than
+     * R,G,B — the crack texture is a TRANSPARENT overlay, so its "blue"
+     * channel is really the crack's coverage. Without this the crack
+     * branch reads an opaque alpha and every damaged block comes out
+     * fully replaced by the crack colour instead of blended with it. */
+    t->px = (uint8_t *)malloc((size_t)total * 4);
+    if (!t->px) { t->used = 0; return -1; }
+    for (i = 0; i < total; i++) {
+        int c;
+        for (c = 0; c < 3; c++) {
+            char *end;
+            long d;
+            const char *q = src[c];
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            d = strtol(q, &end, 10);
+            if (end == q) d = 0;
+            src[c] = end;              /* this plane's cursor MOVES ON */
+            if (d < 0) d = 0;
+            if (d > 255) d = 255;
+            t->px[i*4 + c] = (uint8_t)d;
+        }
+        t->px[i*4 + 3] = rgba ? t->px[i*4 + 2] : (uint8_t)255;
+        if (rgba) t->px[i*4 + 2] = 0;   /* B is unused on an RGBA texture */
+    }
+    t->size = size;
+    t->rgba = rgba;
+    t->used = 1;
+    if (idx + 1 > T_n) T_n = idx + 1;
+    return 0;
+}
+
+void fb_frag_flags(int crt_on, int corrupt_on) {
+    T_crt = crt_on ? 1 : 0;
+    T_corrupt = corrupt_on ? 1 : 0;
+}
+
+void fb_frag_view(int w, int h) { T_vw = w; T_vh = h; }
+
+/* THE CUBE'S PER-VERTEX TEXTURE COORDINATES, transcribed from the
+ * game's own /dev/webgl/buffer/aUv write (www/bin/mimecroft.sh, line
+ * 1444):
+ *
+ *   f32 0 0 1 0 1 1 0 1  0 0 1 0 1 1 0 1  0 0 1 0 1 1 0 1
+ *       1 1 1 0 1 0  0 1 0 0 1 0 0 1 0  1 1 1 1 1 0 0 0 0 1
+ *
+ * 24 vertices x (u,v), row-major — 48 doubles, indexed as fuv[vi*2+k]
+ * so it lines up with CUBE_P and CUBE_SHADE, which use the same vertex
+ * numbering. This is the varying the fragment shader samples with, and
+ * it is why the faces do NOT all span the same rectangle: the last two
+ * vertices are (0,0) and (0,1), which is the floor/ceiling quad's own
+ * orientation. Writing "every face is 0..1" instead — the obvious
+ * guess, and what a first pass at this did — puts the same texture on
+ * every face at the same scale, which looks plausible and is not what
+ * the game draws.
+ *
+ * TRANSCRIBED, like CUBE_P and CUBE_SHADE, and for the same reason: a
+ * hand-built version of a 48-number geometry table is a second source
+ * of truth about the same cube, and this file already has one
+ * transcription bug on record (see CUBE_P). */
+static const double CUBE_UV[48] = {
+  0, 0,  1, 0,  1, 1,  0, 1,   0, 0,  1, 0,  1, 1,  0, 1,
+  0, 0,  1, 0,  1, 1,  0, 1,   0, 0,  1, 0,  1, 1,  0, 1,
+  1, 1,  1, 0,  1, 0,  0, 1,   0, 1,  0, 0,  1, 0,  0, 1,
+};
+
+/* THE CRACK TEXTURE IS SLOT 9, not slot 0. The game binds it
+ * explicitly: `echo "9" > /dev/webgl/uniform/1i/uCrack`
+ * (www/bin/mimecroft.sh, setup_webgl), and slot 0 is the FIRST BLOCK
+ * texture, so a device that assumed "the crack is texture 0" would
+ * overlay the stone texture on itself: every damaged block would get
+ * a faint copy of its own face pattern mixed in, which is invisible in
+ * a still frame and obvious in a swing. The number is a binding, not
+ * an index into a list this device owns. */
+#define CRACK_TEX 9
+
+
+/* fract(vUv) → a texel index, with the wrap the shader gets free from
+ * GL_REPEAT. The generated shader samples with fract(vUv) explicitly,
+ * so the device does the same rather than relying on a sampler mode. */
+static void frag_sample(const Tex *t, double u, double v,
+                        int *r, int *g, int *b, int *a) {
+    int iu, iv, o;
+    u = u - (double)(long)u;   /* fract() for the 0..1 case, floor-safe */
+    if (u < 0.0) u += 1.0;
+    v = v - (double)(long)v;
+    if (v < 0.0) v += 1.0;
+    iu = (int)(u * t->size);
+    iv = (int)(v * t->size);
+    if (iu >= t->size) iu = t->size - 1;
+    if (iv >= t->size) iv = t->size - 1;
+    if (iu < 0) iu = 0;
+    if (iv < 0) iv = 0;
+    o = (iv * t->size + iu) * 4;
+    *r = t->px[o]; *g = t->px[o+1]; *b = t->px[o+2]; *a = t->px[o+3];
+}
+
+/* The vignette's half-extent comes from the CANVAS, exactly as the
+ * original reads disp_w/disp_h back from the device after the resize
+ * (emit_fragment_shader bakes disp_w/disp_h into the generated
+ * program). So it is a PARAMETER, not the surface size: the settings
+ * menu's DISPLAY row resizes the canvas, but the fragment program's
+ * centre is fixed at the moment the program was generated, and on a
+ * display smaller than ~900x900 the threshold is simply never reached
+ * (the original's own numbers: 450 against 1920x1080's 1500 corner).
+ *
+ * Reading S_w here instead would have made the check for the vignette
+ * impossible to write: every 320x240 case is below the threshold, so a
+ * device with the wrong threshold and one with the right threshold
+ * answer identically on every pixel. */
+static void frag_vignette(int px, int py, int vw, int vh,
+                          int *r, int *g, int *b) {
+    int hw = vw / 2, hh = vh / 2;
+    int vx = px - hw, vy = py - hh;
+    int edge, dim;
+    if (vx < 0) vx = -vx;
+    if (vy < 0) vy = -vy;
+    edge = vx + vy;
+    if (edge > 450) {
+        dim = edge - 450;
+        if (dim > 30) dim = 30;
+        /* multiplicative, so dark pixels never hard-clip to black */
+        *r -= *r * dim / 256;
+        *g -= *g * dim / 256;
+        *b -= *b * dim / 256;
+    }
+}
+
+/* ONE PIXEL of the block's fragment program.
+ *
+ * `sh` is the face's shade (the aShade barycentric value 0..1) and
+ * `tint` the record's r/g/b × 255, so this is the whole of what the
+ * fragment shader receives as vcolor. `u`,`v` are the pixel's position
+ * on the face, already fract-wrapped by the caller. */
+static void frag_pixel(const Tex *blk, const Tex *crk,
+                       int tr, int tg, int tb, int shade,
+                       int damage, int px, int py,
+                       double u, double v,
+                       int vw, int vh,
+                       int *outr, int *outg, int *outb) {
+    int tex_r, tex_g, tex_b, tex_a;
+    int r, g, b;
+    frag_sample(blk, u, v, &tex_r, &tex_g, &tex_b, &tex_a);
+    /* the per-face shade is the OTHER half of vcolor: the original's
+     * vertex shader multiplies aShade into vcolor before the fragment
+     * ever runs, so it is applied here, before the texture. */
+    tr = tr * shade / 1000;
+    tg = tg * shade / 1000;
+    tb = tb * shade / 1000;
+    if (tr < 0) tr = 0;
+    if (tr > 255) tr = 255;
+    if (tg < 0) tg = 0;
+    if (tg > 255) tg = 255;
+    if (tb < 0) tb = 0;
+    if (tb > 255) tb = 255;
+    r = tr * tex_r / 128;
+    g = tg * tex_g / 128;
+    b = tb * tex_b / 128;
+    if (T_crt) {
+        if (py % 6 == 0) {
+            r = r * 90 / 100;
+            g = g * 90 / 100;
+            b = b * 90 / 100;
+        }
+    }
+    if (damage > 0 && crk && crk->used) {
+        int cr, cg2, cb, ca, mix;
+        frag_sample(crk, u, v, &cr, &cg2, &cb, &ca);
+        mix = damage * ca / 4;
+        if (mix > 127) mix = 127;
+        r = r - (r - cr) * mix / 128;
+        g = g - (g - cg2) * mix / 128;
+        b = b - (b - cb) * mix / 128;
+    }
+    if (T_corrupt) {
+        int hash = px * 7 + py * 13;
+        if (hash % 97 == 0) {
+            r = 255;
+            g = g / 2;
+            b = b / 2;
+        }
+    }
+    if (T_crt) frag_vignette(px, py, vw, vh, &r, &g, &b);
+    if (r < 0) r = 0;
+    if (g < 0) g = 0;
+    if (b < 0) b = 0;
+    *outr = r; *outg = g; *outb = b;
+}
+
+/* The one-point entry point, AFTER frag_pixel so it can call it without a
+ * forward declaration. See fbdev.h for why this is a primitive the game
+ * itself wants (the settings menu's texture thumbnails) and not only a
+ * test hook. */
+void fb_frag_color(int texidx, int shade, int tr, int tg, int tb,
+                   int damage, double u, double v, int px, int py,
+                   int *outr, int *outg, int *outb) {
+    const Tex *blk = 0, *crk = 0;
+    *outr = *outg = *outb = 0;
+    if (texidx < 0 || texidx >= T_n || !T_tex[texidx].used) return;
+    blk = &T_tex[texidx];
+    if (CRACK_TEX < T_n && T_tex[CRACK_TEX].used) crk = &T_tex[CRACK_TEX];
+    /* The vignette centre is the CANVAS the caller is asking about, and
+     * a caller that wants a different one (the settings menu's DISPLAY
+     * row) says so with fb_frag_view. It defaults to the surface. */
+    frag_pixel(blk, crk, tr, tg, tb, shade, damage, px, py, u, v,
+               T_vw > 0 ? T_vw : S_w, T_vh > 0 ? T_vh : S_h,
+               outr, outg, outb);
+}
+
 /* ── MIMEcroft's cube geometry ──────────────────────────────────────
  * Generated VERBATIM from MIMEcroft.sh's own buffer writes:
  *   /dev/webgl/buffer/aPosition  24 verts x (x,y,z), x1000
@@ -271,22 +560,36 @@ static int tri_covers(double ax, double ay, double bx, double by,
  * computed first and the winding normalised, which is what makes this
  * correct for any camera heading. (Measured: with yaw 180 the game's
  * own 4 corner triangles come out CCW, CW, CW, CW.) */
-static void tri_shaded(double x0, double y0, double s0,
-                       double x1, double y1, double s1,
-                       double x2, double y2, double s2,
-                       uint32_t rgb) {
+static void tri_shaded(double x0, double y0, double s0, double u0, double v0,
+                       double x1, double y1, double s1, double u1, double v1,
+                       double x2, double y2, double s2, double u2, double v2,
+                       uint32_t rgb, int damage, int face) {
     int x, y;
     double minx, maxx, miny, maxy, area;
     double cr = (double)((rgb >> 16) & 0xFF);
     double cg = (double)((rgb >>  8) & 0xFF);
     double cb = (double)( rgb        & 0xFF);
+    /* The per-pixel path needs the face's four corners in TEXTURE
+     * space, which the flat path has no use for. They are carried
+     * alongside the shade and interpolated barycentrically by exactly
+     * the same weights, so a pixel's (u,v) is the point where the
+     * face's own uv rectangle says the pixel is — which is what the
+     * fragment shader's varying vUv gives it. */
+    const Tex *blk = 0, *crk = 0;
+    if (FB_TEX_ACTIVE) {
+        int t = FB_TEX_IDX;
+        if (t >= 0 && t < T_n && T_tex[t].used) blk = &T_tex[t];
+        if (CRACK_TEX < T_n && T_tex[CRACK_TEX].used) crk = &T_tex[CRACK_TEX];
+    }
+    (void)face;
 
     area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
     if (area == 0.0) return;
     if (area < 0.0) {           /* normalise: swap v1 and v2 */
         double tx = x1, ty = y1, ts = s1;
-        x1 = x2; y1 = y2; s1 = s2;
-        x2 = tx; y2 = ty; s2 = ts;
+        double tu = u1, tv = v1;
+        x1 = x2; y1 = y2; s1 = s2; u1 = u2; v1 = v2;
+        x2 = tx; y2 = ty; s2 = ts; u2 = tu; v2 = tv;
     }
 
     /* whole-triangle off-screen: skip (the near-plane clamp can push
@@ -316,6 +619,34 @@ static void tri_shaded(double x0, double y0, double s0,
             sh = w0 * s0 + w1 * s1 + w2 * s2;
             if (sh < 0.0) sh = 0.0;
             if (sh > 1.0) sh = 1.0;
+            if (blk) {
+                /* THE TEXTURED PATH: the fragment program, per pixel.
+                 *
+                 * The shade is NOT rounded to a float here — it is
+                 * carried to frag_pixel as the face's aShade ×1000, so
+                 * the multiply that the original's vertex shader does
+                 * into vcolor stays an integer multiply. Rounding
+                 * through a double first is a smooth-looking way to
+                 * be wrong on a different number of pixels every run.
+                 *
+                 * uv is the barycentric mix of the face's three
+                 * texture-space corners, which is the same varying the
+                 * shader's vUv carries into the fragment stage. */
+                int fr, fg, fb;
+                double iu = w0 * u0 + w1 * u1 + w2 * u2;
+                double iv = w0 * v0 + w1 * v1 + w2 * v2;
+                frag_pixel(blk, crk,
+                           (int)cr, (int)cg, (int)cb,
+                           (int)(sh * 1000.0 + 0.5),
+                           damage, x, y, iu, iv,
+                           S_w, S_h,
+                           &fr, &fg, &fb);
+                if (fr > 255) fr = 255;
+                if (fg > 255) fg = 255;
+                if (fb > 255) fb = 255;
+                put_px(x, y, ((uint32_t)fr << 16) | ((uint32_t)fg << 8) | (uint32_t)fb);
+                continue;
+            }
             r = (int)(cr * sh + 0.5); if (r > 255) r = 255;
             g = (int)(cg * sh + 0.5); if (g > 255) g = 255;
             b = (int)(cb * sh + 0.5); if (b > 255) b = 255;
@@ -408,7 +739,8 @@ static void lerp_v(const Vtx *a, const Vtx *b, double t, Vtx *out) {
 /* Draw one cube record: centre (ox,oy,oz), scale ×1000, colour 0..1. */
 static void draw_cube(double ox, double oy, double oz,
                       double sx, double sy, double sz,
-                      double r, double g, double b) {
+                      double r, double g, double b,
+                      int texidx, int damage) {
     int i;
     uint32_t rgb;
     int cr = (int)(r * 255.0 + 0.5);
@@ -421,6 +753,8 @@ static void draw_cube(double ox, double oy, double oz,
     if (cb < 0) cb = 0;
     if (cb > 255) cb = 255;
     rgb = ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
+    FB_TEX_IDX = texidx;
+    FB_TEX_ACTIVE = (T_n > 0);
 
     /* PAINTER'S ALGORITHM: draw far faces first.
      *
@@ -471,6 +805,8 @@ static void draw_cube(double ox, double oy, double oz,
         for (b = 0; b < 12; b++) {
             int fi = order[b];
             double px[8], py[8], sh[8];  /* the clipped screen-space polygon */
+            double pu[8], pv[8];          /* ... and its texture-space corners */
+            const double *fuv = CUBE_UV;  /* the cube's own aUv table */
             double gx0 = -1.0, gy0 = -1.0;
             double gx1 = (double)S_w + 1.0, gy1 = (double)S_h + 1.0;
             int np = 0, k;
@@ -570,6 +906,8 @@ static void draw_cube(double ox, double oy, double oz,
                 if (a.w > W_NEAR && np < 8) {
                     project(&a, &px[np], &py[np]);
                     sh[np] = s0;
+                    pu[np] = fuv[vi*2+0];
+                    pv[np] = fuv[vi*2+1];
                     np++;
                 }
                 if ((a.w > W_NEAR) != (b2.w > W_NEAR) && np < 8) {
@@ -577,6 +915,8 @@ static void draw_cube(double ox, double oy, double oz,
                     lerp_v(&a, &b2, u, &iv);
                     project(&iv, &px[np], &py[np]);
                     sh[np] = s0 + (s1 - s0) * u;
+                    pu[np] = fuv[vi*2+0] + (fuv[vj*2+0] - fuv[vi*2+0]) * u;
+                    pv[np] = fuv[vi*2+1] + (fuv[vj*2+1] - fuv[vi*2+1]) * u;
                     np++;
                 }
             }
@@ -604,7 +944,7 @@ static void draw_cube(double ox, double oy, double oz,
              * that face's corner. Clipping into a scratch array and
              * copying back costs one 8-element struct copy per pass. */
             {
-                double qx[8], qy[8], qs[8];
+                double qx[8], qy[8], qs[8], qu[8], qv[8];
                 for (k = 0; k < 4 && np >= 3; k++) {
                     double nx, ny, d;
                     int m = 0, e;
@@ -619,27 +959,32 @@ static void draw_cube(double ox, double oy, double oz,
                         double d0 = px[e] * nx + py[e] * ny + d;
                         double d1 = px[e2] * nx + py[e2] * ny + d;
                         if (d0 >= 0.0 && m < 8) {
-                            qx[m] = px[e]; qy[m] = py[e]; qs[m] = sh[e]; m++;
+                            qx[m] = px[e]; qy[m] = py[e]; qs[m] = sh[e];
+                            qu[m] = pu[e]; qv[m] = pv[e]; m++;
                         }
                         if ((d0 >= 0.0) != (d1 >= 0.0) && m < 8) {
                             double u = d0 / (d0 - d1);
                             qx[m] = px[e] + (px[e2] - px[e]) * u;
                             qy[m] = py[e] + (py[e2] - py[e]) * u;
                             qs[m] = sh[e] + (sh[e2] - sh[e]) * u;
+                            qu[m] = pu[e] + (pu[e2] - pu[e]) * u;
+                            qv[m] = pv[e] + (pv[e2] - pv[e]) * u;
                             m++;
                         }
                     }
                     np = m;
                     for (e = 0; e < np; e++) {
                         px[e] = qx[e]; py[e] = qy[e]; sh[e] = qs[e];
+                        pu[e] = qu[e]; pv[e] = qv[e];
                     }
                 }
             }
             /* fan-triangulate */
             for (k = 2; k < np; k++)
-                tri_shaded(px[0], py[0], sh[0],
-                           px[k - 1], py[k - 1], sh[k - 1],
-                           px[k], py[k], sh[k], rgb);
+                tri_shaded(px[0], py[0], sh[0], pu[0], pv[0],
+                           px[k - 1], py[k - 1], sh[k - 1], pu[k - 1], pv[k - 1],
+                           px[k], py[k], sh[k], pu[k], pv[k],
+                           rgb, damage, fi / 2);
         }
     }
 }
@@ -711,7 +1056,8 @@ void fb_blocks(const char *payload) {
              * them required-but-unused is honest — dropping them would
              * change the record's shape and re-open that door. */
             draw_cube(v[0], v[1], v[2], v[3] * 1000.0, v[4] * 1000.0,
-                      v[5] * 1000.0, v[6], v[7], v[8]);
+                      v[5] * 1000.0, v[6], v[7], v[8],
+                      (int)v[9], (int)v[10]);
         } else if (n > 0 && !complained) {
             /* A SHORT LINE, with fields on it. Reported, because from the
              * caller's side a truncated payload and an empty one are the
