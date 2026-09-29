@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
+#include <signal.h>
 #include <termios.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -68,6 +69,87 @@ static int    T_raw_set = 0;
 
 /* Defined below t_set_game_mode, which registers it with atexit. */
 static void   t_restore_game_mode(void);
+
+/* ATEXIT ALONE IS NOT ENOUGH, and getting that wrong is what left the
+ * terminal raw for the second time.
+ *
+ * atexit handlers run for exit() and for return from main. They do
+ * NOT run when a process is killed by a SIGNAL, and for an
+ * interactive game the signal is the NORMAL way out: Ctrl-C at the
+ * terminal delivers SIGINT to the foreground process group, the game
+ * dies, and every atexit handler is discarded. Measured on this host
+ * over a pty pair, with a game running unbounded:
+ *
+ *     child exited, status 2 (signalled: 2)
+ *     terminal ICANON now: False  ECHO now: False
+ *
+ * which is the user's shell left echo-less, needing `stty sane` by
+ * hand — the exact complaint that fixing atexit was supposed to end,
+ * so a fix that only covers clean exits is a fix that misses the way
+ * the program is actually stopped.
+ *
+ * THE HANDLER RESTORES AND THEN RE-RAISES, rather than calling exit.
+ * A handler that returns leaves a killed-by-signal process looking
+ * like a clean exit, which loses the exit STATUS a caller checks
+ * ($? == 130 is how a shell knows the user asked to stop) and, worse,
+ * would swallow a second signal — pressing Ctrl-C twice has to mean
+ * "stop waiting and die" even if the terminal restore is wedged. So
+ * the default disposition is restored first, and the signal is
+ * re-raised with the default handler in place, which kills the
+ * process exactly as if this device had never been here.
+ *
+ * Only the signals a person or a harness actually stops a game with
+ * are installed. SIGCHLD, SIGWINCH and friends are left alone: a
+ * handler that restores the terminal and then re-raises one of those
+ * would kill a game for being resized. */
+static struct sigaction  T_old_int, T_old_term, T_old_hup, T_old_quit;
+static int  T_sigs_installed = 0;
+
+static void t_signal_restore(int sig) {
+    /* Restore the terminal FIRST: it is the one thing the user cannot
+     * do for themselves afterwards without a new terminal. */
+    t_restore_game_mode();
+    /* Then put the default action back and re-raise, so the process
+     * dies of the signal it was given instead of pretending to have
+     * exited normally. */
+    switch (sig) {
+        case SIGINT:  sigaction(SIGINT,  &T_old_int,  NULL); break;
+        case SIGTERM: sigaction(SIGTERM, &T_old_term, NULL); break;
+        case SIGHUP:  sigaction(SIGHUP,  &T_old_hup,  NULL); break;
+        case SIGQUIT: sigaction(SIGQUIT, &T_old_quit, NULL); break;
+        default: break;
+    }
+    raise(sig);
+    /* Unreachable for a signal with the default action, but not
+     * silently: if the signal was blocked or ignored for some reason,
+     * leave by signal anyway rather than returning into a game that
+     * just handled a quit request. */
+    _exit(128 + sig);
+}
+
+static void t_install_signal_handlers(void) {
+    struct sigaction sa;
+    int i;
+    static const int sigs[4] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
+    struct sigaction *olds[4];
+    olds[0] = &T_old_int; olds[1] = &T_old_term;
+    olds[2] = &T_old_hup;  olds[3] = &T_old_quit;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = t_signal_restore;
+    sigemptyset(&sa.sa_mask);
+    /* NO SA_RESTART: a signal must interrupt the game's blocking
+     * poll(2) on the terminal, or Ctrl-C would sit in the kernel
+     * until the next keypress arrived. */
+    sa.sa_flags = 0;
+    for (i = 0; i < 4; i++) {
+        if (sigaction(sigs[i], &sa, olds[i]) != 0) {
+            /* One failed install is not fatal; it only means that
+             * signal leaves the terminal as it always did. Keeping
+             * going lets the other three work. */
+        }
+    }
+    T_sigs_installed = 1;
+}
 
 /* Is this terminal SAFE for us to read from and reconfigure? (see
  * t_open for why it is a question at all).
@@ -425,6 +507,11 @@ static int t_set_game_mode(void) {
         T_orig = a;
         T_saved = 1;
         atexit(t_restore_game_mode);
+        /* The signal handlers go in at the SAME moment as the atexit
+         * registration, and for the same reason: the first time this
+         * process changes the terminal is the first time it owes the
+         * user a way back, on every exit route, not just exit(). */
+        if (!T_sigs_installed) t_install_signal_handlers();
     }
     a.c_lflag &= (tcflag_t)~(ICANON | ECHO | ECHOE | ECHOK | ECHONL);
     a.c_cc[VMIN] = 0;
@@ -435,21 +522,29 @@ static int t_set_game_mode(void) {
 }
 
 /* Put the terminal back the way we found it. Registered with atexit
- * by t_set_game_mode, and safe to call when we never changed anything.
+ * by t_set_game_mode, and ALSO reached from the signal handler above,
+ * and safe to call when we never changed anything.
  *
- * ATEXIT, NOT AN EXPLICIT CALL, and the reason is that a game can leave
- * by routes the game does not know about: `exit` from a device, a
- * signal that kills it, the transpiled binary's own exit-time code. An
- * explicit restore in the game's cleanup would be skipped by every one
- * of those, and the user's terminal would be left raw. atexit runs for
- * exit() and return-from-main, which covers the normal path, and the
- * common abnormal path (a terminal killed by a signal) is a crash
- * either way.
+ * TWO EXIT ROUTES, because there are two, and covering only the first
+ * is what left the terminal raw twice. atexit covers exit() and
+ * return-from-main; the signal handler covers SIGINT/SIGTERM/SIGHUP/
+ * SIGQUIT, which is how an interactive game is actually stopped
+ * (Ctrl-C). An explicit call in the game's own cleanup would be a
+ * third route, and the worst one: it is the route a program takes
+ * least often, because a game that is killed never reaches it.
  *
  * Restoring the SAVED struct rather than re-deriving a "sane" mode
  * matters: it puts back this user's actual settings, including the
  * ones we never touched (flow control, IUTF8, the erase character),
- * where a hand-built tcsetattr would quietly reset them. */
+ * where a hand-built tcsetattr would quietly reset them.
+ *
+ * SAFE TO CALL TWICE, and from a signal handler, which is why it does
+ * its own guard: the handler can fire between the tcsetattr and the
+ * clearing of T_raw_set on a path that also exits normally, and a
+ * second tcsetattr of the same settings is harmless where a use of a
+ * cleared flag is not. The handler must not call anything that is not
+ * async-signal-safe, so this is deliberately just the flag check and
+ * one syscall. */
 static void t_restore_game_mode(void) {
     if (T_fd < 0 || !T_saved || !T_raw_set) return;
     /* TCSADRAIN, not TCSANOW: TCSANOW can drop output the game has
