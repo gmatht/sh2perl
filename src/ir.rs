@@ -58,6 +58,9 @@ pub enum Sigil {
 pub enum IrType {
     Int,
     Str,
+    /// String known to contain only ASCII bytes. Additive: backends that
+    /// ignore the annotation treat it as Str.
+    AsciiStr,
     Any,
     /// IEEE-754 bit width (32 = float, 64 = double). Serialized as
     /// `{"kind": "Float", "width": 64}` so the width survives the A1
@@ -101,10 +104,15 @@ impl serde::Serialize for IrType {
                 st.serialize_field("width", w)?;
                 st.end()
             }
-            // Sized C ints serialize as {"kind": "Int32"} etc.
-            IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64 => {
+            // AsciiStr and sized C ints serialize as {"kind": "…"}.
+            IrType::AsciiStr
+            | IrType::Int32
+            | IrType::Int64
+            | IrType::UInt32
+            | IrType::UInt64 => {
                 use serde::ser::SerializeStruct;
                 let kind = match self {
+                    IrType::AsciiStr => "AsciiStr",
                     IrType::Int32 => "Int32",
                     IrType::Int64 => "Int64",
                     IrType::UInt32 => "UInt32",
@@ -158,6 +166,7 @@ impl<'de> serde::Deserialize<'de> for IrType {
                             "expected {\"kind\":\"Float\",\"width\":N}",
                         )),
                     },
+                    Some("AsciiStr") => Ok(IrType::AsciiStr),
                     Some("Int32") => Ok(IrType::Int32),
                     Some("Int64") => Ok(IrType::Int64),
                     Some("UInt32") => Ok(IrType::UInt32),
