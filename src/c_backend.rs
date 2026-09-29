@@ -18439,9 +18439,54 @@ fn param_copy_alias(
             }
             _ => {
                 if let Some(fb) = self.fb_call_opt(&cmd, &args) {
-                    // the fb device returns 0 on success, so the shell
-                    // status is 0 (like any other successful builtin)
-                    format!("({fb}, _sh_rc = 0, _sh_rc == 0)")
+                    // A DEVICE CALL'S STATUS IS ITS OWN RETURN VALUE,
+                    // and this used to be hardcoded to 0 — so every
+                    // `if fb_window_open; then`, `if fb_window_closed;
+                    // then` and `if fb_present; then` took its THEN
+                    // branch unconditionally. The two window
+                    // predicates are exactly the ones a game asks, and
+                    // the failure is silent and total: `if
+                    // fb_window_closed` is true on frame 1, the game
+                    // treats it as the quit key, and a 3-key walk drew
+                    // one frame and stopped (measured: "1 frames, 0
+                    // steps, 0 found" where real bash did the walk).
+                    // The smallest reproducer did not even COMPILE —
+                    // `_sh_rc` was undeclared at this depth — so the
+                    // transpiler fell back to cc, cc rejected it too,
+                    // and the shell reported an unrelated error.
+                    //
+                    // The expression must be a TEST VERDICT (1 = true,
+                    // 0 = false), not a value: every command emitter
+                    // here ends with `, _sh_rc == 0`, so the store
+                    // below has to land a STATUS and the comparison
+                    // turns it into the verdict. `fb_status` returns the
+                    // whole store expression, per primitive, because
+                    // the device's conventions are not uniform.
+                    //
+                    // THE VOID PRIMITIVES BYPASS THE REGISTER ENTIRELY.
+                    // `fb_clear`, `fb_blocks` and `fb_set_camera` are
+                    // `void`, so there is no value to store — and
+                    // storing a literal 0 is actively destructive:
+                    // trim_discarded_rc_cmp peels the `, _sh_rc == 0`
+                    // tail, strip_dead_rc then sees a dead `_sh_rc = 0`
+                    // line and DELETES THE WHOLE LINE, taking the
+                    // `fb_blocks(...)` draw call with it. The game then
+                    // cleared to black every frame and drew nothing,
+                    // and both sides of the equivalence suite agreed
+                    // perfectly on a solid black rectangle (measured:
+                    // 1 colour, 100% of 76800 pixels, 1760 block records
+                    // logged and none of them rendered).
+                    //
+                    // A statement-position void call is emitted as the
+                    // bare call — no register, nothing for the rc
+                    // passes to strip.
+                    if Self::fb_is_void(&fb) {
+                        format!("({fb})")
+                    } else {
+                        self.need_sh = true;
+                        let ok = Self::fb_status(&fb);
+                        format!("(_sh_rc = {ok}, _sh_rc == 0)")
+                    }
                 } else if let Some(uu) = self.uu_run_opt(&cmd, &args) {
                     self.need_sh = true;
                     format!("(_sh_rc = {uu}, _sh_rc == 0)")
@@ -18485,7 +18530,60 @@ fn param_copy_alias(
             "fb_blocks" => Some(&['s']),               // the batched payload
             "fb_present" => Some(&[]),                 // no args
             "fb_dump_ppm" => Some(&['s']),             // path
+            // the WINDOW (runtime/fbwin.h): a game asks these three
+            // things about the display it is drawing to, and each is
+            // otherwise a fact the shell would have to know.
+            "fb_window_open" => Some(&[]),             // is there a window
+            "fb_window_key" => Some(&[]),              // a key pressed IN it
+            "fb_window_closed" => Some(&[]),           // was it closed
             _ => None,
+        }
+    }
+
+    /// The fb_* primitives declared `void` in runtime/fbdev.h. They
+    /// have no return value to read, so a status store around them is
+    /// both uncompilable (`_sh_rc = (fb_clear(0))` — "void value not
+    /// ignored as it ought to be") and, once padded to a literal 0,
+    /// destructively strippable (see the exec_call note). Matched on
+    /// the head of the rendered call, exactly as `fb_status` is.
+    fn fb_is_void(call: &str) -> bool {
+        matches!(
+            call.split('(').next().unwrap_or(call),
+            "fb_clear" | "fb_blocks" | "fb_set_camera"
+        )
+    }
+
+    /// An fb_* primitive's C return value, as a SHELL EXIT STATUS
+    /// expression (0 = success, nonzero = failure) — the thing that
+    /// belongs in `_sh_rc = <here>`, so that the `, _sh_rc == 0` the
+    /// command emitter appends turns it into a test verdict.
+    ///
+    /// `call` is the full rendered call (`fb_window_closed()`), and the
+    /// primitive name is its head — the same `cmd` `fb_call_opt` matched
+    /// on. The polarity is PER-PRIMITIVE, because the device is not
+    /// uniform and getting it wrong is silent:
+    ///   fb_open      0 on success, -1 on OOM      -> pass through
+    ///   fb_dump_ppm  0 on success, -1 on failure  -> pass through
+    ///   fb_present   1 when a blit happened      -> "(ret - 1)"
+    ///   fb_window_open / fb_window_closed
+    ///                1 means "yes"               -> "(ret == 0)"
+    ///   the void three                             -> (caller skips this)
+    ///
+    /// `fb_present` is the genuinely surprising one: it returns 1 when
+    /// a frame was blitted, and a blit is the SUCCESS case, so its
+    /// status is `ret - 1`. A caller testing `if fb_present` wants to
+    /// know a frame was SHOWN, and a blanket "the device returns 0 on
+    /// success" would make that test permanently false on exactly the
+    /// runs where a window exists.
+    fn fb_status(call: &str) -> String {
+        let name = call.split('(').next().unwrap_or(call);
+        match name {
+            // nonzero = the answer is "yes" -> a yes is a failure
+            "fb_window_open" | "fb_window_closed" => format!("(({call}) == 0)"),
+            // nonzero = it worked -> status 1 means failure
+            "fb_present" => format!("(({call}) - 1)"),
+            // 0-on-success primitives: pass the value through
+            _ => format!("({call})"),
         }
     }
 
@@ -18557,8 +18655,9 @@ fn param_copy_alias(
             match (ty, w) {
                 ('i', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
                 ('s', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
-                // integers: fb_open's w/h and the packed clear colour
-                // are written as plain decimal words in the script.
+                // integers: fb_open's w/h, the packed clear colour, and
+                // the window predicates are written as plain decimal
+                // words in the script.
                 ('i', _) => parts.push(self.value_num(w)),
                 // doubles: the camera uniforms. atof-style coercion, so
                 // "0.5" and "$cy" both work.
@@ -18600,34 +18699,51 @@ fn param_copy_alias(
     /// returning `void` (fb_present) or `int` (fb_open) has no
     /// printable value, so it is REFUSED here and stays a statement
     /// call — a capture of it is a shell error, not a number to guess.
-    fn fb_capture_sig(cmd: &str) -> Option<&'static str> {
+    fn fb_capture_sig(cmd: &str) -> Option<(&'static str, usize)> {
         match cmd {
             // the keyboard: the one primitive a game captures per
             // frame. The argument is the key FILE (see above).
-            "fb_input_line" => Some("fb_input_line"),
+            "fb_input_line" => Some(("fb_input_line", 1)),
+            // a key pressed in the fb0 WINDOW, captured the same way
+            // and for the same reason: the game's own control code is
+            // `k=$(...)` either way, and only the source of the byte
+            // changes. Both return the device's own static buffer,
+            // which is the lifetime a capture helper's result has.
+            "fb_window_key" => Some(("fb_window_key", 0)),
             _ => None,
         }
     }
 
     fn fb_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
-        let call = Self::fb_capture_sig(cmd)?;
+        let (call, want_arity) = Self::fb_capture_sig(cmd)?;
         // exactly as fb_call_opt: no env prefix Object arg
         if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
             return None;
         }
-        // exactly ONE argument, the key file, and it must be one value.
-        // A split word is fine — that is a variable read, not a glob —
-        // so fb_word_one_value is the right gate, not word_single_argv.
-        let words = match args.get(1) {
+        // fb_input_line takes ONE argument, the key FILE, and it must be
+        // one value. A split word is fine — that is a variable read, not
+        // a glob — so fb_word_one_value is the right gate, not
+        // word_single_argv.
+        //
+        // fb_window_key takes NONE, and that is a different arity rather
+        // than a zero-length path: the window knows its own keys. The
+        // two are told apart by the CAPTURE TABLE, which is a
+        // (name, arity) pair and not a name, so a future capture
+        // primitive with a different shape cannot silently be rendered
+        // with this one's arguments.
+        let words: &[IrExpr] = match args.get(1) {
             Some(IrExpr::Array(items)) => items.as_slice(),
-            _ => return None,
+            _ => &[],
         };
-        if words.len() != 1 || !Self::fb_word_one_value(&words[0]) {
+        if words.len() != want_arity {
             return None;
         }
-        let path = self.value_c(&words[0]);
+        if words.iter().any(|w| !Self::fb_word_one_value(w)) {
+            return None;
+        }
+        let arg = if want_arity == 1 { self.value_c(&words[0]) } else { String::new() };
         self.need_fb = true;
-        Some(format!("_sh_xstrdup({call}({path}))"))
+        Some(format!("_sh_xstrdup({call}({arg}))"))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
