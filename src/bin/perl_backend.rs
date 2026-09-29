@@ -1,6 +1,13 @@
-//! Perl backend CLI — LIBRARY path (branch `backend/perl`).
+//! Perl backend CLI — LIBRARY path.
 //!
-//! Compiles the Perl renderer IN (debashl::perl_backend) and drives it
+//! DEDUP (2026-09-29): this used to call `debashl::perl_backend`, a partial
+//! renderer rewrite that `aa583efab` swept in inside an unrelated estree/C
+//! commit and that was never finished. It punted 60 `# TODO(unsupported)`
+//! markers across 30 corpus examples where the renderer in `ir.rs` punts 0,
+//! and shell-outs instead of lowering (measured 7/20 vs 19/20 against bash).
+//! `perl_backend.rs` is deleted; `ir::shir_to_perl` is the only Perl renderer.
+//!
+//! Compiles the Perl renderer IN (debashl::ir) and drives it
 //! directly from the parsed ShIR — no `--shir` JSON round-trip. Usage:
 //!
 //!     perl_backend foo.sh                # this: library path, in-process
@@ -32,5 +39,5 @@ fn main() {
         }
     };
     let prog = debashl::shir::ast_to_ir(&commands);
-    print!("{}", debashl::perl_backend::shir_to_perl(&prog));
+    print!("{}", debashl::ir::shir_to_perl(&prog));
 }

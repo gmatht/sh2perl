@@ -56,7 +56,7 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     // output is unchanged (Ident renders like a lifted Var read
     // everywhere; the estree arm emits the identifier directly).
     let numeric = crate::shir::numeric_lift_vars(&prog);
-    let string = crate::shir::string_lift_vars(&prog, &numeric);
+    let (string, _ascii) = crate::shir::string_lift_vars(&prog, &numeric);
     let (num, str) = crate::shir::analyze_loop_var_refs(&prog, &numeric, &string);
     let lifted: std::collections::HashSet<String> =
         num.union(&str).cloned().collect();
@@ -589,7 +589,7 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         // PureCpu (namespace spec): no I/O, no state beyond args
         "contains" | "join" | "brace" | "idiv" | "imod" | "arith" | "arithEval" | "trimCapture"
         | "dirname" | "basename" | "not" | "guard" | "caseMatch" | "split" | "param"
-        | "callDirect" => "PureCpu",
+        | "callDirect" | "lit" => "PureCpu",
         // Emulable: implementable in a backend runtime (state/string/glob/fs-tests)
         "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"

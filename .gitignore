@@ -95,3 +95,9 @@ runtime/lib/
 # agent session logs / scratch (never commit)
 .pir/
 .scratch/
+
+# AI scratchpad (debug output)
+scratchpad/
+
+# worktree-local CLI build for the Ext-node work (untracked)
+/otranspilerl/

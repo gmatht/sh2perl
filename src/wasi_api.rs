@@ -66,7 +66,7 @@ fn ok_json(output: &str) -> String {
 fn err_json(e: &dyn std::fmt::Display) -> String {
     format!(
         r#"{{"ok":false,"error":{}}}"#,
-        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
+        serde_json::to_string(&e).unwrap_or_else(|_| "\"\"".into())
     )
 }
 
@@ -156,7 +156,7 @@ pub extern "C" fn sh2perl_lex(input: *const u8, input_len: usize) -> *mut u8 {
     let mut lexer = Lexer::new(&input);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.peek() {
-        let token_text = lexer.get_current_text().unwrap_or_default().to_string();
+        let token_text = lexer.get_current_text().unwrap_or_default();
         tokens.push(format!("{:?}('{}')", token, token_text));
         lexer.next();
     }
@@ -232,7 +232,7 @@ fn read_str(ptr: *const u8, len: usize) -> String {
 }
 
 fn parse_to_ir(src: &str) -> Result<crate::ir::IrProgram, String> {
-    let (commands, lines) = Parser::new(src).parse_with_lines().map_err(|e| e.to_string())?;
+    let (commands, lines) = Parser::new(src).parse_with_lines().map_err(|e| e)?;
     Ok(crate::shir::ast_to_ir_with_lines(&commands, &lines))
 }
 
@@ -241,8 +241,8 @@ fn render_ir(prog: &crate::ir::IrProgram, lang: &str) -> Result<String, String> 
         "c" => Ok(crate::c_backend::shir_to_c(prog)),
         "go" => Ok(crate::go_backend::shir_to_go(prog)),
         "java" => crate::java_backend::shir_to_java(prog),
-        "js" => crate::shir::shir_to_estree_json(prog).map_err(|e| e.to_string()),
-        "pl" | "perl" => Ok(crate::perl_backend::shir_to_perl(prog)),
+        "js" => crate::shir::shir_to_estree_json(prog).map_err(|e| e),
+        "pl" | "perl" => Ok(crate::ir::shir_to_perl(prog)),
         "py" | "python" => Ok(crate::python_backend::shir_to_python(prog)),
         "rs" | "rust" => Ok(crate::rust_backend::shir_to_rust(prog)),
         "sh" => crate::sh_backend::shir_to_sh(prog),

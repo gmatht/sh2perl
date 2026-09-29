@@ -172,6 +172,82 @@ pub fn manifest_for(target: &str) -> Capabilities {
     }
 }
 
+// ── The NODE-side manifest (what text_ops may EMIT per backend) ───────
+//
+// `manifest_for` above answers "which composition may this backend's wc -l
+// become?". The table below answers the complementary question the §11.12
+// design names as the OTHER half: "may the core hand this backend a rich
+// Ext node AT ALL — or must it keep the original command?".
+//
+// It is the authoritative list of what each backend renders natively, kept
+// in sync with the renderer reality (verified by `cargo test` against the
+// shared handler registry: `planner::tests::node_manifest_matches_renderers`
+// asserts every declared node has a handler that renders it).
+//
+// Why it matters: `text_ops` REPLACES a shell command with an Ext node. On
+// a backend that cannot render the node, that replacement is a REGRESSION
+// (the command was exact; the node becomes a `sh2.*` stub or a hard
+// refusal). Gating the transform on this table is what makes the core
+// "lower to supported nodes" instead of emitting unsupported ones.
+pub fn node_manifest(target: &str) -> &'static [&'static str] {
+    // Verified native on the shared registry + the backend's own Ext arms.
+    // `ALL` = everything the shared handlers render for that backend.
+    const ALL_TARGETS: &[&str] = &[
+        "StrLen", "WordCount", "CaseTransform", "CharTranslate", "FieldExtract", "RegSub",
+        "PathName", "SubStrExtract", "TakeLines", "RegCount", "Split", "ArrayLen", "StringTrim",
+        "StringContains", "StringAffix", "AffixStrip", "CutsetTrim", "RepeatStr", "RegexpFind",
+    ];
+    match target {
+        // Full native support (verified by the renderer arms).
+        "perl" | "estree" | "js" | "python" => ALL_TARGETS,
+        // Go renders the common set natively; the shared handlers' Go arms
+        // are TODO for the rest (see all_nodes.rs), so text_ops must not
+        // emit those to Go either.
+        "go" => &[
+            "StrLen", "WordCount", "CaseTransform", "FieldExtract", "StringContains",
+            "StringAffix", "StringTrim", "AffixStrip", "CutsetTrim", "Split", "ArrayLen",
+            "RegCount",
+        ],
+        // C renders StrLen + WordCount natively; everything else is a
+        // `TODO(unsupported)` marker today.
+        "c" => &["StrLen", "WordCount"],
+        // Java: the shared registry now has Java arms for the ALL set, but
+        // the TakeLines/RegSub/RegCount/FieldExtract/PathName arms emit
+        // calls into Java runtime helpers (shTakeLines, shRegSub, shRegCount,
+        // shCutField, shBasename/shDirname) that must exist in the Java
+        // preamble. Until those land, only the self-contained forms are
+        // declared — the rest keeps the original command.
+        "java" => &[
+            "StrLen", "WordCount", "CaseTransform", "CharTranslate", "Split", "ArrayLen",
+            "StringTrim", "StringContains", "StringAffix", "AffixStrip", "RepeatStr",
+            "SubStrExtract",
+        ],
+        // Rust: only the string ops the Rust backend's own Ext arms render
+        // (StringContains/StrLen/CaseTransform/FieldExtract); the shared
+        // Rust arms for the rest are TODO markers.
+        "rs" | "rust" => &[
+            "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+        ],
+        // Zig: the shared Zig arms are TODO for most nodes.
+        "zig" => &["StrLen", "Split", "ArrayLen", "StringContains", "StringAffix", "StringTrim"],
+        // The shell-like targets: the ORIGINAL COMMAND is the native form
+        // (no rich nodes at all) — text_ops must never rewrite them.
+        _ => &[],
+    }
+}
+
+/// May `text_ops` emit its rich Ext nodes for `target`? False when the
+/// target's manifest declares no node the transform emits — the core then
+/// keeps the ORIGINAL COMMAND (which every backend renders natively),
+/// which is the "lower to supported nodes" behaviour.
+///
+/// An unknown/absent target answers `false`: refusing to emit is always
+/// safe (the command form is exact everywhere), whereas emitting a node an
+/// unknown backend cannot render is not.
+pub fn emits_renderable_nodes(target: &str) -> bool {
+    !node_manifest(target).is_empty()
+}
+
 /// Build the IR for `wc -l` given the input text and the target backend's
 /// manifest. Internally runs the solver; the chosen candidate is built
 /// with composites EXPANDED to the backend's declared leaves — so a
@@ -318,5 +394,83 @@ mod tests {
         let m = manifest_for("glsl");
         assert!(m.nodes.is_empty());
         assert!(!m.has_sh2);
+    }
+
+    // ── the NODE-side manifest (what text_ops may EMIT) ───────────────
+
+    #[test]
+    fn text_ops_is_gated_by_the_node_manifest() {
+        // A backend that renders the rich nodes gets the transform...
+        assert!(emits_renderable_nodes("perl"));
+        assert!(emits_renderable_nodes("js"));
+        assert!(emits_renderable_nodes("estree"));
+        assert!(emits_renderable_nodes("python"));
+        assert!(emits_renderable_nodes("java"));
+        assert!(emits_renderable_nodes("c"));
+        // ...a shell-like target does NOT: it keeps the ORIGINAL COMMAND,
+        // which is exact there and which text_ops can only make worse.
+        assert!(!emits_renderable_nodes("sh"));
+        assert!(!emits_renderable_nodes("glsl"));
+        // An unknown target refuses to emit (a node an unknown backend
+        // cannot render is strictly worse than the command form).
+        assert!(!emits_renderable_nodes("some-unknown-target"));
+    }
+
+    /// Every declared node must actually be renderable by the shared
+    /// registry for that backend — otherwise text_ops would emit a node
+    /// that becomes a stub (the exact regression the gate exists to stop).
+    ///
+    /// The check mirrors the registry's own dispatch: a tag has a handler
+    /// iff `handlers/<snake(tag)>.rs` exists (`build.rs` scans that name).
+    #[test]
+    fn node_manifest_names_have_real_renderers() {
+        for target in [
+            "perl", "estree", "js", "python", "java", "c", "go", "rs", "zig",
+        ] {
+            for node in node_manifest(target) {
+                // The shared expr-node handlers live in `shir_nodes/*.node`
+                // with a matching snake_case handler file.
+                let snake = {
+                    let mut out = String::new();
+                    for (i, c) in node.chars().enumerate() {
+                        if c.is_uppercase() {
+                            if i > 0 {
+                                out.push('_');
+                            }
+                            out.extend(c.to_lowercase());
+                        } else {
+                            out.push(c);
+                        }
+                    }
+                    out
+                };
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/render_ext_expr/handlers")
+                    .join(format!("{snake}.rs"));
+                assert!(
+                    path.exists(),
+                    "{target}: manifest declares {node} but has no handler {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_declared_node_is_a_known_node_type() {
+        // The manifest must not name a non-existent node (a typo would
+        // silently widen the gate).
+        let known = crate::shir_nodes::all_expr_nodes()
+            .into_iter()
+            .map(|(tag, _)| tag)
+            .collect::<std::collections::HashSet<_>>();
+        for target in ["perl", "js", "python", "java", "c", "go", "rs", "zig"] {
+            for node in node_manifest(target) {
+                assert!(
+                    known.contains(*node),
+                    "{target}: manifest names {node}, which is not a declared expr node"
+                );
+            }
+        }
     }
 }
