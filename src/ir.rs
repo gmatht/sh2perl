@@ -1361,8 +1361,12 @@ fn first_code_newline(s: &str) -> Option<usize> {
         }
         // `$!` — the pid of the most recent background job. The `Background`
         // arm assigns each fork's pid here, and `var_read("!")` reads it.
+        // bash leaves `$!` UNSET when no background job has run, so it
+        // expands to the empty string (`echo "bg: $!"` → `bg: `). `0` is a
+        // real, distinct value that a pid can never take, so the initializer
+        // must be `''` — with `0` the generator printed `bg: 0`.
         if body.contains("$__sh2_last_bg") {
-            out.push_str("our $__sh2_last_bg = 0;\n");
+            out.push_str("our $__sh2_last_bg = '';\n");
         }
         if body.contains("$ls_success") {
             out.push_str("my $ls_success = 0;\n");
@@ -8580,15 +8584,34 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
 pub(crate) fn render_test_operand(tok: &str) -> String {
     // Strip surrounding source quotes (`"${arr[@]}"` arrives with them).
     let tok = tok.trim();
-    let tok = if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
-        &tok[1..tok.len() - 1]
-    } else {
-        tok
-    };
+    let was_quoted = tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"');
+    let tok = if was_quoted { &tok[1..tok.len() - 1] } else { tok };
     // `${…}` parameter expansion inside a test operand.
     if tok.starts_with("${") && tok.ends_with('}') {
         if let Some(p) = param_text_to_perl(tok) {
             return p;
+        }
+    }
+    // Tilde expansion. bash expands a LEADING `~` to $HOME before either
+    // operand is compared, so `[ ~ = "$HOME" ]` is TRUE and
+    // `[ ~/Documents = "$HOME/Documents" ]` likewise. The spaced `[ ]`
+    // tokenizer hands `~` here as an ordinary word; without this arm it fell
+    // through to the bare-literal fallthrough and emitted `'~'`, a string
+    // that can never equal $HOME (043_home.sh printed `-` where bash
+    // printed `1`). Mirrors the arms in `flat_operand`.
+    //
+    // bash does NOT expand a QUOTED tilde, so the arm is gated on the
+    // source quotes this function strips above. `~user` is deliberately not
+    // handled: bash leaves it literal when the user does not exist, so
+    // passing it through matches bash in both outcomes.
+    if !was_quoted {
+        if tok == "~" {
+            return "$ENV{HOME}".to_string();
+        }
+        if let Some(rest) = tok.strip_prefix("~/") {
+            if !rest.is_empty() {
+                return format!("\"$ENV{{HOME}}/{}\"", rest.replace('\"', "\\\""));
+            }
         }
     }
     // `$(( … ))` arithmetic expansion.
