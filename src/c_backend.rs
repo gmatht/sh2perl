@@ -7872,6 +7872,13 @@ impl Render {
             // adding input to a drawing device would make every
             // headless render depend on it.
             self.emit("#include <fbinput.h>");
+            // The sound half (runtime/fbsound.{h,c}), a THIRD separate
+            // include for the same reason: a program that draws must
+            // not depend on there being a sound card, and the sound
+            // device's own answer to a box with no card is silence
+            // rather than a failure. bash-O4 links fbsound.c and -ldl
+            // (it dlopens libasound) when the render names <fbsound.h>.
+            self.emit("#include <fbsound.h>");
         }
         self.emit("");
         if self.need_sh {
@@ -18536,6 +18543,31 @@ fn param_copy_alias(
             "fb_window_open" => Some(&[]),             // is there a window
             "fb_window_key" => Some(&[]),              // a key pressed IN it
             "fb_window_closed" => Some(&[]),           // was it closed
+            // the 2D OVERLAY (runtime/fbdev.h): the game's own HUD
+            // mini-language, one batched payload per frame, and the
+            // flash on its own layer.
+            "fb_overlay" => Some(&['s']),              // the batched payload
+            "fb_overlay_flash" => Some(&['s']),        // the transient one
+            "fb_overlay_alpha" => Some(&['i', 'i']),   // which pixel to read
+            // the TEXTURES: the block atlas and the fragment program's
+            // switches. fx is called with the game's own colours and
+            // the aShade the face carries, all as the header declares.
+            "fb_texture" => Some(&['i', 's', 's', 's', 'i', 'i', 'i']),
+            "fb_frag_flags" => Some(&['i', 'i']),      // crt, corrupt
+            "fb_frag_view" => Some(&['i', 'i']),       // the canvas the
+                                                      // vignette centres on
+            "fb_frag_color" => Some(&[
+                'i', 'i', 'i', 'i', 'i', 'i', 'd', 'd', 'i', 'i', 'i', 'i', 'i',
+            ]),
+            "fb_tex_count" => Some(&[]),
+            // the SOUND (runtime/fbsound.h). fb_note takes a note NAME
+            // and a duration; fb_samples takes the generator's payload
+            // verbatim, because the samples ARE the sound.
+            "fb_note" => Some(&['s', 'd']),            // note, seconds
+            "fb_samples" => Some(&['s']),              // the PCM payload
+            "fb_sound_ready" => Some(&[]),
+            "fb_sound_count" => Some(&[]),
+            "fb_sound_active" => Some(&[]),
             _ => None,
         }
     }
