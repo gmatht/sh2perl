@@ -34,6 +34,13 @@ static int fails = 0, checks = 0;
 #define CRACK_SLOT 9
 #endif
 
+static void ckr(int got, int want, const char *what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("  FAIL %s: got %d want %d\n", what, got, want);
+    }
+}
 static void ck(int cond, const char *what) {
     checks++;
     if (!cond) { fails++; printf("  FAIL %s\n", what); }
@@ -53,6 +60,9 @@ static void load(const char *path) {
     fclose(f);
     PPMW = w;
     PPMH = h;
+}
+static int is_colour(int r, int g, int b, int R, int G, int B) {
+    return r == R && g == G && b == B;
 }
 static void at(int x, int y, int *r, int *g, int *b) {
     size_t o = ((size_t)y * PPMW + x) * 3;
@@ -757,6 +767,205 @@ static void t_frag(void) {
     }
 }
 
+
+/* ── 6. the 2D overlay layer ─────────────────────────────────────────
+ *
+ * THE HUD IS A SEPARATE SURFACE WITH AN ALPHA CHANNEL, and the three
+ * properties that make it one are each invisible in a single still
+ * frame, so each is checked here against something that IS visible:
+ *
+ *   PERSISTENT   a record written in one frame is still there in the
+ *                next, over a DIFFERENT world. This is what lets the
+ *                game draw the radar base, the gun and the text once
+ *                and only update what moved.
+ *   ERASABLE     `E` sets alpha 0 and what shows through is the
+ *                CURRENT frame's world, not a background colour. The
+ *                game's rm[] arrays (the last cell drawn in each radar
+ *                square) are only meaningful against that.
+ *   COMPOSITED   over the world, not under it.
+ *
+ * THE SIZE IS THE GAME'S OWN, and it settles the one field whose
+ * meaning cannot be guessed from its name: the radar is 16 cells of
+ * CELL_W = 0.040, so 16 x 0.040 = 0.64 of the canvas and w is the FULL
+ * extent as a fraction. Read as a half-extent the same radar is 1.28
+ * screens wide and every cell runs off the right edge — a HUD that
+ * looks entirely plausible and is twice the size.
+ */
+static void t_overlay(void) {
+    int x, y, n, r, g, b;
+    int x0, x1, y0, y1;
+
+    /* THE PAYLOAD HAS FIVE RECORD SHAPES AND ONE HAS NO TYPE LETTER.
+     *
+     * draw_rect — the radar, the digits, the text, every axis-aligned
+     * element — appends `cx cy w h r g b [a]` with NO letter, because
+     * on the WebGL path an unlettered payload IS a quad. The first
+     * parser knew only R/E/I/T and reported every bare record as
+     * unknown, so it drew the gun and the flash and NOTHING else: no
+     * radar, no digits, no text. A missing record type in a parser
+     * looks exactly like a game that has no HUD. */
+    fb_open(320, 240);
+    fb_clear(0xFF000000);
+    fb_overlay("0.0 0.5 0.040 0.056 0.42 0.42 0.47\n");
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov1.ppm");
+    load("/tmp/fbt_ov1.ppm");
+    n = 0; x0 = 9999; x1 = -1; y0 = 9999; y1 = -1;
+    for (y = 0; y < PPMH; y++)
+        for (x = 0; x < PPMW; x++) {
+            at(x, y, &r, &g, &b);
+            if (r > 80) {
+                n++;
+                if (x < x0) x0 = x; if (x > x1) x1 = x;
+                if (y < y0) y0 = y; if (y > y1) y1 = y;
+            }
+        }
+    ckr(x1 - x0 + 1, 13, "a 0.040-wide cell is 13 px on a 320 canvas");
+    ck(n > 150 && n < 280, "and a 0.056-tall cell is roughly 13x13");
+    /* cy = 0.5 IS THE TOP OF THE SCREEN, because +y is up in NDC and
+     * down in a row. The first version of this check probed the
+     * middle of the canvas and called it a failure; the cell was
+     * exactly where it was asked to be, 60 pixels from the top. A test
+     * that reports a device bug because it probed the wrong pixel is
+     * worse than no test, so the probe is derived from the record. */
+    at((x0 + x1) / 2, (y0 + y1) / 2, &r, &g, &b);
+    ck(is_colour(r, g, b, 107, 107, 120),
+       "a bare (unlettered) record IS a quad, at the game's own colour");
+
+    /* PERSISTENT: the layer survives a frame that writes no overlay */
+    fb_clear(0xFF204080);
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov2.ppm");
+    load("/tmp/fbt_ov2.ppm");
+    at((x0 + x1) / 2, (y0 + y1) / 2, &r, &g, &b);
+    ck(is_colour(r, g, b, 107, 107, 120),
+       "the layer persists into the next frame, over the NEW world");
+    at(10, 200, &r, &g, &b);
+    ck(is_colour(r, g, b, 32, 64, 128),
+       "and the new world shows where the layer is transparent");
+
+    /* ERASE really erases, and only where it says.
+     *
+     * The erase is the SAME size as the cell (CELL_W/CELL_H), so it
+     * clears the cell outright and leaves its neighbours alone — which
+     * is the property that matters, because the game's rm[] arrays
+     * erase one radar square and redraw it. An erase of 0.016 was
+     * tried first and covers only a third of the cell's width (w is the
+     * FULL extent, so 0.016 of a 320 canvas is 5 px of 13), which left
+     * the centre pixel red and read as a device that ignored the
+     * record.
+     *
+     * AND THE FRAME IS CLEARED FIRST, which is the game's own order
+     * (draw_hud_canvas: clear the world, then write the layer, then
+     * present) and which the first version of this check omitted. It
+     * still left the world as the PREVIOUS frame's colour, so "what
+     * shows through the hole" was 32 64 128 from an earlier frame
+     * rather than from this one — and the check failed against a
+     * device that had erased the cell exactly as asked. */
+    fb_clear(0xFF204080);
+    fb_overlay("E 0.0 0.5 0.040 0.056\n");
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov3.ppm");
+    load("/tmp/fbt_ov3.ppm");
+    at((x0 + x1) / 2, (y0 + y1) / 2, &r, &g, &b);
+    ck(is_colour(r, g, b, 32, 64, 128),
+       "an E record lets the CURRENT frame's world show through");
+    /* the erase cleared the cell, so a NEIGHBOUR cell drawn beside it
+     * is what shows it did not simply wipe the layer */
+    fb_clear(0xFF204080);
+    fb_overlay("0.10 0.5 0.040 0.056 0.42 0.42 0.47\n");
+    fb_overlay("E 0.0 0.5 0.040 0.056\n");
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov3b.ppm");
+    load("/tmp/fbt_ov3b.ppm");
+    at((x0 + x1) / 2, (y0 + y1) / 2, &r, &g, &b);
+    ck(is_colour(r, g, b, 32, 64, 128), "the erased cell is the world");
+    /* the neighbour's own position, not a hard-coded one: cx=0.10 maps
+     * to x=176, and a guessed 192 is outside the cell and black — which
+     * reads as "the erase wiped too much" when it wiped exactly as
+     * asked */
+    at(176, 60, &r, &g, &b);
+    ck(is_colour(r, g, b, 107, 107, 120),
+       "and the neighbouring cell is untouched (a partial redraw)");
+
+    /* A R RECORD IS A ROTATED QUAD, and the rotation is real: a bar
+     * rotated 90 degrees is TALL and NARROW, where unrotated it is wide
+     * and short. The gun is drawn at 30 degrees and is visibly tilted. */
+    fb_open(320, 240);
+    fb_clear(0xFF000000);
+    fb_overlay("R 0 0 0.4 0.1 90 1 0 0\n");
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov4.ppm");
+    load("/tmp/fbt_ov4.ppm");
+    x0 = 9999; x1 = -1; y0 = 9999; y1 = -1; n = 0;
+    for (y = 0; y < PPMH; y++)
+        for (x = 0; x < PPMW; x++) {
+            at(x, y, &r, &g, &b);
+            if (r > 80) {
+                n++;
+                if (x < x0) x0 = x; if (x > x1) x1 = x;
+                if (y < y0) y0 = y; if (y > y1) y1 = y;
+            }
+        }
+    ck((x1 - x0) < (y1 - y0),
+       "a bar rotated 90 degrees is TALLER than it is wide");
+    ck((y1 - y0) > 100, "and about as long as it was wide (0.4*320 = 128)");
+
+    /* THE FLASH LAYER IS GONE AFTER THE PRESENT: the game writes the
+     * muzzle flash only while it is lit and simply stops, so a flash
+     * that lingers hangs on a static scene forever. */
+    fb_open(320, 240);
+    fb_clear(0xFF000000);
+    fb_overlay_flash("R 0 0 0.2 0.2 0 1 1 0\n");
+    /* the flash is in the layer now, BEFORE any present can clear it —
+     * which is the only moment its presence is observable at all */
+    ckr(fb_overlay_layer_alpha(1, 160, 120), 255,
+        "a written flash is in the FLASH layer, not the persistent one");
+    /* 0, not -1: an earlier check in this function has already drawn
+     * into the persistent layer, so it EXISTS and is transparent here.
+     * A flash writing into it would be opaque here, which is what the
+     * check is for. */
+    ckr(fb_overlay_layer_alpha(0, 160, 120), 0,
+        "and the persistent layer is untouched by a flash");
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov5.ppm");
+    load("/tmp/fbt_ov5.ppm");
+    at(160, 120, &r, &g, &b);   /* cx=cy=0 IS the centre */
+    ck(is_colour(r, g, b, 255, 255, 0),
+       "a flash record shows on the frame it is written");
+    fb_clear(0xFF000000);
+    fb_present();
+    fb_dump_ppm("/tmp/fbt_ov6.ppm");
+    load("/tmp/fbt_ov6.ppm");
+    at(160, 120, &r, &g, &b);
+    ck(is_colour(r, g, b, 0, 0, 0),
+       "and it is gone on the next frame with no flash written");
+
+    /* A NEW SURFACE IS A NEW HUD, and the FLASH is part of that. A game
+     * that restarts on a new level re-opens, and a flash layer that
+     * outlived the re-open would hang the new level's first frame on the
+     * old one's muzzle flash. fb_open drops both layers; this is the
+     * check for the flash half specifically, because a surviving
+     * PERSISTENT layer is invisible (it is supposed to persist) and only
+     * the transient one shows the bug. */
+    fb_open(320, 240);
+    fb_clear(0xFF000000);
+    fb_overlay_flash("R 0 0 0.2 0.2 0 1 1 0\n");
+    fb_present();
+    fb_open(320, 240);          /* the restart */
+    /* -1 IS THE RIGHT ANSWER HERE, and the distinction matters: it means
+     * there is no layer at all, as opposed to a layer whose pixels are
+     * transparent. Both render the same, so a check that only looked at
+     * the frame could not tell a dropped layer from a cleared one — and
+     * "a new level must not inherit the old one's HUD" is about the
+     * layer's EXISTENCE. */
+    ckr(fb_overlay_alpha(160, 120), -1,
+        "a re-open drops the LAYER, so a new level starts with no HUD");
+    ckr(fb_overlay_layer_alpha(1, 160, 120), -1,
+        "and drops the FLASH layer too, which is the one that would show");
+
+}
+
 int main(void) {
     printf("== fbdev tests ==\n");
     t_clear();
@@ -767,6 +976,7 @@ int main(void) {
     t_projection();
     t_short_record();
     t_frag();
+    t_overlay();
     printf("== %d checks, %d failures ==\n", checks, fails);
     return fails ? 1 : 0;
 }

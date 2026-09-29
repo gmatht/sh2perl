@@ -121,6 +121,57 @@ void fb_frag_color(int texidx, int shade, int tr, int tg, int tb,
 /* Present the frame: copy RAM -> /dev/fb0 when a real device is open
  * (fb_flush does it lazily on close for the RAM path, so this is the
  * explicit "frame done" call). Returns 0 on success. */
+/* ── the 2D overlay: the HUD layer, which is NOT the 3D scene ────────
+ *
+ * The game's HUD is a SEPARATE surface composited over the world at
+ * every swap, and it is a persistent one: the radar base, the viewmodel
+ * gun and the instruction text are drawn ONCE into it, and a per-frame
+ * record only updates what changed. That is why the original carries
+ * rm[] arrays of the last drawn cell per radar square and erases only
+ * the squares that moved — erasing the whole layer every frame would be
+ * a full re-upload, and the game's own comments say so.
+ *
+ * So the layer is an RGBA buffer with a real ALPHA channel, and the
+ * erase record is not a background colour: it sets alpha 0, which is
+ * what lets the world show through. An overlay with no alpha is a
+ * rectangle of paint, and every partial redraw in the game would have
+ * to be redone in full.
+ *
+ * THE PAYLOAD IS THE GAME'S OWN MINI-LANGUAGE, unchanged. It is four
+ * record types on separate lines, transcribed from the game's writes to
+ * /dev/webgl/hud:
+ *
+ *   R cx cy w h deg r g b [a]   a rotated quad, optionally alpha'd
+ *   E cx cy w h                 erase: alpha 0, the world shows through
+ *   I cx cy w h texidx          a label texture, unrotated
+ *   T cx cy w r g b deg a       a texture, rotated, tinted, alpha'd
+ *
+ * cx/cy are in NDC (-1..1, +y up) and w/h are in MILLI on the LONG
+ * axis, which is why the game runs the first three through fmt_ndc and
+ * the fourth through fmt_pos. w is a FRACTION, not a width in pixels:
+ * 0.042 is the radar's triangle, and 1.0 is the full width of the
+ * canvas. Getting that wrong makes every HUD element the size of the
+ * screen, which is a spectacular failure rather than a subtle one. */
+void fb_overlay(const char *payload);
+
+/* The alpha of one PERSISTENT layer pixel, right now. See fbdev.c: the
+ * flash layer is cleared as it composites, so its state cannot be read
+ * back from a presented frame — a frame is black whether the layer
+ * survived or not, and a check that reads the frame passes against a
+ * device that kept it. */
+int  fb_overlay_alpha(int x, int y);
+
+/* The same for the FLASH layer (which = 1). A flash that outlives a
+ * re-open hangs the new level's first frame on the old level's muzzle
+ * flash, and it is invisible in a presented frame because the flash is
+ * cleared as it composites — so the check has to read the layer. */
+int  fb_overlay_layer_alpha(int which, int x, int y);
+
+/* The transient muzzle flash: drawn OVER the persistent layer and
+ * cleared at every swap, so the game writes it only while it is alive
+ * and simply stops writing it when it expires. Same record types. */
+void fb_overlay_flash(const char *payload);
+
 /* Present the frame. Copies RAM -> the fbwin window when one is open
  * (that is the display for a box with no /dev/fb0); a no-op on a real
  * framebuffer, where the draws already landed in the mapping. Returns

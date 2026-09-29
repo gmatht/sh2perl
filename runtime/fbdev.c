@@ -350,6 +350,467 @@ void fb_frag_color(int texidx, int shade, int tr, int tg, int tb,
                outr, outg, outb);
 }
 
+/* ── the 2D overlay: the HUD layer ──────────────────────────────────
+ *
+ * A SEPARATE, PERSISTENT RGBA surface, composited over the world at
+ * present. See fbdev.h for the payload grammar and for why it has an
+ * alpha channel at all (the erase record sets alpha 0, which is what
+ * lets the world show through and what makes the game's per-cell
+ * partial redraw possible).
+ *
+ * NOT A SECOND PIXEL BUFFER OF COLOUR. A layer without alpha is a sheet
+ * of paint: the radar's base, the gun and the text would all have to be
+ * redrawn every frame, because there is no way to take one back out.
+ * The original's rm[] arrays — "the last cell drawn in each radar
+ * square" — only make sense against a layer you can erase. */
+static uint8_t *O_ov;            /* w*h*4, RGBA, alpha meaningful */
+static uint8_t *O_flash;         /* transient overlay, cleared at present */
+static int      O_w, O_h;        /* the layer's size, the surface's */
+static int      O_have;
+
+static void ov_alloc(int w, int h) {
+    size_t n;
+    if (O_have && O_w == w && O_h == h) return;
+    free(O_ov);
+    free(O_flash);
+    n = (size_t)w * (size_t)h;
+    O_ov    = (uint8_t *)calloc(n, 4);
+    O_flash = (uint8_t *)calloc(n, 4);
+    O_w = w;
+    O_h = h;
+    O_have = (O_ov && O_flash);
+    /* fb_open RESET THE SURFACE and every overlay went with it. The
+     * layer is sized on first use, so a re-open at a different size
+     * freed it — which is right — but the suite's re-opens at the SAME
+     * size did not, and a layer that survives a re-open is a layer that
+     * also survives a game restarting on a new level, carrying the old
+     * level's radar with it. fb_open drops it: a new surface is a new
+     * HUD. */
+}
+
+/* NDC (-1..1, +y up) -> pixel. +y is up in NDC and down in a row. */
+static void ndc_to_px(double cx, double cy, int *px, int *py) {
+    *px = (int)((cx * 0.5 + 0.5) * S_w);
+    *py = (int)((0.5 - cy * 0.5) * S_h);
+}
+
+/* The four corners of an overlay record's rectangle, rotated about its
+ * centre by `deg` DEGREES. The game writes the gun and the radar's
+ * player triangle tilted, and a rotated axis-aligned rectangle is not a
+ * rotated one unless the rotation is applied to the corners. */
+static void ov_corners(double cx, double cy, double wfrac, double hfrac,
+                       double deg, int *out) {
+    double hw, hh, rad, ca, sa, dx, dy;
+    int i;
+    int px, py;
+    ndc_to_px(cx, cy, &px, &py);
+    /* w and h are the FULL extents as a FRACTION of the canvas, not
+     * half-extents. The game's own numbers decide it: the radar is 16
+     * cells wide at CELL_W = 0.040, and 16 * 0.040 = 0.64 — a radar
+     * that covers 64% of the screen's width, which is what the game
+     * draws. Read as a half-extent the same 16 cells would be 1.28
+     * screens wide and every one of them would run off the right edge.
+     *
+     * So the size is `frac * S_w` across, and the corners are
+     * centre +/- half of THAT. This is the one field whose meaning
+     * cannot be guessed from its name: a half-extent reading is
+     * self-consistent and draws a plausible-looking, twice-as-large
+     * HUD, and the difference is only visible by counting cells. */
+    hw = wfrac * S_w * 0.5;
+    hh = hfrac * S_h * 0.5;
+    rad = deg * 3.14159265358979323846 / 180.0;
+    ca = cos(rad);
+    sa = sin(rad);
+    for (i = 0; i < 4; i++) {
+        double sx = (i == 0 || i == 3) ? -1.0 : 1.0;
+        double sy = (i < 2) ? -1.0 : 1.0;
+        dx = sx * hw;
+        dy = sy * hh;
+        /* ROUND, DO NOT TRUNCATE, and keep the corners in doubles.
+         *
+         * Truncating towards zero put the far corner of a 12.8px-wide
+         * cell at 6 and the near one at -6 in opposite directions (a
+         * C cast truncates toward zero, not down), so the quad was 13
+         * px wide instead of 12.8's 12 or 13 and a 16-cell radar did
+         * not add up. The truncation is also a half-plane test
+         * boundary: a corner moved inward by a whole pixel claims a
+         * pixel the shape does not cover. */
+        {
+            double ex = px + dx * ca - dy * sa;
+            double ey = py + dx * sa + dy * ca;
+            out[i*2]   = (int)(ex < 0 ? ex - 0.5 : ex + 0.5);
+            out[i*2+1] = (int)(ey < 0 ? ey - 0.5 : ey + 0.5);
+        }
+    }
+}
+
+/* Coverage of a pixel by the rotated quad, by the same half-plane test
+ * the 3D rasterizer uses, so the two agree on what a pixel centre
+ * means. */
+static int ov_covers(int ax, int ay, int bx, int by, int px, int py) {
+    return (double)(bx - ax) * (py - ay) - (double)(by - ay) * (px - ax) >= 0.0;
+}
+
+/* Blit a solid quad into a layer. `a` is 0..255 and is COMBINED with
+ * what is already there: a translucent HUD element over a translucent
+ * one must not simply replace the first, or the radar's ring and core —
+ * drawn as two R records over the same square — would lose the ring. */
+static void ov_fill(uint8_t *layer, const int *corners,
+                    int r, int g, int b, int a) {
+    int minx = corners[0], maxx = corners[0], miny = corners[1], maxy = corners[1];
+    int x, y, i;
+    for (i = 1; i < 4; i++) {
+        if (corners[i*2]   < minx) minx = corners[i*2];
+        if (corners[i*2]   > maxx) maxx = corners[i*2];
+        if (corners[i*2+1] < miny) miny = corners[i*2+1];
+        if (corners[i*2+1] > maxy) maxy = corners[i*2+1];
+    }
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > S_w - 1) maxx = S_w - 1;
+    if (maxy > S_h - 1) maxy = S_h - 1;
+    if (a <= 0) return;
+    for (y = miny; y <= maxy; y++) {
+        for (x = minx; x <= maxx; x++) {
+            double pxd = x + 0.5, pyd = y + 0.5;
+            size_t o;
+            if (!ov_covers(corners[0], corners[1], corners[2], corners[3], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[2], corners[3], corners[4], corners[5], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[4], corners[5], corners[6], corners[7], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[6], corners[7], corners[0], corners[1], (int)pxd, (int)pyd)) continue;
+            o = ((size_t)y * S_w + x) * 4;
+            if (a == 255) {
+                layer[o] = (uint8_t)r; layer[o+1] = (uint8_t)g;
+                layer[o+2] = (uint8_t)b; layer[o+3] = 255;
+            } else {
+                /* source-over, in integer, with the divide the compositing
+                 * actually needs: out = src*a + dst*(255-a) over 255. */
+                int ia = 255 - a;
+                layer[o]   = (uint8_t)((r * a + layer[o]   * ia) / 255);
+                layer[o+1] = (uint8_t)((g * a + layer[o+1] * ia) / 255);
+                layer[o+2] = (uint8_t)((b * a + layer[o+2] * ia) / 255);
+                layer[o+3] = (uint8_t)(a + layer[o+3] * ia / 255);
+            }
+        }
+    }
+}
+
+/* Set alpha 0 over a rectangle. NOT a background colour: this is what
+ * makes the world's pixels visible again underneath. */
+/* cx AND cy ARE NDC DOUBLES, and taking them as ints moved the erase
+ * to the wrong place. `cy = 0.5` is a legal and used NDC position — it
+ * is the TOP HALF of the screen, which is where the game's radar sits —
+ * and an int parameter truncated it to 0, putting the erase in the exact
+ * centre. The erase then covered empty space, the HUD cell it was
+ * supposed to clear stayed, and the device looked like it was ignoring
+ * the record.
+ *
+ * A C compiler will happily convert a double to an int parameter with
+ * no diagnostic, and the result is a plausible-looking wrong position
+ * rather than a build failure, so this is worth stating: every
+ * coordinate in the overlay payload is a double. */
+static void ov_erase_rect(uint8_t *layer, double cx, double cy,
+                          double wfrac, double hfrac) {
+    int corners[8], x, y, minx, maxx, miny, maxy, i;
+    ov_corners(cx, cy, wfrac, hfrac, 0.0, corners);
+    minx = maxx = corners[0];
+    miny = maxy = corners[1];
+    for (i = 1; i < 4; i++) {
+        if (corners[i*2]   < minx) minx = corners[i*2];
+        if (corners[i*2]   > maxx) maxx = corners[i*2];
+        if (corners[i*2+1] < miny) miny = corners[i*2+1];
+        if (corners[i*2+1] > maxy) maxy = corners[i*2+1];
+    }
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > S_w - 1) maxx = S_w - 1;
+    if (maxy > S_h - 1) maxy = S_h - 1;
+    for (y = miny; y <= maxy; y++)
+        for (x = minx; x <= maxx; x++)
+            layer[((size_t)y * S_w + x) * 4 + 3] = 0;
+    fprintf(stderr, "DBG ERASED minx=%d maxx=%d miny=%d maxy=%d; now at (160,60) a=%d r=%d\n",
+            minx,maxx,miny,maxy, layer[((size_t)60*S_w+160)*4+3], layer[((size_t)60*S_w+160)*4]);
+}
+
+/* Blit a TEXTURE into the layer, unrotated (the I record). The game's
+ * label textures are name banners; the texidx is its slot in the
+ * texture table, which is the same table fb_texture fills. */
+static void ov_image(uint8_t *layer, double cx, double cy,
+                   double wfrac, double hfrac, int texidx) {
+    const Tex *t;
+    int corners[8], x, y, minx, maxx, miny, maxy, i;
+    if (texidx < 0 || texidx >= T_n || !T_tex[texidx].used) return;
+    t = &T_tex[texidx];
+    ov_corners(cx, cy, wfrac, hfrac, 0.0, corners);
+    minx = maxx = corners[0];
+    miny = maxy = corners[1];
+    for (i = 1; i < 4; i++) {
+        if (corners[i*2]   < minx) minx = corners[i*2];
+        if (corners[i*2]   > maxx) maxx = corners[i*2];
+        if (corners[i*2+1] < miny) miny = corners[i*2+1];
+        if (corners[i*2+1] > maxy) maxy = corners[i*2+1];
+    }
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > S_w - 1) maxx = S_w - 1;
+    if (maxy > S_h - 1) maxy = S_h - 1;
+    for (y = miny; y <= maxy; y++) {
+        for (x = minx; x <= maxx; x++) {
+            double pxd = x + 0.5, pyd = y + 0.5;
+            size_t o;
+            int tu, tv;
+            if (!ov_covers(corners[0], corners[1], corners[2], corners[3], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[2], corners[3], corners[4], corners[5], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[4], corners[5], corners[6], corners[7], (int)pxd, (int)pyd)) continue;
+            if (!ov_covers(corners[6], corners[7], corners[0], corners[1], (int)pxd, (int)pyd)) continue;
+            tu = (x - corners[0]) * t->size / (corners[2] - corners[0] ? corners[2] - corners[0] : 1);
+            tv = (y - corners[1]) * t->size / (corners[3] - corners[1] ? corners[3] - corners[1] : 1);
+            if (tu < 0) tu = 0;
+            if (tv < 0) tv = 0;
+            if (tu >= t->size) tu = t->size - 1;
+            if (tv >= t->size) tv = t->size - 1;
+            o = ((size_t)y * S_w + x) * 4;
+            {
+                size_t to = ((size_t)tv * t->size + tu) * 4;
+                int a = t->px[to+3];
+                if (a == 0) continue;          /* transparent texel: draw nothing */
+                if (a == 255) {
+                    layer[o] = t->px[to]; layer[o+1] = t->px[to+1];
+                    layer[o+2] = t->px[to+2]; layer[o+3] = 255;
+                } else {
+                    int ia = 255 - a;
+                    layer[o]   = (uint8_t)((t->px[to]   * a + layer[o]   * ia) / 255);
+                    layer[o+1] = (uint8_t)((t->px[to+1] * a + layer[o+1] * ia) / 255);
+                    layer[o+2] = (uint8_t)((t->px[to+2] * a + layer[o+2] * ia) / 255);
+                    layer[o+3] = (uint8_t)(a + layer[o+3] * ia / 255);
+                }
+            }
+        }
+    }
+}
+
+/* the overlay layer, composited over the RAM surface at present */
+static void ov_composite(void) {
+    size_t i, n;
+    fprintf(stderr, "DBG COMPOSITE O_ov=%p S_w=%d\n", (void*)O_ov, S_w);
+    if (!O_have) return;
+    n = (size_t)S_w * (size_t)S_h;
+    for (i = 0; i < n; i++) {
+        int a = O_ov[i*4+3];
+        if (a == 0) continue;
+        if (a == 255) {
+            S_px[i] = 0xFF000000u | ((uint32_t)O_ov[i*4] << 16)
+                   | ((uint32_t)O_ov[i*4+1] << 8) | (uint32_t)O_ov[i*4+2];
+        } else {
+            uint32_t d = S_px[i] & 0x00FFFFFFu;
+            int ia = 255 - a;
+            int r = (O_ov[i*4]   * a + (int)((d >> 16) & 0xFF) * ia) / 255;
+            int g = (O_ov[i*4+1] * a + (int)((d >>  8) & 0xFF) * ia) / 255;
+            int b = (O_ov[i*4+2] * a + (int)( d        & 0xFF) * ia) / 255;
+            S_px[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+    /* the flash layer goes over the persistent one and is GONE after
+     * this: the game writes it only while the muzzle is lit and simply
+     * stops, so a stale flash would hang on a static scene. */
+    for (i = 0; i < n; i++) {
+        int a = O_flash[i*4+3];
+        if (a == 0) continue;
+        if (a == 255) {
+            S_px[i] = 0xFF000000u | ((uint32_t)O_flash[i*4] << 16)
+                   | ((uint32_t)O_flash[i*4+1] << 8) | (uint32_t)O_flash[i*4+2];
+        } else {
+            uint32_t d = S_px[i] & 0x00FFFFFFu;
+            int ia = 255 - a;
+            int r = (O_flash[i*4]   * a + (int)((d >> 16) & 0xFF) * ia) / 255;
+            int g = (O_flash[i*4+1] * a + (int)((d >>  8) & 0xFF) * ia) / 255;
+            int b = (O_flash[i*4+2] * a + (int)( d        & 0xFF) * ia) / 255;
+            S_px[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+        O_flash[i*4+3] = 0;
+    }
+}
+
+/* ── the payload parsers ─────────────────────────────────────────── */
+
+/* Parse and apply one overlay payload into `layer`. The record type is
+ * the FIRST CHARACTER and the fields are whitespace separated, so this
+ * is a per-line switch rather than a field count: an R record has
+ * eight or nine numbers, an I record five and an E record four, and
+ * deciding on a count is how a parser ends up desynchronising and
+ * drawing a gun where a radar cell should be.
+ *
+ * A record this device does not know is REPORTED and skipped, not
+ * guessed at: a HUD that is silently wrong in an unknown shape is a HUD
+ * nobody can debug, and the game's own payload is the only thing that
+ * should ever arrive here. */
+static void ov_apply(int which, const char *payload) {
+    const char *p = payload;
+    uint8_t *layer;
+    if (!p || !S_px) return;
+    ov_alloc(S_w, S_h);
+    if (!O_have) return;
+    layer = which ? O_flash : O_ov;
+    if (!layer) return;
+    for (;;) {
+        double v[10];
+        int n = 0;
+        char kind;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) return;
+        kind = *p++;
+        /* A BARE NUMBER IS A RECORD TOO, and this is the payload's one
+         * piece of grammar that is not a letter. draw_rect — which is
+         * the radar, the digits, the text and every other axis-aligned
+         * element — appends `cx cy w h r g b [a]` with NO type letter,
+         * because on the WebGL path a payload with no letter IS a quad
+         * and the letter is only needed for the shapes that are not.
+         *
+         * The first version of this parser only knew R/E/I/T and
+         * reported every bare record as unknown, which drew the gun and
+         * the flash and NOTHING ELSE: an empty radar and no digits,
+         * which looks like a game with no HUD rather than like a
+         * parser with a gap. Every record type is listed below, and
+         * the count of fields is what distinguishes them. */
+        if (kind == 'R' || kind == 'E' || kind == 'I' || kind == 'T') {
+            int max = (kind == 'R') ? 9 : (kind == 'T' ? 9 : 5);
+            while (n < max) {
+                char *end;
+                double d;
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p || *p == '\n' || *p == '\r') break;
+                d = strtod(p, &end);
+                if (end == p) break;
+                v[n++] = d;
+                p = end;
+            }
+        } else if ((kind >= '0' && kind <= '9') || kind == '-' || kind == '+'
+                   || kind == '.') {
+            /* a bare quad: the first number starts here */
+            p--;
+            n = 0;
+            while (n < 8) {
+                char *end;
+                double d;
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p || *p == '\n' || *p == '\r') break;
+                d = strtod(p, &end);
+                if (end == p) break;
+                v[n++] = d;
+                p = end;
+            }
+            if (n >= 7) {
+                int corners[8];
+                int a = (n >= 8) ? (int)(v[7] * 255.0 + 0.5) : 255;
+                int r = (int)(v[4] * 255.0 + 0.5);
+                int g = (int)(v[5] * 255.0 + 0.5);
+                int b = (int)(v[6] * 255.0 + 0.5);
+                ov_corners(v[0], v[1], v[2], v[3], 0.0, corners);
+                ov_fill(layer, corners, r, g, b, a);
+            }
+        } else {
+            fprintf(stderr, "fb_overlay: unknown record type '%c'"
+                            " (expected a bare quad, R, E, I or T); skipped\n",
+                    kind);
+        }
+        if (kind == 'R' && n >= 8) {
+            int corners[8];
+            int a = (n >= 9) ? (int)(v[8] * 255.0 + 0.5) : 255;
+            int r = (int)(v[5] * 255.0 + 0.5);
+            int g = (int)(v[6] * 255.0 + 0.5);
+            int b = (int)(v[7] * 255.0 + 0.5);
+            ov_corners(v[0], v[1], v[2], v[3], v[4], corners);
+            ov_fill(layer, corners, r, g, b, a);
+        } else if (kind == 'E' && n >= 4) {
+            fprintf(stderr, "DBG E which=%d layer=%p O_ov=%p S_w=%d\n", which, (void*)layer, (void*)O_ov, S_w);
+            ov_erase_rect(layer, v[0], v[1], v[2], v[3]);
+        } else if (kind == 'I' && n >= 5) {
+            ov_image(layer, v[0], v[1], v[2], v[3], (int)v[4]);
+        } else if (kind == 'T' && n >= 9) {
+            /* a rotated, tinted, alpha'd TEXTURE: the radar's player
+             * triangle, which the game draws from a glyph texture at
+             * the player's own heading */
+            int corners[8];
+            int a = (int)(v[8] * 255.0 + 0.5);
+            const Tex *t;
+            int texidx = -1, i, minx, maxx, miny, maxy, x, y;
+            for (i = 0; i < T_n; i++)
+                if (T_tex[i].used) { texidx = i; break; }
+            if (texidx < 0) goto next;
+            t = &T_tex[texidx];
+            ov_corners(v[0], v[1], v[2], v[2] * (double)S_h / (double)(S_w ? S_w : 1),
+                       v[7], corners);
+            minx = maxx = corners[0];
+            miny = maxy = corners[1];
+            for (i = 1; i < 4; i++) {
+                if (corners[i*2]   < minx) minx = corners[i*2];
+                if (corners[i*2]   > maxx) maxx = corners[i*2];
+                if (corners[i*2+1] < miny) miny = corners[i*2+1];
+                if (corners[i*2+1] > maxy) maxy = corners[i*2+1];
+            }
+            if (minx < 0) minx = 0;
+            if (miny < 0) miny = 0;
+            if (maxx > S_w - 1) maxx = S_w - 1;
+            if (maxy > S_h - 1) maxy = S_h - 1;
+            for (y = miny; y <= maxy; y++) {
+                for (x = minx; x <= maxx; x++) {
+                    double pxd = x + 0.5, pyd = y + 0.5;
+                    size_t o, to;
+                    int tu, tv, ia, tr, tg, tb;
+                    if (!ov_covers(corners[0], corners[1], corners[2], corners[3], (int)pxd, (int)pyd)) continue;
+                    if (!ov_covers(corners[2], corners[3], corners[4], corners[5], (int)pxd, (int)pyd)) continue;
+                    if (!ov_covers(corners[4], corners[5], corners[6], corners[7], (int)pxd, (int)pyd)) continue;
+                    if (!ov_covers(corners[6], corners[7], corners[0], corners[1], (int)pxd, (int)pyd)) continue;
+                    tu = (x - corners[0]) * t->size / (corners[2] - corners[0] ? corners[2] - corners[0] : 1);
+                    tv = (y - corners[1]) * t->size / (corners[3] - corners[1] ? corners[3] - corners[1] : 1);
+                    if (tu < 0) tu = 0;
+                    if (tv < 0) tv = 0;
+                    if (tu >= t->size) tu = t->size - 1;
+                    if (tv >= t->size) tv = t->size - 1;
+                    o = ((size_t)y * S_w + x) * 4;
+                    to = ((size_t)tv * t->size + tu) * 4;
+                    tr = t->px[to]   * (int)v[3] / 255;
+                    tg = t->px[to+1] * (int)v[4] / 255;
+                    tb = t->px[to+2] * (int)v[5] / 255;
+                    ia = 255 - a;
+                    layer[o]   = (uint8_t)((tr * a + layer[o]   * ia) / 255);
+                    layer[o+1] = (uint8_t)((tg * a + layer[o+1] * ia) / 255);
+                    layer[o+2] = (uint8_t)((tb * a + layer[o+2] * ia) / 255);
+                    layer[o+3] = (uint8_t)(a + layer[o+3] * ia / 255);
+                }
+            }
+        }
+next:
+        /* to the next LINE, so one bad record cannot desynchronise the
+         * rest of a HUD frame into nonsense */
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        else return;
+    }
+}
+
+void fb_overlay(const char *payload) { ov_apply(0, payload); }
+void fb_overlay_flash(const char *payload) { ov_apply(1, payload); }
+
+/* The alpha of one layer pixel, as the layer holds it RIGHT NOW.
+ *
+ * The flash is cleared as it composites, so "is the flash still
+ * there?" cannot be answered by looking at a presented FRAME — it is
+ * black whether the layer survived or not, and a check that reads the
+ * frame passes against a device that kept the layer. This asks the
+ * layer itself, which is the thing whose state is in question. It is
+ * the same reason a game's own "is it still live?" question is asked of
+ * its state and not of its output. */
+int fb_overlay_alpha(int x, int y) { return fb_overlay_layer_alpha(0, x, y); }
+
+int fb_overlay_layer_alpha(int which, int x, int y) {
+    const uint8_t *L;
+    if (!O_have || x < 0 || y < 0 || x >= S_w || y >= S_h) return -1;
+    L = which ? O_flash : O_ov;
+    if (!L) return -1;
+    return L[((size_t)y * S_w + x) * 4 + 3];
+}
+
 /* ── MIMEcroft's cube geometry ──────────────────────────────────────
  * Generated VERBATIM from MIMEcroft.sh's own buffer writes:
  *   /dev/webgl/buffer/aPosition  24 verts x (x,y,z), x1000
@@ -478,6 +939,17 @@ int fb_open(int w, int h) {
         free(S_px);
         S_px = 0;
         S_opened = 0;
+    }
+    /* A NEW SURFACE IS A NEW HUD. The overlay layer is dropped on every
+     * open, not only on a resize, so a game that restarts on a new
+     * level does not carry the previous level's radar, gun and labels
+     * into the new one. (The settings menu's C-wipe is the game doing
+     * the same thing deliberately, which is what told me the layer
+     * outlives a frame.) */
+    if (O_have) {
+        free(O_ov); free(O_flash);
+        O_ov = 0; O_flash = 0;
+        O_have = 0; O_w = 0; O_h = 0;
     }
     if (S_opened) return 0;
     S_w = w;
@@ -1133,6 +1605,13 @@ int fb_present(void) {
      * Returns 1 when a blit happened, so a caller can tell a drawn
      * frame from an undrawn one without keeping its own state. */
     if (S_px) {
+        /* THE OVERLAY IS COMPOSITED HERE, and here rather than at the
+         * end of every draw call because it is a SEPARATE surface: the
+         * world is drawn first, into the RAM buffer, and the HUD goes
+         * over it once per presented frame. Compositing per draw call
+         * would put the HUD under the next cube, which is behind it in
+         * depth and in the payload's order. */
+        ov_composite();
         fbwin_present(S_px, S_w, S_h);
     }
     return 0;
