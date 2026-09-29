@@ -619,6 +619,7 @@ mod tests {
         let pure = prog(vec![
             IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![echo_hi()],
                 named_blocks: vec![],
             },
@@ -634,6 +635,7 @@ mod tests {
         // the definition itself is not executed).
         let redirected = prog(vec![IrStmt::Function {
             name: "f".to_string(),
+            params: vec![],
             body: vec![IrStmt::Redirect {
                 inner: vec![echo_hi()],
                 redirects: vec![],
@@ -648,6 +650,7 @@ mod tests {
         // …and a named block is part of the function.
         let named = prog(vec![IrStmt::Function {
             name: "f".to_string(),
+            params: vec![],
             body: vec![echo_hi()],
             named_blocks: vec![(
                 "end".to_string(),

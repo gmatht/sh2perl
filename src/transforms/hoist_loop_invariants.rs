@@ -104,9 +104,16 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)], loop_vars: &[Strin
     // total assigned-in-body (for loop-invariance of the candidate's reads)
     let mut assigned: HashSet<String> = HashSet::new();
     for s in body {
-        stmt_writes(s, &mut assigned);
+        if std::env::var("SH2_T").is_ok() {
+            eprintln!("[hb] body stmt keys={:?}", match s {
+                IrStmt::If{..} => "If", IrStmt::Expr(_)=>"Expr", IrStmt::Exec{..}=>"Exec",
+                IrStmt::Assign{..}=>"Assign", IrStmt::While{..}=>"While", _=>"other" });
+        }
+        stmt_writes(s, &mut assigned, fns);
     }
-
+    if std::env::var("SH2_T").is_ok() {
+        eprintln!("[hb] assigned={:?}", assigned);
+    }
     let mut hoisted: Vec<IrStmt> = Vec::new();
     for (j, st) in body.iter().enumerate() {
         let (target, expr) = match st {
@@ -325,7 +332,10 @@ fn stmt_assigns(st: &IrStmt, var: &str) -> bool {
     }
 }
 
-fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>) {
+
+/// `fns` are the user-defined shell functions: a CALL to one can write
+/// any global its body assigns, so those names count as body-written.
+fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStmt>)]) {
     match st {
         IrStmt::Assign { targets, expr, .. } => {
             for t in targets {
@@ -356,6 +366,200 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.insert(n.clone());
                 }
+            }
+            // A call to a user-defined shell FUNCTION writes every global
+            // that function's body assigns — see the long note on the
+            // `Exec` arm. The call reaches the hoist in BOTH shapes: a
+            // bare command inside a loop is `IrStmt::Exec`, and a call
+            // in an expression/`if` position is `IrStmt::Expr(Call)`.
+            // The command name is `args[0]` for the `exec` lowering
+            // (a bare command in an expression position), and `func`
+            // itself for a direct call.
+            {
+                let callee: Option<String> = if func == "exec" {
+                    match args.first() {
+                        Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                        _ => None,
+                    }
+                } else {
+                    Some(func.clone())
+                };
+                if let Some(name) = callee {
+                    if let Some((_, fbody)) = fns.iter().find(|(n, _)| *n == name) {
+                        let mut inner: HashSet<String> = HashSet::new();
+                        for s2 in fbody {
+                            stmt_writes(s2, &mut inner, fns);
+                        }
+                        out.extend(inner);
+                    }
+                }
+            }
+            // `x=$1` inside a function body lowers to `getVar("x")`, so
+            // the name shows up as a call ARGUMENT rather than as an
+            // IrStmt::Assign target. Reading it here is what makes a
+            // callee's global writes visible to the hoist.
+            if matches!(func.as_str(), "getVar" | "param" | "arrayIndex") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+            }
+        }
+        // A call to a user-defined shell FUNCTION writes every global
+        // that function's body assigns. Without this the hoist is
+        // UNSOUND, and silently so — the body still looks like it only
+        // writes its own locals:
+        //
+        //     bump() { v=$1; }
+        //     while [ $i -lt 3 ]; do
+        //       bump 5
+        //       d=$(( v * 1000 ))     # hoisted: `v` looks invariant
+        //       printf '%s\n' "$d"
+        //       i=$((i+1))
+        //     done
+        //
+        // bash prints 5000 three times; the hoisted `d` kept its
+        // pre-loop value 2000, so the native printed 2000 three times.
+        // `v` is only ever written from inside `bump`, and nothing here
+        // knew that. The call is an `IrStmt::Exec` (a bare command), so
+        // the `Expr(Call)` arm above never sees it.
+        IrStmt::Exec { cmd, args, .. } => {
+            if let IrExpr::Str(name, _) = cmd {
+                if let Some((_, fbody)) = fns.iter().find(|(n, _)| n == name) {
+                    let mut inner: HashSet<String> = HashSet::new();
+                    for s2 in fbody {
+                        stmt_writes(s2, &mut inner, fns);
+                    }
+                    out.extend(inner);
+                }
+            }
+            for a in args {
+                writes_of_expr(a, out, fns);
+            }
+        }
+        // Recurse into the COMPOUND statements. Without these a call
+        // nested in a CONDITION is invisible, and `if ! step 5; then
+        // break; fi` writes through `step` exactly as `step 5` does.
+        // That is the shape MIMEcroft's game loop uses: the per-frame
+        // state (`px`, `pz`, `dyaw`) is written by a called function
+        // from inside an `if` condition, so `dpcx_ms=$((px*1000))` looked
+        // loop-invariant, ran ONCE before the loop, and the camera
+        // stayed frozen at its starting cell for the whole run (the
+        // maze drew, but 14 culled cubes differed from real bash on
+        // every frame).
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            writes_of_expr(cond, out, fns);
+            for b in then {
+                stmt_writes(b, out, fns);
+            }
+            for (_, b) in elsifs {
+                for x in b {
+                    stmt_writes(x, out, fns);
+                }
+            }
+            for b in else_ {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::While { cond, body } => {
+            writes_of_expr(cond, out, fns);
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+            writes_of_expr(cond, out, fns);
+        }
+        IrStmt::For { iter, body, .. } => {
+            writes_of_expr(iter, out, fns);
+            for b in body {
+                stmt_writes(b, out, fns);
+            }
+        }
+        IrStmt::Case { discriminant, clauses, .. } => {
+            writes_of_expr(discriminant, out, fns);
+            for c in clauses {
+                for s in &c.body {
+                    stmt_writes(s, out, fns);
+                }
+            }
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            for x in b {
+                stmt_writes(x, out, fns);
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for x in inner {
+                stmt_writes(x, out, fns);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The write set of an EXPRESSION, as far as the hoist is concerned:
+/// the store calls and user-function calls it contains. Conditions are
+/// exactly where a `step`/`apply` call hides in a game-loop body, so
+/// this path is what keeps the hoist sound there.
+fn writes_of_expr(e: &IrExpr, out: &mut HashSet<String>, fns: &[(String, Vec<IrStmt>)]) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if matches!(func.as_str(), "setVar" | "setArray" | "setArrayAppend" | "assign") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+            }
+            // the command name is `func` for a direct call and `args[0]`
+            // for the `exec` lowering of a bare command
+            let callee: Option<String> = if func == "exec" {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                    _ => None,
+                }
+            } else {
+                Some(func.clone())
+            };
+            if let Some(name) = callee {
+                if let Some((_, fbody)) = fns.iter().find(|(n, _)| *n == name) {
+                    let mut inner: HashSet<String> = HashSet::new();
+                    for s2 in fbody {
+                        stmt_writes(s2, &mut inner, fns);
+                    }
+                    out.extend(inner);
+                }
+            }
+            for a in args {
+                writes_of_expr(a, out, fns);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            writes_of_expr(lhs, out, fns);
+            writes_of_expr(rhs, out, fns);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            writes_of_expr(cond, out, fns);
+            writes_of_expr(then, out, fns);
+            writes_of_expr(else_, out, fns);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            writes_of_expr(expr, out, fns);
+            writes_of_expr(default, out, fns);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    writes_of_expr(x, out, fns);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => writes_of_expr(expr, out, fns),
+        IrExpr::Index { key, .. } => writes_of_expr(key, out, fns),
+        IrExpr::Array(items) => {
+            for it in items {
+                writes_of_expr(it, out, fns);
             }
         }
         _ => {}
@@ -850,4 +1054,114 @@ mod tests {
             panic!("expected For at index 1");
         }
     }
+
+
+    /// `step() { px=$1; }` called from a loop BODY: the assignment that
+    /// reads `px` must stay in the loop. Before the fix `px` looked
+    /// loop-invariant (nothing in the body assigns it) and the
+    /// assignment ran once before the loop, freezing the value.
+    #[test]
+    fn refuses_when_a_called_fn_in_the_body_writes_the_read_var() {
+        let fns = vec![(
+            "step".to_string(),
+            vec![assign("px", IrExpr::Str("$1".into(), StrStyle::DoubleQuoted))],
+        )];
+        let stmts = vec![
+            IrStmt::Function {
+                name: "step".to_string(),
+                params: vec![],
+                body: fns[0].1.clone(),
+                named_blocks: vec![],
+            },
+            IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "test".to_string(),
+                    args: vec![IrExpr::Str("$i -lt 3".into(), StrStyle::DoubleQuoted)],
+                },
+                body: vec![
+                    IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: vec![
+                            IrExpr::Str("step".into(), StrStyle::DoubleQuoted),
+                            IrExpr::Array(vec![IrExpr::Str("5".into(), StrStyle::DoubleQuoted)]),
+                        ],
+                    }),
+                    assign("cx", IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Var("px".to_string())),
+                        rhs: Box::new(ArithAst::Num(1000)),
+                    }))),
+                    assign("i", inc("i")),
+                ],
+            },
+        ];
+        let mut stmts = stmts;
+        transform(&mut stmts);
+        let inside = stmts.iter().any(|st| match st {
+            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
+                b,
+                IrStmt::Assign { targets, .. } if targets[0].var == "cx"
+            )),
+            _ => false,
+        });
+        assert!(inside, "cx=$(( px * 1000 )) was hoisted out of a loop whose only writer of `px` is the called function `step`");
+    }
+
+    /// Same, but the call sits in the loop's CONDITION —
+    /// `if ! step 5; then break; fi` — which is how MIMEcroft's game loop
+    /// moves the player. The condition arms must be censused too, or the
+    /// camera uniforms (`dpcx_ms=$((px*1000))`) are hoisted and the view
+    /// freezes at the starting cell.
+    #[test]
+    fn refuses_when_a_called_fn_in_the_condition_writes_the_read_var() {
+        let fns = vec![(
+            "apply".to_string(),
+            vec![assign("px", IrExpr::Str("$1".into(), StrStyle::DoubleQuoted))],
+        )];
+        let stmts = vec![
+            IrStmt::Function {
+                name: "apply".to_string(),
+                params: vec![],
+                body: fns[0].1.clone(),
+                named_blocks: vec![],
+            },
+            IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "test".to_string(),
+                    args: vec![IrExpr::Str("$i -lt 3".into(), StrStyle::DoubleQuoted)],
+                },
+                body: vec![
+                    IrStmt::If {
+                        cond: IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("apply".into(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![IrExpr::Str("5".into(), StrStyle::DoubleQuoted)]),
+                            ],
+                        },
+                        then: vec![IrStmt::Break],
+                        elsifs: vec![],
+                        else_: vec![],
+                    },
+                    assign("cx", IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Var("px".to_string())),
+                        rhs: Box::new(ArithAst::Num(1000)),
+                    }))),
+                    assign("i", inc("i")),
+                ],
+            },
+        ];
+        let mut stmts = stmts;
+        transform(&mut stmts);
+        let inside = stmts.iter().any(|st| match st {
+            IrStmt::While { body, .. } => body.iter().any(|b| matches!(
+                b,
+                IrStmt::Assign { targets, .. } if targets[0].var == "cx"
+            )),
+            _ => false,
+        });
+        assert!(inside, "cx=$(( px * 1000 )) was hoisted even though `px` is written by `apply` from the loop CONDITION");
+    }
+
 }

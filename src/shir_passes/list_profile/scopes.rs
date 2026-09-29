@@ -443,7 +443,7 @@ impl<'a> Walker<'a> {
                     }
                 });
             }
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 // nested function: its own scope (a use inside is NOT a
                 // use of the outer scope, even for same-named bindings —
                 // merging would only ever widen toward global, sound)
@@ -1040,6 +1040,7 @@ mod tests {
     fn nested_function_is_own_scope() {
         let inner = IrStmt::Function {
             name: "g".to_string(),
+            params: vec![],
             body: vec![IrStmt::Expr(IrExpr::Call {
                 func: "getVar".to_string(),
                 args: vec![word("xs")],
@@ -1061,6 +1062,7 @@ mod tests {
             },
             IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![inner],
                 named_blocks: vec![],
             },
@@ -1265,6 +1267,7 @@ mod local_decl_tests {
     fn local_decl_is_a_write_in_fn_scope() {
         let p = prog(vec![IrStmt::Function {
             name: "helper".to_string(),
+            params: vec![],
             body: vec![
                 IrStmt::Expr(IrExpr::Call {
                     func: "builtin".to_string(),

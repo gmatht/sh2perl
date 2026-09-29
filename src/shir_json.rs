@@ -307,15 +307,20 @@ fn stmt_json(s: &IrStmt) -> Value {
         }),
         IrStmt::Function {
             name,
+            params,
             body,
             named_blocks,
         } => {
-            // `named_blocks` is emitted ONLY when non-empty: bash
-            // functions never have them, so every existing emit (and
+            // `params` / `named_blocks` are emitted ONLY when non-empty:
+            // bash functions have neither, so every existing emit (and
             // the frontends' byte-identical oracles) stays byte-identical.
+            // Absent means `[]` on the read side.
             let mut m = serde_json::Map::new();
             m.insert("type".to_string(), json!("Function"));
             m.insert("name".to_string(), json!(name));
+            if !params.is_empty() {
+                m.insert("params".to_string(), json!(params));
+            }
             m.insert("body".to_string(), json!(stmts_json(body)));
             if !named_blocks.is_empty() {
                 let blocks: serde_json::Map<String, serde_json::Value> = named_blocks

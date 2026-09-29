@@ -82,10 +82,15 @@ fn pass(stmts: Vec<IrStmt>, in_fn: bool) -> (Vec<IrStmt>, bool) {
                 changed |= c;
                 out.push(IrStmt::DoWhile { body: b2, cond, until });
             }
-            IrStmt::Function { name, body, .. } => {
+            IrStmt::Function { name, params, body, .. } => {
                 let (b2, c) = pass(body, true);
                 changed |= c;
-                out.push(IrStmt::Function { name, body: b2, named_blocks: Vec::new() });
+                out.push(IrStmt::Function {
+                    name,
+                    params,
+                    body: b2,
+                    named_blocks: Vec::new(),
+                });
             }
             IrStmt::Block(v) => {
                 let (b2, c) = pass(v, in_fn);

@@ -390,6 +390,13 @@ pub struct Render {
     /// genuinely-external command when SH2_UU_FFI env is set. Never
     /// changes default (env-unset) output.
     need_uu: bool,
+    /// fb0 framebuffer device needed: emit `#include <fbdev.h>` and
+    /// direct `fb_*` calls instead of a `bash -c` shell-out site.
+    /// Without this, EVERY draw lowers to `system("bash -c 'fb_blocks
+    /// ...'")` — a fork+exec per draw call, and the fb_* commands are
+    /// not executables, so the call fails outright. Set by
+    /// `fb_call_opt` when a script names an fb_* primitive.
+    need_fb: bool,
     /// index range in self.out covering the need_sh runtime helper block
     /// (recorded at emit_runtime; trim_sh_runtime drops unreferenced
     /// helpers from it after the body is rendered)
@@ -2029,7 +2036,7 @@ fn count_stmt(st: &IrStmt, name: &str, n: &mut usize) {
                 count_expr(&r.target, name, n);
             }
         }
-        IrStmt::Function { name: fname, body, named_blocks } => {
+        IrStmt::Function { name: fname, body, named_blocks, .. } => {
             if fname == name {
                 *n += 1;
             }
@@ -7540,6 +7547,21 @@ impl Render {
                 && fvars.contains(name)
                 && self.is_heap_store_var(name)
                 && !exclude.contains(&name.as_str())
+                // NEVER free a FILE-SCOPE var here. `fvars` is "assigned
+                // in this body and not assigned at top level", which is
+                // NOT the same as "owned by this function": a var that
+                // is only ever written inside shell functions is still
+                // a single global. Freeing it on return left the global
+                // dangling, and the next caller read freed heap —
+                // measured on
+                //     get_cell() { gv=$2; a=$1; }
+                //     p() { get_cell 1 7; echo "gv=$gv a=$a"; }
+                //     p
+                // where bash prints `gv=7 a=1` and the native binary
+                // printed `gv=<garbage> a=<garbage>`. A function frees
+                // only what it declares (`local`/param aliases), and
+                // those are exactly the vars NOT hoisted to file scope.
+                && !self.site_file_vars.contains(name)
             {
                 self.emit(&format!("free({});", self.c_ident(name)));
             }
@@ -7835,6 +7857,21 @@ impl Render {
             // runtime/uu_run.c + runtime/lib/libcoreutils_ffi.so
             // (runtime/build_uu_ffi.sh).
             self.emit("#include <uu_run.h>");
+        }
+        if self.need_fb {
+            // The fb0 framebuffer device (runtime/fbdev.{h,c}). The
+            // program must be linked with fbdev.c (-I$SH2PERL/runtime
+            // and runtime/fbdev.c on the command line) — bash-O4 does
+            // that automatically when the render references <fbdev.h>.
+            self.emit("#include <fbdev.h>");
+            // The keyboard half of the same native device
+            // (runtime/fbinput.{h,c}). A SEPARATE include, and a
+            // separate link input, so a script that only draws
+            // (fb_open/fb_blocks) does not pull in the terminal and
+            // evdev code at all — fbdev.c has no input in it, and
+            // adding input to a drawing device would make every
+            // headless render depend on it.
+            self.emit("#include <fbinput.h>");
         }
         self.emit("");
         if self.need_sh {
@@ -13032,7 +13069,7 @@ fn param_copy_alias(
                 // mentioned anywhere outside F's own direct subtree?
                 let mut outside = false;
                 for st in stmts {
-                    if let IrStmt::Function { name, body, named_blocks } = st {
+                    if let IrStmt::Function { name, body, named_blocks, .. } = st {
                         if name == fname {
                             if nested_hits(body, x)
                                 || named_blocks.iter().any(|(_, b)| nested_hits(b, x))
@@ -18401,7 +18438,11 @@ fn param_copy_alias(
                 }
             }
             _ => {
-                if let Some(uu) = self.uu_run_opt(&cmd, &args) {
+                if let Some(fb) = self.fb_call_opt(&cmd, &args) {
+                    // the fb device returns 0 on success, so the shell
+                    // status is 0 (like any other successful builtin)
+                    format!("({fb}, _sh_rc = 0, _sh_rc == 0)")
+                } else if let Some(uu) = self.uu_run_opt(&cmd, &args) {
                     self.need_sh = true;
                     format!("(_sh_rc = {uu}, _sh_rc == 0)")
                 } else {
@@ -18409,6 +18450,184 @@ fn param_copy_alias(
                 }
             }
         }
+    }
+
+    /// The fb0 framebuffer device (runtime/fbdev.{h,c}).
+    ///
+    /// Why this exists: an unknown command lowers to a `bash -c` shell
+    /// site, i.e. `system("bash -c 'fb_blocks ...'")`. That is a
+    /// fork+exec PER DRAW CALL, and the fb_* names are not executables,
+    /// so the child bash fails outright ("fb_blocks: command not
+    /// found") and the frame stays empty. This hook turns the call into
+    /// a direct in-process `fb_blocks(payload)`.
+    ///
+    /// Opt-in by NAMING, not by env var: a script with no fb_* call
+    /// emits byte-identical C with or without the device linked, so
+    /// adding the device can never change an unrelated program's
+    /// output. (Same shape as the uu_run_opt hook above.)
+    ///
+    /// Conservative, like uu: no env-prefix Object arg, no glob words,
+    /// and every word must lower to exactly one C value — a draw
+    /// payload is a plain word in practice.
+    ///
+    /// ARGUMENT TYPES ARE PER-PRIMITIVE, not all-strings. A shell word
+    /// is a string, so the generic `value_c` path renders `fb_open("64",
+    /// "48")` — passing string literals to `int` parameters. That
+    /// compiles (tcc is permissive) and then silently does the wrong
+    /// thing at runtime. Each primitive declares its C signature here
+    /// and every argument goes through the matching coercion.
+    fn fb_sig(cmd: &str) -> Option<&'static [char]> {
+        // 'i' = int, 'd' = double, 's' = const char*
+        match cmd {
+            "fb_open" => Some(&['i', 'i']),           // w, h
+            "fb_clear" => Some(&['i']),                // packed ARGB
+            "fb_set_camera" => Some(&['d'; 5]),        // x, y, z, yaw, shift
+            "fb_blocks" => Some(&['s']),               // the batched payload
+            "fb_present" => Some(&[]),                 // no args
+            "fb_dump_ppm" => Some(&['s']),             // path
+            _ => None,
+        }
+    }
+
+    /// A word that is exactly ONE value in a C argument position.
+    /// Unlike `word_single_argv` this ACCEPTS `split($x)` (a variable
+    /// read, one value) and REFUSES only genuine multi-word expansions
+    /// — glob, brace, command substitution.
+    fn fb_word_one_value(w: &IrExpr) -> bool {
+        match w {
+            IrExpr::Str(..) | IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
+            IrExpr::Arith(..) => true,
+            IrExpr::Index { key, .. } => Self::fb_word_one_value(key),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(..) => true,
+                InterpPart::Expr(x) => Self::fb_word_one_value(x),
+            }),
+            IrExpr::Capture { .. } => false,
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::fb_word_one_value(lhs) && Self::fb_word_one_value(rhs)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::fb_word_one_value(cond)
+                    && Self::fb_word_one_value(then)
+                    && Self::fb_word_one_value(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                Self::fb_word_one_value(expr) && Self::fb_word_one_value(default)
+            }
+            IrExpr::Call { func, args } => match func.as_str() {
+                // multi-word in a child bash, one value here
+                "split" | "captureWords" => args.iter().all(Self::fb_word_one_value),
+                // real expansion / capture: refuse
+                "brace" | "listVar" | "arrayItems" | "pipeline" | "capture" => false,
+                _ => args.iter().all(Self::fb_word_one_value),
+            },
+            _ => false,
+        }
+    }
+
+    fn fb_call_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let sig = Self::fb_sig(cmd)?;
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+            return None;
+        }
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        if words.len() != sig.len() {
+            return None;
+        }
+        if words.iter().any(Self::word_needs_glob) {
+            return None;
+        }
+        // Device arguments are VALUES, not argv entries, so the argv
+        // rule does not apply: a `split($x)` lowering (how a bare `$x`
+        // word reaches IrExpr) expands to N words in a child bash but
+        // is exactly one value here. Reusing word_single_argv made
+        // every fb_set_camera with a variable fall back to the shell
+        // site — which is a fork+exec that cannot work, since fb_* are
+        // not executables, so the frame came out black. What must still
+        // be refused is shell-level expansion: glob, brace, and any
+        // word that lowers to a multi-word construct.
+        if words.iter().any(|w| !Self::fb_word_one_value(w)) {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (w, ty) in words.iter().zip(sig.iter()) {
+            match (ty, w) {
+                ('i', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
+                ('s', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
+                // integers: fb_open's w/h and the packed clear colour
+                // are written as plain decimal words in the script.
+                ('i', _) => parts.push(self.value_num(w)),
+                // doubles: the camera uniforms. atof-style coercion, so
+                // "0.5" and "$cy" both work.
+                ('d', _) => parts.push(format!("atof({})", self.value_c(w))),
+                ('s', IrExpr::Str(s, _)) => parts.push(Self::cstr(s)),
+                ('s', _) => parts.push(self.value_c(w)),
+                _ => return None,
+            }
+        }
+        self.need_fb = true;
+        Some(format!("{}({})", cmd, parts.join(", ")))
+    }
+
+    /// A CAPTURE of an fb_* primitive — `key=$(fb_input_line "$KEYS")` —
+    /// turned into an in-process value instead of a `bash -c` site.
+    ///
+    /// Why the capture form and not a `read` builtin lowering: a game
+    /// loop wants "the next key if there is one, else nothing", which
+    /// is exactly what a command substitution of a device call
+    /// expresses, and it is the shape the game already had
+    /// (`rk=$(head -n 1 "$KEYS")` before this device existed). Routing
+    /// it through the shell site would fork+exec a bash PER FRAME —
+    /// the device exists to remove that.
+    ///
+    /// WHY THE KEY FILE IS AN ARGUMENT, not just $FB_KEYS: a game
+    /// keeps its key queue in a shell variable, and `export` never
+    /// reaches a C device — in the emitted C an export is a plain
+    /// assignment, and nothing in the render calls setenv, so a
+    /// getenv-based device sees only the environment the process was
+    /// STARTED with. The whole program then silently got "" for every
+    /// key (0 steps in every walk) while the same script under real
+    /// bash worked. An argument keeps the value in the program's own
+    /// data, where no export plumbing can lose it.
+    ///
+    /// Signature rule: only a primitive whose RESULT is a single string
+    /// may be captured. `fb_input_line` returns the `const char *` the
+    /// device hands back, stable until the next call, which is the
+    /// lifetime a capture helper's returned buffer has. A primitive
+    /// returning `void` (fb_present) or `int` (fb_open) has no
+    /// printable value, so it is REFUSED here and stays a statement
+    /// call — a capture of it is a shell error, not a number to guess.
+    fn fb_capture_sig(cmd: &str) -> Option<&'static str> {
+        match cmd {
+            // the keyboard: the one primitive a game captures per
+            // frame. The argument is the key FILE (see above).
+            "fb_input_line" => Some("fb_input_line"),
+            _ => None,
+        }
+    }
+
+    fn fb_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
+        let call = Self::fb_capture_sig(cmd)?;
+        // exactly as fb_call_opt: no env prefix Object arg
+        if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
+            return None;
+        }
+        // exactly ONE argument, the key file, and it must be one value.
+        // A split word is fine — that is a variable read, not a glob —
+        // so fb_word_one_value is the right gate, not word_single_argv.
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
+            _ => return None,
+        };
+        if words.len() != 1 || !Self::fb_word_one_value(&words[0]) {
+            return None;
+        }
+        let path = self.value_c(&words[0]);
+        self.need_fb = true;
+        Some(format!("_sh_xstrdup({call}({path}))"))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
@@ -19747,11 +19966,22 @@ fn param_copy_alias(
         }
         // `$(uu-cmd args)` of a genuinely-external command: capture
         // in-process (no fork/exec, no bash). Single-stmt shape only.
+        // The fb device's CAPTURED primitives (the keyboard) are
+        // lowered the same way. This is the arm a real
+        // `$(fb_input_line …)` reaches: capture_call, not
+        // capture_expr. Hooking only capture_expr left every capture on
+        // the shell site — the generated C called
+        // system("bash -c 'fb_input_line …'"), a fork+exec per frame,
+        // and since fb_input_line is not an executable the child failed
+        // and the game silently never received a key.
         if let [IrExpr::Arrow(stmts)] = args {
             if let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() {
                 if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(cmd) = Self::str_arg(cargs, 0) {
                         if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                        if let Some(v) = self.fb_capture_opt(&cmd, cargs) {
                             return v;
                         }
                     }
@@ -19787,6 +20017,9 @@ fn param_copy_alias(
                 if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(cmd) = Self::str_arg(cargs, 0) {
                         if let Some(v) = self.uu_capture_opt(&cmd, cargs) {
+                            return v;
+                        }
+                        if let Some(v) = self.fb_capture_opt(&cmd, cargs) {
                             return v;
                         }
                     }
@@ -38843,6 +39076,7 @@ mod tests {
         fn fn_stmt(name: &str) -> IrStmt {
             IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body: vec![],
                 named_blocks: vec![],
             }
@@ -39056,11 +39290,13 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "tfn_a".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
                 IrStmt::Function {
                     name: "tfn_g".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
                         args: vec![
@@ -39094,6 +39330,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "tfn_g".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Expr(IrExpr::Call {
                         func: "exec".to_string(),
                         args: vec![
@@ -39111,6 +39348,7 @@ mod tests {
                 },
                 IrStmt::Function {
                     name: "tfn_a".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -39172,6 +39410,7 @@ mod tests {
     fn fn_named(name: &str, body: Vec<IrStmt>) -> IrStmt {
         IrStmt::Function {
             name: name.to_string(),
+            params: vec![],
             body,
             named_blocks: vec![],
         }
@@ -40953,6 +41192,7 @@ mod tests {
             requires: vec![],
             stmts: vec![IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body,
                 named_blocks: vec![],
             }],
@@ -41134,6 +41374,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "add".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         assign("a", "1"),
@@ -41197,6 +41438,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         IrStmt::Assign {
@@ -41259,6 +41501,7 @@ mod tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     named_blocks: vec![],
                     body: vec![
                         IrStmt::Assign {
@@ -43062,6 +43305,7 @@ mod tests {
         fn def(name: &str, body: Vec<IrStmt>) -> IrStmt {
             IrStmt::Function {
                 name: name.to_string(),
+                params: vec![],
                 body,
                 named_blocks: vec![],
             }
@@ -43101,6 +43345,7 @@ mod tests {
         // nested callee mentioning it disqualifies (observes the global).
         let nested = vec![IrStmt::Function {
             name: "g".to_string(),
+            params: vec![],
             body: vec![IrStmt::Expr(IrExpr::Var("_t".to_string(), None))],
             named_blocks: vec![],
         }];
@@ -43205,6 +43450,7 @@ mod tests {
             assign("_t", IrExpr::Int(7)),
             IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![echo_var("g")],
                 named_blocks: vec![],
             },

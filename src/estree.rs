@@ -5972,12 +5972,51 @@ fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
     }
 }
 
+/// True when `s` names a POSITIONAL parameter: `$1`..`$9` (a plain
+/// positional value) or `#1`..`#9` (its length). The frontends emit
+/// those as `getVar("1")` / `getVar("#1")` rather than as a
+/// `sh2.positional` member read, so the direct-call pass has to see them
+/// too — otherwise it drops the positional bridge and the body reads
+/// positionals off the caller's (empty) frame.
+fn is_positional_name(s: &str) -> bool {
+    let rest = s.strip_prefix('#').unwrap_or(s);
+    matches!(rest, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
 fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
     match e {
         Expr::MemberExpression { object, property, computed: false, .. }
             if is_ident_expr(object, "sh2") && is_ident_expr(property, "positional") =>
         {
             *pos_refs = true;
+        }
+        // `sh2.getVar("1")` / `sh2.getVar("#1")` — a positional value /
+        // length read in the getVar convention.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "getVar")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
+        }
+        // `sh2.param(op, "1", …)` — a positional slice/len/case-op read
+        // addressed BY NUMBER rather than by a live binding.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "param")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.get(1) {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -6057,6 +6096,121 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    /// Lower an A1 body to estree and run `direct_shell_fn_calls` on it,
+    /// reporting whether the positional bridge survived.
+    ///
+    /// This is the pass boundary the request names. A frontend (go-sh's
+    /// `len($1)`, any raw A1 producer) emits positional reads as
+    /// `getVar("1")` / `param("len","1")`; if the A1→estree lowering has
+    /// NOT already turned those into a `sh2.positional` member read, the
+    /// direct-call rewrite must not drop the bridge — otherwise the body
+    /// reads the CALLER's positional frame and the argument is dropped.
+    ///
+    /// The pass is driven directly (not through `compile_head_passes`)
+    /// because the earlier `normalize_functions` pass rewrites some
+    /// positional shapes into real JS parameters, which would mask what
+    /// this pass does on its own.
+    fn direct_call_keeps_positional_bridge(a1: serde_json::Value) -> bool {
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
+        serde_json::to_string(&prog).unwrap().contains("sh2.positional")
+    }
+
+    /// An A1 program with one `f` function and one `fnCall("f", …)` site.
+    /// `body` is the function body; it decides whether the bridge is needed.
+    fn a1_fn_call(body: serde_json::Value) -> serde_json::Value {
+        let s = |v: &str| serde_json::json!({"type":"Str","value":v,"style":"DoubleQuoted"});
+        serde_json::json!({
+            "contract_version": 1,
+            "type": "Program",
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type":"Function","name":"f","body":[body],"named_blocks":{}},
+                {"type":"Expr","expr":{
+                    "type":"Call","func":"builtin","purity":"Emulable",
+                    "args":[s("echo"), {"type":"Array","elements":[
+                        {"type":"Call","func":"fnCall","purity":"Emulable",
+                         "args":[s("f"), {"type":"Array","elements":[s("hi")]}]}
+                    ]}]}}
+            ]
+        })
+    }
+
+    /// An Assign of `getVar(<name>)` to `a` — the store-convention read.
+    fn a1_assign_getvar(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":"Assign",
+            "targets":[{"var":"a","indices":[],"sigil":null}],
+            "expr":{"type":"Call","func":"getVar","purity":"Emulable",
+                    "args":[{"type":"Str","value":name,"style":"DoubleQuoted"}]}
+        })
+    }
+
+    #[test]
+    fn direct_call_bridges_getvar_positional_reads() {
+        // `a = getVar("1")` — the getVar convention for `$1`. Without the
+        // bridge the body reads the CALLER's positional frame and the
+        // argument is silently dropped.
+        for name in ["1", "2", "9", "#1"] {
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "positional bridge dropped for getVar({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_bridges_param_positional_reads() {
+        // `n = param("len","1")` — go-sh's `len($1)`, the shape the
+        // request names: a positional read addressed BY NUMBER, with the
+        // name in the SECOND argument.
+        for op in ["len", "slice", ""] {
+            let body = serde_json::json!({
+                "type":"Assign",
+                "targets":[{"var":"a","indices":[],"sigil":null}],
+                "expr":{"type":"Call","func":"param","purity":"Emulable",
+                        "args":[{"type":"Str","value":op,"style":"DoubleQuoted"},
+                                {"type":"Str","value":"1","style":"DoubleQuoted"}]}
+            });
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(body)),
+                "positional bridge dropped for param({op:?},\"1\")"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_without_positional_read_stays_direct() {
+        // The negative half: a body with NO positional read must not pay
+        // the save/restore bridge — that is the point of the rewrite.
+        // `getVar("a")` names a store var; `getVar("0")` is not a
+        // positional ($0 is argv0, read through a different channel).
+        for name in ["a", "0", "#0", "10", "x1"] {
+            assert!(
+                !direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "bridge emitted for the non-positional read getVar({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn zz_probe3() {
+        for (nm, body) in [("getvar1", a1_assign_getvar("1")),
+                           ("param_len1", serde_json::json!({
+                             "type":"Assign",
+                             "targets":[{"var":"a","indices":[],"sigil":null}],
+                             "expr":{"type":"Call","func":"param","purity":"Emulable",
+                                     "args":[{"type":"Str","value":"len","style":"DoubleQuoted"},
+                                             {"type":"Str","value":"1","style":"DoubleQuoted"}]}}))] {
+            let a1 = a1_fn_call(body);
+            let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("ingress");
+            let e = crate::shir::shir_to_estree(&ir);
+            let s = serde_json::to_string(&e).unwrap();
+            println!("### {nm}: has_positional={} has_getVar={} has_param={}",
+                s.contains("sh2.positional"), s.contains("getVar"), s.contains(r#""param""#));
+        }
     }
 
     #[test]

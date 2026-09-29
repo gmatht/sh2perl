@@ -1929,7 +1929,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         }
                     }
                 }
-            } else if func == "test" || func == "let" {
+            } else if func == "test" {
                 // `ternary` (the C frontend's `cond ? a : b`): args[0] is
                 // the cond TEST-STRING — try_native_test lowers it by
                 // scanning `$name` operands natively, so a store write a
@@ -1946,6 +1946,52 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         }
                     } else {
                         collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "let" {
+                // `let "a+1" "i++"` — ARITHMETIC TEXT the runtime evaluates
+                // via evalArith: its refs are BARE identifiers, not `$name`
+                // tokens, so the `$`-scan above sees nothing. Same
+                // rationale (and the same over-mark-is-safe asymmetry) as
+                // the arith/arithEval arm below; a store whose only read
+                // lives in a `let` arg must survive DCE, or the never-written
+                // "" fold answers the arithmetic instead of the variable.
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        for nm in bare_arith_idents(s) {
+                            out.push(nm);
+                        }
+                    } else {
+                        collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "exec"
+                && matches!(
+                    args.first(),
+                    Some(IrExpr::Str(n, _)) if n == "let"
+                )
+            {
+                // `(( ))` and the bash `let` builtin LOWER to
+                // `Call("exec", ["let", Array([...arith words...])])` — the
+                // exec/builtin command form, NOT `func == "let"`. The arith
+                // words live in the arg-list Array, so scan those
+                // (bare_dollar_names would miss every one — a bare ident is
+                // not a `$name` token). Without this the read set stayed
+                // empty, DCE deleted the only store, and the emitter's
+                // never-written fold then blanked the operand IN THE SAME
+                // CONDITION: `x=5; if (( x > 3 ))` rendered
+                // `Number("") || 0 > 3` and took the else branch
+                // (zsh-sh-go t73_zsh_arith_cond). Over-marking only shrinks
+                // the elimination set.
+                if let Some(IrExpr::Array(words)) = args.get(1) {
+                    for w in words {
+                        if let IrExpr::Str(s, _) = w {
+                            for nm in bare_arith_idents(s) {
+                                out.push(nm);
+                            }
+                        } else {
+                            collect_expr_read_names(w, out);
+                        }
                     }
                 }
             } else if matches!(func.as_str(), "cstyleFor" | "arith" | "arithEval") {
@@ -2408,6 +2454,52 @@ mod tests {
         ]);
         let mut prog = prog;
         assert!(!dead_store_elim(&mut prog), "redirect-target getVar read must keep the f store");
+        assert_eq!(prog.stmts.len(), 2);
+    }
+
+    #[test]
+    fn dce_keeps_store_read_only_by_a_let_arith_string() {
+        // x=5; if (( x > 3 )); then echo big; fi
+        //
+        // The `(( ))` / `let` condition reaches the DCE as a BARE-IDENTIFIER
+        // arithmetic string: `Call("exec", ["let", Array(["x > 3"])])`. The
+        // Str read scan only collects `$name` / `${name}` refs, so it saw NO
+        // read of `x`, judged the store dead and dropped `x=5` — which then
+        // made `never_written_read("x")` fold the cond's own read to `""`,
+        // so `(( x > 3 ))` evaluated `Number("") || 0` and the native zsh
+        // `echo big` became `echo small` (zsh-sh-go t73_zsh_arith_cond).
+        let prog = prog_of(vec![
+            assign("x", IrExpr::Int(5)),
+            IrStmt::If {
+                cond: IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("let".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "x > 3".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                },
+                then: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "big".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                })],
+                elsifs: vec![],
+                else_: vec![],
+            },
+        ]);
+        let mut prog = prog;
+        assert!(
+            !dead_store_elim(&mut prog),
+            "a `let` arith string reads its bare identifiers — the x store must survive"
+        );
         assert_eq!(prog.stmts.len(), 2);
     }
 

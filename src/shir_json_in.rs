@@ -218,7 +218,6 @@ pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
                 Some("AsciiStr") => Ok(IrType::AsciiStr),
                 Some("Int32") => Ok(IrType::Int32),
                 Some("Int64") => Ok(IrType::Int64),
-                Some("AsciiStr") => Ok(IrType::AsciiStr),
                 Some("UInt32") => Ok(IrType::UInt32),
                 Some("UInt64") => Ok(IrType::UInt64),
                 _ => Err(format!(
@@ -659,6 +658,32 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Function" => {
             let name = req_str(o, "name", where_)?.to_string();
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            // Named parameters (`func add(a, b int) int`, core request
+            // rust-20260927-121500-function-params-ingress): an optional
+            // `params` list of parameter-name strings, bound in order.
+            //
+            // Same optional-field convention as `typeParams` directly
+            // below: absent or null = no named parameters (bash
+            // functions, which take positional args only, and every
+            // existing frontend emit — all parse unchanged). A non-string
+            // entry is a hard ingress error rather than a silent drop:
+            // the field used to be dropped entirely, which is how a Go
+            // function's parameter names went missing and every read of a
+            // parameter became a read of an unbound name.
+            let params = match o.get("params") {
+                None | Some(serde_json::Value::Null) => vec![],
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| match e.as_str() {
+                        Some(s) => Ok(String::from(s)),
+                        None => Err(format!("{where_}.params[{i}]: not a string")),
+                    })
+                    .collect::<Result<Vec<String>, String>>()?,
+                Some(other) => {
+                    return Err(format!("{where_}.params: not an array ({other})"));
+                }
+            };
             // Go generic declarations (`func id[T any](...)`, core request
             // go-sh-typeargs): an optional `typeParams` list of
             // type-parameter strings. Same ERASURE contract as Call's
@@ -706,6 +731,7 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             }
             IrStmt::Function {
                 name,
+                params,
                 body,
                 named_blocks,
             }
@@ -1147,20 +1173,26 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
     })
 }
 
-/// An explicit JSON `null` means the same as an absent list: the A1
-/// emitter serialises an empty `IrExpr::Array` as `{"type":"Array",
-/// "elements":null}` (serde's `Vec` → `null` for empty), and a command
-/// with no words (`pair()` capturing an empty tail) hits that shape.
-/// Refusing it made every such program RENDER-ERR before the renderer
-/// ever ran — t107/t108/t110.
-fn null_is_empty(x: &Value) -> bool {
-    x.is_null()
-}
-
+/// Optional element lists — the word/operand lists of the A1 nodes that
+/// are legitimately EMPTY: `Call.args`, `Expr.args`, `Redirect.redirects`,
+/// `Target.indices` and `Array.elements`.
+///
+/// A missing key and an explicit JSON `null` both mean "no elements".
+/// The `null` tolerance is the fix for core requests
+/// rust-20260926-105700-empty-array-elements-null / rust-20260926-140000:
+/// a Go frontend that builds its word list with `make([]any, len(words))`
+/// marshals the zero-length slice to `null`, not `[]`, so an empty exec
+/// word list (`a, b := pair()` — the synthetic call carries no words) used
+/// to be rejected here with "elements: not an array" before ANY backend
+/// renderer could run.
+///
+/// A non-null, non-array value is still a hard error: only `null`/absent
+/// are accepted as empty, so a genuinely malformed list still fails loudly
+/// rather than being silently coerced.
 fn exprs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrExpr>, String> {
     match v {
         None => Ok(vec![]),
-        Some(x) if null_is_empty(x) => Ok(vec![]),
+        Some(Value::Null) => Ok(vec![]),
         Some(x) => arr(Some(x), where_)?
             .iter()
             .enumerate()
@@ -1451,6 +1483,96 @@ mod tests {
         let a = round_trip("x=1; echo $x");
         let b = round_trip("x=1; echo $x");
         assert_eq!(a, b);
+    }
+
+    /// A1 `Array.elements: null` is an EMPTY word list, not an ingress
+    /// error. Core requests rust-20260926-105700 / rust-20260926-140000: a
+    /// Go frontend that allocates its word list with `make([]any, n)`
+    /// marshals the zero-length slice to `null`, so `a, b := pair()` (the
+    /// synthetic exec carries no words) used to be rejected with
+    /// "elements: not an array" before ANY backend renderer could run.
+    /// Asserts the structural outcome (an ingested empty element list),
+    /// not merely "it did not crash".
+    #[test]
+    fn array_elements_null_is_an_empty_list() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"echo","args":[
+                {"type":"Str","value":"hi","style":"DoubleQuoted"},
+                {"type":"Array","elements":null}]}}]}"#;
+        let prog = shir_json_to_ir(src).expect("null elements = empty word list");
+        let IrStmt::Expr(expr) = &prog.stmts[0] else {
+            panic!("expected an Expr stmt, got {:?}", prog.stmts[0]);
+        };
+        let crate::ir::IrExpr::Call { args, .. } = expr else {
+            panic!("expected a Call expr, got {expr:?}");
+        };
+        let crate::ir::IrExpr::Array(elements) = &args[1] else {
+            panic!("expected the empty Array arg, got {:?}", args[1]);
+        };
+        assert!(elements.is_empty(), "null elements must ingest as []");
+    }
+
+    /// A NON-null, non-array `elements` is still a hard error — the null
+    /// tolerance must not become a blanket "malformed input is empty".
+    #[test]
+    fn array_elements_non_array_still_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"echo","args":[
+                {"type":"Array","elements":"nope"}]}}]}"#;
+        let err = shir_json_to_ir(src).expect_err("a string elements list must refuse");
+        assert!(err.contains("not an array"), "unexpected error: {err}");
+    }
+
+    /// A function definition's NAMED parameters survive A1 ingress. Core
+    /// request rust-20260927-121500: `IrStmt::Function` had no `params`
+    /// field, so the deserializer dropped the list and every read of a
+    /// parameter inside the body degraded to a read of an unbound name
+    /// (12 of the go-sh corpus's remaining failures). Asserts the
+    /// round-trip: the names are in the IR and survive re-emission.
+    #[test]
+    fn function_params_survive_ingress_and_round_trip() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"isYes","params":["s","n"],"body":[
+                {"type":"Expr","expr":{"type":"Call","func":"echo","args":[
+                    {"type":"Array","elements":[{"type":"Str","value":"in-func","style":"DoubleQuoted"}]}]}}]}]}"#;
+        let prog = shir_json_to_ir(src).expect("named params ingress");
+        let IrStmt::Function { name, params, .. } = &prog.stmts[0] else {
+            panic!("expected a Function stmt, got {:?}", prog.stmts[0]);
+        };
+        assert_eq!(name, "isYes");
+        assert_eq!(params, &vec!["s".to_string(), "n".to_string()]);
+
+        // and the names are re-emitted, so a second ingress sees them too
+        let json2 = shir_to_shir_json(&prog);
+        let prog2 = shir_json_to_ir(&json2).expect("re-ingest");
+        let IrStmt::Function { params: p2, .. } = &prog2.stmts[0] else {
+            panic!("expected a Function stmt on re-ingest");
+        };
+        assert_eq!(p2, params, "params must round-trip, not be dropped");
+    }
+
+    /// `params` is optional: absent (bash functions, every existing
+    /// frontend emit) means no named parameters and parses unchanged.
+    #[test]
+    fn function_params_absent_is_empty() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","body":[]}]}"#;
+        let prog = shir_json_to_ir(src).expect("absent params = no named params");
+        let IrStmt::Function { params, .. } = &prog.stmts[0] else {
+            panic!("expected a Function stmt");
+        };
+        assert!(params.is_empty());
+    }
+
+    /// A non-string `params` entry is a hard ingress error, mirroring the
+    /// `typeParams` convention — the point of the field is that names
+    /// survive, so a malformed one must fail loudly rather than be dropped.
+    #[test]
+    fn function_params_non_string_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Function","name":"f","params":[7],"body":[]}]}"#;
+        let err = shir_json_to_ir(src).expect_err("a non-string param must refuse");
+        assert!(err.contains("not a string"), "unexpected error: {err}");
     }
 
     /// IrType::Float(32/64) round-trips through the A1 JSON: serialized

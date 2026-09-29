@@ -11605,7 +11605,7 @@ pub fn analyze_fn_sink_contexts(prog: &IrProgram) -> HashMap<String, SinkContext
                 IrStmt::Function {
                     name,
                     body,
-                    named_blocks,
+                    named_blocks, ..
                 } => {
                     if !defined.insert(name.clone()) {
                         ambiguous.insert(name.clone());
@@ -12972,7 +12972,7 @@ pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
     ) {
         for s in stmts {
             match s {
-                IrStmt::Function { name, body, named_blocks } => {
+                IrStmt::Function { name, body, named_blocks, .. } => {
                     if defs.insert(name.clone(), body).is_some() {
                         ambiguous.insert(name.clone());
                     }
@@ -16986,6 +16986,10 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         }
         Command::Function(f) => IrStmt::Function {
             name: f.name.clone(),
+            // bash functions take POSITIONAL args only ($1, $2) and carry
+            // no parameter names; the named-`params` list is for the
+            // frontends (core request rust-20260927-121500).
+            params: vec![],
             body: body_stmts(&Command::Block(f.body.clone())),
             named_blocks: vec![],
         },
@@ -31197,6 +31201,15 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         eprintln!("DBG unsafe: {:?}", unsafe_v);
         eprintln!("DBG store_only_var(__fl0) = {}", store_only_var("__fl0"));
     }
+    // Same JS-identifier rule as the LIFTED_NUMERIC/LIFTED_STRING filter
+    // below: a store-only var gets a native `let <name> = null;`
+    // binding, so a reserved-word name (`var`, `let`, `class`, …) would
+    // be a JS syntax error that loses the whole program. Un-lifted, the
+    // var keeps the string-keyed `sh2.vars` store and is unaffected.
+    let store_only: std::collections::HashSet<String> = store_only
+        .into_iter()
+        .filter(|v| is_plain_fn_name_safe(v))
+        .collect();
     *STORE_ONLY_VARS.lock().unwrap() = Some(store_only);
     // Int64 leaf wrapping (the `--true64` machinery, now also the i53
     // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
@@ -31258,6 +31271,25 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let persist_fd1 = ir_has_persist_fd1(prog);
     let mut functions = HashSet::new();
     collect_program_functions(&prog.stmts, &mut functions);
+    // A native binding is emitted as `let <name> = …` / the store-only
+    // prologue's `let <name> = null;`. A shell variable whose name is a
+    // JS reserved word (`var`, `let`, `class`, `in`, …) is perfectly legal
+    // bash — `var=test; eval "$var"` — but `let var = null;` is a JS
+    // SYNTAX ERROR, so the WHOLE program fails to parse and every
+    // statement is lost (heredoc-subshell-redirects.sh,
+    // subshell-heredoc-close.sh, which both name their variable `var`).
+    //
+    // The fix is to NOT lift such a name: a non-lifted var keeps the
+    // `sh2.vars` store protocol, whose key is a string and is therefore
+    // immune to identifier rules. `is_plain_fn_name_safe` is exactly the
+    // existing predicate for "safe as a bare JS identifier" (reserved
+    // words, shadowed globals, generated `__` temps); the function-binding
+    // path already routes through `direct_binding_name`, which renames
+    // rather than refuses — but a VARIABLE cannot be renamed, because its
+    // reads are the bare `Var(name)` expressions. So refuse, don't rename.
+    let js_bindable = |v: &String| is_plain_fn_name_safe(v);
+    let num: HashSet<String> = num.iter().filter(|v| js_bindable(v)).cloned().collect();
+    let str: HashSet<String> = str.iter().filter(|v| js_bindable(v)).cloned().collect();
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     // C typed vars (frontend-emitted var_types): the arith read coercion
@@ -34884,13 +34916,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::If {
             cond,
             then,
-            elsifs: _,
+            elsifs,
             else_,
         } => {
             let consequent = Box::new(Stmt::BlockStatement {
                 body: then.iter().filter_map(stmt_to_estree).collect(),
             });
-            let alternate: Option<Box<Stmt>> = if else_.is_empty() {
+            let alternate: Option<Box<Stmt>> = if else_.is_empty() && elsifs.is_empty() {
                 if lastexit_write_is_dead(stmt) {
                     // Plan 4: the if's status write is provably unread
                     // (no `$?` reader before the next writer; the runner
@@ -34919,14 +34951,57 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }))
                 }
             } else {
-                Some(match else_.as_slice() {
-                    [IrStmt::If { .. }] => Box::new(
-                        stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
-                    ),
-                    _ => Box::new(Stmt::BlockStatement {
-                        body: else_.iter().filter_map(stmt_to_estree).collect(),
-                    }),
-                })
+                // The else-if ladder. `elsifs` is a flat `[cond, body]`
+                // list; JS has no `elif`, so it lowers to the SAME nesting
+                // the AST already uses for `else { if … }` — each arm's
+                // alternate is the next arm (or the final `else`).
+                //
+                // This arm previously bound `elsifs: _` and DROPPED every
+                // `elif` in the corpus — `if A; then …; elif B; then …; fi`
+                // rendered as `if (A) { … }` with the whole `elif` chain
+                // silently discarded (param-expand-default-operator.sh:
+                // the `[ "${BASH_VERSION-}" ]` arm and its `echo bash` never
+                // reached the output, so the program printed nothing).
+                //
+                // `$?` for a failing elif: bash leaves the LAST evaluated
+                // condition's status, which the chain reproduces because
+                // every arm is an ordinary `if` whose test writes the
+                // status (the dead-status unwrap applies per arm exactly as
+                // it does for a top-level if).
+                let mut tail: Option<Box<Stmt>> = if else_.is_empty() {
+                    None
+                } else {
+                    Some(match else_.as_slice() {
+                        [IrStmt::If { .. }] => Box::new(
+                            stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                        ),
+                        _ => Box::new(Stmt::BlockStatement {
+                            body: else_.iter().filter_map(stmt_to_estree).collect(),
+                        }),
+                    })
+                };
+                for (econd, ebody) in elsifs.iter().rev() {
+                    let arm_consequent = Box::new(Stmt::BlockStatement {
+                        body: ebody.iter().filter_map(stmt_to_estree).collect(),
+                    });
+                    // Each elif arm is an ordinary `if` whose test is
+                    // evaluated for truthiness only — the same
+                    // `unwrap_test_bool` treatment the outer condition gets
+                    // (see the `test:` arm below). The dead-status elision
+                    // (`test_cond_write_is_dead`) is keyed by the enclosing
+                    // `IrStmt::If` POINTER, not per-arm, so an arm is not
+                    // given the unstatused form here: the statused sequence
+                    // is the byte-identical behavior-preserving choice, and
+                    // `$?` after a failing elif is exactly the last arm's
+                    // condition status.
+                    let ealt = tail.take();
+                    tail = Some(Box::new(Stmt::IfStatement {
+                        test: unwrap_test_bool(cond_to_estree(econd)),
+                        consequent: arm_consequent,
+                        alternate: ealt,
+                    }));
+                }
+                tail
             };
             Stmt::IfStatement {
                 test: {
@@ -36081,6 +36156,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             name,
             body,
             named_blocks,
+            ..
         } => {
             // Per-function `local` native lift (see [`local_lift_analysis`]):
             // push the function's frame so the body's `local` decls lower
@@ -37106,18 +37182,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Warn { expr, carp: _ } => {
-            // Warning: `console.warn(value)` or fallback `sh2.warn(value)`.
+            // Warning: `sh2.warn(value)` — the runtime writes it to stderr.
+            // It must go through the `sh2.*` namespace like every other
+            // builtin: the structural gate rejects ANY non-sh2 callee
+            // (harness/estree_gate.pl check (b)), so a raw
+            // `console.warn` fails the gate by construction.
             Stmt::ExpressionStatement {
-                expression: Expr::CallExpression {
-                    callee: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier { name: "console".to_string() }),
-                        property: Box::new(Expr::Identifier { name: "warn".to_string() }),
-                        computed: false,
-                        optional: false,
-                    }),
-                    arguments: vec![expr_to_estree(expr)],
-                    optional: false,
-                },
+                expression: sh2_call("warn", vec![expr_to_estree(expr)]),
             }
         }
         IrStmt::SetChildError(e) => {
@@ -37436,6 +37507,14 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
     // A dynamically-changing nocasematch state cannot be folded statically
     // — the runtime test consults the real state.
     if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
+        return None;
+    }
+    // bash only globs an UNQUOTED pattern operand (see
+    // [`test_operand_is_quoted`]): `[ "abc" = "a*" ]` is a literal compare
+    // and `[[ "abc" == "a*" ]]` is too (only the unquoted `[[ ]]` pattern
+    // globs). A quoted operand must stay on the exact-equality path, so
+    // refuse here and let the caller emit `===`.
+    if test_operand_is_quoted(rhs) {
         return None;
     }
     let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
@@ -44867,6 +44946,33 @@ fn regex_test_pattern(rhs: &str) -> Option<String> {
 /// `[ -f x ]` followed by `echo $?` printed the PREVIOUS status).
 fn try_native_test(s: &str) -> Option<Expr> {
     try_native_test_unstatused(s).map(native_test_statused)
+}
+
+/// Is the `=`/`==`/`!=` RHS operand QUOTED in the source test string?
+///
+/// This is the `[[ ]]` vs `[ ]` glob rule. bash's `[` (the `test` BUILTIN)
+/// does NOT glob its operands at all: it receives them as already-expanded
+/// argv, and an unquoted `a*` reaches it as the LITERAL two-character-plus
+/// string `a*` (bash 5 reports "too many arguments" for the split form and
+/// never matches). Only `[[ ]]` — a KEYWORD — performs pathname expansion on
+/// an unquoted pattern, so `[[ abc == a* ]]` is true while `[[ abc == "a*" ]]`
+/// is a literal compare.
+///
+/// The emitter therefore must not lower a `[ ]` equality to a glob regex
+/// (`startsWith`/`includes`/`^…$`) unless the source operand is genuinely an
+/// unquoted pattern. This was the `test-glob-rhs-fallback.sh` failure:
+/// `[ "abc" = "a*" ]` and `[[ "abc" == "a*" ]]` both emitted
+/// `String("abc").startsWith("a")` and took the `bad` branch (a quoted
+/// pattern must compare literally), and `[ "abc" = "[ab]*" ]` emitted the
+/// char-class regex `(/^[ab].*$/s).test("abc")` — also `bad`.
+///
+/// A quoted operand is a fully-quoted string (`"a*"`), possibly built by
+/// concatenating quoted runs and literal text (`"a"\*`, `a"*"`). Any quote
+/// character anywhere in the operand makes it quoted: bash removes the quote
+/// and suppresses globbing for the WHOLE word, so a single quoted character
+/// anywhere in it is enough.
+fn test_operand_is_quoted(op: &str) -> bool {
+    op.contains('"') || op.contains('\'')
 }
 
 /// The value-only native test (no lastExit write): the single-op scans,
@@ -57949,6 +58055,7 @@ mod sink_context_tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -57999,6 +58106,7 @@ mod sink_context_tests {
             stmts: vec![
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![],
                     named_blocks: vec![],
                 },
@@ -59548,7 +59656,7 @@ mod whole_argv_tests {
     }
 
     fn fn_stmt(name: &str, body: Vec<IrStmt>) -> IrStmt {
-        IrStmt::Function { name: name.to_string(), body, named_blocks: vec![] }
+        IrStmt::Function { name: name.to_string(), params: vec![], body, named_blocks: vec![] }
     }
 
     fn prog(stmts: Vec<IrStmt>) -> IrProgram {
@@ -59666,6 +59774,7 @@ mod shift_offset_tests {
         body.extend(rest);
         IrStmt::Function {
             name: name.to_string(),
+            params: vec![],
             body,
             named_blocks: vec![],
         }
@@ -59694,6 +59803,7 @@ mod shift_offset_tests {
     fn no_shift_is_offset_zero() {
         let p = prog(vec![IrStmt::Function {
             name: "g".to_string(),
+            params: vec![],
             body: vec![getvar("1")],
             named_blocks: vec![],
         }]);
@@ -59725,6 +59835,7 @@ mod shift_offset_tests {
     fn double_shift_vetoes() {
         let p = prog(vec![IrStmt::Function {
             name: "dd".to_string(),
+            params: vec![],
             body: vec![
                 IrStmt::Expr(IrExpr::Call {
                     func: "builtin".to_string(),
@@ -59751,6 +59862,7 @@ mod shift_offset_tests {
     fn positional_write_vetoes() {
         let p = prog(vec![IrStmt::Function {
             name: "w".to_string(),
+            params: vec![],
             body: vec![
                 IrStmt::Expr(IrExpr::Call {
                     func: "builtin".to_string(),

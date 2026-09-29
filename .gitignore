@@ -101,3 +101,7 @@ scratchpad/
 
 # worktree-local CLI build for the Ext-node work (untracked)
 /otranspilerl/
+
+# python bytecode from the runtime tools (fbdev-faces.py, the silhouette oracle)
+__pycache__/
+*.pyc

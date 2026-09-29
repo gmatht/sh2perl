@@ -424,7 +424,7 @@ fn analyze_stmt(
         IrStmt::Function {
             name,
             body,
-            named_blocks,
+            named_blocks, ..
         } => {
             // the name is now callable/defined in the enclosing scope.
             must_def.insert(name.clone());
@@ -1046,7 +1046,7 @@ fn walk_defs_reads_stmt(st: &IrStmt, defs: &mut HashSet<String>, reads: &mut Has
                 walk_defs_reads_stmts(stg, defs, reads);
             }
         }
-        IrStmt::Function { name, body, named_blocks } => {
+        IrStmt::Function { name, body, named_blocks, .. } => {
             defs.insert(name.clone());
             walk_defs_reads_stmts(body, defs, reads);
             for (_, nb) in named_blocks {
@@ -1398,6 +1398,7 @@ mod tests {
                 assign("x", IrExpr::Int(5)),
                 IrStmt::Function {
                     name: "f".to_string(),
+                    params: vec![],
                     body: vec![IrStmt::Output {
                         value: read("x"),
                         newline: true,
@@ -1417,6 +1418,7 @@ mod tests {
         let prog = IrProgram {
             stmts: vec![IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![IrStmt::Output {
                     value: IrExpr::Var("typo".to_string(), None),
                     newline: true,
