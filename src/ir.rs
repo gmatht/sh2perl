@@ -6833,7 +6833,16 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
         "read" => {
-            if let Some(n) = words.first().and_then(|w| call_arg_str(w)) {
+            // `read [-flags] VAR` — the leading options (`-r`, `-p`, `-n`, …)
+            // are NOT the target variable: bash reads one line into the first
+            // non-flag word. Taking `words.first()` made `read -r line` emit
+            // `$-r = $__line;`, a Perl syntax error (triage t36_read_stdin).
+            if let Some(n) = words
+                .iter()
+                .copied()
+                .filter_map(call_arg_str)
+                .find(|w| !w.starts_with('-'))
+            {
                 emit_indent(out, indent);
                 out.push_str(&format!("chomp(my $__line = <STDIN>); ${} = $__line;\n", n));
             }
