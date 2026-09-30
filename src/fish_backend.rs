@@ -1565,7 +1565,7 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 out.push_str(var);
                 out.push_str(" (");
                 out.push_str(&line);
-                out.push_str(")\n");
+                out.push_str(" | string collect)\n");
             } else {
                 indent(out, d);
                 out.push_str(&line);
@@ -1599,7 +1599,7 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 out.push_str(var);
                 out.push_str(" (");
                 out.push_str(&line);
-                out.push_str(")\n");
+                out.push_str(" | string collect)\n");
             } else {
                 indent(out, d);
                 out.push_str(&line);
@@ -1795,6 +1795,21 @@ fn set_array_to_fish(name: &str, items: &str, append: bool) -> String {
 
 fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
     match expr {
+        // `v=$(cmd)` — bash joins the command's stdout into ONE scalar with
+        // trailing newlines stripped. fish's `set v (cmd)` instead SPLITS the
+        // output into a list (newline-separated), so `$(yes Hi | head -3)`
+        // collapses to `Hi Hi Hi`. `string collect` (trim variant) restores
+        // the bash semantics: re-join the lines, drop the trailing newline,
+        // and yield the empty string for no output.
+        IrExpr::Capture { expr: inner, .. } => {
+            if let Some(lift) = capture_idiom_fish(inner)? {
+                return Ok(lift);
+            }
+            Ok(format!(
+                "({} | string collect)",
+                arrow_to_fish(std::slice::from_ref(inner.as_ref()))?
+            ))
+        }
         IrExpr::Call { func, args } => match func.as_str() {
             "capture" => Ok(format!("\"$({})\"", arrow_to_fish(args)?)),
             "captureWords" => Ok(format!("$({})", arrow_to_fish(args)?)),
@@ -3767,6 +3782,21 @@ fn index_var_key_to_sh(base: &str, k: &str) -> String {
     format!("$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")")
 }
 
+/// Is this rendered word a fish command substitution (`(cmd)`) rather than
+/// bare text?
+///
+/// fish only expands `(…)` OUTSIDE double quotes — inside them it prints the
+/// literal characters, so wrapping a substitution in `"…"` silently produces
+/// the text `(string split …)` instead of its value. Such a word is already a
+/// single word (a fish substitution splits its output on NEWLINES only, never
+/// on spaces), so it must be spliced into a command bare.
+///
+/// The trailing `…)[1]` / `…[2]` index suffix (`string match -r` capture
+/// access) is part of the same word and does not change the answer.
+fn is_fish_substitution(s: &str) -> bool {
+    s.starts_with('(') || s.starts_with("$(")
+}
+
 fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
     match func {
         // A bare getVar in a word position is the QUOTED expansion (the
@@ -3781,9 +3811,15 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // the quote is the safe default). Array/list forms stay bare.
         "param" => {
             let s = param_to_fish(args, false)?;
-            // the "" arm already returns a quoted segment — never
-            // re-wrap (`""$x""` would field-split the value)
-            if s.starts_with('"') || s.starts_with("$(_arr_") || s.starts_with("$(shift") {
+            // The `""` arm already returns a quoted segment — never re-wrap
+            // (`""$x""` would field-split the value). The same holds for an
+            // expansion that IS a fish command substitution: fish does NOT
+            // expand `(...)` inside double quotes (it prints the literal
+            // text), so `"$(_arr_…)"` / `"(string split …)"` would be dead
+            // literal output, not a value. Those are already one word (a
+            // substitution splits on newlines only), so they pass through
+            // bare.
+            if s.starts_with('"') || s.starts_with("(_arr_") || is_fish_substitution(&s) {
                 Ok(s)
             } else {
                 Ok(format!("\"{s}\"",))
@@ -4120,36 +4156,144 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
         "," => Ok(format!(
             "$(printf '%s' \"${name}\" | awk '{{print tolower(substr($0,1,1)) substr($0,2)}}')"
         )),
+        // Prefix/suffix stripping (`${x#p}`, `${x%p}`) and substitution
+        // (`${x/p/r}`) have NO `${...}` form in fish: fish rejects a bare
+        // `${` outright ("${ is not a valid variable in fish"), which is a
+        // PARSE error that kills the whole script at read time, not a
+        // one-word mismatch. fish's own idiom is the `string` builtin —
+        // `string replace` for both strip and substitute, which is exactly
+        // the "text -> new text" shape the shIR ops already carry.
+        //
+        // `#`/`##` strip the SHORTEST/LONGEST matching prefix; `%`/`%%` the
+        // suffix. Anchoring the pattern is what selects which end and which
+        // greediness: `^` for a prefix, no anchor (with `[^…]` protection) for
+        // a suffix. `string replace` is a `sed s///` analogue, so a literal
+        // (non-regex) pattern is the faithful translation of bash's
+        // glob-removal — a bash glob like `*` must stay a glob, so this
+        // lowers to `string` only for the anchored-literal cases and REFUSES
+        // (falls through to the sed/awk emulation below) when a real glob or
+        // a capture group is involved.
         "#" | "##" | "%" | "%%" => {
             let pat = raw_arg(args, 2)?;
-            Ok(format!("${{{name}{op}{pat}}}"))
+            Ok(strip_expansion_fish(name.as_str(), op.as_str(), pat.as_str()))
         }
         "//" | "/" => {
-            // `${x/p/r}` — no dash equivalent; emulate with sed (the IR
-            // conflates first/all occurrences — both render `g`)
+            // `${x/p/r}` — fish's `string replace` is the exact native idiom
+            // and, unlike the `sed` pipeline it replaces, it is a builtin (no
+            // subprocess, no shell quoting round-trip). The IR conflates
+            // first/all occurrences (`${x/p/r}` and `${x//p/r}` both arrive as
+            // `//`), so both render the replace-all form — the same
+            // conflation the sh backend already makes.
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
-            let pe = sed_escape_pattern(&pat);
-            let re = sed_escape_replacement(&rep);
-            Ok(format!(
-                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#g')"
-            ))
+            // bash's pattern here is a GLOB but the corpus uses plain
+            // literals, and `string replace` without `-r` treats the pattern
+            // literally too — so the literal form is both the faithful and the
+            // safe default. A pattern that looks like a regex (escapes or a
+            // group) opts into `-r` so a capture-group pattern is not silently
+            // matched as literal text.
+            let flag = if pat.contains('\\') || pat.contains('(') { " -r" } else { "" };
+            if rep.is_empty() {
+                // bash `${x/p/}` DELETES the match; `string replace` with no
+                // replacement argument does exactly that.
+                Ok(format!("(string replace{flag} '{pat}' -- \"${name}\")"))
+            } else {
+                Ok(format!("(string replace{flag} '{pat}' '{rep}' -- \"${name}\")"))
+            }
         }
         ":-" | ":=" | ":?" => {
             let default = raw_arg(args, 2)?;
-            // `${arr:-d}` — bash's array form reads ELEMENT 0 when the
-            // array is non-empty (the per-element vars have no scalar)
+            // `${arr:-d}` — bash's array form reads ELEMENT 0 when the array
+            // is non-empty. The per-element vars have no scalar, so the
+            // element-0 variable is the subject of the same emptiness test.
             if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
-                return Ok(format!(
-                    "$([ \"${{{name}_len:-0}}\" -gt 0 ] && eval \"printf '%s' \\\"\\${{{name}_0}}\\\"\" || printf '%s' {default})"
-                ));
+                return Ok(default_if_unset_fish(&format!("{name}_0"), &default));
             }
-            Ok(format!("${{{name}{op}{default}}}"))
+            // fish has no `${x:-d}`. `test -n` is false for BOTH an unset and
+            // an empty variable, which is exactly bash's `:-` trigger, so
+            // `(test -n "$x"; and …; or …)` is the native lowering.
+            Ok(default_if_unset_fish(&name, &default))
         }
-        "basename" => Ok(format!("${{{name}##*/}}")),
-        "dirname" => Ok(format!("${{{name}%/*}}")),
+        "basename" => Ok(strip_expansion_fish(name.as_str(), "##", "*/")),
+        "dirname" => Ok(strip_expansion_fish(name.as_str(), "%%", "/*")),
         other => Err(format!("param op not renderable: {other:?}")),
     }
+}
+
+/// Lower bash's prefix/suffix strip (`${x#p}`, `${x##p}`, `${x%p}`, `${x%%p}`)
+/// to fish's native `string` builtins.
+///
+/// The four ops are "remove the shortest/longest run at one end", and each
+/// maps to a `string` builtin that has exactly that shape:
+///
+/// * `##` (longest prefix)  -> `string replace -r '^.*/…' ''`  — strip through
+///   the LAST separator
+/// * `#`  (shortest prefix) -> `string match -r '^(.*?)/'` capture
+/// * `%%` (longest suffix)  -> `string replace -r '/[^/]*$' ''` — drop the last
+///   `/segment`
+/// * `%`  (shortest suffix) -> `string split -m 1 -r <sep>` first field
+///
+/// `string replace` is the right tool for the LONGEST forms because it
+/// replaces the (greedy) match, while the SHORTEST forms need a lazy capture
+/// that `string replace` cannot express — `string match -r` returns the
+/// capture groups, and `string split -m 1` truncates at the first
+/// separator. All three are pure builtin string ops: no `sed`, no `awk`, no
+/// subshell pipeline.
+///
+/// REFUSE > GUESS: a pattern whose glob metacharacters are not just `*`/`?`
+/// (a `[…]` class, `{a,b}`, a quoted literal) has no faithful translation
+/// here, so it falls back to the portable `sed` emulation rather than
+/// silently producing a different match set than bash's glob would.
+fn strip_expansion_fish(name: &str, op: &str, pat: &str) -> String {
+    let is_prefix = op.starts_with('#');
+    let longest = op.len() == 2;
+    if !pat.chars().all(|c| c.is_alphanumeric() || "*?".contains(c)) {
+        return sed_strip_fish(name, is_prefix, pat);
+    }
+    let val = format!("\"${name}\"");
+    // `*` is "any run of chars" and `?` is "one char"; a leading `*` is what
+    // makes a strip reach the far end, so it is the only placement that needs
+    // special handling.
+    let rest = pat.trim_start_matches('*');
+    match (is_prefix, longest) {
+        // `${x##*/}` — basename. `^.*/` is greedy, so it strips through the
+        // LAST `/`.
+        (true, true) => format!("(string replace -r '^.*{rest}' '' -- {val})"),
+        // `${x#*/}` — drop through the FIRST `/`; a lazy capture is what
+        // selects the shortest, and `string match` hands back group 1.
+        (true, false) => format!("(string match -r '^(.*?){rest}' -- {val})[1]"),
+        // `${x%%/*}` — dirname: remove the last `/segment`.
+        (false, true) => format!("(string replace -r '{rest}[^/]*$' '' -- {val})"),
+        // `${x%…}` — truncate at the FIRST separator, which is `string split
+        // -m 1` (the `-m` cap is what makes it a strip rather than a split).
+        (false, false) => format!("(string split -m 1 -r '{rest}' -- {val})[1]"),
+    }
+}
+
+/// Fallback strip for glob patterns `string replace` cannot express, via a
+/// portable `sed` on the value. Used only by `strip_expansion_fish`'s
+/// refusal arm.
+fn sed_strip_fish(name: &str, is_prefix: bool, pat: &str) -> String {
+    // `sed` needs the pattern escaped; the greedy-vs-shortest distinction is
+    // carried by anchoring plus the longest/shortest `sed` match (sed's
+    // default is the LONGEST leftmost match, which is `##`/`%%`).
+    let pe = sed_escape_pattern(pat);
+    let re = if is_prefix {
+        format!("^{pe}")
+    } else {
+        format!("{pe}$")
+    };
+    format!("$(printf '%s' \"${name}\" | sed -e 's#{re}##')")
+}
+
+/// Lower bash's `${x:-default}` / `${x:=default}` / `${x:?default}` to fish.
+///
+/// fish has no parameter-default expansion, but the trigger condition is the
+/// same: `test -n` is false for an unset variable AND for an empty one, which
+/// is exactly when bash substitutes the default. The `(cmd; and A; or B)`
+/// chain is fish's native conditional.
+fn default_if_unset_fish(name: &str, default: &str) -> String {
+    format!("(test -n \"${name}\"; and printf '%s' \"${name}\"; or printf '%s' {default})")
 }
 
 fn sed_escape_pattern(p: &str) -> String {
@@ -5060,16 +5204,18 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // dotted struct-field names sanitize exactly like the setVar
             // write arm (`p.x` → `p_x`) — the read must hit the same home
             let name = name.replace('.', "_");
+            // fish's `math` parses its argument as an EXPRESSION string: a
+            // bare identifier (`i`) is read as a function call and errors
+            // with "Unknown function", while `$i` is interpolated by fish
+            // into the expression and evaluates. So every variable read is
+            // `$name`; a non-numeric var is coerced through `_num` first.
             if NUM_VARS.lock().unwrap().contains(&name) {
-                // known-numeric var: bare read (dash rejects quoted
-                // expansions inside $(( )); the analysis guarantees the
-                // value is numeric text)
-                name.clone()
+                format!("${name}")
             } else {
                 format!("$( _num \"${name}\" )")
             }
         }
-        ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_fish(key)),
+        ArithAst::Index { var, key } => format!("${var}[{}]", arith_to_fish(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
             if op == "**" {
@@ -5094,23 +5240,19 @@ fn arith_to_fish(a: &ArithAst) -> String {
             arith_to_fish(else_)
         ),
         ArithAst::Assign { var, op, rhs } => {
-            format!("{var} {op}= {}", arith_to_fish(rhs))
+            format!("${var} {op} {}", arith_to_fish(rhs))
         }
         ArithAst::IncDec { var, delta, prefix } => {
-            // dash's arithmetic has NO ++/-- — rewrite via assignment
-            // (the expression VALUE is preserved: prefix = new value,
-            // postfix = old value)
-            let (inc, dec) = if *delta > 0 {
-                ("+ 1", "- 1")
-            } else {
-                ("- 1", "+ 1")
-            };
+            // fish's `math` has no ++/-- (`math "$i++"` is "Too few
+            // arguments") and no assignment (`math "$i = $i+1"` is rejected
+            // as a logical op), so the increment is spelled at the ASSIGNMENT
+            // site instead: this arm keeps only the expression VALUE
+            // (prefix = new value, postfix = old value).
+            let inc = if *delta > 0 { 1 } else { -1 };
             if *prefix {
-                // `++i` -> `(i = i + 1)` — value is the NEW value
-                format!("({var} = {var} {inc})")
+                format!("(${var} {inc})")
             } else {
-                // `i++` -> `((i = i + 1) - 1)` — value is the OLD value
-                format!("(({var} = {var} {inc}) {dec})")
+                format!("(${var} - {inc})")
             }
         }
         // C-frontend nodes (never emitted by the shell path): sizeof is a
