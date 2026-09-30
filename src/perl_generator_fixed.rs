@@ -23,7 +23,7 @@
 //! shared renderer's business — and guessing would be worse than the status
 //! quo, which at least runs).
 
-use crate::ir::{shir_to_perl, IrExpr, IrProgram, IrStmt};
+use crate::ir::{shir_to_perl, InterpPart, IrExpr, IrProgram, IrStmt};
 
 /// The Perl GENERATOR entry point: shared renderer + this module's fixes.
 ///
@@ -455,7 +455,6 @@ fn fix_case_pattern_tail(src: &str) -> String {
 fn quote_cmdsub_tails(src: &str, needle: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
-    let mut found_any = false;
     while let Some(at) = rest.find(needle) {
         // A `q{` opener whose head must stay unquoted: bail on this one if the
         // command substitution is unterminated (a malformed pattern we do not
@@ -464,16 +463,22 @@ fn quote_cmdsub_tails(src: &str, needle: &str) -> String {
         let Some(close) = rest[head_end..].find(")}") else {
             break;
         };
-        found_any = true;
         out.push_str(&rest[..head_end]);
         out.push_str(&format!("qx({}", &rest[head_end..head_end + close]));
         out.push_str(")}");
         rest = &rest[head_end + close + 2..];
         let _ = at;
     }
-    if found_any {
-        out.push_str(rest);
-    }
+    // The untouched tail is appended UNCONDITIONALLY. It used to be guarded
+    // by a `found_any` flag, so when the needle was absent from the whole
+    // program — i.e. the overwhelmingly common case, since the four needles
+    // are `q{$(` / `qq{$(` / `q($(` / `qq($(` and only a case PATTERN with a
+    // command substitution produces one — this returned the empty `out` and
+    // DISCARDED the entire rendered program. Every program without a
+    // cmdsub-in-case-pattern became a 0-byte Perl file that still exited 0,
+    // which is the worst possible failure: a gate sees a clean run that
+    // printed nothing.
+    out.push_str(rest);
     out
 }
 
@@ -743,6 +748,237 @@ fn fix_stmts(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -> Vec<I
     stmts.iter().map(|s| fix_stmt(s, fns)).collect()
 }
 
+// ── Fix 7 — an `eval` payload is SHELL TEXT, not arguments ────────────
+//
+// `eval "y=$x+1"` is not a call with a string argument. Its payload is shell
+// text that bash parses and runs in the CALLER's scope: the variables it
+// assigns, the functions it defines and the `return` it performs all belong
+// to the enclosing program, not to a subshell.
+//
+// The shared renderer cannot express that. `eval` is a shell builtin, so the
+// IR carries it as `Call { func: "builtin", args: [Str("eval"), Array([…])] }`
+// — the same shape as any other command — and `shir_to_perl` emits
+//
+//     system('bash', '-c', q{'eval' "echo \"$x\""});
+//
+// which is wrong twice over. It quotes the command name AND the payload as
+// argv to a fresh `bash -c`, so the payload runs in a child process: every
+// assignment is lost the moment `eval` returns, and the inner `$x` is the
+// child's, not the caller's. It also re-invokes `eval` inside that child,
+// which bash resolves before the caller's assignments are visible.
+//
+// The correction is to RE-ENTER the payload: parse the shell text and splice
+// its statements into the program at this position, so they run inline in
+// the caller's scope exactly as bash would. That is what the caller's
+// `fixups` comment describes ("expanded (Fix 6) and then re-entered as a
+// nested program (Fix 7)") and what this function implements.
+//
+// # Safety of doing this structurally
+//
+// The payload is RE-PARSED, so a `return` inside it returns from the
+// enclosing function rather than from an `eval` — which is correct, because
+// in bash `eval "return 3"` inside a function returns from that function.
+//
+// Deliberately narrow, per this module's rule:
+//   * only `eval` whose payload is a single word we can recover TEXT for;
+//   * only when that text parses; a parse failure keeps the original call,
+//     because a payload we cannot understand is the shared renderer's
+//     business and a wrong inlining is worse than the status quo;
+//   * the spliced statements are NOT re-fixed here. `fixups` calls this
+//     AFTER `fix_stmts`, so the expansion lands in an already-corrected
+//     program and running the fixes again would double-apply Fix 4.
+
+/// Fix 7 — expand `eval "<shell text>"` into inline statements.
+fn fix_eval_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for s in stmts {
+        match s {
+            IrStmt::Expr(expr) => {
+                if let Some(text) = eval_payload_text(expr) {
+                    match parse_shell_text(&text) {
+                        Some(inner) => out.extend(inner),
+                        // Unparseable payload: leave the call as it was.
+                        None => out.push(s.clone()),
+                    }
+                } else {
+                    out.push(s.clone());
+                }
+            }
+            // Recurse into every statement position that holds a body, so an
+            // `eval` inside a loop / function / branch is expanded too.
+            IrStmt::If { cond, then, elsifs, else_ } => out.push(IrStmt::If {
+                cond: cond.clone(),
+                then: fix_eval_stmts(then),
+                elsifs: elsifs
+                    .iter()
+                    .map(|(c, b)| (c.clone(), fix_eval_stmts(b)))
+                    .collect(),
+                else_: fix_eval_stmts(else_),
+            }),
+            IrStmt::While { cond, body } => out.push(IrStmt::While {
+                cond: cond.clone(),
+                body: fix_eval_stmts(body),
+            }),
+            IrStmt::DoWhile { cond, body, until } => out.push(IrStmt::DoWhile {
+                cond: cond.clone(),
+                body: fix_eval_stmts(body),
+                until: *until,
+            }),
+            IrStmt::Block(b) => out.push(IrStmt::Block(fix_eval_stmts(b))),
+            IrStmt::Subshell(b) => out.push(IrStmt::Subshell(fix_eval_stmts(b))),
+            IrStmt::Background(b) => out.push(IrStmt::Background(fix_eval_stmts(b))),
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => out.push(IrStmt::ForInit {
+                init: fix_eval_stmts(init),
+                cond: cond.clone(),
+                step: fix_eval_stmts(step),
+                body: fix_eval_stmts(body),
+            }),
+            IrStmt::Function {
+                name,
+                params,
+                body,
+                named_blocks,
+            } => out.push(IrStmt::Function {
+                name: name.clone(),
+                params: params.clone(),
+                body: fix_eval_stmts(body),
+                named_blocks: named_blocks
+                    .iter()
+                    .map(|(n, b)| (n.clone(), fix_eval_stmts(b)))
+                    .collect(),
+            }),
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// The shell TEXT of an `eval` statement's payload, if this is one.
+///
+/// Matches `Call { func: "builtin"|"exec", args: [Str("eval"), Array([w])] }`
+/// and recovers `w`'s text. An interpolated payload is accepted only when it
+/// is a single literal part: `eval "x=$y"` expands `$y` at eval time, and
+/// inlining the pre-expansion text would change which value is assigned.
+/// Anything we cannot reduce to fixed text is left to the renderer.
+fn eval_payload_text(expr: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = expr else {
+        return None;
+    };
+    if func != "builtin" && func != "exec" {
+        return None;
+    }
+    if exec_cmd_name(args) != Some("eval") {
+        return None;
+    }
+    let Some(IrExpr::Array(words)) = args.get(1) else {
+        return None;
+    };
+    // `eval "$a" "$b"` concatenates its arguments; only a single-word
+    // payload is a shape we can reason about.
+    let [one] = &words[..] else {
+        return None;
+    };
+    word_source_text(one)
+}
+
+/// The literal source text of a word, if it is entirely literal.
+///
+/// A double-quoted word arrives as `Interpolate(parts)`; the renderer keeps
+/// the parts, so a payload with an embedded expression is only usable when
+/// there is exactly one `Lit` part and nothing else.
+fn word_source_text(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => match parts.as_slice() {
+            [InterpPart::Lit(t)] => Some(t.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parse shell text and return the IR statements it denotes.
+///
+/// `None` when the text does not parse, or when it uses a construct this
+/// module cannot render correctly. The second condition is not caution for its
+/// own sake: inlining is only an improvement when the spliced statements
+/// render as well as the delegated call did. Measured, on
+/// `063_12_complex_eval.sh` — `eval "result=$(( ${var:-0} + … ))"` — inlining
+/// produced Perl that does not even compile (`${array[${index:_0}]:_0}` is
+/// emitted verbatim inside a `my %array` program, so perl dies with
+/// "Global symbol requires explicit package name"), whereas the delegated
+/// form at least emitted and ran. A worse result than the status quo is the
+/// one outcome this module's rules forbid, so the guard is on RENDERABILITY,
+/// not on whether the text parses.
+///
+/// The allowed set is deliberately small and is checked per statement:
+/// assignments and plain command calls. Anything else — loops, conditionals,
+/// arithmetic, nested control flow — is left to the shared renderer, which
+/// owns those decisions.
+fn parse_shell_text(text: &str) -> Option<Vec<IrStmt>> {
+    let mut p = crate::Parser::new(text);
+    let commands = p.parse().ok()?;
+    // `ast_to_ir_raw`, NOT `ast_to_ir`: the latter runs `optimize_stmts`,
+    // whose dead-assignment elimination is correct for a whole program and
+    // destroys an eval payload. `eval "y=7"` is a program whose ONLY
+    // statement is an assignment that is never read — dead-store elimination
+    // deletes it and the expansion becomes a no-op, so the variable the
+    // caller then reads stays unset (`y=` instead of `y=7`). The payload of
+    // an eval exists for its SIDE EFFECT; nothing in it is ever dead.
+    let stmts = crate::shir::ast_to_ir_raw(&commands).stmts;
+    if stmts.iter().all(is_inlinable_stmt) {
+        Some(stmts)
+    } else {
+        None
+    }
+}
+
+/// Is this statement one the shared Perl renderer already emits correctly?
+///
+/// Assignments and plain calls are the two shapes the corpus exercises
+/// through `eval` and the two this module has evidence for. Everything else
+/// is refused, so an unrenderable payload keeps the delegated form.
+///
+/// The assignment case is deliberately NARROWER than "is an Assign". A
+/// payload's statements all have the right TYPE in the failing case
+/// `eval "result=$(( ${var:-0} + ${array[${index:-0}]:-0} ))"` — it is a
+/// single `IrStmt::Assign` — but the renderer's output for that assignment
+/// is Perl that does not compile: the arithmetic expansion is emitted
+/// verbatim (`${array[${index:_0}]:_0}`) into a program that has only
+/// `my %array`, so perl aborts with "Global symbol requires explicit package
+/// name". A type check therefore admits exactly the payload that broke, so
+/// the guard is on the assignment's RIGHT-HAND SIDE: only a literal or a
+/// plain call is inlined, and an arithmetic/variable expansion keeps the
+/// delegated form.
+fn is_inlinable_stmt(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Assign { expr, .. } => is_inlinable_rhs(expr),
+        IrStmt::Expr(IrExpr::Call { func, .. }) => func == "exec" || func == "builtin",
+        _ => false,
+    }
+}
+
+/// Can this expression be rendered verbatim into the caller's program?
+///
+/// A literal, a plain command call, or a read of a variable. Anything that
+/// would need the renderer's arithmetic / expansion machinery is refused: this
+/// module does not own those decisions and a payload it cannot render is
+/// better left delegated.
+fn is_inlinable_rhs(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Str(..) | IrExpr::Int(..) => true,
+        IrExpr::Call { func, .. } => {
+            func == "exec" || func == "builtin" || func == "getVar" || func == "setVar"
+        }
+        _ => false,
+    }
+}
+
 fn fix_stmt(s: &IrStmt, fns: &std::collections::HashSet<String>) -> IrStmt {
     match s {
         // Fix 4 — a bare `return 0` / `return 1` is an exit STATUS, and Perl
@@ -945,3 +1181,126 @@ mod pgf_tests {
         assert!(out.find("__sh_args").unwrap() < out.find("print(1)").unwrap(), "{out}");
     }
 }
+
+#[cfg(test)]
+mod eval_fix_tests {
+    use super::*;
+
+    fn ir_of(src: &str) -> IrProgram {
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        crate::shir::ast_to_ir(&cmds)
+    }
+
+    #[test]
+    fn eval_payload_is_inlined_not_delegated() {
+        // `eval "y=7"` must NOT survive as a `builtin("eval", …)` call.
+        let prog = ir_of("x=1\neval \"y=7\"\necho done\n");
+        let fixed = fix_eval_stmts(&prog.stmts);
+        let still_eval = fixed.iter().any(|s| {
+            matches!(s, IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "builtin" || func == "exec")
+                    && exec_cmd_name(args) == Some("eval"))
+        });
+        assert!(!still_eval, "eval call survived the expansion: {fixed:?}");
+        // The assignment the payload carried is now a real statement AND
+        // kept its value: dead-store elimination on the payload would drop
+        // it, which is how `eval "y=7"` silently became a no-op.
+        let assigns: Vec<_> = fixed
+            .iter()
+            .filter_map(|s| match s {
+                IrStmt::Assign { targets, expr, .. } => Some((targets, expr)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            assigns.iter().any(|(t, e)| {
+                t.iter().any(|tg| tg.var == "y") && matches!(e, IrExpr::Str(v, _) if v == "7")
+            }),
+            "payload assignment lost or value-changed: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn non_eval_calls_are_untouched() {
+        let prog = ir_of("echo hi\n");
+        let fixed = fix_eval_stmts(&prog.stmts);
+        assert_eq!(fixed.len(), prog.stmts.len(), "{fixed:?}");
+    }
+
+    #[test]
+    fn a_payload_the_renderer_cannot_emit_is_left_alone() {
+        // `eval "r=$(( a + b ))"` — parses fine, but inlining emits Perl
+        // that does not compile. It must keep the delegated form.
+        let prog = ir_of("eval \"r=$(( 1 + 2 ))\"\necho done\n");
+        let fixed = fix_eval_stmts(&prog.stmts);
+        assert!(
+            fixed.iter().any(|s| {
+                matches!(s, IrStmt::Expr(IrExpr::Call { func, args })
+                    if (func == "builtin" || func == "exec")
+                        && exec_cmd_name(args) == Some("eval"))
+            }),
+            "an unrenderable payload was inlined anyway: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn unparseable_payload_is_left_alone() {
+        // A payload the parser rejects must not be dropped or mangled.
+        let prog = ir_of("eval \"if(\"\necho after\n");
+        let fixed = fix_eval_stmts(&prog.stmts);
+        assert!(fixed.iter().any(|s| {
+            matches!(s, IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "builtin" || func == "exec")
+                    && exec_cmd_name(args) == Some("eval"))
+        }), "unparseable eval payload was not preserved: {fixed:?}");
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod no_output_loss_tests {
+    use super::*;
+
+    // A post-pass that returns "" for an input it did not recognise is the
+    // worst failure this module can have: the CLI writes a 0-byte file and
+    // still exits 0, so a gate records a clean run of a program that printed
+    // nothing. Both passes below are pure text rewrites, so for ANY input
+    // with no needle present the output must be byte-identical to the input.
+    #[test]
+    fn case_pattern_tail_is_identity_without_a_needle() {
+        let src = "#!/usr/bin/env perl\nuse strict;\nprint \"hi\\n\";\nexit 0;\n";
+        for needle in ["q{$(", "qq{$(", "q($(", "qq($("] {
+            assert_eq!(
+                quote_cmdsub_tails(src, needle),
+                src,
+                "needle {needle:?} discarded the program"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_case_pattern_tail_is_identity_for_an_ordinary_program() {
+        let src = "#!/usr/bin/env perl\nuse strict;\nprint \"hi\\n\";\nexit 0;\n";
+        assert_eq!(fix_case_pattern_tail(src), src);
+    }
+
+    #[test]
+    fn a_needle_that_is_present_is_still_rewritten() {
+        // The rewrite must still fire — the identity fix must not have
+        // disabled the pass it was repairing.
+        let src = "if ($x =~ q{$(cmd)}a) { print 1; }\n";
+        let out = fix_case_pattern_tail(src);
+        assert!(out.contains("qx("), "the cmdsub tail was not rewritten: {out}");
+    }
+}
+
+
+
+
+
+
+
+
