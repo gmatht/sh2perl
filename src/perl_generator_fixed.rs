@@ -23,14 +23,24 @@
 //! shared renderer's business — and guessing would be worse than the status
 //! quo, which at least runs).
 
-use crate::ir::{shir_to_perl, InterpPart, IrExpr, IrProgram, IrStmt};
+use crate::ir::{shir_to_perl, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt};
 
 /// The Perl GENERATOR entry point: shared renderer + this module's fixes.
 ///
 /// This is what `otranspilerl-cli`'s `--target pl` dispatch must call.
 pub fn generate(prog: &IrProgram) -> String {
-    let src = shir_to_perl(&fixups(prog));
+    if std::env::var("PG_DUMP_IR").is_ok() {
+        eprintln!("PG_DUMP_IR: {prog:#?}");
+    }
+    let fixed = fixups(prog);
+    let src = shir_to_perl(&fixed);
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!("PGFIX-RENDERED:\n{src}");
+    }
     let src = post_pass(&src);
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!("PGFIX-POSTPASS:\n{src}");
+    }
     // The shared renderer emits only the helpers it knows about, so the
     // `__sh_fn_status` helper `fix_cond` introduces is injected here. Gated on
     // the rendered body, same discipline as the renderer's own preamble
@@ -54,7 +64,525 @@ pub fn generate(prog: &IrProgram) -> String {
 fn post_pass(src: &str) -> String {
     let out = fix_sub_params(src);
     let out = fix_case_pattern_tail(&out);
-    fix_cmd_capture_split(&out)
+    let out = fix_heredoc_delim(&out);
+    let out = fix_cmd_capture_split(&out);
+    let out = fix_for_array_iterand(&out);
+    let out = fix_for_capture_paren(&out);
+    let out = fix_bareword_words(&out);
+    // LAST: it must see the final text, and it only ever PREPENDS
+    // declarations, so it cannot disturb what the earlier passes matched.
+    declare_undeclared_vars(&out)
+}
+
+// ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
+//
+// `echo ab` renders as `print(ab);`. Under the `use strict` the preamble
+// always emits, an unquoted `ab` is a *bareword* — Perl reads it as the
+// string "ab" but warns, and warns to stderr, and "ab" is one token away
+// from a future reserved word:
+//
+// ```perl
+// Unquoted string "ab" may clash with future reserved word at out.pl line 362.
+// ```
+//
+// The value is already correct; only the quoting is missing. `render_word`
+// in the shared renderer returns a bareword for a single unquoted literal
+// word, and the renderer routes that straight into `print(…)` (ir.rs's
+// echo/print path). Anchoring on the renderer's own call shape — a `print`
+// whose argument list is a bare identifier that is NOT a declared Perl
+// symbol — keeps this from touching `$x`, `foo(…)`, `'q'`, or a `print` whose
+// argument is already an expression.
+fn fix_bareword_words(src: &str) -> String {
+    let declared = declared_symbols(src);
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        out.push_str(&quote_bareword_in_line(line, &declared));
+    }
+    out
+}
+
+/// Rewrite `print(AB);` / `print(AB, "\n");` where `AB` is a bareword into
+/// the quoted form. Returns `line` unchanged unless it matches.
+fn quote_bareword_in_line(line: &str, declared: &std::collections::HashSet<String>) -> String {
+    // Cheap reject: the defect needs a `print(` and no `$`/`'`/`"` anywhere
+    // in the call, so most lines never reach the scan.
+    if !line.contains("print(") || line.contains('"') {
+        return line.to_string();
+    }
+    let mut fixed = line.to_string();
+    for (open, close) in [("print(", ");"), ("print (", ");")] {
+        let mut from = 0usize;
+        while let Some(rel) = fixed[from..].find(open) {
+            let start = from + rel + open.len();
+            let Some(end_rel) = fixed[start..].find(close) else {
+                break;
+            };
+            let end = start + end_rel;
+            let inner = &fixed[start..end];
+            from = end + close.len();
+            // Only a bare identifier is a bareword. `$x` is a variable, and
+            // `f(...)`/`q{...}`/`$x + 1` are already expressions.
+            if !is_bareword_ident(inner, declared) {
+                continue;
+            }
+            let q = format!("'{inner}'");
+            fixed.replace_range(start..end, &q);
+            from = start + q.len();
+        }
+    }
+    fixed
+}
+
+/// True when `s` is exactly a Perl identifier that is a bareword: no sigil,
+/// no call, no quotes, and not a name the program declares (a declared
+/// sub or a `my` variable used without a sigil is not our business).
+fn is_bareword_ident(s: &str, declared: &std::collections::HashSet<String>) -> bool {
+    if s.is_empty() || declared.contains(s) {
+        return false;
+    }
+    let mut cs = s.chars();
+    let first = cs.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    true
+}
+
+// ── Fix 13 — declare every variable the program USES but never declares ────
+//
+// The preamble always emits `use strict`, under which reading an undeclared
+// `$name` is a COMPILE error, not a warning:
+//
+// ```perl
+// Global symbol "$__cap" requires explicit package name
+//     (did you forget to declare "my $__cap"?) at out.pl line 7.
+// ```
+//
+// The shared renderer hoists a `my` for variables it can see assigned, but
+// an environment-assignment PREFIX (`VAR=value cmd`) renders the name as a
+// Perl *read* with nothing to bind it:
+//
+// ```perl
+// $ENV{__cap} = $__cap;   # line 4   ← read of an undeclared $__cap
+// ```
+//
+// and the same gap shows up for a command-substitution target and for a
+// `local`-less loop var. Rather than teach the shared renderer about each
+// construct, scan the finished text for `$name` / `@name` / `%name` reads
+// and emit one `my` per symbol that is used but never declared. That is
+// exactly what the strict pragma asks for, and it is a no-op for a program
+// the renderer already got right.
+fn declare_undeclared_vars(src: &str) -> String {
+    if !src.contains("use strict") {
+        return src.to_string();
+    }
+    let declared = declared_symbols(src);
+    // `use English qw($INPUT_RECORD_SEPARATOR …)` predeclares those aliases.
+    // A `my` for one of them is not merely redundant, it is ILLEGAL — the
+    // later `local $INPUT_RECORD_SEPARATOR` would be "Can't localize lexical
+    // variable" — so a name any `use` imports is off limits.
+    let imported = imported_names(src);
+    let mut wanted: Vec<(char, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (sigil, name) in referenced_symbols(src) {
+        if !is_declared_name(&name) || seen.contains(&(sigil, name.clone())) {
+            continue;
+        }
+        // A name the program already binds — by `my`/`our`/`local`, or as a
+        // sub — is not ours to declare.
+        if declared.contains(&name) {
+            continue;
+        }
+        if imported.contains(&name) {
+            continue;
+        }
+        // `$_`, `$0`..`$9`, `$@`, and the renderer's own `$main_exit_code`
+        // / `$CHILD_ERROR` / `$__sh_*` machinery are either special or
+        // already bound by the preamble.
+        if is_special_perl_name(&name, &declared) {
+            continue;
+        }
+        seen.insert((sigil, name.clone()));
+        wanted.push((sigil, name));
+    }
+    if wanted.is_empty() {
+        return src.to_string();
+    }
+    // Sort so the output is deterministic: a re-render of the same program
+    // must produce the same bytes, or every gate run shows a spurious diff.
+    wanted.sort();
+    let mut decl = String::new();
+    for (sigil, name) in &wanted {
+        decl.push_str(&format!("my {sigil}{name};\n"));
+    }
+    inject_before_first_stmt(src, &decl)
+}
+
+/// Every identifier a `use Module qw(a b c)` import list predeclares.
+///
+/// `use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR
+/// $OS_ERROR $PROGRAM_NAME)` is in the renderer's own preamble, and those
+/// aliases must never receive a `my`: `local $INPUT_RECORD_SEPARATOR = …`
+/// is legal against the English alias and fatal against a fresh lexical.
+fn imported_names(src: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        if !(t.starts_with("use ") || t.starts_with("no ")) {
+            continue;
+        }
+        // Collect every bareword in the import list, with any sigil stripped.
+        for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')) {
+            let name = tok.trim_start_matches('$');
+            if name.is_empty() {
+                continue;
+            }
+            let mut cs = name.chars();
+            let first = cs.next().unwrap();
+            if (first.is_ascii_alphabetic() || first == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// True for names Perl reserves or the renderer pre-binds, which must never
+/// get a fresh `my`.
+fn is_special_perl_name(name: &str, declared: &std::collections::HashSet<String>) -> bool {
+    if declared.contains(name) {
+        return true;
+    }
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return true; // $1 .. $9
+    }
+    matches!(
+        name,
+        // `a`/`b` are Perl's `sort` package globals — the renderer lowers a
+        // pipeline's sort stage to `sort { $a cmp $b } @__fs`, and a `my $a`
+        // of ours would shadow them for the whole file and make every sort
+        // compare two undefs. See the sort_globals_* regression tests.
+        "a" | "b"
+            | "_"
+            | "main_exit_code"
+            | "CHILD_ERROR"
+            | "sh_args"
+            | "fn_status"
+            | "OK"
+            | "ARGV"
+            | "ENV"
+            | "INC"
+            | "stdout"
+            | "stderr"
+            | "stdin"
+    )
+}
+
+/// Names a shell program can actually use: skip render-internal `__sh_`/
+/// `__`-prefixed temporaries (the renderer hoists those itself) and Perl's
+/// own special punctuation.
+fn is_declared_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.starts_with("__") {
+        return false;
+    }
+    let mut cs = name.chars();
+    let first = cs.next().unwrap();
+    (first.is_ascii_alphabetic() || first == '_') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every `$name` / `@name` symbol mentioned in the text, with its sigil.
+///
+/// `#`/`%` is deliberately NOT scanned. A hash sigil and a printf format
+/// spec are the same two characters in the same place — `printf("%d %o", …)`
+/// reads as `%d` and `%o` — and modulo, and a regex, and a substitution all
+/// look the same again. A false `%d` declaration was not merely wasteful: it
+/// made `cmp -l` fail to compile and hang. `$` and `@` have no such
+/// ambiguity, so they are safe to scan.
+///
+/// The remaining over-collection (a `$name` inside a single-quoted string is
+/// text, not a variable) costs at most a harmless extra `my`.
+fn referenced_symbols(src: &str) -> Vec<(char, String)> {
+    let mut out = Vec::new();
+    let b: Vec<char> = src.chars().collect();
+    for i in 0..b.len() {
+        let c = b[i];
+        if c != '$' && c != '@' {
+            continue;
+        }
+        // A sigil directly followed by a sigil is a deref/array-slice, not a
+        // new name (`$$ref`, `@$ref`).
+        if i + 1 < b.len() && (b[i + 1] == '$' || b[i + 1] == '@') {
+            continue;
+        }
+        let mut j = i + 1;
+        let mut name = String::new();
+        while j < b.len() {
+            let cj = b[j];
+            if cj.is_ascii_alphanumeric() || cj == '_' {
+                name.push(cj);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if !name.is_empty() {
+            // A subscripted or braced reference is not a scalar: Perl reads
+            // `$PIPESTATUS[0]` as `@PIPESTATUS` and `$h{key}` as `%h`, and a
+            // `my $PIPESTATUS` would leave the read as a compile error under
+            // `use strict` ("Global symbol @PIPESTATUS requires explicit
+            // package name"). Promote the sigil to what the usage demands.
+            let sigil = match b.get(j) {
+                Some('[') => '@',
+                Some('{') => '%',
+                _ => c,
+            };
+            out.push((sigil, name));
+        }
+    }
+    out
+}
+
+/// Every symbol the program already binds: the names introduced by any `my`
+/// / `our` / `local` / `state` declaration, and every `sub NAME`.
+///
+/// A declaration is NOT always at the start of a line — the renderer emits
+/// `open(my $fh, …)`, `for my $i (…)`, and `local $/` in mid-line position,
+/// and a body statement can carry several (`my ($a, $b) = split(…)`). Reading
+/// only the first name after a line-leading keyword missed all three, and a
+/// missed declaration becomes a spurious `my` from Fix 13 — which for a
+/// `local` of that same name is a compile error, not just noise.
+fn declared_symbols(src: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in src.lines() {
+        for kw in ["my ", "our ", "local ", "state "] {
+            let mut from = 0usize;
+            while let Some(rel) = line[from..].find(kw) {
+                let at = from + rel;
+                from = at + kw.len();
+                // The keyword must be a standalone word, not the tail of an
+                // identifier (`my` in `$my_var`).
+                let before_ok = at == 0
+                    || !line[..at]
+                        .chars()
+                        .next_back()
+                        .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                        .unwrap_or(false);
+                if !before_ok {
+                    continue;
+                }
+                // The declaration binds the sigil-bearing names in its BINDING
+                // LIST only — everything from the initialiser on is an
+                // expression that may mention variables this does not bind
+                // (`my $n = length($x)` binds `$n`, not `$x`). Stop at the
+                // first `=` or `;`.
+                let rest = &line[from..];
+                let binding_end = rest
+                    .char_indices()
+                    .find(|(i, c)| *c == '=' || *c == ';')
+                    .map(|(i, _)| i)
+                    .unwrap_or(rest.len());
+                for (sigil, name) in referenced_symbols(&rest[..binding_end]) {
+                    let _ = sigil;
+                    if !name.is_empty() {
+                        out.insert(name);
+                    }
+                }
+                // Keep sweeping: a single rendered line routinely carries
+                // several declarations (`do { my $a = …; my $b = … }`).
+            }
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("sub ") {
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Fix 11 — a `for … in "${arr[@]}"` iterand must stay a LIST, not a scalar.
+///
+/// The renderer wraps a `for` iterand in a redundant pair of parens, exactly
+/// as it does for a capture (Fix 10), but for an ARRAY expansion the inner
+/// expression is the `join`/`split` round-trip rather than a bare `split`:
+///
+/// ```perl
+/// for my $__num ((join(' ', @numbers))) {  # from `for num in "${numbers[@]}"`
+/// ```
+///
+/// Both problems are Fix 10's, at once. The inner parens put `join` in
+/// **scalar context**, so the loop runs exactly once with the whole array as
+/// one word: `for num in "${numbers[@]}"` over `(1 2 3 4 5)` printed nothing
+/// where the nested filter should have printed 8 lines (058), and `for arg in
+/// "$@"` (realpath-cmdsub) collapsed every argument into a single blob. The
+/// `join` is separately wrong here — `join` is what *collapses* the list, and
+/// the list is what the loop wants.
+///
+/// The fix is the same unwrap Fix 10 performs, and for the same reason: the
+/// word-splitting `for` wants is precisely what the array already holds, so
+/// the iterand is the array itself. `for my $__num (@numbers)` iterates one
+/// element at a time, as bash's `for … in "${arr[@]}"` does.
+///
+/// Scoped to the array shape only. An iterand that is a command capture is
+/// Fix 10's business (there the list must come from `split`), and anything
+/// else — a literal list, a range, a glob — is left exactly as rendered.
+fn fix_for_array_iterand(src: &str) -> String {
+    const PREFIX: &str = "for my $";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(at) = rest.find(PREFIX) else {
+            out.push_str(rest);
+            return out;
+        };
+        // The iterand paren pair: `for my $NAME ((`.
+        let after_prefix = &rest[at + PREFIX.len()..];
+        let Some(name_end) = after_prefix.find(' ') else {
+            out.push_str(&rest[..at + PREFIX.len()]);
+            rest = after_prefix;
+            continue;
+        };
+        let open = at + PREFIX.len() + name_end + 1;
+        if !rest[open..].starts_with("((") {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        }
+        // Inner `(` — the one that must go.
+        let inner_open = open + 1;
+        let Some(inner_close) = matching_paren(rest, inner_open) else {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        };
+        // The wrap must be `join(' ', @NAME)` — the array shape. A capture is
+        // Fix 10's; anything else (a literal list, a range) is not ours.
+        let inner = rest[inner_open + 1..inner_close].trim();
+        let Some(arr) = inner
+            .strip_prefix("join(' ', @")
+            .and_then(|t| t.strip_suffix(')'))
+        else {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        };
+        // A bare `@name` is the iterand; `@name[ … ]` and `@{ … }` are not
+        // shapes this fix claims to understand.
+        if arr.is_empty() || !arr.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        }
+        // `for my $NAME ((join(' ', @arr))) {` -> `for my $NAME (@arr) {`
+        // `inner_close` is the `)` that closes the `join`; the iterand's own
+        // `)` follows it, so resumption is one past THAT, not past this one.
+        // A shape that ends before that second `)` is not ours — leave it.
+        let Some(resume) = rest.get(inner_close + 2..) else {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        };
+        out.push_str(&rest[..inner_open]);
+        out.push('@');
+        out.push_str(arr);
+        out.push(')');
+        rest = resume;
+    }
+}
+
+/// Fix 10 — a `for … in $(cmd)` capture must stay a LIST, not a scalar.
+///
+/// The renderer emits the command substitution as
+/// `join(' ', split(/\s+/, …))` and wraps a `for` iterand in a further pair
+/// of parens:
+///
+/// ```perl
+/// for my $f ((join(' ', split(/\s+/, __sh_pipe_capture(…))))) {
+/// ```
+///
+/// Those inner parens put `join` in **scalar context**, so the loop runs
+/// exactly once with the whole line as one word:
+/// `for f in $(echo "a b c")` printed `[a b c]` instead of `[a] [b] [c]`
+/// (examples/sqs-overlap-multiline-awk.sh, 070_gnuisms_thorough.sh line 65).
+///
+/// The word-splitting `for` wants is precisely what `split` already produces —
+/// `join` is what collapses it. So the fix is to drop the redundant parens AND
+/// the `join` wrapper, leaving `for my $f (split(/\s+/, …))`, which iterates
+/// per field exactly as bash's `for … in $(cmd)` does (IFS field splitting).
+///
+/// Scoped to the `for`-iterand shape only: a capture used in a scalar context
+/// (assignment, arithmetic, test) must keep the `join` that
+/// `fix_cmd_capture_split` puts in scalar context.
+fn fix_for_capture_paren(src: &str) -> String {
+    const PREFIX: &str = "for my $";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(at) = rest.find(PREFIX) else {
+            out.push_str(rest);
+            return out;
+        };
+        // The iterand paren pair: `for my $NAME ((`.
+        let after_prefix = &rest[at + PREFIX.len()..];
+        let Some(name_end) = after_prefix.find(' ') else {
+            out.push_str(&rest[..at + PREFIX.len()]);
+            rest = after_prefix;
+            continue;
+        };
+        let open = at + PREFIX.len() + name_end + 1;
+        if !rest[open..].starts_with("((") {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        }
+        // Inner `(` — the one that must go.
+        let inner_open = open + 1;
+        let Some(inner_close) = matching_paren(rest, inner_open) else {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        };
+        // The wrap must be `join(' ', split(/\s+/, …))` — the capture shape.
+        // Anything else (a plain `@list`, an array ref) is not ours.
+        let inner = rest[inner_open + 1..inner_close].trim();
+        if !inner.starts_with("join(' ', split(/\\s+/, ") {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        }
+        // Unwrap the `split`: `join(' ', split(/\s+/, X))` -> `split(/\s+/, X)`.
+        let split_at = inner.find("split(/\\s+/, ").expect("prefix-checked") + "split(/\\s+/, ".len();
+        // The `split` call's own close paren ends the expression.
+        let Some(split_close) = matching_paren(inner, split_at) else {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        };
+        if split_close + 1 != inner.len() || !inner.ends_with(')') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            continue;
+        }
+        let split_expr = &inner[split_at..split_close];
+        out.push_str(&rest[..inner_open]);
+        out.push('(');
+        out.push_str(split_expr);
+        out.push(')');
+        rest = &rest[inner_close + 1..];
+    }
 }
 
 /// Fix 5 — a command substitution whose output is ONE token must not be erased.
@@ -194,7 +722,13 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
                         b'[' => b']',
                         _ => b'>',
                     };
-                    let mut d = 0i32;
+                    // Depth starts at 1 because `i += 2` below has ALREADY
+                    // consumed the opening delimiter. Starting at 0 made the
+                    // first closer drive `d` to -1, so the loop never broke and
+                    // the scanner ran to end-of-line — silently swallowing the
+                    // real close paren and leaving every `matching_paren` on a
+                    // line containing a `q(…)` unbalanced.
+                    let mut d = 1i32;
                     i += 2;
                     while i < b.len() && b[i] != b'\n' {
                         match b[i] {
@@ -325,8 +859,15 @@ fn sub_spans(src: &str) -> Vec<(usize, usize, String)> {
             continue;
         };
         // `rest` starts at the first non-space byte of the line, so the
-        // `{` sits this far into the line.
-        let open = open_rel + (line.len() - rest.len());
+        // `{` sits this far into the line — and `open` must be an ABSOLUTE
+        // offset into `src`, because every consumer below (`after_open`,
+        // `body_start`, the brace walk) indexes into the whole program.
+        // `line_start` is therefore part of the sum: without it, any sub
+        // that is not the first line of the program got a body offset that
+        // pointed back into the preamble, the `#`-comment guard then rejected
+        // it, and `sub_spans` silently returned an empty list for every
+        // program whose functions were not at byte 0.
+        let open = line_start + open_rel + (line.len() - rest.len());
         // Only a REAL function definition opens its body with the `{` we
         // just found. The renderer's own preamble contains other blocks that
         // a bare `sub ` prefix cannot distinguish (`BEGIN { ... }` in the
@@ -390,27 +931,41 @@ fn sub_spans(src: &str) -> Vec<(usize, usize, String)> {
 
 /// Fix 2 (textual half) — bind and rewire a function's positional parameters.
 ///
-/// Applied innermost-first: an outer sub's body contains the inner sub's
-/// text, so rewriting inner bodies first and then splicing them into the
-/// outer extent keeps the offsets of the not-yet-visited bodies valid.
+/// Spans ascend by byte offset and a sub nested inside one already spliced is
+/// skipped: the enclosing body carried it into `out` already.
 fn fix_sub_params(src: &str) -> String {
     let spans = sub_spans(src);
     if spans.is_empty() {
         return src.to_string();
     }
-    let mut out = String::with_capacity(src.len());
+    let mut out = String::with_capacity(src.len() + 64);
     let mut cursor = 0usize;
-    // `(start, end, name)` ascending; walk it backwards so each splice is
-    // applied to the not-yet-copied prefix.
-    let mut i = spans.len();
-    while i > 0 {
-        i -= 1;
-        let (start, end, _name) = spans[i].clone();
-        let body = &src[start..end];
-        let fixed = inject_param_binding(&rewrite_positional_params(body));
-        out.push_str(&src[cursor..start]);
+    // `(start, end, name)` ascending by start. Splicing must walk them
+    // FORWARD: a span's `start`/`end` are byte offsets into the original
+    // `src`, so `src[cursor..start]` is only a valid (non-inverted) range
+    // while `cursor <= start`. A span nested inside one already consumed is
+    // skipped — its text was rewritten as part of the enclosing body.
+    for (start, end, _name) in &spans {
+        if *start < cursor || *end > src.len() || *start > *end {
+            continue;
+        }
+        let body = &src[*start..*end];
+        // The binding is only needed when the body actually READS a
+        // positional parameter. Injecting it unconditionally put a
+        // `local @__sh_args = @_;` into every function — including ones that
+        // never touch `$1` — and, because `declare_param_array` only declares
+        // the array when a `$__sh_args[…` read exists, that lone `@__sh_args`
+        // was an undeclared package variable: a `use strict` compile error
+        // that killed the whole program (func-after-or-assign printed nothing).
+        let rewritten = rewrite_positional_params(body);
+        let fixed = if rewritten.contains("$__sh_args[") {
+            inject_param_binding(&rewritten)
+        } else {
+            rewritten
+        };
+        out.push_str(&src[cursor..*start]);
         out.push_str(&fixed);
-        cursor = end;
+        cursor = *end;
     }
     out.push_str(&src[cursor..]);
     declare_param_array(&out)
@@ -482,6 +1037,164 @@ fn quote_cmdsub_tails(src: &str, needle: &str) -> String {
     out
 }
 
+/// Fix 6 — the heredoc seam's terminator line carries a duplicated pipeline tail.
+///
+/// The renderer builds the shell command first and only then appends the
+/// heredoc (`ir.rs:2226-2233`):
+///
+/// ```text
+/// cmd = "<cmd with its pipeline>"
+/// cmd += "\n" + body + "\n" + delim
+/// ```
+///
+/// which is correct only while the command has nothing after the heredoc. For
+/// `cat << 'EOF' | grep -v "^#" | sed 's/^/  /'` the pipeline is already part of
+/// `cmd`, so the emitted text is
+///
+/// ```perl
+/// system('bash', '-c', q['cat' <<'_SH2DOC_'
+/// # This is a comment
+/// …
+/// _SH2DOC_ | 'grep' '-v' "^#" | 'sed' 's/^/  /']);
+/// ```
+///
+/// A heredoc terminator must be ALONE on its line. Here it is followed by a
+/// copy of the pipeline that the opener line already carries, so bash never
+/// closes the heredoc: it warns "here-document … delimited by end-of-file",
+/// swallows the terminator line into the body, and the pipeline runs on that
+/// garbage — the literal `$(echo …)` lines come out un-indented and un-grepped.
+///
+/// The fix is to drop the tail that follows the terminator token on its line,
+/// leaving the terminator alone. The pipeline it duplicates is already on the
+/// opener, so nothing is lost.
+fn fix_heredoc_delim(src: &str) -> String {
+    if !src.contains("_SH2DOC_") {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    for block in split_heredoc_blocks(src) {
+        match block {
+            HeredocBlock::Plain(t) => out.push_str(t),
+            HeredocBlock::Heredoc { open, body, close } => {
+                out.push_str(open);
+                out.push_str(body);
+                out.push_str(&closer_line(close));
+            }
+        }
+    }
+    out
+}
+
+enum HeredocBlock<'a> {
+    Plain(&'a str),
+    Heredoc {
+        open: &'a str,
+        body: &'a str,
+        close: &'a str,
+    },
+}
+
+/// The terminator line of a heredoc, with anything after the delimiter token
+/// removed so the terminator stands alone — and the rest of the line
+/// (everything up to and including its newline) dropped with it.
+fn closer_line(close: &str) -> String {
+    match close.find('\n') {
+        Some(i) => format!("{}\n", &close[..=i]),
+        None => close.to_string(),
+    }
+}
+
+/// Split `src` into plain text and heredoc blocks, in order.
+///
+/// A block starts at the first `<<'_SH2DOC_'` (or bare `<<_SH2DOC_`) and ends
+/// at the line that closes it. Anything that is not a well-formed open→close
+/// pair is emitted as `Plain` so an unrecognised shape is left exactly as the
+/// renderer wrote it.
+fn split_heredoc_blocks(src: &str) -> Vec<HeredocBlock<'_>> {
+    const OPENER: &str = "_SH2DOC_";
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = src[cursor..].find(OPENER) {
+        let at = cursor + rel;
+        // The opener must be a `<<` introducer, not an arbitrary mention.
+        let Some(lt2) = src[..at].rfind("<<") else {
+            break;
+        };
+        if lt2 + 2 != at {
+            // `_SH2DOC_` not immediately after `<<` — plain text.
+            blocks.push(HeredocBlock::Plain(&src[cursor..at + OPENER.len()]));
+            cursor = at + OPENER.len();
+            continue;
+        }
+        // `open` runs to the end of the line containing the `<<`; the BODY
+        // follows, and the closer is the first later line that is exactly the
+        // delimiter (bare, or quoted).
+        let open_end = match src[at..].find('\n') {
+            Some(i) => at + i + 1,
+            None => src.len(),
+        };
+        let body_start = open_end;
+        let Some(body_end) = find_heredoc_close(src, body_start, OPENER) else {
+            blocks.push(HeredocBlock::Plain(&src[cursor..body_start]));
+            cursor = body_start;
+            continue;
+        };
+        blocks.push(HeredocBlock::Plain(&src[cursor..at]));
+        blocks.push(HeredocBlock::Heredoc {
+            open: &src[at..open_end],
+            body: &src[body_start..body_end],
+            close: &src[body_end..],
+        });
+        cursor = body_end;
+        // `close` was pushed including the delimiter line; advance past it.
+        let after = match src[cursor..].find('\n') {
+            Some(i) => cursor + i + 1,
+            None => src.len(),
+        };
+        cursor = after;
+    }
+    blocks.push(HeredocBlock::Plain(&src[cursor..]));
+    blocks
+}
+
+/// The offset of the line that closes a heredoc whose delimiter is `delim`.
+///
+/// A terminator is the first line at/after `from` that BEGINS with the
+/// delimiter as its own token — bare, or single/double quoted. It is matched on
+/// that prefix rather than on whole-line equality, because the broken emission
+/// puts the duplicated pipeline tail on the same line, and a whole-line test
+/// would never find the terminator at all.
+fn find_heredoc_close(src: &str, from: usize, delim: &str) -> Option<usize> {
+    let mut at = from;
+    while at <= src.len() {
+        let end = src[at..].find('\n').map(|i| at + i).unwrap_or(src.len());
+        if line_opens_with_delim(&src[at..end], delim) {
+            return Some(at);
+        }
+        if end >= src.len() {
+            return None;
+        }
+        at = end + 1;
+    }
+    None
+}
+
+/// True when `line` starts with `delim` as a standalone token (the rest of the
+/// line may be the duplicated pipeline tail).
+fn line_opens_with_delim(line: &str, delim: &str) -> bool {
+    let line = line.trim_start();
+    for open in [format!("{delim}"), format!("'{delim}'"), format!("\"{delim}\"")] {
+        if let Some(rest) = line.strip_prefix(open.as_str()) {
+            // The token must be followed by end-of-line or whitespace — `|` in
+            // the broken tail — so `delim` never matches a longer identifier.
+            if rest.is_empty() || rest.starts_with([' ', '\t', '|']) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Insert `text` after the leading shebang / `use` / `my`-declaration block
 /// and before the first executable statement.
 fn inject_before_first_stmt(src: &str, text: &str) -> String {
@@ -515,13 +1228,25 @@ fn inject_before_first_stmt(src: &str, text: &str) -> String {
 /// Apply every IR-level correction to a clone of `prog`.
 fn fixups(prog: &IrProgram) -> IrProgram {
     let fns = program_function_names(&prog.stmts, &prog.subs);
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!("PGFIX-IN: {:#?}", prog.stmts);
+    }
     let mut fixed = prog.clone();
     fixed.stmts = fix_stmts(&prog.stmts, &fns);
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!("PGFIX-OUT: {:#?}", fixed.stmts);
+    }
     // The eval statement is not a normal Call as far as the IR is concerned:
     // its payload is SHELL TEXT that bash runs in the caller's scope, so it
     // is expanded (Fix 6) and then re-entered as a nested program (Fix 7).
-    // Do that AFTER fix_stmts so the expansions are already corrected.
-    fixed.stmts = fix_eval_stmts(&prog.stmts);
+    // Do that AFTER fix_stmts so the expansions are already corrected — so
+    // it must run over the ALREADY-FIXED stmts, not the original (passing
+    // `&prog.stmts` here discards every correction fix_stmts made above).
+    fixed.stmts = fix_eval_stmts(&fixed.stmts);
+    // Fix 9 — the materialised process-substitution consumer's OWN status.
+    // Same ordering rule as Fix 7: it walks whole statements (a rewrite of
+    // the block's shape), so it runs over the ALREADY-FIXED statements.
+    fixed.stmts = fix_ps_status_blocks(&fixed.stmts);
     fixed.subs = prog
         .subs
         .iter()
@@ -746,6 +1471,105 @@ fn exec_cmd_name(args: &[IrExpr]) -> Option<&str> {
 
 fn fix_stmts(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -> Vec<IrStmt> {
     stmts.iter().map(|s| fix_stmt(s, fns)).collect()
+}
+
+// ── Fix 13 — a `param` op's PATTERN/REPLACEMENT arrive pre-quoted ─────
+//
+// `shir::ast_to_ir` lowers `${s/abc/XYZ}` to
+// `Call { func: "param", args: [Str("/"), Str("s"), Str("abc"), Str("XYZ")] }`,
+// and the shared renderer runs BOTH operands through `param_value`, which
+// calls `render_str_literal` on the text. That is right for a DEFAULT
+// (`${a:-abc}` wants a Perl string) and wrong for a substitution: the
+// operands of a `s///` are a PATTERN and a REPLACEMENT, not strings to be
+// printed. A quoted operand reaches the regex as a literal run of quote
+// characters, so
+//
+//   s=abc:def:ghi; echo "${s/abc/XYZ}"
+//
+// emitted `s/"abc"/"XYZ"/` — a pattern that matches `"abc"`, which never
+// occurs — and the substitution was a silent no-op (bench-strsubst printed
+// `front=abc:def:ghi`). The same mistake hits every glob/brace-expansion
+// removal: `${p##*[/\\]}` emitted `s{^.*\[/\\\]}{}` and returned the whole
+// string (parse-param-pattern-match printed `/opt/tool/git-tool` where bash
+// prints `git-tool`).
+//
+// The fix is IR-level and exact: strip the operand quoting *in the IR*, so
+// the renderer receives the bare pattern text and its own `glob_to_regex`
+// does the escaping it was written to do. Nothing is re-implemented here —
+// only the quotes that the substitution operands should never have had are
+// removed.
+//
+// Scoped deliberately to the ops whose operands are PATTERNS (`/`, `//`,
+// `#*`, `%*`) and to a `Str` operand carrying a balanced pair of the same
+// quote character — the spelling `render_str_literal` itself produces. An
+// operand that is not quoted, or whose quotes do not pair, is left alone:
+// a pattern that genuinely contains a quote is the renderer's business.
+fn fix_param_pattern_operands(expr: &IrExpr) -> IrExpr {
+    let IrExpr::Call { func, args } = expr else {
+        return expr.clone();
+    };
+    if func != "param" || args.len() < 3 {
+        return expr.clone();
+    }
+    let Some(op) = args.first().and_then(crate::ir::call_arg_str) else {
+        return expr.clone();
+    };
+    if !matches!(
+        op.as_str(),
+        "/" | "//" | "#" | "#:" | "##" | "##:" | "%" | "%:" | "%%" | "%%:"
+    ) {
+        return expr.clone();
+    }
+    let mut fixed = args.clone();
+    // arg 2 is the pattern for every one of these ops. For `#`/`%` the
+    // renderer re-reads it as a raw `Str` (it calls `call_arg_str` directly),
+    // so unquoting it is what makes the glob compile. For `/` and `//` the
+    // renderer runs it through `glob_to_regex` — also correct once unquoted.
+    if let Some(unquoted) = unquote_operand(&args[2]) {
+        fixed[2] = match &args[2] {
+            IrExpr::Str(_, style) => IrExpr::Str(unquoted, style.clone()),
+            _ => unreachable!("unquote_operand only matches a Str"),
+        };
+    }
+    // arg 3 is the REPLACEMENT text, and only for the `/` and `//` ops: it
+    // is a value to substitute in, not a pattern to compile. `#`/`%` have
+    // no replacement operand, so an index-3 write would be out of range.
+    if matches!(op.as_str(), "/" | "//") && args.len() >= 4 {
+        if let Some(unquoted) = unquote_operand(&args[3]) {
+            fixed[3] = match &args[3] {
+                IrExpr::Str(_, style) => IrExpr::Str(unquoted, style.clone()),
+                _ => unreachable!("unquote_operand only matches a Str"),
+            };
+        }
+    }
+    IrExpr::Call {
+        func: func.clone(),
+        args: fixed,
+    }
+}
+
+/// The text of a substitution operand with a balanced pair of identical
+/// surrounding quotes removed, or `None` when it carries none.
+///
+/// `render_str_literal` emits `"abc"` / `'abc'`, so a `Str` operand that is
+/// still quoted arrived through that path. Unbalanced or mismatched quotes
+/// return `None` so a pattern which genuinely contains a quote survives.
+fn unquote_operand(e: &IrExpr) -> Option<String> {
+    let IrExpr::Str(s, _) = e else {
+        return None;
+    };
+    let t = s.trim();
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let last = t.chars().last()?;
+    // A single-character operand ("`" or `'`) has no inner content to keep.
+    if first != last || (first != '"' && first != '\'') || t.chars().count() < 2 {
+        return None;
+    }
+    let inner = &t[first.len_utf8()..t.len() - last.len_utf8()];
+    // `trim_matches('\\')` is what the renderer does to a replacement, so a
+    // value that only became quoted by OUR caller must not double-unescape.
+    Some(inner.to_string())
 }
 
 // ── Fix 7 — an `eval` payload is SHELL TEXT, not arguments ────────────
@@ -979,8 +1803,122 @@ fn is_inlinable_rhs(e: &IrExpr) -> bool {
     }
 }
 
+/// Recursively apply {@link fix_param_pattern_operands} to every expression
+/// reachable from `e`.
+///
+/// The substitution operand can appear at any depth — inside a command's
+/// word list, a concatenation, a nested expansion, a condition, a ternary
+/// arm — so a fix that only inspected the outermost expression would repair
+/// `echo "${s/a/b}"` and leave `echo "x=${s/a/b}"` broken.
+///
+/// Every variant is enumerated rather than catching `_ => e.clone()`: a
+/// catch-all would silently skip a construct the moment one is added, which
+/// is exactly the failure mode this walk exists to prevent.
+fn fix_expr(e: &IrExpr) -> IrExpr {
+    match e {
+        IrExpr::Int(_) | IrExpr::Str(..) | IrExpr::Var(..) | IrExpr::Regex { .. }
+        | IrExpr::Range { .. } | IrExpr::RawExpr(_) | IrExpr::Bool(_)
+        | IrExpr::Json(_) | IrExpr::Ident(_) => e.clone(),
+        IrExpr::Index { var, key } => IrExpr::Index {
+            var: var.clone(),
+            key: Box::new(fix_expr(key)),
+        },
+        IrExpr::BinOp { lhs, op, rhs } => IrExpr::BinOp {
+            lhs: Box::new(fix_expr(lhs)),
+            op: op.clone(),
+            rhs: Box::new(fix_expr(rhs)),
+        },
+        IrExpr::Call { func, args } => {
+            // The correction applies to THIS call first, then to its
+            // arguments: a `param` operand can itself contain a `param`
+            // (`${s/${a}/b}`), and the outer unquoting must not hide the
+            // inner one.
+            let corrected = fix_param_pattern_operands(e);
+            match corrected {
+                IrExpr::Call { func, args } => IrExpr::Call {
+                    func,
+                    args: args.iter().map(fix_expr).collect(),
+                },
+                other => other,
+            }
+        }
+        IrExpr::MethodCall { obj, method, args } => IrExpr::MethodCall {
+            obj: Box::new(fix_expr(obj)),
+            method: method.clone(),
+            args: args.iter().map(fix_expr).collect(),
+        },
+        IrExpr::Ternary { cond, then, else_ } => IrExpr::Ternary {
+            cond: Box::new(fix_expr(cond)),
+            then: Box::new(fix_expr(then)),
+            else_: Box::new(fix_expr(else_)),
+        },
+        IrExpr::DefinedOr { expr, default } => IrExpr::DefinedOr {
+            expr: Box::new(fix_expr(expr)),
+            default: Box::new(fix_expr(default)),
+        },
+        IrExpr::Interpolate(parts) => IrExpr::Interpolate(
+            parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(t) => InterpPart::Lit(t.clone()),
+                    InterpPart::Expr(inner) => InterpPart::Expr(Box::new(fix_expr(inner))),
+                })
+                .collect(),
+        ),
+        IrExpr::Capture { expr, native } => IrExpr::Capture {
+            expr: Box::new(fix_expr(expr)),
+            native: *native,
+        },
+        IrExpr::Arrow(stmts) => IrExpr::Arrow(stmts.clone()),
+        IrExpr::Array(elems) => IrExpr::Array(elems.iter().map(fix_expr).collect()),
+        IrExpr::ArrayComp {
+            var,
+            iter,
+            elem,
+            cond,
+        } => IrExpr::ArrayComp {
+            var: var.clone(),
+            iter: Box::new(fix_expr(iter)),
+            elem: Box::new(fix_expr(elem)),
+            cond: cond.as_ref().map(|c| Box::new(fix_expr(c))),
+        },
+        IrExpr::Lambda { params, body } => IrExpr::Lambda {
+            params: params.clone(),
+            body: body.clone(),
+        },
+        IrExpr::Arith(_) | IrExpr::Ext(_) | IrExpr::Splice(_) => e.clone(),
+        IrExpr::Object(fields) => IrExpr::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), fix_expr(v)))
+                .collect(),
+        ),
+    }
+}
+
 fn fix_stmt(s: &IrStmt, fns: &std::collections::HashSet<String>) -> IrStmt {
     match s {
+        // Fix 13 — a `param` substitution/pattern-removal's operands are a
+        // PATTERN and a REPLACEMENT, not strings to be printed, and they
+        // arrive carrying the quoting `render_str_literal` would add. Unquote
+        // them in the IR so the renderer's own `glob_to_regex` does the
+        // escaping, instead of compiling a regex that matches a run of quote
+        // characters and silently never matching.
+        //
+        // `fix_expr` is the recursive entry point: a `${s/…}` can sit in an
+        // assignment's RHS, a command word, a condition, or a nested
+        // expansion, so walking only the top-level expression would fix the
+        // shallow case and leave the rest broken.
+        IrStmt::Expr(e) => IrStmt::Expr(fix_expr(e)),
+        IrStmt::Assign {
+            targets,
+            expr,
+            asm,
+        } => IrStmt::Assign {
+            targets: targets.clone(),
+            expr: fix_expr(expr),
+            asm: asm.clone(),
+        },
         // Fix 4 — a bare `return 0` / `return 1` is an exit STATUS, and Perl
         // reads the two the other way round.
         //
@@ -1032,6 +1970,15 @@ fn fix_stmt(s: &IrStmt, fns: &std::collections::HashSet<String>) -> IrStmt {
         IrStmt::Block(b) => IrStmt::Block(fix_stmts(b, fns)),
         IrStmt::Subshell(b) => IrStmt::Subshell(fix_stmts(b, fns)),
         IrStmt::Background(b) => IrStmt::Background(fix_stmts(b, fns)),
+        // Fix 8 — a redirect stage INSIDE a pipeline is lifted out to an outer
+        // `Redirect` statement, so the renderer reaches its `Redirect` arm
+        // instead of the bare `redirect` call path that refuses.
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+            match fix_pipeline_redirect_stage(s, fns) {
+                Some(rebuilt) => rebuilt,
+                None => s.clone(),
+            }
+        }
         IrStmt::Function {
             name,
             params,
@@ -1050,7 +1997,274 @@ fn fix_stmt(s: &IrStmt, fns: &std::collections::HashSet<String>) -> IrStmt {
     }
 }
 
-/// Fix a condition expression.
+/// Fix 7 — a `redirect` stage inside a pipeline is rewritten to the OUTER
+/// `Redirect` statement the renderer already knows how to lower.
+///
+/// The two spellings of
+///
+/// ```sh
+/// while read -r line; do …; done < /etc/passwd | head -3
+/// ```
+///
+/// arrive as genuinely different IR:
+///
+/// * **no pipeline** → `IrStmt::Redirect { inner: [While …], redirects: [fd 0 r] }`.
+///   The renderer's `Redirect` arm opens the file on `local *STDIN` and runs
+///   the loop natively — this is the shape that already worked.
+/// * **with a pipeline** → `IrStmt::Pipeline { stages: [[ redirect(
+///   [whileLoop(…)], fd 0 r )], [exec head -3]] }`, and `redirect` is an
+///   ordinary *call* node, not the `Redirect` statement.
+///
+/// The renderer has a `pipeline` arm that understands `try_native_while_read_sort`
+/// (`… < FILE | sort`), but no general arm for "a pipeline whose FIRST stage
+/// carries its own redirect". So the stage fell through to the bare-`redirect`
+/// call path, which only honours an **fd 1** write target: with an fd 0 read
+/// spec it found no output redirect, `droppable` was false, and it emitted
+///
+/// ```perl
+/// die "otranspilerl: shIR redirect not yet supported by the Perl backend\n";
+/// ```
+///
+/// — the loop and its output were gone and the whole program stopped (091,
+/// 065, 070_gnuisms, 063_11, 063_hard_to_parse all produced no output at all).
+///
+/// bash's semantics for `cmd < FILE | head` are: the producer runs with STDIN
+/// bound to FILE, and its STDOUT is piped onward. Restoring exactly that shape
+/// — the pipeline wrapped in an `IrStmt::Redirect` around the producer — hands
+/// it to the already-exercised, already-correct `Redirect` arm, so the fix adds
+/// no new emission of its own.
+///
+/// Scoped deliberately:
+/// * only the FIRST stage may carry the redirect (bash binds `|` left to right,
+///   so a redirect on a later stage is a different construct);
+/// * only ONE redirect is lifted (`cmd < a > b | head` keeps its old shape —
+///   guessing at the rest would be worse than leaving the existing behaviour);
+/// * a pipeline that captures its stdout (`x=$(… | head)`) is left untouched,
+///   since that renderer arm consumes the stages directly.
+/// Fix 8 — a `redirect` stage inside a pipeline is lifted to an OUTER
+/// `Redirect` statement, which the renderer already knows how to lower.
+///
+/// The two spellings of
+///
+/// ```sh
+/// while read -r line; do …; done < /etc/passwd | head -3
+/// ```
+///
+/// arrive as genuinely different IR:
+///
+/// * **no pipeline** → `IrStmt::Redirect { inner: [While …], redirects: [fd 0 r] }`.
+///   The renderer's `Redirect` arm opens the file on `local *STDIN` and runs
+///   the loop natively — this is the shape that already worked.
+/// * **with a pipeline** → a `pipeline` CALL whose stages are
+///   `[Arrow([redirect([whileLoop(…)], fd 0 r)]), Arrow([exec head -3])]`,
+///   where `redirect` is an ordinary call node, not the `Redirect` statement.
+///
+/// The renderer has a `pipeline` arm that understands `try_native_while_read_sort`
+/// (`… < FILE | sort`), but no general arm for "a pipeline whose FIRST stage
+/// carries its own redirect". So the stage fell through to the bare-`redirect`
+/// call path, which only honours an **fd 1** write target: with an fd 0 read
+/// spec it found no output redirect, `droppable` was false, and it emitted
+///
+/// ```perl
+/// die "otranspilerl: shIR redirect not yet supported by the Perl backend\n";
+/// ```
+///
+/// — the loop and its output were gone and the whole program stopped (091,
+/// 065, 070_gnuisms, 063_11, 063_hard_to_parse all produced no output at all).
+///
+/// bash's semantics for `cmd < FILE | head` are: the producer runs with STDIN
+/// bound to FILE, and its STDOUT is piped onward. Since a `Redirect` statement
+/// applies its redirects to everything inside it, wrapping the *whole* pipeline
+/// in one is semantically identical for the producer and leaves the consumer
+/// alone — so the correction needs no new emission, only the already-exercised
+/// `Redirect` arm to be reached instead of the bare call's refusal.
+///
+/// Scoped deliberately:
+/// * only the FIRST stage may carry the redirect (bash binds `|` left to right,
+///   so a redirect on a later stage is a different construct);
+/// * only ONE redirect is lifted (`cmd < a > b | head` keeps its old shape —
+///   guessing at the rest would be worse than leaving the existing behaviour);
+/// * a pipeline that captures its stdout is left untouched, since the
+///   `Capture` renderer arm consumes the stages directly.
+fn fix_pipeline_redirect_stage(
+    s: &IrStmt,
+    fns: &std::collections::HashSet<String>,
+) -> Option<IrStmt> {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = s else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    // `pipeline(Array([Arrow([stage]), …]))` — the call form the renderer
+    // unwraps in `pipeline_stages_of`.
+    let stages: Vec<Vec<IrStmt>> = pipeline_stages_of_call(args)?;
+    // Exactly TWO stages, and every argument contributed a stage. Anything
+    // else is a shape we do not recognise and must come through UNCHANGED.
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!(
+            "PGFIX pipeline: stages={} array_len={} spec={:?}",
+            stages.len(),
+            pipeline_array_len(args),
+            redirect_stage_spec(&stages[0]).map(|(f, m, _)| (f, m))
+        );
+    }
+    if stages.len() != 2 || stages.len() != pipeline_array_len(args) {
+        return None;
+    }
+    let (fd, mode, target) = redirect_stage_spec(&stages[0])?;
+    // `fd: 0` is the `done < FILE` reading shape. An fd-1 write, and an
+    // absent fd (which means STDOUT), are both handled by the renderer's
+    // existing stage-local `select()` dance — leave them alone.
+    if fd != Some(0) {
+        return None;
+    }
+    // A redirect Call is not a statement the renderer lowers directly, so the
+    // producer is re-entered as the `Redirect` statement's inner body and the
+    // consumer rides along in the same pipeline, keeping the producer's
+    // STDOUT piped onward exactly as bash binds `|`.
+    let producer = redirect_stage_inner(&stages[0])?;
+    if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
+        eprintln!("PGFIX lift: {} producer stmts", producer.len());
+    }
+    let rebuilt = IrStmt::Redirect {
+        inner: vec![IrStmt::Pipeline {
+            stages: vec![fix_stmts(&producer, fns), stages[1].clone()],
+            last_output: None,
+            capture: None,
+            cmd_str: None,
+        }],
+        redirects: vec![IrRedirect {
+            fd: Some(0),
+            mode,
+            target,
+            interpolate: false,
+        }],
+    };
+    Some(rebuilt)
+}
+
+/// `pipeline_stages_of`'s expression half: the stages of a `pipeline(...)`
+/// call. `None` unless every argument is an `Arrow`-wrapped stage, so a shape
+/// the renderer could not unwrap is never half-understood here.
+fn pipeline_stages_of_call(args: &[IrExpr]) -> Option<Vec<Vec<IrStmt>>> {
+    let mut out: Vec<Vec<IrStmt>> = Vec::with_capacity(args.len());
+    for a in args {
+        match a {
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    match el {
+                        IrExpr::Arrow(v) => out.push(v.clone()),
+                        _ => return None,
+                    }
+                }
+            }
+            IrExpr::Arrow(v) => out.push(v.clone()),
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// How many stages the `pipeline` call's arrays actually carry, so a call
+/// whose stage count disagrees with its array length is refused rather than
+/// silently truncated.
+///
+/// Counted over the NESTED shape the IR actually uses. `pipeline` reaches
+/// this module either as a bare `Call` (the form `IrStmt::Pipeline` lowers
+/// to) or already wrapped by the IR builder into
+///
+/// ```text
+/// pipeline(Array([ <expr>, Arrow([ <expr>, … ]) ]))
+/// ```
+///
+/// — one outer array whose elements are the stage bodies, the LAST of which
+/// is itself the `Arrow`-wrapped stage list. `pipeline_stages_of_call` flattens
+/// both levels, so the count has to as well: counting only the top level
+/// counts that wrapper as one stage, which made every two-stage
+/// `< while read … done < FILE | sort` pipeline disagree with its own
+/// `stages.len()` and be refused by Fix 8 — the bare `redirect` call path then
+/// emitted
+///
+/// ```perl
+/// die "otranspilerl: shIR redirect not yet supported by the Perl backend\n";
+/// ```
+///
+/// and the loop's output vanished (088, 091).
+fn pipeline_array_len(args: &[IrExpr]) -> usize {
+    args.iter()
+        .map(|a| match a {
+            IrExpr::Array(elems) => elems
+                .iter()
+                .map(|el| match el {
+                    IrExpr::Arrow(inner) => inner.len(),
+                    _ => 1,
+                })
+                .sum(),
+            IrExpr::Arrow(_) => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The single redirect spec of a `redirect(Arrow([…]), …)` pipeline stage, as
+/// `(fd, mode, target)`. `None` unless the stage is exactly that shape with
+/// exactly one spec.
+fn redirect_stage_spec(stage: &[IrStmt]) -> Option<(Option<i32>, String, IrExpr)> {
+    let Some(IrStmt::Expr(IrExpr::Call { func, args })) = stage.first() else {
+        return None;
+    };
+    if func != "redirect" || args.len() != 2 {
+        return None;
+    }
+    if !matches!(args[0], IrExpr::Arrow(_)) {
+        return None;
+    }
+    let spec = match &args[1] {
+        IrExpr::Array(elems) if elems.len() == 1 => elems[0].clone(),
+        _ => return None,
+    };
+    let IrExpr::Object(fields) = spec else {
+        return None;
+    };
+    let get = |k: &str| {
+        fields
+            .iter()
+            .find_map(|(name, v)| if name == k { Some(v.clone()) } else { None })
+    };
+    let fd = match get("fd") {
+        Some(IrExpr::Int(i)) => Some(i as i32),
+        Some(IrExpr::Str(s, _)) => s.parse::<i32>().ok(),
+        // An absent `fd` means STDOUT (1) — never liftable.
+        _ => None,
+    };
+    let mode = match get("mode") {
+        Some(IrExpr::Str(m, _)) => m,
+        _ => return None,
+    };
+    let target = get("target")?;
+    Some((fd, mode, target))
+}
+
+/// The producer statements a `redirect(Arrow([…]), […])` stage wraps. `None`
+/// unless the stage is exactly that shape — a redirect alongside other
+/// statements, or carrying more than one spec, is a different construct.
+fn redirect_stage_inner(stage: &[IrStmt]) -> Option<Vec<IrStmt>> {
+    let Some(IrStmt::Expr(IrExpr::Call { args, .. })) = stage.first() else {
+        return None;
+    };
+    let (IrExpr::Arrow(inner), IrExpr::Array(specs)) = (&args[0], &args[1]) else {
+        return None;
+    };
+    if specs.len() != 1 {
+        return None;
+    }
+    Some(inner.clone())
+}
 ///
 /// # Fix 1 — a shell function called in condition position tests its EXIT
 /// STATUS, not its return string.
@@ -1157,6 +2371,46 @@ pub fn needs_fn_status_helper(perl_src: &str) -> bool {
 mod pgf_tests {
     use super::*;
     #[test]
+    fn _dbg_dump_ir() {
+        let src = "is_prime() { if [ $1 -eq 2 ]; then return 0; fi; return 1; }\nx=3; if is_prime $x; then echo yes; fi\n";
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        println!("DBG IR: {prog:#?}");
+        println!("DBG AST: {cmds:#?}");
+    }
+    #[test]
+    fn _dbg_sub_ir() {
+        let mut p = crate::Parser::new("s=abc:def:ghi\necho \"${s/abc/XYZ}\"\n");
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let rendered = crate::ir::shir_to_perl(&prog);
+        println!("DBGSUB DIRECT:\n{rendered}");
+        for st in &prog.stmts {
+            pgf_probe(st, 0);
+        }
+    }
+    fn pgf_probe(st: &IrStmt, d: usize) {
+        if let IrStmt::Expr(e) = st {
+            pgf_probe_expr(e, d);
+        }
+    }
+    fn pgf_probe_expr(e: &IrExpr, d: usize) {
+        let pad = "  ".repeat(d);
+        if let IrExpr::Call { func, args } = e {
+            if func == "param" {
+                for (i, a) in args.iter().enumerate() {
+                    if let IrExpr::Str(s, _) = a {
+                        println!("{pad}param[{i}] = {s:?}");
+                    }
+                }
+            }
+            for a in args { pgf_probe_expr(a, d + 1); }
+        } else if let IrExpr::Array(elems) = e {
+            for a in elems { pgf_probe_expr(a, d + 1); }
+        }
+    }
+    #[test]
     fn span_is_body_only() {
         let s = "sub f {  # line 4\n    print \"x\";\n    $main_exit_code = 0;\n}\n\nprint \"after\";\n";
         let sp = sub_spans(s);
@@ -1179,6 +2433,54 @@ mod pgf_tests {
         let out = inject_param_binding(body);
         assert!(out.contains("local @__sh_args = @_;\n"), "{out}");
         assert!(out.find("__sh_args").unwrap() < out.find("print(1)").unwrap(), "{out}");
+    }
+
+    /// Regression: the undeclared-variable pass must not declare Perl's `sort`
+    /// package globals.
+    ///
+    /// The shared renderer lowers a pipeline's `sort` stage to
+    /// `sort { $a cmp $b } @__fs`, where `$a` / `$b` are the two package
+    /// globals Perl's `sort` sets for the comparison. The pass sees those
+    /// reads, finds no `my` for them, and declared them itself — emitting
+    /// `my $a;` / `my $b;` into the program's lexical scope. That shadows the
+    /// globals for the whole file, so every `sort` then compared two `undef`s
+    /// and returned its input in an arbitrary order:
+    ///
+    /// ```text
+    /// bash:  a b c        perl:  c b a
+    /// ```
+    ///
+    /// A `my $a` is worse than a missing declaration: it is not a warning, it
+    /// is a silent wrong answer. So `$a` and `$b` are special names.
+    #[test]
+    fn sort_globals_are_never_declared_as_lexicals() {
+        let src = "use strict;\nmy @__pl = ('c','b','a'); @__pl = sort { $a cmp $b } @__pl; print \"$_\\n\" for @__pl;\n";
+        let out = declare_undeclared_vars(src);
+        assert!(
+            !out.contains("my $a;") && !out.contains("my $b;"),
+            "declared a sort global as a lexical:\n{out}"
+        );
+    }
+
+    /// The same rule, exercised the way it actually fires: through a real
+    /// program's rendered text, where the sort block sits in the middle.
+    #[test]
+    fn sort_global_declaration_never_reaches_a_real_render() {
+        let mut p = crate::Parser::new("printf \"c\\nb\\na\\n\" | sort\n");
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = generate(&prog);
+        assert!(!out.contains("my $a;"), "{out}");
+        assert!(!out.contains("my $b;"), "{out}");
+    }
+
+    /// And the pass must still do its job: an ordinary undeclared read is
+    /// still declared, so the fix is not just "declare less".
+    #[test]
+    fn ordinary_undeclared_read_is_still_declared() {
+        let src = "use strict;\nprint $never_declared_zz;\n";
+        let out = declare_undeclared_vars(src);
+        assert!(out.contains("my $never_declared_zz;"), "{out}");
     }
 }
 
@@ -1295,6 +2597,394 @@ mod no_output_loss_tests {
         let out = fix_case_pattern_tail(src);
         assert!(out.contains("qx("), "the cmdsub tail was not rewritten: {out}");
     }
+
+    // ── Fix 11 — the `for`-over-array iterand ───────────────────────────
+
+    #[test]
+    fn for_array_iterand_unwraps_the_join() {
+        // The exact shape the renderer emits for `for num in "${numbers[@]}"`.
+        let out = fix_for_array_iterand("for my $__num ((join(' ', @numbers))) {\n");
+        assert_eq!(out, "for my $__num (@numbers) {\n");
+    }
+
+    #[test]
+    fn for_array_iterand_keeps_each_element_separate() {
+        // The behavior the unwrap buys: the loop body must run once per
+        // element, not once with the joined blob. This is the regression the
+        // 058 failure was — 8 expected lines, 0 produced.
+        let out = fix_for_array_iterand("for my $__num ((join(' ', @numbers))) {\n");
+        assert!(out.contains("@numbers"), "iterand lost the array: {out}");
+        assert!(!out.contains("join"), "the collapsing join survived: {out}");
+        // Exactly one paren pair remains: the list context the loop needs.
+        assert_eq!(out.matches('(').count(), 1, "iterand not in list context: {out}");
+    }
+
+    #[test]
+    fn for_array_iterand_leaves_a_capture_to_fix_10() {
+        // A command capture is the OTHER shape; it must pass through
+        // untouched so Fix 10 (which unwraps the `split` instead) owns it.
+        let src = "for my $__f ((join(' ', split(/\\s+/, __sh_pipe_capture(q('cmd'))))) {\n";
+        assert_eq!(fix_for_array_iterand(src), src);
+    }
+
+    #[test]
+    fn for_array_iterand_leaves_other_iterands_alone() {
+        // A literal list and a range are not this fix's business.
+        for src in [
+            "for my $__i (('0', '1', '2')) {\n",
+            "for my $n (1..5) {\n",
+            "for my $x (@{$ref}) {\n",
+            "for my $y (@arr[0..2]) {\n",
+        ] {
+            assert_eq!(fix_for_array_iterand(src), src, "over-rewrote: {src:?}");
+        }
+    }
+
+    #[test]
+    fn for_array_iterand_is_identity_without_a_needle() {
+        let src = "#!/usr/bin/env perl\nuse strict;\nfor my $i (1..3) { print $i; }\n";
+        assert_eq!(fix_for_array_iterand(src), src);
+    }
+}
+
+// ── Fix 9 — the materialised process-substitution consumer keeps its
+// OWN status ──────────────────────────────────────────────────────────
+//
+// `transforms::process_subst` materialises `<(…)` / `>(…)` into a
+// sequential block:
+//
+//     Block[ __ps_tmpN = $(mktemp),  { producer } > __ps_tmpN,
+//            … ,  <the consumer>,  … ,  rm -f __ps_tmpN… ]
+//
+// The CONSUMER is the statement whose `$?` bash reports: in
+// `cmp -s <(echo b) <(echo c); echo "exit: $?"` it is `cmp`, and bash
+// prints 1 because `b` and `c` differ.
+//
+// The trailing cleanup `rm` is the block's LAST statement, so the status
+// the consumer left behind is overwritten before anything reads it. Every
+// statement-emitter in the shared renderer closes with
+// `$main_exit_code = $CHILD_ERROR = …`, so `rm` (success) clobbered the
+// consumer's status with 0 and `echo "$?"` printed `exit: 0` — a
+// correctness bug in every materialised process substitution that is
+// followed by a `$?` read (070_cmp_basic, 012/042_process_substitution).
+//
+// `IrStmt` has no "preserve the status" node and the renderer owns both
+// decisions, so the correction is structural and IR-level: when the
+// consumer's OWN exit status is read before the block ends, carry it in a
+// generated variable and restore it from the cleanup statement, which is
+// the exact value the consumer produced. With no such read the block is
+// left untouched — restoring a status nobody reads can only cost.
+//
+// Scope, per this module's rule:
+//   * a top-level `Block` whose shape is the materialisation above
+//     (mktemp assignments, producer redirects, exactly ONE bare
+//     command-statement consumer, and a trailing `rm -f` of the same
+//     `__ps_tmpN` names);
+//   * a subsequent read of `$?` — the IR's `Call { func: "getVar",
+//     args: [Str("?")] }` — before the enclosing statement list ends. A
+//     read inside a LATER block's condition is deliberately NOT counted:
+//     that is an `&&`/`||` short-circuit branch, where a status written
+//     inside a branch would leak out of it.
+fn fix_ps_status_blocks(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    // A `__ps_tmp` name only ever comes from the materialisation, so its
+    // presence in a name is proof the shape came from there.
+    fn is_ps_tmp(w: &IrExpr) -> bool {
+        matches!(w, IrExpr::Var(n, _) if n.starts_with("__ps_tmp"))
+    }
+    fn is_plain_consumer(s: &IrStmt) -> bool {
+        matches!(
+            s,
+            IrStmt::Exec { .. } | IrStmt::Expr(IrExpr::Call { .. })
+        )
+    }
+    fn expr_reads_exit_status(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(args.first(), Some(IrExpr::Str(v, _)) if v == "?")
+            }
+            IrExpr::Call { args, .. } => args.iter().any(expr_reads_exit_status),
+            IrExpr::Index { key, .. } => expr_reads_exit_status(key),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_reads_exit_status(lhs) || expr_reads_exit_status(rhs)
+            }
+            IrExpr::Array(es) => es.iter().any(expr_reads_exit_status),
+            IrExpr::Arrow(stmts) => stmts.iter().any(stmt_reads_exit_status),
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                expr_reads_exit_status(iter)
+                    || expr_reads_exit_status(elem)
+                    || cond
+                        .as_deref()
+                        .is_some_and(expr_reads_exit_status)
+            }
+            IrExpr::Lambda { body, .. } => body.iter().any(stmt_reads_exit_status),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => expr_reads_exit_status(x),
+                _ => false,
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_reads_exit_status(cond)
+                    || expr_reads_exit_status(then)
+                    || expr_reads_exit_status(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_reads_exit_status(expr) || expr_reads_exit_status(default)
+            }
+            _ => false,
+        }
+    }
+    fn stmt_reads_exit_status(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => expr_reads_exit_status(e),
+            IrStmt::Assign { expr, .. } => expr_reads_exit_status(expr),
+            IrStmt::Return(Some(e)) => expr_reads_exit_status(e),
+            IrStmt::Redirect { inner, .. } => inner.iter().any(stmt_reads_exit_status),
+            IrStmt::If { cond, then, .. } => {
+                expr_reads_exit_status(cond) || then.iter().any(stmt_reads_exit_status)
+            }
+            // A loop's body status is not the loop's status; only its
+            // condition reads `$?` in a way a later read can observe.
+            IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => {
+                expr_reads_exit_status(cond)
+            }
+            IrStmt::ForInit { cond, init, step, body } => {
+                expr_reads_exit_status(cond)
+                    || init.iter().any(stmt_reads_exit_status)
+                    || step.iter().any(stmt_reads_exit_status)
+                    || body.iter().any(stmt_reads_exit_status)
+            }
+            // A subshell runs its body out of process: nothing it writes is
+            // observable here, and walking in could rename a temp in a
+            // scope the caller cannot see.
+            IrStmt::Block(_) | IrStmt::Subshell(_) | IrStmt::Background(_) => false,
+            _ => false,
+        }
+    }
+    /// The `rm -f tmp…` cleanup, and the exact temp set it removes.
+    fn rm_cleanup(s: &IrStmt) -> Option<Vec<String>> {
+        let IrStmt::Exec { cmd, args, .. } = s else {
+            return None;
+        };
+        if !matches!(cmd, IrExpr::Str(c, _) if c == "rm") {
+            return None;
+        }
+        match args.split_first() {
+            Some((IrExpr::Str(flag, _), rest)) if flag == "-f" => {
+                let mut tmps: Vec<String> = Vec::new();
+                for w in rest {
+                    match w {
+                        IrExpr::Var(n, _) if n.starts_with("__ps_tmp") => tmps.push(n.clone()),
+                        _ => return None,
+                    }
+                }
+                if tmps.is_empty() {
+                    None
+                } else {
+                    Some(tmps)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+    // A block's status is only observable when the VERY NEXT statement in
+    // this list reads `$?`. Any other command in between sets `$?` again,
+    // so a read further along observes that command, not this block — and
+    // with no read at all, restoring the status could only cost.
+    for (i, s) in stmts.iter().enumerate() {
+        let read_next = stmts
+            .get(i + 1)
+            .is_some_and(|next| stmt_reads_exit_status(next));
+        if let IrStmt::Block(body) = s {
+            if read_next {
+                if let Some((start, tmps, saved)) =
+                    ps_consumer_position(body, &rm_cleanup, &is_ps_tmp)
+                {
+                    let mut rewritten = body.clone();
+                    rewritten[start] = save_status(saved.clone());
+                    let cleanup = rewritten.len() - 1;
+                    rewritten[cleanup] = restore_status(rewritten[cleanup].clone(), tmps, saved);
+                    out.push(IrStmt::Block(rewritten));
+                    continue;
+                }
+            }
+        }
+        out.push(s.clone());
+    }
+    out
+}
+
+/// Locate the consumer inside a materialised block: returns
+/// `(index, temps, fresh-variable-name)`, or `None` when this block is not
+/// the materialisation shape at all.
+fn ps_consumer_position(
+    body: &[IrStmt],
+    rm_cleanup: &dyn Fn(&IrStmt) -> Option<Vec<String>>,
+    is_ps_tmp: &dyn Fn(&IrExpr) -> bool,
+) -> Option<(usize, Vec<String>, String)> {
+    let is_plain_consumer = |s: &IrStmt| {
+        matches!(s, IrStmt::Exec { .. } | IrStmt::Expr(IrExpr::Call { .. }))
+    };
+    let rm_at = body.len().checked_sub(1)?;
+    let tmps = rm_cleanup(&body[rm_at])?;
+    // Every temp must have been created by a `mktemp` assignment in this
+    // same block — otherwise these names belong to something else.
+    for t in &tmps {
+        let created = body.iter().take(rm_at).any(|s| {
+            matches!(s, IrStmt::Assign { targets, .. }
+                if targets.iter().any(|tt| &tt.var == t))
+        });
+        if !created {
+            return None;
+        }
+    }
+    let consumer_at = body
+        .iter()
+        .enumerate()
+        .take(rm_at)
+        .filter(|(_, s)| is_plain_consumer(s))
+        .map(|(i, _)| i)
+        .last()?;
+    // Exactly ONE consumer: two bare commands means we cannot tell which
+    // one's status bash reports, and guessing is worse than the status quo.
+    let consumers = body
+        .iter()
+        .take(rm_at)
+        .filter(|s| is_plain_consumer(s))
+        .count();
+    if consumers != 1 {
+        return None;
+    }
+    let saved = fresh_status_var(body, &tmps);
+    Some((consumer_at, tmps, saved))
+}
+
+/// A variable name no statement in the block can already be using.
+fn fresh_status_var(body: &[IrStmt], tmps: &[String]) -> String {
+    let mut n = 0usize;
+    loop {
+        let cand = format!("__ps_status{n}");
+        let taken = body.iter().any(|s| mentions_var(s, &cand))
+            || tmps.iter().any(|t| t == &cand);
+        if !taken {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Every statement the name could collide with: the bodies recurse into,
+/// and the redirect targets / command words a materialisation block uses.
+fn mentions_var(s: &IrStmt, name: &str) -> bool {
+    match s {
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            b.iter().any(|x| mentions_var(x, name))
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            mentions_expr(cond, name)
+                || then.iter().any(|x| mentions_var(x, name))
+                || elsifs
+                    .iter()
+                    .any(|(c, b)| {
+                        mentions_expr(c, name) || b.iter().any(|x| mentions_var(x, name))
+                    })
+                || else_.iter().any(|x| mentions_var(x, name))
+        }
+        IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+            mentions_expr(cond, name) || body.iter().any(|x| mentions_var(x, name))
+        }
+        IrStmt::For { .. } => false,
+        IrStmt::Function { body, .. } => body.iter().any(|x| mentions_var(x, name)),
+        IrStmt::Redirect { inner, redirects } => {
+            inner.iter().any(|x| mentions_var(x, name))
+                || redirects.iter().any(|r| mentions_expr(&r.target, name))
+        }
+        IrStmt::Assign { targets, expr, .. } => {
+            targets.iter().any(|t| t.var == name) || mentions_expr(expr, name)
+        }
+        IrStmt::Exec { cmd, args, redirects, .. } => {
+            mentions_expr(cmd, name)
+                || args.iter().any(|a| mentions_expr(a, name))
+                || redirects.iter().any(|r| mentions_expr(r, name))
+        }
+        IrStmt::Expr(e) => mentions_expr(e, name),
+        IrStmt::Return(Some(e)) => mentions_expr(e, name),
+        _ => false,
+    }
+}
+
+fn mentions_expr(e: &IrExpr, name: &str) -> bool {
+    match e {
+        IrExpr::Var(n, _) => n == name,
+        IrExpr::Index { key, .. } => mentions_expr(key, name),
+        IrExpr::Call { args, .. } | IrExpr::MethodCall { args, .. } => {
+            args.iter().any(|a| mentions_expr(a, name))
+        }
+        IrExpr::Array(es) => es.iter().any(|a| mentions_expr(a, name)),
+        IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+            stmts.iter().any(|x| mentions_var(x, name))
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Expr(x) => mentions_expr(x, name),
+            _ => false,
+        }),
+        IrExpr::BinOp { lhs, rhs, .. } => mentions_expr(lhs, name) || mentions_expr(rhs, name),
+        IrExpr::Ternary { cond, then, else_ } => {
+            mentions_expr(cond, name)
+                || mentions_expr(then, name)
+                || mentions_expr(else_, name)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            mentions_expr(expr, name) || mentions_expr(default, name)
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            mentions_expr(iter, name)
+                || mentions_expr(elem, name)
+                || cond.as_deref().is_some_and(|c| mentions_expr(c, name))
+        }
+        _ => false,
+    }
+}
+
+/// `<consumer>; <saved> = $CHILD_ERROR` — capture the status the consumer
+/// just produced, before anything else overwrites it.
+///
+/// `$CHILD_ERROR` (not `$main_exit_code`) because that is the name the
+/// renderer's own `$?` read resolves to (`getVar("?")` → `$CHILD_ERROR`).
+///
+/// The VALUE spells the variable WITHOUT a leading `$`: the renderer writes a
+/// var as `${name}` (ir.rs `ir_expr_to_perl`), so the name `"$CHILD_ERROR"`
+/// came out as `$$CHILD_ERROR` — Perl's PID, not the status. `diff <(echo
+/// one) <(echo two)` then printed `exit: 24653` (process-substitution.sh),
+/// and every `$( … )`/`<( … )` consumer's status was silently the pid.
+fn save_status(saved: String) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![crate::ir::AssignTarget {
+            var: saved,
+            sigil: None,
+            indices: vec![],
+        }],
+        expr: IrExpr::Var("CHILD_ERROR".to_string(), None),
+        asm: None,
+    }
+}
+
+/// `<cleanup>; $CHILD_ERROR = <saved>` — restore the status the consumer
+/// produced, which is the value bash's `$?` holds once the whole
+/// substitution has run.
+///
+/// `SetChildError`, not an `Assign`: an `Assign` to the name `$CHILD_ERROR`
+/// declares a SECOND lexical (`my $$CHILD_ERROR`) that MASKS the preamble's
+/// `our $CHILD_ERROR`. Under `use strict` that is a fatal compile error, so
+/// the whole program produced no output at all — a far worse failure than
+/// the clobbered status. `IrStmt::SetChildError` is the IR's own spelling
+/// of "write the child's exit status" and renders as a plain `$CHILD_ERROR`
+/// assignment.
+fn restore_status(cleanup: IrStmt, _tmps: Vec<String>, saved: String) -> IrStmt {
+    IrStmt::Block(vec![
+        cleanup,
+        IrStmt::SetChildError(IrExpr::Var(saved, None)),
+    ])
 }
 
 
