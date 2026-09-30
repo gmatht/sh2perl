@@ -8136,12 +8136,18 @@ impl Render {
         // redirect (a nested `<(producer)` file) must not swallow the
         // captured output (the inner mktemp would write its path into
         // the outer producer's file)
-        self.emit("let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());");
-        self.emit("let __old = __SH_OUT.lock().unwrap().take();");
-        self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
-        // the captured commands must NOT consume the stage's stdin (a
-        // nested mktemp would eat the pipeline buffer)
-        self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
+        // The save/restore dance around a capture is a FIXED 16-line
+        // block of mutex/TLS traffic. Inlined at every `$(…)` site it
+        // dominates rustc's time: each repetition is re-optimized in the
+        // enclosing function, and the cost is superlinear in the number
+        // of sites — t108 (two captures) spent 4.2s of its ~4.4s budget
+        // in LLVM, blowing the 15s per-file gate timeout on a loaded box
+        // (16 concurrent rustc: every job hit rc=124). Outlined into two
+        // helpers the same program compiles ~4x faster (measured on the
+        // generated shape), so the renderer emits calls, not the block.
+        self.add_helper("cap_begin");
+        self.add_helper("cap_end");
+        self.emit("let __cap_state = __sh_cap_begin();");
         // A value-returning user function called in STATEMENT position
         // (`$(isYes "y")` lowers to capture{ exec("isYes") }) discards
         // the `-> String` result: `self.stmt` renders the bare call, so
@@ -8169,41 +8175,9 @@ impl Render {
                 self.stmt(s);
             }
         }
-        self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
-        if via_ret {
-            // A user-function call can hand its value back two ways, and
-            // which one is used is the CALLEE's choice:
-            //   * through the sticky __SH_RET cell (a callee lowered to a
-            //     value-returning Rust fn — t94's `q, _ := divmod(17,5)`);
-            //   * by PRINTING it — the Go-shaped `f() T` lowering builds
-            //     the value, `echo`s it and returns nothing (t116's
-            //     `p := mk2()`), so the value is the callee's stdout,
-            //     exactly as `$(f)` is in the source language.
-            // Prefer the stdout when the callee wrote any, else the cell:
-            // reading only __SH_RET silently dropped every echoed object
-            // id, and reading only __SH_OUT loses the by-value callee.
-            // Both must be drained — leaving the capture buffer `Some`
-            // LATCHES __SH_OUT for the rest of the program, so every later
-            // print would append to a dead buffer instead of stdout
-            // (t94/t115 printed nothing at all).
-            self.emit("let __cap_out = __SH_OUT.lock().unwrap().take().unwrap();");
-            self.emit("let __cap_ret = __SH_RET.lock().unwrap().clone();");
-            self.emit("*__SH_RET.lock().unwrap() = String::new();");
-            self.emit("*__SH_OUT.lock().unwrap() = __old;");
-            self.emit("let __cap = if __cap_out.is_empty() { __cap_ret } else { String::from_utf8_lossy(&__cap_out).to_string() };");
-        } else {
-            self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
-            self.emit("*__SH_OUT.lock().unwrap() = __old;");
-        }
-        self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
-        // __cap is a String on the by-ret path and a Vec<u8> on the
-        // output-buffer path — only the latter needs the lossy decode.
-        if via_ret {
-            self.emit("let mut __s = __cap;");
-        } else {
-            self.emit("let mut __s = String::from_utf8_lossy(&__cap).to_string();");
-        }
-        self.emit("while __s.ends_with('\\n') { __s.pop(); }");
+        // __sh_cap_end always hands back a String (it does the lossy decode
+        // itself, so the by-ret path and the output-buffer path share it).
+        self.emit(&format!("let __s = __sh_cap_end(__cap_state, {via_ret});"));
         self.emit("__s");
         let block = self.out.join("\n");
         self.out = saved;
@@ -13398,6 +13372,9 @@ const HELPER_ORDER: &[&str] = &[
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "capture", "run_traps", "lines",
+    // the capture save/restore pair — outlined so a `$(…)` site costs a
+    // call, not 16 inlined lines of mutex/TLS traffic (see capture_block)
+    "cap_begin", "cap_end",
     // Go composite-value store (structs/maps/slices) — see `composite_value`
     "obj_new", "obj_get", "obj_set", "obj_add", "json_obj", "to_assoc", "ele_read",
     "list_new", "list_get", "list_set", "list_len", "list_read", "list_push", "list_items",
@@ -13511,6 +13488,8 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "glob" => &["cap_bytes"],
         "rand" => &["cap_bytes"],
         "capture" => &[],
+        "cap_begin" => &[],
+        "cap_end" => &["cap_begin"],
         "grepmatches" => &["cap_bytes"],
         // composite-value store: each op needs the shared __SH_OBJ /
         // __SH_LIST statics, which are emitted when ANY of these is
@@ -13923,6 +13902,49 @@ fn __sh_join_value(ws: &[Vec<String>]) -> String {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Err(_) => String::new(),
     }
+}"#,
+        // The capture save/restore pair, outlined. Semantics are exactly
+        // the block they replace:
+        //   begin — a capture is a standalone stdout context, so an active
+        //     fd-1 redirect is parked (an inner mktemp must not write into
+        //     the outer producer's file), __SH_OUT is emptied into the new
+        //     buffer, and stdin is detached so the captured commands do NOT
+        //     consume the stage's pipeline buffer.
+        //   end   — restore all three, then hand back the captured bytes.
+        //     `via_ret` covers a user-function callee, which returns its
+        //     value TWO ways: through the sticky __SH_RET cell (t94's
+        //     `q, _ := divmod(17,5)`) or by PRINTING it (the Go-shaped
+        //     `f() T` lowering builds the value, echoes it and returns
+        //     nothing — t116's `p := mk2()`), exactly as `$(f)` behaves in
+        //     the source language. Prefer stdout when the callee wrote any,
+        //     else the cell: reading only __SH_RET dropped every echoed
+        //     object id, reading only __SH_OUT loses the by-value callee.
+        //     Both buffers must be drained — leaving __SH_OUT `Some`
+        //     LATCHES it for the rest of the program, so every later print
+        //     appends to a dead buffer instead of stdout (t94/t115 printed
+        //     nothing at all).
+        "cap_begin" => r#"type __ShCapState = (Option<Vec<u8>>, Option<Box<dyn std::io::Read + Send>>, Option<std::fs::File>);
+fn __sh_cap_begin() -> __ShCapState {
+    let oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
+    let old = __SH_OUT.lock().unwrap().take();
+    *__SH_OUT.lock().unwrap() = Some(Vec::new());
+    let oldin = __SH_STDIN.lock().unwrap().take();
+    (old, oldin, oldout)
+}"#,
+        "cap_end" => r#"fn __sh_cap_end(st: __ShCapState, via_ret: bool) -> String {
+    let (old, oldin, oldout) = st;
+    *__SH_STDIN.lock().unwrap() = oldin;
+    let cap_out = __SH_OUT.lock().unwrap().take().unwrap();
+    *__SH_OUT.lock().unwrap() = old;
+    __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = oldout);
+    let mut s = if !via_ret { String::from_utf8_lossy(&cap_out).to_string() } else {
+        let cap_ret = __SH_RET.lock().unwrap().clone();
+        *__SH_RET.lock().unwrap() = String::new();
+        if cap_out.is_empty() { cap_ret } else { String::from_utf8_lossy(&cap_out).to_string() }
+    };
+    // `$(...)` strips the trailing newlines
+    while s.ends_with('\n') { s.pop(); }
+    s
 }"#,
         "cap_bytes" => r#"fn __sh_cap_bytes(cmd: &str, input: Option<&[u8]>) -> Vec<u8> {
     let mut c = std::process::Command::new("bash");
