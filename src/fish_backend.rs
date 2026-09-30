@@ -981,6 +981,109 @@ fn indent(out: &mut String, d: usize) {
     }
 }
 
+/// Does this function body carry the echo-return (value-returning) shape?
+///
+/// The `echo_return` transform rewrites a pure `echo <v>` function into
+/// `Return(Some(v))` so the caller can use the value directly; the fish
+/// call site therefore renders as `(f args)` (a command substitution).
+/// The body must then put the value on stdout, since fish's `return` is a
+/// STATUS. This predicate decides whether the body is that shape.
+///
+/// REFUSE > GUESS: the body qualifies only when EVERY top-level path is
+/// value-terminating, so a mixed body (some paths returning a value, some
+/// falling through or returning bare) keeps the plain `return` rendering
+/// rather than half of it being silently turned into an `echo`. Loops and
+/// subshells are NOT inspected — a value return buried in one is a construct
+/// this lowering does not model, so such a body is refused too.
+fn fn_body_returns_value(body: &[IrStmt]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    fn ends_with_value(s: &IrStmt) -> bool {
+        matches!(s, IrStmt::Return(Some(_)))
+    }
+    for s in body {
+        match s {
+            IrStmt::Return(Some(_)) => {}
+            // A bare `return` does not end the value path — refuse rather
+            // than guess which convention the body meant.
+            IrStmt::Return(None) => return false,
+            IrStmt::If { then, elsifs, else_, .. } => {
+                // every arm of the chain must end with a value return, and
+                // the chain must be total (an `else` must exist, else the
+                // condition's false path falls through).
+                let arms_then = !then.is_empty() && then.iter().all(ends_with_value);
+                let arms_elsif =
+                    elsifs.iter().all(|(_, b)| !b.is_empty() && b.iter().all(ends_with_value));
+                let arms_else = !else_.is_empty() && else_.iter().all(ends_with_value);
+                if !(arms_then && arms_elsif && arms_else) {
+                    return false;
+                }
+            }
+            // A construct that cannot itself end a path and cannot hide a
+            // value return is fine to step over — the echo-return bodies are
+            // a local computation followed by the value return
+            // (`local y=5; echo "$y"`).
+            IrStmt::Declare { .. }
+            | IrStmt::DeclareArray { .. }
+            | IrStmt::Assign { .. } => {}
+            // Anything that can hide a value return (loop, subshell, case,
+            // redirect, exec, …) or can branch: refuse — REFUSE > GUESS.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Render one statement of a value-returning function body, rewriting
+/// `return <v>` to `echo <v>` (the value must reach stdout for the caller's
+/// `(f)` to capture — see `fn_body_returns_value`).
+///
+/// `fn_body_returns_value` has already established that EVERY path in this
+/// body ends with a value return, so the only `return`s reachable here are
+/// value returns; a nested `If`'s arms are re-rendered through this same
+/// function so their returns get the same treatment. Anything else falls
+/// through to the ordinary statement renderer.
+fn valret_body_to_fish(s: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
+    match s {
+        IrStmt::Return(Some(x)) => {
+            indent(out, d);
+            out.push_str("echo ");
+            out.push_str(&word_to_fish(x)?);
+            out.push('\n');
+            Ok(())
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            indent(out, d);
+            out.push_str("if ");
+            out.push_str(&cmd_to_fish(cond)?);
+            out.push('\n');
+            for b in then {
+                valret_body_to_fish(b, d + 1, out)?;
+            }
+            for (c, body) in elsifs {
+                indent(out, d);
+                out.push_str("else if ");
+                out.push_str(&cmd_to_fish(c)?);
+                out.push('\n');
+                for b in body {
+                    valret_body_to_fish(b, d + 1, out)?;
+                }
+            }
+            if !else_.is_empty() {
+                out.push_str("else\n");
+                for b in else_ {
+                    valret_body_to_fish(b, d + 1, out)?;
+                }
+                indent(out, d);
+            }
+            out.push_str("end\n");
+            Ok(())
+        }
+        _ => stmt_to_fish(s, d, out),
+    }
+}
+
 // ── statements (block form, newline-terminated) ──────────────────────
 
 // range_of — a numeric-range For iterable (`$(seq A B)` lowered to a
@@ -1237,8 +1340,21 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("function ");
             out.push_str(name);
             out.push_str("\n");
-            for b in body {
-                stmt_to_fish(b, d + 1, out)?;
+            // A function whose value the caller consumes carries the
+            // echo-return shape: every path ends in `Return(Some(v))`. fish's
+            // `return` is a STATUS (an integer), so the value must leave on
+            // stdout for the caller's `(f)` to capture — the bash `$(f)`
+            // convention the call site was rewritten from. Inside such a body
+            // `return <v>` lowers to `echo <v>`; a value-less `return` (and a
+            // status return in a value-less body) stays a real `return`.
+            if fn_body_returns_value(body) {
+                for b in body {
+                    valret_body_to_fish(b, d + 1, out)?;
+                }
+            } else {
+                for b in body {
+                    stmt_to_fish(b, d + 1, out)?;
+                }
             }
             indent(out, d);
             out.push_str("end\n");
@@ -2093,6 +2209,28 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
                         line.push_str(&word_to_fish(w)?);
                     }
                 }
+                Ok(line)
+            }
+            // VALUE-returning function call (the echo-return transform's
+            // convention — CROSS_BACKEND_RUNTIME.md §8.3). The function's
+            // `return <value>` was rewritten to the shIR `Return(Some(v))`
+            // form, which the fish `function ... end` body renders as a native
+            // `return` — and fish's `return` takes an INTEGER STATUS, so a
+            // string value is a runtime error ("return: hello: invalid
+            // integer"), never the value. The value therefore travels on
+            // stdout and the call site captures it: fish's native
+            // command substitution `(f args)`, which is exactly the bash
+            // `$(f args)` convention this replaces.
+            "fnValue" => {
+                let name = raw_arg(args, 0)?;
+                let mut line = format!("({name}");
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        line.push(' ');
+                        line.push_str(&word_to_fish(w)?);
+                    }
+                }
+                line.push(')');
                 Ok(line)
             }
             // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
@@ -3662,6 +3800,28 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
             other => word_to_fish(other),
         },
         "param" => param_to_fish(args, false),
+        // VALUE-returning function call (the echo-return transform's
+        // convention — CROSS_BACKEND_RUNTIME.md §8.3). The callee's value
+        // return is lowered to an `echo` on stdout (fish's `return` is a
+        // STATUS), so the word form is fish's native command substitution.
+        //
+        // UNQUOTED, and that is the correct single-word semantics rather
+        // than a gap: fish expands `(...)` only outside double quotes
+        // (`printf '%s\n' "(f)"` prints the literal `(f)`), and it splits a
+        // substitution on NEWLINES only — never on spaces — so a value
+        // containing spaces still arrives as ONE argument, exactly like
+        // bash's quoted `"$(f)"` this replaces.
+        "fnValue" => {
+            let name = raw_arg(args, 0)?;
+            let mut inner = name;
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                for w in items {
+                    inner.push(' ');
+                    inner.push_str(&word_to_fish(w)?);
+                }
+            }
+            Ok(format!("({inner})"))
+        }
         "listVar" => {
             let n = raw_arg(args, 0)?;
             Ok(if n == "*" {
@@ -3774,6 +3934,28 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
         // srand()/rand() (int(rand()*32768) = bash's 0..32767 range)
         return "$(awk 'BEGIN{srand(); printf \"%d\", int(rand()*32768)}')".into();
     }
+    // The bash special parameters fish spells differently.
+    //
+    // `$?` is not merely a different NAME in fish — it is a PARSE ERROR
+    // ("$? is not the exit status. In fish, please use $status"), and the
+    // error is raised while reading the file, so it kills the whole script,
+    // not just the one statement. Fish's spelling is `$status`, which works
+    // in every scope including inside double quotes, and carries the same
+    // meaning (the last command's exit status).
+    if name == "?" {
+        return "$status".into();
+    }
+    // Positional parameters: fish has no `$1`/`$2` shorthand — a positional
+    // read is `$argv[N]`. This is not merely a spelling preference: `$1` is
+    // EMPTY inside a fish function (and inside a command substitution, which
+    // is how a value-returning call site invokes the callee), while `$argv[1]`
+    // resolves in every scope, so a `$1` render silently produces empty output
+    // for every function that reads an argument.
+    if let Ok(n) = name.parse::<usize>() {
+        if n >= 1 {
+            return format!("$argv[{n}]");
+        }
+    }
     if list {
         if name == "@" || name == "*" {
             return format!("${{{name}}}");
@@ -3832,7 +4014,10 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                 Ok(var_ref_to_fish(&name, true))
             } else {
                 // special params (`?`, `1`, `@`, ...) keep the `$name`
-                // form inside the quotes (`"$?"` — `${?}` is invalid)
+                // form inside the quotes (`"$?"` — `${?}` is invalid).
+                // `var_ref_to_fish` already renamed `$?` to fish's
+                // `$status`, so the quoted form is `"$status"` — still
+                // valid fish (fish expands `$status` inside quotes).
                 Ok(format!("\"{}\"", var_ref_to_fish(&name, false)))
             }
         }
