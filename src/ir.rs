@@ -2295,6 +2295,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             // Unique names per site: a second `my` in the
                             // same scope masks the first (warnings + a hidden
                             // lexical).
+                            //
+                            // fd 2 (`2>FILE`) redirects STDERR, not STDOUT.
+                            // Before this the emitter always hardcoded STDOUT,
+                            // so `cmd 2>/dev/null` silenced cmd's REAL output
+                            // and let its diagnostics through. `select` is a
+                            // STDOUT-only idiom (it rebinds the default output
+                            // handle), so for STDERR the default handle is
+                            // deliberately left untouched — inner `print`
+                            // output must still reach stdout.
+                            let is_stderr = r.fd == Some(2);
+                            let (h, lh) = if is_stderr {
+                                ("STDERR", "stderr")
+                            } else {
+                                ("STDOUT", "stdout")
+                            };
                             static RD2_SEQ: std::sync::atomic::AtomicUsize =
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = RD2_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2302,24 +2317,32 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             let sel = format!("$__sh2_rsel{n}");
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "open(my {fh}, '>&', \\*STDOUT) or die \"Cannot dup stdout: $!\\n\";\n"
+                                "open(my {fh}, '>&', \\*{h}) or die \"Cannot dup {lh}: $!\\n\";\n"
                             ));
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "close(STDOUT); open(STDOUT, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
+                                "close({h}); open({h}, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
                                 mode,
                                 render_word(&r.target),
                                 target
                             ));
-                            emit_indent(out, indent);
-                            out.push_str(&format!("my {} = select(STDOUT);\n", sel));
+                            if !is_stderr {
+                                emit_indent(out, indent);
+                                out.push_str(&format!("my {} = select(STDOUT);\n", sel));
+                            }
                             for s in inner {
                                 emit_stmt(out, s, indent);
                             }
                             emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
-                            ));
+                            if is_stderr {
+                                out.push_str(&format!(
+                                    "open(STDERR, '>&', {fh}) or die \"Cannot restore stderr: $!\\n\"; close({fh});\n"
+                                ));
+                            } else {
+                                out.push_str(&format!(
+                                    "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
+                                ));
+                            }
                         }
                         _ => {
                             emit_indent(out, indent);
