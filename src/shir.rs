@@ -3943,8 +3943,29 @@ static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// The CURRENT function's param arity, pushed while the define arrow's
 /// body lowers — `positional_read`/`native_special_var` render `$i` as
-/// the `pi` param identifier inside it.
+/// the `p{pos}` param identifier inside it.
 static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+
+/// The CURRENT function's A1-DECLARED parameter NAMES, pushed while the
+/// define arrow's body lowers. A named parameter is bound by the arrow's
+/// own parameter list (the emitters below pass them through), so a body
+/// read of one is a bare JS identifier — NOT a `sh2.vars` store read.
+/// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+/// `IrStmt::Function` arm bound `name`/`body`/`named_blocks` and dropped
+/// `params`, so every A1 function emitted `() => …` and its body's
+/// parameter reads fell through to the empty `sh2.vars` store.
+static NAMED_PARAMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` one of the enclosing function's A1-declared parameters?
+/// A read of one renders as the bare arrow parameter.
+fn is_named_param(name: &str) -> bool {
+    NAMED_PARAMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
 
 /// STORE-ONLY vars (the StoreToNative pass's verdict): written only via
 /// setVar/getVar with literal names — the native binding renders bare
@@ -36108,9 +36129,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::Function {
             name,
+            params,
             body,
             named_blocks,
-            ..
         } => {
             // Per-function `local` native lift (see [`local_lift_analysis`]):
             // push the function's frame so the body's `local` decls lower
@@ -36203,6 +36224,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             if let Some(k) = lifted_arity {
                 *PARAM_FRAME.lock().unwrap() = Some(k);
             }
+            // A1-DECLARED parameters (core request rust-20260930-031500):
+            // the arrow takes them as real JS parameters, and the body's
+            // reads of them render bare (see [`is_named_param`]). Empty
+            // for every bash-sourced function — the corpus's `ast_to_ir`
+            // path emits no `params` — so this is a no-op there.
+            // A param-lifted function already takes `p1..pk` and is
+            // positional-free by construction; the two shapes are disjoint
+            // in practice, but the lift wins if both are present.
+            let named_params: Vec<Expr> = if lifted_arity.is_some() {
+                Vec::new()
+            } else {
+                params
+                    .iter()
+                    .filter(|p| is_plain_ident(p))
+                    .map(|p| ident(p))
+                    .collect()
+            };
+            let named_set: HashSet<String> = named_params
+                .iter()
+                .filter_map(|e| match e {
+                    Expr::Identifier { name } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let pushed_named = !named_set.is_empty();
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = Some(named_set);
+            }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
                 // powershell-sh-go): the define arrow wraps the blocks in
@@ -36214,7 +36263,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else if fn_call_is_sync(name) {
                 let params = lifted_arity
                     .map(|k| (1..=k).map(|i| ident(&format!("p{i}"))).collect())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| named_params.clone());
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
@@ -36224,9 +36273,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     arrow_sink_sync(params, IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
-                arrow_native_echo(vec![], IrExpr::Arrow(cloned_body))
+                arrow_native_echo(named_params.clone(), IrExpr::Arrow(cloned_body))
             } else {
-                arrow_sink(vec![], IrExpr::Arrow(cloned_body))
+                arrow_sink(named_params.clone(), IrExpr::Arrow(cloned_body))
             };
             // The arrow construction is complete — restore the previous
             // arrow-body deadness (the clone's statements are dropped with
@@ -36237,6 +36286,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             FUNCTION_STACK.lock().unwrap().pop();
             if lifted_arity.is_some() {
                 *PARAM_FRAME.lock().unwrap() = None;
+            }
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = None;
             }
             let binding = if lifted_arity.is_some() {
                 // param-lifted: the runtime map is never consulted (the
@@ -50992,10 +51044,21 @@ fn call_free_expr(e: &Expr) -> Option<Expr> {
     }
 }
 
-/// A store write where the RHS is provably already a STRING (a string
-/// literal or template — the runtime's `String(...)` coercion is an
-/// identity), vs a number-valued RHS (native arith) that needs the
-/// coercion.
+/// A store write where the RHS must be handed to the store RAW — the
+/// runtime's `String(...)` coercion would destroy it.
+///
+/// Two classes qualify:
+///  • values already a STRING (a string literal or template — `String(...)`
+///    is an identity);
+///  • an ObjectExpression (a record value, core request
+///    rust-frontend-20260823-record-storage). `String({x:"3"})` is
+///    `"[object Object]"`, and the site this guards is the DIRECT
+///    `sh2.vars[name] = <expr>` write, which preserves any raw value —
+///    so the coercion is the only thing destroying the record, and every
+///    later field read off it yields undefined. Object literals are
+///    emitted ONLY by frontends lowering record/map literals (no shell
+///    path constructs one — bash assoc arrays go through setArray), so
+///    widening the set cannot change bash-semantics output.
 fn store_rhs_string(e: &Expr) -> bool {
     matches!(
         e,
@@ -51004,6 +51067,7 @@ fn store_rhs_string(e: &Expr) -> bool {
                 value: serde_json::Value::String(_),
                 ..
             }
+            | Expr::ObjectExpression { .. }
     )
 }
 
@@ -51492,6 +51556,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         return slot_read(k);
                     }
                     if is_lifted(name) {
+                        return Expr::Identifier { name: name.clone() };
+                    }
+                    // A1-DECLARED parameter of the function being emitted:
+                    // the arrow binds it as a real JS parameter, so the read
+                    // is the bare identifier. Checked AFTER the lifted arms
+                    // (a lifted binding wins — a `local` of the same name
+                    // shadows the parameter) and BEFORE the store read,
+                    // which is empty for a param (the runtime's function map
+                    // carries the args, not `sh2.vars`). Core request
+                    // rust-20260930-031500 — go-sh `t109_bool_func.go`.
+                    if is_named_param(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
                     // NOTE (2026-09-09, t89 list-append): a concurrent
@@ -59881,5 +59956,209 @@ mod shift_offset_tests {
             vec![getvar("1"), getvar("@")],
         )]);
         assert_eq!(analyze_shift_offsets(&p).get("t"), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod named_param_emission_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn getvar(n: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s(n)],
+        })
+    }
+
+    /// `func isYes(s) { … }` — an A1 function with a DECLARED parameter.
+    /// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+    /// `IrStmt::Function` arm dropped `params`, so the arrow emitted
+    /// `() => …` and the body's read of `s` fell through to the empty
+    /// `sh2.vars` store — every predicate saw "".
+    fn param_fn() -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Function {
+                name: "isYes".to_string(),
+                params: vec!["s".to_string()],
+                body: vec![IrStmt::Return(Some(s("y")))],
+                named_blocks: vec![],
+            }],
+        }
+    }
+
+    /// The declared parameter must reach the emitted arrow's parameter list —
+    /// it is a real JS parameter, not a store lookup.
+    #[test]
+    fn declared_param_reaches_the_arrow_parameter_list() {
+        let js = serde_json::to_string(&shir_to_estree(&param_fn())).unwrap();
+        assert!(
+            js.contains(r#"ArrowFunctionExpression","params":[{"type":"Identifier","name":"s"}"#),
+            "the declared parameter must be an arrow parameter: {js}"
+        );
+    }
+
+    /// A body READ of the declared parameter must render as the bare
+    /// identifier — not a `sh2.vars` read, which yields "" (the runtime
+    /// carries function args in its function map, never in the var store).
+    #[test]
+    fn declared_param_read_renders_bare_not_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("s")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            js.contains(r#"{"type":"Identifier","name":"s"}"#),
+            "the param read must be the bare identifier: {js}"
+        );
+    }
+
+    /// The negative half: a body read of a name that is NOT a declared
+    /// parameter must NOT render bare — the frame must not leak.
+    #[test]
+    fn non_param_read_still_uses_the_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("other")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            !js.contains(r#"{"type":"Identifier","name":"other"}"#),
+            "a non-param must not render bare: {js}"
+        );
+    }
+}
+
+/// Record (struct) VALUES must reach the store RAW (core request
+/// rust-frontend-20260823-record-storage). A frontends-emitted Object
+/// literal assigned to a name is a record; the direct `sh2.vars[name] = …`
+/// write preserves any raw value, so the `String(…)` wrapper that
+/// `store_rhs_string` used to force turns the record into
+/// `"[object Object]"` and every later field read yields undefined.
+#[cfg(test)]
+mod record_store_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// A one-statement program: `<var> = <value>`, the shape the native
+    /// direct-store write (`sh2.vars[<var>] = <rhs>`) is chosen for.
+    fn assign_prog(var: &str, value: IrExpr) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: value,
+                asm: None,
+            }],
+        }
+    }
+
+    /// The rendered store statement for `assign_prog`, as JSON. Returned
+    /// alone (not the whole program) so an assertion on `"String"` cannot
+    /// be satisfied by an unrelated part of the output.
+    fn store_expr_of(prog: IrProgram) -> String {
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        // The assignment is the first statement; render just it.
+        serde_json::to_string(&v["body"][0]).unwrap()
+    }
+
+    /// `let p = Point { x: "3", y: "4" };` — a record literal bound to `p`.
+    fn record_assign() -> IrProgram {
+        assign_prog(
+            "p",
+            IrExpr::Object(vec![
+                ("x".to_string(), s("3")),
+                ("y".to_string(), s("4")),
+            ]),
+        )
+    }
+
+    /// The record must be stored as an ObjectExpression, NOT as
+    /// `String(<object>)`. This is the exact bug: `String({x:"3",y:"4"})`
+    /// stringifies to `"[object Object]"`, so the stored value is a string
+    /// and every `p.x` after it reads undefined.
+    #[test]
+    fn record_literal_reaches_the_store_uncoerced() {
+        let js = store_expr_of(record_assign());
+        assert!(
+            js.contains(r#""ObjectExpression""#),
+            "the record must be stored as an ObjectExpression: {js}"
+        );
+        assert!(
+            !js.contains(r#""String""#),
+            "the record must NOT be wrapped in String(...): {js}"
+        );
+    }
+
+    /// The negative half — the widening must be SCOPED to records, not
+    /// "anything that is not a string literal". These pin the predicate
+    /// itself (`store_rhs_string`), which is the thing that changed: a
+    /// numeric RHS and a call RHS both still NEED the runtime's
+    /// `String(...)` coercion, and only a string or a record is exempt.
+    #[test]
+    fn store_rhs_string_exempts_only_strings_and_records() {
+        let string_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::String("s".into()),
+            raw: None,
+            regex: None,
+        };
+        let number_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::from(5),
+            raw: None,
+            regex: None,
+        };
+        let record = crate::estree::Expr::ObjectExpression {
+            properties: vec![],
+        };
+        assert!(store_rhs_string(&string_lit), "a string stays exempt");
+        assert!(
+            store_rhs_string(&record),
+            "a record is now exempt (the fix)"
+        );
+        assert!(
+            !store_rhs_string(&number_lit),
+            "a number must still take the String() coercion"
+        );
+        assert!(
+            !store_rhs_string(&crate::estree::Expr::ArrayExpression { elements: vec![] }),
+            "an array must still take the String() coercion"
+        );
     }
 }
