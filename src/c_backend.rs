@@ -11348,8 +11348,32 @@ impl Render {
                 } else if *op == "/" || *op == "%" {
                     // Strength-reduce power-of-2 divisors: % 2^k -> & (2^k-1),
                     // / 2^k -> >> k. Eliminates ~30-cycle div (1-cycle and/shift).
+                    //
+                    // SOUND ONLY IF the dividend is provably non-negative.
+                    // `x % 2^k == x & (2^k-1)` and `x / 2^k == x >> k` hold
+                    // for `x >= 0` ONLY. For a negative x in two's
+                    // complement the mask still yields the right residue,
+                    // but a COMPARISON against it inverts relative to the
+                    // signed modulo — executed, for v = -3:
+                    //     v % 2 == 1                      -> 0 (bash: 0 iters)
+                    //     (unsigned long long)(v)&1ull==1  -> 1 (runs once)
+                    // and `(0 - v) >> 1` floors toward -inf where the
+                    // shift floors toward zero. Floor division of a
+                    // negative is not a shift.
+                    //
+                    // This is the SAME proof obligation the unsigned op
+                    // below already discharges (`arith_proven_nonneg`),
+                    // and the same one the `refuses_*` tests state. It was
+                    // unconditional here, so the strength reduction
+                    // bypassed the proof entirely — the shape the tests
+                    // catch is `((unsigned long long)(v) & 1ull) == 1`.
+                    // No proof -> refuse (one division beats a wrong
+                    // answer).
                     if let crate::ir::ArithAst::Num(d) = rhs.as_ref() {
-                        if *d > 0 && (*d & (*d - 1)) == 0 {
+                        if *d > 0
+                            && (*d & (*d - 1)) == 0
+                            && self.arith_proven_nonneg(lhs)
+                        {
                             if *op == "%" {
                                 let mask = *d - 1;
                                 return format!("((unsigned long long)({l}) & {mask}ull)");
@@ -39816,8 +39840,17 @@ mod tests {
         let mut prog = empty_prog(vec![assign("v", cast(A::Num(1))), assign("v", rhs)]);
         prog.var_types = vec![("v".to_string(), crate::ir::IrType::Int)];
         let c = shir_to_c(&prog);
+        // The contract is the NATIVE store (a folded `mpz_set_si` of the
+        // proven i64 value) and NO GMP division chain. The exact operator
+        // spelling is not the contract: `28 / 2` and its sound
+        // strength reduction `28 >> 1` are the same value, and the
+        // reduction fires here precisely because the dividend is a
+        // non-negative proven constant. Pin the value, not the spelling.
         assert!(
-            c.contains("mpz_set_si(v, (long long)((unsigned long long)(28) / (unsigned long long)(2)))"),
+            c.contains("mpz_set_si(v, ((unsigned long long)(28) >> 1u))")
+                || c.contains(
+                    "mpz_set_si(v, (long long)((unsigned long long)(28) / (unsigned long long)(2)))"
+                ),
             "division bigint store not native:\n{c}"
         );
         assert!(
