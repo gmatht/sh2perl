@@ -2174,6 +2174,41 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let value = word_to_zsh(arg(args, 1)?)?;
                 Ok(format!("{}={value}", name.replace('.', "_")))
             }
+            // Call-form `A && B` / `A || B` — each side is an Arrow of
+            // statements. This is the shape the shIR lowering emits for
+            // `&&`/`||` inside a condition or command substitution (the
+            // BinOp::And/Or arms above only see the expression form).
+            "and" | "or" => {
+                let joiner = if func == "and" { " && " } else { " || " };
+                let mut parts: Vec<String> = Vec::new();
+                for a in args {
+                    let side = match a {
+                        IrExpr::Arrow(stmts) => stmts_inline(stmts)?,
+                        other => cmd_to_sh(other)?,
+                    };
+                    parts.push(side);
+                }
+                if parts.is_empty() {
+                    return Ok(":".into());
+                }
+                Ok(parts.join(joiner))
+            }
+            // `fnValue("f", [args...])` — the echo-return-lift's
+            // value-returning function dispatch: run f with the given
+            // positional args and capture its stdout (the value). The
+            // shell equivalent is a command substitution.
+            "fnValue" => {
+                let fname = raw_arg(args, 0)?;
+                let call_args: Vec<IrExpr> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items.clone(),
+                    _ => vec![],
+                };
+                let mut words = vec![fname];
+                for a in &call_args {
+                    words.push(word_to_zsh(a)?);
+                }
+                Ok(format!("$({})", words.join(" ")))
+            }
             other => Err(format!("command call not renderable: {other:?}")),
         },
         IrExpr::BinOp {
@@ -3820,6 +3855,21 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                 "\"$(printf '%s' {v} | sed -n '{}p')\"",
                 n + 1
             ))
+        }
+        // `fnValue("f", [args...])` — the echo-return-lift's value-returning
+        // function dispatch in WORD position: run f with the given
+        // positional args and capture its stdout (the value).
+        "fnValue" => {
+            let fname = raw_arg(args, 0)?;
+            let call_args: Vec<IrExpr> = match args.get(1) {
+                Some(IrExpr::Array(items)) => items.clone(),
+                _ => vec![],
+            };
+            let mut words = vec![fname];
+            for a in &call_args {
+                words.push(word_to_zsh(a)?);
+            }
+            Ok(format!("$({})", words.join(" ")))
         }
         other => Err(format!("word call not renderable: {other:?}")),
     }
