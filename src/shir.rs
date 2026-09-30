@@ -31545,6 +31545,17 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // loop bodies are emitted from the ORIGINAL references, so the pointer
     // keys hold).
     *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+    // The GENERAL unread-status-write set — every statement that writes a
+    // status (`ir_stmt_writes_lastexit`) but which the backward scan proved
+    // unread. `LASTEXIT_DEAD` above is the ESTree emitter's NARROW map: it
+    // only carries the shapes it has a hand-written dead twin for (`(( ))`,
+    // native echo, `declare`). A `cmd > file` redirect is a status writer
+    // with no entry there, so its writeFile `.then` closure would look live
+    // no matter what the analysis proved. The Rust backend installs this map
+    // for its own status register; the ESTree path needs the same verdict for
+    // the writeFile status closure (core request
+    // estree-20260813-182443).
+    install_unread_status_writes(prog, errexit);
     // Native-loop passes: (a) which loops may be capture producers (they
     // keep the runtime loop — a native loop would lose the producer bound),
     // (b) which loops' final status write is dead (the native while drops
@@ -33456,7 +33467,11 @@ fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<
     ]))
 }
 
-fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
+fn try_native_echo_redirect(
+    inner: &[IrStmt],
+    specs: &[(i64, &str, &IrExpr)],
+    status_dead: bool,
+) -> Option<Expr> {
     if program_defines_function("echo") {
         return None;
     }
@@ -33647,14 +33662,21 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         arguments: vec![err_msg],
         optional: false,
     };
-    let set1 = Expr::AssignmentExpression {
-        operator: "=".to_string(),
-        left: Box::new(sh2_member("lastExit")),
-        right: Box::new(Expr::Literal {
-            value: serde_json::Value::from(1),
-            raw: None,
-            regex: None,
-        }),
+    let set1 = if status_dead {
+        // the write's exit status is provably unread, so the failure path
+        // reports to stderr and nothing else — the `sh2.lastExit = 1` store
+        // exists only to record `$?` for a reader that does not exist.
+        stderr_write.clone()
+    } else {
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        }
     };
     let then = Expr::ArrowFunctionExpression {
         params: vec![Expr::Identifier {
@@ -33683,20 +33705,31 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         expression: true,
         r#async: false,
     };
-    let chained = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(write),
-                    property: Box::new(Expr::Identifier {
-                        name: "then".to_string(),
-                    }),
-                    computed: false,
-                    optional: false,
+    // The `.then` status closure exists ONLY to record `$?` on success. When
+    // the write's status is lastexit-dead nothing reads it, so the chain
+    // collapses to `await write(...).catch(report)` — one fewer promise
+    // reaction and closure per write. The `.catch` is NOT droppable: it
+    // REPORTS the failure to stderr (core request
+    // go-sh-writefile-eacces), so a failing device still surfaces.
+    let after_write: Expr = if status_dead {
+        write
+    } else {
+        Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(write),
+                property: Box::new(Expr::Identifier {
+                    name: "then".to_string(),
                 }),
-                arguments: vec![then],
+                computed: false,
                 optional: false,
             }),
+            arguments: vec![then],
+            optional: false,
+        }
+    };
+    let chained = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(after_write),
             property: Box::new(Expr::Identifier {
                 name: "catch".to_string(),
             }),
@@ -36523,7 +36556,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .iter()
                 .map(|r| (r.fd.unwrap_or(0) as i64, r.mode.as_str(), &r.target))
                 .collect::<Vec<_>>();
-            if let Some(native) = try_native_echo_redirect(inner, &redirect_specs) {
+            if let Some(native) =
+                try_native_echo_redirect(inner, &redirect_specs, stmt_status_write_is_unread(stmt))
+            {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // `grep -q PAT <<< TEXT` (statement position): the fd-0
@@ -52557,7 +52592,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                     if ok {
-                        if let Some(native) = try_native_echo_redirect(stmts, &specs) {
+                        // EXPRESSION position: the chain's boolean VALUE is
+                        // the command's truth value (a `$(cmd > f)` capture,
+                        // a `&&`/`||` operand), so the `true`/`false` tails
+                        // are load-bearing here regardless of `$?`
+                        // liveness — always the full `.then/.catch` form.
+                        if let Some(native) = try_native_echo_redirect(stmts, &specs, false) {
                             return native;
                         }
                         // `grep -q PAT <<< TEXT` — the fd-0 herestring
@@ -57246,6 +57286,79 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(
             !perl.contains("system('bash'"),
             "cmp -s must not shell out: {perl}"
+        );
+    }
+
+    /// A `cmd > file` redirect lowers to a native
+    /// `await sh2.fs.writeFile(path, text).then(...).catch(...)` chain. The
+    /// `.then` arm exists ONLY to record `$?` on success. When the write's
+    /// status is unread nothing observes it, so the `.then` closure and the
+    /// catch's `sh2.lastExit = 1` store are both droppable and the chain
+    /// collapses to `await writeFile(...).catch(report)`.
+    ///
+    /// The `.catch` must SURVIVE: it reports the failure to stderr (a
+    /// dropped report would make a failing write silent). These two tests are
+    /// the two halves of that contract — one pins the elision, one pins the
+    /// report, and the second also pins that a LIVE `$?` keeps the full form.
+    #[test]
+    fn writefile_status_dead_drops_the_then_closure() {
+        // The shadowing statement AFTER the write is what makes the write's
+        // status unread. A LONE `echo hi > f` would NOT: with no following
+        // writer the write's status IS the program's exit code, so
+        // `sh2._finish` still reports it and the `.then` is load-bearing
+        // there (pinned by `writefile_program_final_write_keeps_the_then_closure`).
+        let src = "echo hi > /tmp/wf_dead\necho done\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            !js.contains("\"then\""),
+            "lastexit-dead write must not emit the .then status closure: {js}"
+        );
+        // …and the error report is still there, so a failed write is visible.
+        assert!(
+            js.contains("\"catch\""),
+            "the .catch report must survive the status elision: {js}"
+        );
+        assert!(
+            js.contains("Permission denied"),
+            "the EACCES report text must survive the status elision: {js}"
+        );
+    }
+
+    /// The negative half: when the script DOES read `$?` after the write, the
+    /// status is live and the full `.then/.catch` chain is mandatory —
+    /// dropping it would make `echo $?` print the PREVIOUS command's status.
+    #[test]
+    fn writefile_status_live_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_live\necho \"rc=$?\"\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "a write whose $? is read must keep the .then status closure: {js}"
+        );
+    }
+
+    /// A write in FINAL POSITION keeps its `.then` even though the script
+    /// never mentions `$?`. With no later statement to shadow it, the write's
+    /// status is the program's own exit code (`sh2._finish` reports the last
+    /// command's status), so dropping the closure would make a failed write
+    /// exit 0 — the exact silent-wrong-output this elision must not cause.
+    ///
+    /// This is the guard that makes the elision safe by construction: the
+    /// deadness scan is only allowed to fire when a later writer shadows the
+    /// read, never at end-of-program.
+    #[test]
+    fn writefile_program_final_write_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_final\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "the program-final write's status IS the exit code and must stay live: {js}"
         );
     }
 
