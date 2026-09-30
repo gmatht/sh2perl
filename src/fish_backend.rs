@@ -2731,6 +2731,37 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
+/// Is this `set` a set of shell OPTIONS rather than variable assignments?
+/// bash overloads one builtin for both: `set -euo pipefail` sets flags,
+/// `set x=1 y=2` assigns. Any argument carrying a `=` settles it as an
+/// assignment, which must keep lowering to fish's own assignment form.
+fn args_are_options(args: &[IrExpr]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    let mut expect_optname = false;
+    for a in args {
+        match a {
+            IrExpr::Str(s, _) => {
+                if s.contains('=') {
+                    return false;
+                }
+                if expect_optname {
+                    expect_optname = false;
+                    continue;
+                }
+                if s == "-o" {
+                    expect_optname = true;
+                }
+            }
+            // A computed/quoted word could be anything, including `x=1`;
+            // treat it as an assignment so we never eat a real `set` value.
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn exec_line_to_fish(
     cmd: &IrExpr,
     args: &[IrExpr],
@@ -2761,76 +2792,43 @@ fn exec_line_to_fish(
         IrExpr::Str(s, _) => Some(s.as_str()),
         _ => None,
     };
-    // bash-only `set` options (pipefail etc.) — dash would reject them;
-    // drop the option word and the trailing `o` of a combined flag (the
-    // corpus's `set -euo pipefail` must run under /bin/sh for the
-    // equivalence gate).
-    if cmd_name == Some("set") {
-        const DASH_SET_O: &[&str] = &[
-            "allexport",
-            "errexit",
-            "noglob",
-            "noclobber",
-            "nolog",
-            "notify",
-            "ignoreeof",
-            "monitor",
-            "nounset",
-            "verbose",
-            "vi",
-            "xtrace",
-        ];
-        let mut kept: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            let lit = match &args[i] {
-                IrExpr::Str(s, _) => s.clone(),
-                _ => {
-                    kept.push(word_to_fish(&args[i])?);
-                    i += 1;
-                    continue;
-                }
-            };
-            if lit == "-o" || (lit.starts_with('-') && lit.len() > 1 && lit.ends_with('o')) {
-                let opt = args.get(i + 1).and_then(|x| match x {
-                    IrExpr::Str(s, _) => Some(s.as_str()),
-                    _ => None,
-                });
-                if let Some(opt) = opt {
-                    if DASH_SET_O.contains(&opt) {
-                        // supported: keep `-o opt` (or the split flag)
-                        if lit == "-o" {
-                            kept.push("-o".into());
-                            kept.push(opt.into());
-                        } else {
-                            kept.push(format!("-{}", &lit[1..lit.len() - 1]));
-                            kept.push("-o".into());
-                            kept.push(opt.into());
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    // unsupported (pipefail…): drop the option word, keep
-                    // the OTHER flags of a combined form (`-euo` → `-eu`)
-                    if lit != "-o" {
-                        let rest = &lit[1..lit.len() - 1];
-                        if !rest.is_empty() {
-                            kept.push(format!("-{rest}"));
+    // bash `set` OPTIONS. fish spells the same runtime behaviour with its own
+    // flags, and the two are NOT interchangeable: fish's `set` is an
+    // assignment command, so emitting `set -e -u` verbatim is a runtime error
+    // ("set: invalid option combination") on the very first line of the script
+    // — it kills the whole file, which is why every corpus script starting with
+    // `set -euo pipefail` failed.
+    //
+    //   bash -e  -> fish has no -e; errexit is the default, so it is a no-op.
+    //   bash -u  -> `set -u` in fish IS "error on unset variable". Same word,
+    //               different grammar: it must be a BARE `set -u`, and the
+    //               assignment form (`set -u x=1`) is what fish rejects.
+    //   bash -x / -v / -o pipefail / -n etc. -> fish has no equivalent.
+    // A script with no fish-representable option lowers to `:` (a no-op), so
+    // the line still parses and the body still runs.
+    if cmd_name == Some("set") && args_are_options(&args) {
+        let mut flags: Vec<&str> = Vec::new();
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) => {
+                    for c in s.strip_prefix('-').unwrap_or(s.as_str()).chars() {
+                        // `-e` is fish's default and `-o pipefail` has no fish
+                        // counterpart; both are dropped silently.
+                        if c == 'u' && !flags.contains(&"u") {
+                            flags.push("u");
                         }
                     }
-                    i += 2;
-                    continue;
                 }
-                // `-o` with no option word — keep verbatim
+                // `-o errexit`, `-o nounset` and friends: a bare word that is
+                // NOT `name=value` is an option, never an assignment.
+                _ => {}
             }
-            kept.push(lit);
-            i += 1;
         }
-        if kept.is_empty() {
+        if flags.is_empty() {
             out.push(':');
         } else {
             out.push_str("set ");
-            out.push_str(&kept.join(" "));
+            out.push_str(&flags.join(" "));
         }
         return Ok(out);
     }
@@ -3158,6 +3156,36 @@ fn exec_line_to_fish(
         return Ok(format!(
             "{name}_len=0; while IFS= read -r _map_line; do eval \"{name}_${{{name}_len}}=\\$_map_line\"; {name}_len=$(({name}_len + 1)); done"
         ));
+    }
+    // `unset x` — fish spells this `set -e x`, and emitting the bash name
+    // verbatim produced "[Unknown command: unset]" (a RUNTIME failure that
+    // killed the script, not a parse error). A flattened array also has to
+    // drop its len counter, or `${#x[@]}` keeps reporting the old length
+    // after the elements are gone.
+    if cmd_name == Some("unset") {
+        let mut words: Vec<String> = Vec::new();
+        for a in args {
+            if let IrExpr::Str(s, _) = a {
+                // `unset -v`/`unset -f` are bash-only flag words.
+                if s.starts_with('-') && s.len() > 1 {
+                    continue;
+                }
+                if s == "@" || s == "*" {
+                    continue;
+                }
+                words.push(s.clone());
+                if ARRAY_NAMES.lock().unwrap().contains(s.as_str()) {
+                    words.push(format!("{s}_len"));
+                }
+            }
+        }
+        if words.is_empty() {
+            out.push(':');
+        } else {
+            out.push_str("set -e ");
+            out.push_str(&words.join(" "));
+        }
+        return Ok(out);
     }
     // `read -a arr` — bash-only array read (dash rejects -a). Split the
     // line on IFS into the per-element vars + len counter.
@@ -3494,14 +3522,65 @@ fn lower_procsub_inline_fish(ps: &[IrRedirect], cmd: &str) -> Result<String, Str
 /// `cmd <<<word` (dash: "redirection unexpected") → `printf '%s\n' word | cmd`
 /// — the herestring feeds the word plus a newline on stdin. The herestring
 /// itself is skipped by redirect_to_fish; this wraps the command with the pipe.
+///
+/// `cmd <<EOF` / `cat <<-EOF` is the same shape: the body goes to stdin, so
+/// it lowers to the same printf pipe. fish has NO heredoc syntax at all, and
+/// emitting `<<EOF` verbatim produced a file fish cannot even parse — one
+/// syntax error for every corpus file that used a heredoc.
 fn herestring_wrap_fish(redirects: &[IrRedirect], cmd: String) -> Result<String, String> {
     for r in redirects {
         if r.mode == "herestring" {
             let t = word_to_fish(&r.target)?;
             return Ok(format!("printf '%s\\n' {t} | {cmd}"));
         }
+        if r.mode == "heredoc" || r.mode == "heredoc-tabs" {
+            let body = match &r.target {
+                IrExpr::Str(s, _) => s.clone(),
+                other => word_to_fish(other)?,
+            };
+            return Ok(format!("{} | {cmd}", heredoc_body_fish(&body, &r.mode)));
+        }
     }
     Ok(cmd)
+}
+
+/// A heredoc body → the left side of the pipe that feeds the command's
+/// stdin. Byte-exact with what bash's `<<` writes:
+///   * the body is emitted line by line, each with a trailing newline, so
+///     `printf '%s\n' a b c` reproduces it exactly;
+///   * an EMPTY body must be `printf ''` — `printf '%s\n'` with no
+///     arguments still prints one bare newline, which is not what
+///     `cat <<EOF\nEOF` writes (nothing at all);
+///   * `<<-` strips leading TABS from each line, so the body is
+///     de-indented before it is emitted.
+/// The `%s` format (never the body as the format) keeps a body containing
+/// `%` from being interpreted, and each line is single-quoted so spaces and
+/// shell metacharacters survive verbatim.
+fn heredoc_body_fish(body: &str, mode: &str) -> String {
+    let mut text = body.to_string();
+    if mode == "heredoc-tabs" {
+        text = text
+            .lines()
+            .map(|l| l.strip_prefix('\t').unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    // A trailing newline is the heredoc's line terminator, not body content:
+    // the format supplies it back. Anything beyond that is content and must
+    // survive — a body ending in a blank line keeps it as a final empty arg.
+    let trimmed = text.strip_suffix('\n').unwrap_or(&text);
+    let lines: Vec<&str> = if trimmed.is_empty() { Vec::new() } else { trimmed.split('\n').collect() };
+    if lines.is_empty() {
+        return "printf ''".to_string();
+    }
+    let args: Vec<String> = lines.iter().map(|l| fish_single_quoted(l)).collect();
+    format!("printf '%s\\n' {}", args.join(" "))
+}
+
+/// Single-quote a literal for fish. Inside single quotes fish treats
+/// everything literally, so only `'` and `\` need escaping.
+fn fish_single_quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "'\\''"))
 }
 
 fn redirect_to_fish(r: &IrRedirect) -> Result<String, String> {
@@ -3511,18 +3590,10 @@ fn redirect_to_fish(r: &IrRedirect) -> Result<String, String> {
         "a" => ">>",
         "r" => "<",
         "r+" => "<>",
-        "herestring" => return Ok(String::new()), // wrapped as a printf pipe by herestring_wrap_fish
-        "heredoc" | "heredoc-tabs" => {
-            // The heredoc BODY is carried in the target string.
-            let body = match &r.target {
-                IrExpr::Str(s, _) => s.clone(),
-                other => word_to_fish(other)?,
-            };
-            let delim = pick_delimiter(&body);
-            let q = if r.interpolate { "" } else { "'" };
-            let tab = if r.mode == "heredoc-tabs" { "-" } else { "" };
-            let fdpre = fd_prefix(fd);
-            return Ok(format!(" {fdpre}<<{tab}{q}{delim}{q}\n{body}{delim}\n"));
+        "herestring" | "heredoc" | "heredoc-tabs" => {
+            // Both feed the command's stdin and are wrapped as a printf pipe
+            // by herestring_wrap_fish — fish has neither `<<<` nor `<<`.
+            return Ok(String::new());
         }
         // `unsupported` / unknown modes must never be silently dropped
         // (core request sh-20260807-130936 item 3 — refuse loudly; the
@@ -3613,15 +3684,6 @@ fn fd_prefix(fd: i32) -> String {
     }
 }
 
-fn pick_delimiter(body: &str) -> &'static str {
-    for d in ["EOF", "_EOF", "SH2_EOF", "SH2EOF", "END"] {
-        if !body.lines().any(|l| l.trim_end() == d) {
-            return d;
-        }
-    }
-    "SH2EOF"
-}
-
 // ── words ────────────────────────────────────────────────────────────
 
 /// `$(seq …)` / `$(wc -l FILE)` — native sh idiom lifts (no external
@@ -3705,7 +3767,16 @@ fn word_to_fish(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(name) => Ok(name.clone()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Interpolate(parts) => interp_to_fish(parts),
-        IrExpr::Arith(a) => Ok(format!("(math \"{}\")", arith_to_fish(a))),
+        IrExpr::Arith(a) => {
+            // An IncDec is a self-contained command substitution (it mutates
+            // the variable, so it cannot be an argument to `math`); everything
+            // else is an expression for math to evaluate.
+            if matches!(&**a, ArithAst::IncDec { .. }) {
+                Ok(arith_to_fish(a))
+            } else {
+                Ok(format!("(math \"{}\")", arith_to_fish(a)))
+            }
+        }
         IrExpr::Call { func, args } => call_word_to_fish(func, args),
         IrExpr::Index { var, key } => index_to_fish(var, key, true),
         IrExpr::Capture { expr, .. } => {
@@ -4178,21 +4249,21 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             Ok(strip_expansion_fish(name.as_str(), op.as_str(), pat.as_str()))
         }
         "//" | "/" => {
-            // `${x/p/r}` — fish's `string replace` is the exact native idiom
-            // and, unlike the `sed` pipeline it replaces, it is a builtin (no
-            // subprocess, no shell quoting round-trip). The IR conflates
-            // first/all occurrences (`${x/p/r}` and `${x//p/r}` both arrive as
-            // `//`), so both render the replace-all form — the same
-            // conflation the sh backend already makes.
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
+            // The IR conflates first/all occurrences (`${x/p/r}` and
+            // `${x//p/r}` both arrive as `//`), so this always renders the
+            // replace-ALL form and needs `-a`: `string replace` without it
+            // replaces only the first match, which turned `${var//o/0}` on
+            // "hello world" into "hell0 world".
+            //
             // bash's pattern here is a GLOB but the corpus uses plain
             // literals, and `string replace` without `-r` treats the pattern
             // literally too — so the literal form is both the faithful and the
             // safe default. A pattern that looks like a regex (escapes or a
             // group) opts into `-r` so a capture-group pattern is not silently
             // matched as literal text.
-            let flag = if pat.contains('\\') || pat.contains('(') { " -r" } else { "" };
+            let flag = if pat.contains('\\') || pat.contains('(') { " -a -r" } else { " -a" };
             if rep.is_empty() {
                 // bash `${x/p/}` DELETES the match; `string replace` with no
                 // replacement argument does exactly that.
@@ -4247,27 +4318,46 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
 fn strip_expansion_fish(name: &str, op: &str, pat: &str) -> String {
     let is_prefix = op.starts_with('#');
     let longest = op.len() == 2;
-    if !pat.chars().all(|c| c.is_alphanumeric() || "*?".contains(c)) {
+    // `/` is in the safe set because it means the same thing in a glob and in
+    // the regex `string` takes: both treat it as an ordinary literal. The
+    // corpus's path strips (`*/`, `/*`) are otherwise refused here and routed
+    // to the `sed` fallback, which escapes the pattern into a form that cannot
+    // match a separator at all.
+    if !pat.chars().all(|c| c.is_alphanumeric() || "*?/-".contains(c)) {
         return sed_strip_fish(name, is_prefix, pat);
     }
     let val = format!("\"${name}\"");
-    // `*` is "any run of chars" and `?` is "one char"; a leading `*` is what
-    // makes a strip reach the far end, so it is the only placement that needs
-    // special handling.
-    let rest = pat.trim_start_matches('*');
-    match (is_prefix, longest) {
-        // `${x##*/}` — basename. `^.*/` is greedy, so it strips through the
-        // LAST `/`.
-        (true, true) => format!("(string replace -r '^.*{rest}' '' -- {val})"),
-        // `${x#*/}` — drop through the FIRST `/`; a lazy capture is what
-        // selects the shortest, and `string match` hands back group 1.
-        (true, false) => format!("(string match -r '^(.*?){rest}' -- {val})[1]"),
-        // `${x%%/*}` — dirname: remove the last `/segment`.
-        (false, true) => format!("(string replace -r '{rest}[^/]*$' '' -- {val})"),
-        // `${x%…}` — truncate at the FIRST separator, which is `string split
-        // -m 1` (the `-m` cap is what makes it a strip rather than a split).
-        (false, false) => format!("(string split -m 1 -r '{rest}' -- {val})[1]"),
-    }
+    // A leading `*` is what makes a strip reach the far end, so it is the only
+    // placement that needs special handling; everywhere else the pattern is
+    // anchored directly. `string replace -r` is the `sed s///` analogue: the
+    // anchors (`^` / `$`) pick the end and the regex engine's greediness picks
+    // shortest-vs-longest, which is exactly bash's `#`/`##`/`%`/`%%`.
+    //
+    // `string match`/`string split` were tried for the single-`*` forms and are
+    // wrong: `string match` PRINTS the whole match (not the capture group) and
+    // `string split` keeps the separator in field 1, so `${x#hello}` on
+    // "hello world" came back as "hello" instead of " world".
+    let (re, rest) = if let Some(rest) = pat.strip_prefix('*') {
+        (if is_prefix { "^.*" } else { ".*" }.to_string(), rest.to_string())
+    } else if is_prefix {
+        ("^".to_string(), pat.to_string())
+    } else {
+        ("".to_string(), pat.to_string())
+    };
+    // A suffix strip anchors the pattern at the END. A leading `*` in a
+    // SUFFIX strip means "everything up to a separator", and which end it
+    // reaches is what `##` vs `%` selects: greedy `^.*` for the longest,
+    // lazy `^.*?` for the shortest. Without the `^.*` the pattern would only
+    // strip the final separator and leave the whole path behind.
+    let anchored = if is_prefix {
+        format!("{re}{rest}")
+    } else if pat.starts_with('*') {
+        // `%%` (longest) reaches the FAR end, `%` (shortest) the near one.
+        format!("{}.*{rest}$", if longest { "^" } else { "^.*?" })
+    } else {
+        format!("{re}{rest}$")
+    };
+    format!("(string replace -r '{anchored}' '' -- {val})", anchored = anchored)
 }
 
 /// Fallback strip for glob patterns `string replace` cannot express, via a
@@ -5215,7 +5305,36 @@ fn arith_to_fish(a: &ArithAst) -> String {
                 format!("$( _num \"${name}\" )")
             }
         }
-        ArithAst::Index { var, key } => format!("${var}[{}]", arith_to_fish(key)),
+        // Arrays are flattened into per-element scalars `a_0 a_1 …`, so the
+        // subscript selects the scalar directly. bash's `${a}[1]` is wrong
+        // here: `$a` expands to the whole list and `[1]` indexes into the
+        // NAMES (`a_1`), reading the string where the number was expected —
+        // `$(( a[1] + 1 ))` on `a=(10 20 30)` came out 1, not 21.
+        //
+        // A literal subscript splices straight into the element name and is
+        // read as a plain `$a_1` — the text lands inside the caller's
+        // `math "…"` string, so it must not add its own quotes (fish rejects
+        // both `${a_1}`, "variables cannot be bracketed", and a nested
+        // `"…"` string).
+        //
+        // A computed key (`a[i]` with a non-literal `i`) is fish's own
+        // concatenation indirection: `$a_$i` is TWO adjacent expansions, so
+        // fish joins the flat element name at runtime and looks it up. This
+        // survives the trip through the enclosing `math "…"` string — it
+        // adds no quotes and is not a function call.
+        //
+        // The two rejected alternatives, both verified against fish:
+        // `${a_$i}` → "variables cannot be bracketed" (fish expands $i
+        // before the name is assembled, then refuses the bracket form), and
+        // a nested `$(eval …)` → `math: Unknown function` (the inner text is
+        // parsed as a math call, not as a value).
+        ArithAst::Index { var, key } => {
+            let base = arr_base(var);
+            if let ArithAst::Num(n) = &**key {
+                return format!("${base}_{n}");
+            }
+            format!("{base}_{}", arith_to_fish(key))
+        }
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
             if op == "**" {
@@ -5243,16 +5362,22 @@ fn arith_to_fish(a: &ArithAst) -> String {
             format!("${var} {op} {}", arith_to_fish(rhs))
         }
         ArithAst::IncDec { var, delta, prefix } => {
-            // fish's `math` has no ++/-- (`math "$i++"` is "Too few
-            // arguments") and no assignment (`math "$i = $i+1"` is rejected
-            // as a logical op), so the increment is spelled at the ASSIGNMENT
-            // site instead: this arm keeps only the expression VALUE
-            // (prefix = new value, postfix = old value).
+            // fish's `math` has no ++/-- and no assignment, so the increment
+            // is spelled out. When the value is USED (`echo $((x++))`) the
+            // expression must both yield the old/new value AND mutate x, so
+            // it becomes a command substitution: save the value, apply the
+            // delta, echo the saved one. `set -g` is required — a bare `set`
+            // inside `(...)` writes the substitution's own scope and the
+            // mutation is lost.
+            //
+            // The bare `((x++))` STATEMENT is handled by assign_to_fish, which
+            // discards the value and needs no substitution.
             let inc = if *delta > 0 { 1 } else { -1 };
+            let v = format!("{var}__sh2v");
             if *prefix {
-                format!("(${var} {inc})")
+                format!("(set -g {v} (math \"${var} + {inc}\"); set -g {var} ${v}; echo ${v})")
             } else {
-                format!("(${var} - {inc})")
+                format!("(set -g {v} ${var}; set -g {var} (math \"${var} + {inc}\"); echo ${v})")
             }
         }
         // C-frontend nodes (never emitted by the shell path): sizeof is a
@@ -5641,9 +5766,11 @@ mod tests {
     /// (triage-sh-20260814-032146): Assign with a single target whose
     /// expr is an Arith IncDec on the SAME var (the estree renderer
     /// emits the IncDec bare). The statement's value is discarded, so
-    /// the sh renderer lowers it to `: $((x++))` — the `:` swallows the
-    /// expansion result (a bare `$((...))` line would try to RUN the
-    /// value as a command: "1: not found").
+    /// the renderer must APPLY the increment and swallow the expansion
+    /// result. In fish the arith form is `math`, not `$(( ))`: the bare
+    /// `begin; set x (math "$x + 1"); end` is the correct native lowering
+    /// (a bare `$((...))` line would try to RUN the value as a command,
+    /// "1: not found", and fish has no `$(( ))` at all).
     #[test]
     fn incdec_assign_emits_colon_arith() {
         let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[{"name":"x","type":"Int"}],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
@@ -5653,14 +5780,20 @@ mod tests {
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t29 A1 ingress");
         let sh = shir_to_fish(&prog).expect("t29 A1 render");
-        // arith_to_fish renders the postfix IncDec as `((x = x + 1) - 1)`
-        // (the old value, with the increment applied); the statement
-        // form must wrap it in `: $(( ... ))` — never a bare `$((...))`
-        // line (that would RUN the value as a command) and never an
-        // `x=$((x++))` assign (that would clobber the side effect).
+        // fish's arith is `math`, and a command-substitution `( ... )` is
+        // NOT allowed as an assignment target — the increment must land as
+        // a `set x (math ...)` inside a block, with no `$(( ))` anywhere.
         assert!(
-            sh.contains(": $((((x = x + 1) - 1)))"),
-            "IncDec statement: {sh}"
+            sh.contains("set x (math \"$x + 1\")"),
+            "IncDec statement must lower to fish math: {sh}"
+        );
+        // The generated BODY must carry no bash arithmetic. The prologue
+        // comment legitimately spells the construct it avoided ("no $(( ))"),
+        // so scan only the code, past the header.
+        let body = sh.split_once("\nset x").map_or(sh.as_str(), |(_, b)| b);
+        assert!(
+            !body.contains("$(("),
+            "no bash arithmetic may leak into the fish body: {sh}"
         );
     }
 }
