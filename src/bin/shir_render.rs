@@ -58,12 +58,12 @@ fn main() {
         "py" | "python" => "python",
         "rs" | "rust" => "rust",
         "glslv" => "glslv",
-        "c" | "go" | "sh" | "java" | "zig" | "glsl" | "lint" | "shir" => {
+        "c" | "go" | "sh" | "java" | "zig" | "glsl" | "lint" | "shir" | "zsh" => {
             target.as_str()
         }
         other => {
             eprintln!(
-                "shir_render: unknown target '{other}' (known: estree pl c go py sh java rs zig glsl glslv lint shir)"
+                "shir_render: unknown target '{other}' (known: estree pl c go py sh java rs zig glsl glslv lint shir zsh)"
             );
             std::process::exit(3);
         }
@@ -119,6 +119,13 @@ fn main() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("shir_render: sh: {e}");
+                std::process::exit(1);
+            }
+        },
+        "zsh" => match debashl::zsh_backend::shir_to_zsh(&prog) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("shir_render: zsh: {e}");
                 std::process::exit(1);
             }
         },

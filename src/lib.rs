@@ -65,6 +65,7 @@ pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;
 pub mod zig_backend;
+pub mod zsh_backend; // worktree-local: zsh renderer (branch backend/zsh)
 pub mod lint_backend; // lint/diagnostic backend (renders analysis verdicts, not code)
 // Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
 #[cfg(not(target_os = "wasi"))]
