@@ -2316,10 +2316,14 @@ impl Render {
                 }
             }
             IrExpr::Call { func, args } if func == "exec" => {
-                let (cmd, argv) = self.exec_text(args)?;
-                let mut parts = vec![quote_sh(&cmd)];
-                for a in argv {
-                    parts.push(quote_sh(&a));
+                let cmd_expr = args.first()?;
+                let cmd = self.cmd_text_expr(cmd_expr)?;
+                let mut parts = vec![cmd_quote(cmd_expr, &cmd)];
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        let text = self.cmd_text_expr(it)?;
+                        parts.push(cmd_quote(it, &text));
+                    }
                 }
                 Some(parts.join(" "))
             }
@@ -3954,7 +3958,7 @@ impl Render {
                             let env = self.env_lit();
                             self.emit(&format!(
                                 "st = redirRun(\"source {}\", {env});",
-                                quote_sh(&t)
+                                cmd_quote(p, &t)
                             ));
                             self.need_st = true;
                         }
@@ -3973,7 +3977,7 @@ impl Render {
                 let mut ok = true;
                 for a in argv {
                     match self.cmd_text_expr(a) {
-                        Some(t) => parts.push(quote_sh(&t)),
+                        Some(t) => parts.push(cmd_quote(a, &t)),
                         None => {
                             ok = false;
                             break;
@@ -5452,6 +5456,34 @@ fn extglob_not(s: &str) -> Option<(String, String)> {
 
 fn quote_sh(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Double-quote a shell word, preserving `${...}`, `$name`, `$((…))` and
+/// `$(...)` for bash expansion inside a `bash -c` fallback.
+fn quote_sh_dq(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push('$'),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Pick the right quoting for a cmd_text argument: single-quote plain
+/// literal strings, double-quote everything else (variable refs, arithmetic,
+/// interpolations) so bash expands them inside `redirRun`/`capRun`.
+fn cmd_quote(expr: &IrExpr, text: &str) -> String {
+    if matches!(expr, IrExpr::Str(_, _)) {
+        quote_sh(text)
+    } else {
+        quote_sh_dq(text)
+    }
 }
 
 /// Pre-scan for runtime flags that must be known before the body renders.

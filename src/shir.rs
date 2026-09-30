@@ -651,7 +651,12 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
                 };
             }
             ArithAst::Var(n) => {
-                if slot_var_index(n).is_none() {
+                // A `${#name[@]}` / `${#name}` length placeholder is already
+                // runtime-exact AND decodes back to the arrayLen/getVar().length
+                // leaf in arith_to_estree — leaving it raw lets that decode
+                // fire; wrapping it instead renders the placeholder NAME as a
+                // store read of an unset variable (reads 0).
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -662,7 +667,7 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
             // a non-slot Var (the A1 export only emits Ident for lifted
             // vars, and a lifted var is never slot-homed).
             ArithAst::Ident(n) => {
-                if slot_var_index(n).is_none() {
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -19264,6 +19269,7 @@ fn arith_var_read(name: &str) -> Expr {
 fn arith_bigint_safe_operand(a: &ArithAst) -> Expr {
     if let ArithAst::Var(name) = a {
         if slot_var_index(name).is_none()
+            && arith_len_leaf(name).is_none()
             && !matches!(var_type_of(name), Some(IrType::Int64 | IrType::UInt64))
         {
             // Exact BigInt read. A lifted-num var is included too: in a
@@ -19707,6 +19713,12 @@ fn in_dual_wide_arm() -> bool {
 /// int64 wrap contexts are excluded: C-typed (`var_type_of`), --true64,
 /// slots, and the dual-loop wide arm (which must stay mod-2^64-exact).
 fn exact_bigint_var_read(n: &str) -> bool {
+    // `${#x[@]}` / `${#x}` length placeholders are their own runtime-exact
+    // leaf (arith_len_leaf decodes them in arith_to_estree) — never read the
+    // placeholder NAME as a store variable.
+    if arith_len_leaf(n).is_some() {
+        return false;
+    }
     if in_dual_wide_arm() {
         return false;
     }
@@ -57023,6 +57035,41 @@ mod const_analysis_tests {
         // the conservative verdict)
         let v = consts_of("if true; then y=5; fi\necho $y");
         assert_eq!(kind(&v, "y"), Some(crate::ir::VarKind::Const));
+    }
+}
+
+#[cfg(test)]
+mod arith_len_placeholder_tests {
+    use super::*;
+
+    /// `${#arr[@]}` / `${#arr}` inside an arith text is stripped by
+    /// [`native_arith_text_len`] to the self-describing placeholder
+    /// `__sh2lena_arr` / `__sh2lens_arr`, which the emitter must ALWAYS
+    /// decode back to the runtime-exact `arrayLen` / `getVar().length` leaf.
+    ///
+    /// Regression (063_hard_to_parse.sh): when a true64 SLOT-homed index var
+    /// shared the arith tree, the wrapper wrapped the placeholder in a
+    /// `Cast(Int64, …)` and [`arith_bigint_safe_operand`] rendered the
+    /// placeholder NAME as a plain store read — a variable nothing ever sets,
+    /// so `${#args[@]}` read 0 and the loop never ran (`Processed 0 options`).
+    #[test]
+    fn length_placeholder_is_never_read_as_a_raw_store_var() {
+        assert!(arith_len_leaf("__sh2lena_arr").is_some());
+        assert!(arith_len_leaf("__sh2lens_s").is_some());
+        // The exact-BigInt shortcut must decline a placeholder (a placeholder
+        // name is not a variable), so the read falls through to the decode.
+        assert!(!exact_bigint_var_read("__sh2lena_arr"));
+        assert!(!exact_bigint_var_read("__sh2lens_s"));
+
+        let js = serde_json::to_string(&arith_bigint_safe_operand(&ArithAst::Var(
+            "__sh2lena_arr".to_string(),
+        )))
+        .unwrap();
+        assert!(js.contains("arrayLen"), "length ref not decoded: {js}");
+        assert!(
+            !js.contains("__sh2lena_arr"),
+            "raw length placeholder leaked into the emit: {js}"
+        );
     }
 }
 

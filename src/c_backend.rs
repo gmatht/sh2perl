@@ -7311,6 +7311,22 @@ impl Render {
             "fgets", "fread", "fwrite", "fscanf", "sscanf", "strftime", "localtime",
             "gmtime", "ctime", "asctime", "difftime", "mktime", "clock", "time",
             "nanosleep", "usleep", "alarm", "pause", "kill", "raise", "sigaction",
+            // rand/srand, and the random() family. A shell function
+            // NAMED rand is not rare — MIMEcroft has one (www/bin/
+            // mimecroft.sh:329, `rand() { seed = ...; }`) — and the
+            // emitted `static void rand(void)` collided with libc's
+            // `int rand(void)` at file scope:
+            //
+            //     error: conflicting types for 'rand'; have 'void(void)'
+            //
+            // which stopped the WHOLE 4976-line game from compiling,
+            // at 94 minutes into a build, with an error that names a
+            // libc function and says nothing about the shell function
+            // that caused it. The list above is the same idea for the
+            // rest of libc, and rand was the one name this project's
+            // own flagship program happens to use.
+            "rand", "srand", "random", "srandom", "initstate", "setstate",
+            "arc4random", "drand48", "srand48", "lrand48", "mrand48",
         ];
         if C_KEYWORDS.contains(&name) {
             format!("{name}_")
