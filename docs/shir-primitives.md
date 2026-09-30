@@ -660,3 +660,97 @@ byte-exact:
   `emit=true`; `$(...)` capture bodies keep the original command (the
   capture collects stdout — reducing the body to a bare value would break
   it). Verified over the corpus: no Ext node appears inside a Capture.
+## As-built: the NODE-side manifest (who may be handed a rich node)
+
+The `Capabilities`/`plan()` solver above answers *"which composition may
+`wc -l` become for this backend?"*. The complementary question — *"may the
+core hand this backend a rich Ext node AT ALL?"* — is
+`planner::node_manifest(target)` in `src/transforms/planner.rs`, and it is
+what `transforms::transform_applies("text-ops")` now consults (via
+`emits_renderable_nodes`).
+
+**Why it is a separate table.** `text_ops` REPLACES a shell command with an
+Ext node. Where the backend renders that node, the replacement is a win;
+where it cannot, the replacement is a REGRESSION — the command was already
+exact, and the node becomes a `sh2.*` stub or a hard renderer error. The
+gate therefore has to be per-target, and it has to be checked BEFORE the
+rewrite.
+
+**Measured (2026-09-24, before the renderer work).** Isolating each Ext node
+`text-ops` emits and rendering a minimal `Output(value=<node>)` program per
+target:
+
+| node | perl | js | go | c | rust | zig | java | python | sh |
+|---|---|---|---|---|---|---|---|---|---|
+| StrLen / WordCount | ✓ | ✓ | ✓ | ✓ | TODO | ✗ | ERR | TODO | ERR |
+| CaseTransform | ✓ | ✓ | ✓ | TODO | TODO | ✗ | ERR | TODO | ERR |
+| CharTranslate | ✓ | ✓ | ✓ | TODO | TODO | TODO | ERR | TODO | ERR |
+| FieldExtract | ✓ | ✓ | ✓ | TODO | ✓ | ✗ | ERR | TODO | ERR |
+| RegSub | ✓ | ✓ | ✓ | TODO | TODO | ✗ | ERR | TODO | ERR |
+| PathName | ✓ | ✓ | ✓ | TODO | TODO | TODO | ERR | TODO | ERR |
+| SubStrExtract | ✓ | ✓ | ✓ | TODO | TODO | ✗ | ERR | TODO | ERR |
+| TakeLines | ✓ | ✓ | ✓ | TODO | TODO | ✗ | ERR | TODO | ERR |
+
+`ERR` = the renderer refuses the whole file (`Err(..)`); `TODO` = a
+`TODO(unsupported)` marker; `✗` = an `sh2.*` runtime stub. Python rendered
+**zero** nodes natively; java and sh refused **every** one.
+
+**After (same measurement).** python 21/22, java 21/22 (plus a 6-helper Java
+preamble), and the shared registry carries the semantics once for every
+backend through the `ChildExprRenderer` hook. The `sh`-class targets keep
+the original command via the gate — which is the point: the ORIGINAL
+COMMAND is the right answer for a shell target, and it is byte-exact.
+
+**The table cannot drift.** `cargo test --lib transforms::planner` asserts
+every node in `node_manifest(target)` (a) has a handler file whose name is
+`snake(node)` (the exact lookup `build.rs` uses for the dispatch) and (b) is
+a declared `shir_nodes/*.node` type. A backend whose renderer regresses to a
+stub must therefore have its manifest entry removed in the same change, or
+the test fails.
+
+**Adding a backend** stays a text-file-shaped change: implement the handler
+arms in `render_ext_expr/handlers/` (or wire `render_with` from the
+backend's own `IrExpr::Ext` arm), then list the nodes it now renders in
+`node_manifest`. Nothing else in the core moves.
+
+### The child-renderer hook (how one handler serves every backend)
+
+A shared handler has to build an expression in the TARGET language, and it
+cannot call that backend's own `expr()` — it does not know the renderer.
+`ExprRenderCtx` carries it:
+
+```rust
+pub(crate) trait ChildExprRenderer {
+    fn render_child(&mut self, e: &IrExpr) -> Option<String>;
+}
+```
+
+A backend implements the trait for a thin wrapper over its renderer and
+calls `render_ext_expr::render_with(node, Backend::X, 0, &mut child)`; a
+handler reaches it with `ctx.child(&expr)?`. `None` means "this backend
+cannot render that child" — the handler MUST then return `None`, so the
+caller keeps its `sh2.*` stub or loud refusal rather than emitting a
+half-built expression. `render_ext_expr` keeps its `&ExprRenderCtx`
+signature (the child lives behind a `RefCell`), so the ~25 existing call
+sites are untouched.
+
+Perl predates the hook: `ir_expr_to_perl` is a free function, so the
+`Backend::Perl` arms call it directly and the registry's Perl entry point
+registers no child renderer.
+
+### Latent bugs the verification surfaced (all fixed)
+
+A targeted cross-target verifier (render, execute, diff against `bash`)
+found five bugs that no corpus gate could see, because `text_ops` is
+opt-in:
+
+1. perl `tr SET1 SET2` emitted only THREE slashes (`tr/a/b;`) — a perl
+   SYNTAX error on every plain translate.
+2. perl `tr -d` / `tr -s` built the set through a VARIABLE
+   (`tr/$f//d`); perl does not interpolate `tr` sets, so this
+   transliterated the literal characters `$`, `f`, `/`.
+3. java `shBasename("/")` returned `""` (bash: `/`).
+4. java `shDirname("a/b/")` returned `a/b` (bash: `a`).
+5. the `substr_extract` handler file never matched
+   `snake("SubStrExtract")` = `sub_str_extract`, so that handler had NEVER
+   been dispatched (renamed; `build.rs`'s warning was the only signal).

@@ -12,7 +12,7 @@ pub(crate) fn render(node: &CutsetTrim) -> Option<Expr> {
     let ident = |n: &str| Expr::Identifier {
         name: n.to_string(),
     };
-    let num = |v: i64| Expr::Literal {
+    let num = |v| Expr::Literal {
         value: serde_json::Value::from(v),
         raw: None,
         regex: None,

@@ -392,7 +392,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Handle backtick command substitution first
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
         if crate::debug::is_debug_enabled() {
-            pdebug!("DEBUG: Found backtick in parse_word");
+            eprintln!("DEBUG: Found backtick in parse_word");
         }
         lexer.next(); // consume the opening backtick
         let mut cmd_content = String::new();
@@ -411,18 +411,18 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
         }
         if crate::debug::is_debug_enabled() {
-            pdebug!("DEBUG: Backtick content: '{}'", cmd_content);
+            eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
         }
         // Parse the command content
         match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
             Ok(command) => {
                 if crate::debug::is_debug_enabled() {
-                    pdebug!("DEBUG: Successfully parsed backtick command: {:?}", command);
+                    eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
                 }
                 return Ok(Word::CommandSubstitution(Box::new(command), None));
             }
             Err(e) => {
-                pdebug!(
+                eprintln!(
                     "DEBUG: Failed to parse backtick command '{}': {:?}",
                     cmd_content, e
                 );
@@ -2346,7 +2346,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 }
             }
 
-            pdebug!(
+            eprintln!(
                 "DEBUG parse_variable_expansion: braced_content='{}'",
                 braced_content
             );
@@ -2403,7 +2403,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     None,
                 ));
             } else if braced_content.contains(":-") {
-                pdebug!(
+                eprintln!(
                     "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
                     braced_content
                 );
@@ -3065,10 +3065,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         }
         Some(Token::DollarBraceAt) => {
             lexer.next();
-            pdebug!("DEBUG DollarBraceAt: peek={:?}", lexer.peek());
+            eprintln!("DEBUG DollarBraceAt: peek={:?}", lexer.peek());
             if matches!(lexer.peek(), Some(Token::BraceClose)) {
                 lexer.next();
-                pdebug!("DEBUG DollarBraceAt: just @");
+                eprintln!("DEBUG DollarBraceAt: just @");
                 Ok(Word::Variable("@".to_string(), true, None))
             } else {
                 // ${@...} with additional operators — build content and analyze
@@ -3350,7 +3350,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let content = unescape_interpolation_content(content);
 
     if crate::debug::is_debug_enabled() {
-        pdebug!(
+        eprintln!(
             "DEBUG parse_string_interpolation: content len={}, content={:?}",
             content.len(),
             &content[..content.len().min(80)]
@@ -3499,7 +3499,7 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                 let mut sub_parser = Parser::new_with_lexer(sub_lexer);
                 match sub_parser.parse() {
                     Ok(commands) => {
-                        pdebug!(
+                        eprintln!(
                             "DEBUG: String interpolation parsed command '{}' as {} commands",
                             cmd_content,
                             commands.len()
@@ -3527,7 +3527,7 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                         }
                     }
                     Err(e) => {
-                        pdebug!(
+                        eprintln!(
                             "DEBUG: String interpolation failed to parse command '{}': {:?}",
                             cmd_content, e
                         );
@@ -3800,12 +3800,12 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
                     if crate::debug::is_debug_enabled() {
-                        pdebug!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
+                        eprintln!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
                     }
                     if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content)
                     {
                         if crate::debug::is_debug_enabled() {
-                            pdebug!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
+                            eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
                         }
                         if cmds.is_empty() {
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
@@ -3821,19 +3821,19 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                         }
                     } else {
                         if crate::debug::is_debug_enabled() {
-                            pdebug!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
+                            eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
                         }
                         // Fallback: try the old pipeline-based parser
                         if let Ok(cmd) =
                             crate::parser::commands::parse_pipeline_from_text(cmd_content)
                         {
                             if crate::debug::is_debug_enabled() {
-                                pdebug!("DEBUG parse_string_interpolation: pipeline parser OK");
+                                eprintln!("DEBUG parse_string_interpolation: pipeline parser OK");
                             }
                             parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                         } else {
                             if crate::debug::is_debug_enabled() {
-                                pdebug!("DEBUG parse_string_interpolation: both parsers failed, using literal");
+                                eprintln!("DEBUG parse_string_interpolation: both parsers failed, using literal");
                             }
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
                         }
@@ -4763,39 +4763,20 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     }
     lexer.next(); // consume '{'
 
-    // `items` holds the COMMA-SEPARATED ALTERNATIVES of this brace level.
-    // `part` accumulates the parts of the CURRENT alternative: literal
-    // text, nested braces, ranges. A comma ends the current alternative
-    // (`part`), and each non-empty part is appended as one alternate —
-    // a single element as-is, several as a Compound (a cartesian
-    // concatenation). Without this grouping, `a{x/{p,q},y}z` flattened
-    // to the siblings `x/`, `{p,q}`, `y` and lost the nesting.
     let mut items: Vec<BraceItem> = Vec::new();
-    let mut part: Vec<BraceItem> = Vec::new();
 
-    // Accumulator for consecutive literal text within one alternative.
-    // In a brace expansion like {file.txt,file.bak}, the text between
-    // commas can consist of multiple tokens (Identifier, Dot,
-    // Identifier, ...) that merge into a single BraceItem::Literal.
+    // Accumulator for consecutive literal text between commas.
+    // In a brace expansion like {file.txt,file.bak}, the items between commas
+    // can consist of multiple tokens (Identifier, Dot, Identifier, etc.) that
+    // should be merged into a single BraceItem::Literal.
     let mut acc: Option<String> = None;
 
-    /// Flush the literal accumulator into the current alternative.
-    fn flush_acc(part: &mut Vec<BraceItem>, acc: &mut Option<String>) {
+    /// Helper: flush the accumulator as a BraceItem::Literal.
+    fn flush_acc(items: &mut Vec<BraceItem>, acc: &mut Option<String>) {
         if let Some(text) = acc.take() {
             if !text.is_empty() {
-                part.push(BraceItem::Literal(text));
+                items.push(BraceItem::Literal(text));
             }
-        }
-    }
-
-    /// End the current alternative: a one-part alternative stays that
-    /// part, a multi-part one becomes a Compound (its cartesian product
-    /// is the alternative's expansion).
-    fn flush_alt(items: &mut Vec<BraceItem>, part: &mut Vec<BraceItem>) {
-        match part.len() {
-            0 => {}
-            1 => items.push(part.pop().unwrap()),
-            _ => items.push(BraceItem::Compound(std::mem::take(part))),
         }
     }
 
@@ -4803,8 +4784,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     loop {
         match lexer.peek() {
             Some(Token::BraceClose) => {
-                flush_acc(&mut part, &mut acc);
-                flush_alt(&mut items, &mut part);
+                flush_acc(&mut items, &mut acc);
                 lexer.next(); // consume '}'
                 break;
             }
@@ -4813,7 +4793,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut part, &mut acc);
+                    flush_acc(&mut items, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
@@ -4825,7 +4805,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                part.push(BraceItem::Range(BraceRange {
+                                items.push(BraceItem::Range(BraceRange {
                                     start,
                                     end,
                                     step: Some(step),
@@ -4838,7 +4818,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            part.push(BraceItem::Range(BraceRange {
+                            items.push(BraceItem::Range(BraceRange {
                                 start,
                                 end,
                                 step: None,
@@ -4861,7 +4841,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut part, &mut acc);
+                    flush_acc(&mut items, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Identifier) = lexer.peek() {
@@ -4873,7 +4853,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                part.push(BraceItem::Range(BraceRange {
+                                items.push(BraceItem::Range(BraceRange {
                                     start: text,
                                     end,
                                     step: Some(step),
@@ -4887,7 +4867,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            part.push(BraceItem::Range(BraceRange {
+                            items.push(BraceItem::Range(BraceRange {
                                 start: text,
                                 end,
                                 step: None,
@@ -4906,10 +4886,10 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::BraceOpen) => {
-                flush_acc(&mut part, &mut acc);
+                flush_acc(&mut items, &mut acc);
                 let nested = parse_brace_expansion(lexer)?;
                 if let Word::BraceExpansion(be, _) = nested {
-                    part.push(BraceItem::Nested(Box::new(be)));
+                    items.push(BraceItem::Nested(Box::new(be)));
                 } else {
                     return Err(ParserError::InvalidSyntax(
                         "Expected brace expansion from nested brace".to_string(),
@@ -4917,11 +4897,8 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::Comma) => {
-                // Comma ends the current alternative: its parts form one
-                // expanded value (Compound when >1), and the next
-                // alternative starts empty.
-                flush_acc(&mut part, &mut acc);
-                flush_alt(&mut items, &mut part);
+                // Comma terminates the current accumulated item.
+                flush_acc(&mut items, &mut acc);
                 lexer.next(); // consume ','
             }
             Some(
@@ -4956,7 +4933,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 acc.get_or_insert_with(String::new).push_str(&text);
             }
             None => {
-                flush_acc(&mut part, &mut acc);
+                flush_acc(&mut items, &mut acc);
                 break;
             }
             _ => {
@@ -4965,26 +4942,24 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     acc.get_or_insert_with(String::new).push_str(&text);
                     lexer.next();
                 } else {
-                    flush_acc(&mut part, &mut acc);
+                    flush_acc(&mut items, &mut acc);
                     break;
                 }
             }
         }
     }
 
-    // Flush any remaining accumulated text and the final alternative.
-    flush_acc(&mut part, &mut acc);
-    flush_alt(&mut items, &mut part);
+    // Flush any remaining accumulated text
+    flush_acc(&mut items, &mut acc);
 
     // bash: a RANGE is only expanded when it is the ENTIRE brace content
     // (`{1..5}` → 1..5). A brace with a top-level comma (`{1..3,7..9}`)
     // expands as ALTERNATION OF LITERALS — each part stays the literal
     // text `1..3` / `7..9` (bash prints "1..3 7..9", never 1 2 3 7 8 9).
-    // A range nested inside a Compound alternative (`{x{1..3},y}`) stays
-    // literal for the same reason.
     if items.len() > 1 {
-        fn as_literal(it: BraceItem) -> BraceItem {
-            match it {
+        items = items
+            .into_iter()
+            .map(|it| match it {
                 BraceItem::Range(r) => {
                     let mut text = format!("{}..{}", r.start, r.end);
                     if let Some(st) = r.step {
@@ -4993,15 +4968,6 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     BraceItem::Literal(text)
                 }
                 other => other,
-            }
-        }
-        items = items
-            .into_iter()
-            .map(|it| match it {
-                BraceItem::Compound(parts) => {
-                    BraceItem::Compound(parts.into_iter().map(as_literal).collect())
-                }
-                other => as_literal(other),
             })
             .collect();
     }

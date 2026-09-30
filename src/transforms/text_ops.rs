@@ -1965,7 +1965,7 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
     let unit = &fmt[..fmt.len() - suffix.len()];
     if unit.contains('%') { return None; } // other conversions — bail
 
-    let mut total: i64 = 0;
+    let mut total = 0;
     for a in &args[1..] {
         match a {
             IrExpr::Str(..) => total += 1,
@@ -1980,7 +1980,7 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
                 if group.len() != 1 { return None; }
                 let spec = group[0].get("range")?.as_array()?;
                 if spec.len() < 2 { return None; }
-                let s: i64 = spec[0].as_str()?.parse().ok()?;
+                let s = spec[0].as_str()?.parse().ok()?;
                 let e: i64 = spec[1].as_str()?.parse().ok()?;
                 if !spec.get(2)?.is_null() { return None; } // step unsupported
                 if e >= s { total += e - s + 1; }

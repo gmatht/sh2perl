@@ -58,6 +58,10 @@ pub enum Sigil {
 pub enum IrType {
     Int,
     Str,
+    /// String known to contain only ASCII bytes. Additive: backends that
+    /// ignore the annotation treat it as Str. Allows byte-indexed slicing
+    /// (`&s[n..m]`) instead of the Unicode-safe `chars().skip().take()`.
+    AsciiStr,
     Any,
     /// IEEE-754 bit width (32 = float, 64 = double). Serialized as
     /// `{"kind": "Float", "width": 64}` so the width survives the A1
@@ -101,10 +105,15 @@ impl serde::Serialize for IrType {
                 st.serialize_field("width", w)?;
                 st.end()
             }
-            // Sized C ints serialize as {"kind": "Int32"} etc.
-            IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64 => {
+            // AsciiStr and sized C ints serialize as {"kind": "…"}.
+            IrType::AsciiStr
+            | IrType::Int32
+            | IrType::Int64
+            | IrType::UInt32
+            | IrType::UInt64 => {
                 use serde::ser::SerializeStruct;
                 let kind = match self {
+                    IrType::AsciiStr => "AsciiStr",
                     IrType::Int32 => "Int32",
                     IrType::Int64 => "Int64",
                     IrType::UInt32 => "UInt32",
@@ -158,6 +167,7 @@ impl<'de> serde::Deserialize<'de> for IrType {
                             "expected {\"kind\":\"Float\",\"width\":N}",
                         )),
                     },
+                    Some("AsciiStr") => Ok(IrType::AsciiStr),
                     Some("Int32") => Ok(IrType::Int32),
                     Some("Int64") => Ok(IrType::Int64),
                     Some("UInt32") => Ok(IrType::UInt32),
@@ -1300,6 +1310,9 @@ fn first_code_newline(s: &str) -> Option<usize> {
     }
     if needs_hostname {
         out.push_str("$ENV{HOSTNAME} //= hostname();\n");
+    }
+    if prog.var_bash_env.iter().any(|n| n == "BASH_VERSION") || body.contains("$ENV{BASH_VERSION}") {
+        out.push_str("$ENV{BASH_VERSION} //= do { my $v = `bash -c 'echo \\$BASH_VERSION'`; chomp $v; $v };\n");
     }
     // Blank line after imports block (only if there are imports)
     if !imports.is_empty() {
@@ -2707,13 +2720,19 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 if let Some(embedded) = try_embed_newline_in_string_literal(&expr) {
                     emit_indent(out, indent);
                     out.push_str(&embedded);
+                    emit_indent(out, indent);
+                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
                 } else {
                     emit_indent(out, indent);
                     out.push_str(&format!("print({}, \"\\n\");\n", expr));
+                    emit_indent(out, indent);
+                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
                 }
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("print({});\n", expr));
+                emit_indent(out, indent);
+                out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
             }
         }
 
@@ -3107,6 +3126,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             else_,
         } => {
             let cond_str = ir_expr_to_perl(cond);
+            // If the condition was derived from a shell test command by
+            // native_if_test_cond (indicated by IrExpr::Str), set
+            // $CHILD_ERROR so $? reflects the test result for subsequent
+            // commands that read $? (e.g. `[ "$?" = "0" ]` after a loop).
+            if matches!(cond, IrExpr::Str(_, _)) {
+                emit_indent(out, indent);
+                out.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", cond_str));
+            }
             emit_indent(out, indent);
             out.push_str(&format!("if ({}) {{\n", cond_str));
             for s in then {
@@ -3126,6 +3153,15 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 for s in else_ {
                     emit_stmt(out, s, indent + 1);
                 }
+            } else if matches!(cond, IrExpr::Str(_, _)) {
+                // bash: an `if` statement with no else returns 0 even when
+                // the test condition is false. Without this the
+                // `$CHILD_ERROR = (...) ? 0 : 1` above would leak a non-zero
+                // status into the parent context (e.g. interactive-test-minus-t).
+                emit_indent(out, indent);
+                out.push_str("} else {\n");
+                emit_indent(out, indent + 1);
+                out.push_str("$CHILD_ERROR = 0;\n");
             }
             emit_indent(out, indent);
             out.push_str("}\n");
@@ -3619,6 +3655,7 @@ fn var_read(name: &str) -> String {
     }
     match name {
         "#" => "$__argc".to_string(),
+        "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
         "?" => "$CHILD_ERROR".to_string(),
         "@" => "@ARGV".to_string(),
         // `$*` is the positional params joined by the first IFS char (space
@@ -4358,20 +4395,27 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                             .map(|w| render_word(w))
                             .unwrap_or_else(|| "$ENV{HOME}".to_string());
                         return match op {
-                            BinOpKind::Or => {
-                                let code = if let IrExpr::Call { func: f, args: a2 } = rhs.as_ref()
-                                {
+                             BinOpKind::Or => {
+                                // `cd D || exit N` — the common "exit on cd
+                                // failure" pattern: render as a direct Perl
+                                // `or exit N`.
+                                if let IrExpr::Call { func: f, args: a2 } = rhs.as_ref() {
                                     if f == "exit" {
-                                        a2.first()
+                                        let code = a2
+                                            .first()
                                             .map(|w| render_word(w))
-                                            .unwrap_or_else(|| "1".to_string())
-                                    } else {
-                                        "1".to_string()
+                                            .unwrap_or_else(|| "1".to_string());
+                                        return Some(format!("chdir({}) or exit {};", dir, code));
                                     }
-                                } else {
-                                    "1".to_string()
-                                };
-                                Some(format!("chdir({}) or exit {};", dir, code))
+                                }
+                                // `cd D || <anything else>` — bash runs <rhs>
+                                // when cd fails (e.g. `cd /bad || echo fallback`).
+                                // Render the RHS as a Perl statement inside a
+                                // `do { }` block so its side-effects + exit status
+                                // update $CHILD_ERROR for follow-up `$?`.
+                                let mut rhs_str = String::new();
+                                emit_stmt(&mut rhs_str, &IrStmt::Expr((**rhs).clone()), 0);
+                                Some(format!("chdir({}) or do {{ {} }};", dir, rhs_str.trim_end()))
                             }
                             BinOpKind::And => {
                                 let tail = expr_to_cmd(rhs);
@@ -8926,10 +8970,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
         IrExpr::Ext(n) => {
             // Transform-declared expression node — drop-in handler dispatch.
-            let ctx = crate::render_ext_expr::ExprRenderCtx {
-                backend: crate::render_ext_expr::Backend::Perl,
-                indent: 0,
-            };
+            let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                crate::render_ext_expr::Backend::Perl,
+                0,
+            );
             if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                 code
             } else {

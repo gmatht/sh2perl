@@ -89,7 +89,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     let contract_version = obj
         .get("contract_version")
         .and_then(|x| x.as_u64())
-        .ok_or_else(|| "Program: missing contract_version (plan §2.1)".to_string())?;
+        .ok_or_else(|| "Program: missing contract_version (plan §2.1)")?;
     if contract_version as u32 != super::shir_json::CONTRACT_VERSION {
         return Err(format!(
             "Program: contract_version {} != core {}",
@@ -215,6 +215,7 @@ pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
                     Some(w) if w <= 255 => Ok(IrType::Float(w as u8)),
                     _ => Err(format!("{where_}: expected {{{{kind: Float, width: N}}}}")),
                 },
+                Some("AsciiStr") => Ok(IrType::AsciiStr),
                 Some("Int32") => Ok(IrType::Int32),
                 Some("Int64") => Ok(IrType::Int64),
                 Some("UInt32") => Ok(IrType::UInt32),

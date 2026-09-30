@@ -1,0 +1,87 @@
+000__04h_complex_examples.sh	otranspilerl failed to generate code
+005_args.sh	otranspilerl failed to generate code
+008_simple_backup.sh	stdout mismatch
+009_arrays.sh	otranspilerl failed to generate code
+028_arrays_indexed.sh	otranspilerl failed to generate code
+029_arrays_associative.sh	otranspilerl failed to generate code
+043_home.sh	stdout mismatch
+045_shell_calling_perl.sh	stdout mismatch
+051_primes.sh	stdout mismatch
+058_advanced_bash_idioms.sh	otranspilerl failed to generate code
+062_09_complex_function.sh	stdout mismatch
+062_hard_to_lex.sh	stdout mismatch
+063_01_deeply_nested_arithmetic.sh	stdout mismatch
+063_04_complex_parameter_expansion.sh	stdout mismatch, exit code (bash=1 perl=0)
+063_05_heredoc_with_complex_content.sh	stdout mismatch
+063_09_complex_function_parameter_handling.sh	stdout mismatch
+063_11_complex_while_loop.sh	stdout mismatch
+063_12_complex_eval.sh	stdout mismatch
+063_18_complex_here_string.sh	stdout mismatch
+063_hard_to_parse.sh	stdout mismatch
+064_01_complex_nested_subshells.sh	stdout mismatch
+064_07_complex_array_operations.sh	stdout mismatch
+064_10_nested_function_definitions.sh	otranspilerl failed to generate code
+064_16_function_complex_argument_handling.sh	otranspilerl failed to generate code
+064_19_complex_pattern_matching_extended_globs.sh	otranspilerl failed to generate code
+064_20_nested_subshells_environment_variables.sh	stdout mismatch
+064_22_function_returning_complex_data_structures.sh	otranspilerl failed to generate code
+064_26_nested_brace_alternatives.sh	stdout mismatch
+064_hard_to_generate.sh	otranspilerl failed to generate code
+065_yes_head_while.sh	stdout mismatch
+070_cmp_basic.sh	stdout mismatch
+070_gnuisms_thorough.sh	otranspilerl failed to generate code
+091_while_pipe_var.sh	stdout mismatch
+096_head_procsub.sh	stdout mismatch, exit code (bash=0 perl=124)
+103_pipeline_failure_multi.sh	stdout mismatch
+arithmetic-vs-command-subshell.sh	stdout mismatch
+at-in-test.sh	otranspilerl failed to generate code
+bc-native-capture.sh	stdout mismatch
+bench-strlen.sh	otranspilerl failed to generate code
+bench-strremove.sh	otranspilerl failed to generate code
+bench-strsubst.sh	otranspilerl failed to generate code
+bench-substr.sh	otranspilerl failed to generate code
+case-pattern-paren.sh	otranspilerl failed to generate code
+dot-source-lib.sh	stdout mismatch
+dq-hashbang-multiline-assign.sh	stdout mismatch
+dqs-nested-awk-sed.sh	otranspilerl failed to generate code
+escaped-singlequote-in-doublequote.sh	otranspilerl failed to generate code
+for-loop-dollar-at.sh	otranspilerl failed to generate code
+grep_p.sh	stdout mismatch
+heredoc-binary-data.sh	stdout mismatch, exit code (bash=0 perl=4)
+heredoc-unclosed.sh	stdout mismatch
+mixed-quoting.sh	otranspilerl failed to generate code
+param-expand-hashhash.sh	otranspilerl failed to generate code
+parse-arithmetic-extra-paren.sh	stdout mismatch
+parse-at-slice-param.sh	stdout mismatch
+parse-bracket-subshell-pipe.sh	exit code (bash=1 perl=0)
+parse-dollar-brace-hash-hash.sh	otranspilerl failed to generate code
+parse-dollar-in-arithmetic.sh	stdout mismatch
+parse-dollar-paren-pipe.sh	stdout mismatch
+parse-dollar-single-quote.sh	stdout mismatch
+parse-dollars-in-string.sh	otranspilerl failed to generate code
+parse-double-semicolon-in-case.sh	otranspilerl failed to generate code
+parse-error-block-in-pipeline.sh	stdout mismatch, exit code (bash=0 perl=124)
+parse-eval-multiline.sh	stdout mismatch
+parse-for-fi-keyword.sh	otranspilerl failed to generate code
+parse-glob-question-in-arg.sh	otranspilerl failed to generate code
+parse-heredoc-dollar-paren.sh	otranspilerl failed to generate code
+parse-heredoc-tab.sh	stdout mismatch
+parse-multi-command-while-condition.sh	stdout mismatch
+parse-param-pattern-match.sh	otranspilerl failed to generate code
+parse-redirect-in-case-pattern.sh	stdout mismatch
+positional-dollar-at-params.sh	otranspilerl failed to generate code
+printf-format-and-v.sh	stdout mismatch
+process-substitution.sh	stdout mismatch
+qx-var-builtin-cd.sh	stdout mismatch
+realpath-cmdsub.sh	otranspilerl failed to generate code
+single-quote-embed-escape.sh	otranspilerl failed to generate code
+sqs-overlap-multiline-awk.sh	otranspilerl failed to generate code
+sync-direct-call-await.sh	stdout mismatch
+test-glob-rhs-fallback.sh	otranspilerl failed to generate code
+test-literal-string-compare.sh	otranspilerl failed to generate code
+tty-cmdsub.sh	otranspilerl failed to generate code
+typeset-cmdsub.sh	stdout mismatch
+utf8-non-utf8-content.sh	stdout mismatch
+variable-apostrophe-concat.sh	otranspilerl failed to generate code
+variable-default-with-hash.sh	otranspilerl failed to generate code
+variable-plus-operator.sh	stdout mismatch
