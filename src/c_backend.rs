@@ -7327,6 +7327,31 @@ impl Render {
             // own flagship program happens to use.
             "rand", "srand", "random", "srandom", "initstate", "setstate",
             "arc4random", "drand48", "srand48", "lrand48", "mrand48",
+            // `main` — the C language's OWN entry point, and the one
+            // clash in this list that is not a libc declaration. A shell
+            // function named `main` is ordinary (MIMEcroft has one:
+            // www/bin/mimecroft.sh:4392, the game's entry-point
+            // dispatcher, called at :4976), and the backend hoists shell
+            // function definitions to file scope, so it emitted
+            //
+            //     static void main(void) { ... }   <- the shell function
+            //     int main(int argc, char **argv) { ... }   <- the driver
+            //
+            // which is two definitions of `main`:
+            //
+            //     error: redefinition of 'main'
+            //     prog.c:15015: error: conflicting types for 'main';
+            //                    have 'int(int, char **)'
+            //
+            // This one is worse than the `rand` case above in two ways:
+            // it is reached on EVERY program whose script names a shell
+            // function `main`, and the name is not declared by any header,
+            // so the diagnostic points at a symbol the reader believes
+            // they own. Mangling to `main_` keeps the shell function's
+            // identity visible in the C while freeing the driver's own
+            // entry point. Call sites go through `c_ident` too, so the
+            // def, the fwd decl and every call stay consistent.
+            "main",
         ];
         if C_KEYWORDS.contains(&name) {
             format!("{name}_")
@@ -9702,8 +9727,22 @@ impl Render {
         for (idx, line) in reinit {
             self.out[idx] = line;
         }
-        for sj in drop_lines.iter().rev() {
-            self.out.remove(*sj);
+        // REMOVE HIGHEST-INDEX-FIRST, EXPLICITLY. `drop_lines` is pushed in
+        // SCAN order (by the decl index `i`), but the value pushed is the
+        // STORE index `sj`, and those two are NOT in the same order: a
+        // decl's store can sit far ahead of the next decl's store, so the
+        // vector comes out as e.g. [17, 16]. `Vec::remove` shifts every
+        // later element down, so walking it in push order (or via
+        // `.iter().rev()`, which only un-reverses the push order rather
+        // than sorting) removes index 16 first and then removes whatever
+        // slid INTO 17 — on MIMEcroft that was the `static char _sN[32];`
+        // of a num_temp whose `snprintf` use then survived, and the
+        // program stopped compiling with '_s1472 undeclared'. A sort is
+        // the only thing that makes removal order independent of scan
+        // order; `.rev()` was never that guarantee.
+        drop_lines.sort_unstable_by(|a, b| b.cmp(a));
+        for &sj in &drop_lines {
+            self.out.remove(sj);
         }
     }
 
@@ -9799,9 +9838,30 @@ impl Render {
                 i += 1;
                 continue;
             }
-            // used later? (def itself excluded by starting after i+1;
-            // the snprintf line's own mentions don't count.)
-            let used = self.out[i + 2..].iter().any(|l| {
+            // used ANYWHERE else? The decl's own two lines are excluded
+            // (the snprintf line's own mentions don't count).
+            //
+            // SCAN THE WHOLE BUFFER, NOT JUST `i+2..`. A forward-only
+            // search is wrong whenever a use lands on an EARLIER line than
+            // the declaration, which is exactly what an `} else if (...)`
+            // arm header does: the If emitter flushes the arm's condition
+            // emissions AFTER the `} else if (` text, so a num_temp the
+            // condition needs is declared INSIDE this arm and read by the
+            // header text emitted just above it. The forward search found
+            // no use, dropped the `static char _sN[32];`, and the header
+            // then failed to compile ('_s1472 undeclared' on MIMEcroft's
+            // draw_radar_cell TREASURE/AIR test).
+            //
+            // Scanning everything is the conservative direction: the worst
+            // case is keeping a temp alive that a smarter analysis would
+            // drop (an unused `static char[32]` is dead weight, not a
+            // miscompile), whereas dropping a live one is a hard error.
+            let used = self
+                .out
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != i && *k != i + 1)
+                .any(|(_, l)| {
                 // word-boundary match so `_s1` doesn't match `_s10`.
                 let mut k = 0;
                 let b = l.as_bytes();
@@ -27658,6 +27718,53 @@ fn param_copy_alias(
                 self.emit("_sh_rc = 0;");
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
+                // RENDER EVERY elsif CONDITION UP FRONT, BEFORE THE `if`
+                // IS EMITTED AT ALL.
+                //
+                // An elsif condition can need a num_temp
+                // (`[ "$gv" -ne "$AIR" ]` lowers to `atoll(_sN)`), and
+                // `num_temp` EMITS its `static char _sN[32];` +
+                // `snprintf(...)` pair into self.out at the current
+                // position. Emitting an arm's condition at the point the
+                // arm is reached put that pair in one of three wrong
+                // places, all of which failed to compile:
+                //   * inside the PREVIOUS arm's block, where the `else if`
+                //     header below cannot see the declaration
+                //     ('_s1472 undeclared');
+                //   * after the `} else if (...)` header, where the USE
+                //     precedes its own declaration (same error); and
+                //   * between the `}` and the `else`, which is not a
+                //     statement position in C at all ("'else' without a
+                //     previous 'if'").
+                //
+                // There is no position inside an if/else chain where a
+                // declaration is legal AND precedes the test that reads
+                // it, so the declarations are hoisted ABOVE the whole
+                // chain. They are `static`, so hoisting is free: one
+                // definition, initialised once, read by whichever arm
+                // runs. The condition TEXT still needs the temp's value,
+                // and the text is complete before the `if` is emitted, so
+                // each arm's header can use it.
+                //
+                // Order matters for side effects: the arms are rendered in
+                // source order, exactly as they would have been reached,
+                // so the sequence of evaluations is unchanged.
+                // Only the condition TEXT has to be captured: the
+                // `} else if (...)` header that uses it is emitted much
+                // later, but the declarations it needs are already in
+                // self.out, sitting above the `if` emitted below. So the
+                // decls are deliberately NOT buffered or re-emitted —
+                // split_off would have to be undone, and re-emitting them
+                // would only risk a second copy.
+                let mut elsif_conds: Vec<String> = Vec::with_capacity(elsifs.len());
+                for (ec, _body) in elsifs {
+                    self.in_cond += 1;
+                    let ec_text = self.expr(ec);
+                    self.in_cond -= 1;
+                    elsif_conds.push(ec_text);
+                }
+                // the `then` condition renders last, so its own emissions
+                // (if any) sit directly above the `if` it belongs to
                 self.in_cond += 1;
                 let c = self.expr(cond);
                 self.in_cond -= 1;
@@ -27680,12 +27787,14 @@ fn param_copy_alias(
                 }
                 self.depth -= 1;
                 let mut post_if = std::mem::take(&mut self.nonnull_var);
-                for (ec, body) in elsifs {
+                for (ec, (_ec, body)) in elsif_conds.into_iter().zip(elsifs) {
+                    
                     let arm_site = self.prof_site(1, "elsif");
                     self.nonnull_var = pre_if.clone();
-                    self.in_cond += 1;
-                    let ec = self.expr(ec);
-                    self.in_cond -= 1;
+                    // the condition's own declarations were already
+                    // emitted ABOVE the whole chain (see the hoist at
+                    // the top of this arm), so the header here is just
+                    // the `} else if (...) {` line the C grammar wants.
                     self.emit(&format!("}} else if ({ec}) {{"));
                     self.depth += 1;
                     if let Some(site) = arm_site {
