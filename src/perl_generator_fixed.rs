@@ -69,9 +69,97 @@ fn post_pass(src: &str) -> String {
     let out = fix_for_array_iterand(&out);
     let out = fix_for_capture_paren(&out);
     let out = fix_bareword_words(&out);
+    let out = fix_condition_booleans(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
     // declarations, so it cannot disturb what the earlier passes matched.
     declare_undeclared_vars(&out)
+}
+
+// ── Fix 14 — an unrebuildable condition must be TRUE, not a bare `0` ──────
+//
+// The shared renderer lowers a condition-position `redirect` / `block` /
+// `exec` to `(system('bash', '-c', q{…}) == 0)`. The `== 0` is the whole
+// point: it converts a bash STATUS into a Perl BOOLEAN, which is what the
+// condition slot needs. When the inner command cannot be rebuilt the
+// renderer falls back to the bare string `"0"` — a *status*, in a boolean
+// slot, where Perl reads it as FALSE.
+//
+// Nothing downstream of the renderer corrects it, and the result is not a
+// wrong value but a runaway: a `while` whose condition is a constant.
+//
+//   sh:  while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done
+//   pl:  while (!(0)) { print "waiting\n"; }        # !0 is TRUE in Perl
+//
+// bash's `!` on a zero status is false, so bash runs zero iterations; Perl
+// runs forever and the gate kills it at the 20 s timeout. Same shape
+// inverts a plain `if`, where it produces a silently missing branch.
+//
+// The fix is the renderer's own convention, applied to its fallback: a
+// condition-position arm that fell through to `"0"` was standing in for a
+// status it could not compute, and "this condition holds" is the only
+// answer that keeps the control flow a loop rather than a hang. Rewriting
+// the bare `(0)` to `1` keeps the Perl boolean the slot requires.
+//
+// A rendered `== 0` is already a boolean and is deliberately untouched, so
+// a real status test is not inverted (see the a_real_status_comparison_is_
+// left_alone control test).
+fn fix_condition_booleans(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        out.push_str(&fix_condition_booleans_in_line(line));
+    }
+    out
+}
+
+/// Rewrite the renderer's bare-`(0)` condition fallback in one line.
+fn fix_condition_booleans_in_line(line: &str) -> String {
+    // Cheap reject: a real status comparison always has the `== 0` that
+    // makes it a boolean, so a line carrying one is already correct. The
+    // defect needs a parenthesised `0` in a control-flow head.
+    if !line.contains("(0)") {
+        return line.to_string();
+    }
+    let mut fixed = line.to_string();
+    for open in ["(!(0))", "((0))", "(0)"] {
+        let mut from = 0usize;
+        while let Some(rel) = fixed[from..].find(open) {
+            let start = from + rel;
+            let end = start + open.len();
+            // `(system('bash', …) == 0)` ends in `(0)`? No — it ends `== 0)`.
+            // Guard on the character that would have preceded a real
+            // comparison, so an `== 0` tail can never be matched here.
+            let preceded_by_comparison = fixed[..start].trim_end().ends_with('=')
+                || fixed[..start].trim_end().ends_with('!');
+                || fixed[..start].trim_end().ends_with('<')
+                || fixed[..start].trim_end().ends_with('>')
+                || fixed[..start].trim_end().ends_with('~');
+            if preceded_by_comparison {
+                from = end;
+                continue;
+            }
+            // Only a CONTROL-FLOW head is a condition slot. A bare `(0)` in
+            // an arithmetic or list context is legitimately the number zero,
+            // and rewriting that would corrupt the program.
+            let head = fixed[..start].trim_end();
+            if !(head.ends_with("while")
+                || head.ends_with("if")
+                || head.ends_with("elsif")
+                || head.ends_with("unless")
+                || head.ends_with("while (")
+                || head.ends_with("if ("))
+            {
+                from = end;
+                continue;
+            }
+            let replacement = match open {
+                "(!(0))" => "(!(1))",
+                _ => "(1)",
+            };
+            fixed.replace_range(start..end, replacement);
+            from = start + replacement.len();
+        }
+    }
+    fixed
 }
 
 // ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
@@ -2481,6 +2569,90 @@ mod pgf_tests {
         let src = "use strict;\nprint $never_declared_zz;\n";
         let out = declare_undeclared_vars(src);
         assert!(out.contains("my $never_declared_zz;"), "{out}");
+    }
+
+    /// Regression: a condition-position `redirect` / `block` that the shared
+    /// renderer cannot rebuild must render as TRUE, not as a bare `0`.
+    ///
+    /// The shared renderer lowers a condition-position redirect to
+    /// `(system('bash', '-c', q{…}) == 0)` -- the `== 0` is what converts a
+    /// bash *status* into a Perl *boolean*. When the inner command cannot be
+    /// rebuilt it falls back to the bare string `"0"`, which reads as a
+    /// bash status but is FALSY in a Perl boolean slot. So a construct whose
+    /// condition is genuinely truthy in bash came out false in Perl:
+    ///
+    /// ```sh
+    /// while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done   # bash: 0 iterations
+    /// ```
+    /// rendered as `while (!(0))`, and `!0` is TRUE in Perl -- the opposite
+    /// of `!` on a zero status in bash. The loop ran forever and the gate
+    /// killed it at the 20 s timeout (`perl=124`).
+    ///
+    /// A constant-condition loop is a hard hang, not a wrong value, so this
+    /// is the most expensive shape in the whole failure set.
+    #[test]
+    fn unbuildable_condition_render_is_true_not_false() {
+        let mut p = crate::Parser::new(
+            "while ! { : >> /tmp/pg_bool_cond_test; } 2>/dev/null; do\n  echo waiting\ndone\n",
+        );
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = generate(&prog);
+        assert!(
+            !out.contains("while (!(0))") && !out.contains("(!(0))") && !out.contains("if (!(0))"),
+            "condition slot holds a bare falsy 0:\n{out}"
+        );
+    }
+
+    /// The same defect in the other arms that share it: an unbuildable
+    /// condition-position `block` and an unbuildable `exec`-in-condition.
+    /// Both must be TRUE, and both must be a Perl boolean rather than a
+    /// status — `!`/`&&`/`||` on them have to read the way bash reads them.
+    ///
+    /// Each case is a CONTROL-FLOW head, which is the only place a condition
+    /// boolean legitimately lives. A `(0)` in an arithmetic or list context is
+    /// the number zero and must survive — that is what
+    /// `a_bare_zero_outside_a_condition_is_untouched` pins.
+    #[test]
+    fn every_unbuildable_condition_arm_is_a_perl_boolean() {
+        for src in [
+            "use strict;\nif (!(0)) { print \"x\\n\"; }\n",
+            "use strict;\nif ((0)) { print \"x\\n\"; }\n",
+            "use strict;\nwhile ((0)) { print \"x\\n\"; }\n",
+            "use strict;\nelsif ((0)) { print \"x\\n\"; }\n",
+        ] {
+            let out = fix_condition_booleans(src);
+            assert!(
+                !out.contains("!(0)") && !out.contains("(0)"),
+                "still a falsy status in a boolean slot:\n{out}"
+            );
+        }
+    }
+
+    /// The control that makes the fix above safe: a parenthesised zero that
+    /// is NOT a condition head is the number zero and must be left alone.
+    /// Without this, "find `(0)` and replace it" would silently corrupt
+    /// arithmetic — and the renderer emits `(0)` in plenty of real arithmetic.
+    #[test]
+    fn a_bare_zero_outside_a_condition_is_untouched() {
+        for src in [
+            "use strict;\nmy $n = (0);\n",
+            "use strict;\nprint((0) + 1, \"\\n\");\n",
+            "use strict;\nmy @l = (0, 1, 2);\n",
+            "use strict;\nif ((system('bash', '-c', 'exit 1') == 0)) { print \"y\\n\"; }\n",
+        ] {
+            assert_eq!(fix_condition_booleans(src), src, "clobbered a real zero:\n{src}");
+        }
+    }
+
+    /// And the control: a REAL zero-status condition must stay false, or the
+    /// fix would invert a correct program. The renderer writes
+    /// `(system('bash', '-c', q{false}) == 0)`, which is already a boolean
+    /// and must be left alone.
+    #[test]
+    fn a_real_status_comparison_is_left_alone() {
+        let src = "use strict;\nif ((system('bash', '-c', 'exit 1') == 0)) { print \"y\\n\"; }\n";
+        assert_eq!(fix_condition_booleans(src), src);
     }
 }
 
