@@ -117,6 +117,21 @@ pub fn size_opt_enabled() -> bool {
     SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Serializes every test that flips [`SIZE_OPT`].
+///
+/// `SIZE_OPT` is a process-global, and cargo runs tests on parallel
+/// threads: a test that calls [`set_size_opt`] while ANOTHER test is
+/// rendering observes the wrong level. This is the same hazard the
+/// dual-loop tests already serialize (see `dual_loop_tests`), and it is
+/// a real flake, not a theoretical one — `literal_literal_ops_are_widened`
+/// failed on ~2 runs in 5 purely from scheduling, with no source change.
+///
+/// Hold this for the whole set/render/reset sequence. The guard is
+/// re-entrant across the module so several `set_size_opt` tests can each
+/// take it.
+#[cfg(test)]
+pub(crate) static SIZE_OPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `-Oz`: golf for output SIZE. `-Os` plus a renderer text pass that
 /// strips what humans need but compilers don't: full-line `//`
 /// comments, indentation/blank lines, and long renderer-owned
@@ -6281,6 +6296,32 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     ast_to_ir_with_lines(commands, &[])
 }
 
+/// Map each element of `new` to the index of the element of `old` it came
+/// from, matching by value in order.
+///
+/// Both IR passes filter and rewrite statement lists, so an index into one
+/// list does NOT name the same statement in another. Greedy in-order
+/// matching recovers the correspondence for the common case (a pass
+/// dropped or kept statements); an element with no unclaimed match — one a
+/// pass inserted or rewrote — maps to nothing and is simply skipped by the
+/// caller, which is the safe outcome: a missing source line is recoverable,
+/// a misattributed one is not.
+fn align_by_identity(new: &[IrStmt], old: &[IrStmt]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(new.len());
+    let mut cursor = 0usize;
+    for st in new {
+        let found = old[cursor..].iter().position(|o| o == st).map(|i| cursor + i);
+        match found {
+            Some(i) => {
+                cursor = i + 1;
+                out.push(Some(i));
+            }
+            None => out.push(None),
+        }
+    }
+    out
+}
+
 /// `ast_to_ir` + the shIR `stmt_lines` markup: `lines[i]` is the 1-based
 /// source line of `commands[i]` (from the parser's `parse_with_lines`),
 /// so the A1 contract can carry each top-level statement's line — the
@@ -6292,19 +6333,29 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // dead-assignment elimination) benefit both consumers of the IR.
     // Then apply worker-submitted transforms (gated by SH2_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
-    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
-    let mut stmts: Vec<IrStmt> = Vec::new();
+    // The LINE is collected here, but the statement INDEX is assigned only
+    // after both passes below have finished.
+    //
+    // `optimize_stmts` drops dead assignments and `transforms::apply` can
+    // add, remove, or rewrite statements, so a map indexed against the
+    // input list is stale the moment anything moves: for `x=hi` + `echo $x`
+    // the dead assignment is elided, the old map still claimed `echo` was
+    // statement 1, and that statement does not exist. A consumer resolving
+    // `stmt` against the final list (the web GUI's source-line map) then
+    // reads past the end or attributes a statement to the wrong source.
+    //
+    // Carrying the line alongside the statement and matching survivors back
+    // to their origin keeps the map aligned with whatever actually
+    // survives. A statement a pass INSERTED has no origin and gets no entry:
+    // a missing line is recoverable, a wrong one is not.
+    let mut origins: Vec<(usize, IrStmt)> = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
         if let Some(st) = stmt_for_command(cmd) {
-            if let Some(&l) = lines.get(i) {
-                if l > 0 {
-                    stmt_lines.push((stmts.len(), l));
-                }
-            }
-            stmts.push(st);
+            origins.push((lines.get(i).copied().unwrap_or(0), st));
         }
     }
-    let mut stmts = crate::ir::optimize_stmts(&stmts);
+    let src: Vec<IrStmt> = origins.iter().map(|(_, s)| s.clone()).collect();
+    let mut stmts = crate::ir::optimize_stmts(&src);
     // Serialize against the shir_to_estree compile lock: the
     // sync-ok-loops transform stores per-compilation POINTER-keyed
     // verdicts in shared statics, and a parallel compilation's unlocked
@@ -6312,7 +6363,31 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // compile concurrently). Never re-entered: shir_to_estree does not
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    let after_optimize = stmts.clone();
     crate::transforms::apply(&mut stmts);
+    // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
+    // from it again, so the source line is recovered by two order-preserving
+    // subsequence matches rather than by using either list's indices
+    // directly — a filtered list's index does not name the same statement.
+    let to_src = align_by_identity(&after_optimize, &src);
+    let to_after_optimize = align_by_identity(&stmts, &after_optimize);
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
+    for (i, via) in to_after_optimize.iter().enumerate() {
+        // stmts[i] -> after_optimize[via] -> src[to_src[via]] -> origins[...]
+        // `via` is a `&Option<usize>`; `and_then` needs the Option by
+        // value, so dereference it (a second `&` in the pattern would
+        // bind the pattern to `&usize` and hand `to_src.get` a
+        // reference where it wants the index).
+        let Some(si) = (*via).and_then(|a| to_src.get(a).copied().flatten()) else {
+            continue;
+        };
+        let Some(&(line, _)) = origins.get(si) else {
+            continue;
+        };
+        if line > 0 {
+            stmt_lines.push((i, line));
+        }
+    }
     IrProgram {
         imports: vec![],
         requires: vec![],
@@ -18124,6 +18199,10 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::UseAlternative(w, need_nonempty) => (
+            if *need_nonempty { ":+" } else { "+" }.into(),
+            vec![st(w)],
+        ),
         ParameterExpansionOperator::ZshFlags(flags, sep) => {
             // zsh `${(flags)var}` / `${(flag:sep:)var}` — the zsh-only
             // flag expansion; the A1 `param("", name, flags[, sep])`
@@ -57189,6 +57268,81 @@ mod arith_len_placeholder_tests {
 }
 
 #[cfg(test)]
+mod stmt_lines_tests {
+    use super::*;
+
+    /// Build the A1 line map for `src` the way the CLI does (parse WITH
+    /// lines, so every statement carries a source line).
+    fn line_map(src: &str) -> (Vec<IrStmt>, Vec<(usize, usize)>) {
+        let (cmds, lines) = crate::Parser::new(src).parse_with_lines().expect("parse");
+        let prog = ast_to_ir_with_lines(&cmds, &lines);
+        (prog.stmts, prog.stmt_lines)
+    }
+
+    /// Every `stmt` index in the map must name a statement that EXISTS.
+    ///
+    /// This is the contract the web GUI's source-line map depends on. It
+    /// broke because the indices were assigned BEFORE `optimize_stmts`
+    /// ran: for `x=hi` + `echo $x` the dead assignment is elided, so the
+    /// map claimed `echo` was statement 1 while only statement 0's worth
+    /// of statements survived. No corpus example caught it because the
+    /// A1 corpus path never reads the map back.
+    #[test]
+    fn stmt_line_indices_stay_in_range_after_dead_assignment_elision() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        // Precondition: the dead assignment really is elided, which is
+        // what used to invalidate the map.
+        assert!(
+            stmts.len() < 2,
+            "expected `x=hi` to be elided as a dead store, got {} stmts",
+            stmts.len()
+        );
+        for (stmt, line) in &lines {
+            assert!(
+                *stmt < stmts.len(),
+                "stmt_lines names statement {} but only {} statements survive (line {})",
+                stmt,
+                stmts.len(),
+                line
+            );
+        }
+    }
+
+    /// The surviving `echo` must map to ITS OWN source line (2), not to
+    /// the elided assignment's line (1). A stale-by-one map silently
+    /// points a consumer at the wrong source, which is worse than a
+    /// missing entry.
+    #[test]
+    fn surviving_statement_keeps_its_own_source_line() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        let echo_idx = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::Expr { .. }))
+            .expect("the echo statement survives");
+        let mapped = lines.iter().find(|(s, _)| *s == echo_idx).map(|(_, l)| *l);
+        assert_eq!(
+            mapped,
+            Some(2),
+            "the echo must map to source line 2, got {:?}",
+            mapped
+        );
+    }
+
+    /// Nothing is elided when every assignment is READ, so the map must be
+    /// complete and in order — the fix must not disturb the ordinary path.
+    #[test]
+    fn map_is_complete_when_nothing_is_elided() {
+        let (stmts, lines) = line_map("x=hi\necho \"$x\"\ny=2\necho \"$y\"\n");
+        assert_eq!(stmts.len(), 4, "nothing is dead, nothing is dropped");
+        assert_eq!(
+            lines,
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+            "every surviving statement keeps its own line"
+        );
+    }
+}
+
+#[cfg(test)]
 mod range_analysis_tests {
     use super::*;
 
@@ -58033,6 +58187,196 @@ mod var_borrowable_tests {
     #[test]
     fn unread_vars_do_not_qualify() {
         assert!(!borrowable("a=foo\necho hi\n").contains("a"));
+    }
+}
+
+#[cfg(test)]
+mod array_key_lift_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    /// Every array element read in the program, as (base, key-channel).
+    ///
+    /// Two lowering shapes reach an array element and BOTH are collected:
+    ///   * `sh2.arrayIndex(BASE, KEY)` — a runtime call
+    ///   * `BASE[KEY]` on a native JS array — a computed MemberExpression
+    ///
+    /// The key's CHANNEL is what decides correctness. A key naming a
+    /// LIFTED binding must be a native read (`mi`); a store-bound name
+    /// must be read from the store (`sh2.vars.gi ?? …`). Reading one
+    /// through the other channel is the desync: the store never holds a
+    /// lifted name (→ "" → index 0), and a native binding of a
+    /// store-bound name is undefined.
+    fn array_reads(json: &str) -> Vec<(String, String)> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        let mut out = Vec::new();
+
+        fn ident(v: &serde_json::Value, name: &str) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                && v.get("name").and_then(|n| n.as_str()) == Some(name)
+        }
+        /// `sh2.vars` — the store object: a MemberExpression whose object
+        /// is the `sh2` identifier and whose property is `vars`.
+        fn is_store_obj(v: &serde_json::Value) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                && v.get("object").map(|o| ident(o, "sh2")).unwrap_or(false)
+                && v.get("property").map(|p| ident(p, "vars")).unwrap_or(false)
+        }
+        fn str_of(v: &serde_json::Value) -> String {
+            v.get("name")
+                .or_else(|| v.get("value"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
+                .to_string()
+        }
+        /// Classify a key subtree by CHANNEL, per name. A name read
+        /// through both the store and a bare binding is the desync; read
+        /// through exactly one is correct (which one depends on how the
+        /// variable is written — the caller pairs this with that fact).
+        fn channel(k: &serde_json::Value) -> String {
+            let mut store: std::collections::HashSet<String> = Default::default();
+            let mut native: std::collections::HashSet<String> = Default::default();
+            fn w(
+                v: &serde_json::Value,
+                store: &mut std::collections::HashSet<String>,
+                native: &mut std::collections::HashSet<String>,
+            ) {
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| w(x, store, native)),
+                    serde_json::Value::Object(m) => {
+                        let ty = m.get("type").and_then(|t| t.as_str());
+                        if ty == Some("Identifier") {
+                            if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                                native.insert(n.to_string());
+                            }
+                        }
+                        // `<store>.<name>` — the store read of a name
+                        if m.get("object").map(is_store_obj).unwrap_or(false) {
+                            if let Some(n) = m
+                                .get("property")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|x| x.as_str())
+                            {
+                                store.insert(n.to_string());
+                            }
+                        }
+                        for (field, child) in m {
+                            // The `property` of a NON-computed member is a
+                            // property NAME, not a value expression — it
+                            // must not count as a native binding read. A
+                            // COMPUTED member's property IS the value.
+                            let is_name_only = field == "property"
+                                && ty == Some("MemberExpression")
+                                && m.get("computed") != Some(&serde_json::Value::Bool(true));
+                            if !is_name_only {
+                                w(child, store, native);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            w(k, &mut store, &mut native);
+            let both: Vec<&String> = store.intersection(&native).collect();
+            if !both.is_empty() {
+                return format!("MIXED{both:?}");
+            }
+            if store.is_empty() {
+                "native"
+            } else {
+                "store"
+            }
+            .to_string()
+        }
+
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(m) => {
+                    // sh2.arrayIndex(BASE, KEY)
+                    if m.get("callee")
+                        .and_then(|c| c.get("property"))
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("arrayIndex")
+                    {
+                        if let Some(args) = m.get("arguments").and_then(|a| a.as_array()) {
+                            if let (Some(b), Some(k)) = (args.first(), args.get(1)) {
+                                out.push((str_of(b), channel(k)));
+                            }
+                        }
+                    }
+                    // BASE[KEY]
+                    if m.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                        && m.get("computed") == Some(&serde_json::Value::Bool(true))
+                    {
+                        if let (Some(obj), Some(k)) = (m.get("object"), m.get("property")) {
+                            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                                out.push((name.to_string(), channel(k)));
+                            }
+                        }
+                    }
+                    m.values().for_each(|x| walk(x, out));
+                }
+                _ => {}
+            }
+        }
+        walk(&v, &mut out);
+        out
+    }
+
+    /// estree-20260813-182439 (function-LOCAL lifted vars): a local the
+    /// emitter lifts to a native JS binding must be indexed by its
+    /// NATIVE binding, not by a store-key string. A `"$mi"` store key
+    /// expands to "" against a store that never holds the name, so
+    /// index 0 → every read returns element 0.
+    #[test]
+    fn local_lifted_array_key_is_native() {
+        let json = shir_to_estree_json(&prog_of(
+            "mx=(10 20 30)\nmime_count=3\nmime_at() {\n  mi=0\n  while [ \"$mi\" -lt \"$mime_count\" ]; do\n    if [ \"${mx[$mi]}\" -eq 20 ]; then echo found; fi\n    mi=$((mi + 1))\n  done\n}\nmime_at\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "mx" && ch == "native"),
+            "lifted local key must be a NATIVE read, got {reads:?}\n{json}"
+        );
+        assert!(
+            !json.contains("sh2.vars.mi"),
+            "a lifted local must not round-trip through the store:\n{json}"
+        );
+    }
+
+    /// estree-20260813-182438 (params): the store-bound twin of the test
+    /// above. `gi` is NOT lifted here — it is written and read through
+    /// `sh2.vars.gi` — so the correct key is the STORE read. The
+    /// invariant both tests share is that the key's channel matches how
+    /// the key variable is written; `MIXED` is the desync in either
+    /// direction.
+    #[test]
+    fn param_store_bound_array_key_uses_the_store() {
+        let json = shir_to_estree_json(&prog_of(
+            "map=(0 1 2 3 4 5 6 7)\nmap_get() { gi=$1; gv=${map[$gi]}; }\nmap_get 5\necho \"$gv\"\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "map" && ch == "store"),
+            "a store-bound key must read the store, got {reads:?}\n{json}"
+        );
+        assert!(
+            !reads.iter().any(|(_, ch)| ch == "MIXED"),
+            "key read through both channels at once: {reads:?}\n{json}"
+        );
+        // the write and the read must agree: `gi` is store-bound
+        assert!(
+            json.contains("\"name\":\"gi\"") && json.contains("\"name\":\"vars\""),
+            "gi must be store-bound for a store key to be correct:\n{json}"
+        );
     }
 }
 

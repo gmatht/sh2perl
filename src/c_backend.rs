@@ -18681,7 +18681,13 @@ fn param_copy_alias(
     fn fb_is_void(call: &str) -> bool {
         matches!(
             call.split('(').next().unwrap_or(call),
-            "fb_clear" | "fb_blocks" | "fb_set_camera"
+            "fb_clear"
+                | "fb_blocks"
+                | "fb_set_camera"
+                | "fb_overlay"
+                | "fb_overlay_flash"
+                | "fb_overlay_alpha"
+                | "fb_overlay_layer_alpha"
         )
     }
 
