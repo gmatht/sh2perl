@@ -6119,6 +6119,23 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             parts.push(cmd);
             continue;
         }
+        // An `IrStmt::Pipeline` as a capture body (``echo `ls | grep -v a` ``):
+        // the Arrow-wrapped `pipeline` Call form rebuilds via expr_to_cmd
+        // above, but a command substitution whose body is a pipeline arrives
+        // as this STATEMENT variant. Without this arm the rebuild returned
+        // None and the capture's VALUE was dropped — `echo `cmd`` rendered
+        // `print('', "\n")` (perl-generator-20261002-053000: the substituted
+        // output silently vanished from stdout).
+        if let IrStmt::Pipeline { stages, .. } = s {
+            let stage_exprs: Vec<IrExpr> = stages
+                .iter()
+                .map(|st| IrExpr::Arrow(st.clone()))
+                .collect();
+            let stage_refs: Vec<&IrExpr> = stage_exprs.iter().collect();
+            let cmd = stages_to_shell_cmd(&stage_refs)?;
+            parts.push(cmd);
+            continue;
+        }
         // a statement the rebuild can't express kills the whole command
         return None;
     }
@@ -6126,6 +6143,23 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
         None
     } else {
         Some(parts.join("; "))
+    }
+}
+
+/// Rebuild a shell command string from `stages` (each already an
+/// `IrExpr`), joining them with ` | `.
+/// A stage whose shell text cannot be rebuilt must NOT be silently
+/// DROPPED — the command would lose a producer (`paste <(…) <(…) | head`
+/// became `head`). Refuse, so the caller emits the stages natively.
+fn stages_to_shell_cmd(stages: &[&IrExpr]) -> Option<String> {
+    let mut out: Vec<String> = Vec::with_capacity(stages.len());
+    for s in stages {
+        out.push(arrow_to_cmd(s)?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(" | "))
     }
 }
 
@@ -6548,27 +6582,15 @@ fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
         if func == "pipeline" {
             // Stages arrive as pipeline([Arrow, Arrow, …]) or
             // pipeline([Array([Arrow, Arrow, …])]).
-            let mut stage_exprs: Vec<&IrExpr> = Vec::new();
+            let mut stages: Vec<&IrExpr> = Vec::new();
             for a in args {
                 if let IrExpr::Array(elems) = a {
-                    stage_exprs.extend(elems.iter());
+                    stages.extend(elems.iter());
                 } else {
-                    stage_exprs.push(a);
+                    stages.push(a);
                 }
             }
-            let mut stages: Vec<String> = Vec::new();
-            for a in &stage_exprs {
-                // A stage whose shell text cannot be rebuilt (the
-                // process-substitution materialisation is an `and`
-                // closure) must NOT be silently DROPPED — the command
-                // would lose a producer (`paste <(…) <(…) | head` became
-                // `head`). Refuse, so the caller emits the stages natively.
-                stages.push(arrow_to_cmd(a)?);
-            }
-            if stages.is_empty() {
-                return None;
-            }
-            return Some(stages.join(" | "));
+            return stages_to_shell_cmd(&stages);
         }
     }
     None
@@ -12151,6 +12173,43 @@ mod tests {
         assert!(
             !perl.contains("system('bash'"),
             "echo|tr pipeline must not shell out: {perl}"
+        );
+    }
+
+    /// ``echo `ls | grep -v a.txt` `` — a command substitution whose body is
+    /// a PIPELINE, used as a command's ARGUMENT. The capture body arrives as
+    /// `IrStmt::Pipeline` (not the Arrow-wrapped `pipeline` Call), and the
+    /// statement rebuild had no arm for it, so it returned None and the
+    /// capture's VALUE was dropped: the render was `print('', "\n")` — an
+    /// empty argument list, a silent wrong answer rather than a crash
+    /// (core-request perl-generator-20261002-053000, 008_simple_backup.sh).
+    #[test]
+    fn cmdsub_pipeline_as_argument_captures_its_value() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"echo"},{"elements":[
+                {"args":[{"body":[{"capture":null,"cmd_str":null,"last_output":null,"purity":"Spawn","stages":[
+                    [{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"ls"},{"elements":[],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}],
+                    [{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"grep"},{"elements":[{"style":"DoubleQuoted","type":"Str","value":"-v"},{"style":"DoubleQuoted","type":"Str","value":"a.txt"}],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}]
+                ],"type":"Pipeline"}],"type":"Arrow"}],"func":"captureWords","purity":"Spawn","type":"Call"}
+            ],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("cmdsub-pipeline A1 ingress");
+        let perl = shir_to_perl(&prog);
+        // The capture must RUN — the pipeline stages are rebuilt into the
+        // command text handed to the capture helper.
+        assert!(
+            perl.contains("__sh_pipe_capture"),
+            "the pipeline body must be captured, not dropped: {perl}"
+        );
+        assert!(
+            perl.contains("'ls'") && perl.contains("'grep'") && perl.contains("'a.txt'"),
+            "every pipeline stage must reach the reconstructed command: {perl}"
+        );
+        // The ARGUMENT list must not be empty: an empty capture rendered
+        // `print('', "\n")` and silently dropped the substituted output.
+        assert!(
+            !perl.contains("print('',"),
+            "a command substitution as an argument must render its value: {perl}"
         );
     }
 
