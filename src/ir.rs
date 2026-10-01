@@ -5117,10 +5117,21 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
         out.push_str(line);
         out.push('\n');
     }
+    // A command carrying a shell expansion must have its VALUES substituted
+    // into the emitted literal. `safe_perl_q_string` escapes `$` so PERL does
+    // not interpolate — which also stops BASH from ever expanding it, so a
+    // `bash -c` seam would silently run `echo ${!aa[@]}` with the literal
+    // text and lose the value (perl-generator-20261002-053100: 6 examples).
+    // The %ENV prelude above only carries bare NAMES, never a compound
+    // expansion (`${arr[@]}`, `${!h[@]}`, `${h[k]}`).
+    let quoted = match sh_cmd_value_expr(cmd) {
+        Some(expr) => expr,
+        None => safe_perl_q_string(cmd),
+    };
     emit_indent(out, indent);
     out.push_str(&format!(
         "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-        safe_perl_q_string(cmd)
+        quoted
     ));
 }
 
@@ -5725,10 +5736,34 @@ fn var_ref_name(e: &IrExpr) -> Option<String> {
 /// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, ` <<< s`,
 /// ` <<DELIM\nbody\nDELIM`) to cmd. Returns false for unknown modes.
 fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) -> bool {
-    let tstr = call_arg_str(target).unwrap_or_default();
+    // A redirect target is frequently NOT a literal: `sort <<<"${cfg[*]}"`
+    // carries a `param("slice", …)` expansion. `call_arg_str` yields None for
+    // such a node and the old `.unwrap_or_default()` turned that into an EMPTY
+    // target — `<<<''` — so the herestring read nothing and the command
+    // produced a silently wrong (empty) answer instead of refusing.
+    // Render the real shell text; refuse (false) only if we cannot.
+    let tstr = match call_arg_str(target) {
+        Some(s) => s,
+        None => bash_word_for(target),
+    };
+    if tstr.is_empty() {
+        // Nothing renderable: refuse rather than emit an empty target, which
+        // would silently produce a wrong answer (`<<<''`).
+        return false;
+    }
     match mode {
         "herestring" => {
-            cmd.push_str(&format!(" <<< '{}'", tstr.replace('\'', "'\\\\''")));
+            // `bash_word_for` yields the NATIVE shell form for an expansion
+            // (`"${cfg[*]}"`), which MUST reach bash un-single-quoted or the
+            // expansion is suppressed and the herestring reads nothing. A
+            // literal target was already shell-quoted by `bash_word_for`, so
+            // only single-quote it when it is not already a quoted word.
+            let rendered = if tstr.contains('$') {
+                tstr.clone()
+            } else {
+                format!("'{}'", tstr.replace('\'', "'\\\\''"))
+            };
+            cmd.push_str(&format!(" <<< {}", rendered));
             return true;
         }
         "heredoc" | "heredoc-tabs" => {
@@ -6600,7 +6635,14 @@ fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
 /// substitution `$(…)` / backticks) whose closure body is an exec/pipeline.
 fn capture_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
-        if func == "capture" {
+        // The A1 spells command substitution `captureWords` in unquoted word
+        // position (`for k in $(echo … | sort)`); `capture` is the scalar /
+        // assignment-position spelling. Only handling `capture` made every
+        // `captureWords` iterator fall through to the joined-STRING render,
+        // so `for k in $(…)` ran ONE iteration carrying the whole value
+        // instead of one per word (`join(' ', split(…))` collapses the list
+        // back to a single scalar).
+        if func == "capture" || func == "captureWords" {
             for a in args {
                 if let Some(cmd) = arrow_to_cmd(a) {
                     return Some(cmd);
@@ -10349,6 +10391,181 @@ fn dq_value_expr(content: &str) -> Option<String> {
     }
 }
 
+/// Build a PERL EXPRESSION evaluating to `cmd` with every shell expansion
+/// substituted as a runtime VALUE (shell-quoted by `__sh_q`), never left as
+/// raw text.
+///
+/// WHY THIS EXISTS. `safe_perl_q_string` escapes `$` so PERL does not
+/// interpolate the string — which is correct for a literal, but it means a
+/// `bash -c` seam handed `q('echo' ${!aa[@]} | sort)` gives bash the literal
+/// characters `$ { ! a a [` and the expansion yields NOTHING. The command
+/// still parses and the exit code is still right; only the value vanishes
+/// (core-request perl-generator-20261002-053100). A bare `$n` happened to
+/// survive because `var_exports_str` re-exports the NAME through %ENV and
+/// bash re-expands it — but there is no %ENV carrier for a COMPOUND
+/// expansion (`${arr[@]}`, `${!h[@]}`, `${h[k]}`), so those were silently
+/// lost.
+///
+/// Returns None when the shape is not expressible (globs, `$(...)`, `&&`,
+/// `||`, subshells, backticks) so the caller keeps the plain shell-out.
+fn sh_cmd_value_expr(cmd: &str) -> Option<String> {
+    if cmd.contains("||") || cmd.contains("|&") {
+        return None;
+    }
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // single-quoted span: no expansion, keep verbatim
+        if c == '\'' {
+            lit.push(c);
+            i += 1;
+            while i < chars.len() {
+                lit.push(chars[i]);
+                let done = chars[i] == '\'';
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '$' && i + 1 < chars.len() {
+            if let Some((expr, next)) = expansion_at(&chars, i) {
+                if !lit.is_empty() {
+                    parts.push(safe_perl_q_string(&lit));
+                    lit.clear();
+                }
+                parts.push(format!("__sh_q({})", expr));
+                i = next;
+                continue;
+            }
+        }
+        // A bare `$(...)`/backtick inside the command has no value form here.
+        if matches!(c, '`' | '&' | ';' | '(' | ')' | '*' | '?' | '\n') {
+            return None;
+        }
+        lit.push(c);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        parts.push(safe_perl_q_string(&lit));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" . "))
+    }
+}
+
+/// Parse one shell expansion starting at `$` (chars[i] == '$'), returning a
+/// Perl value EXPRESSION for it and the index just past it.
+///
+/// Handles `$name`, `${name}`, `${name[@]}` / `${name[*]}` (the whole
+/// collection), `${!name[@]}` (a hash's KEYS) and `${name[key]}` (one
+/// element). None for any other shape — notably the operator forms
+/// (`${x:-y}`, `${x#p}`, `${x/a/b}`) which carry semantics this cannot
+/// reproduce, so the caller must not silently mangle them.
+fn expansion_at(chars: &[char], i: usize) -> Option<(String, usize)> {
+    if chars.get(i + 1) == Some(&'{') {
+        // find the matching `}` (depth-counted)
+        let mut depth = 1;
+        let mut j = i + 2;
+        while j < chars.len() && depth > 0 {
+            match chars[j] {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        let inner: String = chars[i + 2..j].iter().collect();
+        let next = j + 1;
+        let expr = compound_expansion_expr(&inner)?;
+        return Some((expr, next));
+    }
+    let c1 = *chars.get(i + 1)?;
+    if c1 == '@' || c1 == '*' {
+        return None;
+    }
+    if !(c1.is_ascii_alphabetic() || c1 == '_') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    Some((var_read(&chars[i + 1..j].iter().collect::<String>()), j))
+}
+
+/// Perl expression for the INSIDE of a `${…}` expansion. None for shapes
+/// whose semantics are not reproducible here (operator forms).
+fn compound_expansion_expr(inner: &str) -> Option<String> {
+    let s = inner.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // `${!name[@]}` / `${!name[*]}` — a hash's keys (indirect expansion).
+    if let Some(rest) = s.strip_prefix('!') {
+        let (name, idx) = split_indexed_var(rest);
+        let idx = idx?;
+        if !var_is_declarable(name) {
+            return None;
+        }
+        if matches!(idx, "@" | "*") {
+            // bash yields the KEYS; sort for a stable, hash-order-independent
+            // result (the corpus sorts downstream anyway).
+            return Some(format!("join(' ', sort keys %{{{name}}})"));
+        }
+        return None;
+    }
+    // `${name[@]}` / `${name[*]}` — the whole collection.
+    if let Some(rest) = s.strip_suffix("[@]").or_else(|| s.strip_suffix("[*]")) {
+        if rest.is_empty() || !var_is_declarable(rest) {
+            return None;
+        }
+        if array_var(rest) {
+            // bash "${arr[@]}" inside double quotes joins on the first IFS
+            // char; a space matches the corpus' `IFS=$'\n' sorted=(...)` and
+            // `echo "${arr[@]}"` spellings that flow through here.
+            return Some(format!("join(' ', @{{{rest}}})"));
+        }
+        // A hash: `${h[@]}` is its VALUES.
+        return Some(format!("join(' ', values %{{{rest}}})"));
+    }
+    // `${name[key]}` — one element. `key` may be a nested expansion; handle
+    // only a literal key (a dynamic one cannot be resolved at this point).
+    if let Some(open) = s.find('[') {
+        if s.ends_with(']') {
+            let name = &s[..open];
+            let key = &s[open + 1..s.len() - 1];
+            if name.is_empty() || key.is_empty() || key.contains('$') {
+                return None;
+            }
+            if !var_is_declarable(name) {
+                return None;
+            }
+            if array_var(name) {
+                return Some(format!("${{{name}}}[{}]", key));
+            }
+            return Some(format!("${{{name}}}{{{key}}}"));
+        }
+    }
+    // A bare `${name}` is a plain variable read.
+    if var_is_declarable(s) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Some(var_read(s));
+    }
+    None
+}
+
 /// Build a PERL EXPRESSION that evaluates to a pipeline command string with
 /// runtime values substituted for `"$var"` arguments. The `coreutils-ffi`
 /// pipeline grammar has no expansion, so a `$var` in the reconstructed shell
@@ -10901,7 +11118,10 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
             return sh_uu_capture_expr(&argv);
         }
     }
-    let quoted = safe_perl_q_string(cmd);
+    let quoted = match sh_cmd_value_expr(cmd) {
+        Some(expr) => expr,
+        None => safe_perl_q_string(cmd),
+    };
     // Same env-export prologue as expr_to_open_perl — `$n` inside the
     // single-quoted bash -c text must reach the child via %ENV.
     let exports_raw = var_exports_str(cmd);
@@ -12211,6 +12431,103 @@ mod tests {
             !perl.contains("print('',"),
             "a command substitution as an argument must render its value: {perl}"
         );
+    }
+
+    /// A reconstructed capture command containing a shell `$` must NEVER be
+    /// handed to a non-interpolating Perl `q('...')` / `'...'`
+    /// literal. `safe_perl_q_string` escapes `$` precisely so PERL does not
+    /// interpolate it — which means BASH never sees it either, so the
+    /// expansion silently yields nothing:
+    ///
+    ///     __sh_pipe_capture(q('echo' ${!aa[@]} | 'tr' " " "\n" | 'sort'), ...)
+    ///
+    /// hands bash the six literal characters `$`, `{`, `!`, … The command
+    /// still parses and the exit code is right; only the VALUE is gone
+    /// (core-request perl-generator-20261002-053100). Six corpus examples
+    /// hit this: 064_07, 063_11, 063_hard_to_parse, 070_gnuisms_thorough,
+    /// realpath-cmdsub, grep_p.
+    ///
+    /// The `bash -c` seam works for a bare `$n` ONLY because the
+    /// `var_exports_str` prelude re-exports the name through %ENV and bash
+    /// re-expands it. That cannot work for an ARRAY/INDIRECT expansion
+    /// (`${arr[@]}`, `${!h[@]}`, `${h[k]}`): there is no %ENV carrier for a
+    /// compound expansion. Those must be SUBSTITUTED into the emitted
+    /// literal as shell-quoted VALUES (via `__sh_q`), never emitted raw.
+    #[test]
+    fn captured_cmd_with_shell_dollar_is_never_a_bare_perl_literal() {
+        let src = r#"{"type": "Program", "contract_version": 1, "imports": [], "requires": [], "var_types": [], "stmt_lines": [], "var_lengths": [], "var_const": [], "var_lifetimes": [], "var_bash_env": [], "subs": [], "stmts": [{"type": "Expr", "expr": {"args": [{"body": [{"expr": {"args": [{"elements": [{"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "echo"}, {"elements": [{"args": [{"style": "DoubleQuoted", "type": "Str", "value": "slice"}, {"style": "DoubleQuoted", "type": "Str", "value": "!aa"}, {"style": "DoubleQuoted", "type": "Str", "value": "@"}, {"style": "DoubleQuoted", "type": "Str", "value": ""}], "func": "param", "purity": "PureCpu", "type": "Call"}], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}, {"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "tr"}, {"elements": [{"parts": [{"kind": "lit", "text": " "}], "type": "Interpolate"}, {"parts": [{"kind": "lit", "text": "\\n"}], "type": "Interpolate"}], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}, {"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "sort"}, {"elements": [], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}], "type": "Array"}], "func": "pipeline", "purity": "Spawn", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}], "func": "captureWords", "purity": "Spawn", "type": "Call"}}]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("cmdsub A1 ingress");
+        let perl = shir_to_perl(&prog);
+
+        // Find every Perl string literal that is fed to a capture/run seam
+        // and assert it carries no unexpanded shell expansion.
+        for call in ["__sh_pipe_capture(", "__sh_pipe_run("] {
+            let mut from = 0usize;
+            while let Some(rel) = perl[from..].find(call) {
+                let at = from + rel;
+                let arg = &perl[at + call.len()..];
+                // The first argument is either a q('…') / '…' literal or a
+                // concatenation (the correct, substituted shape). Only the
+                // single-literal form can swallow the raw expansion.
+                if let Some(end) = arg.find("), \"pipefail\"") {
+                    let first_arg = &arg[..end];
+                    assert!(
+                        !is_bare_perl_literal(first_arg),
+                        "a reconstructed capture command with a shell expansion \
+                         must not be a non-interpolating Perl literal — bash \
+                         would receive the `$` literally and the value would \
+                         vanish.\n  literal: {first_arg}\n  full: {perl}"
+                    );
+                }
+                from = at + call.len();
+            }
+        }
+    }
+
+    /// The herestring form `sort <<< "${config[*]}"` must SUBSTITUTE the
+    /// hash's values through `__sh_q`, never embed the raw `${config[*]}`
+    /// in the literal handed to the capture seam (064_07_complex_array_operations:
+    /// the generated `q('sort' <<< ${config[*]})` gave bash an EMPTY here
+    /// string, so `Config: ` printed with no value at all).
+    #[test]
+    fn herestring_array_expansion_substitutes_through_sh_q() {
+        let value = sh_cmd_value_expr("sort <<< \"${config[*]}\"")
+            .expect("`${config[*]}` is expressible as a value");
+        assert!(
+            value.contains("__sh_q(join(' ', values %{config}))"),
+            "the array must be substituted as a value, not embedded raw: {value}"
+        );
+        let open = cmd_str_to_open_perl("sort <<< \"${config[*]}\"");
+        assert!(
+            !open.contains("${config"),
+            "no raw shell expansion may reach the capture seam: {open}"
+        );
+        assert!(
+            open.contains("__sh_pipe_capture(") && open.contains("__sh_q("),
+            "the herestring must still run through the capture seam: {open}"
+        );
+    }
+
+    /// True when `s` is a single non-interpolating Perl literal
+    /// (`'…'`, `q(…)`, `q{…}`, `q|…|`, …) with no string concatenation.
+    fn is_bare_perl_literal(s: &str) -> bool {
+        let s = s.trim();
+        let (open, close) = match s.as_bytes().first() {
+            Some(b'\'') => ('\'', '\''),
+            Some(b'q') => match s.as_bytes().get(1) {
+                Some(b'(') => ('(', ')'),
+                Some(b'{') => ('{', '}'),
+                Some(b'[') => ('[', ']'),
+                Some(b'<') => ('<', '>'),
+                Some(c) => (*c as char, *c as char),
+                None => return false,
+            },
+            _ => return false,
+        };
+        s.len() >= 2
+            && s.ends_with(close)
+            && !s[1..s.len() - 1].contains(&format!(" . {close}"))
+            && s[1..s.len() - 1].contains('$')
     }
 
     /// The modern-IR preamble only declares the infrastructure variables
