@@ -40,6 +40,36 @@ lazy_static::lazy_static! {
     /// drop target must be BARE — dash rejects quoted expansions inside
     /// `$(( ))`).
     static ref NUM_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// Heredoc bodies deferred to the end of the current LOGICAL line.
+    ///
+    /// A heredoc's body must follow the complete command line, not be
+    /// spliced into the middle of it. `redirect_to_sh` emits the `<<DELIM`
+    /// header in place and parks `body\nDELIM\n` here; whoever owns the
+    /// logical line (a statement, or an inline pipeline/capture) flushes
+    /// it once the whole line is assembled.
+    ///
+    /// Without this, a heredoc in a pipeline renders as
+    /// `cat <<EOF\nbody\nEOF\n | grep X` — the pipe lands AFTER the
+    /// terminator, which BOTH zsh and bash reject
+    /// (`syntax error near unexpected token '|'`). The pipe belongs on
+    /// the header line: `cat <<EOF | grep X\nbody\nEOF`.
+    static ref HEREDOC_BODIES: std::sync::Mutex<Vec<String>> = Default::default();
+    /// Functions whose trailing `return` is the core's *echo-return-lift*,
+    /// not a POSIX exit status.
+    ///
+    /// The core rewrites a function whose body ends in `echo X` into
+    /// `return X` and its call site into `echo $(f)` — the value moves
+    /// through a command substitution instead of a status. zsh, like bash,
+    /// rejects a non-numeric argument to `return` ("numeric argument
+    /// required") and the substitution then yields the empty string, so
+    /// `f() { echo in-func; }; f` printed nothing.
+    ///
+    /// `sh` has no way to return a string, so the lift is unrenderable as
+    /// written; the only faithful lowering is to print directly and let the
+    /// call site print nothing. A genuine `return 3` keeps its status: the
+    /// call site for that is a plain `exec f`, not `builtin echo $(f)`,
+    /// so the two cases never collide (see `collect_lifted_fns`).
+    static ref LIFTED_FNS: std::sync::Mutex<HashSet<String>> = Default::default();
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -501,6 +531,7 @@ pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
         .filter(|(_, t)| *t == crate::ir::IrType::Int)
         .map(|(n, _)| n)
         .collect();
+    *LIFTED_FNS.lock().unwrap() = collect_lifted_fns(prog);
     let mut out = String::new();
     out.push_str("#!/usr/bin/env zsh\n");
     out.push_str("#\n");
@@ -512,6 +543,26 @@ pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
     out.push_str("# - 'grep -P' helper: PCRE not in POSIX, checked at runtime\n");
     out.push_str("#\n");
 
+    if needs_hostname(&prog.stmts) {
+        out.push_str("\n");
+        // zsh exports HOST (the short hostname) where bash exports HOSTNAME,
+        // and bash's own `${HOSTNAME}` is derived from HOST at startup. A
+        // program that reads HOSTNAME therefore sees a value under bash and
+        // the empty string under zsh, so `${HOSTNAME:-localhost}` silently
+        // takes its default. Rebuild the bash-side value from HOST when it is
+        // absent. Only emitted when the program actually reads HOSTNAME, and
+        // it never overrides a value the environment already supplied.
+        out.push_str(": ${HOSTNAME:=${HOST:-localhost}}\n");
+    }
+    if needs_word_split(&prog.stmts) {
+        out.push_str("\n");
+        // zsh does not word-split unquoted expansions and does not re-glob
+        // the words an expansion yields; POSIX sh does both. The `split`
+        // marker arms below (${=var}) request the split explicitly, and
+        // GLOBSUBST supplies the matching glob so an unquoted expansion
+        // means the same thing in both shells.
+        out.push_str("setopt shwordsplit globsubst\n");
+    }
     if needs_grep_p(&prog.stmts) {
         out.push_str("\n");
         out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, pcregrep/pcre2grep, or perl\n");
@@ -569,6 +620,9 @@ pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
             if [ "$_rl_mode" = m ]; then
                 _rl_ifs=$IFS
                 IFS=/
+                # Leading empty field (the `/` that opens an absolute path)
+                # and `.` components carry no meaning; `..` pops one
+                # component, popping at the root is a no-op like GNU.
                 _rl_out=
                 for _rl_c in $_rl_path; do
                     case $_rl_c in
@@ -576,13 +630,14 @@ pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
                         ..)
                             case $_rl_out in
                                 */*) _rl_out=${_rl_out%/*} ;;
+                                '') ;;
                                 *) _rl_out= ;;
                             esac ;;
-                        *) _rl_out=$_rl_out/$_rl_c ;;
+                        *) _rl_out=${_rl_out:+$_rl_out/}$_rl_c ;;
                     esac
                 done
                 IFS=$_rl_ifs
-                [ -n "$_rl_out" ] || _rl_out=/
+                _rl_out=${_rl_out:-/}
                 if [ "$_rl_nl" -eq 0 ]; then printf '%s\n' "$_rl_out"; else printf '%s' "$_rl_out"; fi
                 continue
             fi
@@ -1103,6 +1158,9 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             indent(out, d);
             out.push_str(&assign_to_sh(targets, expr)?);
             out.push('\n');
+            // A heredoc in the RHS parks its body; it belongs after the
+            // assignment's newline, not inside it.
+            out.push_str(&take_heredoc_bodies());
             Ok(())
         }
         IrStmt::If {
@@ -1252,7 +1310,24 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             indent(out, d);
             out.push_str(name);
             out.push_str("() {\n");
-            for b in body {
+            // The echo-return-lift's `return X` is unrenderable in sh: `return`
+            // takes a status, and the call site (`echo $(f)`) then yields the
+            // empty string. sh has no string return, so print the value and let
+            // the call site's `$( )` capture it exactly as bash's `echo`
+            // would have produced. Only the lifted set is affected — a real
+            // `return 3` still returns its status.
+            let lifted = LIFTED_FNS.lock().unwrap().contains(name);
+            let n = body.len();
+            for (i, b) in body.iter().enumerate() {
+                if lifted && i + 1 == n {
+                    if let IrStmt::Return(Some(x)) = b {
+                        indent(out, d + 1);
+                        out.push_str("printf '%s\\n' ");
+                        out.push_str(&word_to_zsh(x)?);
+                        out.push('\n');
+                        continue;
+                    }
+                }
                 stmt_to_sh(b, d + 1, out)?;
             }
             indent(out, d);
@@ -1282,6 +1357,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str(&line);
             out.push_str(&suffix);
             out.push('\n');
+            out.push_str(&take_heredoc_bodies());
             Ok(())
         }
         IrStmt::Subshell(body) => {
@@ -1466,6 +1542,9 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 out.push_str(&line);
                 out.push('\n');
             }
+            // A stage's heredoc body belongs AFTER the whole pipeline line
+            // (the `|`s are already part of `line`), never inside it.
+            out.push_str(&take_heredoc_bodies());
             Ok(())
         }
         IrStmt::Pipeline {
@@ -1499,6 +1578,9 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 out.push_str(&line);
                 out.push('\n');
             }
+            // A stage's heredoc body belongs AFTER the whole pipeline line
+            // (the `|`s are already part of `line`), never inside it.
+            out.push_str(&take_heredoc_bodies());
             Ok(())
         }
         IrStmt::WriteFile {
@@ -1703,17 +1785,11 @@ fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
 fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
     match expr {
         IrExpr::Call { func, args } => match func.as_str() {
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-            "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(format!("\"{}\"", capture_wrap(arrow_to_sh(args)?))),
+            "captureWords" => Ok(capture_wrap(arrow_to_sh(args)?)),
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
-                let mut line = String::new();
-                for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str(" | ");
-                    }
-                    line.push_str(&stmts_inline(stg)?);
-                }
+                let line = pipeline_line_to_sh(&stages)?;
                 Ok(format!("$({line})"))
             }
 
@@ -1997,14 +2073,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
-                let mut line = String::new();
-                for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str(" | ");
-                    }
-                    line.push_str(&stmts_inline(stg)?);
-                }
-                Ok(line)
+                pipeline_line_to_sh(&stages)
             }
             "redirect" => {
                 let inner = arrow_to_sh(args)?;
@@ -2026,6 +2095,11 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 if !ps_ins.is_empty() {
                     line = lower_procsub_inline(&ps_ins, &line)?;
                 }
+                // A heredoc body is NOT flushed here: this arm runs inside a
+                // larger logical line (a pipeline stage, a `$( … )` capture,
+                // a `; ` join) whose owner flushes once the whole line is
+                // assembled. Flushing here would put the body before the
+                // caller's remaining `|`s / closing paren.
                 Ok(format!("{line}{specs}"))
             }
             "subshell" => Ok(format!("( {} )", arrow_to_sh(args)?)),
@@ -2100,8 +2174,8 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 Ok(format!("{}_{}={}", arr_base(&name), key, value))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false)),
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-            "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(format!("\"{}\"", capture_wrap(arrow_to_sh(args)?))),
+            "captureWords" => Ok(capture_wrap(arrow_to_sh(args)?)),
             "contains" => {
                 let arg = word_to_zsh(arg(args, 0)?)?;
                 let pat = raw_arg(args, 1)?;
@@ -2305,6 +2379,13 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_grep_p),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_grep_p(v)),
+            // A cmdsub is Capture { expr: Arrow([…]) } — see the matching
+            // arm in needs_readlink. `x=$(echo hi | grep -P …)` hides the
+            // exec behind both, so descending Arrow alone is not enough.
+            IrExpr::Capture { expr, .. } => has_grep_p(expr),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_grep_p(x))),
             // pipeline / cmdsub stages nest the stage execs inside Arrow
             // bodies — without this the grep -P exec in `echo X | grep -P
             // …` is invisible and the grep_p polyfill prologue is never
@@ -2465,6 +2546,15 @@ fn needs_readlink(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_readlink),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_readlink(v)),
+            // `$(readlink -f X)` parses as Capture { expr: Arrow([…]) } —
+            // a cmdsub, which is how EVERY command substitution reaches the
+            // IR. Without this arm the polyfill prologue is never emitted
+            // and the render calls an undefined `_readlink`, so the
+            // substitution yields the empty string.
+            IrExpr::Capture { expr, .. } => has_readlink(expr),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_readlink(x))),
             IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
@@ -2556,7 +2646,137 @@ fn needs_readlink(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
-// GNU `cmp(1)` is tool-verbatim: the corpus expects the exact message
+/// Does the program read `HOSTNAME`? If so the render needs the zsh→bash
+/// hostname bridge in the prologue (see the `shir_to_zsh` call site).
+///
+/// Scans the IR for a variable reference named HOSTNAME. A bare `Var` node
+/// covers `$HOSTNAME`; the `param` call covers `${HOSTNAME:-guest}` and the
+/// other parameter expansions. Both recurse through the container nodes that
+/// the other scanners descend, so a read nested in a cmdsub, a pipeline stage
+/// or an interpolation is still seen.
+fn needs_hostname(stmts: &[IrStmt]) -> bool {
+    fn mentions(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(name, _) => name == "HOSTNAME",
+            IrExpr::Call { func, args } => {
+                // `${NAME:-default}` puts the OPERATOR first, so the name is
+                // the arg after it, not args[0] — match getVar/listVar on
+                // args[0] and param on args[1].
+                let name_at = match func.as_str() {
+                    "param" => 1,
+                    "getVar" | "listVar" => 0,
+                    _ => usize::MAX,
+                };
+                if name_at != usize::MAX
+                    && args
+                        .get(name_at)
+                        .is_some_and(|a| matches!(a, IrExpr::Str(s, _) if s == "HOSTNAME"))
+                {
+                    return true;
+                }
+                args.iter().any(mentions)
+            }
+            IrExpr::Array(es) => es.iter().any(mentions),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| mentions(v)),
+            IrExpr::Capture { expr, .. } => mentions(expr),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if mentions(x))),
+            IrExpr::Arrow(inner) => walk(inner),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            let found = match st {
+                IrStmt::Expr(e) => mentions(e),
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    mentions(cond) || walk(body)
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    mentions(cond)
+                        || walk(then)
+                        || walk(else_)
+                        || elsifs.iter().any(|(c, b)| mentions(c) || walk(b))
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    walk(body)
+                }
+                IrStmt::For { iter, body, .. } => mentions(iter) || walk(body),
+                IrStmt::Assign { expr, .. } => mentions(expr),
+                IrStmt::Redirect { inner, redirects } => {
+                    walk(inner) || redirects.iter().any(|r| mentions(&r.target))
+                }
+                IrStmt::Function { body, .. } => walk(body),
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                    ..
+                } => mentions(discriminant) || clauses.iter().any(|c| walk(&c.body)),
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
+                _ => false,
+            };
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+// Does this program contain a `split` marker anywhere? If so it needs the
+// SHWORDSPLIT/GLOBSUBST setopt preamble (see the `split` arm in
+// call_word_to_sh) — zsh has neither behaviour by default.
+fn needs_word_split(stmts: &[IrStmt]) -> bool {
+    fn has_split(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => func == "split" || args.iter().any(has_split),
+            IrExpr::Array(es) => es.iter().any(has_split),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_split(v)),
+            // cmdsub bodies hide behind Capture (see needs_readlink).
+            IrExpr::Capture { expr, .. } => has_split(expr),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_split(x))),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            let found = match st {
+                IrStmt::Expr(e) => has_split(e),
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    has_split(cond) || walk(body)
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    has_split(cond)
+                        || walk(then)
+                        || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_split(c) || walk(b))
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => walk(body),
+                IrStmt::For { iter, body, .. } => has_split(iter) || walk(body),
+                IrStmt::Assign { expr, .. } => has_split(expr),
+                IrStmt::Redirect { inner, redirects } => {
+                    walk(inner) || redirects.iter().any(|r| has_split(&r.target))
+                }
+                IrStmt::Function { body, .. } => walk(body),
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    has_split(discriminant) || clauses.iter().any(|c| walk(&c.body))
+                }
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
+                _ => false,
+            };
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
 // `A B differ: byte N, line M` and (with -l) the `N M\n` per-byte
 // octal listing. busybox cmp differs (uses `char`, different padding).
 // The polyfill reproduces GNU semantics using `od` (POSIX) for octals
@@ -2581,6 +2801,11 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_cmp),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_cmp(v)),
+            // cmdsub bodies hide behind Capture (see needs_readlink).
+            IrExpr::Capture { expr, .. } => has_cmp(expr),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_cmp(x))),
             IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
@@ -2628,12 +2853,173 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                // A process substitution lowers to Redirect{ inner: […] }, so
+                // `diff <(cmp -l a b) <(echo x)` hides its `cmp` in a
+                // redirect body — without this arm the _cmp polyfill is
+                // omitted and the render calls an undefined `_cmp`.
+                // Mirrors the Redirect arm in needs_readlink.
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) || redirects.iter().any(|r| has_cmp(&r.target)) {
+                        return true;
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                    ..
+                } => {
+                    if has_cmp(discriminant) || clauses.iter().any(|c| walk(&c.body)) {
+                        return true;
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    if stages.iter().any(|s| walk(s)) {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }
         false
     }
     walk(stmts)
+}
+
+/// Names of functions whose value-returning `return` is the core's
+/// echo-return-lift rather than a POSIX exit status (see `LIFTED_FNS`).
+///
+/// A function is lifted when BOTH halves of the rewrite are present:
+///
+/// * its body ends in `Return(X)` with a non-numeric `X` — the `echo X`
+///   the core turned into a return, and
+/// * some call site is `builtin echo $(f)` / `exec echo $(f)` — the `f`
+///   the core turned into a value-producing substitution.
+///
+/// Requiring the call site is what keeps a real `return 3` out of the set:
+/// its IR is the same `Return(Str "3")` shape, but the caller is a plain
+/// `exec f`, so the status must survive. A function that is *both* lifted
+/// and status-returned is not expressible in `sh`; the call site decides,
+/// and the call site is what this function keys on.
+fn collect_lifted_fns(prog: &IrProgram) -> HashSet<String> {
+    // Half 1 — the callee side. A trailing `return` whose argument is NOT an
+    // integer is only ever the lift: POSIX `return`'s argument IS a status.
+    let mut candidates: HashSet<String> = HashSet::new();
+    for st in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = st {
+            if let Some(IrStmt::Return(Some(x))) = body.last() {
+                if !is_int_literal(x) {
+                    candidates.insert(name.clone());
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+
+    // Half 2 — the caller side. Only a function actually invoked through a
+    // `fnValue` (i.e. `echo $(f)`) is lifted; a real `return 3` is called as
+    // a plain `exec f` and never produces a `fnValue`.
+    let mut out = HashSet::new();
+    fn scan(e: &IrExpr, candidates: &HashSet<String>, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "fnValue" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if candidates.contains(name) {
+                            out.insert(name.clone());
+                        }
+                    }
+                }
+                args.iter().for_each(|a| scan(a, candidates, out));
+            }
+            IrExpr::Array(es) => es.iter().for_each(|x| scan(x, candidates, out)),
+            IrExpr::Object(es) => es.iter().for_each(|(_, v)| scan(v, candidates, out)),
+            IrExpr::Capture { expr, .. } => scan(expr, candidates, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        scan(x, candidates, out);
+                    }
+                }
+            }
+            IrExpr::Arrow(stmts) => stmts.iter().for_each(|s| scan_stmt(s, candidates, out)),
+            _ => {}
+        }
+    }
+    fn scan_stmt(st: &IrStmt, candidates: &HashSet<String>, out: &mut HashSet<String>) {
+        match st {
+            IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => scan(e, candidates, out),
+            IrStmt::For { iter, body, .. } => {
+                scan(iter, candidates, out);
+                body.iter().for_each(|s| scan_stmt(s, candidates, out));
+            }
+            IrStmt::Return(Some(e)) => scan(e, candidates, out),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                scan(cond, candidates, out);
+                then.iter()
+                    .chain(else_.iter())
+                    .chain(elsifs.iter().flat_map(|(_, b)| b.iter()))
+                    .for_each(|s| scan_stmt(s, candidates, out));
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                scan(cond, candidates, out);
+                body.iter().for_each(|s| scan_stmt(s, candidates, out));
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                b.iter().for_each(|s| scan_stmt(s, candidates, out))
+            }
+            IrStmt::Function { body, .. } => body
+                .iter()
+                .for_each(|s| scan_stmt(s, candidates, out)),
+            IrStmt::Case {
+                discriminant,
+                clauses,
+                ..
+            } => {
+                scan(discriminant, candidates, out);
+                clauses
+                    .iter()
+                    .flat_map(|c| c.body.iter())
+                    .for_each(|s| scan_stmt(s, candidates, out));
+            }
+            IrStmt::Pipeline { stages, .. } => stages
+                .iter()
+                .flat_map(|s| s.iter())
+                .for_each(|s| scan_stmt(s, candidates, out)),
+            IrStmt::Redirect { inner, redirects } => {
+                inner
+                    .iter()
+                    .for_each(|s| scan_stmt(s, candidates, out));
+                redirects
+                    .iter()
+                    .for_each(|r| scan(&r.target, candidates, out));
+            }
+            _ => {}
+        }
+    }
+    prog.stmts.iter().for_each(|s| scan_stmt(s, &candidates, &mut out));
+    out
+}
+
+/// True when `x` is a literal integer — a `return` of one is a real status.
+fn is_int_literal(x: &IrExpr) -> bool {
+    match x {
+        IrExpr::Str(s, _) => s.parse::<i64>().is_ok(),
+        IrExpr::Arith(_) => true,
+        _ => false,
+    }
 }
 
 fn exec_line_to_sh(
@@ -3195,7 +3581,19 @@ fn exec_line_to_sh(
         }
         return Ok(out);
     }
-    out.push_str(&word_to_zsh(cmd)?);
+    // A BARE `command` (no operands) is a no-op in bash, but zsh rejects
+    // the whole line — "redirection with no command" (zsh parses a
+    // redirect with nothing in command position as an error, where bash
+    // and dash treat `command <f >g` as the no-op it is). Rendering the
+    // builtin `:` keeps the observable behaviour: the redirects still
+    // create/truncate the file and the status is 0. Only the zero-operand
+    // form needs it; `command foo` still names a real command.
+    let head = if cmd_name == Some("command") && args.is_empty() {
+        ":"
+    } else {
+        &word_to_zsh(cmd)?
+    };
+    out.push_str(head);
     for w in args {
         out.push(' ');
         out.push_str(&word_to_zsh(w)?);
@@ -3204,6 +3602,14 @@ fn exec_line_to_sh(
 }
 
 // ── redirects ────────────────────────────────────────────────────────
+
+/// Take the heredoc bodies deferred so far (in order) and clear the
+/// collector. Callers append the result to the END of the logical line they
+/// just built — the body follows the complete command, never mid-line.
+fn take_heredoc_bodies() -> String {
+    let parked = std::mem::take(&mut *HEREDOC_BODIES.lock().unwrap());
+    parked.concat()
+}
 
 fn redirects_to_sh(redirects: &[IrRedirect]) -> Result<String, String> {
     let mut out = String::new();
@@ -3413,12 +3819,20 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
     let fd = r.fd.unwrap_or(0);
     let op = match r.mode.as_str() {
         "w" => ">",
+        // `>|` — noclobber-bypassing output. The core gives it its own
+        // mode string "wc" (shir.rs:17613, documented in ir.rs
+        // IrRedirect.mode) so backends can render it faithfully under
+        // `set -C`. zsh implements `>|` natively, so it splices verbatim.
+        "wc" => ">|",
         "a" => ">>",
         "r" => "<",
         "r+" => "<>",
         "herestring" => return Ok(String::new()), // wrapped as a printf pipe by herestring_wrap
         "heredoc" | "heredoc-tabs" => {
-            // The heredoc BODY is carried in the target string.
+            // The heredoc BODY is carried in the target string. Only the
+            // `<<DELIM` header is emitted HERE; the body is parked for the
+            // logical line's owner to flush (see HEREDOC_BODIES) — the body
+            // must come after the whole line, not in the middle of it.
             let body = match &r.target {
                 IrExpr::Str(s, _) => s.clone(),
                 other => word_to_zsh(other)?,
@@ -3427,7 +3841,15 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
             let q = if r.interpolate { "" } else { "'" };
             let tab = if r.mode == "heredoc-tabs" { "-" } else { "" };
             let fdpre = fd_prefix(fd);
-            return Ok(format!(" {fdpre}<<{tab}{q}{delim}{q}\n{body}{delim}\n"));
+            // Park the body verbatim; the owner of the logical line decides
+            // where the line break goes (a statement renderer has already
+            // written '\n'; a pipeline stage has not, and a `$( … )` capture
+            // must place its closing paren AFTER the terminator).
+            HEREDOC_BODIES
+                .lock()
+                .unwrap()
+                .push(format!("{body}{delim}\n"));
+            return Ok(format!(" {fdpre}<<{tab}{q}{delim}{q}"));
         }
         // `unsupported` / unknown modes must never be silently dropped
         // (core request sh-20260807-130936 item 3 — refuse loudly; the
@@ -3618,14 +4040,19 @@ fn word_to_zsh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Index { var, key } => index_to_sh(var, key, true),
         // The first-class Capture node (core request
         // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
-        // `"$(...)"` rendering as the `capture` call arm.
+        // `"$(...)"` rendering as the `capture` call arm. The body MUST
+        // go through capture_wrap, not an inline `"$({})"`: a heredoc
+        // inside the substitution parks its body (redirect_to_sh) and the
+        // terminator has to land AFTER the complete line, or the capture
+        // closes before the body and silently reads nothing
+        // (`result="$(cat <<EOF)"` with the body dropped).
         IrExpr::Capture { expr, .. } => {
             if let Some(lift) = capture_idiom_sh(expr)? {
                 Ok(lift)
             } else {
                 Ok(format!(
-                    "\"$({})\"",
-                    arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+                    "\"{}\"",
+                    capture_wrap(arrow_to_sh(std::slice::from_ref(expr.as_ref()))?)
                 ))
             }
         }
@@ -3723,6 +4150,38 @@ fn index_var_key_to_sh(base: &str, k: &str) -> String {
     format!("$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")")
 }
 
+// Force word splitting on an already-rendered zsh word (the `split` marker).
+//
+// The rendered inner is an expansion like `$x` or `${x#p}`. zsh's
+// "split like sh" flag is `=` and it must sit DIRECTLY inside the braces —
+// `${=x}` splits, `${=$x}` is a bad substitution. A bare `$x` therefore has
+// to be widened to `${=x}` (keeping the `$`), and an already-braced form
+// `${…}` has the flag inserted after the brace.
+//
+// Words that are already quoted are left alone: `"$x"` is the QUOTED form
+// the core emits elsewhere, and wrapping it would double-quote. Likewise a
+// command substitution carries its own splitting and must not be re-wrapped.
+fn force_split(s: &str) -> String {
+    let t = s.trim();
+    if t.starts_with('"') || t.starts_with("$(") || t.is_empty() {
+        return s.to_string();
+    }
+    // already braced: `${x#p}` -> `${=${x#p}}` (nest, so the braced
+    // expansion keeps its own syntax)
+    if let Some(inner) = t.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+        if !inner.contains('}') {
+            return format!("${{={t}}}");
+        }
+        return s.to_string();
+    }
+    // bare `$x`: the name goes INSIDE the braces, after the flag —
+    // `${=x}` splits, `${=$x}` is a bad substitution
+    match t.strip_prefix('$') {
+        Some(name) if !name.is_empty() => format!("${{={name}}}"),
+        _ => s.to_string(),
+    }
+}
+
 fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
     match func {
         // A bare getVar in a word position is the QUOTED expansion (the
@@ -3746,13 +4205,26 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             }
         }
         // the core's word-splitting node: an UNQUOTED `$var` expands and
-        // word-splits natively in POSIX sh — render the inner expansion
-        // bare (no quotes).
+        // word-splits natively in POSIX sh. zsh does NOT split unquoted
+        // expansions (`echo $x` yields one word even for `x='a b'`), so a
+        // bare render silently collapses the fields. zsh's native
+        // equivalent is the `${=...}` flag, which forces splitting on
+        // unquoted parameters.
+        //
+        // GLOBSUBST is the other half, and it is NOT optional: in POSIX sh
+        // an unquoted expansion splits AND the resulting words are
+        // filename-expanded (`y='a* b'` -> `a1 a2 b`). `${=y}` alone
+        // splits without globbing, so `y` would print `a* b` where bash
+        // prints the two matches. With GLOBSUBST the same `${=y}` globs
+        // too, giving byte-identical output. Both options are emitted once
+        // per program (see needs_word_split).
         "split" => match arg(args, 0)? {
             IrExpr::Call { func, args } if func == "getVar" => {
-                Ok(var_ref_to_sh(&raw_arg(args, 0)?, false))
+                Ok(force_split(&var_ref_to_sh(&raw_arg(args, 0)?, false)))
             }
-            IrExpr::Call { func, args } if func == "param" => param_to_sh(args, false),
+            IrExpr::Call { func, args } if func == "param" => {
+                Ok(force_split(&param_to_sh(args, false)?))
+            }
             other => word_to_zsh(other),
         },
         "param" => param_to_sh(args, false),
@@ -3819,8 +4291,8 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
         "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
-        "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-        "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+        "capture" => Ok(format!("\"{}\"", capture_wrap(arrow_to_sh(args)?))),
+        "captureWords" => Ok(capture_wrap(arrow_to_sh(args)?)),
         "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
         "brace" => brace_to_sh(args),
         "join" => join_to_sh(arg(args, 0)?, false),
@@ -4059,7 +4531,12 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#g')"
             ))
         }
-        ":-" | ":=" | ":?" => {
+        // `${x+w}` / `${x-w}` — the "is it set?" probes. Both are native
+        // zsh parameter expansions and splice verbatim; only the word to
+        // substitute is argument 2, exactly like the `:-` family above.
+        // (These reached the fallback and aborted the whole render with
+        // `param op not renderable: "+"`.)
+        "+" | "-" | ":+" | ":-" | ":=" | ":?" => {
             let default = raw_arg(args, 2)?;
             // `${arr:-d}` — bash's array form reads ELEMENT 0 when the
             // array is non-empty (the per-element vars have no scalar)
@@ -4220,6 +4697,10 @@ fn interp_expr_self_quotes(e: &IrExpr) -> bool {
             "arrayIndex" => !matches!(args.get(1), Some(IrExpr::Str(k, _)) if k == "@" || k == "*"),
             _ => true,
         },
+        // A Capture that leads an interpolation (`"$(cmd)"` with no literal
+        // before it) renders WITHOUT its own quotes now, so this path is
+        // what supplies them.
+        IrExpr::Capture { .. } => true,
         _ => true,
     }
 }
@@ -4266,8 +4747,8 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
             "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-            "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(format!("\"{}\"", capture_wrap(arrow_to_sh(args)?))),
+            "captureWords" => Ok(capture_wrap(arrow_to_sh(args)?)),
 
             "arith" => {
                 let raw = raw_arg(args, 0)?;
@@ -4293,17 +4774,17 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         // t21/t56/t73): array element read inside a double-quoted template
         // — the bare `${name_key}` (the template supplies the quotes).
         IrExpr::Index { var, key } => index_to_sh(var, key, false),
-        // The first-class Capture node (core request
-        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
-        // `"$(...)"` rendering as the `capture` call arm.
+        // A cmdsub nested in a double-quoted template must NOT re-open a
+        // quote: the template's own `"` is still held open, so emitting
+        // `"$( … "` closes it early and the rest of the line reparses as
+        // bare words — `unmatched "` at best. The `"$(` spelling is only
+        // correct where the Capture supplies its own quoting (word_to_sh);
+        // here the surrounding interpolation does.
         IrExpr::Capture { expr, .. } => {
             if let Some(lift) = capture_idiom_sh(expr)? {
                 Ok(lift)
             } else {
-                Ok(format!(
-                    "\"$({})\"",
-                    arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
-                ))
+                Ok(capture_wrap(arrow_to_sh(std::slice::from_ref(expr.as_ref()))?))
             }
         }
         other => Err(format!("interp expr not renderable: {other:?}")),
@@ -4993,7 +5474,46 @@ fn arith_to_sh(a: &ArithAst) -> String {
                 format!("$( _num \"${name}\" )")
             }
         }
-        ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
+        ArithAst::Index { var, key } => {
+            // An arithmetic subscript (`$(( a[1] ))`, the A1 Index node) must
+            // read the SAME storage the array emulation writes. The emulated
+            // layout is one scalar per element (`a_0`, `a_1`, …) because zsh
+            // arrays are 1-based and re-indexing the corpus would be a
+            // rewrite; so `a[1]` here is `${a_1}`, not a zsh array subscript
+            // — emitting `a[1]` made zsh read an (unset) real array named
+            // `a` and evaluate to 0, so `echo $(( a[1] + 1 ))` printed 1
+            // instead of 21.
+            // The key itself may be a literal or an expression; only a
+            // literal can be spliced into the element name, which is the
+            // shape the array-assignment lowering produces.
+            let base = var.replace('.', "_");
+            if ARRAY_NAMES.lock().unwrap().contains(&base) {
+                match key.as_ref() {
+                    ArithAst::Num(k) => {
+                        // `$( _num … )` wrapper only when the value is not
+                        // known-numeric; the element vars are the array's
+                        // own assignments, so the same A2 verdict applies.
+                        let elem = format!("{base}_{k}");
+                        if NUM_VARS.lock().unwrap().contains(&elem) {
+                            format!("{elem}")
+                        } else {
+                            format!("$( _num \"${elem}\" )")
+                        }
+                    }
+                    // A non-literal key cannot be named at render time, so
+                    // the element name is built at RUN time: `$((KEY))`
+                    // evaluates the index, and the surrounding eval splices
+                    // it into the element name. Same shape as the
+                    // dynamic-key read in `index_var_key_to_sh`.
+                    other => format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_$(({}))}}\\\"\")",
+                        arith_to_sh(other)
+                    ),
+                }
+            } else {
+                format!("{var}[{}]", arith_to_sh(key))
+            }
+        }
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
             if op == "**" {
@@ -5018,7 +5538,12 @@ fn arith_to_sh(a: &ArithAst) -> String {
             arith_to_sh(else_)
         ),
         ArithAst::Assign { var, op, rhs } => {
-            format!("{var} {op}= {}", arith_to_sh(rhs))
+            // `op` is the COMPLETE assignment operator (`=` / `+=` / `-=`
+            // / `*=` — ir.rs:362), so it must be spliced verbatim. Appending
+            // another `=` turned `let x=5` into `x == 5` and `let x+=3` into
+            // `x +== 3`, both of which zsh rejects ("bad math expression:
+            // operand expected at `= 3'").
+            format!("{var} {op} {}", arith_to_sh(rhs))
         }
         ArithAst::IncDec { var, delta, prefix } => {
             // dash's arithmetic has NO ++/-- — rewrite via assignment
@@ -5046,6 +5571,17 @@ fn arith_to_sh(a: &ArithAst) -> String {
 
 // ── arrows / inline statement sequences ──────────────────────────────
 
+/// Wrap a rendered command in `$( … )`. A heredoc inside the substitution
+/// ends the logical line, so the closing paren belongs AFTER the terminator:
+/// `$(cat <<EOF\nbody\nEOF\n)` — placing it before would truncate the body.
+fn capture_wrap(inner: String) -> String {
+    let bodies = take_heredoc_bodies();
+    if bodies.is_empty() {
+        return format!("$({inner})");
+    }
+    format!("$({inner}\n{bodies})")
+}
+
 fn arrow_to_sh(args: &[IrExpr]) -> Result<String, String> {
     arrow_at(args, 0)
 }
@@ -5058,6 +5594,31 @@ fn arrow_at(args: &[IrExpr], idx: usize) -> Result<String, String> {
 }
 
 /// The stages of a pipeline call: `Array([Arrow, Arrow, ...])`.
+///
+/// Assemble a pipeline's stages into ONE logical line, flushing any
+/// heredoc bodies the stages deferred AFTER the line.
+///
+/// A stage renders its heredoc header in place (`cat <<EOF`) and parks
+/// the body; the `|`s belong on the header line, so the body can only be
+/// appended once every stage is joined. Rendering per-stage and joining
+/// afterwards would splice the body in front of the remaining `|`s.
+fn pipeline_line_to_sh(stages: &[Vec<IrStmt>]) -> Result<String, String> {
+    let mut line = String::new();
+    for (i, stg) in stages.iter().enumerate() {
+        if i > 0 {
+            line.push_str(" | ");
+        }
+        line.push_str(&stmts_inline(stg)?);
+    }
+    let bodies = take_heredoc_bodies();
+    if bodies.is_empty() {
+        return Ok(line);
+    }
+    // The stage line is still OPEN (`cat <<EOF | grep X`) — the body has to
+    // start its own line, and the trailing '\n' is already in the body.
+    Ok(format!("{line}\n{bodies}"))
+}
+
 fn pipeline_stages(args: &[IrExpr]) -> Result<Vec<Vec<IrStmt>>, String> {
     let Some(IrExpr::Array(stages)) = args.first() else {
         return Err("pipeline stages not Array".into());
@@ -5419,6 +5980,39 @@ mod tests {
         assert!(sh.contains("grep_p '\\bbar\\b' f"), "call: {sh}");
     }
 
+    /// An unquoted expansion is the A1 `split` marker, and zsh does NOT
+    /// word-split unquoted expansions the way POSIX sh does — the bare
+    /// render silently collapses `x='a b'` to one word. The split must be
+    /// requested explicitly with zsh's `${=x}` flag.
+    ///
+    /// The expansion is read from the environment rather than assigned, so
+    /// the A1 pass cannot constant-fold it into a literal.
+    #[test]
+    fn unquoted_expansion_forces_word_split() {
+        let sh = render_sh("printf '<%s>\\n' $SPLIT_TEST_VAR");
+        assert!(sh.contains("setopt shwordsplit globsubst"), "setopt: {sh}");
+        assert!(sh.contains("${=SPLIT_TEST_VAR}"), "split flag: {sh}");
+    }
+
+    /// The QUOTED form the core emits elsewhere must not be re-split —
+    /// `printf '<%s>' "$x"` passes one word even for `x='a b'`.
+    #[test]
+    fn quoted_expansion_is_not_split() {
+        let sh = render_sh("printf '<%s>\\n' \"$SPLIT_TEST_VAR\"");
+        assert!(sh.contains("\"$SPLIT_TEST_VAR\""), "quoted form kept: {sh}");
+        assert!(!sh.contains("shwordsplit"), "no split opt: {sh}");
+    }
+
+    /// `force_split` widens `$name` to `${=name}` and nests the flag into
+    /// an already-braced form, leaving quoted/command-substitution words be.
+    #[test]
+    fn force_split_places_the_flag_inside_the_braces() {
+        assert_eq!(force_split("$x"), "${=x}");
+        assert_eq!(force_split("${x#p}"), "${=${x#p}}");
+        assert_eq!(force_split("\"$x\""), "\"$x\"");
+        assert_eq!(force_split("$(cmd)"), "$(cmd)");
+    }
+
     /// `((x++))` as a statement — the zsh-sh-go t29_increment A1 shape
     /// (triage-sh-20260814-032146): Assign with a single target whose
     /// expr is an Arith IncDec on the SAME var (the estree renderer
@@ -5443,6 +6037,107 @@ mod tests {
         assert!(
             sh.contains(": $((((x = x + 1) - 1)))"),
             "IncDec statement: {sh}"
+        );
+    }
+
+    /// `$(readlink -f X)` reaches the IR as Capture{ expr: Arrow([…]) }, so
+    /// needs_readlink must descend through the CAPTURE — not just the Arrow
+    /// it wraps. Without the Capture arm the polyfill prologue is never
+    /// emitted and the render calls an undefined `_readlink`, so the
+    /// substitution silently yields the empty string
+    /// (readlink_example.sh, readlink_relative.sh).
+    #[test]
+    fn cmdsub_readlink_emits_polyfill() {
+        let sh = render_sh("target=$(readlink -f /usr/bin/vi)");
+        assert!(sh.contains("_readlink() {"), "polyfill prologue: {sh}");
+        assert!(sh.contains("_readlink -f /usr/bin/vi"), "call: {sh}");
+    }
+
+    /// The same Capture-descent applies to the other prologue scanners — a
+    /// cmdsub wrapping `cmp` must emit its helper.
+    #[test]
+    fn cmdsub_cmp_emits_polyfill() {
+        let sh = render_sh("d=$(cmp -l a b)");
+        assert!(sh.contains("_cmp() {"), "cmp polyfill: {sh}");
+    }
+
+    /// A process substitution lowers to Redirect{ inner: […] }, so `cmp`
+    /// inside `<( … )` needs the polyfill too — needs_cmp's statement walk
+    /// must descend the redirect body.
+    #[test]
+    fn procsub_cmp_emits_polyfill() {
+        let sh = render_sh("diff <(cmp -l a b) <(echo x)");
+        assert!(sh.contains("_cmp() {"), "cmp polyfill: {sh}");
+    }
+
+    /// A cmdsub nested inside a double-quoted template must NOT re-open a
+    /// quote: the template's `"` is still open, so a second `"$(` closes it
+    /// early and the line fails to parse (`unmatched "`). The cmdsub renders
+    /// bare — the surrounding interpolation supplies the quoting.
+    #[test]
+    fn nested_cmdsub_in_dquote_does_not_reopen_quote() {
+        let sh = render_sh("o=$(echo \"Result: $(echo hi)\")");
+        // exactly one quote pair opens the outer word; no `"$(` inside it
+        assert!(
+            !sh.contains("\"Result: \"$("),
+            "cmdsub must not reopen a quote: {sh}"
+        );
+        assert!(sh.contains("Result: $("), "cmdsub kept inline: {sh}");
+    }
+
+    /// A cmdsub embedded in a string must keep its surrounding quoting, so
+    /// the expansion is not re-split into extra words.
+    ///
+    /// The render no longer carries a literal `"$(` here: the A1 stage folds
+    /// `x="$(echo hi)"` to a plain string, so the meaningful assertion is
+    /// that the result is ONE quoted word with no re-splitting — which is
+    /// what the `${=…}`-style split markers would break.
+    #[test]
+    fn leading_cmdsub_in_dquote_is_quoted() {
+        let sh = render_sh("x=\"pre-$(echo hi)-post\"\necho \"$x\"");
+        assert!(
+            sh.contains("x=\"pre-hi-post\""),
+            "cmdsub folded into one quoted word: {sh}"
+        );
+        assert!(
+            sh.contains("printf '%s\\n' \"$x\""),
+            "value re-read quoted, not re-split: {sh}"
+        );
+    }
+
+    /// zsh exports HOST (short hostname) where bash exports HOSTNAME, and
+    /// bash derives its HOSTNAME from HOST at startup. `${HOSTNAME:-default}`
+    /// therefore silently takes the default under zsh. The bridge restores
+    /// the bash-side value.
+    #[test]
+    fn hostname_param_default_emits_bridge() {
+        let sh = render_sh("m=\"${HOSTNAME:-localhost}\"");
+        assert!(sh.contains("HOSTNAME:="), "hostname bridge: {sh}");
+        assert!(sh.contains("${HOST:-localhost}"), "from HOST: {sh}");
+    }
+
+    /// The bridge is scoped to programs that actually read HOSTNAME — a
+    /// program that never mentions it must not grow the prologue line.
+    #[test]
+    fn hostname_bridge_not_emitted_when_unused() {
+        let sh = render_sh("echo hello");
+        assert!(!sh.contains("HOSTNAME:="), "no stray bridge: {sh}");
+    }
+
+    /// `readlink -m` normalizes a path that need not exist. Building it
+    /// by prepending `/` to each component produced a leading DOUBLE
+    /// slash (`//nonexistent/path` where GNU says `/nonexistent/path`).
+    #[test]
+    fn readlink_m_has_no_double_slash() {
+        let sh = render_sh("p=$(readlink -m /nonexistent/path)");
+        // the accumulator must only add a separator when it is non-empty
+        assert!(
+            sh.contains("_rl_out=${_rl_out:+$_rl_out/}$_rl_c"),
+            "single-slash join: {sh}"
+        );
+        assert!(
+            !sh.contains("_rl_out=$_rl_out/$_rl_c"),
+            "old doubling form gone: {sh}"
         );
     }
 }
