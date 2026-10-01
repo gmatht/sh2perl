@@ -1821,7 +1821,10 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         }
         IrStmt::Warn { expr, .. } => {
             indent(out, d);
-            out.push_str("echo ");
+            // Same arity trap as IrStmt::Output: `print -r` joins argv with
+            // spaces (echo's rule), `printf '%s\n'` would print one line per
+            // split word under `setopt shwordsplit`.
+            out.push_str("print -r -- ");
             out.push_str(&word_to_zsh(expr)?);
             out.push_str(" >&2\n");
             Ok(())
@@ -1854,10 +1857,25 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         }
         IrStmt::Output { value, newline, .. } => {
             indent(out, d);
+            // `print -r --`, not `printf '%s\n'` — printf's format carries
+            // ONE %s, but the value is an ARBITRARY shell word and this
+            // backend runs `setopt shwordsplit` to emulate bash's splitting.
+            // An unquoted `$so` inside it therefore reaches printf as
+            // SEVERAL argv elements (one per split word), so printf cycled
+            // the format once per element and printed one word per LINE:
+            // `echo "  stdout  : $so"` with so="not a tty" came out as
+            // `  stdout  : not` / `a` / `tty`. printf has no way to know the
+            // argv arity it will be handed.
+            //
+            // `print -r --` joins argv with single spaces unconditionally,
+            // which is exactly bash `echo`'s rule, so it is correct for any
+            // arity. `-r` keeps escapes verbatim (bash `echo` does not
+            // interpret them without -e) and `--` stops a leading `-n`
+            // literal being eaten as an option.
             if *newline {
-                out.push_str("printf '%s\\n' ");
+                out.push_str("print -r -- ");
             } else {
-                out.push_str("printf '%s' ");
+                out.push_str("print -rn -- ");
             }
             out.push_str(&word_to_zsh(value)?);
             out.push('\n');
