@@ -478,11 +478,8 @@ fn declared_symbols(src: &str) -> std::collections::HashSet<String> {
                     .find(|(i, c)| *c == '=' || *c == ';')
                     .map(|(i, _)| i)
                     .unwrap_or(rest.len());
-                for (sigil, name) in referenced_symbols(&rest[..binding_end]) {
-                    let _ = sigil;
-                    if !name.is_empty() {
-                        out.insert(name);
-                    }
+                for name in declared_names_in(&rest[..binding_end]) {
+                    out.insert(name);
                 }
                 // Keep sweeping: a single rendered line routinely carries
                 // several declarations (`do { my $a = …; my $b = … }`).
@@ -498,6 +495,90 @@ fn declared_symbols(src: &str) -> std::collections::HashSet<String> {
                 out.insert(name);
             }
         }
+    }
+    out
+}
+
+/// Fix 13 — a `my` must be emitted at most ONCE per symbol.
+///
+/// `declared_symbols` used to answer "is this name bound?" by calling
+/// `referenced_symbols`, which deliberately does not scan `%`: a hash sigil
+/// and a printf conversion are the same two characters in the same place, so
+/// `%d`/`%o` would be read as hash reads and `%` was left out. The consequence
+/// was that `my %words;` — a perfectly good declaration — was INVISIBLE to
+/// the pass, and a later `%words`-bearing read (`$words{$i}` promotes to `%`
+/// in `referenced_symbols`) added a SECOND `my %words;`:
+///
+/// ```perl
+/// my %words;      # the renderer's declaration
+/// my %words;      # Fix 13, because the first one did not count
+/// if (($words{$i}) =~ /…/) { }   # …which now reads an undeclared, shadowed %words
+/// ```
+///
+/// Two `my` of one name in the same scope is not a warning, it is a binding:
+/// the second shadows the first from its own line onward, so everything the
+/// renderer stored in the first `%words` is invisible to every later read —
+/// `case "${words[$counter]}"` matched nothing. And it is a warning on top of
+/// that ("masks earlier declaration in same scope"), which several examples
+/// emit on stderr.
+///
+/// The fix is to collect the DECLARED names over all three sigils. Two
+/// details keep it honest:
+///
+///  * a `%` byte is accepted only when it immediately follows `@name` or
+///    `$name` (the slice forms `$h{%$k}`, `$h{%$k}`), so a printf
+///    conversion or a bare `%` modulo can never be read as a name;
+///  * the first token of a binding list is skipped, because
+///    `my $h = {%$x}` binds `$h` — not `%x` — and binding `%x` here would
+///    mask the real `%x` Fix 13 is about to emit.
+fn declared_names_in(binding_list: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = binding_list.chars().collect();
+    let mut i = 0;
+    // True at a position where a sigil could START a binding-list element —
+    // i.e. not in the middle of a name we are already scanning. Only here may
+    // a bare `%` be a sigil; anywhere else it is printf/modulo syntax.
+    let mut at_element = true;
+    while i < b.len() {
+        let c = b[i];
+        if c != '$' && c != '@' && !(c == '%' && at_element) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                // Still inside a name: a trailing sigil (`@rest`, `%rest`) is
+                // the slice form of the name just read, not a new binding.
+                at_element = false;
+            } else {
+                at_element = true;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 < b.len() && (b[i + 1] == '$' || b[i + 1] == '@' || b[i + 1] == '%') {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        let mut name = String::new();
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == '_') {
+            name.push(b[j]);
+            j += 1;
+        }
+        if name.is_empty() {
+            i = j.max(i + 1);
+            at_element = true;
+            continue;
+        }
+        i = j;
+        // `@rest` / `%rest`: the slice and hash forms of one and the same
+        // array — the binding list gave `$rest`, not a second `%rest`.
+        let trailing_sigil = j < b.len() && (b[j] == '@' || b[j] == '%');
+        if trailing_sigil {
+            i = j + 1;
+            at_element = false;
+            continue;
+        }
+        at_element = false;
+        out.push(name);
     }
     out
 }
@@ -2800,6 +2881,51 @@ mod pgf_tests {
         let src = "use strict;\nprint $never_declared_zz;\n";
         let out = declare_undeclared_vars(src);
         assert!(out.contains("my $never_declared_zz;"), "{out}");
+    }
+
+    /// A hash the renderer already declared must not be declared a second
+    /// time by Fix 13. The second `my` is a binding, not a warning: it
+    /// shadows the first from its own line on, so every earlier store into
+    /// the hash becomes invisible to every later read. This is the shape
+    /// `case "${words[$counter]}"` rendered to, and it made the case match
+    /// nothing.
+    #[test]
+    fn a_declared_hash_is_not_declared_twice() {
+        let src = "use strict;\nmy %words;\nmy $counter = '';\nif (($words{$counter}) =~ /x/) { print 1; }\n";
+        let out = declare_undeclared_vars(src);
+        assert_eq!(
+            out.matches("my %words;").count(),
+            1,
+            "Fix 13 declared an already-declared hash again:\n{out}"
+        );
+    }
+
+    /// The same, through a real render — the pass only sees this text after
+    /// the shared renderer has hoisted its own declarations. Exactly ONE
+    /// `my %words;` may exist: the renderer's. Before the fix there were two,
+    /// and the second shadowed the first.
+    #[test]
+    fn hash_double_declaration_never_reaches_a_real_render() {
+        let src = "case \"${words[$counter]}\" in\n  x) echo match ;;\nesac\n";
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = generate(&prog);
+        assert_eq!(
+            out.matches("my %words;").count(),
+            1,
+            "Fix 13 re-declared %words, shadowing the renderer's own:\n{out}"
+        );
+    }
+
+    /// The `my $h = {%$x}` guard: the binding list binds `$h`, and treating
+    /// `%$x` as a binding would mark `%x` declared and suppress the `my %x;`
+    /// that `use strict` still needs.
+    #[test]
+    fn binding_list_first_token_is_not_a_hash_binding() {
+        let src = "use strict;\nmy $h = {%$x};\nprint $x{0};\n";
+        let out = declare_undeclared_vars(src);
+        assert!(out.contains("my %x;"), "{out}");
     }
 
     /// Regression: a condition-position `redirect` / `block` that the shared

@@ -37343,7 +37343,8 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Label(_name) => {
-            // Label: `name:` — used by Goto.
+            // Label: `name:` — a Goto jump target. A Label on its own is
+            // inert (it only names a position), so dropping it is exact.
             Stmt::ExpressionStatement {
                 expression: Expr::Literal {
                     value: serde_json::Value::Null,
@@ -37352,15 +37353,46 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
-        IrStmt::Goto(_target) => {
-            // Goto: emit a runtime call (the restructure pass normally
-            // resolves gotos; if one reaches here, use the runtime fallback).
-            // Target is unused — the runtime resolves it from state.
+        IrStmt::Goto(target) => {
+            // Goto: REFUSE loudly. The old lowering emitted a bare `null`
+            // literal here, so an un-restructured `goto` was a SILENT
+            // no-op — the program ran straight through the jump and
+            // printed the statements the goto was meant to skip (bat
+            // t06_goto printed `never`; c t27_goto's backward loop ran
+            // once and printed `1` where native prints `3`). The comment
+            // here used to claim "the runtime resolves it from state";
+            // no such runtime helper exists (nothing in
+            // harness/sh2-namespace.mjs resolves a goto), so that was
+            // never true.
+            //
+            // Why refuse rather than restructure: the shared
+            // restructure_goto pass (shir_passes/restructure.rs) already
+            // rewrites the C goto shapes (c-sh-go t27/t30/t31 — backward
+            // guarded, mid-test, forward cleanup) into structured flow at
+            // A1 ingress, and the estree target deliberately SKIPS that
+            // pass (otranspilerl/src/lib.rs: `if kind != "estree"`)
+            // because the estree emitter was expected to handle goto
+            // natively. A survivor here is a goto shape OUTSIDE that
+            // pass's subset — the frontend must be fixed or the pass
+            // widened, and guessing produces wrong output. Fail closed,
+            // matching the sh (`# TODO(unsupported): goto ... not
+            // restructured`) and java (`goto not supported by the java
+            // renderer`) backends. `sh2.unsupported` throws at runtime and
+            // is flagged by the structural gate.
             Stmt::ExpressionStatement {
-                expression: Expr::Literal {
-                    value: serde_json::Value::Null,
-                    raw: None,
-                    regex: None,
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "sh2".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "unsupported".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![str_lit(&format!("goto {target}"))],
+                    optional: false,
                 },
             }
         }
@@ -57513,6 +57545,76 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(
             js.contains("\"then\""),
             "the program-final write's status IS the exit code and must stay live: {js}"
+        );
+    }
+
+    /// A `Goto` that survives to the ESTree renderer used to lower to a
+    /// bare `null` literal — a SILENT no-op, so the program ran straight
+    /// through the jump and executed the statements the goto was meant to
+    /// skip (bat t06_goto printed `never`; c t27_goto's backward loop ran
+    /// once and printed `1` where native prints `3`). The emitter's own
+    /// comment claimed "the runtime resolves it from state"; no such
+    /// runtime helper exists. It must now REFUSE loudly via
+    /// `sh2.unsupported`, matching the sh and java backends.
+    ///
+    /// Built at the IR level (not from bash source) because no shell source
+    /// produces a Goto — only frontends (c-sh-go, bat-sh-go) do, and both
+    /// emit it via the A1 ingress, not the shell parser.
+    #[test]
+    fn goto_lowers_to_unsupported_not_a_silent_null() {
+        let blank = || IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let prog = IrProgram {
+            stmts: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("before")])],
+                }),
+                IrStmt::Goto("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("never")])],
+                }),
+                IrStmt::Label("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("after")])],
+                }),
+            ],
+            ..blank()
+        };
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"name\":\"unsupported\""),
+            "an un-restructured goto must refuse loudly, not lower to a silent null: {js}"
+        );
+        assert!(
+            js.contains("goto skip"),
+            "the refusal must NAME the jump it cannot lower: {js}"
+        );
+        // the Label arm stays an inert `null` — it only names a position,
+        // so dropping it is exact. Pinned so a future Label fix does not
+        // start refusing on a node that needs no runtime support.
+        let label_only = IrProgram {
+            stmts: vec![IrStmt::Label("skip".to_string())],
+            ..blank()
+        };
+        let js2 = serde_json::to_string(&shir_to_estree(&label_only)).unwrap();
+        assert!(
+            !js2.contains("\"name\":\"unsupported\""),
+            "a lone Label is inert and must NOT refuse: {js2}"
         );
     }
 
