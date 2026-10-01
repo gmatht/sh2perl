@@ -68,6 +68,7 @@ fn post_pass(src: &str) -> String {
     let out = fix_cmd_capture_split(&out);
     let out = fix_for_array_iterand(&out);
     let out = fix_for_capture_paren(&out);
+    let out = fix_glob_sentinel_in_for_iterand(&out);
     let out = fix_bareword_words(&out);
     let out = fix_condition_booleans(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
@@ -129,7 +130,7 @@ fn fix_condition_booleans_in_line(line: &str) -> String {
             // Guard on the character that would have preceded a real
             // comparison, so an `== 0` tail can never be matched here.
             let preceded_by_comparison = fixed[..start].trim_end().ends_with('=')
-                || fixed[..start].trim_end().ends_with('!');
+                || fixed[..start].trim_end().ends_with('!')
                 || fixed[..start].trim_end().ends_with('<')
                 || fixed[..start].trim_end().ends_with('>')
                 || fixed[..start].trim_end().ends_with('~');
@@ -670,6 +671,107 @@ fn fix_for_capture_paren(src: &str) -> String {
         out.push_str(split_expr);
         out.push(')');
         rest = &rest[inner_close + 1..];
+    }
+}
+
+// ── Fix 20 — the core's GLOB sentinel must not survive into a Perl string ──
+//
+// An unquoted glob word is tagged by the core with a `\x01SH2GLOB\x01`
+// sentinel so a renderer can tell "expand this pattern" from "this is a
+// literal" (sh_backend.rs / java_backend.rs strip it; the shared
+// `render_word` in ir.rs strips it with `glob(…)`).
+//
+// The BRACE-EXPANSION path is the one place the Perl side never sees that
+// strip: `render_brace_iter` builds its item list from the brace word's own
+// prefix, quotes each result, and emits them as the `for` iterand — so the
+// sentinel rides along inside the quotes:
+//
+//   sh:  for f in *.{txt,log,dat}; do case "$f" in *.txt) …
+//   pl:  for my $__f (("\x01SH2GLOB\x01*.txt", "\x01SH2GLOB\x01*.log", …)) {
+//
+// Every element then matches nothing: `case` sees a literal path that cannot
+// exist, so the whole loop prints `Text file: \x01SH2GLOB\x01*.txt` — the
+// sentinel is *user-visible output*, not just a wrong branch. It is written
+// straight to stdout, so this is a byte-for-byte gate failure on
+// 064_19_complex_pattern_matching_extended_globs and 064_hard_to_generate
+// (and the same shape in 000__04h, whose glob runs through an array instead).
+//
+// The fix is the shared renderer's own convention applied to the one
+// rendering that skipped it: a sentinel-tagged item is a glob to be
+// EXPANDED, so it renders as `glob('…')` — the same form `render_word`
+// produces for a non-braced glob. Left alone, `glob` returns the empty list
+// for a non-matching pattern, which is also what bash does with `nullglob`
+// off for the *word count* in this position, so a pattern that matches
+// nothing degrades the same way on both sides.
+fn fix_glob_sentinel_in_for_iterand(src: &str) -> String {
+    const PREFIX: &str = "for my $";
+    const SENTINEL: &str = "\u{1}SH2GLOB\u{1}";
+    if !src.contains(SENTINEL) {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(at) = rest.find(PREFIX) else {
+            out.push_str(rest);
+            return out;
+        };
+        // To the end of the `for … (…)` header: the iterand list is a single
+        // rendered line, and the sentinel only ever appears inside it.
+        let header_end = rest[at..].find('\n').map(|i| at + i).unwrap_or(rest.len());
+        let (head, tail) = rest.split_at(header_end);
+        out.push_str(&strip_glob_in_header(head));
+        rest = tail;
+    }
+}
+
+/// Replace every sentinel-tagged `'…'` list element in one `for` header with
+/// the `glob(…)` expansion. Elements that are not sentinel-tagged are left
+/// byte-identical, so a plain literal list is not ours to touch.
+fn strip_glob_in_header(head: &str) -> String {
+    const SENTINEL: &str = "\u{1}SH2GLOB\u{1}";
+    let mut out = String::with_capacity(head.len());
+    let mut rest = head;
+    loop {
+        let Some(at) = rest.find(SENTINEL) else {
+            out.push_str(rest);
+            return out;
+        };
+        // The sentinel is followed by the pattern inside a single-quoted
+        // Perl string; take that whole element. The pattern cannot contain
+        // `'` (the renderer escapes it), so the next `'` is the terminator.
+let after = at + SENTINEL.len();
+        let Some(close_rel) = rest[after..].find('\'') else {
+            out.push_str(rest);
+            return out;
+        };
+        let close = after + close_rel;
+        let pattern = &rest[after..close];
+        // The element is a single-quoted Perl string, and the sentinel sits
+        // INSIDE it — so the element opens one quote BEFORE the sentinel and
+        // closes at the quote found above. `glob('…')` brings its own
+        // quotes, so BOTH of the element's quotes go with the sentinel:
+        // consuming only the closing one left the opening quote in place and
+        // produced `'glob('*.txt')'`, which is a quoted string that is not a
+        // call — the glob then matched nothing and the loop printed NOTHING
+        // (064_19 / 064_hard_to_generate / 000__04h). Consume the opener by
+        // requiring the byte before the sentinel to be `'` and stepping back
+        // over it; if it is not (an unquoted element — nothing to undo), the
+        // sentinel is dropped on its own and the element's quoting is
+        // already correct, so the byte before it is left alone.
+        let open = if at > 0 && rest.as_bytes()[at - 1] == b'\'' {
+            Some(at - 1)
+        } else {
+            None
+        };
+        out.push_str(match open {
+            Some(o) => &rest[..o],
+            None => &rest[..at],
+        });
+        // The pattern itself keeps the renderer's own `\'` escaping,
+        // unchanged, so a quote in a pattern still cannot break out.
+        out.push_str(&format!("glob('{}')", pattern.replace('\'', "\\\\'")));
+        rest = &rest[close + 1..];
     }
 }
 
@@ -1660,6 +1762,107 @@ fn unquote_operand(e: &IrExpr) -> Option<String> {
     Some(inner.to_string())
 }
 
+// ── Fix 15 — a `test` operand's `${v+word}` must keep its WORD ───────────
+//
+// `test -n "${MYVAR+set}"` is the standard set/unset test. The `param` node
+// arrives intact (`param("+", "MYVAR", "set")`), but the shared renderer's
+// test-flattening pass rebuilds the operand as expansion TEXT and its
+// re-parse of `${MYVAR+set}` comes back EMPTY, so the operand is dropped and
+// the condition collapses to `test -n` with a missing argument:
+//
+//   sh:  if test -n "${MYVAR+set}"; then …   # FALSE when MYVAR is unset
+//   pl:  if length('-n') { … }               # `length` of the FLAG: TRUE
+//
+// `length('-n')` is true whatever the variable is, so the guard fires for an
+// UNSET variable and the branch is inverted (variable-plus-operator.sh printed
+// "MYVAR is set" where bash prints nothing).
+//
+// The fix is to replace the operand with the DECISION bash's `+` operator
+// makes, expressed in Perl the renderer can evaluate: `${v+word}` is defined
+// (and equal to `word`) iff `v` is SET — including set-but-empty — which is
+// exactly the renderer's own `=` arm spelling. So the operand becomes
+// `param("=", name, word)`:
+//
+//   set (even empty) → $MYVAR            ("= " keeps the value, as bash's does)
+//   unset            → ($MYVAR = 'set')  (assign, so it is non-empty)
+//
+// and `test -n` then measures the operand, which is what bash measures. The
+// `${v+word}` in any other position (an assignment RHS, an `echo` word) is
+// NOT rewritten: there the VALUE is wanted, not the set/unset decision, and
+// that is a different defect with a different fix.
+fn fix_test_set_test_operands(expr: &IrExpr) -> IrExpr {
+    // Only a `test`/`[` COMMAND's operand list carries this shape. It
+    // reaches us as `exec("test", Array[…])` (the neutral command node), so
+    // the command name — not the callee — is what identifies it.
+    let IrExpr::Call { func, args } = expr else {
+        return expr.clone();
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return expr.clone();
+    }
+    let Some(IrExpr::Str(cmd, _)) = args.first() else {
+        return expr.clone();
+    };
+    if !matches!(cmd.as_str(), "test" | "[") {
+        return expr.clone();
+    }
+    let Some(IrExpr::Array(words)) = args.get(1) else {
+        return expr.clone();
+    };
+    let mut changed = false;
+    let mut fixed_words = Vec::with_capacity(words.len());
+    for w in words {
+        match set_test_operand(w) {
+            Some(replacement) => {
+                changed = true;
+                fixed_words.push(replacement);
+            }
+            None => fixed_words.push(w.clone()),
+        }
+    }
+    if !changed {
+        return expr.clone();
+    }
+    let mut fixed = args.clone();
+    fixed[1] = IrExpr::Array(fixed_words);
+    IrExpr::Call {
+        func: func.clone(),
+        args: fixed,
+    }
+}
+
+/// The `param` rewrite for one `test` operand, or `None` when it is not a
+/// bare `${v+word}` / `${v+set}` set-test.
+fn set_test_operand(w: &IrExpr) -> Option<IrExpr> {
+    let IrExpr::Call { func, args } = w else {
+        return None;
+    };
+    if func != "param" || args.len() != 3 {
+        return None;
+    }
+    // `+` (set ⇒ word) is the set/unset DECISION. The `:+` twin is a value
+    // (`${v:+word}` yields the word only when v is set AND non-empty) and
+    // already has a renderer arm; `-`/`:-` likewise. Rewriting them would
+    // change their value, so only the bare `+` is in scope.
+    match args.first().and_then(crate::ir::call_arg_str).as_deref() {
+        Some("+") => {}
+        _ => return None,
+    }
+    let name = args.get(1).and_then(crate::ir::call_arg_str)?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let word = args.get(2).and_then(crate::ir::call_arg_str)?;
+    Some(IrExpr::Call {
+        func: "param".to_string(),
+        args: vec![
+            IrExpr::Str("=".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Str(name, crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Str(word, crate::ir::StrStyle::DoubleQuoted),
+        ],
+    })
+}
+
 // ── Fix 7 — an `eval` payload is SHELL TEXT, not arguments ────────────
 //
 // `eval "y=$x+1"` is not a call with a string argument. Its payload is shell
@@ -1922,6 +2125,8 @@ fn fix_expr(e: &IrExpr) -> IrExpr {
             // (`${s/${a}/b}`), and the outer unquoting must not hide the
             // inner one.
             let corrected = fix_param_pattern_operands(e);
+            // Fix 15: a `test` operand's `${v+word}` must keep its operand.
+            let corrected = fix_test_set_test_operands(&corrected);
             match corrected {
                 IrExpr::Call { func, args } => IrExpr::Call {
                     func,
@@ -2390,15 +2595,41 @@ fn fix_cond(cond: &IrExpr, fns: &std::collections::HashSet<String>) -> IrExpr {
             let is_local_fn = exec_cmd_name(args)
                 .map(|n| fns.contains(n))
                 .unwrap_or(false);
+            // Fix 15 must also run HERE, not only inside `fix_expr`: a
+            // condition reaches the renderer through `fix_cond`, which
+            // rebuilds the `test` call from `args.clone()` and never calls
+            // `fix_expr` at all. So in condition position the
+            // `test -n "${v+word}"` operand rewrite was unreachable, and the
+            // renderer flattened `test -n` to `length('-n')` — testing the
+            // FLAG, which is always non-empty, so the branch fired for an
+            // UNSET variable (variable-plus-operator.sh printed "MYVAR is
+            // set" where bash prints nothing). The rewrite is the same
+            // narrow one `fix_expr` applies; it is not a blanket `fix_expr`,
+            // because this arm's other rewrites are about local-function
+            // detection, not operand shape. A local-function call is left
+            // exactly as it was, so `__sh_fn_status` is still not handed a
+            // rewritten operand.
+            let mut fixed_args = args.clone();
+            if !is_local_fn {
+                if let IrExpr::Call {
+                    args: rewritten, ..
+                } = fix_test_set_test_operands(&IrExpr::Call {
+                    func: func.clone(),
+                    args: args.clone(),
+                })
+                {
+                    fixed_args = rewritten;
+                }
+            }
             if is_local_fn {
                 IrExpr::Call {
                     func: "__sh_fn_status".to_string(),
-                    args: args.clone(),
+                    args: fixed_args,
                 }
             } else {
                 IrExpr::Call {
                     func: func.clone(),
-                    args: args.clone(),
+                    args: fixed_args,
                 }
             }
         }
@@ -2797,6 +3028,56 @@ mod no_output_loss_tests {
         // untouched so Fix 10 (which unwraps the `split` instead) owns it.
         let src = "for my $__f ((join(' ', split(/\\s+/, __sh_pipe_capture(q('cmd'))))) {\n";
         assert_eq!(fix_for_array_iterand(src), src);
+    }
+
+    // ── Fix 20 — the GLOB sentinel in a `for` iterand ──────────────────
+
+    #[test]
+    fn glob_sentinel_in_for_iterand_becomes_an_expansion() {
+        // The exact shape `render_brace_iter` emits for `for f in *.{txt,log,dat}`.
+        // The sentinel is user-VISIBLE: the case arms below cannot match it, so
+        // the loop printed the marker itself. The fix must remove every byte of
+        // it, not just re-quote it.
+        let src = "for my $__f (('\u{1}SH2GLOB\u{1}*.txt', '\u{1}SH2GLOB\u{1}*.log')) {\n";
+        let out = fix_glob_sentinel_in_for_iterand(src);
+        assert!(
+            !out.contains("SH2GLOB"),
+            "the sentinel survived into the emitted program: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{1}'),
+            "the magic bytes survived into the emitted program: {out:?}"
+        );
+        assert_eq!(
+            out,
+            "for my $__f ((glob('*.txt'), glob('*.log'))) {\n"
+        );
+        // The element's OWN quotes must be consumed too. A previous version
+        // kept the opening quote and emitted `('glob('*.txt')', …)`: the glob
+        // then matched nothing and the loop silently printed nothing, while
+        // this same assertion still passed because the expected string was
+        // never compared against the real element shape. Assert the exact
+        // bytes, and assert no nested-quote string survived.
+        assert!(
+            !out.contains("'glob("),
+            "the element quotes survived around the glob call: {out:?}"
+        );
+    }
+
+    #[test]
+    fn glob_sentinel_fix_leaves_an_untagged_list_alone() {
+        // A plain literal list is not ours: every element stays byte-identical
+        // so an ordinary `for x in a b c` is byte-for-byte unchanged.
+        let src = "for my $__x (('a', 'b', 'c')) {\n";
+        assert_eq!(fix_glob_sentinel_in_for_iterand(src), src);
+    }
+
+    #[test]
+    fn glob_sentinel_fix_leaves_a_non_for_line_alone() {
+        // The pass is anchored on the `for my $` header. The same sentinel in
+        // another position belongs to whichever fix owns that position.
+        let src = "my @x = ('\u{1}SH2GLOB\u{1}*.txt');\n";
+        assert_eq!(fix_glob_sentinel_in_for_iterand(src), src);
     }
 
     #[test]
