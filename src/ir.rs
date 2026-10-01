@@ -8514,7 +8514,11 @@ fn perl_compare_op(op: &str) -> &'static str {
 /// `${…}` text → Perl via the shared `render_param` (the test-flattened
 /// form keeps the raw expansion). Returns None when it isn't a plain
 /// parameter expansion.
-fn param_text_to_perl(tok: &str) -> Option<String> {
+///
+/// `pub(crate)`: `src/transforms/shir_native_stmt.rs` calls this from the
+/// `-n`/`-z` parameter-expansion lowering, which needs the expansion's VALUE
+/// rather than its text.
+pub(crate) fn param_text_to_perl(tok: &str) -> Option<String> {
     let inner = tok.strip_prefix("${")?.strip_suffix('}')?;
     if inner.is_empty() {
         return None;
