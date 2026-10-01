@@ -1968,15 +1968,27 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
     // single target is the SAME var the arith mutates (the assignment
     // wrapper would clobber the side effect with the expression's value
     // — `x=$((x++))` assigns the OLD value back). The statement's value
-    // is discarded, so `: $((...))` keeps exactly the increment (the `:`
-    // swallows the expansion result — a bare `$((...))` line would try
-    // to RUN the value as a command: "1: not found").
+    // is discarded — see the `(( ... ))` form's own comment below for why
+    // the statement must be an arithmetic COMMAND and not `: $((...))`.
     if targets.len() == 1
         && targets[0].indices.is_empty()
         && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
     {
         let IrExpr::Arith(a) = expr else { unreachable!() };
-        return Ok(format!(": $(({}))", arith_to_sh(a)));
+        // `(( ... ))` — the arithmetic COMMAND — not `: $(( ... ))`.
+        //
+        // Both are needed for different reasons, and using `:` loses one:
+        // a bare `$((...))` LINE would try to RUN the value as a command
+        // ("2: not found"), so the expression must be hidden from the
+        // command position. But `: $((...))` makes `:` the command, and `:`'
+        //s own exit status (always 0) shadows the arithmetic's. bash's
+        // `((i++))` reports the OLD value — `i=0; ((i++))` exits 1 — so
+        // `arith-postfix-status.sh` printed post0=0 instead of post0=1.
+        //
+        // zsh's `(( ... ))` is the same arithmetic command bash has: it
+        // discards the value (nothing is executed) AND carries the
+        // expression's status, so one form covers both requirements.
+        return Ok(format!("(({}))", arith_to_sh(a)));
     }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
@@ -3377,10 +3389,18 @@ fn collect_lifted_fns(prog: &IrProgram) -> HashSet<String> {
 }
 
 /// True when `x` is a literal integer — a `return` of one is a real status.
+///
+/// An `IrExpr::Arith` is NOT one, even though it evaluates to an integer: the
+/// lift it came from is `echo $((x * y))` → `return $((x * y))`, whose value
+/// is meant to reach the caller through the `fnValue` substitution on stdout.
+/// Returning it as a status would satisfy zsh (a bare `return $((...))` does
+/// set $? to 12) but the call site's `$(mul_xy 3 4)` then captures NOTHING and
+/// the program prints an empty line. An arithmetic expression is also never a
+/// useful exit status — the value is a payload, not a code — so treating it as
+/// a literal only ever mis-classifies the lift.
 fn is_int_literal(x: &IrExpr) -> bool {
     match x {
         IrExpr::Str(s, _) => s.parse::<i64>().is_ok(),
-        IrExpr::Arith(_) => true,
         _ => false,
     }
 }
@@ -3628,28 +3648,35 @@ fn exec_line_to_sh(
                 let joined = words.join(" ");
                 match s.as_str() {
                     "-n" => {
-                        // bash: args joined by a single space, no newline
+                        // bash: args joined by a single space, no newline.
+                        // print's -n (no trailing newline) is the zsh-native
+                        // form and, unlike a printf '%s' per rendered word,
+                        // it does not depend on an arg count that a
+                        // concatenated word can inflate (see the plain-echo
+                        // arm below).
                         if rest.is_empty() {
-                            return Ok("printf '%s'".into());
+                            return Ok("print -rn -- ".into());
                         }
-                        let fmt = rest.iter().map(|_| "%s").collect::<Vec<_>>().join(" ");
-                        return Ok(format!("printf '{fmt}' {joined}"));
+                        return Ok(format!("print -rn -- {joined}"));
                     }
                     "-e" => {
-                        // bash: backslash escapes interpreted, trailing newline
+                        // bash: backslash escapes interpreted, trailing newline.
+                        // print WITHOUT -r is the escape-interpreting form, so
+                        // it is correct as-is: no %b arity to over- or
+                        // under-count (see the plain-echo arm below).
                         if rest.is_empty() {
-                            return Ok("printf '\n'".into());
+                            return Ok("print --".into());
                         }
-                        let fmt = rest.iter().map(|_| "%b").collect::<Vec<_>>().join(" ");
-                        return Ok(format!("printf '{fmt}\\n' {joined}"));
+                        return Ok(format!("print -- {joined}"));
                     }
                     "-E" => {
-                        // bash: escapes NOT interpreted, trailing newline
+                        // bash: escapes NOT interpreted, trailing newline.
+                        // Same verbatim semantics as the plain-echo arm, so
+                        // print -r is the exact match (and arity-free).
                         if rest.is_empty() {
-                            return Ok("printf '\n'".into());
+                            return Ok("print -r --".into());
                         }
-                        let fmt = rest.iter().map(|_| "%s").collect::<Vec<_>>().join(" ");
-                        return Ok(format!("printf '{fmt}\\n' {joined}"));
+                        return Ok(format!("print -r -- {joined}"));
                     }
                     _ => {}
                 }
@@ -3663,21 +3690,29 @@ fn exec_line_to_sh(
             }
             let joined = words.join(" ");
             // dash's echo INTERPRETS backslashes, bash's does not — the
-            // printf form keeps the bytes verbatim for any arg whose
+            // verbatim-print form keeps the bytes for any arg whose
             // RUNTIME value can contain backslashes (quoted vars,
-            // cmdsubs) or that already shows a literal one. `$@`/`$*`
-            // list args are excluded (the %s count is unknowable).
-            // all-quoted args only: printf with several args prints
-            // separate LINES, while `echo $(ls)` joins the split words
-            // with a space — an unquoted expansion keeps the bare echo
-            let needs_printf = !words.is_empty()
+            // cmdsubs) or that already shows a literal one.
+            //
+            // `print -r --` is zsh's verbatim `echo`: no escape expansion
+            // (the -r) and no option parsing (the --), so a leading `-n`
+            // literal prints as itself. It does NOT have printf's
+            // %s-arity trap: the earlier printf lowering emitted ONE %s per
+            // *rendered word*, but a word like `"--- ["$label"] ---"` is a
+            // concatenation of a literal and an expansion and becomes THREE
+            // argv elements at run time. printf then cycles the format once
+            // per argument and prints one word per LINE — `echo "not a tty"`
+            // rendered as `not`/`a`/`tty`. `print -r --` joins argv with
+            // spaces unconditionally, which is exactly echo's rule, and it
+            // needs no arity to be right (it also leaves a literal `%`
+            // alone, which printf would have read as a conversion).
+            let needs_verbatim = !words.is_empty()
                 && words.iter().all(|w| {
                     w.contains('\\')
                         || (w.starts_with('"') && !w.contains("$@") && !w.contains("$*"))
                 });
-            if needs_printf {
-                let fmt = words.iter().map(|_| "%s").collect::<Vec<_>>().join(" ");
-                return Ok(format!("printf '{fmt}\\n' {joined}"));
+            if needs_verbatim {
+                return Ok(format!("print -r -- {joined}"));
             }
         }
     }
@@ -4858,6 +4893,25 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                         // `${x:off:0}` — always empty
                         return Ok("$(printf '')".into());
                     }
+                    if lenn < 0 {
+                        // A NEGATIVE length is measured from the END, and the
+                        // end does NOT move with the offset: `${x:6:-3}` is
+                        // `wo` and `${x:6:-4}` is `w`, i.e. the last |len|
+                        // chars intersected with the tail from off. The old
+                        // arithmetic turned it into the cut range `1--2`,
+                        // which cut rejects ("invalid byte or character
+                        // range", rc 1) and the substitution came out empty.
+                        // The exclusive end INDEX is `#name + len` (verified
+                        // against bash over off×len). When the two cross (the
+                        // offset starts past the end) cut reports the
+                        // decreasing range on stderr and yields the empty
+                        // string, which is bash's answer there too.
+                        let start = offn.max(0) + 1;
+                        let range = format!("{start}-$(( ${{#{name}}} + ({lenn}) ))");
+                        return Ok(format!(
+                            "$(printf '%s' \"${{{name}}}\" | cut -c{range})"
+                        ));
+                    }
                     let start = offn + 1;
                     let range = format!("{start}-{}", offn + lenn);
                     return Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"));
@@ -5768,6 +5822,43 @@ fn arith_rewrite(t: &str) -> String {
             i = j;
             continue;
         }
+        // Array SUBSCRIPT inside a string-carried arithmetic expression
+        // (`$(( a[1] + a[2] ))`). zsh evaluates `a[1]` against a REAL array
+        // named `a`, but the array emulation stores one scalar per element
+        // (`a_0`, `a_1`, …) because zsh arrays are 1-based. The subscript
+        // therefore resolved to 0 and `[ 1 -lt 0 ]` took the wrong branch.
+        // The element name is built at RUN time (the key is an expression,
+        // so it cannot be named here) — the same eval seam the `$`-bearing
+        // Str arm uses via `index_var_key_to_sh`.
+        //
+        // This must precede the plain-identifier arm below: that arm stops at
+        // the identifier's end and would consume only `a`, leaving `[1]` to
+        // be copied through as literal text.
+        if (c.is_ascii_alphabetic() || c == b'_' as char) && i + 1 < b.len() && b[i + 1] == b'[' {
+            let mut j = i;
+            while j < b.len() && ident(b[j]) {
+                j += 1;
+            }
+            // the key runs to the matching `]`; an arithmetic subscript never
+            // contains `]` itself, so the first close wins
+            match (j..b.len()).find(|&k| b[k] == b']') {
+                Some(close) => {
+                    let base = &t[i..j];
+                    let key = &t[j + 1..close];
+                    if ARRAY_NAMES.lock().unwrap().contains(base) {
+                        out.push_str(&index_var_key_to_sh(base, key));
+                    } else {
+                        out.push_str(&t[i..close + 1]);
+                    }
+                    i = close + 1;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            continue;
+        }
         out.push(c);
         i += 1;
     }
@@ -6496,9 +6587,66 @@ mod tests {
             sh.contains("x=\"pre-hi-post\""),
             "cmdsub folded into one quoted word: {sh}"
         );
+        // The verbatim-print lowering replaced the old `printf '%s\n' "$x"`
+        // form (printf's %s arity under-counted a concatenated word and
+        // split it across lines). The property under test is unchanged: the
+        // value is re-read as ONE quoted word, with no re-splitting.
         assert!(
-            sh.contains("printf '%s\\n' \"$x\""),
+            sh.contains("print -r -- \"$x\""),
             "value re-read quoted, not re-split: {sh}"
+        );
+        assert!(
+            !sh.contains("${=x}"),
+            "no re-split marker on a quoted read: {sh}"
+        );
+    }
+
+    /// A quoted literal CONCATENATED with an expansion is ONE shell word,
+    /// but several argv elements. The old `echo` lowering built the printf
+    /// format from one `%s` per *rendered word*, so printf cycled the format
+    /// once per argv element and printed one word per line: `echo "--- [$l]"`
+    /// became `---` / `[LAB]` / `---` on three lines. `print -r --` joins argv
+    /// with spaces unconditionally and needs no arity.
+    #[test]
+    fn echo_concatenated_word_is_not_split_across_lines() {
+        // The corpus shape from tty-cmdsub.sh: a literal glued to a variable
+        // whose VALUE holds spaces ("not a tty"). That is one shell word but
+        // two+ argv elements, which is exactly what printf's per-word %s
+        // arity got wrong.
+        let sh = render_sh(
+            "so=\"not a tty\"\necho \"  stdout  : ${so}\"\n\
+             label=LAB\necho \"--- [${label}] ---\"",
+        );
+        for want in [
+            "print -r -- \"  stdout  : \"",
+            "print -r -- \"--- [\"",
+        ] {
+            assert!(sh.contains(want), "verbatim print for {want:?}: {sh}");
+        }
+        // The trap only fires when a format has fewer %s than argv elements,
+        // so a printf form here is the bug for a concatenated word.
+        assert!(
+            !sh.contains("printf '%s"),
+            "no printf under-count risk on a concatenated word: {sh}"
+        );
+    }
+
+    /// The core's echo-return-lift turns a trailing `echo $((x*y))` into
+    /// `return $((x*y))` and the call site into `echo $(mul_xy 3 4)`. zsh sets
+    /// $? from `return $((...))` but writes NOTHING to stdout, so the
+    /// substitution captures an empty string and the program prints a blank
+    /// line. The value must travel through the substitution, so the callee is
+    /// classified as lifted and prints instead.
+    #[test]
+    fn arith_return_is_a_lifted_value_not_a_status() {
+        let sh = render_sh("mul_xy() {\n  x=$1\n  y=$2\n  echo $((x * y))\n}\nmul_xy 3 4\n");
+        assert!(
+            sh.contains("print") || sh.contains("echo $((("),
+            "callee prints the value rather than returning a status: {sh}"
+        );
+        assert!(
+            !sh.contains("return $((($( _num"),
+            "arithmetic payload is not emitted as a return status: {sh}"
         );
     }
 
