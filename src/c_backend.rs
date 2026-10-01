@@ -25531,7 +25531,19 @@ fn param_copy_alias(
         let mut cargs = Vec::new();
         for p in parts {
             match p {
-                Part::Lit(t) => fmt.push_str(&t),
+                // A LITERAL `%` IN THE TEXT IS PART OF THE FORMAT STRING.
+                // `echo "${pct}% done"` lowers to printf("%s%% done") —
+                // the interpolation contributes the `%s` and the literal
+                // `%` must be doubled or C reads it as the start of a
+                // conversion. Bash has no such rule, so the source
+                // contains a bare `%` and the emitted format carried it
+                // through: `printf("...(%s%)", ...)` is
+                // "unknown conversion type character ')' in format" from
+                // gcc/tcc, and — worse — `printf("%s% y", "A")` prints
+                // "A% y" on glibc only by luck of the following space.
+                // Doubling every literal `%` is the standard escape and is
+                // correct regardless of what precedes it.
+                Part::Lit(t) => fmt.push_str(&t.replace('%', "%%")),
                 Part::Arg(v, spec) => match spec {
                     // numeric: the spec already matches the operand's
                     // proven width — cast only when the type is unproven
