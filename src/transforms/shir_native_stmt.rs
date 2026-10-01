@@ -2166,7 +2166,7 @@ fn native_cat_herestring(st: &mut IrStmt) -> bool {
     };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(content, StrStyle::Raw),
+            value: IrExpr::Str(content, StrStyle::DoubleQuoted),
             newline: true,
             target: None,
         },
