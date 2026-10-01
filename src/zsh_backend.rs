@@ -13,8 +13,8 @@
 //! on stdout with no sh2.*/TODO stub markers — so every construct lowers
 //! to REAL zsh syntax (no stubs).
 
-use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt, StrStyle};
-use std::collections::HashSet;
+use crate::ir::{ArithAst, AssignTarget, BinOpKind, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt, StrStyle};
+use std::collections::{BTreeSet, HashSet};
 
 lazy_static::lazy_static! {
     /// Array base names seen in the program (setArray/arrayLen/arrayIndex/
@@ -144,7 +144,10 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
         for st in sts {
             match st {
                 IrStmt::Expr(e) => expr_names(e, names),
-                IrStmt::Ext(_) => {}
+                // A ForEachLine body holds real statements (a `grep -P` in
+                // `grep P F | …`, a `readlink` in `cat $(readlink …)`), so
+                // the scanner must descend or the polyfill is never emitted.
+                IrStmt::Ext(_) => walk(foreach_line_body(st), names),
                 IrStmt::Assign { expr, targets, .. } => {
                     expr_names(expr, names);
                     for t in targets {
@@ -406,7 +409,7 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
         for st in sts {
             let hit = match st {
                 IrStmt::Expr(e) => expr_uses_arr(e),
-                IrStmt::Ext(_) => false,
+                IrStmt::Ext(_) => walk(foreach_line_body(st)),
                 IrStmt::Assign { expr, .. } => expr_uses_arr(expr),
                 IrStmt::If {
                     cond,
@@ -506,8 +509,229 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
     walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
 }
 
-/// Render a ShIR program to `sh` source. `Err` on a construct outside the
+/// Render a ShIR program to `zsh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
+
+/// zsh parameters that are tied to live shell state, so a bash program
+/// assigning them as ordinary variables silently changes the shell itself.
+/// The array-tied ones (`path` ↔ PATH) are the dangerous case: they rewrite
+/// the command search path and every later external command fails.
+const TIED_SCALARS: &[&str] = &[
+    "path",
+    "cdpath",
+    "manpath",
+    "mailpath",
+    "module_path",
+    "psvar",
+    "fignore",
+    "prompt",
+    "status",
+    "options",
+    "commands",
+    "functions",
+    "history",
+    "jobdirs",
+    "namedirs",
+    "reswords",
+    "watch",
+    "signals",
+];
+
+/// The tied scalars this program mentions, so only those need detaching.
+///
+/// Any mention counts, not just an assignment: a read of `path` before an
+/// unset, or a use inside a branch, would still see the tied array. Over-
+/// detaching costs one `unset` line; under-detaching silently rewrites PATH.
+fn assigned_tied_scalars(prog: &IrProgram) -> Vec<String> {
+    let mut names = HashSet::new();
+    for st in &prog.stmts {
+        collect_var_names_stmt(st, &mut names);
+    }
+    for sub in &prog.subs {
+        for st in &sub.body {
+            collect_var_names_stmt(st, &mut names);
+        }
+    }
+    names
+        .iter()
+        .map(|n| n.trim_start_matches(['$', '!', '#']))
+        .filter(|n| TIED_SCALARS.contains(n))
+        .map(str::to_string)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// Every variable name an `IrStmt` mentions, recursively.
+fn collect_var_names_stmt(st: &IrStmt, out: &mut HashSet<String>) {
+    fn expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Var(n, _) => {
+                out.insert(n.clone());
+            }
+            IrExpr::Index { var, key } => {
+                out.insert(var.clone());
+                expr(key, out);
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr(lhs, out);
+                expr(rhs, out);
+            }
+            IrExpr::Call { args, .. } | IrExpr::Array(args) => {
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                expr(obj, out);
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr(cond, out);
+                expr(then, out);
+                expr(else_, out);
+            }
+            IrExpr::DefinedOr { expr: a, default } => {
+                expr(a, out);
+                expr(default, out);
+            }
+            IrExpr::Capture { expr: a, .. } => expr(a, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        expr(x, out);
+                    }
+                }
+            }
+            IrExpr::Arrow(stmts) => {
+                for s in stmts {
+                    collect_var_names_stmt(s, out);
+                }
+            }
+            IrExpr::ArrayComp { var, iter, elem, .. } => {
+                out.insert(var.clone());
+                expr(iter, out);
+                expr(elem, out);
+            }
+            _ => {}
+        }
+    }
+    fn walk(sts: &[IrStmt], out: &mut HashSet<String>) {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => expr(e, out),
+                IrStmt::Assign { expr: e, targets, .. } => {
+                    expr(e, out);
+                    for t in targets {
+                        // an element target arrives as `arr[idx]`
+                        match t.var.strip_suffix(']').and_then(|v| v.split_once('[')) {
+                            Some((base, _)) => {
+                                out.insert(base.to_string());
+                            }
+                            None => {
+                                out.insert(t.var.clone());
+                            }
+                        }
+                    }
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for v in vars {
+                        out.insert(v.name.clone());
+                    }
+                    if let Some(i) = init {
+                        expr(i, out);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    out.insert(var.clone());
+                    for e in elements {
+                        expr(e, out);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    expr(cond, out);
+                    walk(then, out);
+                    for (c, b) in elsifs {
+                        expr(c, out);
+                        walk(b, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::While { cond, body } => {
+                    expr(cond, out);
+                    walk(body, out);
+                }
+                IrStmt::DoWhile { body, cond, .. } => {
+                    expr(cond, out);
+                    walk(body, out);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, out);
+                    expr(cond, out);
+                    walk(step, out);
+                    walk(body, out);
+                }
+                IrStmt::For { var, iter, body } => {
+                    out.insert(var.clone());
+                    expr(iter, out);
+                    walk(body, out);
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, out);
+                    for ex in excepts {
+                        walk(&ex.body, out);
+                    }
+                    walk(else_body, out);
+                    walk(finally_body, out);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    expr(discriminant, out);
+                    for c in clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                IrStmt::Redirect { inner, redirects, .. } => {
+                    walk(inner, out);
+                    for r in redirects {
+                        expr(&r.target, out);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk(stage, out);
+                    }
+                }
+                IrStmt::Output { value, .. }
+                | IrStmt::Return(Some(value))
+                | IrStmt::Exit(Some(value))
+                | IrStmt::Die { expr: value, .. }
+                | IrStmt::Warn { expr: value, .. } => expr(value, out),
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr(path, out);
+                    expr(content, out);
+                }
+                IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                    expr(cmd, out);
+                    for a in args {
+                        expr(a, out);
+                    }
+                    for r in redirects {
+                        expr(r, out);
+                    }
+                    for (_, v) in env {
+                        expr(v, out);
+                    }
+                }
+                IrStmt::Ext(_) => walk(foreach_line_body(st), out),
+                _ => {}
+            }
+        }
+    }
+    walk(std::slice::from_ref(st), out);
+}
+
 pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
     // builtin-op fallback arm (shir-builtin-op-20260816): the sh
     // backend has NOT accepted the `builtin` op — render as exec.
@@ -553,6 +777,21 @@ pub fn shir_to_zsh(prog: &IrProgram) -> Result<String, String> {
         // absent. Only emitted when the program actually reads HOSTNAME, and
         // it never overrides a value the environment already supplied.
         out.push_str(": ${HOSTNAME:=${HOST:-localhost}}\n");
+    }
+    // zsh's special parameters are TIED to live shell machinery: `path` is
+    // the array form of PATH, so a bash program that uses `path` as an
+    // ordinary variable (`path=/tmp/file`) silently rewrites the command
+    // search path — every later external command then fails with
+    // "command not found". `unset` first breaks the tie, leaving `path` a
+    // plain scalar/array that behaves like bash's.
+    let tied = assigned_tied_scalars(prog);
+    if !tied.is_empty() {
+        out.push_str("\n");
+        out.push_str("# zsh ties `path` & co. to shell machinery; detach them so they\n");
+        out.push_str("# behave as ordinary bash variables.\n");
+        for name in &tied {
+            out.push_str(&format!("unset {name}\n"));
+        }
     }
     if needs_word_split(&prog.stmts) {
         out.push_str("\n");
@@ -988,10 +1227,18 @@ _arr_keys_k() {
 }
 _arr_slice() {
     # $1=name $2=off $3=len — elements off..off+len-1, space-joined
-    _i=$(( $2 ))
     _end=$(eval echo "\${$1_len}")
     _end=${_end:-0}
+    # A negative offset counts back from the END and saturates at 0 —
+    # `${a[@]: -10}` on a 5-element array is the whole array, not an
+    # out-of-range walk from index -10.
+    _i=$(( $2 ))
+    [ "$_i" -lt 0 ] && _i=$(( _end + _i ))
+    [ "$_i" -lt 0 ] && _i=0
     _lim=$(( $2 + ${3:-1000000} ))
+    [ "$_lim" -lt 0 ] && _lim=$(( _end + _lim ))
+    [ "$_lim" -lt 0 ] && _lim=0
+    [ "$_lim" -gt "$_end" ] && _lim=$_end
     while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
         eval "printf '%s' \"\${$1_$_i}\""
         _i=$((_i + 1))
@@ -1126,9 +1373,98 @@ fn grep_q_lift_sh(stages: &[Vec<IrStmt>]) -> Result<Option<String>, String> {
     )))
 }
 
+/// The body statements of a `ForEachLine` Ext node, or an empty slice for
+/// any other Ext tag.
+///
+/// The `needs_*` prologue scanners and the array-emulation walk all have to
+/// look INSIDE a ForEachLine: its body holds ordinary statements, so a
+/// `grep -P` / `readlink` / array read there is invisible to a scanner that
+/// stops at the Ext node, and the polyfill (or the `_a_0, _a_1` emulation)
+/// never gets emitted.
+fn foreach_line_body(st: &IrStmt) -> &[IrStmt] {
+    let IrStmt::Ext(n) = st else { return &[] };
+    if n.tag() != "ForEachLine" {
+        return &[];
+    }
+    n.as_any()
+        .downcast_ref::<crate::shir_nodes::ForEachLine>()
+        .map(|fl| fl.body.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Render a `ForEachLine` Ext node as a native streaming `while read` loop.
+///
+/// The node is the shIR's *dynamic-source* primitive: `cat F`, `cat -n F`,
+/// `tr … < F`, `grep P F | cut …` all reduce to an O(1)-memory per-line
+/// loop. sh has no lexical file handle, but `while read` is exactly that
+/// iteration — so this lowers natively instead of calling a runtime.
+///
+/// Two details make it byte-equivalent to bash:
+///   * `read` strips the trailing newline, which is what the loop var is
+///     supposed to hold (the perl handler `chomp`s for the same reason);
+///   * a trailing partial line (a file whose last line has no newline) is
+///     dropped by `read` alone, so it is picked up by the `|| [ -n "$var" ]`
+///     guard.
+///
+/// `limit` closes the reader after K lines — the streaming form of
+/// `head -n K F` (O(K) memory, not a slurp).
+fn foreach_line_to_sh(n: &dyn crate::shir_nodes::ExtNode, d: usize, out: &mut String) -> Result<(), String> {
+    let Some(fl) = n.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>() else {
+        return Err("Ext tag ForEachLine did not downcast".to_string());
+    };
+    let src = word_to_zsh(&fl.source)?;
+    // A fresh descriptor per loop keeps nested/repeated ForEachLine blocks
+    // from stealing each other's file position.
+    static FD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let k = FD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fd = format!("_zfl_fd{k}");
+
+    // `exec {fd}< file` is POSIX and allocates the descriptor at run time,
+    // so two loops reading the same file each get their own position.
+    indent(out, d);
+    out.push_str(&format!("exec {{{fd}}}< {src} || exit 1\n"));
+    if let Some(lim) = &fl.limit {
+        let lim_w = word_to_zsh(lim)?;
+        indent(out, d);
+        out.push_str(&format!("_zfl_n{k}=0\n"));
+        indent(out, d);
+        out.push_str(&format!("while [ \"$_zfl_n{k}\" -lt {lim_w} ]; do\n"));
+    } else {
+        indent(out, d);
+        out.push_str("while :; do\n");
+    }
+    // `IFS= read -r` keeps backslashes and leading/trailing blanks intact;
+    // the `|| [ -n "$var" ]` arm catches a final line with no newline.
+    indent(out, d + 1);
+    out.push_str(&format!("IFS= read -r {var} <&{fd} || [ -n \"${var}\" ] || break\n", var = fl.var, fd = fd));
+    for b in &fl.body {
+        stmt_to_sh(b, d + 1, out)?;
+    }
+    if fl.limit.is_some() {
+        indent(out, d + 1);
+        out.push_str(&format!("_zfl_n{k}=$((_zfl_n{k} + 1))\n"));
+    }
+    indent(out, d);
+    out.push_str("done\n");
+    // Close the descriptor so a long script does not leak one per loop.
+    indent(out, d);
+    out.push_str(&format!("exec {fd}<&-\n"));
+    Ok(())
+}
+
 fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
-        IrStmt::Ext(_) => return Err("sh renderer: Ext node unsupported".to_string()),
+        // `ForEachLine` is a STREAMING line loop over a file — `cat F`,
+        // `cat -n F`, `tr … < F`, `grep P F | cut …`. sh has no lexical
+        // handle, but `while read` is the same O(1)-memory iteration, so
+        // this is native rather than a runtime call. See
+        // foreach_line_to_sh.
+        IrStmt::Ext(n) if n.tag() == "ForEachLine" => {
+            foreach_line_to_sh(n.as_ref(), d, out)?;
+            out.push_str(&take_heredoc_bodies());
+            Ok(())
+        }
+        IrStmt::Ext(n) => return Err(format!("sh renderer: Ext node unsupported: {}", n.tag())),
         IrStmt::Expr(e) => {
             indent(out, d);
             if let IrExpr::Call { func, .. } = e {
@@ -1136,11 +1472,18 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     // statement position: the matches are the output
                     out.push_str(&format!("echo \"{}\"", cmd_to_sh(e)?));
                     out.push('\n');
+                    out.push_str(&take_heredoc_bodies());
                     return Ok(());
                 }
             }
             out.push_str(&cmd_to_sh(e)?);
             out.push('\n');
+            // A heredoc in the command parks its body; like every other
+            // arm it belongs AFTER this statement's newline, not inside it.
+            // Without this the body surfaced at the next flush point — e.g.
+            // `( cat <<EOF … )` emitted the `)` before `content\nEOF`, which
+            // is a zsh parse error near `\n`.
+            out.push_str(&take_heredoc_bodies());
             Ok(())
         }
         IrStmt::Assign { targets, expr, asm, .. } => {
@@ -2403,6 +2746,14 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                // A ForEachLine body can hold the `grep -P` exec (see
+                // foreach_line_body) — without this the polyfill prologue is
+                // never emitted for `grep P F | grep -P …`.
+                IrStmt::Ext(_) => {
+                    if walk(foreach_line_body(st)) {
+                        return true;
+                    }
+                }
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     if has_grep_p(cond) || walk(body) {
                         return true;
@@ -2567,6 +2918,11 @@ fn needs_readlink(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                IrStmt::Ext(_) => {
+                    if walk(foreach_line_body(st)) {
+                        return true;
+                    }
+                }
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     if has_readlink(cond) || walk(body) {
                         return true;
@@ -2690,6 +3046,7 @@ fn needs_hostname(stmts: &[IrStmt]) -> bool {
         for st in sts {
             let found = match st {
                 IrStmt::Expr(e) => mentions(e),
+                IrStmt::Ext(_) => walk(foreach_line_body(st)),
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     mentions(cond) || walk(body)
                 }
@@ -2747,6 +3104,7 @@ fn needs_word_split(stmts: &[IrStmt]) -> bool {
         for st in sts {
             let found = match st {
                 IrStmt::Expr(e) => has_split(e),
+                IrStmt::Ext(_) => walk(foreach_line_body(st)),
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     has_split(cond) || walk(body)
                 }
@@ -2815,6 +3173,11 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
             match st {
                 IrStmt::Expr(e) => {
                     if has_cmp(e) {
+                        return true;
+                    }
+                }
+                IrStmt::Ext(_) => {
+                    if walk(foreach_line_body(st)) {
                         return true;
                     }
                 }
@@ -4434,6 +4797,14 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             }
             let off = raw_arg(args, 2)?;
             let len = args.get(3).map(str_arg).transpose()?.unwrap_or_default();
+            // A non-literal offset/length (`$i`, `((j+1))`) is DYNAMIC and
+            // must stay an arithmetic expression in the output. Parsing it
+            // with an `unwrap_or(-1)` fallback would silently classify it as
+            // a negative offset-from-the-END and freeze the slice at render
+            // time — `${s:$i:1}` in a loop then always reads index 0. So the
+            // absence of an integer is its own state, never a -1.
+            let offn = off.trim().parse::<i64>().ok();
+            let lenn = if len.is_empty() { None } else { len.trim().parse::<i64>().ok() };
             // `${#arr[@]}` — the parser keeps the `#` in the name
             if name.starts_with('#') {
                 return Ok(format!("${{#{}[@]}}", &name[1..]));
@@ -4442,10 +4813,11 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             // (char-exact for the ASCII corpus)
             if name == "@" || name == "*" {
                 // `${@:off}` — positional slice: shift + join
-                let offn: i64 = off.trim().parse().unwrap_or(-1);
-                if offn >= 1 {
-                    let sh = offn - 1;
-                    return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
+                if let Some(offn) = offn {
+                    if offn >= 1 {
+                        let sh = offn - 1;
+                        return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
+                    }
                 }
                 return Ok(format!("${{{name}:{off}}}"));
             }
@@ -4468,29 +4840,30 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             {
                 return Ok(format!("$(_arr_slice {name} {off} {len})"));
             }
-            let offn: i64 = off.trim().parse().unwrap_or(-1);
-            let lenn: i64 = len.trim().parse().unwrap_or(-1);
-            if offn < 0 && (lenn >= 0 || len.is_empty()) {
-                // `${s: -3}` — negative offsets count from the END
-                let start = format!("$((${{#{name}}}{}+1))", offn);
-                let range = if len.is_empty() {
-                    format!("{start}-")
-                } else {
-                    format!("{start}-$(({start}+{lenn}-1))")
-                };
-                return Ok(format!("$(printf '%s' \"${{{name}}}\" | cut -c{range})"));
-            }
-            if offn >= 0 && (lenn >= 0 || len.is_empty()) {
-                if !len.is_empty() && lenn == 0 {
-                    // `${x:off:0}` — always empty
-                    return Ok("$(printf '')".into());
+            if let Some(offn) = offn {
+                if offn < 0 {
+                    // `${s: -3}` — negative offsets count from the END
+                    let start = format!("$((${{#{name}}}{}+1))", offn);
+                    let range = if lenn.is_none() {
+                        format!("{start}-")
+                    } else {
+                        format!("{start}-$(({start}+{} -1))", lenn.unwrap())
+                    };
+                    return Ok(format!("$(printf '%s' \"${{{name}}}\" | cut -c{range})"));
                 }
-                let start = offn + 1;
-                let range = if len.is_empty() {
-                    format!("{start}-")
-                } else {
-                    format!("{start}-{}", offn + lenn)
-                };
+            }
+            if let Some(offn) = offn {
+                if let Some(lenn) = lenn {
+                    if lenn == 0 {
+                        // `${x:off:0}` — always empty
+                        return Ok("$(printf '')".into());
+                    }
+                    let start = offn + 1;
+                    let range = format!("{start}-{}", offn + lenn);
+                    return Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"));
+                }
+                // `${x:off}` — to the end
+                let range = format!("{}-", offn + 1);
                 return Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"));
             }
             // dynamic offsets — compute in shell arithmetic
@@ -4517,18 +4890,33 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             "$(printf '%s' \"${name}\" | awk '{{print tolower(substr($0,1,1)) substr($0,2)}}')"
         )),
         "#" | "##" | "%" | "%%" => {
-            let pat = raw_arg(args, 2)?;
+            // The pattern is spliced RAW, so its glob metacharacters stay
+            // live (`${p##*/}` must still mean "strip through the last
+            // slash") — quoting the word would make bash AND zsh read it as
+            // a literal and silently stop matching (measured: `${p##"*[/]"}`
+            // returns the whole path where `${p##*[/]}` returns `git-tool`).
+            // The one character that cannot go in raw is a double quote:
+            // it closes the command line (`${val#"}"` → zsh `unmatched "`).
+            // A `\"` is the quote as a literal IN both shells (verified), and
+            // backslash loses its own escaping there, so escaping quotes
+            // alone does not disturb any other character in the pattern.
+            let pat = escape_quotes_in_word(&raw_arg(args, 2)?);
             Ok(format!("${{{name}{op}{pat}}}"))
         }
         "//" | "/" => {
-            // `${x/p/r}` — no dash equivalent; emulate with sed (the IR
-            // conflates first/all occurrences — both render `g`)
+            // `${x/p/r}` vs `${x//p/r}` — dash has neither, so both lower
+            // to sed. The DISTINCTION IS LOAD-BEARING: the IR keeps the ops
+            // apart (`//` = replace all, `/` = first occurrence only), and
+            // collapsing them made `sub=` print `1-two-1` where bash prints
+            // `1-two-one`. sed's `g` flag is exactly "all", so `//` maps to
+            // it and `/` simply omits it.
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
             let pe = sed_escape_pattern(&pat);
             let re = sed_escape_replacement(&rep);
+            let flag = if op == "//" { "g" } else { "" };
             Ok(format!(
-                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#g')"
+                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#{flag}')"
             ))
         }
         // `${x+w}` / `${x-w}` — the "is it set?" probes. Both are native
@@ -5926,6 +6314,15 @@ fn arg<'a>(args: &'a [IrExpr], idx: usize) -> Result<&'a IrExpr, String> {
 /// The raw text of a Str argument.
 fn raw_arg(args: &[IrExpr], idx: usize) -> Result<String, String> {
     str_arg(arg(args, idx)?)
+}
+
+/// Escape a word that is spliced RAW into a command line, where a bare `"`
+/// would close it. Only the quote is escaped: a `\"` is a literal quote in
+/// both bash and zsh, and every other character keeps the meaning the source
+/// gave it — notably the glob metacharacters, which must stay live in a
+/// `${v#pat}` / `${v%pat}` pattern.
+fn escape_quotes_in_word(s: &str) -> String {
+    s.replace('"', "\\\"")
 }
 
 /// The raw text of a Str expression.
