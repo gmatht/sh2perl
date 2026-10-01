@@ -7204,7 +7204,14 @@ mod tests {
         // the capture value (the runtime capture always yields a string) —
         // no store round-trip. A pure echo capture lowers all the way to a
         // native join; other captures keep the await sh2.capture call.
-        let json3 = to_json("x=$(echo hi)");
+        //
+        // `x` MUST BE READ for the capture to survive: a write to a var that
+        // is never read is dead code and is correctly eliminated (an empty
+        // body), so the bare `x=$(echo hi)` form can never contain an
+        // AssignmentExpression and asserting one there pins nothing. Reading
+        // it back (`y=$x`) is what makes the lifted write observable, and it
+        // is the shape the corpus actually exercises.
+        let json3 = to_json("x=$(echo hi)\ny=$x\necho $y");
         assert!(json3.contains("\"type\":\"AssignmentExpression\""));
         // the pure echo capture folds to a single literal (the join of one
         // literal arg is the literal itself — no runtime join machinery)
