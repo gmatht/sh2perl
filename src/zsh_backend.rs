@@ -333,181 +333,94 @@ fn arr_keys_call(name: &str) -> String {
     }
 }
 
-/// Does the program use whole-array expansions (`"${arr[@]}"`, `${!arr[@]}`,
-/// `${arr[*]}`)? They need the `_arr_expand`/`_arr_keys` prologue helpers
-/// (the per-element vars + counter lowering).
-fn needs_arr_helper(prog: &IrProgram) -> bool {
-    fn expr_uses_arr(e: &IrExpr) -> bool {
-        match e {
-            IrExpr::Call { func, args } => {
-                let f = func.as_str();
-                if f == "arrayItems" {
-                    return true;
-                }
-                if f == "arrayIndex" {
-                    if let Some(IrExpr::Str(k, _)) = args.get(1) {
-                        if k == "@" || k == "*" {
-                            return true;
-                        }
-                    }
-                }
-                if f == "param" {
-                    let op = args
-                        .first()
-                        .and_then(|a| match a {
-                            IrExpr::Str(s, _) => Some(s.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("");
-                    let name = args
-                        .get(1)
-                        .and_then(|a| match a {
-                            IrExpr::Str(s, _) => Some(s.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("");
-                    if name.ends_with("[@]") || name.ends_with("[*]") {
-                        return true;
-                    }
-                    if op == "slice" {
-                        let off = args
-                            .get(2)
-                            .and_then(|a| match a {
-                                IrExpr::Str(s, _) => Some(s.as_str()),
-                                _ => None,
-                            })
-                            .unwrap_or("");
-                        if !name.starts_with('#')
-                            && (off == "@"
-                                || off == "*"
-                                || (off.parse::<i64>().is_ok()
-                                    && ARRAY_NAMES.lock().unwrap().contains(name)))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                if f == "join" {
-                    if let Some(inner) = args.first() {
-                        if expr_uses_arr(inner) {
-                            return true;
-                        }
-                    }
-                }
-                args.iter().any(expr_uses_arr)
-            }
-            IrExpr::Array(es) => es.iter().any(expr_uses_arr),
-            IrExpr::Object(es) => es.iter().any(|(_, v)| expr_uses_arr(v)),
-            IrExpr::Interpolate(parts) => parts
-                .iter()
-                .any(|p| matches!(p, InterpPart::Expr(x) if expr_uses_arr(x))),
-            IrExpr::Arrow(stmts) => walk(stmts),
-            _ => false,
-        }
-    }
-    fn walk(sts: &[IrStmt]) -> bool {
-        for st in sts {
-            let hit = match st {
-                IrStmt::Expr(e) => expr_uses_arr(e),
-                IrStmt::Ext(_) => walk(foreach_line_body(st)),
-                IrStmt::Assign { expr, .. } => expr_uses_arr(expr),
-                IrStmt::If {
-                    cond,
-                    then,
-                    elsifs,
-                    else_,
-                    ..
-                } => {
-                    expr_uses_arr(cond)
-                        || walk(then)
-                        || walk(else_)
-                        || elsifs.iter().any(|(c, b)| expr_uses_arr(c) || walk(b))
-                }
-                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                    expr_uses_arr(cond) || walk(body)
-                }
-                IrStmt::ForInit { init, cond, step, body } => {
-                    walk(init) || expr_uses_arr(cond) || walk(step) || walk(body)
-                }
-                IrStmt::Continue | IrStmt::Break => false,
-                IrStmt::For { iter, body, .. } => expr_uses_arr(iter) || walk(body),
-                IrStmt::Case {
-                    discriminant,
-                    clauses,
-                    ..
-                } => expr_uses_arr(discriminant) || clauses.iter().any(|c| walk(&c.body)),
-                IrStmt::Function { body, .. } => walk(body),
-                IrStmt::Redirect { inner, redirects } => {
-                    walk(inner) || redirects.iter().any(|r| expr_uses_arr(&r.target))
-                }
-                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
-                    walk(body)
-                }
-                IrStmt::Select { clauses } => clauses.iter().any(|c| {
-                    walk(&c.body)
-                        || c.ch.as_ref().is_some_and(expr_uses_arr)
-                        || c.value.as_ref().is_some_and(expr_uses_arr)
-                }),
-                IrStmt::Asm { outputs, inputs, .. } => outputs
-                    .iter()
-                    .chain(inputs.iter())
-                    .any(|(_, e)| expr_uses_arr(e)),
-                IrStmt::Exec {
-                    cmd,
-                    args,
-                    redirects,
-                    env,
-                    ..
-                } => {
-                    expr_uses_arr(cmd)
-                        || args.iter().any(expr_uses_arr)
-                        || redirects.iter().any(expr_uses_arr)
-                        || env.iter().any(|(_, v)| expr_uses_arr(v))
-                }
-                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
-                IrStmt::Output { value, .. }
-                | IrStmt::Return(Some(value))
-                | IrStmt::Exit(Some(value))
-                | IrStmt::Die { expr: value, .. }
-                | IrStmt::Warn { expr: value, .. } => expr_uses_arr(value),
-                IrStmt::Declare { init, .. } => init.as_ref().map(expr_uses_arr).unwrap_or(false),
-                IrStmt::DeclareArray { elements, .. } => elements.iter().any(expr_uses_arr),
-                IrStmt::WriteFile { path, content, .. } => {
-                    expr_uses_arr(path) || expr_uses_arr(content)
-                }
-                IrStmt::Return(None)
-                | IrStmt::Exit(None)
-                | IrStmt::SetChildError(_)
-                | IrStmt::Require(_)
-                | IrStmt::RawText(_)
-                | IrStmt::Label(_)
-                | IrStmt::Goto(_) => false,
-                IrStmt::Try {
-                    body,
-                    excepts,
-                    else_body,
-                    finally_body,
-                } => {
-                    walk(body)
-                        || excepts.iter().any(|e| {
-                            e.match_expr.as_ref().map(expr_uses_arr).unwrap_or(false)
-                                || walk(&e.body)
-                        })
-                        || walk(else_body)
-                        || walk(finally_body)
-                }
-                IrStmt::Shaderize { body, .. } => {
-                    body.iter().any(|s| walk(std::slice::from_ref(s)))
-                }
-            };
-            if hit {
-                return true;
-            }
-        }
-        false
-    }
-    walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
-}
+/// The whole-array expansion helpers — the polyfills behind the
+/// `$(_arr_…)` call sites (the per-element vars + counter lowering). Kept as
+/// a table so each can be emitted independently: which ones a program needs
+/// is decided by scanning the RENDERED body, not by an AST walk, so a file
+/// that calls one helper does not drag in the other four.
+const ARR_HELPERS: &[(&str, &str)] = &[
+    (
+        "_arr_expand",
+        r#"_arr_expand() {
+    _i=0
+    _n=$(eval echo "\${$1_len}")
+    _n=${_n:-0}
+    while [ "$_i" -lt "$_n" ]; do
+        eval "printf '%s' \"\${$1_$_i}\""
+        [ "$_i" -lt "$((_n - 1))" ] && printf ' '
+        _i=$((_i + 1))
+    done
+    printf '\n'
+}"#,
+    ),
+    (
+        "_arr_keys",
+        r#"_arr_keys() {
+    _i=0
+    _n=$(eval echo "\${$1_len}")
+    _n=${_n:-0}
+    while [ "$_i" -lt "$_n" ]; do
+        printf '%s\n' "$_i"
+        _i=$((_i + 1))
+    done
+}"#,
+    ),
+    (
+        "_arr_expand_k",
+        r#"_arr_expand_k() {
+    # assoc variant: values in key-list order ($1_keys). Joins with the
+    # FIRST char of the caller's IFS (bash's ${arr[*]} semantics — under
+    # IFS=newline each value lands on its own line); the key list itself
+    # is space-separated, so the split runs under a fixed IFS. All in a
+    # subshell: the caller's IFS is untouched.
+    ( # the first IFS char (${IFS#?} = IFS minus the first char); a
+      # cmdsub would eat a newline separator, so use pure expansion
+      _sep=${IFS%${IFS#?}}
+      IFS=' '
+      _n=0
+      for _k in $(eval echo "\${$1_keys}"); do
+          [ "$_n" -gt 0 ] && printf '%s' "$_sep"
+          eval "printf '%s' \"\${$1_$_k}\""
+          _n=$((_n + 1))
+      done
+      printf '\n' )
+}"#,
+    ),
+    (
+        "_arr_keys_k",
+        r#"_arr_keys_k() {
+    # assoc variant: the key list
+    ( IFS=' '
+      for _k in $(eval echo "\${$1_keys}"); do
+          printf '%s\n' "$_k"
+      done )
+}"#,
+    ),
+    (
+        "_arr_slice",
+        r#"_arr_slice() {
+    # $1=name $2=off $3=len — elements off..off+len-1, space-joined
+    _end=$(eval echo "\${$1_len}")
+    _end=${_end:-0}
+    # A negative offset counts back from the END and saturates at 0 —
+    # `${a[@]: -10}` on a 5-element array is the whole array, not an
+    # out-of-range walk from index -10.
+    _i=$(( $2 ))
+    [ "$_i" -lt 0 ] && _i=$(( _end + _i ))
+    [ "$_i" -lt 0 ] && _i=0
+    _lim=$(( $2 + ${3:-1000000} ))
+    [ "$_lim" -lt 0 ] && _lim=$(( _end + _lim ))
+    [ "$_lim" -lt 0 ] && _lim=0
+    [ "$_lim" -gt "$_end" ] && _lim=$_end
+    while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
+        eval "printf '%s' \"\${$1_$_i}\""
+        _i=$((_i + 1))
+        [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ] && printf ' '
+    done
+    printf '\n'
+}"#,
+    ),
+];
 
 /// Render a ShIR program to `zsh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
@@ -1176,86 +1089,16 @@ _cmp() {
 "#,
         );
     }
-    if needs_arr_helper(prog) {
-        out.push_str(
-            r#"
-# whole-array expansion helpers (the per-element vars + len counter)
-_arr_expand() {
-    _i=0
-    _n=$(eval echo "\${$1_len}")
-    _n=${_n:-0}
-    while [ "$_i" -lt "$_n" ]; do
-        eval "printf '%s' \"\${$1_$_i}\""
-        [ "$_i" -lt "$((_n - 1))" ] && printf ' '
-        _i=$((_i + 1))
-    done
-    printf '\n'
-}
-_arr_keys() {
-    _i=0
-    _n=$(eval echo "\${$1_len}")
-    _n=${_n:-0}
-    while [ "$_i" -lt "$_n" ]; do
-        printf '%s\n' "$_i"
-        _i=$((_i + 1))
-    done
-}
-_arr_expand_k() {
-    # assoc variant: values in key-list order ($1_keys). Joins with the
-    # FIRST char of the caller's IFS (bash's ${arr[*]} semantics — under
-    # IFS=newline each value lands on its own line); the key list itself
-    # is space-separated, so the split runs under a fixed IFS. All in a
-    # subshell: the caller's IFS is untouched.
-    ( # the first IFS char (${IFS#?} = IFS minus the first char); a
-      # cmdsub would eat a newline separator, so use pure expansion
-      _sep=${IFS%${IFS#?}}
-      IFS=' '
-      _n=0
-      for _k in $(eval echo "\${$1_keys}"); do
-          [ "$_n" -gt 0 ] && printf '%s' "$_sep"
-          eval "printf '%s' \"\${$1_$_k}\""
-          _n=$((_n + 1))
-      done
-      printf '\n' )
-}
-_arr_keys_k() {
-    # assoc variant: the key list
-    ( IFS=' '
-      for _k in $(eval echo "\${$1_keys}"); do
-          printf '%s\n' "$_k"
-      done )
-}
-_arr_slice() {
-    # $1=name $2=off $3=len — elements off..off+len-1, space-joined
-    _end=$(eval echo "\${$1_len}")
-    _end=${_end:-0}
-    # A negative offset counts back from the END and saturates at 0 —
-    # `${a[@]: -10}` on a 5-element array is the whole array, not an
-    # out-of-range walk from index -10.
-    _i=$(( $2 ))
-    [ "$_i" -lt 0 ] && _i=$(( _end + _i ))
-    [ "$_i" -lt 0 ] && _i=0
-    _lim=$(( $2 + ${3:-1000000} ))
-    [ "$_lim" -lt 0 ] && _lim=$(( _end + _lim ))
-    [ "$_lim" -lt 0 ] && _lim=0
-    [ "$_lim" -gt "$_end" ] && _lim=$_end
-    while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
-        eval "printf '%s' \"\${$1_$_i}\""
-        _i=$((_i + 1))
-        [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ] && printf ' '
-    done
-    printf '\n'
-}
-
-"#,
-        );
-    }
-    // `_num()` is a polyfill for the $( _num "…" ) arith-coercion calls:
-    // emit the definition iff the RENDERED body actually calls it (bash
-    // coerces non-numeric arith values to 0, dash errors). Checking the
-    // final body is robust by construction — the definition is present
-    // exactly when a call is, no matter which arith form the core
-    // emitted (the Arith AST or the `arith("$a+$b")` string).
+    // The whole-array expansion helpers are polyfills for the `$(_arr_…)`
+    // call sites, so — like `_num` below — each definition is emitted iff the
+    // RENDERED body actually calls it. Gating the whole five-helper block on
+    // an AST walk (needs_arr_helper) shipped 5 definitions into files that
+    // called one or two of them: 22 of the 557 corpus files carried 110
+    // helper definitions, ~96 of them dead weight. Checking the final body is
+    // robust by construction — a definition is present exactly when its call
+    // is, no matter which array form (arrayItems / arrayIndex / `param`)
+    // produced the call. The prologue is emitted BEFORE the body, so the body
+    // has to be rendered first to know which helpers it needs.
     let mut body = String::new();
     for st in &prog.stmts {
         stmt_to_sh(st, 0, &mut body)?;
@@ -1269,6 +1112,31 @@ _arr_slice() {
         }
         body.push_str("}\n");
     }
+    // The whole-array helpers are polyfills for the `$(_arr_… )` call sites,
+    // so each is emitted iff the RENDERED body actually calls it — the same
+    // body-driven rule `_num` below uses. Gating the whole five-helper block
+    // on an AST walk shipped 5 definitions into files that called one or two:
+    // 22 of the 557 corpus files carried 110 helper definitions, ~96 of them
+    // dead weight. The trailing space in the marker is load-bearing — it is
+    // what keeps `$(_arr_expand ` from matching `$(_arr_expand_k foo`.
+    let arr_helpers: Vec<&str> = ARR_HELPERS
+        .iter()
+        .filter(|(name, _)| body.contains(&format!("$({name} ")))
+        .map(|(_, def)| *def)
+        .collect();
+    if !arr_helpers.is_empty() {
+        out.push_str("\n# whole-array expansion helpers (the per-element vars + len counter)\n");
+        for def in arr_helpers {
+            out.push_str(def);
+            out.push('\n');
+        }
+    }
+    // `_num()` is a polyfill for the $( _num "…" ) arith-coercion calls:
+    // emit the definition iff the RENDERED body actually calls it (bash
+    // coerces non-numeric arith values to 0, dash errors). Checking the
+    // final body is robust by construction — the definition is present
+    // exactly when a call is, no matter which arith form the core
+    // emitted (the Arith AST or the `arith("$a+$b")` string).
     if body.contains("$( _num ") {
         out.push_str("_num() {\n");
         out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
