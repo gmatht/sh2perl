@@ -45,14 +45,19 @@ pub fn generate(prog: &IrProgram) -> String {
     // `__sh_fn_status` helper `fix_cond` introduces is injected here. Gated on
     // the rendered body, same discipline as the renderer's own preamble
     // vars: a program that never calls it gets no dead sub.
-    if needs_fn_status_helper(&src) {
+    let mut src = if needs_fn_status_helper(&src) {
         // `sub` is file scope: it must precede the first use, and Perl
         // resolves a named sub called without parens at compile time. Put it
         // right after the `use` block, before any statement runs.
         inject_before_first_stmt(&src, FN_STATUS_PREAMBLE)
     } else {
         src
+    };
+    // Fix 16 — same discipline for the array-slice helper.
+    if needs_slice_helper(&src) {
+        src = inject_before_first_stmt(&src, SLICE_PREAMBLE);
     }
+    src
 }
 
 /// The textual post-pass over a rendered program.
@@ -71,9 +76,592 @@ fn post_pass(src: &str) -> String {
     let out = fix_glob_sentinel_in_for_iterand(&out);
     let out = fix_bareword_words(&out);
     let out = fix_condition_booleans(&out);
+    let out = fix_shell_builtin_command_name(&out);
+    let out = fix_printf_bash_conversions(&out);
+    let out = fix_printf_b_percent_b(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
     // declarations, so it cannot disturb what the earlier passes matched.
     declare_undeclared_vars(&out)
+}
+
+// ── Fix 18 — a shell BUILTIN name must not be quoted in a `bash -c` payload ──
+//
+// `sh_cmd_value_expr` (ir.rs) reconstructs a command for the `bash -c` seam by
+// walking the command TEXT and quoting each literal span:
+//
+//     q{eval} "echo \"The answer is } . __sh_q($x) . q{\""}
+//
+// That is right for every literal EXCEPT the command name. `q{eval}` is an
+// argv string, so `bash -c` runs a program literally NAMED `eval`, fails with
+// "command not found", and prints nothing — the payload never runs at all:
+//
+//     $ x=42; eval "echo \"The answer is $x\""        # bash: The answer is 42
+//     # generated: empty output, exit 0
+//
+// It is silent: the status is 0 and only stdout differs, so it reads as a
+// content bug rather than a dispatch one. Fix 7 (see below) is meant to
+// RE-ENTER an `eval` payload inline instead, but it only fires when the
+// payload's word is fully literal (`word_source_text`) — an interpolated
+// payload like the one above skips it, and this is the fallback that then
+// runs.
+//
+// The shell builtins are exactly the names `is_shell_builtin` (ir.rs) already
+// refuses to send down the uu-ffi argv seam for this same reason: they are
+// resolved by the SHELL, not exec'd. Unquoting the leading name lets bash's own
+// builtin table resolve it. Only the FIRST span is touched — a builtin name
+// later in the text is an argument to it, and must stay quoted.
+fn fix_shell_builtin_command_name(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        out.push_str(&unquote_builtin_command_name(line));
+    }
+    out
+}
+
+/// Un-quote the command NAME at the head of a `system('bash', '-c', …)` call,
+/// when that name is a shell builtin.
+///
+/// The renderer builds the payload by concatenating quoted spans, and
+/// `safe_perl_q_string` picks the quoting per span, so the name arrives in one
+/// of three shapes — all of which must be recognised:
+///
+///     'eval' "echo …"        # plain '…' literal (the common case)
+///     q{'eval' "echo …"}     # a q{…} wrapper around that literal
+///     eval "echo …"          # already bare (nothing to do)
+///
+/// Only the FIRST span is touched: a builtin name later in the text is an
+/// argument to it and must stay quoted.
+fn unquote_builtin_command_name(line: &str) -> String {
+    // Cheap reject: the shape needs this exact seam, and most lines lack it.
+    const SEAM: &str = "system('bash', '-c', ";
+    let Some(call) = line.find(SEAM) else {
+        return line.to_string();
+    };
+    let body_start = call + SEAM.len();
+    let rest = &line[body_start..];
+    let Some((name, consumed)) = leading_quoted_span(rest) else {
+        return line.to_string();
+    };
+    if !is_shell_builtin_name(&name) || !is_plain_command_name(&name) {
+        return line.to_string();
+    }
+    let mut fixed = String::with_capacity(line.len());
+    fixed.push_str(&line[..body_start]);
+    fixed.push_str(&name);
+    fixed.push_str(&rest[consumed..]);
+    fixed
+}
+
+/// The first quoted span of `rest`, returning its DECODED text and the number
+/// of bytes it occupied. `None` when `rest` does not start with a quoted span.
+///
+/// Decodes the three shapes `safe_perl_q_string` produces. Anything with an
+/// interior escape beyond the `\\` / `\'` pair it emits is refused: those do not
+/// occur in a bare command name, and mis-decoding them would corrupt the text.
+fn leading_quoted_span(rest: &str) -> Option<(String, usize)> {
+    // Shape A: a q{…} (or q(…), q[…], …) wrapper. The CONTENTS are themselves
+    // a quoted literal, so peel the wrapper, then recurse on what is inside.
+    if rest.starts_with('q') && rest.as_bytes().get(1).is_some_and(|b| !b.is_ascii_alphanumeric())
+    {
+        let close = match rest.as_bytes()[1] {
+            b'{' => b'}',
+            b'(' => b')',
+            b'[' => b']',
+            b'<' => b'>',
+            _ => return None,
+        };
+        let inner_end = rest[2..].find(close as char)? + 2;
+        let inner = &rest[2..inner_end];
+        // The wrapper must close the span: `q{'eval' "echo"}` is one span,
+        // `q{'eval'} . "x"` is not. Only `'`/`"` may appear inside, so a
+        // balanced check is enough here.
+        let (name, used) = leading_quoted_span(inner)?;
+        if used != inner.len() {
+            return None;
+        }
+        return Some((name, inner_end + 1));
+    }
+
+    // Shape B: a plain '…' or "…" literal.
+    let quote = *rest.as_bytes().first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let end = rest[1..].find(quote as char)? + 1;
+    let body = &rest[1..end];
+    // Only the escapes safe_perl_q_string emits are acceptable here.
+    let unescaped = body.replace("\\\\", "").replace("\\'", "");
+    if unescaped.contains('\\') {
+        return None;
+    }
+    Some((body.replace("\\\\", "\\").replace("\\'", "'"), end + 1))
+}
+
+/// A command name made only of characters a bare command word can contain.
+fn is_plain_command_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Shell builtins whose names must reach `bash -c` unquoted. Mirrors
+/// `ir.rs::is_shell_builtin`, which refuses the same names for the uu-ffi seam.
+fn is_shell_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "eval" | "exec" | "." | "source" | "break" | "continue" | "return" | "shift"
+            | "set" | "unset" | "export" | "readonly" | "declare" | "typeset" | "local"
+            | "alias" | "unalias" | "trap" | "shopt" | "wait" | "read" | "cd" | "pwd"
+            | "echo" | "printf" | "test" | "[" | ":" | "true" | "false" | "let"
+            | "getopts" | "command" | "builtin" | "type" | "umask" | "times" | "trap"
+            | "kill" | "wait" | "hash" | "help" | "jobs" | "logout" | "mapfile"
+            | "readarray" | "compgen" | "complete" | "dirs" | "pushd" | "popd"
+            | "suspend" | "caller" | "disown" | "fc" | "history" | "enable"
+    )
+}
+
+// ── Fix 19 — a bash-only `printf` conversion must not reach Perl's `printf` ──
+//
+// `printf` here is BASH'S builtin, so its conversion set is bash's, not Perl's.
+// The shared renderer emits the format word verbatim into `printf(FMT, …)`, and
+// two of bash's conversions mean something else entirely to Perl:
+//
+//     %q   bash: quote the argument so it can be read back by the shell
+//          Perl: NOT a conversion → `Invalid conversion in printf: "%q"`,
+//                 the whole call dies and prints NOTHING
+//
+//     $'a\nb'  a NUL/newline-bearing IFS then `printf '%q' "$IFS"`   # bash:
+//              $'\n\t'
+//
+// It is the same silent-total-loss shape as Fix 18: no output, exit status 0
+// (the die is caught by nothing, but the comparison in the gate is on stdout,
+// and `printf` dies before `print "…"` runs).
+//
+// `%q` is rewritten to a call to a `__sh2_q` helper prepended to the program,
+// which reproduces bash's shell-quoting rules exactly — measured against bash:
+//
+//     ''       →  ''            (empty is quoted, never bare)
+//     'simple' →  simple        (nothing to escape)
+//     'a b'    →  a\ b          (space escaped)
+//     "it's"   →  it\'s         (single quote escaped)
+//     $'x\ny'  →  $'x\ny'       (any control char → the $'…' form)
+//
+// Only `%q` is touched: every other conversion (`%s %d %b %c %%` …) already
+// agrees between the two, and rewriting them would change passing output.
+fn fix_printf_bash_conversions(src: &str) -> String {
+    if !src.contains("\"%q\"") && !src.contains("'%q'") {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len() + Q_HELPER.len());
+    out.push_str(&Q_HELPER);
+    out.push('\n');
+    for line in src.split_inclusive('\n') {
+        // Only a FORMAT position is rewritten — a `%q` inside an argument is
+        // data, not a conversion, and must survive untouched.
+        out.push_str(&rewrite_q_in_format(line));
+    }
+    out
+}
+
+/// The `__sh2_q` runtime: bash's `printf %q`.
+const Q_HELPER: &str = r#"# bash `printf %q`: quote a value so the shell reads it back identically.
+sub __sh2_q {
+    my $s = shift;
+    $s = '' unless defined $s;
+    return "''" if $s eq '';
+    # Any character the shell cannot carry bare (control chars incl. newline,
+    # tab and DEL) selects the $'…' form; everything else is backslash-escaped.
+    if ($s =~ /[\x00-\x1f\x7f]/) {
+        my $e = $s;
+        $e =~ s/\\/\\\\/g;
+        $e =~ s/'/\\'/g;
+        $e =~ s/\n/\\n/g;
+        $e =~ s/\t/\\t/g;
+        $e =~ s/\r/\\r/g;
+        $e =~ s/([\x00-\x08\x0b\x0c\x0e-\x1f\x7f])/sprintf('\\x%02x', ord($1))/ge;
+        return "\$'".$e."'";
+    }
+    my $e = $s;
+    $e =~ s/([ \t"'\\\$\`!\#\(\)\*\;\:\<\>\?\[\]\|\~])/\\$1/g;
+    return $e;
+}"#;
+
+/// Rewrite a leading `%q` conversion in a `printf(...)` FORMAT argument to
+/// `__sh2_q(<operand>)`. Returns the line unchanged when it is not such a format.
+fn rewrite_q_in_format(line: &str) -> String {
+    const MARK: &str = "printf(";
+    let Some(start) = line.find(MARK) else {
+        return line.to_string();
+    };
+    let args_start = start + MARK.len();
+    let rest = &line[args_start..];
+    let Some(fmt_len) = leading_perl_literal_len(rest) else {
+        return line.to_string();
+    };
+    let fmt = &rest[..fmt_len];
+    if !bash_format_has_q(fmt) {
+        return line.to_string();
+    }
+    // Split the remaining arguments off the closing paren.
+    let tail = &rest[fmt_len..];
+    let close = match tail.rfind(')') {
+        Some(i) => i,
+        None => return line.to_string(),
+    };
+    let operands = split_perl_args(&tail[..close]);
+    if operands.is_empty() {
+        return line.to_string();
+    }
+    let Some((new_fmt, q_positions)) = rewrite_q_operands(fmt) else {
+        return line.to_string();
+    };
+    // The rewritten format no longer consumes the `%q` operands: they are
+    // woven into the format as concatenation instead, so they are dropped
+    // from the printf argument list. Every OTHER operand stays, in order.
+    let mut new_fmt = new_fmt;
+    for slot in &q_positions {
+        let Some(operand) = operands.get(*slot) else {
+            return line.to_string();
+        };
+        new_fmt = new_fmt.replace(&format!("\u{1}{slot}\u{1}"), &format!("__sh2_q({operand})"));
+    }
+    let kept: Vec<String> = operands
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !q_positions.contains(i))
+        .map(|(_, o)| o.clone())
+        .collect();
+    let mut fixed = String::with_capacity(line.len());
+    fixed.push_str(&line[..args_start]);
+    fixed.push_str(&new_fmt);
+    if !kept.is_empty() {
+        fixed.push_str(", ");
+        fixed.push_str(&kept.join(", "));
+    }
+    fixed.push(')');
+    fixed.push_str(&tail[close + 1..]);
+    fixed
+}
+
+/// Byte length of the Perl literal (`"…"` or `'…'`) at the head of `rest`.
+fn leading_perl_literal_len(rest: &str) -> Option<usize> {
+    let quote = *rest.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut i = 1;
+    let b = rest.as_bytes();
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == quote {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Does this format literal contain a `%q` conversion (not `%%q`)?
+fn bash_format_has_q(fmt: &str) -> bool {
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '%' {
+            if cs.get(i + 1) == Some(&'%') {
+                i += 2;
+                continue;
+            }
+            if cs.get(i + 1) == Some(&'q') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Replace the `%q` specifiers in a format literal with `__sh2_q(<operand>)`
+/// concatenation, returning the new format AND the indices (into the printf
+/// operand list) consumed by those `%q` slots, so the caller can drop them.
+fn rewrite_q_operands(fmt: &str) -> Option<(String, Vec<usize>)> {
+    let (quote, body) = match fmt.as_bytes().first() {
+        Some(&b'"') => ('"', &fmt[1..fmt.len().checked_sub(1)?]),
+        Some(&b'\'') => ('\'', &fmt[1..fmt.len().checked_sub(1)?]),
+        _ => return None,
+    };
+    let cs: Vec<char> = body.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let mut slot = 0usize;
+    let mut taken: Vec<usize> = Vec::new();
+    while i < cs.len() {
+        if cs[i] == '%' && cs.get(i + 1) == Some(&'%') {
+            lit.push_str("%%");
+            i += 2;
+            continue;
+        }
+        if cs[i] == '%' && cs.get(i + 1) == Some(&'q') {
+            if !lit.is_empty() {
+                parts.push(perl_literal(quote, &lit));
+                lit.clear();
+            }
+            // The operand is not known here; the caller substitutes it by slot.
+            parts.push(format!("\u{1}{slot}\u{1}"));
+            taken.push(slot);
+            slot += 1;
+            i += 2;
+            continue;
+        }
+        lit.push(cs[i]);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        parts.push(perl_literal(quote, &lit));
+    }
+    let fmt_out = if parts.is_empty() {
+        perl_literal(quote, "")
+    } else {
+        parts.join(" . ")
+    };
+    Some((fmt_out, taken))
+}
+
+/// Split a Perl argument list on top-level commas (bracket/paren/brace and
+/// quote aware). Returns `None` on an unbalanced span.
+fn split_perl_args(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    cur.push(n);
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                let t = cur.trim().to_string();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}
+
+/// Re-quote a literal span under `quote`, escaping only what that quote needs.
+fn perl_literal(quote: char, text: &str) -> String {
+    if quote == '\'' {
+        return format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"));
+    }
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// ── Fix 20 — `printf %b` expands escapes in the ARGUMENT, not the format ────
+//
+// The two `printf`s agree on `%s`, `%d`, `%c` and `%%`, but `%b` is the one
+// conversion whose OPERANDS mean different things:
+//
+//     bash:  %b  the argument is a string whose \n \t \\ … ESCAPES are expanded
+//     Perl:  %b  the argument is a NUMBER, rendered in binary ("a\tb\n" → 0)
+//
+// so `printf '%b' 'a\tb\n'` prints a real tab+newline in bash and the single
+// character `0` in the generated program — plus a warning on stderr. The
+// shared renderer emits `printf("%b", <arg>)` with the argument untouched,
+// because deciding that an argument carries escapes is an operand-level fact.
+//
+// The operand is wrapped in `__sh2_b`, which performs bash's expansion:
+// `\a \b \e \E \f \n \r \t \v \0nnn \xHH \\` and leaves every other backslash
+// pair ALONE (bash does not interpret `\d` and neither do we).
+fn fix_printf_b_percent_b(src: &str) -> String {
+    if !src.contains("\"%b\"") && !src.contains("'%b'") {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len() + B_HELPER.len());
+    out.push_str(&B_HELPER);
+    out.push('\n');
+    for line in src.split_inclusive('\n') {
+        out.push_str(&rewrite_b_operands(line));
+    }
+    out
+}
+
+/// The `__sh2_b` runtime: bash's `printf %b` operand expansion.
+const B_HELPER: &str = r#"# bash `printf %b`: expand backslash escapes in the operand.
+sub __sh2_b {
+    my $s = shift;
+    $s = '' unless defined $s;
+    $s =~ s{\\(?:x([0-9a-fA-F]{1,2})|([0-7]{1,3})|([abefnrtv]))}{
+        my ($hex, $oct, $esc) = ($1, $2, $3);
+        if (defined $hex)  { chr(hex($hex)) }
+        elsif (defined $oct) { chr(oct($oct)) }
+        else { $esc eq 'e' ? "\e" : ($esc eq 'a' ? "\a" : $esc eq 'b' ? "\b"
+                                  : $esc eq 'f' ? "\f" : $esc eq 'n' ? "\n"
+                                  : $esc eq 'r' ? "\r" : $esc eq 't' ? "\t" : "\v") }
+    }ge;
+    return $s;
+}"#;
+
+/// Wrap every operand of a `printf` whose format contains `%b` in `__sh2_b`
+/// AND rewrite the conversion itself to `%s`.
+///
+/// The conversion must change, not just its operand: after `__sh2_b` expands
+/// the escapes the operand really is a plain string, but Perl's `%b` would
+/// then take that string as a NUMBER and print `0` (with an "isn't numeric"
+/// warning). `%s` prints the already-expanded string verbatim — which is
+/// what bash's `%b` means.
+fn rewrite_b_operands(line: &str) -> String {
+    const MARK: &str = "printf(";
+    let Some(start) = line.find(MARK) else {
+        return line.to_string();
+    };
+    let args_start = start + MARK.len();
+    let rest = &line[args_start..];
+    let Some(fmt_len) = leading_perl_literal_len(rest) else {
+        return line.to_string();
+    };
+    let fmt = &rest[..fmt_len];
+    let slots = bash_b_operand_slots(fmt);
+    if slots.is_empty() {
+        return line.to_string();
+    }
+    let new_fmt = replace_conversion(fmt, 'b', 's');
+    let tail = &rest[fmt_len..];
+    let Some(close) = tail.rfind(')') else {
+        return line.to_string();
+    };
+    let operands = split_perl_args(&tail[..close]);
+    if operands.is_empty() {
+        return line.to_string();
+    }
+    let mut wrapped: Vec<String> = operands.clone();
+    for s in &slots {
+        if let Some(o) = wrapped.get(*s) {
+            // Already wrapped (a line rewritten twice) — leave it alone.
+            if !o.starts_with("__sh2_b(") {
+                wrapped[*s] = format!("__sh2_b({o})");
+            }
+        }
+    }
+    let mut fixed = String::with_capacity(line.len());
+    fixed.push_str(&line[..args_start]);
+    fixed.push_str(&new_fmt);
+    fixed.push_str(", ");
+    fixed.push_str(&wrapped.join(", "));
+    fixed.push(')');
+    fixed.push_str(&tail[close + 1..]);
+    fixed
+}
+
+/// In a printf format literal, replace every `…<from>` conversion with the
+/// same flags/width but a `to` conversion letter. `%%` is never a conversion.
+fn replace_conversion(fmt: &str, from: char, to: char) -> String {
+    let (quote, body) = match fmt.as_bytes().first() {
+        Some(&b'"') => ('"', &fmt[1..fmt.len().saturating_sub(1)]),
+        Some(&b'\'') => ('\'', &fmt[1..fmt.len().saturating_sub(1)]),
+        _ => return fmt.to_string(),
+    };
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '%' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        if cs.get(i + 1) == Some(&'%') {
+            out.push_str("%%");
+            i += 2;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < cs.len() && !cs[j].is_ascii_alphabetic() {
+            out.push(cs[j]);
+            j += 1;
+        }
+        if j < cs.len() {
+            out.push(if cs[j] == from { to } else { cs[j] });
+            i = j + 1;
+        } else {
+            out.push_str(&cs[i..].iter().collect::<String>());
+            break;
+        }
+    }
+    perl_literal(quote, &out)
+}
+
+/// Operand indices consumed by `%b` conversions, in format order.
+///
+/// A conversion may carry flags/width/precision (`%-10b`), so the letter is
+/// taken as the first alphabetic character after the `%`, matching the way
+/// the renderer itself picks a conversion out (`literal_printf_conversions`).
+fn bash_b_operand_slots(fmt: &str) -> Vec<usize> {
+    let body = match fmt.as_bytes().first() {
+        Some(&b'"') => &fmt[1..fmt.len().saturating_sub(1)],
+        Some(&b'\'') => &fmt[1..fmt.len().saturating_sub(1)],
+        _ => return Vec::new(),
+    };
+    let cs: Vec<char> = body.chars().collect();
+    let mut slots = Vec::new();
+    let mut conv = 0usize;
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '%' {
+            i += 1;
+            continue;
+        }
+        if cs.get(i + 1) == Some(&'%') {
+            i += 2;
+            continue;
+        }
+        // skip flags/width/precision, then read the conversion letter
+        let mut j = i + 1;
+        while j < cs.len() && !cs[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        if j < cs.len() {
+            if cs[j] == 'b' {
+                slots.push(conv);
+            }
+            // `%c`/`%s` etc. consume an argument; `%%`-style aside, a
+            // conversion is one argument unless it is a star-width (rare).
+            conv += 1;
+            i = j + 1;
+        } else {
+            break;
+        }
+    }
+    slots
 }
 
 // ── Fix 14 — an unrebuildable condition must be TRUE, not a bare `0` ──────
@@ -1819,6 +2407,101 @@ fn fix_param_pattern_operands(expr: &IrExpr) -> IrExpr {
     }
 }
 
+// ── Fix 16 — `${arr[@]:offset:length}` must honour a NEGATIVE offset ────
+//
+// `shir::ast_to_ir` lowers `${primes[@]: -10}` to
+// `Call { func: "param", args: [Str("slice"), Str("primes"), Str(" -10"), Str("")] }` —
+// note the offset arrives with bash's space after the colon intact.
+//
+// The shared renderer parses that with `raw_off.parse::<i64>().unwrap_or(0)`
+// (ir.rs, the `"slice"` arm). Three things go wrong, all from that one parse:
+//
+//   1. `" -10"` does not parse, so it became 0 — the LAST N elements came out
+//      as ALL of them (051_primes printed every prime after "Last 10:").
+//   2. Even trimmed, a negative offset was emitted as a bare Perl range bound:
+//      `@a[-3..$#a]` runs from -3 to the END, not to -1.
+//   3. A length past the end was emitted verbatim (`@a[1..10]`), and Perl pads
+//      the missing elements with undef — `join` then renders 5 empty fields
+//      where bash stops at the last element. Only a runtime length can clamp.
+//
+// bash's rule for a negative offset on an array is: count back from the LAST
+// element, and an offset before the first is empty. That is exactly what
+// {@link SLICE_PREAMBLE}'s `__sh_slice` implements, so every negative offset
+// AND every bounded slice is routed through the helper.
+//
+// Scoped to the shape we fully understand: a `param("slice", …)` whose offset
+// is numeric (after trimming) or whose length is present. An offset that is a
+// VARIABLE (`${a[@]:$i:2}`) is left alone — it needs a runtime value this
+// pre-pass cannot evaluate, and the shared renderer already has its own path
+// for that.
+fn fix_array_slice_bounds(expr: &IrExpr) -> IrExpr {
+    let IrExpr::Call { func, args } = expr else {
+        return expr.clone();
+    };
+    if func != "param" || args.len() < 3 {
+        return expr.clone();
+    }
+    if args.first().and_then(crate::ir::call_arg_str).as_deref() != Some("slice") {
+        return expr.clone();
+    }
+    // `${@:off:len}` / `${*:off:len}` slice the positional parameters, which
+    // the renderer already handles with its own 1-based `@ARGV` arithmetic.
+    let Some(raw_name) = args.get(1).and_then(crate::ir::call_arg_str) else {
+        return expr.clone();
+    };
+    if raw_name == "@" || raw_name == "*" {
+        return expr.clone();
+    }
+    let raw_off = args
+        .get(2)
+        .and_then(crate::ir::call_arg_str)
+        .unwrap_or_default();
+    let raw_len = args.get(3).and_then(crate::ir::call_arg_str).unwrap_or_default();
+    // A VARIABLE offset or length cannot be resolved statically — leave the
+    // shared renderer its own handling rather than emitting a literal 0.
+    let off = match raw_off.trim().parse::<i64>() {
+        Ok(n) => n,
+        Err(_) => return expr.clone(),
+    };
+    let len = if raw_len.trim().is_empty() {
+        None
+    } else {
+        match raw_len.trim().parse::<i64>() {
+            Ok(n) => Some(n),
+            Err(_) => return expr.clone(),
+        }
+    };
+    // Nothing is wrong with a non-negative offset and no length: the range
+    // `@a[off..$#a]` is exactly bash's unbounded slice.
+    if off >= 0 && len.is_none() {
+        return expr.clone();
+    }
+    // `${#arr[@]}` (length), `${!map[@]}` (keys) and `${arr[@]}` (all) reach
+    // this arm with a non-numeric offset and are refused above.
+    let base = raw_name
+        .strip_suffix("[@]")
+        .or_else(|| raw_name.strip_suffix("[0]"))
+        .unwrap_or(&raw_name)
+        .to_string();
+    if base.is_empty() {
+        return expr.clone();
+    }
+    IrExpr::Call {
+        func: "__sh_slice".to_string(),
+        // The args are RAW PERL, not shell text: the renderer quotes a
+        // `Str(arg, Raw)` as a string literal, and `@primes` must arrive as a
+        // real array reference or `no strict 'refs'` has nothing to resolve.
+        args: vec![
+            IrExpr::RawExpr(format!("\\@{base}")),
+            IrExpr::RawExpr(off.to_string()),
+            match len {
+                Some(n) => IrExpr::RawExpr(n.to_string()),
+                None => IrExpr::RawExpr("undef".to_string()),
+            },
+        ],
+    }
+}
+
 /// The text of a substitution operand with a balanced pair of identical
 /// surrounding quotes removed, or `None` when it carries none.
 ///
@@ -2208,6 +2891,10 @@ fn fix_expr(e: &IrExpr) -> IrExpr {
             let corrected = fix_param_pattern_operands(e);
             // Fix 15: a `test` operand's `${v+word}` must keep its operand.
             let corrected = fix_test_set_test_operands(&corrected);
+            // Fix 16: a `${arr[@]:o:l}` whose offset/length is static must go
+            // through the runtime helper so a negative offset and an
+            // over-long length behave like bash's.
+            let corrected = fix_array_slice_bounds(&corrected);
             match corrected {
                 IrExpr::Call { func, args } => IrExpr::Call {
                     func,
@@ -2767,9 +3454,153 @@ pub fn needs_fn_status_helper(perl_src: &str) -> bool {
     perl_src.contains("__sh_fn_status(")
 }
 
+/// Emitted on demand when the body actually contains a `__sh_slice(` call
+/// (Fix 16). Same gating discipline as {@link FN_STATUS_PREAMBLE}.
+pub const SLICE_PREAMBLE: &str = r#"
+sub __sh_slice {
+    # bash's `${arr[@]:offset:length}` semantics, which a Perl range bound
+    # does not reproduce:
+    #
+    #   * a NEGATIVE offset counts back from the last element, and the slice
+    #     ends at the last element (not at `$#arr`);
+    #   * an offset before the first element yields the EMPTY list;
+    #   * a length past the end stops at the last element — a Perl range would
+    #     instead pad with undef, which `join` renders as empty fields.
+    #
+    # So both bounds are clamped against the real element count here.
+    my $__av = shift();   # \@name
+    my $__off = shift();
+    my $__len = shift();
+    my $__n = scalar(@$__av);
+    my $__start = $__off < 0 ? $__n + $__off : $__off;
+    return () if $__start < 0;
+    return () if $__start > $__n;
+    return @$__av[$__start .. $__n - 1] if !defined($__len);
+    return () if $__len <= 0;
+    my $__end = $__start + $__len - 1;
+    $__end = $__n - 1 if $__end > $__n - 1;
+    return @$__av[$__start .. $__end];
+}
+"#;
+
+/// True when the rendered program needs `__sh_slice` defined.
+pub fn needs_slice_helper(perl_src: &str) -> bool {
+    perl_src.contains("__sh_slice(")
+}
+
 #[cfg(test)]
 mod pgf_tests {
     use super::*;
+
+    /// Render `src` through the full GENERATOR entry point (the shared
+    /// renderer plus this module's fixes), so a test exercises the same path
+    /// `./fail` gates.
+    fn gen(src: &str) -> String {
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        generate(&prog)
+    }
+
+    // ── Fix 16 — the array-slice bounds ─────────────────────────────────
+    //
+    // Each of these pins ONE of the three ways the shared renderer's
+    // `raw_off.parse::<i64>().unwrap_or(0)` mis-lowered `${a[@]:o:l}`.
+
+    #[test]
+    fn slice_negative_offset_uses_the_helper() {
+        // The offset arrives as " -10" (bash's space after the colon). It did
+        // not parse, became 0, and "Last 10:" printed every element.
+        let out = gen("a=(2 3 5 7 11)\necho \"${a[@]: -3}\"\n");
+        assert!(
+            out.contains("__sh_slice(\\@a, -3, undef)"),
+            "negative offset must route through the helper, got:\n{out}"
+        );
+        assert!(
+            !out.contains("@a[0..$#a]"),
+            "must not degrade to the whole array, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_overlong_length_is_clamped_at_runtime() {
+        // `@a[1..10]` pads with undef; bash stops at the last element. Only
+        // the helper, which knows the element count, can express this.
+        let out = gen("a=(1 2 3 4 5)\necho \"${a[@]:1:10}\"\n");
+        assert!(
+            out.contains("__sh_slice(\\@a, 1, 10)"),
+            "bounded slice must go through the helper, got:\n{out}"
+        );
+        assert!(!out.contains("@a[1..10]"), "unclamped range, got:\n{out}");
+    }
+
+    #[test]
+    fn slice_unbounded_nonnegative_is_left_to_the_renderer() {
+        // No negative bound and no length — `@a[1..$#a]` is exactly bash, so
+        // the helper must NOT be introduced for it.
+        let out = gen("a=(1 2 3)\necho \"${a[@]:1}\"\n");
+        assert!(
+            out.contains("@a[1..$#a]") && !out.contains("__sh_slice("),
+            "plain unbounded slice must stay a range, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_helper_is_declared_only_when_called() {
+        // Same discipline as __sh_fn_status: a program with no slice must not
+        // grow a dead sub.
+        let out = gen("a=(1 2 3)\necho \"${a[@]}\"\n");
+        assert!(!needs_slice_helper(&out), "helper needed unexpectedly:\n{out}");
+        assert!(!out.contains("sub __sh_slice"), "dead sub emitted:\n{out}");
+        assert!(needs_slice_helper(&gen("a=(1 2 3)\necho \"${a[@]: -1}\"\n")));
+    }
+
+    #[test]
+    fn slice_positional_params_are_left_alone() {
+        // `${@:3}` is the positionals, with the renderer's own 1-based
+        // arithmetic — rewriting it would break that.
+        let out = gen("set -- a b c d\necho \"${@:3}\"\n");
+        assert!(
+            !out.contains("__sh_slice("),
+            "positional slice must keep the renderer's path, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_helper_matches_bash_bounds() {
+        // Every expectation below is what bash prints for
+        // `a=(1 2 3 4 5)` — derived from the interpreter, not reasoned out.
+        let helper = SLICE_PREAMBLE;
+        for (off, len, want) in [
+            ("0", "2", "1 2"),
+            ("2", "2", "3 4"),
+            ("1", "10", "2 3 4 5"),
+            ("-3", "undef", "3 4 5"),
+            ("-10", "undef", ""),
+            ("-2", "1", "4"),
+            ("3", "undef", "4 5"),
+            ("9", "undef", ""),
+            ("0", "0", ""),
+        ] {
+            let script = format!(
+                "{helper}\n@a=(1,2,3,4,5);\n\
+                 print join(' ', __sh_slice(\\@a, {off}, {len})), \"\\n\";\n"
+            );
+            let dir = std::env::temp_dir().join(format!("pgf_slice_{off}_{len}"));
+            std::fs::create_dir_all(&dir).expect("tmpdir");
+            let path = dir.join("t.pl");
+            std::fs::write(&path, &script).expect("write");
+            let out = std::process::Command::new("perl")
+                .arg(&path)
+                .output()
+                .expect("run perl");
+            let got = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                got, format!("{want}\n"),
+                "__sh_slice(@a, {off}, {len}) should be {want:?}"
+            );
+        }
+    }
     #[test]
     fn _dbg_dump_ir() {
         let src = "is_prime() { if [ $1 -eq 2 ]; then return 0; fi; return 1; }\nx=3; if is_prime $x; then echo yes; fi\n";
@@ -3380,7 +4211,18 @@ fn fix_ps_status_blocks(stmts: &[IrStmt]) -> Vec<IrStmt> {
                     ps_consumer_position(body, &rm_cleanup, &is_ps_tmp)
                 {
                     let mut rewritten = body.clone();
-                    rewritten[start] = save_status(saved.clone());
+                    // INSERT the capture AFTER the consumer, never over it.
+                    // Assigning `rewritten[start] = save_status(..)` replaced
+                    // the consumer statement itself, so the whole command
+                    // vanished from the emitted program: `cmp -s <(echo b)
+                    // <(echo c); echo "$?"` rendered the two producers, the
+                    // cleanup, and the echo — and NO `cmp` — so `$?` could
+                    // only ever be the producer's status, and `cmp`'s own
+                    // stdout (the GNU "differ: byte N" lines) was lost
+                    // entirely (070_cmp_basic, process-substitution.sh,
+                    // 040_process_substitution_comm).
+                    rewritten.insert(start + 1, save_status(saved.clone()));
+                    // …so the cleanup index shifted by one with it.
                     let cleanup = rewritten.len() - 1;
                     rewritten[cleanup] = restore_status(rewritten[cleanup].clone(), tmps, saved);
                     out.push(IrStmt::Block(rewritten));
