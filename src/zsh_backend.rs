@@ -1131,21 +1131,11 @@ _cmp() {
             out.push('\n');
         }
     }
-    // `_num()` is a polyfill for the $( _num "…" ) arith-coercion calls:
-    // emit the definition iff the RENDERED body actually calls it (bash
-    // coerces non-numeric arith values to 0, dash errors). Checking the
-    // final body is robust by construction — the definition is present
-    // exactly when a call is, no matter which arith form the core
-    // emitted (the Arith AST or the `arith("$a+$b")` string).
-    if body.contains("$( _num ") {
-        out.push_str("_num() {\n");
-        out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
-        out.push_str("    case \"$1\" in\n");
-        out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
-        out.push_str("        *) echo \"$1\" ;;\n");
-        out.push_str("    esac\n");
-        out.push_str("}\n\n");
-    }
+    // No `_num()` polyfill is emitted any more: zsh evaluates a bare
+    // variable natively inside `$(( ))` and coerces non-numeric to 0
+    // exactly as bash does, so every former `$( _num "${name}" )` call
+    // site is now a bare read (see arith_to_sh). Nothing else in the
+    // runtime namespace is generated from here.
     out.push_str(&body);
     Ok(out)
 }
@@ -5686,25 +5676,12 @@ fn arith_rewrite(t: &str) -> String {
                 i = j + 2;
                 continue;
             }
-            let mut k = j;
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            let is_assign = k < b.len()
-                && b[k] == b'='
-                && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
-            if is_assign {
-                out.push_str(name);
-            } else if NUM_VARS.lock().unwrap().contains(name) {
-                // known-numeric var: the coercion is dead weight — both
-                // shells evaluate the bare name natively (dash rejects
-                // QUOTED expansions inside $(( )) — `"${name}"` — so the
-                // drop target must be the bare identifier, which the
-                // analysis guarantees to hold numeric text)
-                out.push_str(name);
-            } else {
-                out.push_str(&format!("$( _num \"${name}\" )"));
-            }
+            // Assignment LHS and plain read both emit the bare name: a read is
+            // evaluated natively by zsh inside `$(( ))` (non-numeric
+            // coerces to 0, as in bash), so the `$( _num … )` dash-compat
+            // wrapper this used to take for unproven vars was dead weight
+            // that also cost a subshell fork per read.
+            out.push_str(name);
             i = j;
             continue;
         }
@@ -5830,14 +5807,17 @@ fn arith_to_sh(a: &ArithAst) -> String {
             // dotted struct-field names sanitize exactly like the setVar
             // write arm (`p.x` → `p_x`) — the read must hit the same home
             let name = name.replace('.', "_");
-            if NUM_VARS.lock().unwrap().contains(&name) {
-                // known-numeric var: bare read (dash rejects quoted
-                // expansions inside $(( )); the analysis guarantees the
-                // value is numeric text)
-                name.clone()
-            } else {
-                format!("$( _num \"${name}\" )")
-            }
+            // Bare read for EVERY variable, known-numeric or not: zsh
+            // evaluates a bare name in `$(( ))` natively and coerces a
+            // non-numeric value to 0, exactly as bash does. The former
+            // `$( _num "${name}" )` wrapper was a dash-compat polyfill
+            // (dash ERRORS on a non-numeric arith operand where bash
+            // coerces) — a constraint zsh does not have, so here it was
+            // not just dead weight but actively LESS faithful: it
+            // clobbered a value that bash would have re-evaluated as an
+            // expression (`n="3+4"` -> bash 7, `_num` 0). Verified by
+            // differential probe over the coercion value space.
+            name.clone()
         }
         ArithAst::Index { var, key } => {
             // An arithmetic subscript (`$(( a[1] ))`, the A1 Index node) must
@@ -5855,15 +5835,10 @@ fn arith_to_sh(a: &ArithAst) -> String {
             if ARRAY_NAMES.lock().unwrap().contains(&base) {
                 match key.as_ref() {
                     ArithAst::Num(k) => {
-                        // `$( _num … )` wrapper only when the value is not
-                        // known-numeric; the element vars are the array's
-                        // own assignments, so the same A2 verdict applies.
-                        let elem = format!("{base}_{k}");
-                        if NUM_VARS.lock().unwrap().contains(&elem) {
-                            format!("{elem}")
-                        } else {
-                            format!("$( _num \"${elem}\" )")
-                        }
+                        // Bare read, same reason as the Var arm above: zsh evaluates
+                        // the element var in `$(( ))` natively. No
+                        // `_num` wrapper needed.
+                        format!("{base}_{k}")
                     }
                     // A non-literal key cannot be named at render time, so
                     // the element name is built at RUN time: `$((KEY))`
@@ -6531,9 +6506,22 @@ mod tests {
             "callee prints the value rather than returning a status: {sh}"
         );
         assert!(
-            !sh.contains("return $((($( _num"),
-            "arithmetic payload is not emitted as a return status: {sh}"
+            !sh.contains("_num"),
+            "arithmetic reads are native zsh, not a runtime polyfill: {sh}"
         );
+    }
+
+    /// Arithmetic reads are lowered to the BARE zsh variable, never to the
+    /// `$( _num … )` dash-compat polyfill. zsh coerces a non-numeric operand
+    /// to 0 natively (as bash does), so the wrapper bought nothing and cost a
+    /// subshell fork per read — and was actively LESS faithful, because it
+    /// clobbered a value bash would have re-evaluated as an expression
+    /// (`n="3+4"` is 7 to bash, 0 through `_num`).
+    #[test]
+    fn arith_reads_are_bare_not_a_num_polyfill() {
+        let sh = render_sh("n=1\necho $((n + 1))\n");
+        assert!(!sh.contains("_num"), "no runtime coercion helper: {sh}");
+        assert!(sh.contains("n + 1"), "bare arithmetic read: {sh}");
     }
 
     /// zsh exports HOST (short hostname) where bash exports HOSTNAME, and
