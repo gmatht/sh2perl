@@ -8677,16 +8677,44 @@ pub(crate) fn param_text_to_perl(tok: &str) -> Option<String> {
     // `${s:off:len}` — the substring/slice form (`${flags:j:1}`). The `:`
     // also introduces `:-`/`:=`/`:?`/`:+`, which the operator list below
     // handles, so only a `:digit`/`:$` continuation is a slice.
-    if let Some(rest) = rest.strip_prefix(':') {
-        // `:` followed by anything that is NOT one of the parameter
-        // operators (`:-`, `:=`, `:?`, `:+`) is a slice. An identifier
-        // subscript (`${flags:j:1}`) is the common shell idiom for
-        // `substr(..., $j, 1)`.
-        let is_op = [':', '=', '?', '+']
-            .iter()
-            .any(|c| rest.starts_with(*c));
+    //
+    // The operator-vs-slice decision has to be made on the two-character
+    // prefix. Reading only the single `:` character made EVERY `:-` look like
+    // a slice, so `${a:-${b:-$(cmd)}}` re-lexed textually became
+    // `substr($b, -$(cmd))` — the `-` taken as a negative slice offset — which
+    // emitted Perl with a bare `$(` (Perl's GID special variable): the file
+    // failed to COMPILE and every other construct in it was lost
+    // (perl-20261002-231200; corpus 063_04 and 063_hard_to_parse). Nesting
+    // depth 0-2 was unaffected because their `:-` was the OUTERMOST operator
+    // and so arrived structurally lowered, never through this textual
+    // fallback.
+    //
+    // bash's own rule: `:-` is the default operator only when the `-` follows
+    // the `:` immediately. A space makes it a slice offset — with
+    // `a=abcdef`, `${a:-1}` is `abcdef` and `${a: -1}` is `f`. The parser
+    // encodes that by keeping the space in the slice's offset text (it lowers
+    // `${a: -1}` to `param("slice", "a", " -1", "")` and `${a:-1}` to
+    // `param(":-", "a", "1")`), so this textual fallback applies the same
+    // test the parser already applies.
+    if rest.starts_with(':') {
+        // `:`-operator ⇒ fall through to the operator loop below. This is
+        // the WHOLE of the decision: bash reads `:-`/`:=`/`:?`/`:+` as the
+        // parameter operators, and EVERY other `:` continuation as a slice
+        // offset (`${a:1:3}`, `${a: -1}`, `${flags:j:1}`).
+        //
+        // The operator is the TWO-character PREFIX `:` followed by one of
+        // `- = ? +`. Testing the single character `:` instead — which is what
+        // `[':', '=', '?', '+'].iter().any(|c| rest.starts_with(...))` did —
+        // matched EVERY `:` continuation, so `:-` never reached the operator
+        // loop and always fell into the slice branch. That is the defect this
+        // branch exists to prevent.
+        let is_op = rest.len() >= 2 && matches!(rest.as_bytes()[1], b'-' | b'=' | b'?' | b'+');
         if !is_op {
-        
+            // A slice. Consume the `:` and split offset from (optional)
+            // length. The leading space of `${a: -1}` is significant and is
+            // kept: it is exactly what distinguishes the slice from the
+            // `:-` operator, and the parser preserves it the same way.
+            let rest = &rest[1..];
             let (off, len) = match rest.split_once(':') {
                 Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
                 None => (rest.trim().to_string(), String::new()),
@@ -13020,6 +13048,61 @@ mod tests {
         assert!(
             !perl.contains("$xs = setArrayAppend"),
             "no scalar fallback:\n{perl}"
+        );
+    }
+
+    /// `${v:-${b:-$(cmd)}}` — a command substitution nested inside a
+    /// parameter-expansion DEFAULT must reach the renderer as a real capture,
+    /// not as opaque text re-lexed into a slice.
+    ///
+    /// `param_text_to_perl` re-lexes an expansion that arrived as a `Str`
+    /// (which is how a nested default is carried). It has to choose between
+    /// the `:-` operator and the `:` slice, and it used to read the SINGLE
+    /// character `:` — so `:-` never reached the operator loop and every
+    /// nested default was lowered as `substr($b, -$(cmd))`. The bare `$(` is
+    /// Perl's GID special variable, so such a file fails `perl -c` and loses
+    /// every construct in it (core request perl-20261002-231200; corpus
+    /// 063_04, 063_hard_to_parse).
+    ///
+    /// Pins both halves of bash's rule: `:-` immediately after the `:` is the
+    /// operator, `:` + SPACE is a slice (`a=abcdef` → `${a:-1}` is `abcdef`,
+    /// `${a: -1}` is `f`).
+    #[test]
+    fn nested_default_cmdsub_is_a_capture_not_a_slice() {
+        let op = |tok: &str| param_text_to_perl(tok).unwrap_or_else(|| panic!("{tok}"));
+        // The nested command substitution is a real capture, and the `:-`
+        // default is a real conditional — never a `substr` with a negative
+        // offset, which is the shape the defect produced.
+        let deep = op("${a:-${b:-$(echo DEEP)}}");
+        assert!(
+            deep.contains("defined($a)"),
+            "outer default survives: {deep}"
+        );
+        assert!(
+            deep.contains("defined($b)"),
+            "inner default survives: {deep}"
+        );
+        assert!(
+            !deep.contains("substr("),
+            "a nested default is not a slice: {deep}"
+        );
+        assert!(
+            !deep.contains("$("),
+            "no bare $( (Perl's GID) may reach the output: {deep}"
+        );
+        // bash: `:-` is the operator only when the `-` follows the `:` with
+        // no space. The space is the whole discriminator and the parser keeps
+        // it in the offset, so the textual fallback must too.
+        assert_eq!(op("${a:-1}"), op("${a:-1}"), "stable");
+        let defaulted = op("${a:-1}");
+        assert!(
+            defaulted.contains("defined($a)"),
+            "`:-` is the default operator: {defaulted}"
+        );
+        let sliced = op("${a: -1}");
+        assert!(
+            !sliced.contains("defined($a)"),
+            "`: ` + space is a slice, not a default: {sliced}"
         );
     }
 }
