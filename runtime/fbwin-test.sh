@@ -45,6 +45,31 @@ for CC in cc tcc; do
     rm -f "/tmp/fbwin-test-$CC-$$" /tmp/fbwin-test-$$.ppm
 done
 
+# THE HAND-DECLARED STRUCT, CHECKED AGAINST X11'S OWN.
+#
+# fbwin.c cannot include <X11/Xlib.h> — a framebuffer box has no X11
+# headers, and a device that needs one to compile is not a fallback —
+# so XSetWindowAttributes is declared by hand. A hand-declared X11
+# struct is only as good as the number of fields somebody remembered,
+# and a wrong one is SILENT: it still compiles, still opens a window,
+# and the one flag the device's design rests on (override_redirect,
+# field 14) simply lands at the wrong offset. That is not a theory —
+# the first version of the declaration was missing `event_mask` and put
+# override_redirect at byte 80 where X11 puts it at 88, and nothing
+# complained until the attributes were compared.
+#
+# So this is checked on every run, and it needs the real header, which
+# means it is NOT part of the tcc/cc loop above: this is a check on the
+# source, not a build of the device.
+if command -v cc > /dev/null 2>&1 && [ -f /usr/include/X11/Xlib.h ]; then
+    echo "== fbwin / XSetWindowAttributes layout =="
+    cc -Wall -O1 fbwin-attr-layout.c -o /tmp/fbwin-attr-layout-$$ -lX11 \
+        && /tmp/fbwin-attr-layout-$$ || rc=1
+    rm -f /tmp/fbwin-attr-layout-$$
+else
+    echo "== fbwin: attribute layout SKIPPED (no X11 headers to check against)"
+fi
+
 rm -f "$ORACLE"
 [ "$rc" -eq 0 ] && echo "== fbwin: all green ==" || echo "== fbwin: FAILURES =="
 exit $rc

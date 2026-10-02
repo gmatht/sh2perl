@@ -206,6 +206,107 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* THE SECOND FRAME MUST REACH THE WINDOW. This is the check for the
+     * dirty-flag gate, and it is here because a single-present test
+     * cannot see it at all.
+     *
+     * fbwin_present used to skip the blit unless an Expose or a
+     * Configure had arrived since the last one:
+     *
+     *     if (!X_dirty) return 0;
+     *
+     * A game loop presents once per frame, and the first Expose is
+     * consumed by the first present, so every present after that was a
+     * no-op and the window held frame 1 forever. Everything else in
+     * this suite still passed: the window was open, it was the right
+     * size, frame 1 was on it, and the oracle was happy. What made it
+     * wrong is that a GAME DOES NOT STOP AT FRAME 1, and only a test
+     * that changes the picture and looks again can tell.
+     *
+     * The test is two DIFFERENT frames into one window, read back
+     * through the oracle each time, and compared. Same window, same
+     * size, same camera: the only thing that changed is the colour, so
+     * identical readings mean the second frame never landed. */
+    if (oracle) {
+        char cmd[640];
+        char out[1024];
+        char first[1024];
+        FILE *p;
+        int second_differs = 0, third_differs = 0;
+
+        check(fbwin_open(64, 48) == 1, "the window is open for the 2nd-frame test");
+        check(fb_open(64, 48) == 0, "the RAM surface is back at 64x48");
+
+        /* frame 1: red */
+        fb_clear(0xFF101010u);
+        fb_set_camera(4, 0.9, 4, 0, 0);
+        fb_blocks("0 0 0 1 1 1 1 0 0 0 0\n");
+        for (i = 0; i < 3; i++) { fb_present(); usleep(200000); }
+        fbwin_sync();
+        first[0] = 0;
+        snprintf(cmd, sizeof cmd, "%s 2>&1", oracle);
+        p = popen(cmd, "r");
+        if (p) {
+            size_t n = fread(first, 1, sizeof first - 1, p);
+            (void)pclose(p);
+            first[n] = 0;
+        }
+        check(first[0] != 0, "frame 1 was read back through the oracle");
+        printf("   frame 1: %s", first);
+
+        /* frame 2: green, same window, no Expose in between */
+        fb_clear(0xFF101010u);
+        fb_blocks("0 0 0 1 1 1 0 1 0 0 0\n");
+        for (i = 0; i < 3; i++) { fb_present(); usleep(200000); }
+        fbwin_sync();
+        out[0] = 0;
+        p = popen(cmd, "r");
+        if (p) {
+            size_t n = fread(out, 1, sizeof out - 1, p);
+            (void)pclose(p);
+            out[n] = 0;
+        }
+        printf("   frame 2: %s", out);
+        second_differs = (first[0] && out[0] && strcmp(first, out) != 0);
+        check(second_differs, "a SECOND frame reaches the window (no dirty gate)");
+
+        /* frame 3: blue. This is also the byte-order check: with the
+         * LSB/MSB branches swapped, a blue frame arrives with red and
+         * green in each other's places and no blue at all, so the
+         * reading is a DIFFERENT string but the wrong one. Checking
+         * that it differs is what catches the frozen window; checking
+         * the blue is what catches the swapped byte order. */
+        fb_clear(0xFF101010u);
+        fb_blocks("0 0 0 1 1 1 0 0 1 0 0\n");
+        for (i = 0; i < 3; i++) { fb_present(); usleep(200000); }
+        fbwin_sync();
+        {
+            char third[1024];
+            third[0] = 0;
+            p = popen(cmd, "r");
+            if (p) {
+                size_t n = fread(third, 1, sizeof third - 1, p);
+                (void)pclose(p);
+                third[n] = 0;
+            }
+            printf("   frame 3: %s", third);
+            third_differs = (out[0] && third[0] && strcmp(out, third) != 0);
+            check(third_differs, "a THIRD frame reaches the window too");
+            /* "b=0.0" in the oracle's summary means every pixel in the
+             * window has a zero blue channel. A device that lost its
+             * blue channel reports exactly that while the PPM beside it
+             * is perfectly correct, which is why this is checked here
+             * and not only in the dump. */
+            {
+                const char *bb = strstr(third, " b=");
+                double bval = bb ? strtod(bb + 3, 0) : -1.0;
+                check(bval > 0.0, "the window's blue channel is not zero");
+                printf("   (oracle blue = %.1f%s)\n", bval,
+                       bval > 0.0 ? "" : "  <- blue is being dropped");
+            }
+        }
+    }
+
     /* a size change re-maps at the new size */
     check(fbwin_open(96, 64) == 1, "a different size re-maps");
 

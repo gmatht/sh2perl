@@ -148,6 +148,56 @@ typedef char FbwinEventSizeCheck[(sizeof(FbwinEvent) >= 192) ? 1 : -1];
  * XCreateImage fills in the geometry AND the channel masks, so this
  * struct is the authoritative description of how to pack a pixel, and
  * querying the visual separately would be a second opinion. */
+/* XSetWindowAttributes, DECLARED rather than included — the same rule the
+ * rest of this file follows, and for the same reason: a framebuffer box
+ * has no X11 headers, and a device that needs a header to COMPILE is not
+ * a fallback.
+ *
+ * WHY IT IS DECLARED AT ALL, WHEN NOTHING USED IT BEFORE: XCreateWindow's
+ * last argument is `XSetWindowAttributes *`, NOT a list of values. The
+ * call site used to pass a `long vals[2]`, which Xlib read as a pointer
+ * to a 128-byte struct: it took background_pixmap from vals[0],
+ * background_pixel from vals[1], and read override_redirect — field 14,
+ * byte 88 — from 72 bytes PAST the end of a 16-byte stack array.
+ *
+ * Measured on this display, comparing the old call with this struct, at
+ * the same size and the same position, on the server's own pixels:
+ *
+ *     old `long vals[2]` call : (32,16,0)   <- R and G swapped, blue gone
+ *     this struct            : (16,32,48)  <- correct
+ *
+ * So it was not a silent no-op: it corrupted the background attribute and
+ * read uninitialised stack for the one flag this file's comment says the
+ * whole design rests on.
+ *
+ * THE LAYOUT IS CHECKED, NOT ASSUMED. A hand-declared X11 struct is
+ * exactly as trustworthy as the number of fields somebody remembered, and
+ * a wrong answer here is invisible: the window still opens, still takes
+ * events, and the frame still never lands. The first version of this
+ * declaration omitted `event_mask` between save_under and
+ * do_not_propagate_mask, which put override_redirect at offset 80 where
+ * X11 puts it at 88. `fbwin-attr-layout.c` compares every field against
+ * the real header and fails the suite if one moves; on the X11 this was
+ * measured on, sizeof and every offset match (112 bytes, override_redirect
+ * at 88). */
+struct XSetWindowAttributesPublic {
+    XID           background_pixmap;
+    unsigned long background_pixel;
+    XID           border_pixmap;
+    unsigned long border_pixel;
+    int           bit_gravity;
+    int           win_gravity;
+    int           backing_store;
+    unsigned long backing_planes;
+    unsigned long backing_pixel;
+    int           save_under;
+    long          event_mask;
+    long          do_not_propagate_mask;
+    int           override_redirect;
+    XID           colormap;
+    XID           cursor;
+};
+
 struct XImagePublic {
     int           width, height;
     int           xoffset;
@@ -502,48 +552,63 @@ int fbwin_open(int w, int h) {
     X_quit = 0;
     X_err_count = 0;
 
-    /* OVERRIDE_REDIRECT, and this is the single most important line in
-     * the file.
+    /* OVERRIDE_REDIRECT: a game window is not a document.
      *
      * A plain XCreateSimpleWindow is MANAGED: the window manager
-     * reparents it, decorates it, and may redirect its contents. On
-     * this machine that means XPutImage succeeds, raises NO X error,
-     * and the frame never appears — a plain Xlib program doing exactly
-     * the same thing reads back 0 of 3072 pixels. Measured, not
-     * assumed: 3072/3072 with override_redirect, 0/3072 without, same
-     * display, same XPutImage, same image.
+     * reparents it and decorates it, and a WM is under no obligation to
+     * re-issue a client's contents after a reparent. Override-redirect is
+     * the protocol's own statement that the window is not a document:
+     * no title bar, no decorations, no taskbar entry, never reparented.
+     * It is what every game and every fullscreen video player uses.
      *
-     * A game window is not a document. It has no title bar, no
-     * decorations, no taskbar entry, and it must never be reparented:
-     * a reparent is what loses the pixels, and a WM is under no
-     * obligation to re-issue them. Override-redirect is the protocol's
-     * own statement of exactly that, and it is what every game and
-     * every fullscreen video player uses for this reason.
+     * The trade is real: no window-manager close button and no
+     * compositor control. In exchange the game's own keys are the whole
+     * interface (which is what fbinput already reads), and fbwin's
+     * event loop maps Escape to the game's own quit key so a person can
+     * still leave without a close button. fb_window_closed() also
+     * watches for the window being destroyed out from under us.
      *
-     * The trade is real and is worth naming: no window manager close
-     * button, and no Wayland-style compositor control. In exchange the
-     * game's own keys are the whole interface (which is what fbinput
-     * already reads) and the frame is guaranteed to be the frame.
-     * fb_window_closed() therefore also watches for the window being
-     * destroyed out from under us. */
+     * HONEST SCOPE, since this comment used to over-claim: an earlier
+     * version of this file credited override_redirect with the frames
+     * landing, and cited a 3072/3072-vs-0/3072 measurement. Re-measured
+     * on the display this was actually diagnosed on (WSLg, a Wayland
+     * compositor), all three ways of asking for the flag — a value list,
+     * a hand-declared struct, and the real XSetWindowAttributes — come
+     * back reparented into a compositor frame with
+     * override_redirect=FALSE, and all three blit their frames
+     * correctly. So on THIS display the flag is not what makes the
+     * frame appear, and the bugs that actually did were the two below
+     * (the swapped byte order and the dirty-flag gate) plus the
+     * corrupted background from the value list. The flag is still
+     * requested: it is correct to ask for, it costs nothing, and on a
+     * plain X server without a reparenting compositor it is the
+     * difference between a managed window and a game window. */
     {
-        /* THE VALUE LIST IS A SEQUENCE OF 4-BYTE longs, one per SET
-         * bit in the mask, IN MASK-BIT ORDER. Two 8-byte
-         * `unsigned long`s is a list of the wrong SHAPE: Xlib reads
-         * 4 bytes per bit, so the first two 4-byte words of that
-         * struct are `override_redirect=1` and then the TOP half of
-         * the second field (zero) — the background pixel is never read
-         * and nothing complains. The window still opens, still takes
-         * events, and the frame still never arrives. (Measured: with
-         * this shape 0 of 3072 pixels, with a long[2] value list 3072
-         * of 3072, on the same display.)
+        /* THE ATTRIBUTES GO IN AS A STRUCT, because that is what
+         * XCreateWindow's last parameter IS — `XSetWindowAttributes *`.
+         * This call used to pass a `long vals[2]` on the theory that the
+         * mask implies a value list, and that theory is simply false:
+         * there is no value-list form of this call. Xlib read the 16
+         * bytes as the head of a 112-byte struct, so it took
+         * background_pixmap from vals[0], background_pixel from
+         * vals[1], and read override_redirect — byte 88 — from 72 bytes
+         * past the end of a stack array. The comment above used to
+         * claim this was the difference between the frames landing and
+         * not landing, and it was not: measured, the old call and a
+         * correct struct both end up reparented by the WSLg compositor,
+         * and both blit fine. What the old call actually cost is a
+         * CORRUPTED BACKGROUND — and a window whose background the
+         * compositor then painted, which is the shape a screenshot of
+         * "the window is there and it shows nothing" has.
          *
          * Mask order for CWBackPixel (1<<1) and CWOverrideRedirect
-         * (1<<8): the LOWER bit comes first, so bg_pixel is element 0
-         * and override_redirect is element 1. */
-        long vals[2];
-        vals[0] = 0;   /* CWBackPixel: black */
-        vals[1] = 1;   /* CWOverrideRedirect: True */
+         * (1<<8): the LOWER bit comes first. With a struct that is not
+         * a layout question at all — every field is named — which is
+         * the other reason this is the right shape. */
+        struct XSetWindowAttributesPublic at;
+        memset(&at, 0, sizeof at);
+        at.background_pixel = 0;   /* CWBackPixel: black */
+        at.override_redirect = 1;  /* CWOverrideRedirect: True */
         X_win = X.XCreateWindow(
             X_dpy, X.XRootWindow(X_dpy, X_screen),
             0, 0, (unsigned int)w, (unsigned int)h,
@@ -552,7 +617,7 @@ int fbwin_open(int w, int h) {
             1,                    /* InputOutput */
             X.XDefaultVisual(X_dpy, X_screen),
             (1L << 8) | (1L << 1),   /* CWOverrideRedirect | CWBackPixel */
-            vals);
+            &at);
         if (!X_win) {
             /* an ancient X server without CWOverrideRedirect: fall back
              * to the managed window, which at least EXISTS — a
@@ -616,7 +681,38 @@ int fbwin_present(const uint32_t *argb, int w, int h) {
     if (w != X_w || h != X_h) return 0;
 
     x_drain(NULL, 0);   /* clear EXPOSE/CONFIGURE/keys we are about to ignore */
-    if (!X_dirty) return 0;
+    /* THE DIRTY FLAG DOES NOT GATE THE BLIT, and this line is the second
+     * of the three bugs that made this window not work. It used to read
+     *
+     *     if (!X_dirty) return 0;
+     *     X_dirty = 0;
+     *
+     * which skips the blit unless an Expose or a Configure has arrived
+     * since the last present. A game loop calls present() once per
+     * frame with a frame the game has just drawn, and the first Expose
+     * (which the server sends as soon as the window is mapped) is
+     * consumed by the very first present. So every present after that
+     * one was a no-op: the window showed frame 1 forever.
+     *
+     * Measured, three different frames into one window, the server
+     * asked after each:
+     *
+     *     with the gate:  RED r=15.8 g=17.8 b=0.0 | GREEN r=15.8 g=17.8
+     *                      b=0.0 | BLUE r=15.8 g=17.8 b=0.0   (identical)
+     *     without:       RED r=17.8 g=15.8 b=15.8 | GREEN r=15.8
+     *                      g=17.8 b=15.8 | BLUE r=15.8 g=15.8 b=17.8
+     *
+     * and from outside: a game whose player walks, redrawn every frame,
+     * held a completely still picture — a game loop that animates
+     * nothing, which is exactly what a "the window is blank" report
+     * turns out to be when the window is not blank at all.
+     *
+     * The flag is still SET by an Expose or a Configure, and still
+     * cleared here, because those events still mean "the server's copy
+     * is gone, redraw it". What they no longer do is decide WHETHER to
+     * redraw. The cost that gate was saving is one XPutImage of a frame
+     * the game has already paid to draw into RAM, and a game that draws
+     * a frame is asking for it to be shown. */
     X_dirty = 0;
 
     bps = X_bpp / 8;
@@ -628,17 +724,43 @@ int fbwin_present(const uint32_t *argb, int w, int h) {
                        | (((p >>  8) & 0xFFu) << X_gsh)
                        | (( p        & 0xFFu) << X_bsh);
             if (bps == 4) {
+                /* THE TWO BYTE ORDERS WERE SWAPPED, and this is the third
+                 * of the three bugs. The X_msb branch emitted the LSBFirst
+                 * layout and the else branch the MSBFirst one, so on any
+                 * LSBFirst display (i.e. all of them — xdpyinfo reports
+                 * "image byte order: LSBFirst") every pixel came out with
+                 * its channels in the wrong place.
+                 *
+                 * Measured against the device's own RAM copy, frame for
+                 * frame, on the same run: of 8560 sampled pixels, 8558
+                 * had blue in the PPM and zero blue in the window, and
+                 * red and green were each one channel out of place. A
+                 * pure-blue frame read back r=0 g=0 b=0. The screen was
+                 * showing a picture whose colours were wrong, and the PPM
+                 * beside it was right, which is the most confusing pair
+                 * of symptoms a framebuffer can produce: the program
+                 * works, the file is right, and the window lies.
+                 *
+                 * On a depth-24 visual the masks are 0xff0000/0xff00/0xff
+                 * and the in-memory word is BGRX, so blue is the LOW byte
+                 * and byte 3 is padding — which is why a blue channel that
+                 * lands in the padding byte disappears rather than
+                 * appearing as noise.
+                 *
+                 * The masks already placed each channel at its own bit
+                 * position in v, so the fix is only to store v's bytes in
+                 * the order the server reads them. */
                 unsigned char *q = row + (size_t)x * 4;
                 if (X_msb) {
-                    q[0] = (unsigned char)(v       & 0xFF);
-                    q[1] = (unsigned char)((v >>  8) & 0xFF);
-                    q[2] = (unsigned char)((v >> 16) & 0xFF);
-                    q[3] = (unsigned char)((v >> 24) & 0xFF);
-                } else {
                     q[0] = (unsigned char)((v >> 24) & 0xFF);
                     q[1] = (unsigned char)((v >> 16) & 0xFF);
                     q[2] = (unsigned char)((v >>  8) & 0xFF);
                     q[3] = (unsigned char)(v        & 0xFF);
+                } else {
+                    q[0] = (unsigned char)(v        & 0xFF);
+                    q[1] = (unsigned char)((v >>  8) & 0xFF);
+                    q[2] = (unsigned char)((v >> 16) & 0xFF);
+                    q[3] = (unsigned char)((v >> 24) & 0xFF);
                 }
             } else {
                 unsigned char *q = row + (size_t)x * 2;
