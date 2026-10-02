@@ -4309,6 +4309,46 @@ fn render_param(args: &[IrExpr]) -> String {
             v = var,
             d = val
         ),
+        // `${v+w}` / `${v:+w}` — the ALTERNATE-VALUE twins of `-`/`:-`.
+        // The predicate differs between the two and the distinction is
+        // load-bearing, so they cannot share an arm:
+        //
+        //   `+`  — is v SET?           strictly WEAKER than non-empty.
+        //   `:+` — is v set AND non-empty?
+        //
+        // A var assigned the empty string IS set, so `E=; echo ${E+d}`
+        // prints `d` while `${E:+d}` prints nothing. Folding `+` into the
+        // `:-` non-empty test therefore loses the payload for exactly the
+        // set-but-empty case, and — because `test -n` then sees a different
+        // length — can invert the branch outright:
+        //
+        //   if test -n "${V+x}"; then …    # bash: taken iff V is SET
+        //
+        // Before these arms, `+` fell through to the catch-all `_ => var`,
+        // which renders the VARIABLE — dropping `x` entirely and making
+        // `test -n` read the value rather than the set-ness. Unset V
+        // rendered as an empty read that still had length under `warn`, and
+        // the `+` operand reached the renderer already rewritten to `=` by
+        // the generator pre-pass, which rendered `($ENV{V} = "x")` — an
+        // ASSIGNMENT with a side effect, making the branch permanently true.
+        "+" => {
+            if var.starts_with('@') {
+                format!("(@ARGV ? {d} : '')", d = val)
+            } else {
+                format!("(defined({v}) ? {d} : '')", v = var, d = val)
+            }
+        }
+        ":+" => {
+            if var.starts_with('@') {
+                format!("(@ARGV ? {d} : '')", d = val)
+            } else {
+                format!(
+                    "((defined({v}) && length({v})) ? {d} : '')",
+                    v = var,
+                    d = val
+                )
+            }
+        }
         // Prefix removal: # shortest, ## longest. The `:` forms (only when
         // non-empty) are approximated by the plain forms.
         // Prefix removal: # shortest, ## longest (approximated by the
@@ -12203,6 +12243,72 @@ impl IrProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `${v+w}` / `${v:+w}` must lower to the SETNESS predicate, and the two
+    /// must NOT render identically — `+` is set-ness, `:+` is non-empty.
+    ///
+    /// Regression (core-request perl-generator-20261001-202305): with no
+    /// `+` arm both fell through to the catch-all `_ => var`, rendering the
+    /// VARIABLE and dropping `w`. Combined with the generator pre-pass
+    /// rewriting the operand to `=` (which renders an ASSIGNMENT), a
+    /// `test -n "${V+x}"` branch was unconditionally true and printed for an
+    /// UNSET variable — a silent wrong answer, not a crash.
+    #[test]
+    fn param_plus_lowers_to_a_set_test_not_the_value() {
+        let plus = render_param(&[
+            IrExpr::Str("+".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("x".into(), StrStyle::DoubleQuoted),
+        ]);
+        // the payload survives, and the guard is `defined` ALONE — a var
+        // assigned "" is set, so a `length` conjunct would drop `x` for it.
+        assert_eq!(plus, "(defined($ENV{V}) ? \"x\" : '')");
+        assert!(!plus.contains("length("), "must not be the non-empty test: {plus}");
+
+        // `:+` is the OTHER predicate — set AND non-empty.
+        let colon_plus = render_param(&[
+            IrExpr::Str(":+".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("x".into(), StrStyle::DoubleQuoted),
+        ]);
+        assert_eq!(
+            colon_plus,
+            "((defined($ENV{V}) && length($ENV{V})) ? \"x\" : '')"
+        );
+        assert_ne!(plus, colon_plus, "`+` and `:+` must stay distinct");
+    }
+
+    /// The operand must never render as an ASSIGNMENT, and `+` must not
+    /// degrade to `=`.
+    ///
+    /// The generator pre-pass rewrites `${v+set}` to `param("=", …)` on the
+    /// theory (stated in its own comment) that `+` has no renderer arm. Both
+    /// then fell through to the catch-all, which returned the bare variable —
+    /// so the rewrite was a no-op on its own terms. Once `+` gains an arm it
+    /// becomes actively harmful: `=` renders `($ENV{V} = "set")`, an
+    /// ASSIGNMENT whose side effect makes the `test -n` guard permanently
+    /// true.
+    ///
+    /// Asserting `+ != =` is the shape that fails pre-fix: with BOTH arms
+    /// absent the catch-all returned the same variable for either operator,
+    /// so the two were indistinguishable.
+    #[test]
+    fn param_plus_never_renders_an_assignment() {
+        let operand = |op: &str| {
+            render_param(&[
+                IrExpr::Str(op.into(), StrStyle::DoubleQuoted),
+                IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+                IrExpr::Str("set".into(), StrStyle::DoubleQuoted),
+            ])
+        };
+        let plus = operand("+");
+        assert!(!plus.contains('='), "`+` must not assign: {plus}");
+        assert_ne!(
+            plus,
+            operand("="),
+            "`+` must not render as `=` — the pre-pass rewrite's premise is gone"
+        );
+    }
 
     /// The t32_redirect A1 shape (triage-perl-20260814-033432): a
     /// Redirect whose target is an Interpolate carrying the PID
