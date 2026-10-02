@@ -57344,9 +57344,27 @@ mod stmt_lines_tests {
     /// the elided assignment's line (1). A stale-by-one map silently
     /// points a consumer at the wrong source, which is worse than a
     /// missing entry.
+    ///
+    /// `x=hi` alone is NOT used as the assignment here. Since
+    /// `copy-propagation` (transforms/copy_propagation.rs, 2026-09-15)
+    /// folds single-def literal variables into their reads, `x=hi` +
+    /// `echo $x` collapses to ONE synthesized `echo` that matches NO
+    /// original statement — so `stmt_lines` is legitimately EMPTY and an
+    /// assertion on the echo's line can never hold (that shape is pinned
+    /// separately, by `a_folded_away_statement_leaves_no_stale_map_entry`).
+    /// An assignment nothing reads is a DIFFERENT drop —
+    /// `dead-store-elim` — and the echo keeps its own origin: exactly the
+    /// stale-by-one shape this test exists to catch.
     #[test]
     fn surviving_statement_keeps_its_own_source_line() {
-        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        let (stmts, lines) = line_map("x=hi\necho done\n");
+        // Precondition: the dead store is still elided, the echo survives.
+        assert_eq!(
+            stmts.len(),
+            1,
+            "expected only the echo to survive, got {:?}",
+            stmts
+        );
         let echo_idx = stmts
             .iter()
             .position(|s| matches!(s, IrStmt::Expr { .. }))
@@ -57362,14 +57380,55 @@ mod stmt_lines_tests {
 
     /// Nothing is elided when every assignment is READ, so the map must be
     /// complete and in order — the fix must not disturb the ordinary path.
+    ///
+    /// Same fold caveat as above: command substitutions stand in for
+    /// literals so each of the four statements keeps a distinct origin.
     #[test]
     fn map_is_complete_when_nothing_is_elided() {
-        let (stmts, lines) = line_map("x=hi\necho \"$x\"\ny=2\necho \"$y\"\n");
+        let (stmts, lines) =
+            line_map("x=$(date +%s)\ny=$(date +%T)\necho \"$x\"\necho \"$y\"\n");
         assert_eq!(stmts.len(), 4, "nothing is dead, nothing is dropped");
         assert_eq!(
             lines,
             vec![(0, 1), (1, 2), (2, 3), (3, 4)],
             "every surviving statement keeps its own line"
+        );
+    }
+
+    /// A statement `copy-propagation` FOLDS AWAY must leave the map EMPTY,
+    /// not stale. This is the shape the two tests above could no longer
+    /// assert directly once folding landed: `x=hi` + `echo $x` lowers to a
+    /// synthesized `echo` that originates from no input statement, so a
+    /// naive pre-pass map would still claim `echo` was statement 1 — a
+    /// reference to a statement that no longer exists. A missing entry is
+    /// recoverable; a dangling index is not.
+    #[test]
+    fn a_folded_away_statement_leaves_no_stale_map_entry() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "copy-propagation folds the pair into one echo"
+        );
+        assert!(
+            lines.is_empty(),
+            "a synthesized statement has no origin, so the map must be empty, got {:?}",
+            lines
+        );
+    }
+
+    /// A fold that keeps ONE surviving statement on both sides of a drop
+    /// must still attribute it to its OWN line. `x=hi` folds away, `y=2`
+    /// folds away, but the two `echo`s are distinct origins at lines 2 and
+    /// 4 — the map must not shift by the number of dropped statements.
+    #[test]
+    fn dropped_statements_do_not_shift_the_survivors_lines() {
+        let (stmts, lines) = line_map("x=hi\necho done\ny=2\necho bye\n");
+        assert_eq!(stmts.len(), 2, "both assignments folded away");
+        assert_eq!(
+            lines,
+            vec![(0, 2), (1, 4)],
+            "survivors keep lines 2 and 4 despite two dropped statements"
         );
     }
 }
@@ -57645,9 +57704,20 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
 
     /// A literal before a brace on a SEPARATE source word stays a separate
     /// argv word: `mkdir -p a/{x,y}` is `-p a/x a/y`, never `-pa/x`.
+    ///
+    /// `mkdir` is NOT the vehicle any more. `mkdir`/`mkdir -p` lower to
+    /// native Perl (`File::Path::make_path`), so the `-p` FLAG NO LONGER
+    /// APPEARS IN THE OUTPUT AT ALL and this assertion can never hold —
+    /// the same stale-expectation shape this round found in
+    /// `stmt_lines_tests`. What the test actually pins is WORD SEPARATION:
+    /// a literal on one source word must not fuse with the brace expansion
+    /// on the next. `echo` keeps its argv native (`print` + `join`) with no
+    /// shell-out, so the same contract is testable there — and the native
+    /// `mkdir` lowering it moved off is pinned separately, by
+    /// `native_brace_expansion_reaches_mkdir_args_intact` below.
     #[test]
     fn brace_prefix_does_not_glue_a_separate_word() {
-        let src = "mkdir -p a/{x,y}\n";
+        let src = "echo -p a/{x,y}\n";
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
@@ -57658,6 +57728,28 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(
             !perl.contains("-pa/x"),
             "`-p` must not glue to the brace prefix: {perl}"
+        );
+    }
+
+    /// The companion guard for the source the test above moved off: the
+    /// NATIVE `mkdir` lowering must still receive both brace-expanded
+    /// directories as separate arguments. Without this, moving `mkdir` out
+    /// of the test above would leave the `mkdir` path unasserted — a
+    /// native lowering that silently collapsed `a/{x,y}` to a single
+    /// argument would still pass.
+    #[test]
+    fn native_brace_expansion_reaches_mkdir_args_intact() {
+        let src = "mkdir -p a/{x,y}\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("a/x") && perl.contains("a/y"),
+            "both brace-expanded dirs must reach make_path: {perl}"
+        );
+        assert!(
+            !perl.contains("a/{x,y}"),
+            "the brace expansion must be applied, not passed through: {perl}"
         );
     }
 
@@ -60721,3 +60813,4 @@ mod record_store_tests {
         );
     }
 }
+
