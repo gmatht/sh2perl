@@ -1162,11 +1162,11 @@ fn grep_q_lift_sh(stages: &[Vec<IrStmt>]) -> Result<Option<String>, String> {
     let (Some(pat), invert) = (pat, invert) else {
         return Ok(None);
     };
-    let (match_br, miss_br) = if invert { ("false", "true") } else { ("true", "false") };
-    Ok(Some(format!(
-        "case {echo_arg} in *{}*) {match_br};; *) {miss_br};; esac",
-        pat
-    )))
+    Ok(Some(if invert {
+        format!("not string match -q -- {pat} {echo_arg}")
+    } else {
+        format!("string match -q -- {pat} {echo_arg}")
+    }))
 }
 
 fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
@@ -1831,9 +1831,9 @@ fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
                     // bash errors at RUNTIME (the assignment is skipped);
                     // dash would fail to PARSE the whole script — a
                     // failed cmdsub has the same ${x:-d} observable
-                    Ok("$(false)".into())
+                    Ok("(false)".into())
                 } else {
-                    Ok(format!("$(({}))", arith_rewrite(&raw)))
+                    Ok(arith_cmd_fish(&raw))
                 }
             }
             "setArray" => {
@@ -1949,39 +1949,37 @@ fn test_cmp_to_fish(t: &str) -> Result<String, String> {
         // inside the quoted lhs (`"!"1"` — a literal).
         let negate = lhs.starts_with('!');
         let lhs = lhs.trim_start_matches('!');
-        let case: String = if let Some((neg, rest)) =
+        let m = if let Some((neg, rest)) =
             rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
         {
-            // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
-            //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+            // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`
             format!(
-                "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+                "string match -q -- *{rest} {lhs}; and not string match -q -- {neg}{rest} {lhs}"
             )
         } else if let Some(inner) =
             rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
         {
             // extglob list match: `@(a|b)` == `a|b`
-            format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
+            format!("string match -q -- {inner} {lhs}")
         } else if let Some(inner) =
             rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
         {
             // optional: `?(a|b)` matches empty or a|b
-            format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
+            format!("string match -q -- {inner} {lhs}")
         } else if *NOCASEMATCH.lock().unwrap() {
-            format!(
-                "case \"{lhs}\" in {}) : ;; *) false ;; esac",
-                fold_case_pattern(&rhs)
-            )
+            // fish's `string match -i` is the case-insensitive match; no
+            // `[fF][oO][oO]` character-class folding needed.
+            format!("string match -qi -- {rhs} {lhs}")
         } else {
-            format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+            format!("string match -q -- {rhs} {lhs}")
         };
         if negate {
-            Ok(format!("! {case}"))
+            Ok(format!("! {m}"))
         } else {
-            Ok(case)
+            Ok(m)
         }
     } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
-        Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
+        Ok(format!("not string match -q -- {rhs} {lhs}"))
     } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
         // regex match: grep -E ([[ =~ ]] semantics)
         Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
@@ -2004,7 +2002,7 @@ fn test_cmp_to_fish(t: &str) -> Result<String, String> {
             let t = quote_test_expansions(&space_test_ops(t));
             Ok(format!("[ {t} ]"))
         } else {
-            Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+            Ok(format!("string match -q -- {rhs} {lhs}"))
         }
     } else {
         // quote bare $(...) and ${...} so word-splitting
@@ -2091,17 +2089,20 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
             // case emulation as the `==` test arm
             "caseMatch" => {
                 let word = word_to_fish(arg(args, 0)?)?;
-                // patterns stay RAW — a quoted pattern in case is a
+                // patterns stay RAW — a quoted pattern in a glob match is a
                 // LITERAL (`'h*'` never matches hello)
-                let mut out = format!("case \"{word}\" in ");
+                let mut tests: Vec<String> = Vec::new();
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     for it in items {
                         let p = str_arg(it)?;
-                        out.push_str(&format!("{p}) : ;; "));
+                        tests.push(format!("string match -q -- {p} {word}"));
                     }
                 }
-                out.push_str("*) false ;; esac");
-                Ok(out)
+                Ok(if tests.is_empty() {
+                    "false".to_string()
+                } else {
+                    tests.join("; or ")
+                })
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
@@ -4052,6 +4053,18 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
     if name == "?" {
         return "$status".into();
     }
+    // `$#` (argument count) is a PARSE ERROR in fish ("$# is not supported.
+    // In fish, please use 'count $argv'") — same read-time kill as `$?`.
+    // fish's spelling is a command, so it must not be wrapped in `$…`
+    // quotes by a caller; the `count $argv` form is self-quoting.
+    if name == "#" {
+        return "count $argv".into();
+    }
+    // `$!` (last background pid) and `$-` have no fish spelling at all and
+    // are a parse error; emit an empty expansion so the file still reads.
+    if name == "!" || name == "-" {
+        return "\"\"".into();
+    }
     // Positional parameters: fish has no `$1`/`$2` shorthand — a positional
     // read is `$argv[N]`. This is not merely a spelling preference: `$1` is
     // EMPTY inside a fish function (and inside a command substitution, which
@@ -4064,10 +4077,16 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
         }
     }
     if list {
+        // fish has NO `${...}` form at all — a bare `${` is a parse error
+        // that kills the whole file ("${ is not a valid variable in fish").
+        // A fish list variable expands to all of its elements on its own,
+        // so the list form is the plain `$name` (and `$argv` for the
+        // positional parameters).
         if name == "@" || name == "*" {
-            return format!("${{{name}}}");
+            return "$argv".into();
         }
-        return format!("${{{name}[@]}}");
+        let base = name.strip_suffix("[@]").unwrap_or(name);
+        return format!("${base}");
     }
     // special parameters / positionals: `$?` `$!` `$@` `$1` …
     if !name.is_empty()
@@ -4078,8 +4097,11 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
     {
         format!("${name}")
     } else {
-        // array elements / indexed names: `${x[i]}`
-        format!("${{{name}}}")
+        // array elements / indexed names: fish has no `${x[i]}` subscript
+        // syntax either ("Variables cannot be bracketed"), but the lowering
+        // already flattened `x[i]` to the flat scalar name `x_i`, which is a
+        // legal fish variable name.
+        format!("${name}")
     }
 }
 
@@ -4125,16 +4147,22 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                 // `var_ref_to_fish` already renamed `$?` to fish's
                 // `$status`, so the quoted form is `"$status"` — still
                 // valid fish (fish expands `$status` inside quotes).
-                Ok(format!("\"{}\"", var_ref_to_fish(&name, false)))
+                let r = var_ref_to_fish(&name, false);
+                // `$#` / `$!` / `$-` render to a COMMAND or a bare literal,
+                // which double quotes would turn into a literal string.
+                if r == "count $argv" {
+                    return Ok(r);
+                }
+                Ok(format!("\"{r}\""))
             }
         }
         "len" => {
             // `len` on an array (`${#arr[@]}`) -> the counter; on a scalar
-            // (`${#s}`) -> the portable `$#{s}`
+            // (`${#s}`) -> fish's `string length`
             if let Some(an) = name.strip_suffix("[@]") {
                 Ok(format!("${{{an}_len}}"))
             } else {
-                Ok(format!("${{#{name}}}"))
+                Ok(format!("(string length -- \"${name}\")"))
             }
         }
         "slice" => {
@@ -4149,16 +4177,16 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             if name.starts_with('#') {
                 return Ok(format!("${{#{}[@]}}", &name[1..]));
             }
-            // dash has no substring expansion — emulate with cut
+            // fish has no substring expansion — emulate with cut
             // (char-exact for the ASCII corpus)
             if name == "@" || name == "*" {
                 // `${@:off}` — positional slice: shift + join
                 let offn: i64 = off.trim().parse().unwrap_or(-1);
                 if offn >= 1 {
                     let sh = offn - 1;
-                    return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
+                    return Ok(format!("(shift {sh}; printf '%s' $argv)"));
                 }
-                return Ok(format!("${{{name}:{off}}}"));
+                return Ok(format!("${name}"));
             }
             // `${arr[@]}` / `${arr[*]}` — the whole array: the per-element
             // counter helper (arrays have no POSIX form)
@@ -4182,50 +4210,46 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             let offn: i64 = off.trim().parse().unwrap_or(-1);
             let lenn: i64 = len.trim().parse().unwrap_or(-1);
             if offn < 0 && (lenn >= 0 || len.is_empty()) {
-                // `${s: -3}` — negative offsets count from the END
-                let start = format!("$((${{#{name}}}{}+1))", offn);
-                let range = if len.is_empty() {
-                    format!("{start}-")
-                } else {
-                    format!("{start}-$(({start}+{lenn}-1))")
-                };
-                return Ok(format!("$(printf '%s' \"${{{name}}}\" | cut -c{range})"));
+                // `${s: -3}` — negative offsets count from the END, which is
+                // exactly `string sub --start <neg>`.
+                let mut c = format!("string sub --start {offn} -- \"${name}\"");
+                if !len.is_empty() && lenn > 0 {
+                    c.push_str(&format!(" --length {lenn}"));
+                }
+                return Ok(format!("({c})"));
             }
             if offn >= 0 && (lenn >= 0 || len.is_empty()) {
                 if !len.is_empty() && lenn == 0 {
                     // `${x:off:0}` — always empty
-                    return Ok("$(printf '')".into());
+                    return Ok("(printf '')".into());
                 }
-                let start = offn + 1;
-                let range = if len.is_empty() {
-                    format!("{start}-")
-                } else {
-                    format!("{start}-{}", offn + lenn)
-                };
-                return Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"));
+                // `string sub` is 1-based; bash `${s:off}` starts at 0.
+                let mut c = format!("string sub --start {} -- \"${name}\"", offn + 1);
+                if !len.is_empty() {
+                    c.push_str(&format!(" --length {lenn}"));
+                }
+                return Ok(format!("({c})"));
             }
-            // dynamic offsets — compute in shell arithmetic
-            let start = format!("$((({off})+1))");
-            let range = if len.is_empty() {
-                format!("{start}-")
-            } else {
-                format!("{start}-$((({off})+({len})))")
-            };
-            Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"))
+            // dynamic offsets — `string sub` takes the start as an argument,
+            // so the caller's arithmetic expression goes straight through.
+            let mut c = format!("string sub --start (math \"{off} + 1\") -- \"${name}\"");
+            if !len.is_empty() {
+                c.push_str(&format!(" --length (math \"{len}\")"));
+            }
+            Ok(format!("({c})"))
         }
-        // case-modification: busybox tr treats `[:lower:]`/`[:upper:]`
-        // literally (class support is compile-gated), so use the ASCII
-        // ranges; GNU sed's \U/\L escapes are not portable either
-        // (busybox/BSD sed lack them) - awk toupper/tolower exist in
-        // gawk/mawk/busybox/BSD awk alike and match the old sed's
-        // per-line first-char behaviour.
-        "^^" => Ok(format!("$(printf '%s' \"${name}\" | tr a-z A-Z)")),
-        ",," => Ok(format!("$(printf '%s' \"${name}\" | tr A-Z a-z)")),
+        // case-modification, via fish's own `string` builtin (no tr/awk):
+        // `string upper`/`string lower` cover the whole-string forms. bash's `${x^}`
+        // / `${x,}` upper/lower exactly ONE character, which is
+        // `string sub -l1` of the head + the `-s2` tail — fish has no
+        // per-character regex case conversion.
+        "^^" => Ok(format!("(string upper -- \"${name}\")")),
+        ",," => Ok(format!("(string lower -- \"${name}\")")),
         "^" => Ok(format!(
-            "$(printf '%s' \"${name}\" | awk '{{print toupper(substr($0,1,1)) substr($0,2)}}')"
+            "(string upper -- (string sub -l1 -- \"${name}\"))(string sub -s2 -- \"${name}\")"
         )),
         "," => Ok(format!(
-            "$(printf '%s' \"${name}\" | awk '{{print tolower(substr($0,1,1)) substr($0,2)}}')"
+            "(string lower -- (string sub -l1 -- \"${name}\"))(string sub -s2 -- \"${name}\")"
         )),
         // Prefix/suffix stripping (`${x#p}`, `${x%p}`) and substitution
         // (`${x/p/r}`) have NO `${...}` form in fish: fish rejects a bare
@@ -4585,16 +4609,16 @@ fn interp_expr_to_fish(e: &IrExpr) -> Result<String, String> {
                     // bash errors at RUNTIME (the assignment is skipped);
                     // dash would fail to PARSE the whole script — a
                     // failed cmdsub has the same ${x:-d} observable
-                    Ok("$(false)".into())
+                    Ok("(false)".into())
                 } else {
-                    Ok(format!("$(({}))", arith_rewrite(&raw)))
+                    Ok(arith_cmd_fish(&raw))
                 }
             }
             "join" => join_to_fish(arg(args, 0)?, false),
             "brace" => brace_to_fish(args),
             other => Err(format!("interp call not renderable: {other:?}")),
         },
-        IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_fish(a))),
+        IrExpr::Arith(a) => Ok(arith_cmd_fish(&arith_to_fish(a))),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
@@ -4618,25 +4642,6 @@ fn interp_expr_to_fish(e: &IrExpr) -> Result<String, String> {
         }
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
-}
-
-/// Case-fold a glob pattern for `shopt -s nocasematch` emulation:
-/// `foo` -> `[fF][oO][oO]` (glob metachars pass through).
-fn fold_case_pattern(p: &str) -> String {
-    let mut out = String::new();
-    for c in p.chars() {
-        match c {
-            '*' | '?' | '[' | ']' | '\\' | '!' | '^' => out.push(c),
-            c if c.is_ascii_alphabetic() => {
-                out.push('[');
-                out.push(c.to_ascii_lowercase());
-                out.push(c.to_ascii_uppercase());
-                out.push(']');
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// The core's test lowering strips the spaces around comparison
@@ -5086,6 +5091,13 @@ fn math_call_to_awk(name: &str, s: &str) -> Option<(String, usize)> {
     };
     Some((expr, k))
 }
+/// fish has no `$(( ))` at all — it is a PARSE ERROR, not just a spelling
+/// difference. Every arithmetic value therefore goes through `math`, whose
+/// argument is an expression STRING.
+fn arith_cmd_fish(raw: &str) -> String {
+    format!("(math \"{}\")", arith_rewrite(raw))
+}
+
 fn arith_rewrite(t: &str) -> String {
     let b = t.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -5204,7 +5216,9 @@ fn arith_rewrite(t: &str) -> String {
                 // analysis guarantees to hold numeric text)
                 out.push_str(name);
             } else {
-                out.push_str(&format!("$( _num \"${name}\" )"));
+                out.push_str(&format!(
+                    "(string match -qr -- '^-?[0-9]+$' \"${name}\"; and echo \"${name}\"; or echo 0)"
+                ));
             }
             i = j;
             continue;
@@ -5298,11 +5312,18 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // bare identifier (`i`) is read as a function call and errors
             // with "Unknown function", while `$i` is interpolated by fish
             // into the expression and evaluates. So every variable read is
-            // `$name`; a non-numeric var is coerced through `_num` first.
+            // `$name`.
+            //
+            // bash coerces a non-numeric value to 0 in arithmetic; fish's
+            // `math` errors. The coercion must therefore be INLINE: a
+            // `$( _num "$x" )` command substitution inside the `math "…"`
+            // string is a fish PARSE ERROR ("command substitutions not
+            // allowed here"), so the guard has to be a nested expression.
+            // `string match -qr` is a builtin `math` function in fish.
             if NUM_VARS.lock().unwrap().contains(&name) {
                 format!("${name}")
             } else {
-                format!("$( _num \"${name}\" )")
+                format!("(string match -qr -- '^-?[0-9]+$' \"${name}\"; and echo \"${name}\"; or echo 0)")
             }
         }
         // Arrays are flattened into per-element scalars `a_0 a_1 …`, so the
@@ -5426,6 +5447,12 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
 }
 
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
+    // Compounds are emitted in fish's INLINE form (`if c; BODY; end`,
+    // terminated by `;` rather than a newline). Every arm mirrors the
+    // block renderer `stmt_to_fish` arm-for-arm — the two used to be
+    // separate implementations and this one still spoke bash
+    // (`if c; then …; fi`, `case … esac`, `$(( ))`), which fish cannot
+    // parse at all.
     match st {
         IrStmt::Expr(e) => cmd_to_fish(e),
         IrStmt::Ext(_) => return Err("sh renderer: Ext node unsupported".to_string()),
@@ -5436,41 +5463,41 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             elsifs,
             else_,
         } => {
-            // empty branches need a `:` no-op (bash rejects `then ; else`)
+            // an empty branch is legal fish (`if c; end`), but keep the `:`
+            // no-op so an empty arm is still a statement
             let inline = |b: &[IrStmt]| -> Result<String, String> {
-                let s = stmts_inline(b)?;
-                Ok(if b.is_empty() { ":".to_string() } else { s })
+                if b.is_empty() {
+                    Ok(":".to_string())
+                } else {
+                    stmts_inline(b)
+                }
             };
-            let mut out = format!("if {}; then {}", cmd_to_fish(cond)?, inline(then)?);
+            let mut out = format!("if {}; {}; end", cmd_to_fish(cond)?, inline(then)?);
             for (ec, body) in elsifs {
-                out.push_str(&format!(
-                    "; elif {}; then {}",
-                    cmd_to_fish(ec)?,
-                    inline(body)?
-                ));
+                out.push_str(&format!("; else if {}; {}; end", cmd_to_fish(ec)?, inline(body)?));
             }
             if !else_.is_empty() {
-                out.push_str(&format!("; else {}", stmts_inline(else_)?));
+                out.push_str(&format!("; else {}; end", stmts_inline(else_)?));
             }
-            out.push_str("; fi");
             Ok(out)
         }
         IrStmt::For { var, iter, body } => {
             if let Some((start, end)) = range_of(iter) {
-                // portable while form (the block renderer's inline twin)
+                // the block renderer's numeric-range form (a fish `for`
+                // over `seq`), kept identical so both spellings agree
                 return Ok(format!(
-                    "{var}={start}; while [ \"${var}\" -le {end} ]; do {}; {var}=$(({var} + 1)); done",
+                    "for {var} in (seq {start} {end}); {}; end",
                     stmts_inline(body)?
                 ));
             }
             Ok(format!(
-                "for {var} in {}; do {}; done",
+                "for {var} in {}; {}; end",
                 for_items_to_fish(iter)?,
                 stmts_inline(body)?
             ))
         }
         IrStmt::While { cond, body } => Ok(format!(
-            "while {}; do {}; done",
+            "while {}; {}; end",
             cmd_to_fish(cond)?,
             stmts_inline(body)?
         )),
@@ -5480,9 +5507,11 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         IrStmt::Continue => Ok(format!("continue")),
         IrStmt::Break => Ok(format!("break")),
         IrStmt::DoWhile { body, cond, until } => {
-            let neg = if *until { "" } else { "! " };
+            // `while true; BODY; if COND; and break; end; end` — the block
+            // renderer's form. `until` drops the `not`.
+            let neg = if *until { "" } else { "not " };
             Ok(format!(
-                "while :; do {}; if {neg}{}; then break; fi; done",
+                "while true; {}; if {neg}{}; and break; end; end",
                 stmts_inline(body)?,
                 cmd_to_fish(cond)?
             ))
@@ -5491,26 +5520,43 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             discriminant,
             clauses,
         } => {
-            let mut out = format!("case {} in", word_to_fish(discriminant)?);
+            // fish `switch`: several `case` arms under one `switch`, each
+            // arm an alternation list of patterns.
+            let mut out = format!("switch {}", word_to_fish(discriminant)?);
             for cl in clauses {
                 out.push_str(&format!(
-                    " {}) {};;",
-                    cl.patterns.join("|"),
-                    stmts_inline(&cl.body)?
+                    "; case {}; {}; end",
+                    cl.patterns.join(" "),
+                    if cl.body.is_empty() {
+                        ":".to_string()
+                    } else {
+                        stmts_inline(&cl.body)?
+                    }
                 ));
             }
-            out.push_str(" esac");
+            out.push_str("; end");
             Ok(out)
         }
-        IrStmt::Function { name, body, .. } => Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?)),
+        IrStmt::Function { name, body, .. } => Ok(format!(
+            "function {name}; {}; end",
+            stmts_inline(body)?
+        )),
         IrStmt::Redirect { inner, redirects } => {
             let mut out = herestring_wrap_fish(redirects, stmts_inline(inner)?)?;
             out.push_str(&redirects_to_fish(redirects)?);
             Ok(out)
         }
-        IrStmt::Subshell(body) => Ok(format!("( {} )", stmts_inline(body)?)),
-        IrStmt::Background(body) => Ok(format!("( {} ) &", stmts_inline(body)?)),
-        IrStmt::Block(body) => Ok(format!("{{ {}; }}", stmts_inline(body)?)),
+        // `begin … end` is fish's scoped block — the block renderer's form.
+        IrStmt::Subshell(body) => Ok(format!("begin; {}; end", stmts_inline(body)?)),
+        IrStmt::Background(body) => {
+            if body.len() == 1 {
+                if let IrStmt::Expr(e) = &body[0] {
+                    return Ok(format!("{} &", cmd_to_fish(e)?));
+                }
+            }
+            Ok(format!("begin; {}; end &", stmts_inline(body)?))
+        }
+        IrStmt::Block(body) => Ok(format!("begin; {}; end", stmts_inline(body)?)),
         IrStmt::Return(e) => match e {
             Some(x) => Ok(format!("return {}", word_to_fish(x)?)),
             None => Ok("return".into()),
@@ -5522,24 +5568,23 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         IrStmt::Die { expr, .. } => Ok(format!("echo {} >&2; exit 1", word_to_fish(expr)?)),
         IrStmt::Warn { expr, .. } => Ok(format!("echo {} >&2", word_to_fish(expr)?)),
         IrStmt::Declare { vars, init, local } => {
-            let mut out = String::new();
-            if *local {
-                out.push_str("local ");
-            }
+            // `set`/`set -l` with space-separated values (the block
+            // renderer's form) — `name=value` is bash, not fish.
+            let mut out = String::from(if *local { "set -l " } else { "set " });
             for (i, v) in vars.iter().enumerate() {
                 if i > 0 {
                     out.push(' ');
                 }
                 out.push_str(&v.name);
                 if let Some(init) = init {
-                    out.push('=');
+                    out.push(' ');
                     out.push_str(&word_to_fish(init)?);
                 }
             }
             Ok(out)
         }
         IrStmt::DeclareArray { var, elements, .. } => {
-            Ok(format!("{var}=({})", array_literal_to_fish(elements)?))
+            Ok(format!("set {var} {}", array_literal_to_fish(elements)?))
         }
         IrStmt::Output { value, newline, .. } => {
             let w = word_to_fish(value)?;
@@ -5561,13 +5606,15 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
                 line.push_str(&redirect_objs_to_fish(redirects)?);
             }
             if let Some(var) = capture {
-                Ok(format!("{var}=$({line})"))
+                Ok(format!("set {var} ({line} | string collect)"))
             } else {
                 Ok(line)
             }
         }
         IrStmt::Pipeline {
-            stages, capture, ..
+            stages,
+            capture,
+            ..
         } => {
             let mut line = String::new();
             for (i, stg) in stages.iter().enumerate() {
@@ -5577,7 +5624,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
                 line.push_str(&stmts_inline(stg)?);
             }
             if let Some(var) = capture {
-                Ok(format!("{var}=$({line})"))
+                Ok(format!("set {var} ({line} | string collect)"))
             } else {
                 Ok(line)
             }
