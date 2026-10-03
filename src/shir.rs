@@ -14604,6 +14604,165 @@ type Range = Option<(i128, i128)>;
 /// `--true64`.
 const SAFE_NUMBER: i128 = 1 << 53;
 
+/// Vars named inside an OPAQUE text position — a `[...]` subscript or a
+/// word the emitter hands to the runtime verbatim (e.g. the
+/// `options["${flags:j:1}"]` setVar key, the `arr[$i]` getVar name).
+///
+/// Those reads are resolved at RUN TIME by `normAssocKey`/`expandWord`
+/// against `sh2.vars`, never against the IR. A slot-homed var is written
+/// only to `__t64[k]`, so it never appears in `sh2.vars` and every such
+/// read silently yields the EMPTY/undefined value — the loop counter
+/// `options["${flags:j:1}"]="true"` collapsed to one key instead of one
+/// per character. So a var mentioned in opaque text must NOT be
+/// slot-homed.
+///
+/// This is a REFUSAL, deliberately conservative: it over-approximates (a
+/// var merely sharing a name with a subscript expression is refused),
+/// which costs a fast path but never correctness.
+/// One bare shell identifier inside an expansion's text, if `piece` is
+/// exactly that. `None` for operators, digits and the empty run — so
+/// `${flags:j:1}` yields `flags` and `j`, never `:1`.
+fn bare_name_at(piece: char) -> Option<String> {
+    if !(piece == '_' || piece.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(piece.to_string())
+}
+
+fn vars_in_opaque_text(text: &str, out: &mut HashSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // `${name...}` / `$name` — both are read from the store at runtime.
+        let (name, next) = match bytes.get(i + 1) {
+            Some(b'{') => {
+                let close = text[i + 2..].find('}').map(|p| i + 2 + p);
+                match close {
+                    // EVERY bare name inside `${…}` is a runtime read, not
+                    // just the leading one: `${flags:j:1}` reads `flags`
+                    // AND the slice offset `j`. Harvest the whole span.
+                    //
+                    // HARVEST WHOLE IDENTIFIERS, not single characters.
+                    // Walking the span char-by-char and asking
+                    // `bare_name_at(c)` yields `f`,`l`,`a`,`g`,`s`,`j` —
+                    // letters that match no real variable, so the
+                    // slot-homing refusal misses every var that actually
+                    // matters and `options["${flags:j:1}"]` collapses to
+                    // one key instead of one per character (063_09, "Processed
+                    // 1 options"). `bare_name_at` is still the filter for
+                    // each candidate; the scan just has to produce whole
+                    // names for it to judge.
+                    Some(c) => {
+                        let span = &text[i + 2..c];
+                        // Split the expansion body on the operators that
+                        // end a name — `:`, `#`, `[`, whitespace — so
+                        // `flags:j:1` yields `flags` and `j`, and never the
+                        // `1`. The candidates are WHOLE identifiers;
+                        // `bare_name_at` judges each one's first char.
+                        let mut ident = String::new();
+                        let mut flush = |ident: &mut String, out: &mut HashSet<String>| {
+                            if ident.is_empty() {
+                                return;
+                            }
+                            let first = ident.chars().next().unwrap_or(' ');
+                            if first == '_' || first.is_ascii_alphabetic() {
+                                out.insert(std::mem::take(ident));
+                            } else {
+                                ident.clear();
+                            }
+                        };
+                        for ch in span.chars() {
+                            if ch == '_' || ch.is_ascii_alphanumeric() {
+                                ident.push(ch);
+                            } else {
+                                flush(&mut ident, out);
+                            }
+                        }
+                        flush(&mut ident, out);
+                        // skip past this expansion
+                        while i < c {
+                            i += 1;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            Some(c) if *c == b'_' || c.is_ascii_alphabetic() => {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == b'_' || bytes[j].is_ascii_alphanumeric()) {
+                    j += 1;
+                }
+                (text[i + 1..j].split(['[', '#', ':']).next().unwrap_or(""), j)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let name = name.trim_start_matches('#');
+        if !name.is_empty()
+            && name.chars().next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            out.insert(name.to_string());
+        }
+        i = next;
+    }
+}
+
+/// Recursively harvest every var named inside an IR expression's OPAQUE
+/// text operands (`Str` payload of a call arg / assign target var).
+fn harvest_opaque_expr(e: &IrExpr, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Str(s, _) => vars_in_opaque_text(s, out),
+        IrExpr::Array(elems) => elems.iter().for_each(|e| harvest_opaque_expr(e, out)),
+        IrExpr::Call { args, .. } => args.iter().for_each(|a| harvest_opaque_expr(a, out)),
+        IrExpr::Arith(a) => harvest_opaque_arith(a, out),
+        IrExpr::Index { var, key } => {
+            vars_in_opaque_text(var, out);
+            harvest_opaque_expr(key, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Lit(s) = p {
+                    vars_in_opaque_text(s, out);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => harvest_opaque_expr(expr, out),
+        _ => {}
+    }
+}
+
+fn harvest_opaque_arith(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        // A bare arith var is a real IR read, not an opaque-text read.
+        ArithAst::Var(_) | ArithAst::Ident(_) | ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        ArithAst::Index { var, key } => {
+            vars_in_opaque_text(var, out);
+            harvest_opaque_arith(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            harvest_opaque_arith(lhs, out);
+            harvest_opaque_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => harvest_opaque_arith(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            harvest_opaque_arith(test, out);
+            harvest_opaque_arith(then, out);
+            harvest_opaque_arith(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => harvest_opaque_arith(rhs, out),
+        ArithAst::IncDec { .. } => {}
+    }
+}
+
 /// The `--true64` analysis: which numeric vars escape ±2^53 (Int64/BigInt
 /// or a BigInt64Array slot), and which of those are slot-worthy — a
 /// self-RMW accumulator chain (`x = x op e` / `x op= e` / `x++`/`x--`)
@@ -14621,11 +14780,19 @@ pub fn analyze_true64(
         in_loop: &mut HashSet<String>,
         unsafe_write: &mut HashSet<String>,
         rmw_reads: &mut HashMap<String, HashSet<String>>,
+        opaque_read: &mut HashSet<String>,
         inside_loop: bool,
     ) {
         for s in stmts {
             match s {
                 IrStmt::Assign { targets, expr, .. } => {
+                    harvest_opaque_expr(expr, opaque_read);
+                    for t in targets {
+                        vars_in_opaque_text(&t.var, opaque_read);
+                        for i in &t.indices {
+                            harvest_opaque_expr(i, opaque_read);
+                        }
+                    }
                     if targets.len() == 1 && targets[0].indices.is_empty() {
                         let v = &targets[0].var;
                         if numeric.contains(v) || matches!(expr, IrExpr::Arith(_)) {
@@ -14665,20 +14832,25 @@ pub fn analyze_true64(
                 IrStmt::While { body, .. }
                 | IrStmt::For { body, .. }
                 | IrStmt::DoWhile { body, .. } => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, true);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, true);
                 }
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 IrStmt::If { then, elsifs, else_, .. } => {
-                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                     for (_, arm) in elsifs {
-                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                     }
-                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 IrStmt::Redirect { inner, .. } => {
-                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
+                }
+                IrStmt::Expr(e) => {
+                    // `setVar("options[\"${flags:j:1}\"]", …)` and friends: the
+                    // call args are opaque runtime text.
+                    harvest_opaque_expr(e, opaque_read);
                 }
                 IrStmt::Function { body, .. } => {
                     // function-locals get their inits baked into `let`
@@ -14734,7 +14906,7 @@ pub fn analyze_true64(
                     for s in body {
                         mark_fn_writes(s, unsafe_write);
                     }
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 _ => {}
             }
@@ -14748,6 +14920,7 @@ pub fn analyze_true64(
     let mut in_loop = HashSet::new();
     let mut unsafe_write = HashSet::new();
     let mut rmw_reads: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut opaque_read: HashSet<String> = HashSet::new();
     walk_stmts(
         &prog.stmts,
         &numeric,
@@ -14756,6 +14929,7 @@ pub fn analyze_true64(
         &mut in_loop,
         &mut unsafe_write,
         &mut rmw_reads,
+        &mut opaque_read,
         false,
     );
     let mut int_vars = HashSet::new();
@@ -14791,6 +14965,13 @@ pub fn analyze_true64(
         if rmw.contains(v)
             && in_loop.contains(v)
             && !unsafe_write.contains(v)
+            // A slot var lives ONLY in `__t64[k]`. Any read that resolves
+            // against `sh2.vars` at runtime (a `[...]` subscript or an
+            // opaque word text) can never see it, so it MUST NOT be
+            // slot-homed — otherwise the read yields undefined silently.
+            // 063_09: `options["${flags:j:1}"]="true"` in a `j` loop wrote
+            // one key instead of one per character ("Processed 1 options").
+            && !opaque_read.contains(v)
             && rmw_reads
                 .get(v)
                 .map(|reads| {
@@ -22409,7 +22590,7 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
 
 /// Every variable a (native-lowered) arith AST writes: assignment targets
 /// and `++`/`--` targets.
-fn arith_written_vars(a: &ArithAst) -> Vec<String> {
+pub(crate) fn arith_written_vars(a: &ArithAst) -> Vec<String> {
     match a {
         ArithAst::Assign { var, rhs, .. } => {
             let mut v = vec![var.clone()];
@@ -23382,7 +23563,7 @@ fn native_arith_text(t: &str) -> Option<ArithAst> {
 ///   - a ref in a WRITE position (`${#x} = 5` — bash: syntax error; the
 ///     placeholder would parse as an assign target and the native path
 ///     would WRITE it — the caller's written-vars guard rejects those).
-fn arith_len_strip(t: &str) -> Option<String> {
+pub(crate) fn arith_len_strip(t: &str) -> Option<String> {
     if t.contains("__sh2len") {
         return None;
     }
@@ -60814,3 +60995,42 @@ mod record_store_tests {
     }
 }
 
+
+#[cfg(test)]
+mod opaque_text_harvest_tests {
+    use super::vars_in_opaque_text;
+    use std::collections::HashSet;
+
+    fn harvest(text: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        vars_in_opaque_text(text, &mut out);
+        out
+    }
+
+    /// `${flags:j:1}` reads BOTH `flags` and the slice offset `j` at
+    /// runtime. Harvesting a char at a time (the shape this test exists to
+    /// reject) yields `f`,`l`,`a`,`g`,`s`,`j` — single letters that match no
+    /// real variable, so the slot-homing refusal misses every var that
+    /// actually matters and the `options["${flags:j:1}"]` key collapses.
+    #[test]
+    fn expansion_slice_harvests_whole_identifiers() {
+        let got = harvest("options[\"${flags:j:1}\"]");
+        assert!(got.contains("flags"), "missing base name: {got:?}");
+        assert!(got.contains("j"), "missing slice offset: {got:?}");
+        // The length `1` is not a name, and no single letter may leak.
+        assert!(!got.contains("1"), "digit harvested as a name: {got:?}");
+        assert!(!got.contains("f"), "single letter leaked: {got:?}");
+        assert_eq!(got.len(), 2, "harvest should be exactly flags+j: {got:?}");
+    }
+
+    #[test]
+    fn plain_subscript_and_name_harvest() {
+        // `arr[$i]` — the base is NOT inside an expansion, so only the
+        // subscript expression is harvested. (What matters is that `i`
+        // survives whole and no letter of it leaks.)
+        assert!(harvest("arr[$i]").contains("i"));
+        assert!(!harvest("arr[$i]").contains("A"));
+        // A multi-char identifier must survive whole, not as letters.
+        assert!(harvest("$a1_b").contains("a1_b"));
+    }
+}
