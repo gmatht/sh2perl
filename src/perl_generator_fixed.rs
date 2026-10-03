@@ -55,6 +55,10 @@ pub fn generate(prog: &IrProgram) -> String {
     };
     // Fix 16 — same discipline for the array-slice helper.
     if needs_slice_helper(&src) {
+        src = inject_before_first_stmt(&src, SLICE_PREAMBLE_2);
+    }
+    // Fix 22 — and for the positional-parameter slice helper.
+    if needs_pos_slice_helper(&src) {
         src = inject_before_first_stmt(&src, SLICE_PREAMBLE);
     }
     src
@@ -77,11 +81,192 @@ fn post_pass(src: &str) -> String {
     let out = fix_bareword_words(&out);
     let out = fix_condition_booleans(&out);
     let out = fix_shell_builtin_command_name(&out);
+    let out = fix_eval_payload_expansion(&out);
     let out = fix_printf_bash_conversions(&out);
     let out = fix_printf_b_percent_b(&out);
+    let out = fix_pos_param_slice(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
     // declarations, so it cannot disturb what the earlier passes matched.
+    let out = bind_toplevel_positional_params(&out);
     declare_undeclared_vars(&out)
+}
+
+// ── Top-level positional parameters ───────────────────────────────────
+//
+// Inside a sub, Fix 2 binds `@_` into `@__sh_args` and rewires `$1` to
+// `$__sh_args[0]` — a sub's `$1` is ITS first parameter. At file scope
+// there is no `@_`, so the renderer emits the read straight against `@ARGV`
+// (`$ARGV[0]` for `$1`, `@ARGV` for `"$@"`).
+//
+// That is wrong under `./fail`, which invokes the program as
+// `perl -e '$0 = shift @ARGV; my $f = shift @ARGV; do $f' SCRIPT FILE` —
+// `do` runs the file in the main scope with `@ARGV` EMPTIED, so every
+// `$ARGV[0]` read is `undef`. bash, given the same empty argument list,
+// treats a missing `$1` as the EMPTY STRING, so the two diverge by exactly
+// "undef warning plus a field where bash had an empty one"
+// (parse-at-slice-param.sh).
+//
+// Binding file-scope `@ARGV` into `@__sh_args` makes the top-level read
+// agree with bash's: both are empty when the script is given no arguments.
+// The binding is placed before the first statement, matching where
+// `inject_param_binding` puts a sub's.
+
+/// Bind the file-scope positional parameters to `@__sh_args` and rewire the
+/// renderer's `$ARGV[ … ]` / `$#ARGV` reads to it.
+fn bind_toplevel_positional_params(src: &str) -> String {
+    // `$ARGV[` reads and `$#ARGV` are the ONLY top-level spellings the
+    // renderer produces for `$1` / `${@:…}`. The slice fix above already
+    // rewrote `@ARGV[lo..hi]` slices, so what is left here is a bare
+    // element read.
+    if !src.contains("$ARGV[") && !src.contains("$#ARGV") {
+        return src.to_string();
+    }
+    let out = replace_all_outside_strings(src, "$ARGV[", "$__sh_args[");
+    let out = replace_all_outside_strings(&out, "$#ARGV", "$__sh_args_n");
+    let out = replace_all_outside_strings(&out, "@ARGV", "@__sh_args");
+    inject_toplevel_binding(&out)
+}
+
+/// The file-scope binding, spliced in after the declarations: `@__sh_args`
+/// from `@ARGV`, and the count `$__sh_args_n` that `$#` reads at file scope.
+///
+/// The count is named `$__sh_args_n`, NOT `$#__sh_args_n`. `$#` is Perl's
+/// length operator, not a declarable sigil, so `our $#foo;` is a hard
+/// compile error ("syntax error … near \"our $#foo\"") — and a bare
+/// assignment `our $#foo = …` is equally invalid. Emitting it put that
+/// error in the preamble of every program with a top-level `$1`/`$@`, so
+/// the whole file failed to compile and produced ZERO output instead of a
+/// mismatch.
+///
+/// The assignment is `local`, not `our`: the top-level DECLARATIONS
+/// (`TOPLEVEL_POS_DECLS`) already introduce both names next to the other
+/// `our` preamble declarations, so `our @__sh_args = @ARGV;` re-declared
+/// them and Perl warned "our variable … redeclared" on every run. `local`
+/// is also what `inject_param_binding` uses for a sub's binding, so the two
+/// levels now agree.
+const TOPLEVEL_POS_BINDING: &str = "local @__sh_args = @ARGV;\nlocal $__sh_args_n = scalar(@ARGV);\n";
+
+/// The file-scope DECLARATIONS, spliced in next to the preamble's other
+/// `our` declarations so `use strict` accepts the reads.
+const TOPLEVEL_POS_DECLS: &str = "our @__sh_args;\nour $__sh_args_n;\n";
+
+/// Insert the file-scope positional binding so it runs BEFORE any statement
+/// that reads `$__sh_args`, and declare the two names under `use strict`.
+fn inject_toplevel_binding(src: &str) -> String {
+    // 1. Declare both names on the renderer's own preamble line, exactly as
+    //    `declare_param_array` does for `@__sh_args`.
+    let declared = match src.find("use strict;") {
+        Some(i) => {
+            let at = i + "use strict;".len();
+            let mut s = String::with_capacity(src.len() + 48);
+            s.push_str(&src[..at]);
+            s.push('\n');
+            s.push_str(TOPLEVEL_POS_DECLS);
+            s.push_str(&src[at..]);
+            s
+        }
+        None => format!("{TOPLEVEL_POS_DECLS}{src}"),
+    };
+
+    // 2. Assign them immediately after the preamble — before the first
+    //    statement. `inject_param_binding` splices a sub's binding in the
+    //    same place, so the two agree on ordering.
+    let mut out = String::with_capacity(declared.len() + 64);
+    let mut lines = declared.lines();
+    let mut placed = false;
+    for line in lines.by_ref() {
+        out.push_str(line);
+        out.push('\n');
+        // The preamble is `use strict; / use warnings; / my $main_exit_code…`.
+        // Splicing right after `use warnings;` puts the binding ahead of
+        // every statement without having to find the first one.
+        if !placed && line.trim_start().starts_with("use warnings;") {
+            out.push_str(TOPLEVEL_POS_BINDING);
+            placed = true;
+        }
+    }
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    // `lines()` dropped the final newline; restore it, and preserve a source
+    // that did not end with one.
+    if !src.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Replace every occurrence of `needle` that is not inside a single- or
+/// double-quoted string or a comment, so a rewrite keyed on Perl text never
+/// rewrites the same characters when they are DATA (a filename, a heredoc
+/// body, an `echo`'d literal).
+fn replace_all_outside_strings(src: &str, needle: &str, repl: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&src[start..i.min(src.len())]);
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&src[start..i.min(src.len())]);
+            }
+            b'#' => {
+                // A `#` runs to end of line is a comment — but only at the
+                // start of a line or after whitespace, so `$x#1` and
+                // `a#b` keep their literal meaning.
+                let at_line_start = i == 0 || b[i - 1] == b'\n' || b[i - 1] == b' ' || b[i - 1] == b'\t';
+                if at_line_start {
+                    let start = i;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    out.push_str(&src[start..i]);
+                } else {
+                    out.push('#');
+                    i += 1;
+                }
+            }
+            _ if src[i..].starts_with(needle) => {
+                out.push_str(repl);
+                i += needle.len();
+            }
+            _ => {
+                let ch_len = src[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+                out.push_str(&src[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    out
 }
 
 // ── Fix 18 — a shell BUILTIN name must not be quoted in a `bash -c` payload ──
@@ -216,6 +401,282 @@ fn is_shell_builtin_name(name: &str) -> bool {
             | "readarray" | "compgen" | "complete" | "dirs" | "pushd" | "popd"
             | "suspend" | "caller" | "disown" | "fc" | "history" | "enable"
     )
+}
+
+// ── Fix 21 — an `eval` payload's expansion must not be SHELL-quoted ─────
+//
+// `sh_cmd_value_expr` (ir.rs) rebuilds a `bash -c` payload by walking the
+// command TEXT and splicing each `$expansion` as `__sh_q(<perl value>)` —
+// a single-quoted SHELL word:
+//
+//     $ x=42; eval "echo \"The answer is $x\""
+//     pl: system('bash','-c', q{'eval' "echo \"The answer is } . __sh_q($x) . '\\""');
+//         ⇒ the payload text bash receives is
+//              eval "echo \"The answer is '42'\""
+//         ⇒ bash expands $x (already done by the splice) and the literal
+//            single quotes survive into the OUTPUT:  The answer is '42'
+//
+// bash prints `The answer is 42`. The single quotes are the bug: the splice
+// point is INSIDE a double-quoted span, and a shell-quoted word dropped into a
+// double-quoted span contributes its QUOTING CHARACTERS to the text rather
+// than its value.
+//
+// This is safe to fix narrowly precisely because of the double quotes. The
+// emitted payload is a concatenation of three kinds of piece, and only the
+// middle ones are expansions:
+//
+//     "…\"The answer is "   literal span (double-quoted shell text)
+//          __sh_q($x)      expansion  ← lives INSIDE the double quotes
+//     "…\""                literal span
+//
+// so an expansion is "inside double quotes" exactly when the literal span
+// immediately before it has an UNCLOSED `"`. In that position the value is
+// interpolated text and needs no shell quoting; `__sh_q` there both adds
+// quotes and fails to protect a value containing `"` or `$`.
+//
+// Outside a double-quoted span (`eval ls $x`) the original `__sh_q` is
+// correct and is left untouched — it is what makes the value one argv word.
+fn fix_eval_payload_expansion(src: &str) -> String {
+    if !src.contains("'eval'") && !src.contains("q{'eval'}") && !src.contains("q{eval}") {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        out.push_str(&unquote_eval_splices(line));
+    }
+    out
+}
+
+/// One line: un-wrap every `__sh_q(` splice that sits inside a double-quoted
+/// span of an `eval` payload.
+fn unquote_eval_splices(line: &str) -> String {
+    const SEAM: &str = "system('bash', '-c', ";
+    let Some(call) = line.find(SEAM) else {
+        return line.to_string();
+    };
+    let body_start = call + SEAM.len();
+    let rest = &line[body_start..];
+
+    // The payload is a Perl expression: a quoted literal, or a `q{…}`
+    // wrapper around one, optionally continued with ` . <more literals>`.
+    // The quoting state that matters is tracked over the TEXT those literals
+    // spell out, so peel a `q{}` wrapper when present and note where the
+    // wrapper's own closing delimiter was.
+    let (payload, resume) = match rest.strip_prefix('q') {
+        Some(tail) => match q_wrapper_span(tail) {
+            Some(inner) => (inner, 1),
+            None => return line.to_string(),
+        },
+        None => (rest, 0),
+    };
+    let _ = resume;
+
+    // Peel the leading Perl literal (the command-name span) and work on what
+    // the NEXT literal spells, which is where the double quotes live.
+    let Some(first_lit) = eval_payload_literal_len(payload) else {
+        return line.to_string();
+    };
+    let remainder = &payload[first_lit..];
+
+    // Only an `eval` payload: the command name must be the builtin.
+    match perl_literal_value(payload, first_lit) {
+        Some(ref name) if name == "eval" => {}
+        _ => return line.to_string(),
+    }
+
+    let rewritten = rewrite_splices_in_dq(remainder);
+    if rewritten == remainder {
+        return line.to_string();
+    }
+    let mut fixed = String::with_capacity(line.len());
+    fixed.push_str(&line[..body_start]);
+    if rest.starts_with('q') {
+        // The whole payload was ONE `q<open>…<close>` span. Re-wrap the
+        // rewritten text in the same delimiters. Safe because the rewrite
+        // only DELETES the literal characters `__sh_q(` and `)` — it can
+        // neither introduce nor unbalance a delimiter.
+        let (open, close) = match q_delims(rest) {
+            Some(d) => d,
+            None => return line.to_string(),
+        };
+        fixed.push('q');
+        fixed.push(open);
+        fixed.push_str(&rewritten);
+        fixed.push(close);
+    } else {
+        fixed.push_str(&rewritten);
+    }
+    // Whatever followed the payload's closing delimiter, verbatim.
+    fixed.push_str(&payload[first_lit + remainder.len()..]);
+    fixed
+}
+
+/// The delimiter pair of a `q<open>…<close>` wrapper: `rest` must be the text
+/// starting AT the opening delimiter.
+fn q_delims(rest: &str) -> Option<(char, char)> {
+    let open = *rest.as_bytes().get(1)? as char;
+    let close = match open {
+        '{' => '}',
+        '(' => ')',
+        '[' => ']',
+        '<' => '>',
+        _ => return None,
+    };
+    Some((open, close))
+}
+
+/// Given the text starting just after a `q`, the wrapper's CONTENTS (through
+/// its matching close) and whether a wrapper was actually present.
+fn q_wrapper_span(tail: &str) -> Option<&str> {
+    let (open, close) = q_delims(&format!("q{tail}"))?;
+    let body_start = open.len_utf8();
+    let mut depth = 1usize;
+    let bytes = tail.as_bytes();
+    let mut i = body_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            _ => {
+                let ch = tail[i..].chars().next()?;
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&tail[body_start..i]);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte length of the Perl string literal at the head of `s`.
+fn eval_payload_literal_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    match *bytes.first()? {
+        b'\'' | b'"' => {
+            let q = bytes[0];
+            let mut i = 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            None
+        }
+        b'q' => {
+            let (open, close) = q_delims(s)?;
+            let body = open.len_utf8();
+            let mut depth = 1usize;
+            let mut i = body;
+            let bytes = s.as_bytes();
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                let ch = s[i..].chars().next()?;
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + close.len_utf8());
+                    }
+                }
+                i += ch.len_utf8();
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The DECODED text of the Perl literal occupying `s[0..len]`. Only the
+/// `\'` / `\"` / `\\` escapes a shell payload can contain are decoded.
+fn perl_literal_value(s: &str, len: usize) -> Option<String> {
+    let lit = s.get(..len)?;
+    let body = if lit.starts_with('q') {
+        let open = lit[1..].chars().next()?.len_utf8() + 1;
+        lit.get(open..lit.len().checked_sub(open)?)?
+    } else {
+        lit.get(1..len.checked_sub(1)?)?
+    };
+    Some(
+        body.replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\"),
+    )
+}
+
+/// Replace `__sh_q(EXPR)` with `EXPR` where EXPR lies inside an unclosed
+/// double-quoted span; leave every other occurrence alone.
+fn rewrite_splices_in_dq(rest: &str) -> String {
+    let mut out = String::with_capacity(rest.len());
+    let mut in_dq = false;
+    let mut i = 0usize;
+    let bytes = rest.as_bytes();
+    while i < bytes.len() {
+        if rest[i..].starts_with("__sh_q(") {
+            // Balanced-paren scan for the splice's expression.
+            let open = i + "__sh_q(".len();
+            let mut depth = 1usize;
+            let mut j = open;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b'\\' => j += 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                // Unbalanced (truncated line): copy the rest verbatim.
+                out.push_str(&rest[i..]);
+                return out;
+            }
+            if in_dq {
+                // Inside a double-quoted span: the value is interpolated
+                // text, so it must be spliced RAW.
+                out.push_str(&rest[open..j]);
+            } else {
+                out.push_str(&rest[i..j + 1]);
+            }
+            i = j + 1;
+            continue;
+        }
+        // Track quoting state over the LITERAL parts only. `__sh_q(` is
+        // consumed whole above, so a quote inside a splice never flips state.
+        if bytes[i] == b'\\' {
+            out.push('\\');
+            if let Some(ch) = rest[i + 1..].chars().next() {
+                out.push(ch);
+            }
+            i += 1 + rest[i + 1..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let ch = rest[i..].chars().next().unwrap();
+        if ch == '"' {
+            in_dq = !in_dq;
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 // ── Fix 19 — a bash-only `printf` conversion must not reach Perl's `printf` ──
@@ -605,11 +1066,24 @@ fn replace_conversion(fmt: &str, from: char, to: char) -> String {
             continue;
         }
         let mut j = i + 1;
+        // Flags/width between `%` and the conversion letter (`-5`, `08.3`…).
+        // Collected, not emitted as we go, so a trailing bare `%` (no letter
+        // follows) can still be copied verbatim in the else-arm below without
+        // duplicating what we consumed.
+        let mut flags = String::new();
         while j < cs.len() && !cs[j].is_ascii_alphabetic() {
-            out.push(cs[j]);
+            flags.push(cs[j]);
             j += 1;
         }
         if j < cs.len() {
+            // The LEADING `%` belongs to the conversion. Dropping it (as this
+            // loop once did) turns the format `%b` into a bare `s` and `%d`
+            // into a bare `d`, so `printf("%s", …)` printed the LITERAL `s`
+            // with an "Redundant argument" warning and ate the argument:
+            // bash printed `a<TAB>b`, the generated Perl printed `s`
+            // (printf-format-and-v.sh).
+            out.push('%');
+            out.push_str(&flags);
             out.push(if cs[j] == from { to } else { cs[j] });
             i = j + 1;
         } else {
@@ -2486,6 +2960,23 @@ fn fix_array_slice_bounds(expr: &IrExpr) -> IrExpr {
     if base.is_empty() {
         return expr.clone();
     }
+    // A SCALAR `${s:off:len}` is a SUBSTRING, not an array slice, and must
+    // stay with the shared renderer, which lowers it to `substr`. The A1
+    // drops the `[@]` that distinguished them, so the program's own array
+    // census is the only signal left.
+    //
+    // Without this, `x="hello world"; echo "${x::-2}"` was routed into
+    // `__sh_slice(\@x, 0, -2)` — an ARRAY helper handed a scalar's address.
+    // Two things broke at once (bench-substr.sh,
+    // parse-substring-double-colon.sh): `\@x` on a scalar declared `my $x`
+    // does not compile under `strict` ("Global symbol \"@x\" requires
+    // explicit package name"), so the program aborted at compile time
+    // instead of printing; and had it compiled, the helper's
+    // `$__len <= 0` guard would have returned the EMPTY list, where bash
+    // prints the last two characters.
+    if !crate::ir::array_var_pub(&base) {
+        return expr.clone();
+    }
     IrExpr::Call {
         func: "__sh_slice".to_string(),
         // The args are RAW PERL, not shell text: the renderer quotes a
@@ -2526,106 +3017,6 @@ fn unquote_operand(e: &IrExpr) -> Option<String> {
     Some(inner.to_string())
 }
 
-// ── Fix 15 — a `test` operand's `${v+word}` must keep its WORD ───────────
-//
-// `test -n "${MYVAR+set}"` is the standard set/unset test. The `param` node
-// arrives intact (`param("+", "MYVAR", "set")`), but the shared renderer's
-// test-flattening pass rebuilds the operand as expansion TEXT and its
-// re-parse of `${MYVAR+set}` comes back EMPTY, so the operand is dropped and
-// the condition collapses to `test -n` with a missing argument:
-//
-//   sh:  if test -n "${MYVAR+set}"; then …   # FALSE when MYVAR is unset
-//   pl:  if length('-n') { … }               # `length` of the FLAG: TRUE
-//
-// `length('-n')` is true whatever the variable is, so the guard fires for an
-// UNSET variable and the branch is inverted (variable-plus-operator.sh printed
-// "MYVAR is set" where bash prints nothing).
-//
-// The fix is to replace the operand with the DECISION bash's `+` operator
-// makes, expressed in Perl the renderer can evaluate: `${v+word}` is defined
-// (and equal to `word`) iff `v` is SET — including set-but-empty — which is
-// exactly the renderer's own `=` arm spelling. So the operand becomes
-// `param("=", name, word)`:
-//
-//   set (even empty) → $MYVAR            ("= " keeps the value, as bash's does)
-//   unset            → ($MYVAR = 'set')  (assign, so it is non-empty)
-//
-// and `test -n` then measures the operand, which is what bash measures. The
-// `${v+word}` in any other position (an assignment RHS, an `echo` word) is
-// NOT rewritten: there the VALUE is wanted, not the set/unset decision, and
-// that is a different defect with a different fix.
-fn fix_test_set_test_operands(expr: &IrExpr) -> IrExpr {
-    // Only a `test`/`[` COMMAND's operand list carries this shape. It
-    // reaches us as `exec("test", Array[…])` (the neutral command node), so
-    // the command name — not the callee — is what identifies it.
-    let IrExpr::Call { func, args } = expr else {
-        return expr.clone();
-    };
-    if !matches!(func.as_str(), "exec" | "builtin") {
-        return expr.clone();
-    }
-    let Some(IrExpr::Str(cmd, _)) = args.first() else {
-        return expr.clone();
-    };
-    if !matches!(cmd.as_str(), "test" | "[") {
-        return expr.clone();
-    }
-    let Some(IrExpr::Array(words)) = args.get(1) else {
-        return expr.clone();
-    };
-    let mut changed = false;
-    let mut fixed_words = Vec::with_capacity(words.len());
-    for w in words {
-        match set_test_operand(w) {
-            Some(replacement) => {
-                changed = true;
-                fixed_words.push(replacement);
-            }
-            None => fixed_words.push(w.clone()),
-        }
-    }
-    if !changed {
-        return expr.clone();
-    }
-    let mut fixed = args.clone();
-    fixed[1] = IrExpr::Array(fixed_words);
-    IrExpr::Call {
-        func: func.clone(),
-        args: fixed,
-    }
-}
-
-/// The `param` rewrite for one `test` operand, or `None` when it is not a
-/// bare `${v+word}` / `${v+set}` set-test.
-fn set_test_operand(w: &IrExpr) -> Option<IrExpr> {
-    let IrExpr::Call { func, args } = w else {
-        return None;
-    };
-    if func != "param" || args.len() != 3 {
-        return None;
-    }
-    // `+` (set ⇒ word) is the set/unset DECISION. The `:+` twin is a value
-    // (`${v:+word}` yields the word only when v is set AND non-empty) and
-    // already has a renderer arm; `-`/`:-` likewise. Rewriting them would
-    // change their value, so only the bare `+` is in scope.
-    match args.first().and_then(crate::ir::call_arg_str).as_deref() {
-        Some("+") => {}
-        _ => return None,
-    }
-    let name = args.get(1).and_then(crate::ir::call_arg_str)?;
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    let word = args.get(2).and_then(crate::ir::call_arg_str)?;
-    Some(IrExpr::Call {
-        func: "param".to_string(),
-        args: vec![
-            IrExpr::Str("=".to_string(), crate::ir::StrStyle::DoubleQuoted),
-            IrExpr::Str(name, crate::ir::StrStyle::DoubleQuoted),
-            IrExpr::Str(word, crate::ir::StrStyle::DoubleQuoted),
-        ],
-    })
-}
 
 // ── Fix 7 — an `eval` payload is SHELL TEXT, not arguments ────────────
 //
@@ -2889,8 +3280,6 @@ fn fix_expr(e: &IrExpr) -> IrExpr {
             // (`${s/${a}/b}`), and the outer unquoting must not hide the
             // inner one.
             let corrected = fix_param_pattern_operands(e);
-            // Fix 15: a `test` operand's `${v+word}` must keep its operand.
-            let corrected = fix_test_set_test_operands(&corrected);
             // Fix 16: a `${arr[@]:o:l}` whose offset/length is static must go
             // through the runtime helper so a negative offset and an
             // over-long length behave like bash's.
@@ -3363,32 +3752,21 @@ fn fix_cond(cond: &IrExpr, fns: &std::collections::HashSet<String>) -> IrExpr {
             let is_local_fn = exec_cmd_name(args)
                 .map(|n| fns.contains(n))
                 .unwrap_or(false);
-            // Fix 15 must also run HERE, not only inside `fix_expr`: a
-            // condition reaches the renderer through `fix_cond`, which
-            // rebuilds the `test` call from `args.clone()` and never calls
-            // `fix_expr` at all. So in condition position the
-            // `test -n "${v+word}"` operand rewrite was unreachable, and the
-            // renderer flattened `test -n` to `length('-n')` — testing the
-            // FLAG, which is always non-empty, so the branch fired for an
-            // UNSET variable (variable-plus-operator.sh printed "MYVAR is
-            // set" where bash prints nothing). The rewrite is the same
-            // narrow one `fix_expr` applies; it is not a blanket `fix_expr`,
-            // because this arm's other rewrites are about local-function
-            // detection, not operand shape. A local-function call is left
-            // exactly as it was, so `__sh_fn_status` is still not handed a
-            // rewritten operand.
-            let mut fixed_args = args.clone();
-            if !is_local_fn {
-                if let IrExpr::Call {
-                    args: rewritten, ..
-                } = fix_test_set_test_operands(&IrExpr::Call {
-                    func: func.clone(),
-                    args: args.clone(),
-                })
-                {
-                    fixed_args = rewritten;
-                }
-            }
+            // A local-function call is wrapped in `__sh_fn_status`; every
+            // other `exec`/`builtin` call is passed through with its
+            // arguments untouched. Fix 15 used to rewrite a `test` operand's
+            // `${v+word}` HERE as well as in `fix_expr`, but the renderer's
+            // own `+` arm renders the set/unset DECISION correctly, so the
+            // rewrite was no longer needed — and it was actively wrong: it
+            // mapped `+` onto the `=` arm, whose predicate is
+            // `defined && length`, i.e. the STRICTER `:+` test. A variable
+            // set to the empty string is set, so `${V+set}` is non-empty in
+            // bash while the rewritten form yielded `V` itself (empty) —
+            // inverting the guard. Fix 15's comment argued for the `=` arm
+            // on the grounds that "set (even empty) keeps the value"; that
+            // is true of `=` and false of the arm the rewrite actually
+            // reached once the `+` arm landed.
+            let fixed_args = args.clone();
             if is_local_fn {
                 IrExpr::Call {
                     func: "__sh_fn_status".to_string(),
@@ -3457,6 +3835,32 @@ pub fn needs_fn_status_helper(perl_src: &str) -> bool {
 /// Emitted on demand when the body actually contains a `__sh_slice(` call
 /// (Fix 16). Same gating discipline as {@link FN_STATUS_PREAMBLE}.
 pub const SLICE_PREAMBLE: &str = r#"
+sub __sh_pos {
+    # bash's `${@:offset}` / `${*:offset}` — a slice of the POSITIONAL
+    # PARAMETERS, which is a LIST. The renderer lowers it to
+    # `join(' ', @ARGV[N..$#ARGV])`, and that join is WRONG for an empty
+    # slice: `@ARGV[N..$#ARGV]` on an empty `@ARGV` is the range `N..-1`,
+    # which yields NO elements, so the inner join returns '' — but the
+    # OUTER join then sees that '' as ONE empty field and emits a single
+    # space. bash emits nothing at all (parse-at-slice-param.sh: `' $'` vs
+    # `  $'`).
+    #
+    # Returning the LIST, not a joined string, is what fixes it: an empty
+    # list contributes zero fields to the enclosing join, and a non-empty
+    # one contributes exactly its elements. The offset is 1-based, as bash
+    # counts it; a non-positive or past-the-end offset is empty.
+    my $__off = shift();
+    my $__len = shift();
+    return () if $__off < 1;
+    return () if $__off > $#ARGV + 1;
+    my $__end = defined($__len) ? $__off + $__len - 1 : $#ARGV;
+    $__end = $#ARGV if $__end > $#ARGV;
+    return () if $__end < $__off - 1;
+    return @ARGV[$__off - 1 .. $__end];
+}
+"#;
+/// {@link SLICE_PREAMBLE}, continued: the array-slice helper of Fix 16.
+pub const SLICE_PREAMBLE_2: &str = r#"
 sub __sh_slice {
     # bash's `${arr[@]:offset:length}` semantics, which a Perl range bound
     # does not reproduce:
@@ -3486,6 +3890,119 @@ sub __sh_slice {
 /// True when the rendered program needs `__sh_slice` defined.
 pub fn needs_slice_helper(perl_src: &str) -> bool {
     perl_src.contains("__sh_slice(")
+}
+
+/// True when the rendered program needs `__sh_pos` defined (Fix 22).
+pub fn needs_pos_slice_helper(perl_src: &str) -> bool {
+    perl_src.contains("__sh_pos(")
+}
+
+// ── Fix 22 — `${@:offset}` is a LIST slice; the renderer's join is not ────
+//
+// The `"slice"` arm of `param` in ir.rs lowers `${@:off}` to
+//     join(' ', @ARGV[off-1..$#ARGV])
+// and `${@:off:len}` to
+//     join(' ', @ARGV[off-1..off-1+len-1]).
+// Both are inside whatever the renderer was building, so a `${@:1}` that
+// became the BODY of an enclosing `join(' ', …)` is doubly wrapped:
+//
+//     print("1:[" . (join(' ', join(' ', @ARGV[0..$#ARGV]))) . "]", "\n");
+//
+// An empty slice then contributes one empty FIELD where bash contributes
+// none, printing a lone space (parse-at-slice-param.sh, `  $` vs ` $`).
+// A bounded slice that runs past the end is worse: Perl pads the missing
+// elements with undef and `join` prints the padding as empty fields, where
+// bash stops at the last argument.
+//
+// `__sh_pos` returns the LIST, so an empty slice contributes zero fields and
+// a short slice contributes only real arguments. The bounded form is routed
+// through it too, with the same end index the renderer computed — a bounded
+// slice past the end must not fabricate fields either.
+//
+// Only the UNBOUNDED-to-end form (`..$#ARGV`) and the bounded numeric form
+// are rewritten, and only when the index is a plain literal, so anything
+// else is left exactly as the renderer wrote it.
+fn fix_pos_param_slice(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        out.push_str(&fix_pos_param_slice_in_line(line));
+        out.push('\n');
+    }
+    // `lines()` drops a trailing newline; put it back so a program that ended
+    // with one still does.
+    if !src.ends_with('\n') && !out.is_empty() {
+        out.pop();
+    }
+    out
+}
+
+/// One line of {@link fix_pos_param_slice}.
+fn fix_pos_param_slice_in_line(line: &str) -> String {
+    const NEEDLE: &str = "join(' ', @ARGV[";
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let Some(at) = rest.find(NEEDLE) else {
+            out.push_str(rest);
+            return out;
+        };
+        let after = &rest[at + NEEDLE.len()..];
+        let Some(close) = after.find(']') else {
+            out.push_str(rest);
+            return out;
+        };
+        let bounds = &after[..close];
+        let Some((lo, hi)) = bounds.split_once("..") else {
+            out.push_str(rest);
+            return out;
+        };
+        // Both bounds must be plain literals — a computed index is left to
+        // the renderer, which may have a reason we do not.
+        let is_lit = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        // Unbounded: `@ARGV[lo..$#ARGV]` — bash's `${@:lo+1}`.
+        let replacement = if hi == "$#ARGV" && is_lit(lo) {
+            let start = lo.parse::<u64>().unwrap_or(0) + 1;
+            format!("join(' ', __sh_pos({start}))")
+        } else if is_lit(lo) && is_lit(hi) {
+            // Bounded: bash's `${@:off:len}`. The renderer already turned
+            // that into a closed 0-based range, so pass the 1-based start
+            // and keep the count; the helper clamps at the real end.
+            if let (Ok(l), Ok(h)) = (lo.parse::<u64>(), hi.parse::<u64>()) {
+                if h < l {
+                    // A reversed range means bash asked for nothing.
+                    "''".to_string()
+                } else {
+                    format!("join(' ', __sh_pos({}, {}))", l + 1, h + 1 - l)
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        if replacement.is_empty() {
+            // Not a shape we rewrite: copy through and continue AFTER the
+            // needle so the next occurrence is still considered.
+            out.push_str(&rest[..at + NEEDLE.len()]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(&replacement);
+        // The needle is `join(' ', @ARGV[…]`: `]` closes the slice, and the
+        // character after it is the `)` that closes the ORIGINAL `join(`.
+        // The replacement re-opens its own balanced `join(…)`, so copying
+        // that `)` through would leave one paren too many —
+        // `join(' ', __sh_pos(3))))` — which is a Perl COMPILE error that
+        // takes the whole program down, not a wrong value
+        // (parse-at-slice-param.sh, whose only other symptom is the
+        // single-space diff this pass exists to fix).
+        //
+        // Consume exactly one `)`, and only when it really is the join's
+        // closer: `join(' ', @ARGV[0..1] . "x")` puts `. "x"` there, so the
+        // `strip_prefix` miss is the correct fallback, not an error.
+        rest = after[close + 1..].strip_prefix(')').unwrap_or(&after[close + 1..]);
+    }
 }
 
 #[cfg(test)]
@@ -3657,6 +4174,135 @@ mod pgf_tests {
         assert_eq!(rewrite_positional_params("print(\"$1\");\n"), "print(\"$__sh_args[0]\");\n");
         assert_eq!(rewrite_positional_params("x =~ s{^--}{}r;\n"), "x =~ s{^--}{}r;\n");
         assert_eq!(rewrite_positional_params("my @ARGV = @_;\n"), "my @ARGV = @_;\n");
+    }
+
+    /// Regression (Fix 22): the slice rewrite must consume the `)` that
+    /// closed the ORIGINAL `join(`, or it leaves one paren too many.
+    ///
+    /// The needle stops at `]` — the character after it is the join's own
+    /// closer, and the replacement supplies its own balanced `join(…)`.
+    /// Copying that `)` through produced `join(' ', __sh_pos(3))))`, a Perl
+    /// COMPILE error, so the program printed nothing at all rather than
+    /// merely the wrong value.
+    #[test]
+    fn pos_slice_rewrite_consumes_join_close_paren() {
+        // The exact shape the renderer emits inside an array assignment,
+        // which is where parse-at-slice-param.sh hits it.
+        assert_eq!(
+            fix_pos_param_slice_in_line(
+                "@ARGV = ($ARGV[0], $tempfile, join(' ', @ARGV[2..$#ARGV]));  # line 3"
+            ),
+            "@ARGV = ($ARGV[0], $tempfile, join(' ', __sh_pos(3)));  # line 3"
+        );
+        // The `print(...)` shape: same needle, different surrounding closers.
+        assert_eq!(
+            fix_pos_param_slice_in_line("print(join(' ', @ARGV[0..$#ARGV]), \"\\n\");"),
+            "print(join(' ', __sh_pos(1)), \"\\n\");"
+        );
+        // A bounded slice is rewritten through the same path.
+        assert_eq!(
+            fix_pos_param_slice_in_line("x = join(' ', @ARGV[0..1]);"),
+            "x = join(' ', __sh_pos(1, 2));"
+        );
+        // A `)` that is NOT the join's closer must survive: stripping it
+        // would corrupt `join(' ', @ARGV[0..1] . "x")`.
+        assert_eq!(
+            fix_pos_param_slice_in_line("x = join(' ', @ARGV[0..$#ARGV] . 'x');"),
+            "x = join(' ', __sh_pos(1)) . 'x');"
+        );
+    }
+
+    /// The paren fix is only real if the emitted program COMPILES. Assert the
+    /// whole generated program is paren-balanced, since an unbalanced program
+    /// is a compile error that yields no stdout at all.
+    #[test]
+    fn pos_slice_generated_program_is_paren_balanced() {
+        let src = "set -- \"$1\" \"$tempfile\" \"${@:3}\"\necho \"${@:1}\"\n";
+        let out = gen(src);
+        let mut depth: i64 = 0;
+        for ch in out.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "paren underflow in:\n{out}");
+        }
+        assert_eq!(depth, 0, "unbalanced parens in:\n{out}");
+    }
+
+    /// The file-scope binding must appear BEFORE the first read of
+    /// `@__sh_args`, and both names must be declared for `use strict`.
+    #[test]
+    fn toplevel_positional_binding_precedes_its_reads() {
+        let out = gen("echo $1\n");
+        let decl = out.find("our @__sh_args;").expect("declared");
+        let bind = out.find("local @__sh_args = @ARGV;").expect("bound");
+        let read = out.find("$__sh_args[").expect("read");
+        assert!(decl < bind && bind < read, "order wrong in:\n{out}");
+        assert!(out.contains("our $__sh_args_n;"), "count declared in:\n{out}");
+    }
+
+    /// The count binding must be a name Perl can actually declare.
+    ///
+    /// `$#` is the length operator, not a sigil: `our $#foo;` and
+    /// `our $#foo = 1;` are both compile errors. Emitting one put a syntax
+    /// error in the preamble of every program with a top-level `$1`/`$@`,
+    /// which compiled to nothing and produced zero output — so this pins
+    /// the *name*, not merely the presence of a count, and additionally
+    /// requires the emitted text to be real Perl.
+    #[test]
+    fn toplevel_pos_count_binding_is_valid_perl() {
+        let out = gen("echo $1\n");
+        assert!(
+            !out.contains("$#__sh_args"),
+            "undeclarable $# name re-emitted in:\n{out}"
+        );
+        // `perl -c` is the oracle: it is what actually rejected the old
+        // spelling, and it rejects it without needing @ARGV to be set up.
+        let dir = std::env::temp_dir().join(format!(
+            "pg_toplevel_pos_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("t.pl");
+        std::fs::write(&path, &out).expect("write");
+        let chk = std::process::Command::new("perl")
+            .arg("-c")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let chk = chk.expect("run perl -c");
+        assert!(
+            chk.status.success(),
+            "emitted preamble is not valid Perl:\n{}\n---\n{out}",
+            String::from_utf8_lossy(&chk.stderr)
+        );
+        // `perl -c` cannot catch a *warning*; redeclaring the names the
+        // preamble already declared made every run print
+        // `"our" variable @__sh_args redeclared` on stderr.
+        assert!(
+            !out.contains("our @__sh_args = @ARGV;") && !out.contains("our $__sh_args_n = scalar"),
+            "binding re-declares the names TOPLEVEL_POS_DECLS already declared:\n{out}"
+        );
+    }
+
+    /// The rewire must NOT touch `@ARGV` text that is DATA — a quoted
+    /// literal, or the tail of a comment.
+    #[test]
+    fn toplevel_rewire_skips_strings_and_comments() {
+        // A quoted `$ARGV[0]` is the string the script prints, not a read.
+        let quoted = replace_all_outside_strings("print \"$ARGV[0]\";\n", "$ARGV[", "$__sh_args[");
+        assert_eq!(quoted, "print \"$ARGV[0]\";\n", "string was rewritten");
+        // The same in a heredoc-fed `print`.
+        let sq = replace_all_outside_strings("print '$ARGV[0]';\n", "$ARGV[", "$__sh_args[");
+        assert_eq!(sq, "print '$ARGV[0]';\n", "single-quoted string was rewritten");
+        // A comment's text is not code.
+        let comment = replace_all_outside_strings("x = 1;  # uses $ARGV[0] here\n", "$ARGV[", "$__sh_args[");
+        assert_eq!(comment, "x = 1;  # uses $ARGV[0] here\n", "comment was rewritten");
+        // Code outside those IS rewritten.
+        let code = replace_all_outside_strings("y = $ARGV[0];\n", "$ARGV[", "$__sh_args[");
+        assert_eq!(code, "y = $__sh_args[0];\n");
     }
     #[test]
     fn binding_injected_after_argv() {
