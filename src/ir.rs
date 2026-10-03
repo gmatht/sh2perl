@@ -5068,6 +5068,20 @@ fn bash_word_for(w: &IrExpr) -> String {
                 None => "''".to_string(),
             }
         }
+        // A command substitution as the Capture VARIANT (not the
+        // Call{func:"capture"} form above). `cd -- "$(dirname "$0")"`
+        // arrives here: the enclosing command text is rebuilt for a
+        // `bash -c` / pipeline run, so the word must go back as SHELL
+        // syntax. Falling through to `_` ran `render_word` instead, which
+        // emits PERL (`do { … File::Basename::dirname($0) … }`), and that
+        // Perl was then spliced verbatim inside the surrounding quotes —
+        // bash ran a command literally named `do { … }` and the capture
+        // yielded the empty string. Rebuild the command text the same way
+        // the Call form does.
+        IrExpr::Capture { expr, native: _ } => match arrow_to_cmd(expr) {
+            Some(cmd) => format!("$({})", cmd),
+            None => "''".to_string(),
+        },
         IrExpr::Call { func, args } if func == "brace" => bash_brace_syntax(args),
         IrExpr::Call { func, args } if func == "param" => bash_param_syntax(args),
         _ => {
@@ -10444,6 +10458,16 @@ fn dq_value_expr(content: &str) -> Option<String> {
     if content.contains('\\') {
         return None;
     }
+    // A COMMAND SUBSTITUTION nested inside the double quotes is not a value
+    // this can produce: `$(…)`/backtick is a whole command whose OUTPUT
+    // becomes the value, and the identifier scan below only rewrites a `$`
+    // expansion it recognised — a leftover `$(` falls through as literal
+    // text and is spliced into the `q{…}` command string verbatim, handing
+    // bash a Perl expression as a literal WORD. Refuse so the caller keeps
+    // the plain `bash -c` text path, which evaluates it correctly.
+    if content.contains("$(") || content.contains('`') {
+        return None;
+    }
     let chars: Vec<char> = content.chars().collect();
     let mut parts: Vec<String> = Vec::new();
     let mut lit = String::new();
@@ -13266,6 +13290,55 @@ mod tests {
         // An unescaped `/` still has to be escaped, or the substitution ends
         // early and the rest of the expression is a syntax error.
         assert_eq!(repl_for_regex("a/b"), "a\\/b");
+    }
+
+    /// A nested command substitution inside a rebuilt command word must go
+    /// back as SHELL syntax, never as rendered Perl.
+    ///
+    /// `cd -- "$(dirname "$0")"` reaches `bash_word_for` as the `IrExpr::Capture`
+    /// VARIANT (not the `Call{func:"capture"}` form). Without a variant arm it
+    /// fell through to `_`, which runs `render_word` and emits PERL
+    /// (`do { … File::Basename::dirname($0) … }`) into a command string that is
+    /// then handed to `bash -c`. bash runs a command literally named `do { … }`,
+    /// the capture yields empty, and the program silently prints the wrong
+    /// value with exit 0 — the shape reported on qx-var-builtin-cd.sh.
+    #[test]
+    fn nested_capture_word_rebuilds_as_shell_syntax() {
+        // `cd -- "$(dirname "$0")"` — the enclosing command text is rebuilt
+        // for a `bash -c` / pipeline run, so the nested word must come back
+        // as SHELL syntax.
+        let prog = embed_prog("d=$(cd -- \"$(dirname \"$0\")\" && pwd)");
+        let text = shir_to_perl(&prog);
+        assert!(
+            !text.contains("require File::Basename"),
+            "no Perl module call may reach a command string: {text}"
+        );
+        assert!(
+            !text.contains("do { my $__sh_cap"),
+            "no raw Perl capture body may reach a command string: {text}"
+        );
+        assert!(
+            text.contains("$(dirname") || text.contains("$('dirname'"),
+            "the nested substitution survives as shell text: {text}"
+        );
+    }
+
+    /// A `dq_value_expr` content carrying a command substitution is refused,
+    /// so the caller keeps the plain `bash -c` text path.
+    ///
+    /// `$(…)` is a whole command whose OUTPUT is the value; the identifier
+    /// scan only rewrites a `$` expansion it recognised, so a leftover `$(`
+    /// was spliced into the reconstructed command string verbatim and bash was
+    /// handed a Perl expression as a literal WORD (exit 0, empty stdout).
+    #[test]
+    fn dq_value_expr_refuses_a_nested_command_substitution() {
+        assert_eq!(dq_value_expr("$(dirname \"$0\")"), None);
+        assert_eq!(dq_value_expr("pre$(echo x)post"), None);
+        assert_eq!(dq_value_expr("`echo x`"), None);
+        // A plain expansion still has a value form — the guard must not
+        // swallow the shapes this function exists to serve.
+        assert!(dq_value_expr("$0").is_some());
+        assert!(dq_value_expr("${d}/f").is_some());
     }
 }
 
