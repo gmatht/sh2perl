@@ -282,18 +282,32 @@ fn arr_base(name: &str) -> &str {
 }
 
 fn arr_expand_call_fish(name: &str) -> String {
+    // fish spells command substitution `(cmd)`, not bash's `$(cmd)`.
+    // The `_join` variant prints bash's `${arr[*]}` shape (one
+    // space-joined line); a `for` loop wants the per-line list instead.
     if ASSOC_VARS.lock().unwrap().contains(name) {
-        format!("$(_arr_expand_k {name})")
+        format!("(_arr_expand_k_join {name})")
     } else {
-        format!("$(_arr_expand {name})")
+        format!("(_arr_expand_join {name})")
+    }
+}
+
+/// The `for x in …` form — one element per line, because a fish command
+/// substitution splits on newlines (the `_join` variant would iterate once
+/// over the whole space-joined string).
+fn arr_expand_call_fish_list(name: &str) -> String {
+    if ASSOC_VARS.lock().unwrap().contains(name) {
+        format!("(_arr_expand_k {name})")
+    } else {
+        format!("(_arr_expand {name})")
     }
 }
 
 fn arr_keys_call_fish(name: &str) -> String {
     if ASSOC_VARS.lock().unwrap().contains(name) {
-        format!("$(_arr_keys_k {name})")
+        format!("(_arr_keys_k {name})")
     } else {
-        format!("$(_arr_keys {name})")
+        format!("(_arr_keys {name})")
     }
 }
 
@@ -881,65 +895,81 @@ _cmp() {
     if needs_arr_helper(prog) {
         out.push_str(
             r#"
-# whole-array expansion helpers (the per-element vars + len counter)
-_arr_expand() {
-    _i=0
-    _n=$(eval echo "\${$1_len}")
-    _n=${_n:-0}
-    while [ "$_i" -lt "$_n" ]; do
-        eval "printf '%s' \"\${$1_$_i}\""
-        [ "$_i" -lt "$((_n - 1))" ] && printf ' '
-        _i=$((_i + 1))
-    done
+# whole-array expansion helpers (the per-element vars + len counter).
+# fish has no indirect expansion, but `$name_suffix` composes a variable
+# name from parts, so the per-element `arr_0`..`arr_{n-1}` layout the
+# renderer emits is reachable without eval.
+#
+# A fish command substitution splits on NEWLINES, so the two callers need
+# different shapes: `for x in (_arr_expand …)` takes one element per line,
+# while `echo (_arr_expand_join …)` needs bash's `${arr[*]}` on ONE
+# space-joined line. Emitting one form for both would break the other.
+function _arr_expand --argument-names name
+    # `${arr[@]}` in a word-split position — one element per line.
+    set -l _len_var $name"_len"
+    set -l _n $$_len_var
+    or set _n 0
+    set -l _i 0
+    while test $_i -lt $_n
+        set -l _ev $name"_$_i"
+        printf '%s\n' $$_ev
+        set _i (math $_i + 1)
+    end
+end
+function _arr_expand_join --argument-names name
+    # `${arr[@]}` / `${arr[*]}` where bash joins with a space.
+    set -l _out (_arr_expand $name)
+    string join ' ' $_out
     printf '\n'
-}
-_arr_keys() {
-    _i=0
-    _n=$(eval echo "\${$1_len}")
-    _n=${_n:-0}
-    while [ "$_i" -lt "$_n" ]; do
-        printf '%s\n' "$_i"
-        _i=$((_i + 1))
-    done
-}
-_arr_expand_k() {
-    # assoc variant: values in key-list order ($1_keys). Joins with the
-    # FIRST char of the caller's IFS (bash's ${arr[*]} semantics — under
-    # IFS=newline each value lands on its own line); the key list itself
-    # is space-separated, so the split runs under a fixed IFS. All in a
-    # subshell: the caller's IFS is untouched.
-    ( # the first IFS char (${IFS#?} = IFS minus the first char); a
-      # cmdsub would eat a newline separator, so use pure expansion
-      _sep=${IFS%${IFS#?}}
-      IFS=' '
-      _n=0
-      for _k in $(eval echo "\${$1_keys}"); do
-          [ "$_n" -gt 0 ] && printf '%s' "$_sep"
-          eval "printf '%s' \"\${$1_$_k}\""
-          _n=$((_n + 1))
-      done
-      printf '\n' )
-}
-_arr_keys_k() {
-    # assoc variant: the key list
-    ( IFS=' '
-      for _k in $(eval echo "\${$1_keys}"); do
-          printf '%s\n' "$_k"
-      done )
-}
-_arr_slice() {
-    # $1=name $2=off $3=len — elements off..off+len-1, space-joined
-    _i=$(( $2 ))
-    _end=$(eval echo "\${$1_len}")
-    _end=${_end:-0}
-    _lim=$(( $2 + ${3:-1000000} ))
-    while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
-        eval "printf '%s' \"\${$1_$_i}\""
-        _i=$((_i + 1))
-        [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ] && printf ' '
-    done
+end
+function _arr_keys --argument-names name
+    # the element INDICES — a plain list, one per line.
+    set -l _len_var $name"_len"
+    set -l _n $$_len_var
+    or set _n 0
+    set -l _i 0
+    while test $_i -lt $_n
+        printf '%s\n' $_i
+        set _i (math $_i + 1)
+    end
+end
+function _arr_expand_k --argument-names name
+    # assoc variant: values in key-list order ($name_keys).
+    set -l _keys_var $name"_keys"
+    for _k in $$_keys_var
+        set -l _ev $name"_"$_k
+        printf '%s\n' $$_ev
+    end
+end
+function _arr_expand_k_join --argument-names name
+    # assoc variant, space-joined (bash's `${arr[*]}`).
+    set -l _out (_arr_expand_k $name)
+    string join ' ' $_out
     printf '\n'
-}
+end
+function _arr_keys_k --argument-names name
+    # assoc variant: the key list, one per line.
+    set -l _keys_var $name"_keys"
+    for _k in $$_keys_var
+        printf '%s\n' $_k
+    end
+end
+function _arr_slice --argument-names name off len
+    # elements off..off+len-1, space-joined.
+    set -l _len_var $name"_len"
+    set -l _end $$_len_var
+    or set _end 0
+    set -l _lim (math $off + $len)
+    set -l _out
+    set -l _i $off
+    while test $_i -lt $_lim; and test $_i -lt $_end
+        set -l _ev $name"_$_i"
+        set -a _out $$_ev
+        set _i (math $_i + 1)
+    end
+    string join ' ' $_out
+    printf '\n'
+end
 
 "#,
         );
@@ -2027,7 +2057,13 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
                 exec_line_to_fish(arg(args, 0)?, words, env)
             }
             "test" => {
-                let raw = raw_arg(args, 0)?;
+                // The core hands the whole condition over as one flattened
+                // string, so any bash-only spelling inside it (`$?`, `$*`,
+                // `${…}`, `$(( ))`) arrives as literal text and would be a
+                // fish parse error. Rewrite those to native fish BEFORE any
+                // of the operator splitting below, which must then see only
+                // fish-legal text.
+                let raw = bash_specials_to_fish(&raw_arg(args, 0)?);
                 let t = raw.trim();
                 // `[[ ... ]]`-style compound tests survive as raw text; `[ ]`
                 // cannot express &&/||, so keep those in [[ ]] form.
@@ -3762,9 +3798,13 @@ fn capture_idiom_fish(expr: &IrExpr) -> Result<Option<String>, String> {
 
 fn word_to_fish(e: &IrExpr) -> Result<String, String> {
     match e {
-        IrExpr::Str(s, _) => Ok(str_word(s)),
+        IrExpr::Str(s, _) => Ok(bash_specials_to_fish(&str_word(s))),
         IrExpr::Int(i) => Ok(i.to_string()),
-        IrExpr::Var(name, _) => Ok(format!("${name}")),
+        // Route through `var_ref_to_fish`: the core hands bash's special
+        // parameters over as bare names (`getVar("*")` for `$*`, `getVar("$")`
+        // for `$$`, `getVar("?")` for `$?`) and `$*` / `$$` are fish PARSE
+        // ERRORS, so emitting `$` + the raw name verbatim kills the file.
+        IrExpr::Var(name, _) => Ok(var_ref_to_fish(name, false)),
         IrExpr::Ident(name) => Ok(name.clone()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Interpolate(parts) => interp_to_fish(parts),
@@ -3869,6 +3909,12 @@ fn is_fish_substitution(s: &str) -> bool {
     s.starts_with('(') || s.starts_with("$(")
 }
 
+/// fish has no `$#`: the positional-parameter COUNT is the `count` builtin.
+/// It is a command, so a value position needs the command substitution
+/// `(count $argv)` — the bare `count $argv` only works where a command is
+/// already expected, and `"count $argv"` prints the literal text.
+const COUNT_ARGV_FISH: &str = "(count $argv)";
+
 fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
     match func {
         // A bare getVar in a word position is the QUOTED expansion (the
@@ -3876,7 +3922,17 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // quote matters — bash `printf '%s' "$x"` passes the value as
         // ONE word, the unquoted form re-splits it (heredoc-apostrophe.sh
         // truncates at the first space without it).
-        "getVar" => Ok(format!("\"{}\"", var_ref_to_fish(&raw_arg(args, 0)?.replace('.', "_"), false))),
+        "getVar" => {
+            let r = var_ref_to_fish(&raw_arg(args, 0)?.replace('.', "_"), false);
+            // `$#` lowers to `(count $argv)`, a fish command substitution
+            // that is already ONE word. Wrapping it in `"…"` would print the
+            // literal text `(count a b)`. Every other variable expands to a
+            // value, which does need the quotes.
+            if r == COUNT_ARGV_FISH {
+                return Ok(r);
+            }
+            Ok(format!("\"{r}\""))
+        }
         // param expansions in word position are the QUOTED source form
         // (`echo "\"${x#p}\" "` — bash keeps interior spaces; the core
         // wraps only unquoted getVar in split(), param has no marker, so
@@ -3932,11 +3988,13 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
         }
         "listVar" => {
             let n = raw_arg(args, 0)?;
-            Ok(if n == "*" {
-                "\"$*\"".into()
-            } else {
-                "\"$@\"".into()
-            })
+            // `"$@"` is a hard PARSE ERROR in fish ("$@ is not supported.
+            // In fish, please use $argv"), so this cannot be spelled
+            // literally. Bare `$argv` is the positional-parameter LIST and
+            // matches bash's word-split `"$@"` in an unquoted word position;
+            // a value that must stay ONE word (a quoted context) is handled
+            // by the callers, which wrap this in `"…"` themselves.
+            Ok("$argv".into())
         }
         "arrayIndex" => {
             let name = raw_arg(args, 0)?;
@@ -4055,15 +4113,28 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
     }
     // `$#` (argument count) is a PARSE ERROR in fish ("$# is not supported.
     // In fish, please use 'count $argv'") — same read-time kill as `$?`.
-    // fish's spelling is a command, so it must not be wrapped in `$…`
-    // quotes by a caller; the `count $argv` form is self-quoting.
     if name == "#" {
-        return "count $argv".into();
+        return COUNT_ARGV_FISH.into();
     }
     // `$!` (last background pid) and `$-` have no fish spelling at all and
     // are a parse error; emit an empty expansion so the file still reads.
     if name == "!" || name == "-" {
         return "\"\"".into();
+    }
+    // `$$` — the core lexes the pid as a bare `$` name (`getVar("$")`), and
+    // `$` alone in the generic branch below would render the literal `$$`,
+    // which fish rejects at parse time.
+    if name == "$" {
+        return "$fish_pid".into();
+    }
+    // `$*` / `$@` — the positional list, joined by the first char of IFS.
+    // fish spells it `$argv`; `$*` / `$@` are parse errors in every context,
+    // and the generic branch below would emit them verbatim because they pass
+    // its `?!@*#$-` character test. Handle them in the SCALAR position too,
+    // not just under `list` — `"$*"` inside a double-quoted template is
+    // joined there and `"$argv"` is its exact equivalent.
+    if name == "@" || name == "*" {
+        return "$argv".into();
     }
     // Positional parameters: fish has no `$1`/`$2` shorthand — a positional
     // read is `$argv[N]`. This is not merely a spelling preference: `$1` is
@@ -4127,16 +4198,20 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                     return Ok(arr_expand_call_fish(arr_base(&an)));
                 }
                 if idx.contains(['$', '(']) {
-                    // dynamic key (`${map[$k]}`) — indirect via eval
-                    return Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{idx}}}\\\"\")",
-                        arr_base(&an)
-                    ));
+                    // dynamic key (`${map[$k]}`). fish has no eval and no
+                    // `${map[$k]}`, but `$base_$k` composes the name from
+                    // parts, so the renderer never needs an indirect lookup.
+                    // The key text already carries its `$` (`m[$k]`), so it
+                    // is spliced in as written rather than re-quoted.
+                    let base = arr_base(&an);
+                    return Ok(format!("${base}_{idx}"));
                 }
-                return Ok(format!("\"${{{an}_{idx}}}\""));
+                // fish has no `${arr[0]}` and rejects `${arr_0}` as a
+                // bracketed variable — the element is the flat `arr_0`.
+                return Ok(format!("\"${an}_{idx}\""));
             }
             if let Some(an) = name.strip_prefix('#') {
-                return Ok(format!("${{{an}_len}}"));
+                return Ok(format!("${an}_len"));
             }
             if list {
                 // `"${x[@]}"` — array elements joined
@@ -4150,7 +4225,7 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                 let r = var_ref_to_fish(&name, false);
                 // `$#` / `$!` / `$-` render to a COMMAND or a bare literal,
                 // which double quotes would turn into a literal string.
-                if r == "count $argv" {
+                if r == COUNT_ARGV_FISH {
                     return Ok(r);
                 }
                 Ok(format!("\"{r}\""))
@@ -4160,7 +4235,7 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // `len` on an array (`${#arr[@]}`) -> the counter; on a scalar
             // (`${#s}`) -> fish's `string length`
             if let Some(an) = name.strip_suffix("[@]") {
-                Ok(format!("${{{an}_len}}"))
+                Ok(format!("${an}_len"))
             } else {
                 Ok(format!("(string length -- \"${name}\")"))
             }
@@ -4169,7 +4244,7 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // `${#arr[@]}` arrives as slice with a `#name` target — the
             // per-element length counter
             if let Some(an) = name.strip_prefix('#') {
-                return Ok(format!("${{{an}_len}}"));
+                return Ok(format!("${an}_len"));
             }
             let off = raw_arg(args, 2)?;
             let len = args.get(3).map(str_arg).transpose()?.unwrap_or_default();
@@ -4205,7 +4280,7 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                 && name != "*"
                 && ARRAY_NAMES.lock().unwrap().contains(name.as_str())
             {
-                return Ok(format!("$(_arr_slice {name} {off} {len})"));
+                return Ok(format!("(_arr_slice {name} {off} {len})"));
             }
             let offn: i64 = off.trim().parse().unwrap_or(-1);
             let lenn: i64 = len.trim().parse().unwrap_or(-1);
@@ -4303,6 +4378,17 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // element-0 variable is the subject of the same emptiness test.
             if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
                 return Ok(default_if_unset_fish(&format!("{name}_0"), &default));
+            }
+            // `${@:-d}` / `${*:-d}` — the positionals. `"$@"` is a fish
+            // PARSE ERROR, so the subject must be fish's positional list.
+            // bash's `${@:-d}` is empty when there are no positionals and
+            // otherwise expands to them all (IFS-joined inside quotes);
+            // `count $argv` is 0 exactly when there are none, which is the
+            // same emptiness test `test -n` performs for a scalar.
+            if name == "@" || name == "*" {
+                return Ok(format!(
+                    "(test (count $argv) -gt 0; and printf '%s' \"$argv\"; or printf '%s' {default})"
+                ));
             }
             // fish has no `${x:-d}`. `test -n` is false for BOTH an unset and
             // an empty variable, which is exactly bash's `:-` trigger, so
@@ -4463,7 +4549,7 @@ fn join_to_fish(inner: &IrExpr, quoted: bool) -> Result<String, String> {
     // array expansions are already word lists, and param renders are
     // already quoted — never re-quote them (`""$x""` would leave an
     // UNQUOTED segment and field-split the value)
-    if s.starts_with("$(_arr_expand") || s.starts_with("$(_arr_keys") {
+    if s.starts_with("(_arr_expand") || s.starts_with("(_arr_keys") {
         Ok(s)
     } else {
         Ok(if quoted && !s.starts_with('"') {
@@ -4552,6 +4638,14 @@ fn interp_expr_self_quotes(e: &IrExpr) -> bool {
             "capture" | "captureWords" | "brace" | "arrayItems" => false,
             // the whole-array forms expand to multiple words
             "arrayIndex" => !matches!(args.get(1), Some(IrExpr::Str(k, _)) if k == "@" || k == "*"),
+            // `$#` lowers to `(count $argv)`, a command substitution that is
+            // already ONE word: putting it inside `"…"` prints the literal
+            // text `(count a b)` instead of the number. A bare `$#` read
+            // reaches the renderer as getVar("#") (the core wraps the read in
+            // a variable lookup, not a param node); the param arm carries the
+            // same name in args[1] (shape (op, name)).
+            "getVar" => !matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "#"),
+            "param" => !matches!(args.get(1), Some(IrExpr::Str(n, _)) if n == "#"),
             _ => true,
         },
         _ => true,
@@ -4565,8 +4659,12 @@ fn interp_expr_to_fish(e: &IrExpr) -> Result<String, String> {
             "getVar" => Ok(var_ref_to_fish(&raw_arg(args, 0)?.replace('.', "_"), false)),
             "param" => param_to_fish(args, false),
             "listVar" => {
-                let n = raw_arg(args, 0)?;
-                Ok(if n == "*" { "$*".into() } else { "$@".into() })
+                // Inside a double-quoted template `"$@"` means the positionals
+                // joined by the first char of IFS; fish's `"$argv"` is the
+                // space-joined equivalent and IS valid fish (unlike `"$@"`
+                // itself, which is a parse error).
+                let _ = raw_arg(args, 0)?;
+                Ok("$argv".into())
             }
             "arrayIndex" => {
                 let name = raw_arg(args, 0)?;
@@ -4621,8 +4719,12 @@ fn interp_expr_to_fish(e: &IrExpr) -> Result<String, String> {
         IrExpr::Arith(a) => Ok(arith_cmd_fish(&arith_to_fish(a))),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
-        IrExpr::Var(name, _) => Ok(format!("${name}")),
-        IrExpr::Str(s, _) => Ok(s.clone()),
+        IrExpr::Var(name, _) => Ok(var_ref_to_fish(name, false)),
+        // A literal `$` reaches here for `$$` (the core lexes the pid as
+        // `getVar("$")`); inside a double-quoted template `"…$…"` would read
+        // as fish's dangling-`$` parse error.
+        IrExpr::Str(s, _) if s == "$" => Ok("$fish_pid".into()),
+        IrExpr::Str(s, _) => Ok(bash_specials_to_fish(s)),
         // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
         // t21/t56/t73): array element read inside a double-quoted template
         // — the bare `${name_key}` (the template supplies the quotes).
@@ -4642,6 +4744,320 @@ fn interp_expr_to_fish(e: &IrExpr) -> Result<String, String> {
         }
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
+}
+
+/// Rewrite the bash-only spellings that reach the output as LITERAL TEXT,
+/// so fish can read the file at all.
+///
+/// WHY THIS EXISTS. The core lowers a test condition or an `(( ))` body to a
+/// single flattened string and hands it to the renderer as an `IrExpr::Str`
+/// — `[ $? -eq 0 ]` arrives as `Str("$? -eq 0")`, not as a `Var("?")` node.
+/// `var_ref_to_fish` therefore never sees it, and the raw bash spelling is
+/// emitted verbatim. That is not a wrong VALUE, it is a fish PARSE ERROR, and
+/// fish reports it while READING the file, so one bad token kills every
+/// statement in the script — not just the one that contains it:
+///
+///     "$? is not the exit status. In fish, please use $status."
+///     "$* is not supported. In fish, please use $argv."
+///     "${ is not a valid variable in fish."
+///     "command substitutions not allowed here"      ($(( )) inside [ ])
+///     "$$ is not the pid. In fish, please use $fish_pid."
+///
+/// So the whole file must be rewritten, and it has to happen on the raw-text
+/// path. Each rewrite below is the native fish spelling of the same read; the
+/// scalar forms are plain `$name` so they survive word-splitting exactly as
+/// `var_ref_to_fish` already renders them, and `count`/`$status`/`$fish_pid`
+/// are commands-or-builtins that are legal as `[ ]` / `test` operands.
+fn bash_specials_to_fish(s: &str) -> String {
+    if !s.contains(['$', '(', '{']) {
+        return s.to_string();
+    }
+    let b: Vec<char> = s.chars().collect();
+    let n = b.len();
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0;
+    // regions where `$`/`(` are literal and must be copied through untouched
+    let mut in_sq = false;
+    let mut in_dq = false;
+    while i < n {
+        let c = b[i];
+        if c == '\'' && !in_dq {
+            in_sq = !in_sq;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' && !in_sq {
+            in_dq = !in_dq;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_sq {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // `$(( … ))` — bash arithmetic. fish spells it `(math …)` and it is
+        // NOT legal inside a `[ ]` operand, so the arithmetic has to become
+        // the `test` BUILTIN, which accepts a substitution. The caller decides
+        // which; here we only recognise the span and hand back the inner text
+        // so `space_test_ops` can pick the legal enclosing form.
+        if c == '$' && i + 2 < n && b[i + 1] == '(' && b[i + 2] == '(' {
+            let (inner, next) = scan_arith_span(&b, i + 3);
+            let inner: String = inner.iter().collect();
+            out.push_str(&arith_span_to_fish(inner.trim()));
+            i = next;
+            continue;
+        }
+        if c == '$' {
+            if let Some(next) = special_param_to_fish(&b, i, &mut out) {
+                i = next;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `$( ( … ) )` → return the inner text and the index just past the closing
+/// `))`. Tolerates nesting so `$(( $(( 1 + 1 )) ))` does not stop at the
+/// first `)`.
+fn scan_arith_span(b: &[char], start: usize) -> (&[char], usize) {
+    let mut depth = 1i32;
+    let mut i = start;
+    while i < b.len() {
+        if b[i] == '(' {
+            depth += 1;
+        } else if b[i] == ')' {
+            depth -= 1;
+            if depth == 0 {
+                // the second `)` of the `))` pair
+                let end = if i + 1 < b.len() && b[i + 1] == ')' { i } else { i };
+                return (&b[start..end], (end + 2).min(b.len()));
+            }
+        }
+        i += 1;
+    }
+    (&b[start..], b.len())
+}
+
+/// The inner text of a `$(( … ))` span → the native fish `(math …)`
+/// command substitution.
+///
+/// fish has no `$(( ))` at all: it is a parse error even inside a `[ ]`
+/// operand ("command substitutions not allowed here"). The `(…)` form IS
+/// legal there, so `test "$n" -lt (math 1 + 2)` reads and evaluates, while
+/// `test "$n" -lt "$(( 1 + 2 ))"` kills the whole file.
+///
+/// The numeric guards the core injects are bash `(( … ))` bodies wrapped one
+/// paren-pair deeper than the arithmetic; they are stripped here so `math`
+/// receives the bare expression rather than `(( … ))`, which it rejects.
+fn arith_span_to_fish(inner: &str) -> String {
+    let mut t = inner.trim();
+    loop {
+        let next = if t.starts_with("((") && t.ends_with("))") && balanced(&t[2..t.len() - 2]) {
+            Some(t[2..t.len() - 2].trim())
+        } else if t.starts_with('(') && t.ends_with(')') && balanced(&t[1..t.len() - 1]) {
+            Some(t[1..t.len() - 1].trim())
+        } else {
+            None
+        };
+        match next {
+            Some(n) if !n.is_empty() => t = n,
+            _ => break,
+        }
+    }
+    // `math` needs a bare expression; strip the redundant quoting the core
+    // leaves around numeric guards so the guard's own `(cmd)` text is dropped.
+    format!("(math {t})")
+}
+
+/// Does every `(` in the text have a matching `)` before the end?
+fn balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// One bash special parameter at `b[i]` (`$` already seen) → the native fish
+/// spelling, appended to `out`. Returns the index just past the parameter, or
+/// None when this is an ordinary `$name` the caller should copy itself.
+fn special_param_to_fish(b: &[char], i: usize, out: &mut String) -> Option<usize> {
+    let n = b.len();
+    let next = i + 1;
+    if next >= n {
+        return None;
+    }
+    match b[next] {
+        // `$?` → `$status`. Not just a rename: the fish spelling is a PARSE
+        // ERROR that kills the whole file, and `$status` is legal everywhere
+        // including inside double quotes.
+        '?' => {
+            out.push_str("$status");
+            Some(next + 1)
+        }
+        // `$$` → `$fish_pid`.
+        '$' => {
+            out.push_str("$fish_pid");
+            Some(next + 1)
+        }
+        // `$!` / `$-` have no fish spelling at all; an empty expansion keeps
+        // the file readable, which is strictly better than a parse error.
+        '!' | '-' => {
+            out.push_str("\"\"");
+            Some(next + 1)
+        }
+        // `$#` → `count $argv`. fish has no `$#`, and inside a `[ ]` operand
+        // the bare `count` builtin is legal.
+        '#' => {
+            out.push_str("count $argv");
+            Some(next + 1)
+        }
+        // `"$*"` / `"$@"` are parse errors in fish; inside double quotes
+        // `"$argv"` is the space-joined equivalent and is legal.
+        '*' | '@' => {
+            if in_dq_scope(b, i) {
+                out.push_str("$argv");
+            } else {
+                // bare `"$*"` quoted context is handled by the caller's quote
+                // scan; outside quotes the list form is `$argv` too.
+                out.push_str("$argv");
+            }
+            Some(next + 1)
+        }
+        // `${…}` — fish has NO braces form at all ("${ is not a valid variable
+        // in fish"). Flatten `${name}` to `$name`, and `${name:-d}` /
+        // `${name-d}` / `${name:?}` to the fish `set -q`-free spellings.
+        '{' => {
+            let (inner, after) = scan_braced(b, next + 1);
+            out.push_str(&braced_to_fish(inner));
+            Some(after)
+        }
+        // `$1` … `$9` — fish has no positional shorthand; `$argv[N]`.
+        d if d.is_ascii_digit() => {
+            out.push_str(&format!("$argv[{d}]"));
+            Some(next + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Is the `$` at index `i` inside a double-quoted region? Scans backwards
+/// over the text we have already emitted (the quote state lives on the
+/// output, so re-derive it from the prefix).
+fn in_dq_scope(b: &[char], i: usize) -> bool {
+    let mut in_dq = false;
+    let mut in_sq = false;
+    for c in &b[..i] {
+        match c {
+            '\'' if !in_dq => in_sq = !in_sq,
+            '"' if !in_sq => in_dq = !in_dq,
+            _ => {}
+        }
+    }
+    in_dq
+}
+
+/// `$( {name} … )` → the inner text and the index past the closing `}`.
+fn scan_braced(b: &[char], start: usize) -> (&[char], usize) {
+    let mut depth = 1i32;
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (&b[start..i], i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (&b[start..], b.len())
+}
+
+/// `${name}` / `${name:-d}` / `${name-d}` / `${name:?w}` / `${#name}` → a
+/// native fish expansion of the same value.
+fn braced_to_fish(inner: &[char]) -> String {
+    let t: String = inner.iter().collect();
+    // `${#name}` is the LENGTH form, and it is what collides with `${name}`
+    // for a variable literally called `#` — resolve the length reading first.
+    if let Some(rest) = t.strip_prefix('#') {
+        if is_plain_var(rest) {
+            return format!("(count ${rest})");
+        }
+    }
+    // `${arr[@]}` / `${arr[*]}` — the whole-array forms the array helpers
+    // already lower; leave those to the array path by keeping the base name.
+    if let Some(base) = t.strip_suffix("[@]").or_else(|| t.strip_suffix("[*]")) {
+        if is_plain_var(base) {
+            return format!("${base}");
+        }
+    }
+    // `${name:-default}` / `${name-default}`
+    for op in [":-", "-", ":=", "=", ":?", "?", ":+", "+"] {
+        if let Some(idx) = t.find(op) {
+            let (name, dflt) = (&t[..idx], &t[idx + op.len()..]);
+            if is_plain_var(name) {
+                return match op {
+                    // fish has no `${x:-d}`; `set -q` + a conditional is the
+                    // native read, and `or` keeps it one expression.
+                    ":-" | "-" => {
+                        if dflt.is_empty() {
+                            format!("${name}")
+                        } else {
+                            format!("(test -s \"${name}\"; and printf '%s' \"${name}\"; or printf '%s' {dflt})")
+                        }
+                    }
+                    ":+" | "+" => {
+                        format!("(test -s \"${name}\"; and printf '%s' {dflt}; or printf '')")
+                    }
+                    // `:?` / `?` abort with a message when unset/empty.
+                    _ => format!(
+                        "(test -s \"${name}\"; and printf '%s' \"${name}\"; or begin; printf '%s' {dflt} >&2; exit 1; end)"
+                    ),
+                };
+            }
+        }
+    }
+    if is_plain_var(&t) {
+        format!("${t}")
+    } else {
+        // not a form we can lower — keep the name readable rather than
+        // emitting a `${` that would kill the parse.
+        let cleaned: String = t
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if cleaned.is_empty() {
+            "\"\"".into()
+        } else {
+            format!("${cleaned}")
+        }
+    }
+}
+
+/// Is this a bare fish-legal variable name?
+fn is_plain_var(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_') == Some(true)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The core's test lowering strips the spaces around comparison
@@ -5687,14 +6103,34 @@ fn for_items_to_fish(iter: &IrExpr) -> Result<String, String> {
     match iter {
         IrExpr::Array(items) => {
             if items.is_empty() {
-                // `for x; do` — iterate the positional parameters
-                return Ok("\"$@\"".into());
+                // `for x; do` — iterate the positional parameters.
+                //
+                // This must be BARE `$argv`, not `"$argv"`: a quoted fish
+                // list expands to its elements JOINED into one word, so
+                // `for a in "$argv"` would run the body once with
+                // "a b c" instead of once per argument the way bash's
+                // `for a in "$@"` does. A bare `$argv` expands to the
+                // element list, which is the bash semantics.
+                return Ok("$argv".into());
             }
             let mut out = Vec::new();
             for it in items {
                 out.push(for_item_to_fish(it)?);
             }
             Ok(out.join(" "))
+        }
+        // `for x in "${arr[@]}"` — a for loop iterates per ELEMENT, so the
+        // expansion must be the per-line list, not the space-joined form.
+        IrExpr::Call { func, args }
+            if (func == "arrayItems" || func == "arrayIndex")
+                && matches!(args.get(1), Some(IrExpr::Str(k, _)) if k == "@" || k == "*") =>
+        {
+            let raw = raw_arg(args, 0)?;
+            let name = arr_base(&raw);
+            if func == "arrayIndex" {
+                return Ok(arr_expand_call_fish_list(name));
+            }
+            Ok(arr_keys_call_fish(name))
         }
         other => Ok(word_to_fish(other)?),
     }
@@ -5704,23 +6140,61 @@ fn for_item_to_fish(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } if func == "getVar" => Ok(format!("${}", raw_arg(args, 0)?)),
         IrExpr::Call { func, args } if func == "listVar" => {
-            let n = raw_arg(args, 0)?;
-            Ok(if n == "*" {
-                "\"$*\"".into()
-            } else {
-                "\"$@\"".into()
-            })
+            // bare `$argv` — see the `listVar` arm in `word_to_fish`: a
+            // quoted fish list joins into one word, which is wrong for a
+            // `for` item list.
+            let _ = raw_arg(args, 0)?;
+            Ok("$argv".into())
         }
         IrExpr::Call { func, args } if func == "join" => join_to_fish(arg(args, 0)?, true),
-        IrExpr::Call { func, args } if func == "param" => param_to_fish(args, false),
+        IrExpr::Call { func, args } if func == "param" => {
+            // `for x in "${arr[@]}"` arrives as the slice param
+            // ("slice", name, "@", "") — a for loop iterates per element, so
+            // it needs the per-line helper rather than the space-joined
+            // `${arr[*]}` shape a value position wants.
+            let op = raw_arg(args, 0)?;
+            if op == "slice" {
+                let base = raw_arg(args, 1)?;
+                let idx = raw_arg(args, 2).unwrap_or_default();
+                if idx == "@" || idx == "*" {
+                    return Ok(if base.starts_with('!') {
+                        arr_keys_call_fish(arr_base(&base))
+                    } else {
+                        arr_expand_call_fish_list(arr_base(&base))
+                    });
+                }
+            }
+            // the baked-name form (`arr[@]`) is the other spelling
+            let pname = raw_arg(args, 1)?;
+            if let Some((an, idx)) = pname.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                if idx == "@" || idx == "*" {
+                    return Ok(if an.starts_with('!') {
+                        arr_keys_call_fish(arr_base(an))
+                    } else {
+                        arr_expand_call_fish_list(arr_base(an))
+                    });
+                }
+            }
+            param_to_fish(args, false)
+        }
         IrExpr::Call { func, args } if func == "arrayIndex" => {
-            Ok(format!("${{{}{}}}", raw_arg(args, 0)?, raw_arg(args, 1)?))
+            let raw = raw_arg(args, 0)?;
+            let key = raw_arg(args, 1)?;
+            // `${arr[@]}` iterates per ELEMENT, so it needs the per-line
+            // helper; a literal index is the flat `arr_0` variable.
+            if key == "@" || key == "*" {
+                return Ok(arr_expand_call_fish_list(arr_base(&raw)));
+            }
+            if key.contains(['$', '(']) {
+                return Ok(format!("${}_$key", arr_base(&raw)));
+            }
+            Ok(format!("${}_{}", arr_base(&raw), key))
         }
         IrExpr::Call { func, args } if func == "arrayItems" => {
-            Ok(format!("${{!{}[@]}}", raw_arg(args, 0)?))
+            Ok(arr_keys_call_fish(arr_base(&raw_arg(args, 0)?)))
         }
         IrExpr::Call { func, args } if func == "arrayLen" => {
-            Ok(format!("${{{}_len}}", raw_arg(args, 0)?))
+            Ok(format!("${}_len", raw_arg(args, 0)?))
         }
         _ => word_to_fish(e),
     }
