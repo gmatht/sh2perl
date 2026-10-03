@@ -1005,20 +1005,7 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     }
     // Array-variable census (before the transform's rewrites) for the
     // `param("slice", …)` `${arr[@]:o:l}` vs `${s:o:l}` disambiguation.
-    {
-        let mut arrays = std::collections::HashSet::new();
-        collect_array_vars(&stripped.stmts, &mut arrays);
-        for sub in &stripped.subs {
-            collect_array_vars(&sub.body, &mut arrays);
-        }
-        ARRAY_VARS.with(|s| *s.borrow_mut() = arrays);
-        let mut hashes = std::collections::HashSet::new();
-        collect_hash_vars(&stripped.stmts, &mut hashes);
-        for sub in &stripped.subs {
-            collect_hash_vars(&sub.body, &mut hashes);
-        }
-        HASH_VARS.with(|s| *s.borrow_mut() = hashes);
-    }
+    populate_var_census(&stripped);
     // builtin-op native arm (shir-builtin-op-20260816): the A1 carries
     // `builtin(cmd, args)` ops (the exec-to-builtin transform). The perl
     // renderer ACCEPTS the op — emit_stmt's builtin arms (statement,
@@ -10996,6 +10983,29 @@ pub(crate) fn array_var_pub(name: &str) -> bool {
 /// The associative-array census, for the pipeline_native leaves.
 pub(crate) fn hash_var_pub(name: &str) -> bool {
     hash_var(name)
+}
+
+/// Populate the array / associative-array censuses for `prog`.
+///
+/// {@link shir_to_perl} does this itself, but it runs it *after* its own
+/// preamble — a consumer that must consult {@link array_var_pub} while
+/// preparing its fixups (the perl GENERATOR's `fix_array_slice_bounds`
+/// gates `${arr[@]:o:l}` → `__sh_slice` on it) otherwise reads an empty
+/// census and never takes the rewrite. `fixups` introduces no new array
+/// bindings, so running it on the pre-`shir_to_perl` program is equivalent.
+pub(crate) fn populate_var_census(prog: &IrProgram) {
+    let mut arrays = std::collections::HashSet::new();
+    collect_array_vars(&prog.stmts, &mut arrays);
+    for sub in &prog.subs {
+        collect_array_vars(&sub.body, &mut arrays);
+    }
+    ARRAY_VARS.with(|s| *s.borrow_mut() = arrays);
+    let mut hashes = std::collections::HashSet::new();
+    collect_hash_vars(&prog.stmts, &mut hashes);
+    for sub in &prog.subs {
+        collect_hash_vars(&sub.body, &mut hashes);
+    }
+    HASH_VARS.with(|s| *s.borrow_mut() = hashes);
 }
 
 fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
