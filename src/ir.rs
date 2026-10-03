@@ -4201,6 +4201,69 @@ fn strip_re(var: &str, pat: &str) -> String {
     format!("(({} =~ s{{{}}}{{}}r))", var, pat.replace('}', "\\}"))
 }
 
+/// Escape a `s///` REPLACEMENT for Perl's regex BODY.
+///
+/// The operand arrives as SOURCE TEXT, so it carries the shell's own
+/// backslash escapes (`${v/a/b\/c}` reaches us as `b\/c`), and the job is to
+/// translate each shell escape into the literal character it denotes BEFORE
+/// re-escaping for Perl. Escaping first instead would turn one source
+/// backslash into two emitted ones and print `b\/c` where bash prints `b/c`.
+///
+/// The two languages escape for different reasons:
+///
+///  * `/` terminates the substitution (`s/a/b/c/r` is a syntax error), so it
+///    must be escaped — but only a `/` that is NOT already escaped by a
+///    backslash, which the arm below consumes first;
+///  * `\` is Perl's escape character in a replacement, so a LITERAL backslash
+///    must become `\\` or it swallows the character after it;
+///  * `@` and `$` are INTERPOLATED into a replacement, so `${v/a/@b/}` would
+///    splice Perl's `@b` array instead of the text `@b`. Both are escaped.
+///
+/// An unrecognised escape keeps its backslash (`\q` → `\q`), which is what
+/// bash does for an operator it does not define; `\ ` (escaped space) and
+/// `\$`/`\@` become the bare character, since bash's rule is "a backslash
+/// quotes the next character".
+///
+/// `/` is escaped rather than switching to the brace delimiter `s{pat}{rep}`
+/// used by {@link strip_re}: the brace form suits prefix/suffix stripping but
+/// not here, because a glob PATTERN may legitimately contain unbalanced
+/// `{`/`}`, which `glob_to_regex` emits verbatim from the user's text.
+///
+/// Kept separate from the pattern side deliberately — a pattern needs REGEX
+/// metacharacter escaping (handled by `glob_to_regex`) and a replacement needs
+/// substitution-body escaping, which are not the same transformation.
+fn repl_for_regex(rep: &str) -> String {
+    let mut out = String::with_capacity(rep.len());
+    let mut chars = rep.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // A shell escape: emit the escaped character, escaped for Perl.
+            '\\' => match chars.next() {
+                // `\\` is a literal backslash → `\\\\` in the Perl body.
+                Some('\\') => out.push_str("\\\\"),
+                // An escaped character that Perl would re-interpret.
+                Some(ch @ ('/' | '$' | '@')) => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                // `\n`, `\t`, … mean what they mean in bash; `\q` means `\q`.
+                Some('n') => out.push_str("\\n"),
+                Some('t') => out.push_str("\\t"),
+                Some(ch) => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                None => out.push_str("\\\\"),
+            },
+            '/' => out.push_str("\\/"),
+            '@' => out.push_str("\\@"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// A parameter-expansion default/replacement value: a quoted literal is
 /// unquoted (`"default"` → `"default"`), everything else renders as a word.
 fn param_value(a: &IrExpr) -> String {
@@ -4276,10 +4339,6 @@ fn render_param(args: &[IrExpr]) -> String {
     };
     let val = args
         .get(2)
-        .map(param_value)
-        .unwrap_or_else(|| "''".to_string());
-    let repl = args
-        .get(3)
         .map(param_value)
         .unwrap_or_else(|| "''".to_string());
     match op.as_str() {
@@ -4431,13 +4490,29 @@ fn render_param(args: &[IrExpr]) -> String {
             }
         }
         // Substitution: / first, // all.
-        "/" => format!(
-            "(({} =~ s/{}/{}/r))",
-            var,
-            glob_to_regex(&val),
-            repl.trim_matches('\\')
-        ),
-        "//" | "/" => {
+        //
+        // The operands are read with `call_arg_str` (RAW text), never through
+        // `param_value`. `param_value` renders a `Str` via
+        // `render_str_literal`, whose job is to emit a Perl STRING LITERAL —
+        // correct for a default (`${a:-abc}` really does want `"abc"`), wrong
+        // here. The two operands are a PATTERN and a REPLACEMENT, and they
+        // are spliced into a REGEX position, so the quotes came back out as
+        // part of the pattern:
+        //
+        //     s=abc:def:ghi; echo "${s/abc/XYZ}"
+        //     ⇒ print((($s =~ s/"abc"/"XYZ"/r)), "\n");
+        //
+        // Perl compiles that as "the six characters `\"abc\"`", which never
+        // occur in the subject, so the match fails, `s///r` returns the
+        // subject UNCHANGED, and the substitution is a SILENT no-op: correct
+        // exit code, no warning, wrong text. `glob_to_regex` below does the
+        // escaping this operand was always meant to receive.
+        //
+        // This arm also SHADOWED the `"//" | "/"` arm that follows it. In a
+        // Rust `match` the FIRST matching arm wins, so that arm was dead code
+        // and the plain `/` form silently took this path; it is folded in here
+        // rather than left as a trap.
+        "/" | "//" => {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             let rep = args.get(3).and_then(call_arg_str).unwrap_or_default();
             let g = if op == "//" { "g" } else { "" };
@@ -4445,7 +4520,7 @@ fn render_param(args: &[IrExpr]) -> String {
                 "(({} =~ s/{}/{}/{g}r))",
                 var,
                 glob_to_regex(&pat),
-                rep.trim_matches('\\')
+                repl_for_regex(&rep)
             )
         }
         // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
@@ -13104,6 +13179,83 @@ mod tests {
             !sliced.contains("defined($a)"),
             "`: ` + space is a slice, not a default: {sliced}"
         );
+    }
+
+    /// Build the `Call { func: "param" }` IR a `${v/pat/rep}` lowers to.
+    fn subst_ir(op: &str, pat: &str, rep: &str) -> Vec<IrExpr> {
+        vec![
+            IrExpr::Str(op.to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str("s".to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str(pat.to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str(rep.to_string(), StrStyle::DoubleQuoted),
+        ]
+    }
+
+    /// `${v/pat/rep}` must compile a PATTERN and a REPLACEMENT, not two
+    /// strings — a quoted operand makes the substitution a silent no-op.
+    ///
+    /// The operands reach the renderer bare (`Str("abc")`), and this arm used
+    /// to run them through `param_value`, which is `render_str_literal` under
+    /// another name. That is right for a DEFAULT (`${a:-abc}` wants the Perl
+    /// string `"abc"`) and wrong here: the quotes became part of the PATTERN,
+    ///
+    ///     s/abc/XYZ  ⇒  s/"abc"/"XYZ"
+    ///
+    /// which Perl compiles as "the six characters `\"abc\"`". Those never occur
+    /// in the subject, so the match fails, `s///r` returns the subject
+    /// UNCHANGED, and the whole substitution silently does nothing — correct
+    /// exit code, no warning, wrong text (core request
+    /// perl-20261002-231200 Gap 2; corpus bench-strsubst).
+    #[test]
+    fn param_substitution_operands_are_not_quoted() {
+        let one = render_param(&subst_ir("/", "abc", "XYZ"));
+        assert!(
+            one.contains("s/abc/XYZ/"),
+            "operands must reach the regex unquoted: {one}"
+        );
+        assert!(
+            !one.contains("s/\""),
+            "a quoted PATTERN can never match the subject: {one}"
+        );
+        // `//` is the global form and adds `g`; it shares this arm because
+        // the separate `"//" | "/"` arm was dead (shadowed by a plain `"/"`).
+        let global = render_param(&subst_ir("//", "abc", "XYZ"));
+        assert!(
+            global.contains("s/abc/XYZ/gr"),
+            "`//` replaces globally: {global}"
+        );
+    }
+
+    /// A replacement is interpolated into the regex BODY, so its `/` must be
+    /// escaped — but the operand arrives as SOURCE TEXT that already carries
+    /// the shell's own escape, which must be consumed rather than doubled.
+    ///
+    /// `s/abc/b\/c` (three backslashes emitted) compiles and runs, so this
+    /// would not be a syntax error; it prints `b\/c` where bash prints `b/c`.
+    #[test]
+    fn param_substitution_replacement_escapes_bash_escapes_once() {
+        // Source `${s/abc/b\/c}` reaches the IR as the two characters `\` `/`.
+        let escaped = render_param(&subst_ir("/", "abc", "b\\/c"));
+        assert!(
+            escaped.contains("s/abc/b\\/c/"),
+            "one shell escape in, one escape out: {escaped}"
+        );
+        assert!(
+            !escaped.contains("b\\\\\\/"),
+            "the shell escape must not be doubled: {escaped}"
+        );
+        // `@`/`$` are interpolated by Perl, so they must be escaped or the
+        // replacement splices in Perl's own arrays/scalars.
+        assert_eq!(repl_for_regex("@x"), "\\@x");
+        assert_eq!(repl_for_regex("$y"), "\\$y");
+        assert_eq!(repl_for_regex("@$y"), "\\@\\$y");
+        // A literal backslash is `\\` in the SOURCE, so it reaches the helper
+        // as two characters and must be emitted as four — otherwise it eats
+        // the character after it in the Perl body.
+        assert_eq!(repl_for_regex("b\\\\c"), "b\\\\\\\\c");
+        // An unescaped `/` still has to be escaped, or the substitution ends
+        // early and the rest of the expression is a syntax error.
+        assert_eq!(repl_for_regex("a/b"), "a\\/b");
     }
 }
 
