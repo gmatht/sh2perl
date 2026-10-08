@@ -1337,6 +1337,63 @@ fn decode_rust_str_lit(s: &str) -> Option<(String, usize)> {
     None
 }
 
+/// `__sh_q("LIT")` on a compile-time literal is a constant: [`sh_q_lit`] is
+/// exactly the wrap the runtime helper performs, so the call folds to the
+/// resulting string literal and the runtime call disappears — the same move
+/// [`wq_fold`] makes for `__sh_wq`.
+///
+/// The helper survives for the sites whose argument is only known at runtime
+/// (a value spliced into a command string), so the fold only fires on the
+/// shape `__sh_q(` immediately followed by a Rust string literal and `)`.
+/// Retiring the last caller is what lets `prune_unused_helpers` collect the
+/// definition too.
+fn q_fold(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < b.len() {
+        // never match inside a comment or a literal (see concat_vec_peephole)
+        if s_starts_at(text, i, "//") {
+            let nl = text[i..].find('\n').map(|k| i + k).unwrap_or(b.len());
+            out.push_str(&text[i..nl]);
+            i = nl;
+            continue;
+        }
+        if b[i] == b'"' || b[i] == b'\'' {
+            match scan_literal(b, i) {
+                Some(end) => {
+                    out.push_str(&text[i..end]);
+                    i = end;
+                }
+                None => {
+                    out.push_str(&text[i..]);
+                    i = b.len();
+                }
+            }
+            continue;
+        }
+        if s_starts_at(text, i, "__sh_q(\"") {
+            let lit_at = i + "__sh_q(".len();
+            if let Some((val, end)) = decode_rust_str_lit(&text[lit_at..]) {
+                if b.get(lit_at + end) == Some(&b')') {
+                    out.push_str(&Render::rust_str(&sh_q_lit(&val)));
+                    i = lit_at + end + 1;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if !changed {
+        return text.to_string();
+    }
+    out
+}
+
 /// Split a list body on its top-level commas. `None` when a literal cannot
 /// be scanned, so the caller refuses instead of splitting inside one.
 fn split_top_commas(inner: &str) -> Option<Vec<String>> {
@@ -2706,6 +2763,22 @@ fn cmd_template(arg: &str) -> Option<(String, Vec<String>)> {
     Some((tmpl, dyns))
 }
 
+/// bash's status for a command it could not START — distinct from one that
+/// ran and failed, and the distinction is observable through `$?`.
+///
+/// `Command::status()`/`output()` report a failed `execve` as a plain
+/// `io::Error`, and the lowerings used to collapse every one of those to a
+/// bare `1`. bash does not: a program it cannot find exits **127**
+/// (`EOF: command not found`) and one it finds but cannot execute exits
+/// **126**. The old `unwrap_or(1)` therefore printed `exit: 1` where bash
+/// prints `exit: 127` — measured on examples/heredoc-parse-error.sh and
+/// examples/parse-brace-in-heredoc.sh, where the heredoc ends at the first
+/// `EOF` and the stray second `EOF` word becomes a command.
+///
+/// Kept as one shared snippet so [`native_cmd_call`] and
+/// [`native_capture_expr`] cannot drift; the arm binds the error as `e`.
+const BASH_NOCMD: &str = "if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }";
+
 /// `std::process::Command::new(PROG)` with one `.arg(..)` per word: nothing
 /// is quoted, nothing is re-parsed and no shell is forked. Shared by
 /// [`native_cmd_call`] (exec) and [`native_capture_expr`] (capture) so the
@@ -2726,13 +2799,39 @@ fn native_cmd_chain(prog: &str, args: &[CmdArg]) -> String {
 }
 
 /// The native `std::process::Command` call for a simple command. Mirrors
-/// `__sh_spawn`'s exit-code contract exactly (`code().unwrap_or(1)`) and,
+/// `__sh_spawn`'s exit-code contract — the child's code, or bash's
+/// 127/126 for a command that could not be started ([`BASH_NOCMD`]) — and,
 /// like its `!want_out` arm, flushes Rust's buffered stdout first so prints
 /// made BEFORE the child are not reordered behind its inherited fd 1.
 fn native_cmd_call(prog: &str, args: &[CmdArg]) -> String {
     format!(
-        "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); {}.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1) }}",
+        "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); match {}.status() \
+         {{ Ok(s) => s.code().unwrap_or(1), Err(e) => {BASH_NOCMD} }} }}",
         native_cmd_chain(prog, args)
+    )
+}
+
+/// The native call for a simple command whose stdin is a known byte slice.
+///
+/// `__sh_spawn(CMD, Some(EXPR))` pipes `EXPR` into a `bash -c` child's fd 0.
+/// With `CMD` a literal SIMPLE command the shell has nothing left to
+/// interpret, so the same feed is `Stdio::piped()` plus a `write_all` — one
+/// `execve`, no shell. `EXPR` keeps the type it had at the call site (the
+/// runtime takes `Option<&[u8]>`, so it is already `&[u8]`-coercible) and is
+/// spliced straight into `write_all` rather than bound, because binding it
+/// would end a `String` temporary's life before the borrow is used.
+///
+/// The exit-code contract is [`lower_exec_call`]'s: the child's code, or
+/// bash's 127/126 for a command that could not be started.
+fn native_fed_cmd_call(chain: &str, feed: &str) -> String {
+    format!(
+        "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); \
+         match {chain}.stdin(std::process::Stdio::piped()).spawn() \
+         {{ Ok(mut __cc) => {{ \
+         if let Some(mut __ci) = __cc.stdin.take() \
+         {{ let _ = std::io::Write::write_all(&mut __ci, {feed}); }} \
+         __cc.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1) }}, \
+         Err(e) => {BASH_NOCMD} }} }}"
     )
 }
 
@@ -2743,14 +2842,26 @@ fn native_cmd_call(prog: &str, args: &[CmdArg]) -> String {
 /// [`lower_capture_call`] (`__sh_capture_rc`): REFUSE > GUESS, so anything
 /// bash would expand, glob, redirect, split or run as a builtin keeps its
 /// runtime lowering.
-fn cmd_argv(text: &str, at: usize, spawn: bool) -> Option<(String, usize)> {
+///
+/// Returns the argv chain, the fd-0 feed a `Some(..)` input names (see
+/// [`native_fed_cmd_call`]), and the offset past the closing `)`.
+fn cmd_argv(text: &str, at: usize, spawn: bool) -> Option<(String, Option<String>, usize)> {
     let (args, end) = scan_paren(text, at)?;
     let parts = split_top_commas(args)?;
+    let mut feed: Option<String> = None;
     let given = if spawn {
-        // a `Some(..)` input is a pipeline/here-string feed this lowering
-        // does not reproduce — the runtime keeps it
-        if parts.len() != 2 || parts[1].trim() != "None" {
+        if parts.len() != 2 {
             return None;
+        }
+        let inp = parts[1].trim();
+        if inp != "None" {
+            // `Some(EXPR)`: the feed is a value the lowering CAN reproduce
+            // (a piped stdin), so unwrap it and keep the inner expression.
+            let inner = inp.strip_prefix("Some(")?.strip_suffix(')')?.trim();
+            if inner.is_empty() {
+                return None;
+            }
+            feed = Some(inner.to_string());
         }
         parts[0].trim()
     } else {
@@ -2788,19 +2899,22 @@ fn cmd_argv(text: &str, at: usize, spawn: bool) -> Option<(String, usize)> {
         CmdArg::Lit(p) => p,
         CmdArg::Dyn(_) => return None,
     };
-    Some((native_cmd_chain(&prog, &argv), end))
+    Some((native_cmd_chain(&prog, &argv), feed, end))
 }
 
-/// `__sh_run(CMD)` / `__sh_spawn(CMD, None)` at `at` (its `(`), lowered to
-/// [`native_cmd_call`].
+/// `__sh_run(CMD)` / `__sh_spawn(CMD, None|Some(..))` at `at` (its `(`),
+/// lowered to [`native_cmd_call`] or, when the site names an fd-0 feed,
+/// [`native_fed_cmd_call`].
 fn lower_exec_call(text: &str, at: usize, spawn: bool) -> Option<(String, usize)> {
-    let (chain, end) = cmd_argv(text, at, spawn)?;
-    Some((
-        format!(
-            "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); {chain}.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1) }}"
+    let (chain, feed, end) = cmd_argv(text, at, spawn)?;
+    let call = match feed {
+        Some(f) => native_fed_cmd_call(&chain, &f),
+        None => format!(
+            "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); match {chain}.status() \
+             {{ Ok(s) => s.code().unwrap_or(1), Err(e) => {BASH_NOCMD} }} }}"
         ),
-        end,
-    ))
+    };
+    Some((call, end))
 }
 
 /// `__sh_capture_rc(CMD)` at `at` (its `(`), lowered to the standard
@@ -2821,14 +2935,15 @@ fn lower_exec_call(text: &str, at: usize, spawn: bool) -> Option<(String, usize)
 /// through the sink, and pins fd 0 to `inherit()` rather than consulting
 /// `__SH_STDIN`, so its result cannot depend on the enclosing redirect.
 fn lower_capture_call(text: &str, at: usize) -> Option<(String, usize)> {
-    let (chain, end) = cmd_argv(text, at, false)?;
+    let (chain, _, end) = cmd_argv(text, at, false)?;
     Some((native_capture_expr(&chain), end))
 }
 
 /// The `(String, i32)` expression [`lower_capture_call`] splices in,
 /// reproducing `__sh_capture_rc`'s contract: a spawn failure is
-/// `("", 1)`, the status is the child's code (`unwrap_or(1)`), and every
-/// trailing `\n` is stripped (bash's `$(…)`).
+/// `("", 127)` for a program bash could not find (`126` when it exists but
+/// cannot be executed — see [`BASH_NOCMD`]), the status is the child's code
+/// (`unwrap_or(1)`), and every trailing `\n` is stripped (bash's `$(…)`).
 fn native_capture_expr(chain: &str) -> String {
     format!(
         "{{ let __sc = {chain}.stdin(std::process::Stdio::inherit()).output(); \
@@ -2836,7 +2951,7 @@ fn native_capture_expr(chain: &str) -> String {
          let mut __ss = String::from_utf8_lossy(&__sc.stdout).to_string(); \
          while __ss.ends_with('\\n') {{ __ss.pop(); }} \
          (__ss, __sc.status.code().unwrap_or(1)) }}, \
-         Err(_) => (String::new(), 1) }} }}"
+         Err(e) => (String::new(), {BASH_NOCMD}) }} }}"
     )
 }
 
@@ -2952,6 +3067,12 @@ fn rewrite_main_body(
 ///
 ///     __sh_run("'rm' '-f' 'x'")            → Command::new("rm").arg("-f").arg("x")
 ///     __sh_spawn("'sha256sum' 'f'", None)  → Command::new("sha256sum").arg("f")
+///     __sh_spawn("'sort'", Some(&buf))     → Command::new("sort").stdin(piped)
+///
+/// The `Some(..)` feed is the pipeline/here-string case: the runtime writes
+/// those bytes into the shell child's fd 0, which is `native_fed_cmd_call`'s
+/// `Stdio::piped()` + `write_all`. `cmd_argv` refuses a feed only when the
+/// COMMAND text itself is outside the argv subset.
 ///
 /// Two processes and a shell become one `execve`, the argument list stops
 /// round-tripping through a regex of quotes, and the output no longer
@@ -3955,6 +4076,10 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // is what turns `__sh_wq(&__sh_cat(&[vec![..], …]))` into the plain
     // `&[..]` list this pass understands.
     let text = wq_fold(&text);
+    // `__sh_q("LIT")` is a constant for the same reason `__sh_wq` is, and the
+    // corpus's dominant use is a literal (`__sh_q("/dev/null")` in a redirect
+    // target) — fold those so `__sh_q` retires with its last runtime caller.
+    let text = q_fold(&text);
     // Belt-and-braces: confirm in the rendered output that no sink was
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
@@ -14069,8 +14194,11 @@ impl Render {
                 for c in clauses {
                     // patterns arrive as source text — unwrap a fully
                     // quoted pattern (`""` matches the empty string;
-                    // `"*"` is a LITERAL star, not the wildcard)
-                    let pats: Vec<String> = c
+                    // `"*"` is a LITERAL star, not the wildcard). Each
+                    // pattern is paired with its SOURCE TEXT when it is a
+                    // compile-time literal; a `$(cmd)` pattern evaluates at
+                    // runtime and carries `None`.
+                    let pats: Vec<(String, Option<String>)> = c
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
@@ -14090,9 +14218,12 @@ impl Render {
                                 self.add_helper("capture_rc");
                                 let interp = self.dollar_interp(&unquoted);
                                 // cmdsub strips trailing newlines
-                                format!("&({interp}).trim_end_matches('\\n').to_string()")
+                                (
+                                    format!("&({interp}).trim_end_matches('\\n').to_string()"),
+                                    None,
+                                )
                             } else {
-                                Self::rust_str(&unquoted)
+                                (Self::rust_str(&unquoted), Some(unquoted))
                             }
                         })
                         .collect();
@@ -14100,12 +14231,31 @@ impl Render {
                     let cond = if is_default {
                         "true".to_string()
                     } else {
-                        self.add_helper("fnmatch");
-                        // pats are already fnmatch ARG expressions — a
-                        // quoted literal or a runtime-evaluated `&(expr)`
+                        // A literal pattern with no glob metachar can only match
+                        // itself — a plain string compare — and one with a
+                        // single leading or trailing `*` is a prefix/suffix
+                        // test: `simple_glob_test` folds both to native Rust, so
+                        // the runtime glob helper is never called for them.
+                        // `case $x in start)` is the corpus's dominant shape
+                        // (~half of all literal patterns). A metachar-bearing
+                        // literal and every runtime pattern keep the call.
+                        // `nocasematch` makes matching case-insensitive, which
+                        // only the runtime helper expresses — so it disables
+                        // the fold.
+                        let fold = !self.nocasematch;
                         let alts = pats
                             .iter()
-                            .map(|p| format!("__sh_fnmatch({p}, &{dg})"))
+                            .map(|(p, lit)| {
+                                if fold {
+                                    if let Some(text) = lit {
+                                        if let Some(t) = Self::simple_glob_test(text, &dg) {
+                                            return t;
+                                        }
+                                    }
+                                }
+                                self.add_helper("fnmatch");
+                                format!("__sh_fnmatch({p}, &{dg})")
+                            })
                             .collect::<Vec<_>>()
                             .join(" || ");
                         format!("({alts})")
@@ -17682,7 +17832,25 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     };
                 }
                 if self.style == "[[" {
-                    // pattern match (glob) in [[ ]]
+                    // pattern match (glob) in [[ ]]. An UNQUOTED rhs is a
+                    // pattern, but a literal pattern with no glob metachar can
+                    // only match itself — fold it to the plain compare and skip
+                    // the helper, exactly as the `[ ]` arm below already does
+                    // for its own constant rhs. `nocasematch` makes `[[ ]]`
+                    // case-insensitive, which only the runtime call expresses,
+                    // so it disables the fold.
+                    if !self.render.nocasematch {
+                        if let Some(rlit) = rhs_lit {
+                            if !glob_like(rlit) {
+                                let ro = Render::rust_str(rlit);
+                                return if eq {
+                                    format!("({l} == {ro})")
+                                } else {
+                                    format!("({l} != {ro})")
+                                };
+                            }
+                        }
+                    }
                     self.render.add_helper("fnmatch");
                     if self.render.nocasematch {
                         format!(
