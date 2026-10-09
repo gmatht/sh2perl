@@ -373,10 +373,16 @@ fn materialize_redirect(
             let tmp_v = var(&tmp);
             pre.push(mktemp_assign(&tmp));
             cleanup.push(tmp_v.clone());
+            // The consumer's redirect, and the producer's, are INVERSES:
+            // `done < <(P)`  ->  `P > tmp` (fd 1, write) ; `cmd > >(P)`  ->
+            // `P < tmp` (fd 0, read). Reusing the consumer's pair made the
+            // process-in producer a READ of the temp file — nothing ever
+            // wrote it, so the consumer read an empty file and the real
+            // producer output leaked to the program's stdout.
             let (fd, mode) = if r.mode == "process-in" {
                 (Some(0), "r")
             } else {
-                (Some(0), "w")
+                (Some(1), "w")
             };
             new_redirects.push(IrRedirect {
                 fd,
@@ -384,7 +390,21 @@ fn materialize_redirect(
                 target: tmp_v.clone(),
                 interpolate: false,
             });
-            pre.push(producer_redirect(producer, &tmp_v, mode, fd));
+            let (pfd, pmode) = if r.mode == "process-in" {
+                (Some(1), "w")
+            } else {
+                (Some(0), "r")
+            };
+            let prod = producer_redirect(producer, &tmp_v, pmode, pfd);
+            if r.mode == "process-in" {
+                // the producer must have filled the file before the consumer reads it
+                pre.push(prod);
+            } else {
+                // process-out: the consumer writes the file, so the producer
+                // can only read it afterwards (it runs in `post`, before the
+                // cleanup `rm` appended below).
+                post.push(prod);
+            }
         }
         if !cleanup.is_empty() {
             post.push(rm_exec(&cleanup));
@@ -700,6 +720,56 @@ mod tests {
         let mut prog = ast_to_ir_raw(&commands);
         assert!(!transform(&mut prog.stmts), "transform should be a no-op");
         crate::shir_json::shir_to_shir_json(&prog)
+    }
+
+    /// The (fd, mode) of every redirect node in the lowered program, in
+    /// emission order — the observable shape a renderer consumes.
+    fn redirect_pairs(json: &str) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        // `{"fd":N,...,"mode":"X","target":{"name":"__ps_tmpY"…`
+        let bytes: Vec<char> = json.chars().collect();
+        let mut i = 0;
+        while let Some(p) = json[i..].find("\"fd\":").map(|p| p + i) {
+            let rest: String = bytes[p + 5..].iter().take(64).collect();
+            let fd: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let mode = rest
+                .split_once("\"mode\":\"")
+                .and_then(|(_, m)| m.split_once('"'))
+                .map(|(m, _)| m.to_string());
+            out.push((fd.parse().unwrap_or(-1), mode.unwrap_or_default()));
+            i = p + 5;
+        }
+        out
+    }
+
+    /// `done < <(P)` is NOT an exec consumer, so it takes the
+    /// `!appendable` branch. There the producer's redirect must be the
+    /// INVERSE of the consumer's: producer writes fd 1, consumer reads fd 0.
+    /// Reusing the consumer's pair made the producer a READ of the temp
+    /// file — nothing wrote it, so the consumer read an empty file while the
+    /// real producer output leaked to the program's stdout.
+    #[test]
+    fn while_done_process_in_producer_writes_and_consumer_reads() {
+        let json = lower("while read -r line; do echo \"$line\"; done < <(printf 'a\\n')");
+        let pairs = redirect_pairs(&json);
+        assert_eq!(
+            pairs,
+            vec![(1, "w".to_string()), (0, "r".to_string())],
+            "producer must be fd 1 mode w, consumer fd 0 mode r: {json}"
+        );
+    }
+
+    /// The mirror: `cmd > >(P)` on a non-exec consumer. The consumer's
+    /// redirect is a WRITE on fd 1 and the producer READS fd 0 afterwards.
+    #[test]
+    fn process_out_consumer_writes_and_producer_reads() {
+        let json = lower("if true; then echo hi; fi > >(cat)");
+        let pairs = redirect_pairs(&json);
+        assert_eq!(
+            pairs,
+            vec![(1, "w".to_string()), (0, "r".to_string())],
+            "consumer must be fd 1 mode w, producer fd 0 mode r: {json}"
+        );
     }
 
     #[test]

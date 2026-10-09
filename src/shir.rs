@@ -175,6 +175,21 @@ pub fn size_opt_enabled() -> bool {
     SIZE_OPT_TL.with(|c| c.get()) || SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Serializes every test that flips [`SIZE_OPT`].
+///
+/// `SIZE_OPT` is a process-global, and cargo runs tests on parallel
+/// threads: a test that calls [`set_size_opt`] while ANOTHER test is
+/// rendering observes the wrong level. This is the same hazard the
+/// dual-loop tests already serialize (see `dual_loop_tests`), and it is
+/// a real flake, not a theoretical one — `literal_literal_ops_are_widened`
+/// failed on ~2 runs in 5 purely from scheduling, with no source change.
+///
+/// Hold this for the whole set/render/reset sequence. The guard is
+/// re-entrant across the module so several `set_size_opt` tests can each
+/// take it.
+#[cfg(test)]
+pub(crate) static SIZE_OPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `-Oz`: golf for output SIZE. `-Os` plus a renderer text pass that
 /// strips what humans need but compilers don't: full-line `//`
 /// comments, indentation/blank lines, and long renderer-owned
@@ -709,7 +724,12 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
                 };
             }
             ArithAst::Var(n) => {
-                if slot_var_index(n).is_none() {
+                // A `${#name[@]}` / `${#name}` length placeholder is already
+                // runtime-exact AND decodes back to the arrayLen/getVar().length
+                // leaf in arith_to_estree — leaving it raw lets that decode
+                // fire; wrapping it instead renders the placeholder NAME as a
+                // store read of an unset variable (reads 0).
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -720,7 +740,7 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
             // a non-slot Var (the A1 export only emits Ident for lifted
             // vars, and a lifted var is never slot-homed).
             ArithAst::Ident(n) => {
-                if slot_var_index(n).is_none() {
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -3996,8 +4016,29 @@ static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// The CURRENT function's param arity, pushed while the define arrow's
 /// body lowers — `positional_read`/`native_special_var` render `$i` as
-/// the `pi` param identifier inside it.
+/// the `p{pos}` param identifier inside it.
 static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+
+/// The CURRENT function's A1-DECLARED parameter NAMES, pushed while the
+/// define arrow's body lowers. A named parameter is bound by the arrow's
+/// own parameter list (the emitters below pass them through), so a body
+/// read of one is a bare JS identifier — NOT a `sh2.vars` store read.
+/// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+/// `IrStmt::Function` arm bound `name`/`body`/`named_blocks` and dropped
+/// `params`, so every A1 function emitted `() => …` and its body's
+/// parameter reads fell through to the empty `sh2.vars` store.
+static NAMED_PARAMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` one of the enclosing function's A1-declared parameters?
+/// A read of one renders as the bare arrow parameter.
+fn is_named_param(name: &str) -> bool {
+    NAMED_PARAMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
 
 /// STORE-ONLY vars (the StoreToNative pass's verdict): written only via
 /// setVar/getVar with literal names — the native binding renders bare
@@ -6313,6 +6354,32 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     ast_to_ir_with_lines(commands, &[])
 }
 
+/// Map each element of `new` to the index of the element of `old` it came
+/// from, matching by value in order.
+///
+/// Both IR passes filter and rewrite statement lists, so an index into one
+/// list does NOT name the same statement in another. Greedy in-order
+/// matching recovers the correspondence for the common case (a pass
+/// dropped or kept statements); an element with no unclaimed match — one a
+/// pass inserted or rewrote — maps to nothing and is simply skipped by the
+/// caller, which is the safe outcome: a missing source line is recoverable,
+/// a misattributed one is not.
+fn align_by_identity(new: &[IrStmt], old: &[IrStmt]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(new.len());
+    let mut cursor = 0usize;
+    for st in new {
+        let found = old[cursor..].iter().position(|o| o == st).map(|i| cursor + i);
+        match found {
+            Some(i) => {
+                cursor = i + 1;
+                out.push(Some(i));
+            }
+            None => out.push(None),
+        }
+    }
+    out
+}
+
 /// `ast_to_ir` + the shIR `stmt_lines` markup: `lines[i]` is the 1-based
 /// source line of `commands[i]` (from the parser's `parse_with_lines`),
 /// so the A1 contract can carry each top-level statement's line — the
@@ -6324,19 +6391,29 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // dead-assignment elimination) benefit both consumers of the IR.
     // Then apply worker-submitted transforms (gated by SH2_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
-    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
-    let mut stmts: Vec<IrStmt> = Vec::new();
+    // The LINE is collected here, but the statement INDEX is assigned only
+    // after both passes below have finished.
+    //
+    // `optimize_stmts` drops dead assignments and `transforms::apply` can
+    // add, remove, or rewrite statements, so a map indexed against the
+    // input list is stale the moment anything moves: for `x=hi` + `echo $x`
+    // the dead assignment is elided, the old map still claimed `echo` was
+    // statement 1, and that statement does not exist. A consumer resolving
+    // `stmt` against the final list (the web GUI's source-line map) then
+    // reads past the end or attributes a statement to the wrong source.
+    //
+    // Carrying the line alongside the statement and matching survivors back
+    // to their origin keeps the map aligned with whatever actually
+    // survives. A statement a pass INSERTED has no origin and gets no entry:
+    // a missing line is recoverable, a wrong one is not.
+    let mut origins: Vec<(usize, IrStmt)> = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
         if let Some(st) = stmt_for_command(cmd) {
-            if let Some(&l) = lines.get(i) {
-                if l > 0 {
-                    stmt_lines.push((stmts.len(), l));
-                }
-            }
-            stmts.push(st);
+            origins.push((lines.get(i).copied().unwrap_or(0), st));
         }
     }
-    let mut stmts = crate::ir::optimize_stmts(&stmts);
+    let src: Vec<IrStmt> = origins.iter().map(|(_, s)| s.clone()).collect();
+    let mut stmts = crate::ir::optimize_stmts(&src);
     // Serialize against the shir_to_estree compile lock: the
     // sync-ok-loops transform stores per-compilation POINTER-keyed
     // verdicts in shared statics, and a parallel compilation's unlocked
@@ -6344,7 +6421,31 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // compile concurrently). Never re-entered: shir_to_estree does not
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    let after_optimize = stmts.clone();
     crate::transforms::apply(&mut stmts);
+    // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
+    // from it again, so the source line is recovered by two order-preserving
+    // subsequence matches rather than by using either list's indices
+    // directly — a filtered list's index does not name the same statement.
+    let to_src = align_by_identity(&after_optimize, &src);
+    let to_after_optimize = align_by_identity(&stmts, &after_optimize);
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
+    for (i, via) in to_after_optimize.iter().enumerate() {
+        // stmts[i] -> after_optimize[via] -> src[to_src[via]] -> origins[...]
+        // `via` is a `&Option<usize>`; `and_then` needs the Option by
+        // value, so dereference it (a second `&` in the pattern would
+        // bind the pattern to `&usize` and hand `to_src.get` a
+        // reference where it wants the index).
+        let Some(si) = (*via).and_then(|a| to_src.get(a).copied().flatten()) else {
+            continue;
+        };
+        let Some(&(line, _)) = origins.get(si) else {
+            continue;
+        };
+        if line > 0 {
+            stmt_lines.push((i, line));
+        }
+    }
     IrProgram {
         imports: vec![],
         requires: vec![],
@@ -18156,6 +18257,10 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::UseAlternative(w, need_nonempty) => (
+            if *need_nonempty { ":+" } else { "+" }.into(),
+            vec![st(w)],
+        ),
         ParameterExpansionOperator::ZshFlags(flags, sep) => {
             // zsh `${(flags)var}` / `${(flag:sep:)var}` — the zsh-only
             // flag expansion; the A1 `param("", name, flags[, sep])`
@@ -19322,6 +19427,7 @@ fn arith_var_read(name: &str) -> Expr {
 fn arith_bigint_safe_operand(a: &ArithAst) -> Expr {
     if let ArithAst::Var(name) = a {
         if slot_var_index(name).is_none()
+            && arith_len_leaf(name).is_none()
             && !matches!(var_type_of(name), Some(IrType::Int64 | IrType::UInt64))
         {
             // Exact BigInt read. A lifted-num var is included too: in a
@@ -19765,6 +19871,12 @@ fn in_dual_wide_arm() -> bool {
 /// int64 wrap contexts are excluded: C-typed (`var_type_of`), --true64,
 /// slots, and the dual-loop wide arm (which must stay mod-2^64-exact).
 fn exact_bigint_var_read(n: &str) -> bool {
+    // `${#x[@]}` / `${#x}` length placeholders are their own runtime-exact
+    // leaf (arith_len_leaf decodes them in arith_to_estree) — never read the
+    // placeholder NAME as a store variable.
+    if arith_len_leaf(n).is_some() {
+        return false;
+    }
     if in_dual_wide_arm() {
         return false;
     }
@@ -31570,6 +31682,17 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // loop bodies are emitted from the ORIGINAL references, so the pointer
     // keys hold).
     *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+    // The GENERAL unread-status-write set — every statement that writes a
+    // status (`ir_stmt_writes_lastexit`) but which the backward scan proved
+    // unread. `LASTEXIT_DEAD` above is the ESTree emitter's NARROW map: it
+    // only carries the shapes it has a hand-written dead twin for (`(( ))`,
+    // native echo, `declare`). A `cmd > file` redirect is a status writer
+    // with no entry there, so its writeFile `.then` closure would look live
+    // no matter what the analysis proved. The Rust backend installs this map
+    // for its own status register; the ESTree path needs the same verdict for
+    // the writeFile status closure (core request
+    // estree-20260813-182443).
+    install_unread_status_writes(prog, errexit);
     // Native-loop passes: (a) which loops may be capture producers (they
     // keep the runtime loop — a native loop would lose the producer bound),
     // (b) which loops' final status write is dead (the native while drops
@@ -33481,7 +33604,11 @@ fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<
     ]))
 }
 
-fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
+fn try_native_echo_redirect(
+    inner: &[IrStmt],
+    specs: &[(i64, &str, &IrExpr)],
+    status_dead: bool,
+) -> Option<Expr> {
     if program_defines_function("echo") {
         return None;
     }
@@ -33672,14 +33799,21 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         arguments: vec![err_msg],
         optional: false,
     };
-    let set1 = Expr::AssignmentExpression {
-        operator: "=".to_string(),
-        left: Box::new(sh2_member("lastExit")),
-        right: Box::new(Expr::Literal {
-            value: serde_json::Value::from(1),
-            raw: None,
-            regex: None,
-        }),
+    let set1 = if status_dead {
+        // the write's exit status is provably unread, so the failure path
+        // reports to stderr and nothing else — the `sh2.lastExit = 1` store
+        // exists only to record `$?` for a reader that does not exist.
+        stderr_write.clone()
+    } else {
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        }
     };
     let then = Expr::ArrowFunctionExpression {
         params: vec![Expr::Identifier {
@@ -33708,20 +33842,31 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         expression: true,
         r#async: false,
     };
-    let chained = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(write),
-                    property: Box::new(Expr::Identifier {
-                        name: "then".to_string(),
-                    }),
-                    computed: false,
-                    optional: false,
+    // The `.then` status closure exists ONLY to record `$?` on success. When
+    // the write's status is lastexit-dead nothing reads it, so the chain
+    // collapses to `await write(...).catch(report)` — one fewer promise
+    // reaction and closure per write. The `.catch` is NOT droppable: it
+    // REPORTS the failure to stderr (core request
+    // go-sh-writefile-eacces), so a failing device still surfaces.
+    let after_write: Expr = if status_dead {
+        write
+    } else {
+        Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(write),
+                property: Box::new(Expr::Identifier {
+                    name: "then".to_string(),
                 }),
-                arguments: vec![then],
+                computed: false,
                 optional: false,
             }),
+            arguments: vec![then],
+            optional: false,
+        }
+    };
+    let chained = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(after_write),
             property: Box::new(Expr::Identifier {
                 name: "catch".to_string(),
             }),
@@ -36154,9 +36299,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::Function {
             name,
+            params,
             body,
             named_blocks,
-            ..
         } => {
             // Per-function `local` native lift (see [`local_lift_analysis`]):
             // push the function's frame so the body's `local` decls lower
@@ -36249,6 +36394,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             if let Some(k) = lifted_arity {
                 *PARAM_FRAME.lock().unwrap() = Some(k);
             }
+            // A1-DECLARED parameters (core request rust-20260930-031500):
+            // the arrow takes them as real JS parameters, and the body's
+            // reads of them render bare (see [`is_named_param`]). Empty
+            // for every bash-sourced function — the corpus's `ast_to_ir`
+            // path emits no `params` — so this is a no-op there.
+            // A param-lifted function already takes `p1..pk` and is
+            // positional-free by construction; the two shapes are disjoint
+            // in practice, but the lift wins if both are present.
+            let named_params: Vec<Expr> = if lifted_arity.is_some() {
+                Vec::new()
+            } else {
+                params
+                    .iter()
+                    .filter(|p| is_plain_ident(p))
+                    .map(|p| ident(p))
+                    .collect()
+            };
+            let named_set: HashSet<String> = named_params
+                .iter()
+                .filter_map(|e| match e {
+                    Expr::Identifier { name } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let pushed_named = !named_set.is_empty();
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = Some(named_set);
+            }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
                 // powershell-sh-go): the define arrow wraps the blocks in
@@ -36260,7 +36433,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else if fn_call_is_sync(name) {
                 let params = lifted_arity
                     .map(|k| (1..=k).map(|i| ident(&format!("p{i}"))).collect())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| named_params.clone());
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
@@ -36270,9 +36443,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     arrow_sink_sync(params, IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
-                arrow_native_echo(vec![], IrExpr::Arrow(cloned_body))
+                arrow_native_echo(named_params.clone(), IrExpr::Arrow(cloned_body))
             } else {
-                arrow_sink(vec![], IrExpr::Arrow(cloned_body))
+                arrow_sink(named_params.clone(), IrExpr::Arrow(cloned_body))
             };
             // The arrow construction is complete — restore the previous
             // arrow-body deadness (the clone's statements are dropped with
@@ -36283,6 +36456,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             FUNCTION_STACK.lock().unwrap().pop();
             if lifted_arity.is_some() {
                 *PARAM_FRAME.lock().unwrap() = None;
+            }
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = None;
             }
             let binding = if lifted_arity.is_some() {
                 // param-lifted: the runtime map is never consulted (the
@@ -36517,7 +36693,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .iter()
                 .map(|r| (r.fd.unwrap_or(0) as i64, r.mode.as_str(), &r.target))
                 .collect::<Vec<_>>();
-            if let Some(native) = try_native_echo_redirect(inner, &redirect_specs) {
+            if let Some(native) =
+                try_native_echo_redirect(inner, &redirect_specs, stmt_status_write_is_unread(stmt))
+            {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // `grep -q PAT <<< TEXT` (statement position): the fd-0
@@ -37223,7 +37401,8 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Label(_name) => {
-            // Label: `name:` — used by Goto.
+            // Label: `name:` — a Goto jump target. A Label on its own is
+            // inert (it only names a position), so dropping it is exact.
             Stmt::ExpressionStatement {
                 expression: Expr::Literal {
                     value: serde_json::Value::Null,
@@ -37232,15 +37411,46 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
-        IrStmt::Goto(_target) => {
-            // Goto: emit a runtime call (the restructure pass normally
-            // resolves gotos; if one reaches here, use the runtime fallback).
-            // Target is unused — the runtime resolves it from state.
+        IrStmt::Goto(target) => {
+            // Goto: REFUSE loudly. The old lowering emitted a bare `null`
+            // literal here, so an un-restructured `goto` was a SILENT
+            // no-op — the program ran straight through the jump and
+            // printed the statements the goto was meant to skip (bat
+            // t06_goto printed `never`; c t27_goto's backward loop ran
+            // once and printed `1` where native prints `3`). The comment
+            // here used to claim "the runtime resolves it from state";
+            // no such runtime helper exists (nothing in
+            // harness/sh2-namespace.mjs resolves a goto), so that was
+            // never true.
+            //
+            // Why refuse rather than restructure: the shared
+            // restructure_goto pass (shir_passes/restructure.rs) already
+            // rewrites the C goto shapes (c-sh-go t27/t30/t31 — backward
+            // guarded, mid-test, forward cleanup) into structured flow at
+            // A1 ingress, and the estree target deliberately SKIPS that
+            // pass (otranspilerl/src/lib.rs: `if kind != "estree"`)
+            // because the estree emitter was expected to handle goto
+            // natively. A survivor here is a goto shape OUTSIDE that
+            // pass's subset — the frontend must be fixed or the pass
+            // widened, and guessing produces wrong output. Fail closed,
+            // matching the sh (`# TODO(unsupported): goto ... not
+            // restructured`) and java (`goto not supported by the java
+            // renderer`) backends. `sh2.unsupported` throws at runtime and
+            // is flagged by the structural gate.
             Stmt::ExpressionStatement {
-                expression: Expr::Literal {
-                    value: serde_json::Value::Null,
-                    raw: None,
-                    regex: None,
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "sh2".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "unsupported".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![str_lit(&format!("goto {target}"))],
+                    optional: false,
                 },
             }
         }
@@ -51038,10 +51248,21 @@ fn call_free_expr(e: &Expr) -> Option<Expr> {
     }
 }
 
-/// A store write where the RHS is provably already a STRING (a string
-/// literal or template — the runtime's `String(...)` coercion is an
-/// identity), vs a number-valued RHS (native arith) that needs the
-/// coercion.
+/// A store write where the RHS must be handed to the store RAW — the
+/// runtime's `String(...)` coercion would destroy it.
+///
+/// Two classes qualify:
+///  • values already a STRING (a string literal or template — `String(...)`
+///    is an identity);
+///  • an ObjectExpression (a record value, core request
+///    rust-frontend-20260823-record-storage). `String({x:"3"})` is
+///    `"[object Object]"`, and the site this guards is the DIRECT
+///    `sh2.vars[name] = <expr>` write, which preserves any raw value —
+///    so the coercion is the only thing destroying the record, and every
+///    later field read off it yields undefined. Object literals are
+///    emitted ONLY by frontends lowering record/map literals (no shell
+///    path constructs one — bash assoc arrays go through setArray), so
+///    widening the set cannot change bash-semantics output.
 fn store_rhs_string(e: &Expr) -> bool {
     matches!(
         e,
@@ -51050,6 +51271,7 @@ fn store_rhs_string(e: &Expr) -> bool {
                 value: serde_json::Value::String(_),
                 ..
             }
+            | Expr::ObjectExpression { .. }
     )
 }
 
@@ -51538,6 +51760,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         return slot_read(k);
                     }
                     if is_lifted(name) {
+                        return Expr::Identifier { name: name.clone() };
+                    }
+                    // A1-DECLARED parameter of the function being emitted:
+                    // the arrow binds it as a real JS parameter, so the read
+                    // is the bare identifier. Checked AFTER the lifted arms
+                    // (a lifted binding wins — a `local` of the same name
+                    // shadows the parameter) and BEFORE the store read,
+                    // which is empty for a param (the runtime's function map
+                    // carries the args, not `sh2.vars`). Core request
+                    // rust-20260930-031500 — go-sh `t109_bool_func.go`.
+                    if is_named_param(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
                     // NOTE (2026-09-09, t89 list-append): a concurrent
@@ -52528,7 +52761,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                     if ok {
-                        if let Some(native) = try_native_echo_redirect(stmts, &specs) {
+                        // EXPRESSION position: the chain's boolean VALUE is
+                        // the command's truth value (a `$(cmd > f)` capture,
+                        // a `&&`/`||` operand), so the `true`/`false` tails
+                        // are load-bearing here regardless of `$?`
+                        // liveness — always the full `.then/.catch` form.
+                        if let Some(native) = try_native_echo_redirect(stmts, &specs, false) {
                             return native;
                         }
                         // `grep -q PAT <<< TEXT` — the fd-0 herestring
@@ -57085,6 +57323,175 @@ mod const_analysis_tests {
 }
 
 #[cfg(test)]
+mod arith_len_placeholder_tests {
+    use super::*;
+
+    /// `${#arr[@]}` / `${#arr}` inside an arith text is stripped by
+    /// [`native_arith_text_len`] to the self-describing placeholder
+    /// `__sh2lena_arr` / `__sh2lens_arr`, which the emitter must ALWAYS
+    /// decode back to the runtime-exact `arrayLen` / `getVar().length` leaf.
+    ///
+    /// Regression (063_hard_to_parse.sh): when a true64 SLOT-homed index var
+    /// shared the arith tree, the wrapper wrapped the placeholder in a
+    /// `Cast(Int64, …)` and [`arith_bigint_safe_operand`] rendered the
+    /// placeholder NAME as a plain store read — a variable nothing ever sets,
+    /// so `${#args[@]}` read 0 and the loop never ran (`Processed 0 options`).
+    #[test]
+    fn length_placeholder_is_never_read_as_a_raw_store_var() {
+        assert!(arith_len_leaf("__sh2lena_arr").is_some());
+        assert!(arith_len_leaf("__sh2lens_s").is_some());
+        // The exact-BigInt shortcut must decline a placeholder (a placeholder
+        // name is not a variable), so the read falls through to the decode.
+        assert!(!exact_bigint_var_read("__sh2lena_arr"));
+        assert!(!exact_bigint_var_read("__sh2lens_s"));
+
+        let js = serde_json::to_string(&arith_bigint_safe_operand(&ArithAst::Var(
+            "__sh2lena_arr".to_string(),
+        )))
+        .unwrap();
+        assert!(js.contains("arrayLen"), "length ref not decoded: {js}");
+        assert!(
+            !js.contains("__sh2lena_arr"),
+            "raw length placeholder leaked into the emit: {js}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stmt_lines_tests {
+    use super::*;
+
+    /// Build the A1 line map for `src` the way the CLI does (parse WITH
+    /// lines, so every statement carries a source line).
+    fn line_map(src: &str) -> (Vec<IrStmt>, Vec<(usize, usize)>) {
+        let (cmds, lines) = crate::Parser::new(src).parse_with_lines().expect("parse");
+        let prog = ast_to_ir_with_lines(&cmds, &lines);
+        (prog.stmts, prog.stmt_lines)
+    }
+
+    /// Every `stmt` index in the map must name a statement that EXISTS.
+    ///
+    /// This is the contract the web GUI's source-line map depends on. It
+    /// broke because the indices were assigned BEFORE `optimize_stmts`
+    /// ran: for `x=hi` + `echo $x` the dead assignment is elided, so the
+    /// map claimed `echo` was statement 1 while only statement 0's worth
+    /// of statements survived. No corpus example caught it because the
+    /// A1 corpus path never reads the map back.
+    #[test]
+    fn stmt_line_indices_stay_in_range_after_dead_assignment_elision() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        // Precondition: the dead assignment really is elided, which is
+        // what used to invalidate the map.
+        assert!(
+            stmts.len() < 2,
+            "expected `x=hi` to be elided as a dead store, got {} stmts",
+            stmts.len()
+        );
+        for (stmt, line) in &lines {
+            assert!(
+                *stmt < stmts.len(),
+                "stmt_lines names statement {} but only {} statements survive (line {})",
+                stmt,
+                stmts.len(),
+                line
+            );
+        }
+    }
+
+    /// The surviving `echo` must map to ITS OWN source line (2), not to
+    /// the elided assignment's line (1). A stale-by-one map silently
+    /// points a consumer at the wrong source, which is worse than a
+    /// missing entry.
+    ///
+    /// `x=hi` alone is NOT used as the assignment here. Since
+    /// `copy-propagation` (transforms/copy_propagation.rs, 2026-09-15)
+    /// folds single-def literal variables into their reads, `x=hi` +
+    /// `echo $x` collapses to ONE synthesized `echo` that matches NO
+    /// original statement — so `stmt_lines` is legitimately EMPTY and an
+    /// assertion on the echo's line can never hold (that shape is pinned
+    /// separately, by `a_folded_away_statement_leaves_no_stale_map_entry`).
+    /// An assignment nothing reads is a DIFFERENT drop —
+    /// `dead-store-elim` — and the echo keeps its own origin: exactly the
+    /// stale-by-one shape this test exists to catch.
+    #[test]
+    fn surviving_statement_keeps_its_own_source_line() {
+        let (stmts, lines) = line_map("x=hi\necho done\n");
+        // Precondition: the dead store is still elided, the echo survives.
+        assert_eq!(
+            stmts.len(),
+            1,
+            "expected only the echo to survive, got {:?}",
+            stmts
+        );
+        let echo_idx = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::Expr { .. }))
+            .expect("the echo statement survives");
+        let mapped = lines.iter().find(|(s, _)| *s == echo_idx).map(|(_, l)| *l);
+        assert_eq!(
+            mapped,
+            Some(2),
+            "the echo must map to source line 2, got {:?}",
+            mapped
+        );
+    }
+
+    /// Nothing is elided when every assignment is READ, so the map must be
+    /// complete and in order — the fix must not disturb the ordinary path.
+    ///
+    /// Same fold caveat as above: command substitutions stand in for
+    /// literals so each of the four statements keeps a distinct origin.
+    #[test]
+    fn map_is_complete_when_nothing_is_elided() {
+        let (stmts, lines) =
+            line_map("x=$(date +%s)\ny=$(date +%T)\necho \"$x\"\necho \"$y\"\n");
+        assert_eq!(stmts.len(), 4, "nothing is dead, nothing is dropped");
+        assert_eq!(
+            lines,
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+            "every surviving statement keeps its own line"
+        );
+    }
+
+    /// A statement `copy-propagation` FOLDS AWAY must leave the map EMPTY,
+    /// not stale. This is the shape the two tests above could no longer
+    /// assert directly once folding landed: `x=hi` + `echo $x` lowers to a
+    /// synthesized `echo` that originates from no input statement, so a
+    /// naive pre-pass map would still claim `echo` was statement 1 — a
+    /// reference to a statement that no longer exists. A missing entry is
+    /// recoverable; a dangling index is not.
+    #[test]
+    fn a_folded_away_statement_leaves_no_stale_map_entry() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "copy-propagation folds the pair into one echo"
+        );
+        assert!(
+            lines.is_empty(),
+            "a synthesized statement has no origin, so the map must be empty, got {:?}",
+            lines
+        );
+    }
+
+    /// A fold that keeps ONE surviving statement on both sides of a drop
+    /// must still attribute it to its OWN line. `x=hi` folds away, `y=2`
+    /// folds away, but the two `echo`s are distinct origins at lines 2 and
+    /// 4 — the map must not shift by the number of dropped statements.
+    #[test]
+    fn dropped_statements_do_not_shift_the_survivors_lines() {
+        let (stmts, lines) = line_map("x=hi\necho done\ny=2\necho bye\n");
+        assert_eq!(stmts.len(), 2, "both assignments folded away");
+        assert_eq!(
+            lines,
+            vec![(0, 2), (1, 4)],
+            "survivors keep lines 2 and 4 despite two dropped statements"
+        );
+    }
+}
+
+#[cfg(test)]
 mod range_analysis_tests {
     use super::*;
 
@@ -57185,6 +57592,149 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// A `cmd > file` redirect lowers to a native
+    /// `await sh2.fs.writeFile(path, text).then(...).catch(...)` chain. The
+    /// `.then` arm exists ONLY to record `$?` on success. When the write's
+    /// status is unread nothing observes it, so the `.then` closure and the
+    /// catch's `sh2.lastExit = 1` store are both droppable and the chain
+    /// collapses to `await writeFile(...).catch(report)`.
+    ///
+    /// The `.catch` must SURVIVE: it reports the failure to stderr (a
+    /// dropped report would make a failing write silent). These two tests are
+    /// the two halves of that contract — one pins the elision, one pins the
+    /// report, and the second also pins that a LIVE `$?` keeps the full form.
+    #[test]
+    fn writefile_status_dead_drops_the_then_closure() {
+        // The shadowing statement AFTER the write is what makes the write's
+        // status unread. A LONE `echo hi > f` would NOT: with no following
+        // writer the write's status IS the program's exit code, so
+        // `sh2._finish` still reports it and the `.then` is load-bearing
+        // there (pinned by `writefile_program_final_write_keeps_the_then_closure`).
+        let src = "echo hi > /tmp/wf_dead\necho done\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            !js.contains("\"then\""),
+            "lastexit-dead write must not emit the .then status closure: {js}"
+        );
+        // …and the error report is still there, so a failed write is visible.
+        assert!(
+            js.contains("\"catch\""),
+            "the .catch report must survive the status elision: {js}"
+        );
+        assert!(
+            js.contains("Permission denied"),
+            "the EACCES report text must survive the status elision: {js}"
+        );
+    }
+
+    /// The negative half: when the script DOES read `$?` after the write, the
+    /// status is live and the full `.then/.catch` chain is mandatory —
+    /// dropping it would make `echo $?` print the PREVIOUS command's status.
+    #[test]
+    fn writefile_status_live_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_live\necho \"rc=$?\"\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "a write whose $? is read must keep the .then status closure: {js}"
+        );
+    }
+
+    /// A write in FINAL POSITION keeps its `.then` even though the script
+    /// never mentions `$?`. With no later statement to shadow it, the write's
+    /// status is the program's own exit code (`sh2._finish` reports the last
+    /// command's status), so dropping the closure would make a failed write
+    /// exit 0 — the exact silent-wrong-output this elision must not cause.
+    ///
+    /// This is the guard that makes the elision safe by construction: the
+    /// deadness scan is only allowed to fire when a later writer shadows the
+    /// read, never at end-of-program.
+    #[test]
+    fn writefile_program_final_write_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_final\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "the program-final write's status IS the exit code and must stay live: {js}"
+        );
+    }
+
+    /// A `Goto` that survives to the ESTree renderer used to lower to a
+    /// bare `null` literal — a SILENT no-op, so the program ran straight
+    /// through the jump and executed the statements the goto was meant to
+    /// skip (bat t06_goto printed `never`; c t27_goto's backward loop ran
+    /// once and printed `1` where native prints `3`). The emitter's own
+    /// comment claimed "the runtime resolves it from state"; no such
+    /// runtime helper exists. It must now REFUSE loudly via
+    /// `sh2.unsupported`, matching the sh and java backends.
+    ///
+    /// Built at the IR level (not from bash source) because no shell source
+    /// produces a Goto — only frontends (c-sh-go, bat-sh-go) do, and both
+    /// emit it via the A1 ingress, not the shell parser.
+    #[test]
+    fn goto_lowers_to_unsupported_not_a_silent_null() {
+        let blank = || IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let prog = IrProgram {
+            stmts: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("before")])],
+                }),
+                IrStmt::Goto("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("never")])],
+                }),
+                IrStmt::Label("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("after")])],
+                }),
+            ],
+            ..blank()
+        };
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"name\":\"unsupported\""),
+            "an un-restructured goto must refuse loudly, not lower to a silent null: {js}"
+        );
+        assert!(
+            js.contains("goto skip"),
+            "the refusal must NAME the jump it cannot lower: {js}"
+        );
+        // the Label arm stays an inert `null` — it only names a position,
+        // so dropping it is exact. Pinned so a future Label fix does not
+        // start refusing on a node that needs no runtime support.
+        let label_only = IrProgram {
+            stmts: vec![IrStmt::Label("skip".to_string())],
+            ..blank()
+        };
+        let js2 = serde_json::to_string(&shir_to_estree(&label_only)).unwrap();
+        assert!(
+            !js2.contains("\"name\":\"unsupported\""),
+            "a lone Label is inert and must NOT refuse: {js2}"
+        );
+    }
+
     /// A brace level's comma alternatives may contain nested braces. The
     /// parser must group each alternative's parts into a Compound (a
     /// cartesian factor), not flatten them into sibling alternatives —
@@ -57212,9 +57762,20 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
 
     /// A literal before a brace on a SEPARATE source word stays a separate
     /// argv word: `mkdir -p a/{x,y}` is `-p a/x a/y`, never `-pa/x`.
+    ///
+    /// `mkdir` is NOT the vehicle any more. `mkdir`/`mkdir -p` lower to
+    /// native Perl (`File::Path::make_path`), so the `-p` FLAG NO LONGER
+    /// APPEARS IN THE OUTPUT AT ALL and this assertion can never hold —
+    /// the same stale-expectation shape this round found in
+    /// `stmt_lines_tests`. What the test actually pins is WORD SEPARATION:
+    /// a literal on one source word must not fuse with the brace expansion
+    /// on the next. `echo` keeps its argv native (`print` + `join`) with no
+    /// shell-out, so the same contract is testable there — and the native
+    /// `mkdir` lowering it moved off is pinned separately, by
+    /// `native_brace_expansion_reaches_mkdir_args_intact` below.
     #[test]
     fn brace_prefix_does_not_glue_a_separate_word() {
-        let src = "mkdir -p a/{x,y}\n";
+        let src = "echo -p a/{x,y}\n";
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
@@ -57225,6 +57786,28 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(
             !perl.contains("-pa/x"),
             "`-p` must not glue to the brace prefix: {perl}"
+        );
+    }
+
+    /// The companion guard for the source the test above moved off: the
+    /// NATIVE `mkdir` lowering must still receive both brace-expanded
+    /// directories as separate arguments. Without this, moving `mkdir` out
+    /// of the test above would leave the `mkdir` path unasserted — a
+    /// native lowering that silently collapsed `a/{x,y}` to a single
+    /// argument would still pass.
+    #[test]
+    fn native_brace_expansion_reaches_mkdir_args_intact() {
+        let src = "mkdir -p a/{x,y}\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("a/x") && perl.contains("a/y"),
+            "both brace-expanded dirs must reach make_path: {perl}"
+        );
+        assert!(
+            !perl.contains("a/{x,y}"),
+            "the brace expansion must be applied, not passed through: {perl}"
         );
     }
 
@@ -57856,6 +58439,196 @@ mod var_borrowable_tests {
     #[test]
     fn unread_vars_do_not_qualify() {
         assert!(!borrowable("a=foo\necho hi\n").contains("a"));
+    }
+}
+
+#[cfg(test)]
+mod array_key_lift_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    /// Every array element read in the program, as (base, key-channel).
+    ///
+    /// Two lowering shapes reach an array element and BOTH are collected:
+    ///   * `sh2.arrayIndex(BASE, KEY)` — a runtime call
+    ///   * `BASE[KEY]` on a native JS array — a computed MemberExpression
+    ///
+    /// The key's CHANNEL is what decides correctness. A key naming a
+    /// LIFTED binding must be a native read (`mi`); a store-bound name
+    /// must be read from the store (`sh2.vars.gi ?? …`). Reading one
+    /// through the other channel is the desync: the store never holds a
+    /// lifted name (→ "" → index 0), and a native binding of a
+    /// store-bound name is undefined.
+    fn array_reads(json: &str) -> Vec<(String, String)> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        let mut out = Vec::new();
+
+        fn ident(v: &serde_json::Value, name: &str) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                && v.get("name").and_then(|n| n.as_str()) == Some(name)
+        }
+        /// `sh2.vars` — the store object: a MemberExpression whose object
+        /// is the `sh2` identifier and whose property is `vars`.
+        fn is_store_obj(v: &serde_json::Value) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                && v.get("object").map(|o| ident(o, "sh2")).unwrap_or(false)
+                && v.get("property").map(|p| ident(p, "vars")).unwrap_or(false)
+        }
+        fn str_of(v: &serde_json::Value) -> String {
+            v.get("name")
+                .or_else(|| v.get("value"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
+                .to_string()
+        }
+        /// Classify a key subtree by CHANNEL, per name. A name read
+        /// through both the store and a bare binding is the desync; read
+        /// through exactly one is correct (which one depends on how the
+        /// variable is written — the caller pairs this with that fact).
+        fn channel(k: &serde_json::Value) -> String {
+            let mut store: std::collections::HashSet<String> = Default::default();
+            let mut native: std::collections::HashSet<String> = Default::default();
+            fn w(
+                v: &serde_json::Value,
+                store: &mut std::collections::HashSet<String>,
+                native: &mut std::collections::HashSet<String>,
+            ) {
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| w(x, store, native)),
+                    serde_json::Value::Object(m) => {
+                        let ty = m.get("type").and_then(|t| t.as_str());
+                        if ty == Some("Identifier") {
+                            if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                                native.insert(n.to_string());
+                            }
+                        }
+                        // `<store>.<name>` — the store read of a name
+                        if m.get("object").map(is_store_obj).unwrap_or(false) {
+                            if let Some(n) = m
+                                .get("property")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|x| x.as_str())
+                            {
+                                store.insert(n.to_string());
+                            }
+                        }
+                        for (field, child) in m {
+                            // The `property` of a NON-computed member is a
+                            // property NAME, not a value expression — it
+                            // must not count as a native binding read. A
+                            // COMPUTED member's property IS the value.
+                            let is_name_only = field == "property"
+                                && ty == Some("MemberExpression")
+                                && m.get("computed") != Some(&serde_json::Value::Bool(true));
+                            if !is_name_only {
+                                w(child, store, native);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            w(k, &mut store, &mut native);
+            let both: Vec<&String> = store.intersection(&native).collect();
+            if !both.is_empty() {
+                return format!("MIXED{both:?}");
+            }
+            if store.is_empty() {
+                "native"
+            } else {
+                "store"
+            }
+            .to_string()
+        }
+
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(m) => {
+                    // sh2.arrayIndex(BASE, KEY)
+                    if m.get("callee")
+                        .and_then(|c| c.get("property"))
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("arrayIndex")
+                    {
+                        if let Some(args) = m.get("arguments").and_then(|a| a.as_array()) {
+                            if let (Some(b), Some(k)) = (args.first(), args.get(1)) {
+                                out.push((str_of(b), channel(k)));
+                            }
+                        }
+                    }
+                    // BASE[KEY]
+                    if m.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                        && m.get("computed") == Some(&serde_json::Value::Bool(true))
+                    {
+                        if let (Some(obj), Some(k)) = (m.get("object"), m.get("property")) {
+                            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                                out.push((name.to_string(), channel(k)));
+                            }
+                        }
+                    }
+                    m.values().for_each(|x| walk(x, out));
+                }
+                _ => {}
+            }
+        }
+        walk(&v, &mut out);
+        out
+    }
+
+    /// estree-20260813-182439 (function-LOCAL lifted vars): a local the
+    /// emitter lifts to a native JS binding must be indexed by its
+    /// NATIVE binding, not by a store-key string. A `"$mi"` store key
+    /// expands to "" against a store that never holds the name, so
+    /// index 0 → every read returns element 0.
+    #[test]
+    fn local_lifted_array_key_is_native() {
+        let json = shir_to_estree_json(&prog_of(
+            "mx=(10 20 30)\nmime_count=3\nmime_at() {\n  mi=0\n  while [ \"$mi\" -lt \"$mime_count\" ]; do\n    if [ \"${mx[$mi]}\" -eq 20 ]; then echo found; fi\n    mi=$((mi + 1))\n  done\n}\nmime_at\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "mx" && ch == "native"),
+            "lifted local key must be a NATIVE read, got {reads:?}\n{json}"
+        );
+        assert!(
+            !json.contains("sh2.vars.mi"),
+            "a lifted local must not round-trip through the store:\n{json}"
+        );
+    }
+
+    /// estree-20260813-182438 (params): the store-bound twin of the test
+    /// above. `gi` is NOT lifted here — it is written and read through
+    /// `sh2.vars.gi` — so the correct key is the STORE read. The
+    /// invariant both tests share is that the key's channel matches how
+    /// the key variable is written; `MIXED` is the desync in either
+    /// direction.
+    #[test]
+    fn param_store_bound_array_key_uses_the_store() {
+        let json = shir_to_estree_json(&prog_of(
+            "map=(0 1 2 3 4 5 6 7)\nmap_get() { gi=$1; gv=${map[$gi]}; }\nmap_get 5\necho \"$gv\"\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "map" && ch == "store"),
+            "a store-bound key must read the store, got {reads:?}\n{json}"
+        );
+        assert!(
+            !reads.iter().any(|(_, ch)| ch == "MIXED"),
+            "key read through both channels at once: {reads:?}\n{json}"
+        );
+        // the write and the read must agree: `gi` is store-bound
+        assert!(
+            json.contains("\"name\":\"gi\"") && json.contains("\"name\":\"vars\""),
+            "gi must be store-bound for a store key to be correct:\n{json}"
+        );
     }
 }
 
@@ -59894,3 +60667,208 @@ mod shift_offset_tests {
         assert_eq!(analyze_shift_offsets(&p).get("t"), Some(&1));
     }
 }
+
+#[cfg(test)]
+mod named_param_emission_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn getvar(n: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s(n)],
+        })
+    }
+
+    /// `func isYes(s) { … }` — an A1 function with a DECLARED parameter.
+    /// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+    /// `IrStmt::Function` arm dropped `params`, so the arrow emitted
+    /// `() => …` and the body's read of `s` fell through to the empty
+    /// `sh2.vars` store — every predicate saw "".
+    fn param_fn() -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Function {
+                name: "isYes".to_string(),
+                params: vec!["s".to_string()],
+                body: vec![IrStmt::Return(Some(s("y")))],
+                named_blocks: vec![],
+            }],
+        }
+    }
+
+    /// The declared parameter must reach the emitted arrow's parameter list —
+    /// it is a real JS parameter, not a store lookup.
+    #[test]
+    fn declared_param_reaches_the_arrow_parameter_list() {
+        let js = serde_json::to_string(&shir_to_estree(&param_fn())).unwrap();
+        assert!(
+            js.contains(r#"ArrowFunctionExpression","params":[{"type":"Identifier","name":"s"}"#),
+            "the declared parameter must be an arrow parameter: {js}"
+        );
+    }
+
+    /// A body READ of the declared parameter must render as the bare
+    /// identifier — not a `sh2.vars` read, which yields "" (the runtime
+    /// carries function args in its function map, never in the var store).
+    #[test]
+    fn declared_param_read_renders_bare_not_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("s")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            js.contains(r#"{"type":"Identifier","name":"s"}"#),
+            "the param read must be the bare identifier: {js}"
+        );
+    }
+
+    /// The negative half: a body read of a name that is NOT a declared
+    /// parameter must NOT render bare — the frame must not leak.
+    #[test]
+    fn non_param_read_still_uses_the_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("other")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            !js.contains(r#"{"type":"Identifier","name":"other"}"#),
+            "a non-param must not render bare: {js}"
+        );
+    }
+}
+
+/// Record (struct) VALUES must reach the store RAW (core request
+/// rust-frontend-20260823-record-storage). A frontends-emitted Object
+/// literal assigned to a name is a record; the direct `sh2.vars[name] = …`
+/// write preserves any raw value, so the `String(…)` wrapper that
+/// `store_rhs_string` used to force turns the record into
+/// `"[object Object]"` and every later field read yields undefined.
+#[cfg(test)]
+mod record_store_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// A one-statement program: `<var> = <value>`, the shape the native
+    /// direct-store write (`sh2.vars[<var>] = <rhs>`) is chosen for.
+    fn assign_prog(var: &str, value: IrExpr) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: value,
+                asm: None,
+            }],
+        }
+    }
+
+    /// The rendered store statement for `assign_prog`, as JSON. Returned
+    /// alone (not the whole program) so an assertion on `"String"` cannot
+    /// be satisfied by an unrelated part of the output.
+    fn store_expr_of(prog: IrProgram) -> String {
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        // The assignment is the first statement; render just it.
+        serde_json::to_string(&v["body"][0]).unwrap()
+    }
+
+    /// `let p = Point { x: "3", y: "4" };` — a record literal bound to `p`.
+    fn record_assign() -> IrProgram {
+        assign_prog(
+            "p",
+            IrExpr::Object(vec![
+                ("x".to_string(), s("3")),
+                ("y".to_string(), s("4")),
+            ]),
+        )
+    }
+
+    /// The record must be stored as an ObjectExpression, NOT as
+    /// `String(<object>)`. This is the exact bug: `String({x:"3",y:"4"})`
+    /// stringifies to `"[object Object]"`, so the stored value is a string
+    /// and every `p.x` after it reads undefined.
+    #[test]
+    fn record_literal_reaches_the_store_uncoerced() {
+        let js = store_expr_of(record_assign());
+        assert!(
+            js.contains(r#""ObjectExpression""#),
+            "the record must be stored as an ObjectExpression: {js}"
+        );
+        assert!(
+            !js.contains(r#""String""#),
+            "the record must NOT be wrapped in String(...): {js}"
+        );
+    }
+
+    /// The negative half — the widening must be SCOPED to records, not
+    /// "anything that is not a string literal". These pin the predicate
+    /// itself (`store_rhs_string`), which is the thing that changed: a
+    /// numeric RHS and a call RHS both still NEED the runtime's
+    /// `String(...)` coercion, and only a string or a record is exempt.
+    #[test]
+    fn store_rhs_string_exempts_only_strings_and_records() {
+        let string_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::String("s".into()),
+            raw: None,
+            regex: None,
+        };
+        let number_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::from(5),
+            raw: None,
+            regex: None,
+        };
+        let record = crate::estree::Expr::ObjectExpression {
+            properties: vec![],
+        };
+        assert!(store_rhs_string(&string_lit), "a string stays exempt");
+        assert!(
+            store_rhs_string(&record),
+            "a record is now exempt (the fix)"
+        );
+        assert!(
+            !store_rhs_string(&number_lit),
+            "a number must still take the String() coercion"
+        );
+        assert!(
+            !store_rhs_string(&crate::estree::Expr::ArrayExpression { elements: vec![] }),
+            "an array must still take the String() coercion"
+        );
+    }
+}
+

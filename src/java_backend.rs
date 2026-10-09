@@ -3225,6 +3225,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
                     used++;
                     if (n == 'd' || n == 'i') {
                         try { sb.append(Long.parseLong(arg.trim())); } catch (Exception e) { sb.append("0"); }
+                        if (ai < args.length) ai++;
                     } else if (n == 's') {
                         StringBuilder padded = new StringBuilder(arg);
                         while (padded.length() < width) {
@@ -3870,4 +3871,55 @@ fn sh_aslice_src() -> &'static str {
         return String.join(" ", a.subList((int) start, (int) end));
     }
 "#
+}
+
+#[cfg(test)]
+mod shprintf_tests {
+    /// Every numeric conversion must advance the argument cursor.
+    ///
+    /// `shPrintf` drives its outer loop with `do { ... } while (ai < args.length)`,
+    /// so a branch that appends a value but never increments `ai` makes the
+    /// program spin forever — the java cell then produces NO output at all and
+    /// every example looks like an opaque "backend differs". The `%d`/`%i`
+    /// branch was the one missing the increment, so `printf "%d\n" $((x+3))`
+    /// hung on every integer format.
+    ///
+    /// This pins the increment structurally: the `%d` arm must advance `ai`
+    /// exactly like the `%s`/`%b`/default arms do. It is a source assertion
+    /// on purpose — compiling and running the generated java would need a JDK
+    /// in the unit-test sandbox, and a hang is exactly the failure a
+    /// behavioural test cannot time out of cheaply.
+    #[test]
+    fn numeric_conversion_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        // isolate the numeric branch
+        let start = src
+            .find("if (n == 'd' || n == 'i')")
+            .expect("shPrintf must handle %d/%i");
+        let rest = &src[start..];
+        let end = rest.find("} else").expect("numeric branch must be bounded");
+        let arm = &rest[..end];
+        assert!(
+            arm.contains("ai++"),
+            "the %d/%i branch of shPrintf must increment `ai`, else the \
+             `do/while (ai < args.length)` outer loop never terminates and \
+             every integer printf hangs the generated program. Arm was:\n{arm}"
+        );
+    }
+
+    /// The other arms must keep advancing too — a guard against the same
+    /// regression landing on %s/%b/default later.
+    #[test]
+    fn every_conversion_arm_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        for arm in ["n == 's'", "n == 'b'"] {
+            let start = src.find(arm).expect("arm must exist");
+            let rest = &src[start..];
+            let end = rest.find("} else").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("ai++"),
+                "the `{arm}` branch must increment `ai`"
+            );
+        }
+    }
 }

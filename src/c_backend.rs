@@ -7311,6 +7311,47 @@ impl Render {
             "fgets", "fread", "fwrite", "fscanf", "sscanf", "strftime", "localtime",
             "gmtime", "ctime", "asctime", "difftime", "mktime", "clock", "time",
             "nanosleep", "usleep", "alarm", "pause", "kill", "raise", "sigaction",
+            // rand/srand, and the random() family. A shell function
+            // NAMED rand is not rare — MIMEcroft has one (www/bin/
+            // mimecroft.sh:329, `rand() { seed = ...; }`) — and the
+            // emitted `static void rand(void)` collided with libc's
+            // `int rand(void)` at file scope:
+            //
+            //     error: conflicting types for 'rand'; have 'void(void)'
+            //
+            // which stopped the WHOLE 4976-line game from compiling,
+            // at 94 minutes into a build, with an error that names a
+            // libc function and says nothing about the shell function
+            // that caused it. The list above is the same idea for the
+            // rest of libc, and rand was the one name this project's
+            // own flagship program happens to use.
+            "rand", "srand", "random", "srandom", "initstate", "setstate",
+            "arc4random", "drand48", "srand48", "lrand48", "mrand48",
+            // `main` — the C language's OWN entry point, and the one
+            // clash in this list that is not a libc declaration. A shell
+            // function named `main` is ordinary (MIMEcroft has one:
+            // www/bin/mimecroft.sh:4392, the game's entry-point
+            // dispatcher, called at :4976), and the backend hoists shell
+            // function definitions to file scope, so it emitted
+            //
+            //     static void main(void) { ... }   <- the shell function
+            //     int main(int argc, char **argv) { ... }   <- the driver
+            //
+            // which is two definitions of `main`:
+            //
+            //     error: redefinition of 'main'
+            //     prog.c:15015: error: conflicting types for 'main';
+            //                    have 'int(int, char **)'
+            //
+            // This one is worse than the `rand` case above in two ways:
+            // it is reached on EVERY program whose script names a shell
+            // function `main`, and the name is not declared by any header,
+            // so the diagnostic points at a symbol the reader believes
+            // they own. Mangling to `main_` keeps the shell function's
+            // identity visible in the C while freeing the driver's own
+            // entry point. Call sites go through `c_ident` too, so the
+            // def, the fwd decl and every call stay consistent.
+            "main",
         ];
         if C_KEYWORDS.contains(&name) {
             format!("{name}_")
@@ -7872,6 +7913,13 @@ impl Render {
             // adding input to a drawing device would make every
             // headless render depend on it.
             self.emit("#include <fbinput.h>");
+            // The sound half (runtime/fbsound.{h,c}), a THIRD separate
+            // include for the same reason: a program that draws must
+            // not depend on there being a sound card, and the sound
+            // device's own answer to a box with no card is silence
+            // rather than a failure. bash-O4 links fbsound.c and -ldl
+            // (it dlopens libasound) when the render names <fbsound.h>.
+            self.emit("#include <fbsound.h>");
         }
         self.emit("");
         if self.need_sh {
@@ -9679,8 +9727,22 @@ impl Render {
         for (idx, line) in reinit {
             self.out[idx] = line;
         }
-        for sj in drop_lines.iter().rev() {
-            self.out.remove(*sj);
+        // REMOVE HIGHEST-INDEX-FIRST, EXPLICITLY. `drop_lines` is pushed in
+        // SCAN order (by the decl index `i`), but the value pushed is the
+        // STORE index `sj`, and those two are NOT in the same order: a
+        // decl's store can sit far ahead of the next decl's store, so the
+        // vector comes out as e.g. [17, 16]. `Vec::remove` shifts every
+        // later element down, so walking it in push order (or via
+        // `.iter().rev()`, which only un-reverses the push order rather
+        // than sorting) removes index 16 first and then removes whatever
+        // slid INTO 17 — on MIMEcroft that was the `static char _sN[32];`
+        // of a num_temp whose `snprintf` use then survived, and the
+        // program stopped compiling with '_s1472 undeclared'. A sort is
+        // the only thing that makes removal order independent of scan
+        // order; `.rev()` was never that guarantee.
+        drop_lines.sort_unstable_by(|a, b| b.cmp(a));
+        for &sj in &drop_lines {
+            self.out.remove(sj);
         }
     }
 
@@ -9776,9 +9838,30 @@ impl Render {
                 i += 1;
                 continue;
             }
-            // used later? (def itself excluded by starting after i+1;
-            // the snprintf line's own mentions don't count.)
-            let used = self.out[i + 2..].iter().any(|l| {
+            // used ANYWHERE else? The decl's own two lines are excluded
+            // (the snprintf line's own mentions don't count).
+            //
+            // SCAN THE WHOLE BUFFER, NOT JUST `i+2..`. A forward-only
+            // search is wrong whenever a use lands on an EARLIER line than
+            // the declaration, which is exactly what an `} else if (...)`
+            // arm header does: the If emitter flushes the arm's condition
+            // emissions AFTER the `} else if (` text, so a num_temp the
+            // condition needs is declared INSIDE this arm and read by the
+            // header text emitted just above it. The forward search found
+            // no use, dropped the `static char _sN[32];`, and the header
+            // then failed to compile ('_s1472 undeclared' on MIMEcroft's
+            // draw_radar_cell TREASURE/AIR test).
+            //
+            // Scanning everything is the conservative direction: the worst
+            // case is keeping a temp alive that a smarter analysis would
+            // drop (an unused `static char[32]` is dead weight, not a
+            // miscompile), whereas dropping a live one is a hard error.
+            let used = self
+                .out
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != i && *k != i + 1)
+                .any(|(_, l)| {
                 // word-boundary match so `_s1` doesn't match `_s10`.
                 let mut k = 0;
                 let b = l.as_bytes();
@@ -11265,8 +11348,32 @@ impl Render {
                 } else if *op == "/" || *op == "%" {
                     // Strength-reduce power-of-2 divisors: % 2^k -> & (2^k-1),
                     // / 2^k -> >> k. Eliminates ~30-cycle div (1-cycle and/shift).
+                    //
+                    // SOUND ONLY IF the dividend is provably non-negative.
+                    // `x % 2^k == x & (2^k-1)` and `x / 2^k == x >> k` hold
+                    // for `x >= 0` ONLY. For a negative x in two's
+                    // complement the mask still yields the right residue,
+                    // but a COMPARISON against it inverts relative to the
+                    // signed modulo — executed, for v = -3:
+                    //     v % 2 == 1                      -> 0 (bash: 0 iters)
+                    //     (unsigned long long)(v)&1ull==1  -> 1 (runs once)
+                    // and `(0 - v) >> 1` floors toward -inf where the
+                    // shift floors toward zero. Floor division of a
+                    // negative is not a shift.
+                    //
+                    // This is the SAME proof obligation the unsigned op
+                    // below already discharges (`arith_proven_nonneg`),
+                    // and the same one the `refuses_*` tests state. It was
+                    // unconditional here, so the strength reduction
+                    // bypassed the proof entirely — the shape the tests
+                    // catch is `((unsigned long long)(v) & 1ull) == 1`.
+                    // No proof -> refuse (one division beats a wrong
+                    // answer).
                     if let crate::ir::ArithAst::Num(d) = rhs.as_ref() {
-                        if *d > 0 && (*d & (*d - 1)) == 0 {
+                        if *d > 0
+                            && (*d & (*d - 1)) == 0
+                            && self.arith_proven_nonneg(lhs)
+                        {
                             if *op == "%" {
                                 let mask = *d - 1;
                                 return format!("((unsigned long long)({l}) & {mask}ull)");
@@ -18439,9 +18546,54 @@ fn param_copy_alias(
             }
             _ => {
                 if let Some(fb) = self.fb_call_opt(&cmd, &args) {
-                    // the fb device returns 0 on success, so the shell
-                    // status is 0 (like any other successful builtin)
-                    format!("({fb}, _sh_rc = 0, _sh_rc == 0)")
+                    // A DEVICE CALL'S STATUS IS ITS OWN RETURN VALUE,
+                    // and this used to be hardcoded to 0 — so every
+                    // `if fb_window_open; then`, `if fb_window_closed;
+                    // then` and `if fb_present; then` took its THEN
+                    // branch unconditionally. The two window
+                    // predicates are exactly the ones a game asks, and
+                    // the failure is silent and total: `if
+                    // fb_window_closed` is true on frame 1, the game
+                    // treats it as the quit key, and a 3-key walk drew
+                    // one frame and stopped (measured: "1 frames, 0
+                    // steps, 0 found" where real bash did the walk).
+                    // The smallest reproducer did not even COMPILE —
+                    // `_sh_rc` was undeclared at this depth — so the
+                    // transpiler fell back to cc, cc rejected it too,
+                    // and the shell reported an unrelated error.
+                    //
+                    // The expression must be a TEST VERDICT (1 = true,
+                    // 0 = false), not a value: every command emitter
+                    // here ends with `, _sh_rc == 0`, so the store
+                    // below has to land a STATUS and the comparison
+                    // turns it into the verdict. `fb_status` returns the
+                    // whole store expression, per primitive, because
+                    // the device's conventions are not uniform.
+                    //
+                    // THE VOID PRIMITIVES BYPASS THE REGISTER ENTIRELY.
+                    // `fb_clear`, `fb_blocks` and `fb_set_camera` are
+                    // `void`, so there is no value to store — and
+                    // storing a literal 0 is actively destructive:
+                    // trim_discarded_rc_cmp peels the `, _sh_rc == 0`
+                    // tail, strip_dead_rc then sees a dead `_sh_rc = 0`
+                    // line and DELETES THE WHOLE LINE, taking the
+                    // `fb_blocks(...)` draw call with it. The game then
+                    // cleared to black every frame and drew nothing,
+                    // and both sides of the equivalence suite agreed
+                    // perfectly on a solid black rectangle (measured:
+                    // 1 colour, 100% of 76800 pixels, 1760 block records
+                    // logged and none of them rendered).
+                    //
+                    // A statement-position void call is emitted as the
+                    // bare call — no register, nothing for the rc
+                    // passes to strip.
+                    if Self::fb_is_void(&fb) {
+                        format!("({fb})")
+                    } else {
+                        self.need_sh = true;
+                        let ok = Self::fb_status(&fb);
+                        format!("(_sh_rc = {ok}, _sh_rc == 0)")
+                    }
                 } else if let Some(uu) = self.uu_run_opt(&cmd, &args) {
                     self.need_sh = true;
                     format!("(_sh_rc = {uu}, _sh_rc == 0)")
@@ -18485,7 +18637,91 @@ fn param_copy_alias(
             "fb_blocks" => Some(&['s']),               // the batched payload
             "fb_present" => Some(&[]),                 // no args
             "fb_dump_ppm" => Some(&['s']),             // path
+            // the WINDOW (runtime/fbwin.h): a game asks these three
+            // things about the display it is drawing to, and each is
+            // otherwise a fact the shell would have to know.
+            "fb_window_open" => Some(&[]),             // is there a window
+            "fb_window_key" => Some(&[]),              // a key pressed IN it
+            "fb_window_closed" => Some(&[]),           // was it closed
+            // the 2D OVERLAY (runtime/fbdev.h): the game's own HUD
+            // mini-language, one batched payload per frame, and the
+            // flash on its own layer.
+            "fb_overlay" => Some(&['s']),              // the batched payload
+            "fb_overlay_flash" => Some(&['s']),        // the transient one
+            "fb_overlay_alpha" => Some(&['i', 'i']),   // which pixel to read
+            // the TEXTURES: the block atlas and the fragment program's
+            // switches. fx is called with the game's own colours and
+            // the aShade the face carries, all as the header declares.
+            "fb_texture" => Some(&['i', 's', 's', 's', 'i', 'i', 'i']),
+            "fb_frag_flags" => Some(&['i', 'i']),      // crt, corrupt
+            "fb_frag_view" => Some(&['i', 'i']),       // the canvas the
+                                                      // vignette centres on
+            "fb_frag_color" => Some(&[
+                'i', 'i', 'i', 'i', 'i', 'i', 'd', 'd', 'i', 'i', 'i', 'i', 'i',
+            ]),
+            "fb_tex_count" => Some(&[]),
+            // the SOUND (runtime/fbsound.h). fb_note takes a note NAME
+            // and a duration; fb_samples takes the generator's payload
+            // verbatim, because the samples ARE the sound.
+            "fb_note" => Some(&['s', 'd']),            // note, seconds
+            "fb_samples" => Some(&['s']),              // the PCM payload
+            "fb_sound_ready" => Some(&[]),
+            "fb_sound_count" => Some(&[]),
+            "fb_sound_active" => Some(&[]),
             _ => None,
+        }
+    }
+
+    /// The fb_* primitives declared `void` in runtime/fbdev.h. They
+    /// have no return value to read, so a status store around them is
+    /// both uncompilable (`_sh_rc = (fb_clear(0))` — "void value not
+    /// ignored as it ought to be") and, once padded to a literal 0,
+    /// destructively strippable (see the exec_call note). Matched on
+    /// the head of the rendered call, exactly as `fb_status` is.
+    fn fb_is_void(call: &str) -> bool {
+        matches!(
+            call.split('(').next().unwrap_or(call),
+            "fb_clear"
+                | "fb_blocks"
+                | "fb_set_camera"
+                | "fb_overlay"
+                | "fb_overlay_flash"
+                | "fb_overlay_alpha"
+                | "fb_overlay_layer_alpha"
+        )
+    }
+
+    /// An fb_* primitive's C return value, as a SHELL EXIT STATUS
+    /// expression (0 = success, nonzero = failure) — the thing that
+    /// belongs in `_sh_rc = <here>`, so that the `, _sh_rc == 0` the
+    /// command emitter appends turns it into a test verdict.
+    ///
+    /// `call` is the full rendered call (`fb_window_closed()`), and the
+    /// primitive name is its head — the same `cmd` `fb_call_opt` matched
+    /// on. The polarity is PER-PRIMITIVE, because the device is not
+    /// uniform and getting it wrong is silent:
+    ///   fb_open      0 on success, -1 on OOM      -> pass through
+    ///   fb_dump_ppm  0 on success, -1 on failure  -> pass through
+    ///   fb_present   1 when a blit happened      -> "(ret - 1)"
+    ///   fb_window_open / fb_window_closed
+    ///                1 means "yes"               -> "(ret == 0)"
+    ///   the void three                             -> (caller skips this)
+    ///
+    /// `fb_present` is the genuinely surprising one: it returns 1 when
+    /// a frame was blitted, and a blit is the SUCCESS case, so its
+    /// status is `ret - 1`. A caller testing `if fb_present` wants to
+    /// know a frame was SHOWN, and a blanket "the device returns 0 on
+    /// success" would make that test permanently false on exactly the
+    /// runs where a window exists.
+    fn fb_status(call: &str) -> String {
+        let name = call.split('(').next().unwrap_or(call);
+        match name {
+            // nonzero = the answer is "yes" -> a yes is a failure
+            "fb_window_open" | "fb_window_closed" => format!("(({call}) == 0)"),
+            // nonzero = it worked -> status 1 means failure
+            "fb_present" => format!("(({call}) - 1)"),
+            // 0-on-success primitives: pass the value through
+            _ => format!("({call})"),
         }
     }
 
@@ -18557,8 +18793,9 @@ fn param_copy_alias(
             match (ty, w) {
                 ('i', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
                 ('s', IrExpr::Str(s, _)) if Self::static_needs_shell(s) => return None,
-                // integers: fb_open's w/h and the packed clear colour
-                // are written as plain decimal words in the script.
+                // integers: fb_open's w/h, the packed clear colour, and
+                // the window predicates are written as plain decimal
+                // words in the script.
                 ('i', _) => parts.push(self.value_num(w)),
                 // doubles: the camera uniforms. atof-style coercion, so
                 // "0.5" and "$cy" both work.
@@ -18600,34 +18837,51 @@ fn param_copy_alias(
     /// returning `void` (fb_present) or `int` (fb_open) has no
     /// printable value, so it is REFUSED here and stays a statement
     /// call — a capture of it is a shell error, not a number to guess.
-    fn fb_capture_sig(cmd: &str) -> Option<&'static str> {
+    fn fb_capture_sig(cmd: &str) -> Option<(&'static str, usize)> {
         match cmd {
             // the keyboard: the one primitive a game captures per
             // frame. The argument is the key FILE (see above).
-            "fb_input_line" => Some("fb_input_line"),
+            "fb_input_line" => Some(("fb_input_line", 1)),
+            // a key pressed in the fb0 WINDOW, captured the same way
+            // and for the same reason: the game's own control code is
+            // `k=$(...)` either way, and only the source of the byte
+            // changes. Both return the device's own static buffer,
+            // which is the lifetime a capture helper's result has.
+            "fb_window_key" => Some(("fb_window_key", 0)),
             _ => None,
         }
     }
 
     fn fb_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
-        let call = Self::fb_capture_sig(cmd)?;
+        let (call, want_arity) = Self::fb_capture_sig(cmd)?;
         // exactly as fb_call_opt: no env prefix Object arg
         if args.iter().any(|a| matches!(a, IrExpr::Object(_))) {
             return None;
         }
-        // exactly ONE argument, the key file, and it must be one value.
-        // A split word is fine — that is a variable read, not a glob —
-        // so fb_word_one_value is the right gate, not word_single_argv.
-        let words = match args.get(1) {
+        // fb_input_line takes ONE argument, the key FILE, and it must be
+        // one value. A split word is fine — that is a variable read, not
+        // a glob — so fb_word_one_value is the right gate, not
+        // word_single_argv.
+        //
+        // fb_window_key takes NONE, and that is a different arity rather
+        // than a zero-length path: the window knows its own keys. The
+        // two are told apart by the CAPTURE TABLE, which is a
+        // (name, arity) pair and not a name, so a future capture
+        // primitive with a different shape cannot silently be rendered
+        // with this one's arguments.
+        let words: &[IrExpr] = match args.get(1) {
             Some(IrExpr::Array(items)) => items.as_slice(),
-            _ => return None,
+            _ => &[],
         };
-        if words.len() != 1 || !Self::fb_word_one_value(&words[0]) {
+        if words.len() != want_arity {
             return None;
         }
-        let path = self.value_c(&words[0]);
+        if words.iter().any(|w| !Self::fb_word_one_value(w)) {
+            return None;
+        }
+        let arg = if want_arity == 1 { self.value_c(&words[0]) } else { String::new() };
         self.need_fb = true;
-        Some(format!("_sh_xstrdup({call}({path}))"))
+        Some(format!("_sh_xstrdup({call}({arg}))"))
     }
 
     /// UU-FFI.md: lower a genuinely-external command to an in-process
@@ -25277,7 +25531,19 @@ fn param_copy_alias(
         let mut cargs = Vec::new();
         for p in parts {
             match p {
-                Part::Lit(t) => fmt.push_str(&t),
+                // A LITERAL `%` IN THE TEXT IS PART OF THE FORMAT STRING.
+                // `echo "${pct}% done"` lowers to printf("%s%% done") —
+                // the interpolation contributes the `%s` and the literal
+                // `%` must be doubled or C reads it as the start of a
+                // conversion. Bash has no such rule, so the source
+                // contains a bare `%` and the emitted format carried it
+                // through: `printf("...(%s%)", ...)` is
+                // "unknown conversion type character ')' in format" from
+                // gcc/tcc, and — worse — `printf("%s% y", "A")` prints
+                // "A% y" on glibc only by luck of the following space.
+                // Doubling every literal `%` is the standard escape and is
+                // correct regardless of what precedes it.
+                Part::Lit(t) => fmt.push_str(&t.replace('%', "%%")),
                 Part::Arg(v, spec) => match spec {
                     // numeric: the spec already matches the operand's
                     // proven width — cast only when the type is unproven
@@ -27494,6 +27760,53 @@ fn param_copy_alias(
                 self.emit("_sh_rc = 0;");
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
+                // RENDER EVERY elsif CONDITION UP FRONT, BEFORE THE `if`
+                // IS EMITTED AT ALL.
+                //
+                // An elsif condition can need a num_temp
+                // (`[ "$gv" -ne "$AIR" ]` lowers to `atoll(_sN)`), and
+                // `num_temp` EMITS its `static char _sN[32];` +
+                // `snprintf(...)` pair into self.out at the current
+                // position. Emitting an arm's condition at the point the
+                // arm is reached put that pair in one of three wrong
+                // places, all of which failed to compile:
+                //   * inside the PREVIOUS arm's block, where the `else if`
+                //     header below cannot see the declaration
+                //     ('_s1472 undeclared');
+                //   * after the `} else if (...)` header, where the USE
+                //     precedes its own declaration (same error); and
+                //   * between the `}` and the `else`, which is not a
+                //     statement position in C at all ("'else' without a
+                //     previous 'if'").
+                //
+                // There is no position inside an if/else chain where a
+                // declaration is legal AND precedes the test that reads
+                // it, so the declarations are hoisted ABOVE the whole
+                // chain. They are `static`, so hoisting is free: one
+                // definition, initialised once, read by whichever arm
+                // runs. The condition TEXT still needs the temp's value,
+                // and the text is complete before the `if` is emitted, so
+                // each arm's header can use it.
+                //
+                // Order matters for side effects: the arms are rendered in
+                // source order, exactly as they would have been reached,
+                // so the sequence of evaluations is unchanged.
+                // Only the condition TEXT has to be captured: the
+                // `} else if (...)` header that uses it is emitted much
+                // later, but the declarations it needs are already in
+                // self.out, sitting above the `if` emitted below. So the
+                // decls are deliberately NOT buffered or re-emitted —
+                // split_off would have to be undone, and re-emitting them
+                // would only risk a second copy.
+                let mut elsif_conds: Vec<String> = Vec::with_capacity(elsifs.len());
+                for (ec, _body) in elsifs {
+                    self.in_cond += 1;
+                    let ec_text = self.expr(ec);
+                    self.in_cond -= 1;
+                    elsif_conds.push(ec_text);
+                }
+                // the `then` condition renders last, so its own emissions
+                // (if any) sit directly above the `if` it belongs to
                 self.in_cond += 1;
                 let c = self.expr(cond);
                 self.in_cond -= 1;
@@ -27516,12 +27829,14 @@ fn param_copy_alias(
                 }
                 self.depth -= 1;
                 let mut post_if = std::mem::take(&mut self.nonnull_var);
-                for (ec, body) in elsifs {
+                for (ec, (_ec, body)) in elsif_conds.into_iter().zip(elsifs) {
+                    
                     let arm_site = self.prof_site(1, "elsif");
                     self.nonnull_var = pre_if.clone();
-                    self.in_cond += 1;
-                    let ec = self.expr(ec);
-                    self.in_cond -= 1;
+                    // the condition's own declarations were already
+                    // emitted ABOVE the whole chain (see the hoist at
+                    // the top of this arm), so the header here is just
+                    // the `} else if (...) {` line the C grammar wants.
                     self.emit(&format!("}} else if ({ec}) {{"));
                     self.depth += 1;
                     if let Some(site) = arm_site {
@@ -39543,8 +39858,17 @@ mod tests {
         let mut prog = empty_prog(vec![assign("v", cast(A::Num(1))), assign("v", rhs)]);
         prog.var_types = vec![("v".to_string(), crate::ir::IrType::Int)];
         let c = shir_to_c(&prog);
+        // The contract is the NATIVE store (a folded `mpz_set_si` of the
+        // proven i64 value) and NO GMP division chain. The exact operator
+        // spelling is not the contract: `28 / 2` and its sound
+        // strength reduction `28 >> 1` are the same value, and the
+        // reduction fires here precisely because the dividend is a
+        // non-negative proven constant. Pin the value, not the spelling.
         assert!(
-            c.contains("mpz_set_si(v, (long long)((unsigned long long)(28) / (unsigned long long)(2)))"),
+            c.contains("mpz_set_si(v, ((unsigned long long)(28) >> 1u))")
+                || c.contains(
+                    "mpz_set_si(v, (long long)((unsigned long long)(28) / (unsigned long long)(2)))"
+                ),
             "division bigint store not native:\n{c}"
         );
         assert!(

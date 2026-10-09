@@ -18,6 +18,12 @@
  *      unmapped key is skipped, and a mapped key after it still lands
  *   5. the tty source, over a pty pair, echoes and delivers one byte
  *   6. fb_input_line(kf) never blocks when there is nothing pending
+ *   7. a terminal owned by another job is refused, not stopped
+ *   8. the terminal is restored when the game EXITS
+ *   9. the terminal is restored when the game is KILLED BY A SIGNAL —
+ *      the way a person actually stops a game (Ctrl-C), and the route
+ *      atexit does not cover. Check 8 alone is what made this look
+ *      finished while Ctrl-C still left the terminal raw.
  */
 /* _GNU_SOURCE FIRST, before even the local header: openpty() is a GNU
  * addition, and with only the default feature macros the implicit
@@ -42,6 +48,7 @@
 #if defined(__linux__)
 #include <pty.h>
 #include <sys/ioctl.h>
+#include <termios.h>   /* the terminal-restore check (check 8) */
 #include <linux/input.h>
 #endif
 
@@ -496,9 +503,327 @@ static int foreign_tty_child(void) {
     return 0;
 }
 
+/* THE RE-EXECUTED HALF OF CHECK 8. A fresh process whose only source
+ * is a pty it is the session leader on: it will put that terminal into
+ * raw mode, so the parent gets to ask what the terminal looks like
+ * AFTERWARDS. Written as a separate process on purpose — atexit only
+ * fires when a process exits, so a same-process check would be testing
+ * something that cannot happen. */
+static int raw_tty_child(void) {
+    const char *kf = 0;
+    (void)fb_input_line(kf);   /* this is what makes it raw */
+    return 0;
+}
+
+/* CHECK 8: A GAME MUST NOT LEAVE THE TERMINAL IN RAW MODE.
+ *
+ * The bug this exists for is not a crash and not a wrong frame: it is
+ * the user's shell coming back with no echo and no line editing, which
+ * they fix by typing `stty sane` by hand. A test suite that only checks
+ * what the game DREW would report this device as perfectly healthy
+ * while it was breaking the terminal on every run.
+ *
+ * The child puts the pty slave into raw mode via the device and then
+ * exits. The parent — which still holds the pty MASTER open, exactly as
+ * a login shell holds the session's terminal — checks the slave's
+ * settings afterwards. Holding the master open is the point: the device
+ * used to justify leaving the terminal raw on the grounds that "the
+ * kernel restores the termios when the session's last descriptor
+ * closes", and that only happens when there is no other holder. With
+ * the master held open, nothing is left to close and the settings
+ * persist — so this check fails against that claim, which is what it
+ * should do.
+ *
+ * ECHO AND ICANON ARE CHECKED SEPARATELY because they are cleared by
+ * the same line and a test that only looked at one of them would pass
+ * against a device that cleared the other.
+ *
+ * THE ORIGINAL SETTINGS ARE ROUND-TRIPPED, not compared against a
+ * hard-coded "sane": a device that restores a hand-built tcsetattr
+ * instead of the struct it saved would pass an ECHO/ICANON check while
+ * quietly resetting the user's flow control and IUTF8. */
+static void t_restore_tty(void) {
+    int mfd, sfd;
+    pid_t pid;
+    int status = 0;
+    struct termios before, after;
+
+    if (openpty(&mfd, &sfd, NULL, NULL, NULL) != 0) {
+        printf("  FAIL openpty (skipping the restore check)\n");
+        return;
+    }
+    if (tcgetattr(sfd, &before) != 0) {
+        printf("  FAIL tcgetattr before\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    /* Give the pty a distinctive state to be restored TO, so a device
+     * that writes back a generic "sane" mode is caught rather than
+     * passed by accident. IEXTEN off is unusual in the wild but
+     * entirely legal, and no hard-coded restore would reproduce it.
+     * ICANON and ECHO are deliberately left ON: they are the bits the
+     * device clears, and the check below asserts they come back, so
+     * the starting state has to have had them set for that to mean
+     * anything. */
+    struct termios custom = before;
+    custom.c_lflag &= (tcflag_t)~IEXTEN;
+    if (tcsetattr(sfd, TCSANOW, &custom) != 0) {
+        printf("  FAIL tcsetattr (skipping the restore check)\n");
+        close(mfd); close(sfd);
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) { printf("  FAIL fork\n"); fails++; close(mfd); close(sfd); return; }
+    if (pid == 0) {
+        close(mfd);
+        /* become the session leader so the slave is OUR controlling
+         * terminal — the device refuses to touch a terminal owned by
+         * another job, and would then correctly do nothing */
+        if (setsid() < 0) _exit(70);
+        if (ioctl(sfd, TIOCSCTTY, 0) < 0) _exit(71);
+        dup2(sfd, STDIN_FILENO);
+        /* NOT closed: the device's own dup of stdin is what it
+         * restores through, and the restore must happen while that
+         * descriptor is still a live terminal. */
+        (void)!close(sfd);
+        /* exit(), NOT _exit(). _exit skips atexit, and the whole point
+         * of the check is that the restore is an atexit handler — a
+         * child that bypasses it would report a failure the device
+         * cannot have caused. (Measured: with _exit here the parent
+         * saw ECHO still off and the check failed for a reason that
+         * was entirely the test's.) */
+        exit(raw_tty_child());
+    }
+    /* The SLAVE stays open in the parent. tcgetattr on the pty MASTER
+     * returns the master's own settings, not the line discipline the
+     * device changed, so reading mfd here answers a different question
+     * than the one being asked — and answers it wrongly, which is how
+     * a correct restore reports as a failure. (Measured: the same
+     * child under a master-read gave ECHO off; reading the slave gave
+     * ECHO on.) Holding the slave open is also what a login shell
+     * does — it keeps the terminal's own end for the session. */
+    waitpid(pid, &status, 0);
+
+    if (tcgetattr(sfd, &after) != 0) {
+        printf("  FAIL tcgetattr after\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    /* ECHO AND ICANON ARE CHECKED SEPARATELY, and each is checked
+     * against a value the test KNOWS, not against a boolean it
+     * asserted itself. Getting that backwards is easy and produces a
+     * check that can only ever pass: `ck(after & ECHO ? 0 : 1, ...)`
+     * says "fail iff ECHO is set", which is a second opinion, not a
+     * measurement. Here the parent put ICANON and ECHO ON and IEXTEN
+     * OFF before forking, so the answer after the game is known. */
+    ck(after.c_lflag & ECHO ? 1 : 0, "ECHO is back after the game exits");
+    ck(after.c_lflag & ICANON ? 1 : 0, "ICANON is back after the game exits");
+    /* the distinctive bit: a hand-written "sane" would restore ECHO
+     * and ICANON and quietly reset IEXTEN, so this is the check that
+     * can tell a saved struct from a synthesised one */
+    ck(after.c_lflag & IEXTEN ? 0 : 1,
+       "the user's OWN settings come back, not a generic sane mode");
+    close(mfd);
+    close(sfd);
+}
+
+/* THE RE-EXECUTED HALF OF CHECK 9: the same game, killed by a SIGNAL
+ * instead of exiting. A fresh process, because the whole question is
+ * what a dying process leaves behind.
+ *
+ * A FRESH PROCESS, AND THAT IS LOAD-BEARING HERE IN A WAY IT IS NOT
+ * FOR CHECK 7. The device's state is process globals — the tty
+ * descriptor, the key-file descriptor, the "this terminal is not ours"
+ * refusal — and the checks before this one deliberately leave several
+ * of them set. A forked child inherits all of it, so fb_input_line
+ * short-circuits on an earlier pty or a key file and never touches the
+ * terminal under test: the child then never makes it raw, the parent's
+ * poll times out, and the check reports a device failure that is
+ * entirely the test's. Check 7 already learned this and fixed it by
+ * exec'ing; this check has to do the same, which is why it is an
+ * execl and not a fork-and-call. */
+static int signalled_tty_child(void) {
+    const char *kf = 0;
+    /* Clear the inherited device configuration first, so the only
+     * source this child can possibly answer from is the terminal the
+     * parent just gave it. Every one of these is set by an earlier
+     * check in this same process. */
+    unsetenv("FB_KEYS");
+    unsetenv("FB_INPUT");
+    unsetenv("FB_TTY");
+    setenv("FB_NO_TTY", "0", 1);
+    (void)fb_input_line(kf);   /* puts the terminal into raw mode */
+    fprintf(stderr, "child: raw, blocking\n");
+    fflush(stderr);
+    /* Block forever, and do NOT exit: a game is a loop, and a process
+     * that returns here has run its atexit handlers, which is the
+     * route check 8 already covers. pause() returns when a handler
+     * runs, so the loop re-checks and a handler that returned instead
+     * of stopping the process spins rather than hanging silently. */
+    for (;;) pause();
+    return 0;
+}
+
+/* CHECK 9: THE TERMINAL MUST COME BACK WHEN THE GAME IS KILLED, not
+ * only when it exits.
+ *
+ * Check 8 covers exit(), and passing it is what made this look
+ * finished. atexit handlers run for exit() and return-from-main, and
+ * they do NOT run when a process dies of a signal — which is the
+ * NORMAL way a person stops an interactive game: Ctrl-C sends SIGINT
+ * to the foreground process group, the game is gone, and every atexit
+ * handler is discarded along with it. The user's terminal is then
+ * left with no echo and no line editing, and the fix is `stty sane`
+ * by hand.
+ *
+ * That is not a theoretical gap. It is what happened, twice, and the
+ * first fix (an atexit handler) closed only this check's route while
+ * leaving the one people actually use open. Measured over a pty with
+ * the old device, a game killed with SIGINT:
+ *
+ *     child exited, status 2 (signalled: 2)
+ *     terminal ICANON now: False  ECHO now: False
+ *
+ * So the child here is NOT allowed to exit on its own: it puts the
+ * terminal into raw mode and then blocks, and the parent kills it with
+ * a real signal. Everything the check asserts is then the state of the
+ * terminal after a signal death.
+ *
+ * THE EXIT STATUS IS CHECKED TOO, and it is the part that distinguishes
+ * a device that HANDLED the signal from one that merely survived it. A
+ * handler that restores the terminal and returns leaves a
+ * killed-by-signal process that looks like a clean exit — the game
+ * would report success for a Ctrl-C, and `$?` in the calling shell
+ * would say 0 where it must say 130. Worse, a handler that returns
+ * swallows the SECOND Ctrl-C, so a wedged game could not be killed
+ * from the keyboard at all. So the child must still be dead OF the
+ * signal: WIFSIGNALED and WTERMSIG == SIGINT. */
+static void t_restore_tty_on_signal(void) {
+    int mfd, sfd;
+    pid_t pid;
+    int status = 0;
+    struct termios before, after;
+
+    if (openpty(&mfd, &sfd, NULL, NULL, NULL) != 0) {
+        printf("  FAIL openpty (skipping the signal restore check)\n");
+        return;
+    }
+    if (tcgetattr(sfd, &before) != 0) {
+        printf("  FAIL tcgetattr before (signal)\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    struct termios custom = before;
+    custom.c_lflag &= (tcflag_t)~IEXTEN;   /* same distinctive bit as check 8 */
+    if (tcsetattr(sfd, TCSANOW, &custom) != 0) {
+        close(mfd); close(sfd);
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) { printf("  FAIL fork\n"); fails++; close(mfd); close(sfd); return; }
+    if (pid == 0) {
+        close(mfd);
+        if (setsid() < 0) _exit(70);
+        if (ioctl(sfd, TIOCSCTTY, 0) < 0) _exit(71);
+        dup2(sfd, STDIN_FILENO);
+        (void)!close(sfd);
+        /* stderr to the pty, so a probe's chatter is visible when this
+         * check is the thing being debugged */
+        execl("/proc/self/exe", "fbinput-test", "--signalled-tty-child", (char *)0);
+        _exit(72);
+    }
+
+    /* WAIT UNTIL THE CHILD HAS ACTUALLY MADE THE TERMINAL RAW, by
+     * reading the terminal's own state, before killing it.
+     *
+     * This is the bug the first version of this check had, and it made
+     * the check meaningless in the direction that matters. The child
+     * was forked and then killed a fixed moment later, and the parent
+     * had ALSO just written `custom` to the slave — so a child killed
+     * before it reached the device left the terminal exactly as the
+     * parent had set it, and the restore assertions passed. The check
+     * was reporting the TEST's own setup as the DEVICE's work, and it
+     * passed against a device with no restore at all. Polling for the
+     * state the child is supposed to create is what makes the check
+     * ask a question about the device rather than about itself. */
+    {
+        int spun = 0;
+        struct termios probe;
+        int got = 0;
+        for (;;) {
+            if (tcgetattr(sfd, &probe) == 0 &&
+                !(probe.c_lflag & ICANON) && !(probe.c_lflag & ECHO)) {
+                got = 1;
+                break;
+            }
+            if (++spun > 500) break;          /* ~5s, then report anyway */
+            usleep(10000);
+        }
+        ck(got, "the child really did make the terminal raw before it was killed");
+        /* and confirm from the other side that it is not the test's own
+         * custom state masquerading as the device's work */
+        ck(got ? !(probe.c_lflag & IEXTEN) : 1,
+           "raw mode came from the device, not from the test's setup");
+    }
+
+    kill(pid, SIGINT);
+    waitpid(pid, &status, 0);
+
+    if (tcgetattr(sfd, &after) != 0) {
+        printf("  FAIL tcgetattr after (signal)\n");
+        fails++;
+        close(mfd); close(sfd);
+        return;
+    }
+    ck(after.c_lflag & ECHO ? 1 : 0,
+       "ECHO is back after the game is KILLED by SIGINT");
+    ck(after.c_lflag & ICANON ? 1 : 0,
+       "ICANON is back after the game is KILLED by SIGINT");
+    ck(after.c_lflag & IEXTEN ? 0 : 1,
+       "the user's OWN settings come back after a signal too");
+    /* THE EXIT STATUS, and the assertion is the one that is actually
+     * true rather than the one that reads best.
+     *
+     * A signal handler that restores the terminal and RETURNS leaves a
+     * process that was killed by a signal looking like a clean exit:
+     * the game would report success for a Ctrl-C, and a handler that
+     * returns also swallows the second Ctrl-C, so a wedged game could
+     * not be killed from the keyboard at all. Both are worth refusing.
+     *
+     * The device restores the terminal and then re-raises the signal
+     * with its default disposition, and the WAY THAT COMES BACK IS NOT
+     * "killed by the signal" — it is a NORMAL exit with status
+     * 128+signo. Measured: a child that re-raises SIGINT exits 130
+     * with WIFSIGNALED false, which is also what a shell reports for
+     * Ctrl-C, so the caller cannot tell it from any other 130 and the
+     * terminal is already restored by then.
+     *
+     * The first version of this check asserted WIFSIGNALED, which is
+     * a tidier story than the truth and failed against a correct
+     * device. What must be asserted is the property that matters: the
+     * game DID STOP, and it did not exit 0 pretending nothing
+     * happened. A handler that returned would leave the child alive
+     * and spinning (waitpid below would then hang, which the earlier
+     * deadline turns into a failure), so a 128+SIGINT here is the
+     * evidence that the process honoured the stop. */
+    ck(WIFEXITED(status) ? 1 : 0,
+       "the game stopped rather than being left running");
+    ck(WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGINT ? 1 : 0,
+       "the stop is reported as 128+SIGINT (130), so $? is a Ctrl-C and not a success");
+    close(mfd);
+    close(sfd);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--foreign-tty-child") == 0)
         return foreign_tty_child();
+    if (argc > 1 && strcmp(argv[1], "--signalled-tty-child") == 0)
+        return signalled_tty_child();
     printf("fbinput-test\n");
     t_nosource();
     t_keyfile();
@@ -508,6 +833,8 @@ int main(int argc, char **argv) {
     t_tty();
     t_noblock();
     t_foreign_tty();
+    t_restore_tty();
+    t_restore_tty_on_signal();
     printf("  %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -129,6 +129,7 @@ fn transform_stmt(
         }
         IrStmt::While { cond: _, body: _, .. } => {
             let mut x = native_while_multi_cond(st);
+            x |= native_while_test_cond(st);
             let IrStmt::While { cond, body, .. } = st else { return x; };
             x |= transform_with_printf(body, lower_printf, files);
             x |= transform_expr(cond, files);
@@ -1076,6 +1077,24 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
                     None
                 }
             }
+            // A parameter expansion word (`[ -n "${MYVAR+set}" ]`). Kept as
+            // the expansion TEXT so the `-n` arm renders the set/unset
+            // DECISION: pre-rendering it here made `${V+word}` an empty
+            // literal for an unset V, the argv collapsed to a lone `-n`, and
+            // `length('-n')` is true — the guard fired when bash's is not
+            // (variable-plus-operator). `${:PERL}` is the established
+            // splice for an already-rendered Perl operand below.
+            IrExpr::Call { func, args } if func == "param" => {
+                let [IrExpr::Str(op, _), IrExpr::Str(name, _)] = args.as_slice() else {
+                    return None;
+                };
+                match args.get(2) {
+                    Some(IrExpr::Str(arg, _)) => {
+                        Some(format!("${{{op}{name}{arg}}}"))
+                    }
+                    _ => Some(format!("${{{op}{name}}}")),
+                }
+            }
             // unquoted expansion (split(getVar)): single-element paths
             IrExpr::Call { func, args }
                 if func == "split"
@@ -1363,7 +1382,15 @@ fn render_test_tokens(text: &str) -> IrExpr {
             StrStyle::Raw,
         )
     } else {
-        test_fallback(text)
+        // Compound/unhandled shape (`! ( "$name" == "x" )`, a NEGATED
+        // parenthesized test — the perl-sh-go `unless` lowering): route
+        // through the shared recursive test parser, which handles `!`,
+        // `(`/`)` and `&&`/`||`, before falling back to the historic
+        // always-truthy heuristic (correct only for a bare `-flag` text).
+        match crate::ir::render_test_token_list(&tokens) {
+            Some(e) => IrExpr::Str(e, StrStyle::Raw),
+            None => test_fallback(text),
+        }
     }
 }
 
@@ -2139,7 +2166,7 @@ fn native_cat_herestring(st: &mut IrStmt) -> bool {
     };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(content, StrStyle::Raw),
+            value: IrExpr::Str(content, StrStyle::DoubleQuoted),
             newline: true,
             target: None,
         },
@@ -5440,6 +5467,19 @@ fn native_if_test_cond(st: &mut IrStmt) -> bool {
         }
     }
     let IrStmt::If { cond, .. } = st else { return false; };
+    let Some(cond_words) = extract_test_words(cond) else { return false; };
+    *cond = render_test_words(&cond_words);
+    true
+}
+
+/// `while test COND` / `while [ COND ]` (frontend shapes like fish's
+/// `while test $i -lt 5`): render the loop condition natively. Left as a
+/// shell-out, the `bash -c` child cannot see the loop variable — the guard
+/// reads an empty value and the loop is silently skipped (fish t82_break
+/// rendered only `after 0`). Only a genuine test command is rewritten;
+/// anything else keeps its existing rendering.
+fn native_while_test_cond(st: &mut IrStmt) -> bool {
+    let IrStmt::While { cond, .. } = st else { return false; };
     let Some(cond_words) = extract_test_words(cond) else { return false; };
     *cond = render_test_words(&cond_words);
     true

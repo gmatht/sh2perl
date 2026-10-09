@@ -2404,9 +2404,24 @@ impl Parser {
             } else {
                 // For non-assignment expressions like ((i++)),
                 // create a simple command that evaluates the expression
+                //
+                // The arg is marked QUOTED (`Some`) on purpose: `(( ))` and
+                // `let` args are arithmetic, never glob or field-split
+                // context. Synthesizing it as unquoted (`None`) sent it
+                // through arg_word_ir's glob-tagging path, so `((x *= 2))`
+                // emitted `exec let \x01SH2GLOB\x01x *= 2`. The GLOB_MAGIC
+                // prefix then made `let_arg_text`/parse_arith fail, so the
+                // arith_forms transform refused the node and the whole
+                // `(( ))` stayed an opaque exec — every backend but estree
+                // (whose JS runtime implements `let` in evalArith) then
+                // rendered a `let` binary call that does not exist, or
+                // dropped the store write entirely. Marking it quoted keeps
+                // the arith text literal AND lets arith_forms lower it to
+                // the structured Assign{Arith} shape. REFUSE > GUESS holds
+                // for `let`: the argument is a formula, not a filename.
                 return Ok(Command::Simple(SimpleCommand {
                     name: Word::Literal("let".to_string(), None),
-                    args: vec![Word::Literal(expr.to_string(), None)],
+                    args: vec![Word::Literal(expr.to_string(), Some(()))],
                     redirects: vec![],
                     env_vars: BTreeMap::new(),
                     stdout_used: true,
@@ -2435,9 +2450,12 @@ impl Parser {
                     operator: AssignmentOperator::Assign,
                 }));
             } else {
+                // Same arithmetic-context rule as the single-expression
+                // branch above: quoted marker, so the arith text never
+                // picks up GLOB_MAGIC and arith_forms can lower it.
                 commands.push(Command::Simple(SimpleCommand {
                     name: Word::Literal("let".to_string(), None),
-                    args: vec![Word::Literal(expr.to_string(), None)],
+                    args: vec![Word::Literal(expr.to_string(), Some(()))],
                     redirects: vec![],
                     env_vars: BTreeMap::new(),
                     stdout_used: true,

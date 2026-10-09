@@ -1359,6 +1359,15 @@ fn first_code_newline(s: &str) -> Option<usize> {
             // scalar(@ARGV)).
             out.push_str("my $__argc = @ARGV;\n");
         }
+        // `$!` — the pid of the most recent background job. The `Background`
+        // arm assigns each fork's pid here, and `var_read("!")` reads it.
+        // bash leaves `$!` UNSET when no background job has run, so it
+        // expands to the empty string (`echo "bg: $!"` → `bg: `). `0` is a
+        // real, distinct value that a pid can never take, so the initializer
+        // must be `''` — with `0` the generator printed `bg: 0`.
+        if body.contains("$__sh2_last_bg") {
+            out.push_str("our $__sh2_last_bg = '';\n");
+        }
         if body.contains("$ls_success") {
             out.push_str("my $ls_success = 0;\n");
         }
@@ -1835,6 +1844,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             );
             emit_indent(out, indent);
             out.push_str(&format!("my ${pid} = fork();\n"));
+            // `$!` — bash's "pid of the last background job". Recorded in a
+            // stable variable (not the per-fork `$__sh2_bgN`, whose name
+            // depends on how many Background nodes the program has) so
+            // `var_read("!")` can resolve a `$!` read anywhere in the body.
+            emit_indent(out, indent);
+            out.push_str(&format!("$__sh2_last_bg = ${pid};\n"));
             emit_indent(out, indent);
             out.push_str(&format!("if (defined ${pid} && ${pid} == 0) {{\n"));
             for s in body.iter() {
@@ -1955,6 +1970,43 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     out.push_str(&format!(
                         "open(STDIN, '<', {}) or die \"Cannot read input: $!\\n\";\n",
                         render_word(&r.target)
+                    ));
+                    for s in inner {
+                        emit_stmt(out, s, indent + 1);
+                    }
+                    emit_indent(out, indent);
+                    out.push_str("}\n");
+                    return;
+                }
+            }
+            // `while …; do …; done <<< "text"` — a herestring feeding the
+            // loop's STDIN (the bat-sh-go `for /f %%a in ("lit")` lowering).
+            // bash appends a trailing newline to the herestring, so build the
+            // scalar with one and open an in-memory filehandle over it; `read`
+            // then consumes it line-wise exactly as under bash.
+            if let [IrStmt::While { .. }] = inner.as_slice() {
+                if let Some(r) = redirects
+                    .iter()
+                    .find(|r| matches!(r.fd, None | Some(0)) && r.mode == "herestring")
+                {
+                    static HS_SEQ: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let hs = format!(
+                        "__sh2_hs{}",
+                        HS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
+                    emit_indent(out, indent);
+                    out.push_str("{\n");
+                    emit_indent(out, indent + 1);
+                    out.push_str("local *STDIN;\n");
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!(
+                        "my ${hs} = {} . \"\\n\";\n",
+                        render_word(&r.target)
+                    ));
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!(
+                        "open(STDIN, '<', \\${hs}) or die \"Cannot read herestring: $!\\n\";\n"
                     ));
                     for s in inner {
                         emit_stmt(out, s, indent + 1);
@@ -2243,6 +2295,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             // Unique names per site: a second `my` in the
                             // same scope masks the first (warnings + a hidden
                             // lexical).
+                            //
+                            // fd 2 (`2>FILE`) redirects STDERR, not STDOUT.
+                            // Before this the emitter always hardcoded STDOUT,
+                            // so `cmd 2>/dev/null` silenced cmd's REAL output
+                            // and let its diagnostics through. `select` is a
+                            // STDOUT-only idiom (it rebinds the default output
+                            // handle), so for STDERR the default handle is
+                            // deliberately left untouched — inner `print`
+                            // output must still reach stdout.
+                            let is_stderr = r.fd == Some(2);
+                            let (h, lh) = if is_stderr {
+                                ("STDERR", "stderr")
+                            } else {
+                                ("STDOUT", "stdout")
+                            };
                             static RD2_SEQ: std::sync::atomic::AtomicUsize =
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = RD2_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2250,24 +2317,32 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             let sel = format!("$__sh2_rsel{n}");
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "open(my {fh}, '>&', \\*STDOUT) or die \"Cannot dup stdout: $!\\n\";\n"
+                                "open(my {fh}, '>&', \\*{h}) or die \"Cannot dup {lh}: $!\\n\";\n"
                             ));
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "close(STDOUT); open(STDOUT, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
+                                "close({h}); open({h}, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
                                 mode,
                                 render_word(&r.target),
                                 target
                             ));
-                            emit_indent(out, indent);
-                            out.push_str(&format!("my {} = select(STDOUT);\n", sel));
+                            if !is_stderr {
+                                emit_indent(out, indent);
+                                out.push_str(&format!("my {} = select(STDOUT);\n", sel));
+                            }
                             for s in inner {
                                 emit_stmt(out, s, indent);
                             }
                             emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
-                            ));
+                            if is_stderr {
+                                out.push_str(&format!(
+                                    "open(STDERR, '>&', {fh}) or die \"Cannot restore stderr: $!\\n\"; close({fh});\n"
+                                ));
+                            } else {
+                                out.push_str(&format!(
+                                    "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
+                                ));
+                            }
                         }
                         _ => {
                             emit_indent(out, indent);
@@ -2857,6 +2932,65 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 elems.iter().map(|e| render_word_list(*e)).collect();
                             emit_indent(out, indent);
                             out.push_str(&format!("push @{}, ({});\n", var, items.join(", ")));
+                            return;
+                        }
+                    }
+                    if func == "assign" {
+                        // `assign(NAME, OP, VALUE)` — the `y+=2` / `n-=1`
+                        // compound write. Without this the whole call fell
+                        // through to `ir_expr_to_perl`'s generic `_ =>` arm,
+                        // which renders `assign("y", "+=", "2")` as a call to
+                        // a sub that is never defined in the preamble — a
+                        // runtime death, not a bad render (examples/051_primes,
+                        // 062_hard_to_lex).
+                        //
+                        // The two forms differ by whether the TARGET is an
+                        // array: an array `+=` appends (`push`), a scalar
+                        // `+=` is numeric. The Assign target carries no sigil
+                        // for this shape (the frontend emits `assign` for
+                        // BOTH `y+=2` and `z+=(a b)`), so ask the program-wide
+                        // array census — a value-shape test misreads
+                        // `z+=${primes[@]:0:1}` (a single-word RHS appending
+                        // to an ARRAY) as a scalar add.
+                        if let IrExpr::Call { args, .. } = expr {
+                            let inner = args.first().and_then(call_arg_str).unwrap_or(var.clone());
+                            let op = match args.get(1).and_then(call_arg_str) {
+                                Some(o) if o != "=" => o,
+                                _ => "=".to_string(),
+                            };
+                            let value = args
+                                .get(2)
+                                .or_else(|| args.get(1))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    IrExpr::Str(String::new(), StrStyle::DoubleQuoted)
+                                });
+                            emit_indent(out, indent);
+                            if op == "+=" && array_var(&inner) {
+                                let items: Vec<String> = match &value {
+                                    IrExpr::Array(elems) => {
+                                        elems.iter().map(|e| render_word_list(e)).collect()
+                                    }
+                                    other => vec![render_word_list(other)],
+                                };
+                                out.push_str(&format!(
+                                    "push @{0}, ({1});\n",
+                                    inner,
+                                    items.join(", ")
+                                ));
+                            } else {
+                                // The numeric ops (`-=`, `*=`, `/=`) and
+                                // `+=` on a scalar are the same in both
+                                // languages — Perl's `+=` is numeric like
+                                // bash's on an integer.
+                                let rhs = ir_expr_to_perl(&value);
+                                out.push_str(&format!(
+                                    "{} {} {};\n",
+                                    perl_lhs_for(&inner),
+                                    op,
+                                    rhs
+                                ));
+                            }
                             return;
                         }
                     }
@@ -3669,6 +3803,11 @@ fn var_read(name: &str) -> String {
         "#" => "$__argc".to_string(),
         "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
         "?" => "$CHILD_ERROR".to_string(),
+        // `$!` — the pid of the most recent background job. The Background
+        // arm writes it; without this arm the name fell through to the
+        // generic branch and rendered `${!}` (an undefined Perl symbolic
+        // ref) — examples/grep_p.
+        "!" => "$__sh2_last_bg".to_string(),
         "@" => "@ARGV".to_string(),
         // `$*` is the positional params joined by the first IFS char (space
         // in the default IFS) — in scalar context `@ARGV` gave the COUNT.
@@ -4062,6 +4201,69 @@ fn strip_re(var: &str, pat: &str) -> String {
     format!("(({} =~ s{{{}}}{{}}r))", var, pat.replace('}', "\\}"))
 }
 
+/// Escape a `s///` REPLACEMENT for Perl's regex BODY.
+///
+/// The operand arrives as SOURCE TEXT, so it carries the shell's own
+/// backslash escapes (`${v/a/b\/c}` reaches us as `b\/c`), and the job is to
+/// translate each shell escape into the literal character it denotes BEFORE
+/// re-escaping for Perl. Escaping first instead would turn one source
+/// backslash into two emitted ones and print `b\/c` where bash prints `b/c`.
+///
+/// The two languages escape for different reasons:
+///
+///  * `/` terminates the substitution (`s/a/b/c/r` is a syntax error), so it
+///    must be escaped — but only a `/` that is NOT already escaped by a
+///    backslash, which the arm below consumes first;
+///  * `\` is Perl's escape character in a replacement, so a LITERAL backslash
+///    must become `\\` or it swallows the character after it;
+///  * `@` and `$` are INTERPOLATED into a replacement, so `${v/a/@b/}` would
+///    splice Perl's `@b` array instead of the text `@b`. Both are escaped.
+///
+/// An unrecognised escape keeps its backslash (`\q` → `\q`), which is what
+/// bash does for an operator it does not define; `\ ` (escaped space) and
+/// `\$`/`\@` become the bare character, since bash's rule is "a backslash
+/// quotes the next character".
+///
+/// `/` is escaped rather than switching to the brace delimiter `s{pat}{rep}`
+/// used by {@link strip_re}: the brace form suits prefix/suffix stripping but
+/// not here, because a glob PATTERN may legitimately contain unbalanced
+/// `{`/`}`, which `glob_to_regex` emits verbatim from the user's text.
+///
+/// Kept separate from the pattern side deliberately — a pattern needs REGEX
+/// metacharacter escaping (handled by `glob_to_regex`) and a replacement needs
+/// substitution-body escaping, which are not the same transformation.
+fn repl_for_regex(rep: &str) -> String {
+    let mut out = String::with_capacity(rep.len());
+    let mut chars = rep.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // A shell escape: emit the escaped character, escaped for Perl.
+            '\\' => match chars.next() {
+                // `\\` is a literal backslash → `\\\\` in the Perl body.
+                Some('\\') => out.push_str("\\\\"),
+                // An escaped character that Perl would re-interpret.
+                Some(ch @ ('/' | '$' | '@')) => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                // `\n`, `\t`, … mean what they mean in bash; `\q` means `\q`.
+                Some('n') => out.push_str("\\n"),
+                Some('t') => out.push_str("\\t"),
+                Some(ch) => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                None => out.push_str("\\\\"),
+            },
+            '/' => out.push_str("\\/"),
+            '@' => out.push_str("\\@"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// A parameter-expansion default/replacement value: a quoted literal is
 /// unquoted (`"default"` → `"default"`), everything else renders as a word.
 fn param_value(a: &IrExpr) -> String {
@@ -4139,10 +4341,6 @@ fn render_param(args: &[IrExpr]) -> String {
         .get(2)
         .map(param_value)
         .unwrap_or_else(|| "''".to_string());
-    let repl = args
-        .get(3)
-        .map(param_value)
-        .unwrap_or_else(|| "''".to_string());
     match op.as_str() {
         "" => var,
         // `${#var}` — the scalar length (the shIR's `len` op).
@@ -4170,6 +4368,46 @@ fn render_param(args: &[IrExpr]) -> String {
             v = var,
             d = val
         ),
+        // `${v+w}` / `${v:+w}` — the ALTERNATE-VALUE twins of `-`/`:-`.
+        // The predicate differs between the two and the distinction is
+        // load-bearing, so they cannot share an arm:
+        //
+        //   `+`  — is v SET?           strictly WEAKER than non-empty.
+        //   `:+` — is v set AND non-empty?
+        //
+        // A var assigned the empty string IS set, so `E=; echo ${E+d}`
+        // prints `d` while `${E:+d}` prints nothing. Folding `+` into the
+        // `:-` non-empty test therefore loses the payload for exactly the
+        // set-but-empty case, and — because `test -n` then sees a different
+        // length — can invert the branch outright:
+        //
+        //   if test -n "${V+x}"; then …    # bash: taken iff V is SET
+        //
+        // Before these arms, `+` fell through to the catch-all `_ => var`,
+        // which renders the VARIABLE — dropping `x` entirely and making
+        // `test -n` read the value rather than the set-ness. Unset V
+        // rendered as an empty read that still had length under `warn`, and
+        // the `+` operand reached the renderer already rewritten to `=` by
+        // the generator pre-pass, which rendered `($ENV{V} = "x")` — an
+        // ASSIGNMENT with a side effect, making the branch permanently true.
+        "+" => {
+            if var.starts_with('@') {
+                format!("(@ARGV ? {d} : '')", d = val)
+            } else {
+                format!("(defined({v}) ? {d} : '')", v = var, d = val)
+            }
+        }
+        ":+" => {
+            if var.starts_with('@') {
+                format!("(@ARGV ? {d} : '')", d = val)
+            } else {
+                format!(
+                    "((defined({v}) && length({v})) ? {d} : '')",
+                    v = var,
+                    d = val
+                )
+            }
+        }
         // Prefix removal: # shortest, ## longest. The `:` forms (only when
         // non-empty) are approximated by the plain forms.
         // Prefix removal: # shortest, ## longest (approximated by the
@@ -4252,13 +4490,29 @@ fn render_param(args: &[IrExpr]) -> String {
             }
         }
         // Substitution: / first, // all.
-        "/" => format!(
-            "(({} =~ s/{}/{}/r))",
-            var,
-            glob_to_regex(&val),
-            repl.trim_matches('\\')
-        ),
-        "//" | "/" => {
+        //
+        // The operands are read with `call_arg_str` (RAW text), never through
+        // `param_value`. `param_value` renders a `Str` via
+        // `render_str_literal`, whose job is to emit a Perl STRING LITERAL —
+        // correct for a default (`${a:-abc}` really does want `"abc"`), wrong
+        // here. The two operands are a PATTERN and a REPLACEMENT, and they
+        // are spliced into a REGEX position, so the quotes came back out as
+        // part of the pattern:
+        //
+        //     s=abc:def:ghi; echo "${s/abc/XYZ}"
+        //     ⇒ print((($s =~ s/"abc"/"XYZ"/r)), "\n");
+        //
+        // Perl compiles that as "the six characters `\"abc\"`", which never
+        // occur in the subject, so the match fails, `s///r` returns the
+        // subject UNCHANGED, and the substitution is a SILENT no-op: correct
+        // exit code, no warning, wrong text. `glob_to_regex` below does the
+        // escaping this operand was always meant to receive.
+        //
+        // This arm also SHADOWED the `"//" | "/"` arm that follows it. In a
+        // Rust `match` the FIRST matching arm wins, so that arm was dead code
+        // and the plain `/` form silently took this path; it is folded in here
+        // rather than left as a trap.
+        "/" | "//" => {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             let rep = args.get(3).and_then(call_arg_str).unwrap_or_default();
             let g = if op == "//" { "g" } else { "" };
@@ -4266,7 +4520,7 @@ fn render_param(args: &[IrExpr]) -> String {
                 "(({} =~ s/{}/{}/{g}r))",
                 var,
                 glob_to_regex(&pat),
-                rep.trim_matches('\\')
+                repl_for_regex(&rep)
             )
         }
         // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
@@ -4295,6 +4549,17 @@ fn render_param(args: &[IrExpr]) -> String {
             // A NON-`@` offset on a SCALAR variable is a substring
             // `${s:off:len}`: `substr`. The A1 drops `[@]`, so consult the
             // program's array census (`numbers[@]:3:4` stays a slice).
+            //
+            // `${arr[@]:off:len}` reaches here with the `[@]` still on the
+            // NAME, so `array_var("primes[@]")` is false and the census is
+            // asked about the wrong name — the slice took the substring branch
+            // and emitted `substr($primes[$@], 0, 1)` ("Argument "" isn't
+            // numeric in array or hash lookup", examples/051_primes line 9).
+            // Drop the subscript suffix first so the census sees `primes`.
+            let name = name
+                .strip_suffix("[@]")
+                .or_else(|| name.strip_suffix("[0]"))
+                .unwrap_or(&name);
             if raw_off != "@" && !array_var(&name) {
                 // The offset/length may be VARIABLES — `${flags:j:1}` is the
                 // bash idiom for `substr($flags, $j, 1)`; emitting the bare
@@ -4370,10 +4635,12 @@ fn render_param(args: &[IrExpr]) -> String {
                 }
                 _ => i64::MAX, // unbounded → to the last element
             };
+            // `${arr[@]:off:len}` — the `[@]` was already stripped from `name`
+            // above so the census (and this interpolation) see the bare array.
             if end == i64::MAX {
-                format!("@{}[{}..$#{}]", name, off, name)
+                format!("@{0}[{1}..$#{0}]", name, off)
             } else {
-                format!("@{}[{}..{}]", name, off, end)
+                format!("@{0}[{1}..{2}]", name, off, end)
             }
         }
         _ => {
@@ -4965,10 +5232,21 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
         out.push_str(line);
         out.push('\n');
     }
+    // A command carrying a shell expansion must have its VALUES substituted
+    // into the emitted literal. `safe_perl_q_string` escapes `$` so PERL does
+    // not interpolate — which also stops BASH from ever expanding it, so a
+    // `bash -c` seam would silently run `echo ${!aa[@]}` with the literal
+    // text and lose the value (perl-generator-20261002-053100: 6 examples).
+    // The %ENV prelude above only carries bare NAMES, never a compound
+    // expansion (`${arr[@]}`, `${!h[@]}`, `${h[k]}`).
+    let quoted = match sh_cmd_value_expr(cmd) {
+        Some(expr) => expr,
+        None => safe_perl_q_string(cmd),
+    };
     emit_indent(out, indent);
     out.push_str(&format!(
         "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-        safe_perl_q_string(cmd)
+        quoted
     ));
 }
 
@@ -5573,10 +5851,34 @@ fn var_ref_name(e: &IrExpr) -> Option<String> {
 /// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, ` <<< s`,
 /// ` <<DELIM\nbody\nDELIM`) to cmd. Returns false for unknown modes.
 fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) -> bool {
-    let tstr = call_arg_str(target).unwrap_or_default();
+    // A redirect target is frequently NOT a literal: `sort <<<"${cfg[*]}"`
+    // carries a `param("slice", …)` expansion. `call_arg_str` yields None for
+    // such a node and the old `.unwrap_or_default()` turned that into an EMPTY
+    // target — `<<<''` — so the herestring read nothing and the command
+    // produced a silently wrong (empty) answer instead of refusing.
+    // Render the real shell text; refuse (false) only if we cannot.
+    let tstr = match call_arg_str(target) {
+        Some(s) => s,
+        None => bash_word_for(target),
+    };
+    if tstr.is_empty() {
+        // Nothing renderable: refuse rather than emit an empty target, which
+        // would silently produce a wrong answer (`<<<''`).
+        return false;
+    }
     match mode {
         "herestring" => {
-            cmd.push_str(&format!(" <<< '{}'", tstr.replace('\'', "'\\\\''")));
+            // `bash_word_for` yields the NATIVE shell form for an expansion
+            // (`"${cfg[*]}"`), which MUST reach bash un-single-quoted or the
+            // expansion is suppressed and the herestring reads nothing. A
+            // literal target was already shell-quoted by `bash_word_for`, so
+            // only single-quote it when it is not already a quoted word.
+            let rendered = if tstr.contains('$') {
+                tstr.clone()
+            } else {
+                format!("'{}'", tstr.replace('\'', "'\\\\''"))
+            };
+            cmd.push_str(&format!(" <<< {}", rendered));
             return true;
         }
         "heredoc" | "heredoc-tabs" => {
@@ -5967,6 +6269,23 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             parts.push(cmd);
             continue;
         }
+        // An `IrStmt::Pipeline` as a capture body (``echo `ls | grep -v a` ``):
+        // the Arrow-wrapped `pipeline` Call form rebuilds via expr_to_cmd
+        // above, but a command substitution whose body is a pipeline arrives
+        // as this STATEMENT variant. Without this arm the rebuild returned
+        // None and the capture's VALUE was dropped — `echo `cmd`` rendered
+        // `print('', "\n")` (perl-generator-20261002-053000: the substituted
+        // output silently vanished from stdout).
+        if let IrStmt::Pipeline { stages, .. } = s {
+            let stage_exprs: Vec<IrExpr> = stages
+                .iter()
+                .map(|st| IrExpr::Arrow(st.clone()))
+                .collect();
+            let stage_refs: Vec<&IrExpr> = stage_exprs.iter().collect();
+            let cmd = stages_to_shell_cmd(&stage_refs)?;
+            parts.push(cmd);
+            continue;
+        }
         // a statement the rebuild can't express kills the whole command
         return None;
     }
@@ -5974,6 +6293,23 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
         None
     } else {
         Some(parts.join("; "))
+    }
+}
+
+/// Rebuild a shell command string from `stages` (each already an
+/// `IrExpr`), joining them with ` | `.
+/// A stage whose shell text cannot be rebuilt must NOT be silently
+/// DROPPED — the command would lose a producer (`paste <(…) <(…) | head`
+/// became `head`). Refuse, so the caller emits the stages natively.
+fn stages_to_shell_cmd(stages: &[&IrExpr]) -> Option<String> {
+    let mut out: Vec<String> = Vec::with_capacity(stages.len());
+    for s in stages {
+        out.push(arrow_to_cmd(s)?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(" | "))
     }
 }
 
@@ -6396,27 +6732,15 @@ fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
         if func == "pipeline" {
             // Stages arrive as pipeline([Arrow, Arrow, …]) or
             // pipeline([Array([Arrow, Arrow, …])]).
-            let mut stage_exprs: Vec<&IrExpr> = Vec::new();
+            let mut stages: Vec<&IrExpr> = Vec::new();
             for a in args {
                 if let IrExpr::Array(elems) = a {
-                    stage_exprs.extend(elems.iter());
+                    stages.extend(elems.iter());
                 } else {
-                    stage_exprs.push(a);
+                    stages.push(a);
                 }
             }
-            let mut stages: Vec<String> = Vec::new();
-            for a in &stage_exprs {
-                // A stage whose shell text cannot be rebuilt (the
-                // process-substitution materialisation is an `and`
-                // closure) must NOT be silently DROPPED — the command
-                // would lose a producer (`paste <(…) <(…) | head` became
-                // `head`). Refuse, so the caller emits the stages natively.
-                stages.push(arrow_to_cmd(a)?);
-            }
-            if stages.is_empty() {
-                return None;
-            }
-            return Some(stages.join(" | "));
+            return stages_to_shell_cmd(&stages);
         }
     }
     None
@@ -6426,7 +6750,14 @@ fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
 /// substitution `$(…)` / backticks) whose closure body is an exec/pipeline.
 fn capture_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
-        if func == "capture" {
+        // The A1 spells command substitution `captureWords` in unquoted word
+        // position (`for k in $(echo … | sort)`); `capture` is the scalar /
+        // assignment-position spelling. Only handling `capture` made every
+        // `captureWords` iterator fall through to the joined-STRING render,
+        // so `for k in $(…)` ran ONE iteration carrying the whole value
+        // instead of one per word (`join(' ', split(…))` collapses the list
+        // back to a single scalar).
+        if func == "capture" || func == "captureWords" {
             for a in args {
                 if let Some(cmd) = arrow_to_cmd(a) {
                     return Some(cmd);
@@ -6627,6 +6958,29 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             let has_split = words[1..]
                 .iter()
                 .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+            // bash `printf %c` prints the FIRST CHARACTER of the argument
+            // (`printf '%c' 65` → `6`, `printf '%c' hello` → `h`); Perl's
+            // `%c` NUMIFIES the argument instead (`"hello"` → NUL). When the
+            // format is a literal and the args are positional (one per
+            // conversion), wrap each `%c` operand in `substr(…, 0, 1)` so the
+            // emitted Perl matches bash (c-sh-go t10_string_pointer:
+            // `printf("%c\n", s[0])` printed a NUL, not `h`).
+            let mut rest = rest;
+            let c_convs: Option<Vec<char>> = literal_printf_conversions(&words[0]);
+            if !has_split {
+                if let Some(convs) = &c_convs {
+                    if !rest.is_empty() && rest.len() == convs.len() {
+                        for (i, c) in convs.iter().enumerate() {
+                            if *c == 'c' {
+                                // Perl's `%c` takes a CODE POINT: `ord` of the
+                                // first character (`"h"` → 104 → `h`); bash's
+                                // `%c` prints that same first character.
+                                rest[i] = format!("ord(substr({}, 0, 1))", rest[i]);
+                            }
+                        }
+                    }
+                }
+            }
             // placeholder count in the (rendered) format: a `%` not part of
             // a `%%` pair is one conversion. Computed on the RENDERED literal
             // so Interpolate formats (`"%s-%s\n"` → Interpolate Lit) count
@@ -6833,7 +7187,16 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
         "read" => {
-            if let Some(n) = words.first().and_then(|w| call_arg_str(w)) {
+            // `read [-flags] VAR` — the leading options (`-r`, `-p`, `-n`, …)
+            // are NOT the target variable: bash reads one line into the first
+            // non-flag word. Taking `words.first()` made `read -r line` emit
+            // `$-r = $__line;`, a Perl syntax error (triage t36_read_stdin).
+            if let Some(n) = words
+                .iter()
+                .copied()
+                .filter_map(call_arg_str)
+                .find(|w| !w.starts_with('-'))
+            {
                 emit_indent(out, indent);
                 out.push_str(&format!("chomp(my $__line = <STDIN>); ${} = $__line;\n", n));
             }
@@ -7093,10 +7456,15 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
-                    // setArray RHS → the target is an array even if the sigil
-                    // annotation is absent.
-                    let is_array_rhs =
-                        matches!(expr, IrExpr::Call { func, .. } if func == "setArray");
+                    // setArray/setArrayAppend RHS → the target is an array even
+                    // if the sigil annotation is absent. `z+=(a b)` lowers to
+                    // setArrayAppend, and the emit_stmt `+=` arm renders it as
+                    // `push @z, (...)`; declaring `my $z` instead makes the
+                    // program die at compile time with "Global symbol @z
+                    // requires explicit package name" (examples/051_primes
+                    // line 9).
+                    let is_array_rhs = matches!(expr, IrExpr::Call { func, .. }
+                        if func == "setArray" || func == "setArrayAppend");
                     // An uppercase ARRAY is not an env var: the env-style
                     // heuristic must not skip its declaration (`LIST=()` left
                     // `@LIST` undeclared — examples/parse-array-plusassign).
@@ -7151,7 +7519,22 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
             IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "assign" => {
                 if let Some(name) = args.first().and_then(call_arg_str) {
                     if !is_env_style_var_name(&name) && !out.iter().any(|(n, _)| n == &name) {
-                        out.push((name, Sigil::Scalar));
+                        // `z+=(a b)` is an ARRAY append — the emitter lowers
+                        // it to `push @z, (...)`, so declaring `my $z` here
+                        // emits a program that dies at compile time ("Global
+                        // symbol @z requires explicit package name",
+                        // examples/051_primes line 9). The frontend emits
+                        // `assign` for both `y+=2` and `z+=(a b)`, so ask the
+                        // same program-wide census the emitter's `+=` arm uses
+                        // rather than a value-shape test (which misreads
+                        // `z+=${primes[@]:0:1}`, a single-word RHS appending
+                        // to an array).
+                        let sigil = if array_var(&name) {
+                            Sigil::Array
+                        } else {
+                            Sigil::Scalar
+                        };
+                        out.push((name, sigil));
                     }
                 }
                 for a in args {
@@ -7276,6 +7659,63 @@ fn var_is_declarable(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A `read VAR…` target is a variable the SCRIPT assigns, so it must be
+/// declared even when it carries the reserved `__` prefix: a frontend may
+/// name a scratch variable `__frest` (the bat `for /f` "rest of line"
+/// lowering), and `var_is_declarable` refuses `__*` to protect the backend's
+/// own temporaries — leaving the rendered `$__frest` an undeclared global
+/// under `use strict` (bat t24_forf2). The backend's internal prefix
+/// (`__sh2*`) stays excluded.
+fn read_target_is_declarable(name: &str) -> bool {
+    var_is_declarable(name)
+        || (name.starts_with("__")
+            && !name.starts_with("__sh2")
+            && !is_env_style_var_name(name)
+            && name != "main_exit_code"
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The ordered printf conversion characters of a LITERAL format word
+/// (`%c`/`%s`/`%d`…; `%%` is not a conversion), or `None` when the format is
+/// not a single literal (a dynamic `$fmt` cannot be mapped to its args).
+/// Used to give a positional `%c` operand bash's first-character semantics.
+fn literal_printf_conversions(fmt: &IrExpr) -> Option<Vec<char>> {
+    let text: String = match fmt {
+        IrExpr::Str(s, _) => s.clone(),
+        IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(t) => t.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        }
+        _ => return None,
+    };
+    let mut convs = Vec::new();
+    let mut cs = text.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c != '%' {
+            continue;
+        }
+        if cs.peek() == Some(&'%') {
+            cs.next();
+            continue;
+        }
+        // Skip flags/width/precision, then take the conversion letter.
+        let mut conv = None;
+        for c2 in cs.by_ref() {
+            if c2.is_ascii_alphabetic() {
+                conv = Some(c2);
+                break;
+            }
+        }
+        convs.push(conv.unwrap_or('?'));
+    }
+    Some(convs)
+}
+
 /// Collect vars READ via getVar/param/Var (recursively) so the preamble can
 /// declare them too — `use strict` fails on any undeclared read, and bash
 /// reads of unset vars yield empty strings (a `my $x;` matches that).
@@ -7356,7 +7796,7 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                                 if n.starts_with('-') {
                                     continue;
                                 }
-                                if var_is_declarable(&n)
+                                if read_target_is_declarable(&n)
                                     && !out.iter().any(|(name, _)| name == &n)
                                 {
                                     out.push((n, Sigil::Scalar));
@@ -7614,6 +8054,54 @@ fn collect_vars_from_test_string(s: &str, out: &mut Vec<(String, Sigil)>) {
     }
 }
 
+/// The expression-position twin of [`rewrite_fn_calls`]: rewrite
+/// `exec(foo, …)` to the `$fn_call` marker when `foo` is a function defined in
+/// the program. `if is_prime $n; then` puts the call in the CONDITION, and the
+/// statement-level pass cannot see it (it only matches `IrStmt::Expr`).
+fn rewrite_fn_calls_in_expr(e: &IrExpr, fns: &std::collections::HashSet<String>) -> IrExpr {
+    match e {
+        IrExpr::Call { func, args } => {
+            let args: Vec<IrExpr> = args.iter().map(|a| rewrite_fn_calls_in_expr(a, fns)).collect();
+            if func == "exec" {
+                if let Some(name) = args.first().and_then(call_arg_str) {
+                    if fns.contains(&name) {
+                        return IrExpr::Call {
+                            func: "$fn_call".to_string(),
+                            args,
+                        };
+                    }
+                }
+            }
+            IrExpr::Call {
+                func: func.clone(),
+                args,
+            }
+        }
+        IrExpr::BinOp { lhs, op, rhs } => IrExpr::BinOp {
+            lhs: Box::new(rewrite_fn_calls_in_expr(lhs, fns)),
+            op: op.clone(),
+            rhs: Box::new(rewrite_fn_calls_in_expr(rhs, fns)),
+        },
+        IrExpr::Ternary { cond, then, else_ } => IrExpr::Ternary {
+            cond: Box::new(rewrite_fn_calls_in_expr(cond, fns)),
+            then: Box::new(rewrite_fn_calls_in_expr(then, fns)),
+            else_: Box::new(rewrite_fn_calls_in_expr(else_, fns)),
+        },
+        IrExpr::DefinedOr { expr, default } => IrExpr::DefinedOr {
+            expr: Box::new(rewrite_fn_calls_in_expr(expr, fns)),
+            default: Box::new(rewrite_fn_calls_in_expr(default, fns)),
+        },
+        IrExpr::Array(elems) => {
+            IrExpr::Array(elems.iter().map(|a| rewrite_fn_calls_in_expr(a, fns)).collect())
+        }
+        IrExpr::Capture { expr, native } => IrExpr::Capture {
+            expr: Box::new(rewrite_fn_calls_in_expr(expr, fns)),
+            native: *native,
+        },
+        other => other.clone(),
+    }
+}
+
 /// Rewrite `exec(foo, …)` calls to the `$fn_call` marker when `foo` is a
 /// function defined in the program (recursively into compound bodies).
 fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -> Vec<IrStmt> {
@@ -7631,27 +8119,34 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                 }
                 s.clone()
             }
+            // A call in CONDITION position — `if is_prime $n; then`
+            // (examples/051_primes line 50) — is as common as the statement
+            // form and was NOT rewritten: the arm cloned `cond` verbatim, so
+            // the exec fell through emit_exec_call's shell-out and became
+            // `system('bash','-c','"is_prime" $candidate')` → "bash: line 1:
+            // is_prime: command not found", even though `sub is_prime` was
+            // emitted a few lines above. Descend into the condition.
             IrStmt::If {
                 cond,
                 then,
                 elsifs,
                 else_,
             } => IrStmt::If {
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 then: rewrite_fn_calls(then, fns),
                 elsifs: elsifs
                     .iter()
-                    .map(|(c, b)| (c.clone(), rewrite_fn_calls(b, fns)))
+                    .map(|(c, b)| (rewrite_fn_calls_in_expr(c, fns), rewrite_fn_calls(b, fns)))
                     .collect(),
                 else_: rewrite_fn_calls(else_, fns),
             },
             IrStmt::While { cond, body } => IrStmt::While {
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 body: rewrite_fn_calls(body, fns),
             },
             IrStmt::DoWhile { body, cond, until } => IrStmt::DoWhile {
                 body: rewrite_fn_calls(body, fns),
-                cond: cond.clone(),
+                cond: rewrite_fn_calls_in_expr(cond, fns),
                 until: *until,
             },
             IrStmt::For { var, iter, body } => IrStmt::For {
@@ -7734,6 +8229,24 @@ fn render_test_expr(s: &str) -> String {
         "0".to_string()
     } else {
         expr
+    }
+}
+
+/// Parse an already-tokenized test expression (the `[ ]`/`[[ ]]` tokenizer's
+/// output, with any trailing `[[` marker already removed) with the recursive
+/// `!`/`(`/`&&`/`||` parser. Returns `None` for an empty token list.
+///
+/// Shared with the native-stmt transform's test fallback so COMPOUND tests
+/// (`! ( "$name" == "x" )` — a perl-sh-go `unless` lowering) render natively
+/// instead of the historic always-truthy `$t =~ /-\w+/` heuristic.
+pub(crate) fn render_test_token_list(toks: &[String]) -> Option<String> {
+    let toks = normalize_test_tokens(toks.to_vec());
+    let mut i = 0;
+    let expr = parse_test_or(&toks, &mut i);
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr)
     }
 }
 
@@ -8180,7 +8693,11 @@ fn perl_compare_op(op: &str) -> &'static str {
 /// `${…}` text → Perl via the shared `render_param` (the test-flattened
 /// form keeps the raw expansion). Returns None when it isn't a plain
 /// parameter expansion.
-fn param_text_to_perl(tok: &str) -> Option<String> {
+///
+/// `pub(crate)`: `src/transforms/shir_native_stmt.rs` calls this from the
+/// `-n`/`-z` parameter-expansion lowering, which needs the expansion's VALUE
+/// rather than its text.
+pub(crate) fn param_text_to_perl(tok: &str) -> Option<String> {
     let inner = tok.strip_prefix("${")?.strip_suffix('}')?;
     if inner.is_empty() {
         return None;
@@ -8235,16 +8752,44 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
     // `${s:off:len}` — the substring/slice form (`${flags:j:1}`). The `:`
     // also introduces `:-`/`:=`/`:?`/`:+`, which the operator list below
     // handles, so only a `:digit`/`:$` continuation is a slice.
-    if let Some(rest) = rest.strip_prefix(':') {
-        // `:` followed by anything that is NOT one of the parameter
-        // operators (`:-`, `:=`, `:?`, `:+`) is a slice. An identifier
-        // subscript (`${flags:j:1}`) is the common shell idiom for
-        // `substr(..., $j, 1)`.
-        let is_op = [':', '=', '?', '+']
-            .iter()
-            .any(|c| rest.starts_with(*c));
+    //
+    // The operator-vs-slice decision has to be made on the two-character
+    // prefix. Reading only the single `:` character made EVERY `:-` look like
+    // a slice, so `${a:-${b:-$(cmd)}}` re-lexed textually became
+    // `substr($b, -$(cmd))` — the `-` taken as a negative slice offset — which
+    // emitted Perl with a bare `$(` (Perl's GID special variable): the file
+    // failed to COMPILE and every other construct in it was lost
+    // (perl-20261002-231200; corpus 063_04 and 063_hard_to_parse). Nesting
+    // depth 0-2 was unaffected because their `:-` was the OUTERMOST operator
+    // and so arrived structurally lowered, never through this textual
+    // fallback.
+    //
+    // bash's own rule: `:-` is the default operator only when the `-` follows
+    // the `:` immediately. A space makes it a slice offset — with
+    // `a=abcdef`, `${a:-1}` is `abcdef` and `${a: -1}` is `f`. The parser
+    // encodes that by keeping the space in the slice's offset text (it lowers
+    // `${a: -1}` to `param("slice", "a", " -1", "")` and `${a:-1}` to
+    // `param(":-", "a", "1")`), so this textual fallback applies the same
+    // test the parser already applies.
+    if rest.starts_with(':') {
+        // `:`-operator ⇒ fall through to the operator loop below. This is
+        // the WHOLE of the decision: bash reads `:-`/`:=`/`:?`/`:+` as the
+        // parameter operators, and EVERY other `:` continuation as a slice
+        // offset (`${a:1:3}`, `${a: -1}`, `${flags:j:1}`).
+        //
+        // The operator is the TWO-character PREFIX `:` followed by one of
+        // `- = ? +`. Testing the single character `:` instead — which is what
+        // `[':', '=', '?', '+'].iter().any(|c| rest.starts_with(...))` did —
+        // matched EVERY `:` continuation, so `:-` never reached the operator
+        // loop and always fell into the slice branch. That is the defect this
+        // branch exists to prevent.
+        let is_op = rest.len() >= 2 && matches!(rest.as_bytes()[1], b'-' | b'=' | b'?' | b'+');
         if !is_op {
-        
+            // A slice. Consume the `:` and split offset from (optional)
+            // length. The leading space of `${a: -1}` is significant and is
+            // kept: it is exactly what distinguishes the slice from the
+            // `:-` operator, and the parser preserves it the same way.
+            let rest = &rest[1..];
             let (off, len) = match rest.split_once(':') {
                 Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
                 None => (rest.trim().to_string(), String::new()),
@@ -8273,15 +8818,34 @@ fn param_text_to_perl(tok: &str) -> Option<String> {
 pub(crate) fn render_test_operand(tok: &str) -> String {
     // Strip surrounding source quotes (`"${arr[@]}"` arrives with them).
     let tok = tok.trim();
-    let tok = if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
-        &tok[1..tok.len() - 1]
-    } else {
-        tok
-    };
+    let was_quoted = tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"');
+    let tok = if was_quoted { &tok[1..tok.len() - 1] } else { tok };
     // `${…}` parameter expansion inside a test operand.
     if tok.starts_with("${") && tok.ends_with('}') {
         if let Some(p) = param_text_to_perl(tok) {
             return p;
+        }
+    }
+    // Tilde expansion. bash expands a LEADING `~` to $HOME before either
+    // operand is compared, so `[ ~ = "$HOME" ]` is TRUE and
+    // `[ ~/Documents = "$HOME/Documents" ]` likewise. The spaced `[ ]`
+    // tokenizer hands `~` here as an ordinary word; without this arm it fell
+    // through to the bare-literal fallthrough and emitted `'~'`, a string
+    // that can never equal $HOME (043_home.sh printed `-` where bash
+    // printed `1`). Mirrors the arms in `flat_operand`.
+    //
+    // bash does NOT expand a QUOTED tilde, so the arm is gated on the
+    // source quotes this function strips above. `~user` is deliberately not
+    // handled: bash leaves it literal when the user does not exist, so
+    // passing it through matches bash in both outcomes.
+    if !was_quoted {
+        if tok == "~" {
+            return "$ENV{HOME}".to_string();
+        }
+        if let Some(rest) = tok.strip_prefix("~/") {
+            if !rest.is_empty() {
+                return format!("\"$ENV{{HOME}}/{}\"", rest.replace('\"', "\\\""));
+            }
         }
     }
     // `$(( … ))` arithmetic expansion.
@@ -9264,6 +9828,21 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             .unwrap_or_else(|| "0".to_string())
                     }),
                 "brace" => render_brace_word(args),
+                "$fn_call" | "fnCall" => {
+                    // Call to a shell function defined in this program, in
+                    // EXPRESSION position — `if is_prime $n; then`
+                    // (examples/051_primes line 50). The statement emitter has
+                    // had a `$fn_call` arm for a while, but the expression
+                    // renderer did not, so the call in the if-CONDITION fell
+                    // through to the generic `_` arm and emitted a literal
+                    // `$fn_call(...)` → "Global symbol "$fn_call" requires
+                    // explicit package name". A Perl sub call is a valid
+                    // expression; the status is `$?` for the caller.
+                    let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                    let words = exec_word_args(args);
+                    let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
+                    format!("{}({})", name, rest.join(", "))
+                }
                 "capture" | "captureWords" => {
                     // Expression/interpolated context (e.g. inside a
                     // double-quoted word): the raw chomped value, NOT a
@@ -9955,6 +10534,181 @@ fn dq_value_expr(content: &str) -> Option<String> {
     }
 }
 
+/// Build a PERL EXPRESSION evaluating to `cmd` with every shell expansion
+/// substituted as a runtime VALUE (shell-quoted by `__sh_q`), never left as
+/// raw text.
+///
+/// WHY THIS EXISTS. `safe_perl_q_string` escapes `$` so PERL does not
+/// interpolate the string — which is correct for a literal, but it means a
+/// `bash -c` seam handed `q('echo' ${!aa[@]} | sort)` gives bash the literal
+/// characters `$ { ! a a [` and the expansion yields NOTHING. The command
+/// still parses and the exit code is still right; only the value vanishes
+/// (core-request perl-generator-20261002-053100). A bare `$n` happened to
+/// survive because `var_exports_str` re-exports the NAME through %ENV and
+/// bash re-expands it — but there is no %ENV carrier for a COMPOUND
+/// expansion (`${arr[@]}`, `${!h[@]}`, `${h[k]}`), so those were silently
+/// lost.
+///
+/// Returns None when the shape is not expressible (globs, `$(...)`, `&&`,
+/// `||`, subshells, backticks) so the caller keeps the plain shell-out.
+fn sh_cmd_value_expr(cmd: &str) -> Option<String> {
+    if cmd.contains("||") || cmd.contains("|&") {
+        return None;
+    }
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // single-quoted span: no expansion, keep verbatim
+        if c == '\'' {
+            lit.push(c);
+            i += 1;
+            while i < chars.len() {
+                lit.push(chars[i]);
+                let done = chars[i] == '\'';
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '$' && i + 1 < chars.len() {
+            if let Some((expr, next)) = expansion_at(&chars, i) {
+                if !lit.is_empty() {
+                    parts.push(safe_perl_q_string(&lit));
+                    lit.clear();
+                }
+                parts.push(format!("__sh_q({})", expr));
+                i = next;
+                continue;
+            }
+        }
+        // A bare `$(...)`/backtick inside the command has no value form here.
+        if matches!(c, '`' | '&' | ';' | '(' | ')' | '*' | '?' | '\n') {
+            return None;
+        }
+        lit.push(c);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        parts.push(safe_perl_q_string(&lit));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" . "))
+    }
+}
+
+/// Parse one shell expansion starting at `$` (chars[i] == '$'), returning a
+/// Perl value EXPRESSION for it and the index just past it.
+///
+/// Handles `$name`, `${name}`, `${name[@]}` / `${name[*]}` (the whole
+/// collection), `${!name[@]}` (a hash's KEYS) and `${name[key]}` (one
+/// element). None for any other shape — notably the operator forms
+/// (`${x:-y}`, `${x#p}`, `${x/a/b}`) which carry semantics this cannot
+/// reproduce, so the caller must not silently mangle them.
+fn expansion_at(chars: &[char], i: usize) -> Option<(String, usize)> {
+    if chars.get(i + 1) == Some(&'{') {
+        // find the matching `}` (depth-counted)
+        let mut depth = 1;
+        let mut j = i + 2;
+        while j < chars.len() && depth > 0 {
+            match chars[j] {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        let inner: String = chars[i + 2..j].iter().collect();
+        let next = j + 1;
+        let expr = compound_expansion_expr(&inner)?;
+        return Some((expr, next));
+    }
+    let c1 = *chars.get(i + 1)?;
+    if c1 == '@' || c1 == '*' {
+        return None;
+    }
+    if !(c1.is_ascii_alphabetic() || c1 == '_') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    Some((var_read(&chars[i + 1..j].iter().collect::<String>()), j))
+}
+
+/// Perl expression for the INSIDE of a `${…}` expansion. None for shapes
+/// whose semantics are not reproducible here (operator forms).
+fn compound_expansion_expr(inner: &str) -> Option<String> {
+    let s = inner.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // `${!name[@]}` / `${!name[*]}` — a hash's keys (indirect expansion).
+    if let Some(rest) = s.strip_prefix('!') {
+        let (name, idx) = split_indexed_var(rest);
+        let idx = idx?;
+        if !var_is_declarable(name) {
+            return None;
+        }
+        if matches!(idx, "@" | "*") {
+            // bash yields the KEYS; sort for a stable, hash-order-independent
+            // result (the corpus sorts downstream anyway).
+            return Some(format!("join(' ', sort keys %{{{name}}})"));
+        }
+        return None;
+    }
+    // `${name[@]}` / `${name[*]}` — the whole collection.
+    if let Some(rest) = s.strip_suffix("[@]").or_else(|| s.strip_suffix("[*]")) {
+        if rest.is_empty() || !var_is_declarable(rest) {
+            return None;
+        }
+        if array_var(rest) {
+            // bash "${arr[@]}" inside double quotes joins on the first IFS
+            // char; a space matches the corpus' `IFS=$'\n' sorted=(...)` and
+            // `echo "${arr[@]}"` spellings that flow through here.
+            return Some(format!("join(' ', @{{{rest}}})"));
+        }
+        // A hash: `${h[@]}` is its VALUES.
+        return Some(format!("join(' ', values %{{{rest}}})"));
+    }
+    // `${name[key]}` — one element. `key` may be a nested expansion; handle
+    // only a literal key (a dynamic one cannot be resolved at this point).
+    if let Some(open) = s.find('[') {
+        if s.ends_with(']') {
+            let name = &s[..open];
+            let key = &s[open + 1..s.len() - 1];
+            if name.is_empty() || key.is_empty() || key.contains('$') {
+                return None;
+            }
+            if !var_is_declarable(name) {
+                return None;
+            }
+            if array_var(name) {
+                return Some(format!("${{{name}}}[{}]", key));
+            }
+            return Some(format!("${{{name}}}{{{key}}}"));
+        }
+    }
+    // A bare `${name}` is a plain variable read.
+    if var_is_declarable(s) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Some(var_read(s));
+    }
+    None
+}
+
 /// Build a PERL EXPRESSION that evaluates to a pipeline command string with
 /// runtime values substituted for `"$var"` arguments. The `coreutils-ffi`
 /// pipeline grammar has no expansion, so a `$var` in the reconstructed shell
@@ -10255,6 +11009,21 @@ fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Stri
                         out.insert(t.var.clone());
                     }
                 }
+                // `assign(NAME, "+=", <word list>)` is the array append the
+                // frontend emits for `arr+=(a b)`. When it is the FIRST
+                // mention of the name nothing else has bound it as an array,
+                // so without this the renderer would take the scalar branch
+                // and emit `$z += ...` (examples/051_primes: `z+=(a b)` then
+                // `z+=${primes[@]:0:1}`).
+                if let IrExpr::Call { func, args } = expr {
+                    if func == "assign"
+                        && args.get(2).map(|v| matches!(v, IrExpr::Array(_))).unwrap_or(false)
+                    {
+                        for t in targets {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
             }
             IrStmt::DeclareArray { var, sigil, .. } => {
                 // Only ARRAY declarations; a hash (`declare -A`) must keep
@@ -10492,7 +11261,10 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
             return sh_uu_capture_expr(&argv);
         }
     }
-    let quoted = safe_perl_q_string(cmd);
+    let quoted = match sh_cmd_value_expr(cmd) {
+        Some(expr) => expr,
+        None => safe_perl_q_string(cmd),
+    };
     // Same env-export prologue as expr_to_open_perl — `$n` inside the
     // single-quoted bash -c text must reach the child via %ENV.
     let exports_raw = var_exports_str(cmd);
@@ -11575,6 +12347,72 @@ impl IrProgram {
 mod tests {
     use super::*;
 
+    /// `${v+w}` / `${v:+w}` must lower to the SETNESS predicate, and the two
+    /// must NOT render identically — `+` is set-ness, `:+` is non-empty.
+    ///
+    /// Regression (core-request perl-generator-20261001-202305): with no
+    /// `+` arm both fell through to the catch-all `_ => var`, rendering the
+    /// VARIABLE and dropping `w`. Combined with the generator pre-pass
+    /// rewriting the operand to `=` (which renders an ASSIGNMENT), a
+    /// `test -n "${V+x}"` branch was unconditionally true and printed for an
+    /// UNSET variable — a silent wrong answer, not a crash.
+    #[test]
+    fn param_plus_lowers_to_a_set_test_not_the_value() {
+        let plus = render_param(&[
+            IrExpr::Str("+".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("x".into(), StrStyle::DoubleQuoted),
+        ]);
+        // the payload survives, and the guard is `defined` ALONE — a var
+        // assigned "" is set, so a `length` conjunct would drop `x` for it.
+        assert_eq!(plus, "(defined($ENV{V}) ? \"x\" : '')");
+        assert!(!plus.contains("length("), "must not be the non-empty test: {plus}");
+
+        // `:+` is the OTHER predicate — set AND non-empty.
+        let colon_plus = render_param(&[
+            IrExpr::Str(":+".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+            IrExpr::Str("x".into(), StrStyle::DoubleQuoted),
+        ]);
+        assert_eq!(
+            colon_plus,
+            "((defined($ENV{V}) && length($ENV{V})) ? \"x\" : '')"
+        );
+        assert_ne!(plus, colon_plus, "`+` and `:+` must stay distinct");
+    }
+
+    /// The operand must never render as an ASSIGNMENT, and `+` must not
+    /// degrade to `=`.
+    ///
+    /// The generator pre-pass rewrites `${v+set}` to `param("=", …)` on the
+    /// theory (stated in its own comment) that `+` has no renderer arm. Both
+    /// then fell through to the catch-all, which returned the bare variable —
+    /// so the rewrite was a no-op on its own terms. Once `+` gains an arm it
+    /// becomes actively harmful: `=` renders `($ENV{V} = "set")`, an
+    /// ASSIGNMENT whose side effect makes the `test -n` guard permanently
+    /// true.
+    ///
+    /// Asserting `+ != =` is the shape that fails pre-fix: with BOTH arms
+    /// absent the catch-all returned the same variable for either operator,
+    /// so the two were indistinguishable.
+    #[test]
+    fn param_plus_never_renders_an_assignment() {
+        let operand = |op: &str| {
+            render_param(&[
+                IrExpr::Str(op.into(), StrStyle::DoubleQuoted),
+                IrExpr::Str("V".into(), StrStyle::DoubleQuoted),
+                IrExpr::Str("set".into(), StrStyle::DoubleQuoted),
+            ])
+        };
+        let plus = operand("+");
+        assert!(!plus.contains('='), "`+` must not assign: {plus}");
+        assert_ne!(
+            plus,
+            operand("="),
+            "`+` must not render as `=` — the pre-pass rewrite's premise is gone"
+        );
+    }
+
     /// The t32_redirect A1 shape (triage-perl-20260814-033432): a
     /// Redirect whose target is an Interpolate carrying the PID
     /// (`/tmp/zsh_t32_redirect.$$.tmp` — the `$$` interp part lowers to
@@ -11765,6 +12603,140 @@ mod tests {
             !perl.contains("system('bash'"),
             "echo|tr pipeline must not shell out: {perl}"
         );
+    }
+
+    /// ``echo `ls | grep -v a.txt` `` — a command substitution whose body is
+    /// a PIPELINE, used as a command's ARGUMENT. The capture body arrives as
+    /// `IrStmt::Pipeline` (not the Arrow-wrapped `pipeline` Call), and the
+    /// statement rebuild had no arm for it, so it returned None and the
+    /// capture's VALUE was dropped: the render was `print('', "\n")` — an
+    /// empty argument list, a silent wrong answer rather than a crash
+    /// (core-request perl-generator-20261002-053000, 008_simple_backup.sh).
+    #[test]
+    fn cmdsub_pipeline_as_argument_captures_its_value() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"echo"},{"elements":[
+                {"args":[{"body":[{"capture":null,"cmd_str":null,"last_output":null,"purity":"Spawn","stages":[
+                    [{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"ls"},{"elements":[],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}],
+                    [{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"grep"},{"elements":[{"style":"DoubleQuoted","type":"Str","value":"-v"},{"style":"DoubleQuoted","type":"Str","value":"a.txt"}],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}]
+                ],"type":"Pipeline"}],"type":"Arrow"}],"func":"captureWords","purity":"Spawn","type":"Call"}
+            ],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("cmdsub-pipeline A1 ingress");
+        let perl = shir_to_perl(&prog);
+        // The capture must RUN — the pipeline stages are rebuilt into the
+        // command text handed to the capture helper.
+        assert!(
+            perl.contains("__sh_pipe_capture"),
+            "the pipeline body must be captured, not dropped: {perl}"
+        );
+        assert!(
+            perl.contains("'ls'") && perl.contains("'grep'") && perl.contains("'a.txt'"),
+            "every pipeline stage must reach the reconstructed command: {perl}"
+        );
+        // The ARGUMENT list must not be empty: an empty capture rendered
+        // `print('', "\n")` and silently dropped the substituted output.
+        assert!(
+            !perl.contains("print('',"),
+            "a command substitution as an argument must render its value: {perl}"
+        );
+    }
+
+    /// A reconstructed capture command containing a shell `$` must NEVER be
+    /// handed to a non-interpolating Perl `q('...')` / `'...'`
+    /// literal. `safe_perl_q_string` escapes `$` precisely so PERL does not
+    /// interpolate it — which means BASH never sees it either, so the
+    /// expansion silently yields nothing:
+    ///
+    ///     __sh_pipe_capture(q('echo' ${!aa[@]} | 'tr' " " "\n" | 'sort'), ...)
+    ///
+    /// hands bash the six literal characters `$`, `{`, `!`, … The command
+    /// still parses and the exit code is right; only the VALUE is gone
+    /// (core-request perl-generator-20261002-053100). Six corpus examples
+    /// hit this: 064_07, 063_11, 063_hard_to_parse, 070_gnuisms_thorough,
+    /// realpath-cmdsub, grep_p.
+    ///
+    /// The `bash -c` seam works for a bare `$n` ONLY because the
+    /// `var_exports_str` prelude re-exports the name through %ENV and bash
+    /// re-expands it. That cannot work for an ARRAY/INDIRECT expansion
+    /// (`${arr[@]}`, `${!h[@]}`, `${h[k]}`): there is no %ENV carrier for a
+    /// compound expansion. Those must be SUBSTITUTED into the emitted
+    /// literal as shell-quoted VALUES (via `__sh_q`), never emitted raw.
+    #[test]
+    fn captured_cmd_with_shell_dollar_is_never_a_bare_perl_literal() {
+        let src = r#"{"type": "Program", "contract_version": 1, "imports": [], "requires": [], "var_types": [], "stmt_lines": [], "var_lengths": [], "var_const": [], "var_lifetimes": [], "var_bash_env": [], "subs": [], "stmts": [{"type": "Expr", "expr": {"args": [{"body": [{"expr": {"args": [{"elements": [{"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "echo"}, {"elements": [{"args": [{"style": "DoubleQuoted", "type": "Str", "value": "slice"}, {"style": "DoubleQuoted", "type": "Str", "value": "!aa"}, {"style": "DoubleQuoted", "type": "Str", "value": "@"}, {"style": "DoubleQuoted", "type": "Str", "value": ""}], "func": "param", "purity": "PureCpu", "type": "Call"}], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}, {"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "tr"}, {"elements": [{"parts": [{"kind": "lit", "text": " "}], "type": "Interpolate"}, {"parts": [{"kind": "lit", "text": "\\n"}], "type": "Interpolate"}], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}, {"body": [{"expr": {"args": [{"style": "DoubleQuoted", "type": "Str", "value": "sort"}, {"elements": [], "type": "Array"}], "func": "builtin", "purity": "Emulable", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}], "type": "Array"}], "func": "pipeline", "purity": "Spawn", "type": "Call"}, "type": "Expr"}], "type": "Arrow"}], "func": "captureWords", "purity": "Spawn", "type": "Call"}}]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("cmdsub A1 ingress");
+        let perl = shir_to_perl(&prog);
+
+        // Find every Perl string literal that is fed to a capture/run seam
+        // and assert it carries no unexpanded shell expansion.
+        for call in ["__sh_pipe_capture(", "__sh_pipe_run("] {
+            let mut from = 0usize;
+            while let Some(rel) = perl[from..].find(call) {
+                let at = from + rel;
+                let arg = &perl[at + call.len()..];
+                // The first argument is either a q('…') / '…' literal or a
+                // concatenation (the correct, substituted shape). Only the
+                // single-literal form can swallow the raw expansion.
+                if let Some(end) = arg.find("), \"pipefail\"") {
+                    let first_arg = &arg[..end];
+                    assert!(
+                        !is_bare_perl_literal(first_arg),
+                        "a reconstructed capture command with a shell expansion \
+                         must not be a non-interpolating Perl literal — bash \
+                         would receive the `$` literally and the value would \
+                         vanish.\n  literal: {first_arg}\n  full: {perl}"
+                    );
+                }
+                from = at + call.len();
+            }
+        }
+    }
+
+    /// The herestring form `sort <<< "${config[*]}"` must SUBSTITUTE the
+    /// hash's values through `__sh_q`, never embed the raw `${config[*]}`
+    /// in the literal handed to the capture seam (064_07_complex_array_operations:
+    /// the generated `q('sort' <<< ${config[*]})` gave bash an EMPTY here
+    /// string, so `Config: ` printed with no value at all).
+    #[test]
+    fn herestring_array_expansion_substitutes_through_sh_q() {
+        let value = sh_cmd_value_expr("sort <<< \"${config[*]}\"")
+            .expect("`${config[*]}` is expressible as a value");
+        assert!(
+            value.contains("__sh_q(join(' ', values %{config}))"),
+            "the array must be substituted as a value, not embedded raw: {value}"
+        );
+        let open = cmd_str_to_open_perl("sort <<< \"${config[*]}\"");
+        assert!(
+            !open.contains("${config"),
+            "no raw shell expansion may reach the capture seam: {open}"
+        );
+        assert!(
+            open.contains("__sh_pipe_capture(") && open.contains("__sh_q("),
+            "the herestring must still run through the capture seam: {open}"
+        );
+    }
+
+    /// True when `s` is a single non-interpolating Perl literal
+    /// (`'…'`, `q(…)`, `q{…}`, `q|…|`, …) with no string concatenation.
+    fn is_bare_perl_literal(s: &str) -> bool {
+        let s = s.trim();
+        let (open, close) = match s.as_bytes().first() {
+            Some(b'\'') => ('\'', '\''),
+            Some(b'q') => match s.as_bytes().get(1) {
+                Some(b'(') => ('(', ')'),
+                Some(b'{') => ('{', '}'),
+                Some(b'[') => ('[', ']'),
+                Some(b'<') => ('<', '>'),
+                Some(c) => (*c as char, *c as char),
+                None => return false,
+            },
+            _ => return false,
+        };
+        s.len() >= 2
+            && s.ends_with(close)
+            && !s[1..s.len() - 1].contains(&format!(" . {close}"))
+            && s[1..s.len() - 1].contains('$')
     }
 
     /// The modern-IR preamble only declares the infrastructure variables
@@ -12152,6 +13124,138 @@ mod tests {
             !perl.contains("$xs = setArrayAppend"),
             "no scalar fallback:\n{perl}"
         );
+    }
+
+    /// `${v:-${b:-$(cmd)}}` — a command substitution nested inside a
+    /// parameter-expansion DEFAULT must reach the renderer as a real capture,
+    /// not as opaque text re-lexed into a slice.
+    ///
+    /// `param_text_to_perl` re-lexes an expansion that arrived as a `Str`
+    /// (which is how a nested default is carried). It has to choose between
+    /// the `:-` operator and the `:` slice, and it used to read the SINGLE
+    /// character `:` — so `:-` never reached the operator loop and every
+    /// nested default was lowered as `substr($b, -$(cmd))`. The bare `$(` is
+    /// Perl's GID special variable, so such a file fails `perl -c` and loses
+    /// every construct in it (core request perl-20261002-231200; corpus
+    /// 063_04, 063_hard_to_parse).
+    ///
+    /// Pins both halves of bash's rule: `:-` immediately after the `:` is the
+    /// operator, `:` + SPACE is a slice (`a=abcdef` → `${a:-1}` is `abcdef`,
+    /// `${a: -1}` is `f`).
+    #[test]
+    fn nested_default_cmdsub_is_a_capture_not_a_slice() {
+        let op = |tok: &str| param_text_to_perl(tok).unwrap_or_else(|| panic!("{tok}"));
+        // The nested command substitution is a real capture, and the `:-`
+        // default is a real conditional — never a `substr` with a negative
+        // offset, which is the shape the defect produced.
+        let deep = op("${a:-${b:-$(echo DEEP)}}");
+        assert!(
+            deep.contains("defined($a)"),
+            "outer default survives: {deep}"
+        );
+        assert!(
+            deep.contains("defined($b)"),
+            "inner default survives: {deep}"
+        );
+        assert!(
+            !deep.contains("substr("),
+            "a nested default is not a slice: {deep}"
+        );
+        assert!(
+            !deep.contains("$("),
+            "no bare $( (Perl's GID) may reach the output: {deep}"
+        );
+        // bash: `:-` is the operator only when the `-` follows the `:` with
+        // no space. The space is the whole discriminator and the parser keeps
+        // it in the offset, so the textual fallback must too.
+        assert_eq!(op("${a:-1}"), op("${a:-1}"), "stable");
+        let defaulted = op("${a:-1}");
+        assert!(
+            defaulted.contains("defined($a)"),
+            "`:-` is the default operator: {defaulted}"
+        );
+        let sliced = op("${a: -1}");
+        assert!(
+            !sliced.contains("defined($a)"),
+            "`: ` + space is a slice, not a default: {sliced}"
+        );
+    }
+
+    /// Build the `Call { func: "param" }` IR a `${v/pat/rep}` lowers to.
+    fn subst_ir(op: &str, pat: &str, rep: &str) -> Vec<IrExpr> {
+        vec![
+            IrExpr::Str(op.to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str("s".to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str(pat.to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Str(rep.to_string(), StrStyle::DoubleQuoted),
+        ]
+    }
+
+    /// `${v/pat/rep}` must compile a PATTERN and a REPLACEMENT, not two
+    /// strings — a quoted operand makes the substitution a silent no-op.
+    ///
+    /// The operands reach the renderer bare (`Str("abc")`), and this arm used
+    /// to run them through `param_value`, which is `render_str_literal` under
+    /// another name. That is right for a DEFAULT (`${a:-abc}` wants the Perl
+    /// string `"abc"`) and wrong here: the quotes became part of the PATTERN,
+    ///
+    ///     s/abc/XYZ  ⇒  s/"abc"/"XYZ"
+    ///
+    /// which Perl compiles as "the six characters `\"abc\"`". Those never occur
+    /// in the subject, so the match fails, `s///r` returns the subject
+    /// UNCHANGED, and the whole substitution silently does nothing — correct
+    /// exit code, no warning, wrong text (core request
+    /// perl-20261002-231200 Gap 2; corpus bench-strsubst).
+    #[test]
+    fn param_substitution_operands_are_not_quoted() {
+        let one = render_param(&subst_ir("/", "abc", "XYZ"));
+        assert!(
+            one.contains("s/abc/XYZ/"),
+            "operands must reach the regex unquoted: {one}"
+        );
+        assert!(
+            !one.contains("s/\""),
+            "a quoted PATTERN can never match the subject: {one}"
+        );
+        // `//` is the global form and adds `g`; it shares this arm because
+        // the separate `"//" | "/"` arm was dead (shadowed by a plain `"/"`).
+        let global = render_param(&subst_ir("//", "abc", "XYZ"));
+        assert!(
+            global.contains("s/abc/XYZ/gr"),
+            "`//` replaces globally: {global}"
+        );
+    }
+
+    /// A replacement is interpolated into the regex BODY, so its `/` must be
+    /// escaped — but the operand arrives as SOURCE TEXT that already carries
+    /// the shell's own escape, which must be consumed rather than doubled.
+    ///
+    /// `s/abc/b\/c` (three backslashes emitted) compiles and runs, so this
+    /// would not be a syntax error; it prints `b\/c` where bash prints `b/c`.
+    #[test]
+    fn param_substitution_replacement_escapes_bash_escapes_once() {
+        // Source `${s/abc/b\/c}` reaches the IR as the two characters `\` `/`.
+        let escaped = render_param(&subst_ir("/", "abc", "b\\/c"));
+        assert!(
+            escaped.contains("s/abc/b\\/c/"),
+            "one shell escape in, one escape out: {escaped}"
+        );
+        assert!(
+            !escaped.contains("b\\\\\\/"),
+            "the shell escape must not be doubled: {escaped}"
+        );
+        // `@`/`$` are interpolated by Perl, so they must be escaped or the
+        // replacement splices in Perl's own arrays/scalars.
+        assert_eq!(repl_for_regex("@x"), "\\@x");
+        assert_eq!(repl_for_regex("$y"), "\\$y");
+        assert_eq!(repl_for_regex("@$y"), "\\@\\$y");
+        // A literal backslash is `\\` in the SOURCE, so it reaches the helper
+        // as two characters and must be emitted as four — otherwise it eats
+        // the character after it in the Perl body.
+        assert_eq!(repl_for_regex("b\\\\c"), "b\\\\\\\\c");
+        // An unescaped `/` still has to be escaped, or the substitution ends
+        // early and the rest of the expression is a syntax error.
+        assert_eq!(repl_for_regex("a/b"), "a\\/b");
     }
 }
 
