@@ -256,7 +256,21 @@ fn collect_stmt_strs(st: &IrStmt, out: &mut HashSet<String>) {
         IrStmt::For { iter, .. } => collect_expr_strs(iter, out),
         IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => collect_expr_strs(cond, out),
         IrStmt::ForInit { cond, .. } => collect_expr_strs(cond, out),
-        IrStmt::Case { discriminant, .. } => collect_expr_strs(discriminant, out),
+        IrStmt::Case { discriminant, clauses } => {
+            collect_expr_strs(discriminant, out);
+            // Clause patterns are RAW TEXT: a `$(f)` pattern (a command
+            // substitution of a shell function) hides its call, so `f`
+            // looked unreferenced and was removed — the call then shelled
+            // out to a child that cannot see it (the
+            // parse-redirect-in-case-pattern mis-lowering). Harvest the
+            // identifier runs so a pattern-referenced function is kept
+            // (coarse on purpose: keeping a function is the safe side).
+            for c in clauses {
+                for p in &c.patterns {
+                    collect_identifiers(p, out);
+                }
+            }
+        }
         IrStmt::WriteFile { content, path, .. } => {
             collect_expr_strs(content, out);
             collect_expr_strs(path, out);
@@ -341,6 +355,32 @@ fn collect_stmt_list_strs(stmts: &[IrStmt], out: &mut HashSet<String>) {
 
 fn collect_str_from_str(s: &str, out: &mut HashSet<String>) {
     out.insert(s.to_string());
+}
+
+/// Insert every identifier-like run (`[A-Za-z_][A-Za-z0-9_]*`) in a raw
+/// `case` pattern string. A pattern such as `$(_docker_to_extglob "$x")`
+/// carries the callee's name only as text; harvesting the runs makes a
+/// function referenced SOLELY from a pattern count as referenced.
+fn collect_identifiers(s: &str, out: &mut HashSet<String>) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() {
+                let d = b[i] as char;
+                if d.is_ascii_alphanumeric() || d == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            out.insert(s[start..i].to_string());
+        } else {
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
