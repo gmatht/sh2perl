@@ -161,6 +161,8 @@ const GO_RESERVED: &[&str] = &[
     "capRun",
     "redirRun",
     "runPipe",
+    "capPipe",
+    "capPipeRaw",
     "fileTest",
     "globMatch",
     "globRe",
@@ -181,6 +183,46 @@ const GO_RESERVED: &[&str] = &[
     "pExpStr",
     "eEsc",
 ];
+
+/// Commands bash resolves to a BUILTIN rather than to an executable on
+/// PATH. `exec.Command(name, …)` does not go through bash at all, so a
+/// native stage naming one of these is only sound when
+/// `native_stage_builtin` proves the external counterpart agrees.
+fn is_shell_builtin(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "echo" | "printf" | "exit" | "cd" | "let" | "local" | "read" | "test"
+    )
+}
+
+/// May `cmd` run as a native pipeline STAGE (a real process) instead of
+/// inside a `bash -c` reconstruction?
+///
+/// Only `echo` and `printf` qualify, and only because the corpus's uses of
+/// them are argv-identical between bash's builtin and coreutils:
+/// measured against this box, `/usr/bin/echo` agrees with the builtin for
+/// plain words, empty words, `-n`, `-e` (both escape classes), a literal
+/// `-n`/`-e` operand, `--`, and a lone `-`.
+///
+/// `printf`'s `%q` is the one verb coreutils' printf does NOT implement
+/// (it shell-quotes its argument, bash-style), so a format that mentions it
+/// — or a format this renderer cannot inspect — keeps the `bash -c` stage.
+/// `%b`, `%s`, `%d`, `%%` are common to both.
+///
+/// The remaining builtins are refused outright: `read`/`cd`/`let`/`local`/
+/// `exit` have no external executable to exec, and `test`'s argv form is
+/// not the builtin's semantics (`[` and `test` differ on argument count,
+/// and bash's is the one the IR was lowered against).
+fn native_stage_builtin(cmd: &str, argv: &[IrExpr]) -> bool {
+    match cmd {
+        "echo" => true,
+        "printf" => match argv.first() {
+            Some(IrExpr::Str(fmt, _)) => !fmt.contains("%q"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 /// Render an `IrProgram` to Go source (package main).
 pub fn shir_to_go(prog: &IrProgram) -> String {
@@ -934,10 +976,14 @@ impl Render {
             // value-producing op (`$(echo … | grep -o PAT)` arrives as
             // `capture(Arrow[Expr(grepMatches(…)])`): the op IS the command
             // and yields the string natively — no subprocess at all.
-            if let Some(v) = self.capture_value_op(body) {
+            if let Some(v) = self.capture_value_op(body, native) {
                 return Some(v);
             }
-            if let Some((cmd, argv)) = self.body_single_exec(body) {
+            // `allow_builtin`: a lone `echo`/`printf` exec's natively when
+            // coreutils agrees with the builtin (native_stage_builtin), so
+            // `$(printf '%s\n' "$a")` costs one process instead of a
+            // `bash -c` child plus its whole env literal.
+            if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
                 let mut parts = vec![cmd];
                 parts.extend(argv);
                 if native {
@@ -946,7 +992,10 @@ impl Render {
                 return Some(format!("capCmd(exec.Command({}))", parts.join(", ")));
             }
             if let Some(text) = self.cmd_text_stmts(body) {
-                let env = self.env_lit();
+                // Same env narrowing the `redirRun` reconstructions use: the
+                // child runs `text`, so only the vars that text READS are
+                // worth marshalling (see `env_lit_for`).
+                let env = self.env_lit_for(Some(&text));
                 return Some(format!("capRun({}, {env})", Self::go_str(&text)));
             }
         }
@@ -954,8 +1003,25 @@ impl Render {
     }
 
     /// If the body is exactly one external `exec` call, return its
-    /// (cmd expr, argv expr list).
+    /// (cmd expr, argv expr list). Shell builtins stay refused — see
+    /// `body_single_exec_opt`.
     fn body_single_exec(&mut self, body: &[IrStmt]) -> Option<(String, Vec<String>)> {
+        self.body_single_exec_opt(body, false)
+    }
+
+    /// `body_single_exec` with the PIPELINE STAGE's builtin policy.
+    ///
+    /// A pipeline stage is exec'd as a real process here, so a builtin
+    /// stage is only admissible when the target has a faithful external
+    /// counterpart (`native_stage_builtin`). `read`/`cd`/`let`/`local`/
+    /// `exit` have NO external executable at all — exec'ing them would
+    /// fail outright — and `test`'s argv form differs from the builtin's,
+    /// so those keep the `bash -c` stage.
+    fn body_single_exec_opt(
+        &mut self,
+        body: &[IrStmt],
+        allow_builtin: bool,
+    ) -> Option<(String, Vec<String>)> {
         let mut execs = Vec::new();
         for s in body {
             match s {
@@ -997,10 +1063,17 @@ impl Render {
             return None;
         }
         if let Some(IrExpr::Str(cmd, _)) = args.first() {
-            if matches!(
-                cmd.as_str(),
-                "echo" | "printf" | "exit" | "cd" | "let" | "local" | "read" | "test"
-            ) {
+            // A shell builtin is refused unless it is BOTH allowed by the
+            // caller AND has a faithful external counterpart. The plain
+            // calls (capCmd for `$(…)`) keep `allow_builtin = false`, which
+            // is the historical behaviour.
+            let argv_items: &[IrExpr] = match args.get(1) {
+                Some(IrExpr::Array(items)) => items,
+                _ => &[],
+            };
+            if is_shell_builtin(cmd)
+                && !(allow_builtin && native_stage_builtin(cmd, argv_items))
+            {
                 return None;
             }
             let cmd = Self::go_str(cmd);
@@ -1205,7 +1278,19 @@ impl Render {
             }
             if c == '$' {
                 if i + 1 < b.len() && b[i + 1] == '(' {
-                    return None;
+                    // `$(( … ))` nested inside the expression is a nested
+                    // arithmetic expansion, which this tokenizer does not
+                    // model — refuse it rather than mis-read the inner `(`.
+                    if i + 2 < b.len() && b[i + 2] == '(' {
+                        return None;
+                    }
+                    // `$( … )` — bash substitutes the command FIRST and
+                    // evaluates its output as an operand, so it is a single
+                    // atom here; `MA::CmdSub` carries its TEXT.
+                    let end = arith_cmdsub_end(&b, i + 1)?;
+                    out.push((b[i..=end].iter().collect(), false));
+                    i = end + 1;
+                    continue;
                 }
                 if i + 1 < b.len() && b[i + 1] == '{' {
                     let mut j = i + 2;
@@ -1343,6 +1428,10 @@ impl Render {
                 let (ks, kv) = self.ma_render(key)?;
                 Some((ks, format!("s2i(arrIdx({}, {kv}))", self.ident_of(name))))
             }
+            MA::CmdSub(text) => {
+                let v = self.arith_cmdsub(text)?;
+                Some((Vec::new(), format!("s2i({v})")))
+            }
             MA::Bin(op, l, r) => {
                 let (ls, lv) = self.ma_render(l)?;
                 let (rs, rv) = self.ma_render(r)?;
@@ -1405,6 +1494,36 @@ impl Render {
                 }
             }
         }
+    }
+
+    /// A `$( … )` used as an arithmetic operand.
+    ///
+    /// bash performs the command substitution BEFORE it evaluates the
+    /// expression, and the substitution's output then stands in the text as
+    /// an operand — so this is the ordinary command-substitution lowering
+    /// (`capture_str`) with the same string→int coercion the other string
+    /// operands use (`s2i`, the `arrIdx` element read).
+    ///
+    /// The payload is raw shell TEXT rather than IR: the core does not
+    /// descend into the arithmetic string, so the inner command is
+    /// re-parsed here with the same frontend that produced the program and
+    /// wrapped in the `Arrow` shape `capture_str` consumes. That makes the
+    /// in-arith substitution lower EXACTLY like the same command written
+    /// outside `$(( … ))`. REFUSE > GUESS: unparseable text, or a capture
+    /// `capture_str` declines, returns `None` and the call site keeps its
+    /// refusal.
+    fn arith_cmdsub(&mut self, text: &str) -> Option<String> {
+        let mut src = text.to_string();
+        src.push('\n');
+        let commands = crate::Parser::new(&src).parse().ok()?;
+        if commands.is_empty() {
+            return None;
+        }
+        let prog = crate::shir::ast_to_ir(&commands);
+        if prog.stmts.is_empty() {
+            return None;
+        }
+        self.capture_str(&IrExpr::Arrow(prog.stmts), false)
     }
 
     /// A top-level arith-string statement (`let i++`, cstyleFor init/update):
@@ -1856,24 +1975,37 @@ impl Render {
         Self::argv_slice(st)
     }
 
-    /// `pipeline` Call → runPipe or bash -c reconstruction. Value = status.
-    fn pipeline_expr(&mut self, args: &[IrExpr]) -> String {
+    /// A pipeline's stages as Go `[]string` part lists, or `None` when any
+    /// stage is not a single execut-able command (a redirect, a subshell, a
+    /// loop …) — then the caller keeps the `bash -c` reconstruction.
+    ///
+    /// Builtins are admitted (`allow_builtin`): every stage becomes a real
+    /// process here, which is what removes the `bash -c` child AND its env
+    /// literal. See `native_stage_builtin` for which builtins qualify.
+    fn pipeline_stages(&mut self, args: &[IrExpr]) -> Option<Vec<Vec<String>>> {
         let mut stages: Vec<Vec<String>> = Vec::new();
         if let Some(IrExpr::Array(items)) = args.first() {
             for it in items {
                 if let IrExpr::Arrow(body) = it {
-                    if let Some((cmd, argv)) = self.body_single_exec(body) {
+                    if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
                         let mut st = vec![cmd];
                         st.extend(argv);
                         stages.push(st);
                         continue;
                     }
                 }
-                stages.clear();
-                break;
+                return None;
             }
         }
-        if !stages.is_empty() {
+        if stages.is_empty() {
+            return None;
+        }
+        Some(stages)
+    }
+
+    /// `pipeline` Call → runPipe or bash -c reconstruction. Value = status.
+    fn pipeline_expr(&mut self, args: &[IrExpr]) -> String {
+        if let Some(stages) = self.pipeline_stages(args) {
             let mut parts: Vec<String> = Vec::new();
             for st in &stages {
                 parts.push(self.stage_lit(st));
@@ -1898,6 +2030,21 @@ impl Render {
             }
         }
         self.sh2_stub("pipeline")
+    }
+
+    /// `$(cmd | cmd …)` — the pipeline's CAPTURE form. Same stage analysis
+    /// as `pipeline_expr`, but the stages' stdout is READ instead of
+    /// inherited, so the substitution yields a Go string with no shell
+    /// reconstruction and no env literal.
+    fn pipeline_capture(&mut self, args: &[IrExpr], native: bool) -> Option<String> {
+        let stages = self.pipeline_stages(args)?;
+        let mut parts: Vec<String> = Vec::new();
+        for st in &stages {
+            parts.push(self.stage_lit(st));
+        }
+        // `native` = the value already needs no trailing-newline strip.
+        let f = if native { "capPipeRaw" } else { "capPipe" };
+        Some(format!("{f}([][]string{{{}}})", parts.join(", ")))
     }
 
     /// `redirect` Call: args[0] = Arrow(body), args[1] = Array of
@@ -2334,7 +2481,10 @@ impl Render {
         // capture_str — without it a `capture` CALL (the shape the core
         // emits for these lifts) fell through to the shell-text
         // reconstruction, which has no text for `grepMatches` and stubbed.
-        if let Some(v) = self.capture_value_op(body) {
+        //
+        // `native = false`: this path's fallbacks below all trim (capCmd),
+        // so its value-producing ops are asked for the trimmed form too.
+        if let Some(v) = self.capture_value_op(body, false) {
             return v;
         }
         // The C frontend's outparam channel: capture(Arrow[fnCall(..)]) —
@@ -2370,13 +2520,15 @@ impl Render {
                 return "s2s(string(__b))".to_string();
             }
         }
-        if let Some((cmd, argv)) = self.body_single_exec(body) {
+        // Same builtin policy as capture_str: a lone `echo`/`printf` exec's
+        // natively when coreutils agrees with the builtin.
+        if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
             let mut parts = vec![cmd];
             parts.extend(argv);
             return format!("capCmd(exec.Command({}))", parts.join(", "));
         }
         if let Some(text) = self.cmd_text_stmts(body) {
-            let env = self.env_lit();
+            let env = self.env_lit_for(Some(&text));
             return format!("capRun({}, {env})", Self::go_str(&text));
         }
         self.sh2_stub("capture")
@@ -2508,12 +2660,17 @@ impl Render {
     /// op stands in for the whole command, so the capture is its native
     /// value. Only side-effect-free ops qualify — anything else keeps the
     /// subprocess path.
-    fn capture_value_op(&mut self, body: &[IrStmt]) -> Option<String> {
+    fn capture_value_op(&mut self, body: &[IrStmt], native: bool) -> Option<String> {
         let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
             return None;
         };
         match func.as_str() {
             "grepMatches" => self.grep_matches_value(args),
+            // `$(cmd | cmd …)`: the pipeline is the command, and every stage
+            // is a real process — no shell text, no env literal. Declines
+            // (None) when a stage is not a plain command, which keeps the
+            // `bash -c` reconstruction in the caller.
+            "pipeline" => self.pipeline_capture(args, native),
             _ => None,
         }
     }
@@ -2535,9 +2692,30 @@ impl Render {
 
     /// The env literal for `bash -c` calls: every written scalar var.
     fn env_lit(&mut self) -> String {
+        self.env_lit_for(None)
+    }
+
+    /// The env literal for a `bash -c` child whose SCRIPT TEXT is known:
+    /// only the written vars that text reads.
+    ///
+    /// A reconstructed command text names every variable it can reach, so
+    /// handing the child the whole written namespace is marshalling for a
+    /// process that will not look at most of it — and each entry an `any`
+    /// var contributes is another `s2s` boxing coercion. `None`, or a text
+    /// whose reads cannot be enumerated statically (see `sh_text_refs`),
+    /// keeps the complete list: the filter may only ever shrink an env the
+    /// child provably does not need (REFUSE > GUESS).
+    ///
+    /// `eval`/`source` callers must pass `None` — the code they run is not
+    /// in the text, so every var is reachable.
+    fn env_lit_for(&mut self, script: Option<&str>) -> String {
+        let refs: Option<BTreeSet<String>> = script.and_then(sh_text_refs);
         let mut parts = Vec::new();
         let written: Vec<String> = self.written.iter().cloned().collect();
         for v in &written {
+            if refs.as_ref().is_some_and(|r| !r.contains(v)) {
+                continue;
+            }
             if v == "?" || self.is_arr(v) || v.starts_with('#') {
                 continue;
             }
@@ -3892,6 +4070,31 @@ impl Render {
                     }
                     return;
                 }
+                // `cmd argv… > f` / `cmd … 2>/dev/null` in statement
+                // position: the native counterpart of `redirRun` is
+                // `exec.Command` with its stdio welded to the redirect
+                // targets — no `bash -c` child and no env literal
+                // (AGENTS.md §2). `native_redirect_spec` accepts only the
+                // fd 0/1/2 file redirects and `2>&1` it can reproduce
+                // exactly, and `body_single_exec_opt` only a lone external
+                // command, so anything richer keeps the fallback below
+                // (REFUSE > GUESS).
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let Some((cmd, argv)) = self.body_single_exec_opt(inner, true) {
+                        if let Some(lines) = self.native_redirect_spec_lines(&cmd, &argv, redirects)
+                        {
+                            if self.todo == todo {
+                                for l in lines {
+                                    self.emit(&l);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                }
                 if let Some(text) = self.cmd_text_stmts(inner) {
                     let mut with_redirs = format!("( {text} )");
                     let mut ok = true;
@@ -3905,7 +4108,7 @@ impl Render {
                         }
                     }
                     if ok {
-                        let env = self.env_lit();
+                        let env = self.env_lit_for(Some(&with_redirs));
                         self.emit(&format!(
                             "st = redirRun({}, {env});",
                             Self::go_str(&with_redirs)
@@ -4052,7 +4255,7 @@ impl Render {
                     }
                     if ok2 {
                         let text = parts.join(" | ");
-                        let env = self.env_lit();
+                        let env = self.env_lit_for(Some(&text));
                         self.emit(&format!(
                             "st = redirRun({}, {env});",
                             Self::go_str(&text)
@@ -5894,6 +6097,10 @@ enum MA {
     Cond(Box<MA>, Box<MA>, Box<MA>),
     Assign(String, String, Box<MA>),
     IncDec(String, i64, bool),
+    /// `$( … )` — a command substitution used as an arithmetic operand. The
+    /// payload is the INNER command text, still unparsed (see
+    /// `Render::arith_cmdsub`).
+    CmdSub(String),
 }
 
 struct MAParser {
@@ -6150,6 +6357,12 @@ impl MAParser {
         if let Some(n) = parse_arith_num(&t) {
             return Some(MA::Num(n));
         }
+        // `$( … )` — checked BEFORE the `${`/`#`/`[` arms below, any of
+        // which would otherwise read the command text as a name (`$(grep
+        // '#')` would look like base notation, `$(x[0])` like an index).
+        if let Some(inner) = t.strip_prefix("$(").and_then(|r| r.strip_suffix(')')) {
+            return Some(MA::CmdSub(inner.to_string()));
+        }
         if let Some(rest) = t.strip_prefix("${") {
             let inner = rest.strip_suffix('}')?;
             return self.brace_var(inner);
@@ -6242,6 +6455,53 @@ fn arith_quoted_operand(s: &str) -> bool {
         .and_then(|x| x.strip_suffix('}'))
         .unwrap_or(t);
     !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Index of the `)` matching the `(` at `open`, or `None` when the span is
+/// unbalanced or holds a construct this scan cannot account for.
+///
+/// The scan must survive the shapes a real command line has inside
+/// `$( … )`: a subshell (`( … )`), a `)` that is QUOTED or escaped (it does
+/// not close), and a nested `$( … )`. Quotes are skipped as spans — a
+/// double-quoted span may contain `$(` whose own `)` is balanced inside it,
+/// and skipping the whole span keeps the outer depth right. REFUSE > GUESS:
+/// anything unterminated returns `None`, which leaves the arith refusal in
+/// place instead of emitting a mis-parsed operand.
+fn arith_cmdsub_end(b: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = open;
+    while j < b.len() {
+        match b[j] {
+            '\\' => j += 2,
+            '\'' | '"' => {
+                let q = b[j];
+                j += 1;
+                while j < b.len() && b[j] != q {
+                    if q == '"' && b[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                if j >= b.len() {
+                    return None;
+                }
+                j += 1;
+            }
+            '(' => {
+                depth += 1;
+                j += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+                j += 1;
+            }
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 enum ForList {
@@ -7293,6 +7553,80 @@ fn go_contains_word(s: &str, w: &str) -> bool {
     }
     false
 }
+/// The shell variable names a RECONSTRUCTED command text reads, or `None`
+/// when the text can read one this scan cannot name.
+///
+/// Used to shrink the `name=<value>` env list a `bash -c` child is handed:
+/// the child only ever sees a variable the text actually mentions, so
+/// shipping the whole written namespace is pure marshalling. `None` is the
+/// REFUSE > GUESS arm — it keeps the complete list — and covers the read
+/// forms that do not spell a name out:
+///
+///   * `${!ref}`      — an indirect expansion names its target at run time.
+///   * `eval`/`declare`/`export`/`trap`/`set`/`unset`/`readonly`/`local`,
+///     `read`/`mapfile`/`readarray`/`getopts`/`shift` — dynamic or
+///     IMPLICIT reads (`read` consults IFS, which the text need not name).
+///   * `$((…))` / `$[…]` — arithmetic resolves BARE names (`$((x + 1))`).
+///   * `${#name}` / `$#` — `#` is not part of an identifier, so the name
+///     inside would be missed.
+fn sh_text_refs(text: &str) -> Option<BTreeSet<String>> {
+    const DYNAMIC_WORDS: &[&str] = &[
+        "eval", "declare", "typeset", "export", "readonly", "local", "unset", "set", "trap",
+        "read", "mapfile", "readarray", "getopts", "shift", "nameref", "IFS",
+    ];
+    if text.contains("${!") || text.contains("${#") || text.contains("$#") {
+        return None;
+    }
+    if text.contains("$((") || text.contains("$[") {
+        return None;
+    }
+    for w in DYNAMIC_WORDS {
+        if go_contains_word(text, w) {
+            return None;
+        }
+    }
+    let b = text.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut i = 0;
+    while i < b.len() {
+        // `$name` / `${name…}` — an expansion. Also accept a name only when
+        // it starts with an identifier char, so `$$`/`$@`/`$1` add nothing
+        // (none of them name a shell variable).
+        if b[i] == b'$' && i + 1 < b.len() {
+            let mut j = i + 1;
+            if b[j] == b'{' {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && is_id(b[j]) {
+                j += 1;
+            }
+            if j > start && !b[start].is_ascii_digit() {
+                out.insert(String::from_utf8_lossy(&b[start..j]).into_owned());
+            }
+            i = if j > i { j } else { i + 1 };
+            continue;
+        }
+        // `name=` — an ASSIGNMENT (or a `--flag=value` operand, which only
+        // over-approximates). A child that assigns a var needs it in scope
+        // for the rest of its own text, so the entry must survive.
+        if is_id(b[i]) && (i == 0 || !is_id(b[i - 1])) {
+            let mut j = i;
+            while j < b.len() && is_id(b[j]) {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'=' && !b[i].is_ascii_digit() {
+                out.insert(String::from_utf8_lossy(&b[i..j]).into_owned());
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
 fn go_split_helpers() -> Vec<(String, Vec<String>)> {
     let mut segs: Vec<(String, Vec<String>)> = Vec::new();
     let mut cur: Option<(String, Vec<String>)> = None;
@@ -7463,9 +7797,15 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return \"\"",
     "}",
     "",
+    // A PRE-WIRED stdio is left alone: the native redirect lowering welds
+    // c.Stdout/c.Stderr to the redirect targets (os.OpenFile, a dup) before
+    // calling this, and an unconditional assignment here would silently
+    // discard that wiring and send the command's output to the terminal.
+    // The defaults (inherit stdout, drop stderr) apply only where the
+    // caller left the field unset — the historical behaviour.
     "func runCmd(c *exec.Cmd) int64 {",
-    "    c.Stdout = os.Stdout",
-    "    c.Stderr = io.Discard",
+    "    if c.Stdout == nil { c.Stdout = os.Stdout }",
+    "    if c.Stderr == nil { c.Stderr = io.Discard }",
     "    if err := c.Run(); err != nil {",
     "        if ee, ok := err.(*exec.ExitError); ok { return int64(ee.ExitCode()) }",
     "        return 1",
@@ -7528,6 +7868,43 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    }",
     "    for i := 0; i < len(cmds)-1; i++ { cmds[i].Wait() }",
     "    return 0",
+    "}",
+    "",
+    "func capPipe(stages [][]string) string {",
+    "    return strings.TrimRight(capPipeRaw(stages), \"\\n\")",
+    "}",
+    "",
+    "// The capture form of runPipe: same native stage chain, but the LAST",
+    "// stage's stdout is read instead of inherited, so `$(cmd | cmd ...)` needs",
+    "// no `bash -c` child. Both the read and the Waits must happen before the",
+    "// last stage is reaped - a StdoutPipe is not valid after Wait.",
+    "func capPipeRaw(stages [][]string) string {",
+    "    var cmds []*exec.Cmd",
+    "    for _, st := range stages {",
+    "        if len(st) == 0 { return \"\" }",
+    "        c := exec.Command(st[0], st[1:]...)",
+    "        c.Stderr = io.Discard",
+    "        cmds = append(cmds, c)",
+    "    }",
+    "    if len(cmds) == 0 { return \"\" }",
+    "    for i := 0; i < len(cmds)-1; i++ {",
+    "        p, err := cmds[i].StdoutPipe()",
+    "        if err != nil { return \"\" }",
+    "        cmds[i+1].Stdin = p",
+    "    }",
+    "    last, err := cmds[len(cmds)-1].StdoutPipe()",
+    "    if err != nil { return \"\" }",
+    "    for _, c := range cmds {",
+    "        if err := c.Start(); err != nil {",
+    "            for _, d := range cmds { if d.Process != nil { d.Process.Kill() } }",
+    "            for _, d := range cmds { d.Wait() }",
+    "            return \"\"",
+    "        }",
+    "    }",
+    "    data, err := io.ReadAll(last)",
+    "    if err != nil { data = nil }",
+    "    for _, c := range cmds { c.Wait() }",
+    "    return string(data)",
     "}",
     "",
     "func readInto(ps ...*string) bool {",
