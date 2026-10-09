@@ -286,7 +286,8 @@ fn arr_base(name: &str) -> &str {
 /// Indexed arrays lower to a native fish LIST (`set arr a b c`), which fish
 /// already expands, joins, slices and counts — so they need no runtime at
 /// all. bash's associative arrays have no fish equivalent, so those keep the
-/// per-key helpers (`_arr_expand_k`, `_arr_keys_k`).
+/// flat per-key lowering (`{name}_{key}` elements plus the `{name}_keys`
+/// LIST), which the readers spell in native fish too.
 fn is_assoc(name: &str) -> bool {
     ASSOC_VARS.lock().unwrap().contains(arr_base(name))
 }
@@ -308,12 +309,28 @@ fn is_plain_name(name: &str) -> bool {
 /// substitution yielding a single joined line is one word everywhere.
 fn arr_expand_call_fish(name: &str) -> String {
     if is_assoc(name) {
-        return format!("(_arr_expand_k_join {name})");
+        return format!("({} | string join ' ')", assoc_values_loop_fish(name));
     }
     if !is_plain_name(name) {
         return format!("(_arr_expand_join {name})");
     }
     format!("(string join ' ' ${name})")
+}
+
+/// The ASSOC walk, as a native fish `for` block: the VALUES in key-list order,
+/// one per line.
+///
+/// `{name}_keys` is already a fish LIST (the flat `{name}_{key}` write keeps
+/// it), so the loop needs no helper at all — the old `_arr_expand_k` function
+/// only wrapped this same loop in a definition.
+///
+/// The element read is INDIRECT: `_nk` composes the `{name}_{key}` variable
+/// name and `$$_nk` dereferences it once. `$base_$key` is NOT that — fish
+/// reads it as the name `$base_`.
+fn assoc_values_loop_fish(name: &str) -> String {
+    format!(
+        "for _k in ${name}_keys; set -l _nk {name}_\"$_k\"; printf '%s\\n' $$_nk; end"
+    )
 }
 
 /// The `for x in …` form — bash iterates per ELEMENT, and fish's bare `$arr`
@@ -323,7 +340,7 @@ fn arr_expand_call_fish(name: &str) -> String {
 /// space-joined string instead of once per element.)
 fn arr_expand_call_fish_list(name: &str) -> String {
     if is_assoc(name) {
-        return format!("(_arr_expand_k {name})");
+        return format!("({})", assoc_values_loop_fish(name));
     }
     if !is_plain_name(name) {
         return format!("(_arr_expand {name})");
@@ -335,13 +352,30 @@ fn arr_expand_call_fish_list(name: &str) -> String {
 ///
 /// A fish list is always 0-based and contiguous, so its index list is
 /// `0 .. count-1`: `seq` and `count` are both builtins, so this is native
-/// fish with no helper. bash's indirect NAME listing (`${!prefix*}`) is not
-/// an array read at all and keeps the old helper.
+/// fish with no helper.
+///
+/// An ASSOC array already keeps its keys in the fish list `{name}_keys`, so
+/// its key list IS that variable — the old `_arr_keys_k` helper only re-printed
+/// it one key per line, which is what a fish list expands to anyway.
+///
+/// Inlining is not just a call removed: a helper is a SEPARATE fish function,
+/// and `set -a map_keys …` inside a fish function creates a FUNCTION-scoped
+/// variable that no other function can see. So a `declare -A` local to a shell
+/// function read its keys back as EMPTY through the helper, while the same list
+/// read in the enclosing scope is correct (064_22). The scope has to match.
+///
+/// bash's indirect NAME listing (`${!prefix*}` / `${!prefix@}`) is not an
+/// array read at all: it lists the NAMES of the variables beginning with
+/// `prefix`. The core hands the pattern over as the raw text `prefix*`, and
+/// fish spells the listing natively with `set --names` + `string match`.
 fn arr_keys_call_fish(name: &str) -> String {
     if is_assoc(name) {
-        return format!("(_arr_keys_k {name})");
+        return format!("${name}_keys");
     }
     if !is_plain_name(name) {
+        if let Some(prefix) = name.strip_suffix('*').or_else(|| name.strip_suffix('@')) {
+            return format!("(set --names | string match '{prefix}*')");
+        }
         return format!("(_arr_keys {name})");
     }
     format!("(seq 0 (math (count ${name}) - 1))")
@@ -356,15 +390,85 @@ fn arr_len_fish(name: &str) -> String {
     format!("(count ${name})")
 }
 
+/// Is this statement the CORE's process-substitution temp-file cleanup?
+///
+/// `transforms/process_subst.rs::rm_exec` builds it as
+/// `IrStmt::Exec { cmd: "rm", args: ["-f", Var("__ps_tmpN"), …] }` and appends
+/// it as the LAST statement of the block it synthesizes. Recognising it lets
+/// [`stmt_to_fish`]'s block arm carry the consumer's status across it.
+fn is_ps_tmp_cleanup(st: &IrStmt) -> bool {
+    let IrStmt::Exec { cmd, args, .. } = st else {
+        return false;
+    };
+    match cmd {
+        IrExpr::Str(s, _) if s == "rm" => {}
+        _ => return false,
+    }
+    let mut tmps = 0usize;
+    for a in args {
+        match a {
+            IrExpr::Str(s, _) if s == "-f" => {}
+            IrExpr::Var(v, _) if v.starts_with("__ps_tmp") => tmps += 1,
+            _ => return false,
+        }
+    }
+    tmps > 0
+}
+
+/// The core's arithmetic-length placeholders: `__sh2lena_<name>` (an array
+/// length, from `${#name[@]}`) / `__sh2lens_<name>` (a scalar length, from
+/// `${#name}`).
+///
+/// `native_arith_text_len` in the shared core substitutes those
+/// self-describing identifiers into arithmetic TEXT so a downstream emitter can
+/// decode them back; the estree emitter has a Var arm for exactly this. fish
+/// had none, so the placeholder reached the output as the literal (unset)
+/// `$__sh2lena_args` and every `while (( i < ${#args[@]} ))` loop ran ZERO
+/// times (063_09, 063_hard_to_parse).
+///
+/// The value is a `$( … )` substitution, not a bare command, because it lands
+/// inside the caller's `math "…"` string, where only the `$`-form is expanded.
+/// The scalar read is QUOTED so an unset name still yields `string length`
+/// one (empty) argument — 0 — rather than no argument at all, which is what
+/// bash's `${#unset}` means.
+fn arith_len_placeholder_fish(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("__sh2lena_") {
+        if is_plain_name(rest) {
+            // `$( … )` rather than the bare `( … )` `arr_len_fish` returns: this
+            // value is spliced INSIDE a double-quoted `math "…"` argument, and
+            // fish prints a bare paren form there as literal TEXT
+            // (`math "(count $args)"` is "Unknown function").
+            return Some(if is_assoc(rest) {
+                format!("${rest}_len")
+            } else {
+                format!("$(count ${rest})")
+            });
+        }
+    }
+    if let Some(rest) = name.strip_prefix("__sh2lens_") {
+        if is_plain_name(rest) {
+            return Some(format!("$(string length -- \"${rest}\")"));
+        }
+    }
+    None
+}
+
 /// A LITERAL element reference — bash's `arr[i]`, 0-based; fish subscripts its
 /// list from 1, so a numeric index is offset by one. A non-numeric index is
 /// an assoc KEY and keeps the flat `{base}_{key}` element name.
 fn arr_elem_ref(base: &str, idx: &str) -> String {
     if is_plain_name(base) && !is_assoc(base) {
-        let key = if idx.is_empty() { "0" } else { idx };
-        if let Ok(n) = key.parse::<i64>() {
-            return format!("${base}[{}]", n + 1);
-        }
+        // An INDEXED array is a native fish LIST, and `subscript_read_fish` is
+        // the one place that spells its subscript — including the COMPUTED
+        // form, which cannot be written inline (fish does not evaluate
+        // arithmetic inside `[ ]`; `"$a[$i + 1]"` is a runtime "Invalid index
+        // value", so the index is evaluated into a temp first).
+        //
+        // The `{base}_{idx}` scalar this used to fall back to belongs to the
+        // retired per-element layout, so it named an UNSET variable: 063_09
+        // rendered its option loop's subject as `switch "$args_i"`, which never
+        // matched, and the whole parser processed nothing.
+        return subscript_read_fish(base, if idx.is_empty() { "0" } else { idx });
     }
     format!("${base}_{idx}")
 }
@@ -426,8 +530,13 @@ fn body_calls(body: &str, name: &str) -> bool {
     body.contains(&format!("{name} ")) || body.contains(&format!("{name})"))
 }
 
-/// The assoc-array runtime, plus the two shapes only a non-identifier array
-/// name can reach. Emitted per helper — see [`arr_helper_preamble`].
+/// The array runtime the renderer still cannot spell natively, plus the two
+/// shapes only a non-identifier array name can reach. Emitted per helper —
+/// see [`arr_helper_preamble`].
+///
+/// The assoc walk is NOT here: `${!map[@]}` is the fish list `$map_keys`,
+/// `${map[*]}` is an inline `for` over that list, and `${!prefix*}` is
+/// `set --names | string match`. All three are plain fish.
 const ARR_HELPERS: &[(&str, &str)] = &[
     (
         "_arr_expand",
@@ -473,39 +582,6 @@ end
     while test $_i -lt $_n
         printf '%s\n' $_i
         set _i (math $_i + 1)
-    end
-end
-"#,
-    ),
-    (
-        "_arr_expand_k",
-        r#"function _arr_expand_k --argument-names name
-    # assoc variant: values in key-list order ($name_keys).
-    set -l _keys_var $name"_keys"
-    for _k in $$_keys_var
-        set -l _ev $name"_"$_k
-        printf '%s\n' $$_ev
-    end
-end
-"#,
-    ),
-    (
-        "_arr_expand_k_join",
-        r#"function _arr_expand_k_join --argument-names name
-    # assoc variant, space-joined (bash's `${arr[*]}`).
-    set -l _out (_arr_expand_k $name)
-    string join ' ' $_out
-    or printf '\n'
-end
-"#,
-    ),
-    (
-        "_arr_keys_k",
-        r#"function _arr_keys_k --argument-names name
-    # assoc variant: the key list, one per line.
-    set -l _keys_var $name"_keys"
-    for _k in $$_keys_var
-        printf '%s\n' $_k
     end
 end
 "#,
@@ -558,15 +634,10 @@ fn arr_helper_preamble(body: &str) -> String {
         .filter(|(name, _)| body_calls(body, name))
         .map(|(name, _)| *name)
         .collect();
-    // `_arr_expand_join` calls `_arr_expand`; `_arr_expand_k_join` calls
-    // `_arr_expand_k`.
-    for base in ["_arr_expand", "_arr_expand_k"] {
-        let derived = ARR_HELPERS
-            .iter()
-            .any(|(n, _)| needed.contains(n) && *n == format!("{base}_join").as_str());
-        if derived && !needed.contains(&base) {
-            needed.push(base);
-        }
+    // `_arr_expand_join` calls `_arr_expand`.
+    let derived = needed.contains(&"_arr_expand_join");
+    if derived && !needed.contains(&"_arr_expand") {
+        needed.push("_arr_expand");
     }
     if needed.is_empty() {
         return String::new();
@@ -1272,6 +1343,16 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 // compound inner: inline it, then the redirects apply to the group
                 stmts_inline(inner)?
             };
+            // A STANDALONE redirect (`>file` with no command) arrives as
+            // `exec("")`, which renders the empty word `''`. `'' >file` is
+            // "Unknown command" in fish, so the file is never even created —
+            // parse-standalone-redirect measured an EMPTY size where bash
+            // reports 0. bash runs the empty command with the redirect
+            // applied, which is the same statement as fish's no-op `:`:
+            // `: >file` truncates the file, `: <file` just reads it.
+            if line.trim() == "''" {
+                line = ":".into();
+            }
             line = herestring_wrap_fish(&plain, line)?;
             if !ps_ins.is_empty() {
                 line = lower_procsub_stmt_fish(&ps_ins, &line)?;
@@ -1313,8 +1394,28 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::Block(body) => {
             indent(out, d);
             out.push_str("begin\n");
-            for b in body {
+            // The CORE's process-substitution transform appends its temp-file
+            // cleanup (`rm -f $__ps_tmp0 …`) as the LAST statement of the block
+            // it builds (transforms/process_subst.rs::rm_exec). Rendered
+            // literally, that makes the block's exit STATUS the cleanup's —
+            // always 0 — so `diff <(echo one) <(echo two); echo "exit: $?"`
+            // printed 0 where bash printed 1 (process-substitution, 064_01,
+            // 070_cmp_basic). The consumer's status is snapshotted before the
+            // cleanup and re-asserted after it, which is what the shell's own
+            // `;` sequence would have carried.
+            let cut = match body.last() {
+                Some(last) if is_ps_tmp_cleanup(last) => body.len() - 1,
+                _ => body.len(),
+            };
+            for b in &body[..cut] {
                 stmt_to_fish(b, d + 1, out)?;
+            }
+            if cut < body.len() {
+                indent(out, d + 1);
+                out.push_str("set -l _ps_rc $status\n");
+                stmt_to_fish(&body[cut], d + 1, out)?;
+                indent(out, d + 1);
+                out.push_str("test $_ps_rc -eq 0\n");
             }
             indent(out, d);
             out.push_str("end\n");
@@ -1559,9 +1660,26 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
         && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
     {
         let IrExpr::Arith(a) = expr else { unreachable!() };
-        if let ArithAst::IncDec { var, delta, .. } = &**a {
+        if let ArithAst::IncDec { var, delta, prefix } = &**a {
             let op = if *delta > 0 { "+" } else { "-" };
-            return Ok(format!("set {var} (math --scale 0 \"${var} {op} 1\")"));
+            // `set` and `math` both SUCCEED, so the bare increment left the
+            // statement with status 0 — but bash's `(( … ))` status is the
+            // VALUE's truthiness, and a POSTFIX increment yields the OLD
+            // value: `i=0; ((i++))` exits 1, and `echo $?` right after it
+            // reads that (arith-postfix-status pinned `post0=1`). So the
+            // status is re-asserted from whichever value the operator yields
+            // — the incremented one for a prefix `++i`, the previous one for
+            // a postfix `i++`.
+            if *prefix {
+                return Ok(format!(
+                    "set {var} (math --scale 0 \"${var} {op} 1\"); test ${var} -ne 0"
+                ));
+            }
+            return Ok(format!(
+                "set -l {var}__sh2old ${var}; \
+                 set {var} (math --scale 0 \"${var} {op} 1\"); \
+                 test ${var}__sh2old -ne 0"
+            ));
         }
         return Ok(format!(":"));
     }
@@ -1698,7 +1816,7 @@ fn array_elem_write(base: &str, idx: &str, rhs: &str) -> String {
 }
 
 /// An associative-array element write (`map[key]=v`) — the flat
-/// `{base}_{key}` element plus the key list `_arr_keys_k` walks.
+/// `{base}_{key}` element plus the `{base}_keys` LIST the readers walk.
 fn assoc_elem_write(base: &str, key: &str, rhs: &str) -> String {
     format!(
         "set {base}_{key} {rhs}; set {base}_len (math --scale 0 \"${base}_len + 1\"); set -a {base}_keys {key}"
@@ -1714,7 +1832,7 @@ fn assoc_elem_write(base: &str, key: &str, rhs: &str) -> String {
 ///
 /// An ASSOCIATIVE array (`declare -A`, string keys) has no fish equivalent
 /// and keeps the per-key lowering: `{name}_{key}` elements plus the
-/// `{name}_keys` key list the `_arr_*_k` helpers walk.
+/// `{name}_keys` LIST the readers walk.
 fn set_array_to_fish(name: &str, items: &str, append: bool) -> String {
     // the KEYED literal form — `d=([a]=1 [b]=2)` (Python dicts / bash
     // assoc literals): each item is `[k]=v` — write the per-key element + key list
@@ -2169,6 +2287,37 @@ fn test_rhs_is_quoted(rhs: &str) -> bool {
             || (r.starts_with('\'') && r.ends_with('\'')))
 }
 
+/// A `[[ lhs = PATTERN ]]` comparison, with bash's extglob ALTERNATION
+/// `@(a|b)` lowered to the anchored regex it actually means.
+///
+/// fish's `string match` is a GLOB matcher and reads `|` as an ordinary
+/// character, so handing `@(foo|bar)` over verbatim matched NOTHING —
+/// at-in-test printed no `matched` where bash prints it. `@(…)` must consume
+/// the whole word, which is what `string match` does anyway, so the regex is
+/// anchored at both ends.
+///
+/// Only a glob-and-regex-free alternative list is lowered. An alternative
+/// holding `*`, `?`, `.`, `+` … would mean something different inside a
+/// regex, so those keep the literal-glob rendering rather than being guessed
+/// at — REFUSE > GUESS.
+fn glob_pattern_test_fish(lhs: &str, rhs: &str) -> String {
+    if let Some(inner) = rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')')) {
+        let plain = |a: &str| {
+            !a.is_empty()
+                && !a.contains([
+                    '*', '?', '[', ']', '\\', '$', '.', '^', '+', '{', '}', '(', ')',
+                ])
+        };
+        if inner.split('|').all(plain) {
+            return format!(
+                "string match -rq -- {} {lhs}",
+                fish_pattern_lit(&format!("^({inner})$"))
+            );
+        }
+    }
+    format!("string match -q -- {} {lhs}", fish_pattern_lit(rhs))
+}
+
 /// One comparison atom of a test string (`"$a" == "b"`, `"$s" =~ ^h`,
 /// `-f /x` …) → a single sh cond command. The `==`/`!=`/`=` forms lower
 /// to the case emulation (dash has no `==`), `=~` to a grep -E pipeline,
@@ -2205,11 +2354,10 @@ fn test_cmp_to_fish(t: &str, dbl: bool) -> Result<String, String> {
                 fish_pattern_lit(&format!("*{rest}")),
                 fish_pattern_lit(&format!("{neg}{rest}"))
             )
-        } else if let Some(inner) =
-            rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
-        {
-            // extglob list match: `@(a|b)` == `a|b`
-            format!("string match -q -- {} {lhs}", fish_pattern_lit(inner))
+        } else if rhs.starts_with("@(") {
+            // extglob list match `@(a|b)` — the alternation is not a fish
+            // glob; see `glob_pattern_test_fish`.
+            glob_pattern_test_fish(&lhs, &rhs)
         } else if let Some(inner) =
             rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
         {
@@ -2267,10 +2415,7 @@ fn test_cmp_to_fish(t: &str, dbl: bool) -> Result<String, String> {
             // and an unquoted pattern, so they keep the glob.
             Ok(format!("[ {lhs} = {rhs} ]"))
         } else {
-            Ok(format!(
-                "string match -q -- {} {lhs}",
-                fish_pattern_lit(&rhs)
-            ))
+            Ok(glob_pattern_test_fish(&lhs, &rhs))
         }
     } else {
         // quote bare $(...) and ${...} so word-splitting
@@ -2758,13 +2903,75 @@ fn arith_cond_ast_fish(a: &ArithAst) -> String {
     if let ArithAst::Bin { op, lhs, rhs } = a {
         if let Some(flag) = test_flag(op) {
             return format!(
-                "[ (math --scale 0 \"{}\") {flag} (math --scale 0 \"{}\") ]",
-                arith_to_fish(lhs),
-                arith_to_fish(rhs)
+                "[ {} {flag} {} ]",
+                arith_value_subst_fish(lhs),
+                arith_value_subst_fish(rhs)
             );
         }
     }
-    format!("[ (math --scale 0 \"{}\") -ne 0 ]", arith_to_fish(a))
+    format!("[ {} -ne 0 ]", arith_value_subst_fish(a))
+}
+
+/// True when `a` contains a node fish's `math` cannot evaluate: a RELATIONAL
+/// (`>`, `<`, `==`, …) or a ternary.
+///
+/// `math` rejects both with "Logical operations are not supported, use `test`
+/// instead" on STDERR and prints NOTHING — so a value-position rendering of
+/// `$((a > b))` as a bare `(math …)` came back EMPTY and silently deleted the
+/// whole word, rather than yielding the 1/0 the expression expands to
+/// (redirect-in-arithmetic, t78_arith_ternary).
+fn arith_needs_test(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            test_flag(op).is_some() || arith_needs_test(lhs) || arith_needs_test(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_needs_test(arg),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_needs_test(test) || arith_needs_test(then) || arith_needs_test(else_)
+        }
+        _ => false,
+    }
+}
+
+/// A statement that PRINTS the value of an arithmetic expression — the body of
+/// the `if` branches [`arith_value_subst_fish`] emits.
+fn arith_print_fish(a: &ArithAst) -> String {
+    if arith_needs_test(a) {
+        // `echo (…)`, not a bare `(…)`: a command substitution standing alone
+        // in command position is not a statement fish accepts.
+        format!("echo {}", arith_value_subst_fish(a))
+    } else {
+        format!("math --scale 0 \"{}\"", arith_to_fish(a))
+    }
+}
+
+/// An arithmetic VALUE, as a fish command substitution yielding one word.
+///
+/// The plain case is fish's `math` — the same spelling every other arithmetic
+/// site uses, so this is byte-identical to the previous rendering whenever the
+/// expression holds nothing `math` refuses. The two forms it does refuse are
+/// lowered to fish proper, with no runtime helper:
+///
+/// * a relational (`$((a > b))`) becomes fish's own `test`, whose status is
+///   turned into the 1/0 the arithmetic expansion produces;
+/// * a ternary (`$((c ? t : e))`) becomes fish's `if`, each branch printed by
+///   whichever spelling its own shape needs.
+///
+/// fish's `test` has no `<`/`>` for STRINGS, but every relational reaching
+/// arithmetic is numeric — which is exactly what `-gt`/`-lt` spell.
+fn arith_value_subst_fish(a: &ArithAst) -> String {
+    match a {
+        ArithAst::Cond { test, then, else_ } => format!(
+            "(if {}; {}; else; {}; end)",
+            arith_cond_ast_fish(test),
+            arith_print_fish(then),
+            arith_print_fish(else_)
+        ),
+        ArithAst::Bin { op, .. } if test_flag(op).is_some() => {
+            format!("(if {}; echo 1; else; echo 0; end)", arith_cond_ast_fish(a))
+        }
+        _ => format!("(math --scale 0 \"{}\")", arith_to_fish(a)),
+    }
 }
 
 /// bash's arithmetic relationals → fish `test` flags. `None` for the
@@ -3063,6 +3270,21 @@ fn exec_line_to_fish(
     //   bash -x / -v / -o pipefail / -n etc. -> fish has no equivalent.
     // A script with no fish-representable option lowers to `:` (a no-op), so
     // the line still parses and the body still runs.
+    //
+    // `set -- a b c d` is the exception, and it is not an option line at all:
+    // it REPLACES the positional parameters. fish keeps those in the ordinary
+    // variable `argv`, which `set` can write, so the assignment is direct —
+    // dropping it left every `$1`/`${@:N}` that followed reading the SCRIPT's
+    // arguments (parse-at-slice: `set -- a b c d; echo "${@:3}"` printed
+    // nothing).
+    if cmd_name == Some("set") && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "--") {
+        out.push_str("set argv");
+        for a in &args[1..] {
+            out.push(' ');
+            out.push_str(&word_to_fish(a)?);
+        }
+        return Ok(out);
+    }
     if cmd_name == Some("set") && args_are_options(&args) {
         let mut flags: Vec<&str> = Vec::new();
         for a in args {
@@ -3314,7 +3536,11 @@ fn exec_line_to_fish(
                     .iter()
                     .any(|a| matches!(a, IrExpr::Str(s, _) if s == "-r"));
                 if has_r {
-                    let mut words: Vec<String> = Vec::new();
+                    // The command word is NOT in `args` — rebuilding the line
+                    // from `args` alone dropped `grep` itself, so the render
+                    // started at `-r` and fish tried to RUN `-r`
+                    // (017_grep_context had no results at all).
+                    let mut words: Vec<String> = vec![word_to_fish(cmd)?];
                     let mut found_pattern = false;
                     let mut replaced_dir = false;
                     for (i, a) in args.iter().enumerate() {
@@ -3422,10 +3648,36 @@ fn exec_line_to_fish(
                 ));
             }
         }
-        // `mapfile` fills an ARRAY, and fish's command substitution already
-        // yields one element per LINE — so reading the stream straight into
-        // the list IS the `-t` semantics, with no loop and no counter.
-        return Ok(format!("set -l _mf (cat); set {name} $_mf"));
+        // `mapfile` fills an ARRAY from a stream, one element per LINE — which
+        // is exactly what a `read -l` loop appends. The bulk
+        // `set -l _mf (cat); set {name} $_mf` this replaces read NOTHING: the
+        // caller appends the input redirect (`mapfile … < <(…)` becomes
+        // `< "$_ps_t"`), that redirect lands on the TRAILING `set`, and the
+        // `(cat)` command substitution inherits the SCRIPT's stdin — measured:
+        // `set lines (cat) < f` leaves `lines` EMPTY (012/041 printed a bare
+        // space). The loop is what makes the redirect reach the reader, since
+        // `while …; end < f` redirects the whole block.
+        return Ok(format!(
+            "set -e {name}\nwhile read -l _mf_line\n    set -a {name} $_mf_line\nend"
+        ));
+    }
+    // `shift` / `shift N` — fish has no `shift` at all (verifying: "Unknown
+    // command: shift"), so emitting it verbatim left `$argv` unchanged and a
+    // function like `capture() { local label="$1"; shift; "$@" }` then ran the
+    // label AS the command (`01-default id` -> rc 127, id-cmdsub / tty-cmdsub /
+    // readonly-cmdsub). `argv` is an ordinary fish variable, so the leading
+    // arguments are erased directly.
+    if cmd_name == Some("shift") && env.is_none() {
+        let n = args.first().and_then(|a| match a {
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
+            IrExpr::Int(i) => Some(*i),
+            _ => None,
+        });
+        match n {
+            Some(k) if k > 1 => out.push_str(&format!("set -e argv[1..{k}]")),
+            _ => out.push_str("set -e argv[1]"),
+        }
+        return Ok(out);
     }
     // `unset x` — fish spells this `set -e x`, and emitting the bash name
     // verbatim produced "[Unknown command: unset]" (a RUNTIME failure that
@@ -3727,13 +3979,17 @@ fn lower_procsub_stmt_fish(ps: &[IrRedirect], cmd: &str) -> Result<String, Strin
             if cmd.starts_with("head ") || cmd == "head" {
                 return Ok(format!("{{ {producer}; }} 2>/dev/null | {cmd}"));
             }
+            // The consumer's status must survive the temp-file cleanup: the
+            // `rm` that follows always succeeds, so without the `rc` snapshot
+            // every `cmd <(producer); echo $?` read 0 (process-substitution
+            // printed `exit: 0` for `diff <(echo one) <(echo two)`).
             return Ok(format!(
-                "_ps_t=$(mktemp)\n{{ {producer}; }} 2>/dev/null > \"$_ps_t\"\n{cmd} < \"$_ps_t\"\nrm -f \"$_ps_t\""
+                "_ps_t=$(mktemp)\n{{ {producer}; }} 2>/dev/null > \"$_ps_t\"\n{cmd} < \"$_ps_t\"; rc=$?\nrm -f \"$_ps_t\"\n[ \"$rc\" -eq 0 ]"
             ));
         }
         // process-out: the target CONSUMES the command's output
         return Ok(format!(
-            "_ps_t=$(mktemp)\n{cmd} > \"$_ps_t\"\n{{ {}; }} < \"$_ps_t\"\nrm -f \"$_ps_t\"",
+            "_ps_t=$(mktemp)\n{cmd} > \"$_ps_t\"\n{{ {}; }} < \"$_ps_t\"; rc=$?\nrm -f \"$_ps_t\"\n[ \"$rc\" -eq 0 ]",
             proc_target(r)?
         ));
     }
@@ -4225,9 +4481,13 @@ fn word_to_fish(e: &IrExpr) -> Result<String, String> {
         IrExpr::Arith(a) => {
             // An IncDec is a self-contained command substitution (it mutates
             // the variable, so it cannot be an argument to `math`); everything
-            // else is an expression for math to evaluate.
+            // else is an expression for math to evaluate — except a relational
+            // or a ternary, which `math` refuses outright and which the native
+            // `test`/`if` spelling covers (see `arith_value_subst_fish`).
             if matches!(&**a, ArithAst::IncDec { .. }) {
                 Ok(arith_to_fish(a))
+            } else if arith_needs_test(a) {
+                Ok(arith_value_subst_fish(a))
             } else {
                 Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a)))
             }
@@ -4767,10 +5027,30 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
 /// `${name}`-family rendering. `list` selects the list form (join
 /// context, `"${arr[@]}"`).
 fn var_ref_to_fish(name: &str, list: bool) -> String {
+    // The core's arith-length placeholders are not variables at all — decode
+    // them before the generic identifier path names them (which would emit a
+    // dangling `$__sh2lena_x`).
+    if let Some(len) = arith_len_placeholder_fish(name) {
+        return len;
+    }
     if name == "RANDOM" {
         // bash-only; POSIX sh has no portable random — POSIX awk's
         // srand()/rand() (int(rand()*32768) = bash's 0..32767 range)
         return "$(awk 'BEGIN{srand(); printf \"%d\", int(rand()*32768)}')".into();
+    }
+    if name == "HOSTNAME" {
+        // bash sets HOSTNAME to the machine's host name in EVERY shell (it
+        // is not an exported variable — a child bash sets it itself), and
+        // fish keeps the same value under its own lowercase spelling. This
+        // is the `$?` → `$status` rename, not a stub: both name the host.
+        //
+        // Without it `${HOSTNAME:-localhost}` printed the host name under
+        // bash and fell through to the DEFAULT under fish, because fish's
+        // `$HOSTNAME` is unset (064_21: "…from PC" vs "…from localhost").
+        // Safe to rename because no corpus script ever ASSIGNS HOSTNAME —
+        // the only other readers are quoted heredoc bodies, where the text
+        // is literal and never reaches this function.
+        return "$hostname".into();
     }
     // The bash special parameters fish spells differently.
     //
@@ -5050,8 +5330,17 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                     // `string sub` is 1-based; bash `${s:off}` starts at 0.
                     format!("string sub --start {}", offn + 1)
                 };
-                if lenn.unwrap_or(0) > 0 {
-                    c.push_str(&format!(" --length {}", lenn.unwrap()));
+                match lenn {
+                    Some(l) if l > 0 => c.push_str(&format!(" --length {l}")),
+                    // `${x:off:-N}` — a NEGATIVE length keeps everything from
+                    // the offset up to N characters from the END, which is
+                    // fish's negative `--end` (measured: `${x:0:-2}` on
+                    // "hello world" is "hello wor", and `string sub --start 1
+                    // --end -2` yields the same nine characters). Dropping it
+                    // returned the whole tail instead — `${x::-2}` printed all
+                    // eleven characters (parse-substring-double-colon).
+                    Some(l) if l < 0 => c.push_str(&format!(" --end {l}")),
+                    _ => {}
                 }
                 c.push_str(&format!(" -- \"{subj}\""));
                 return Ok(format!("({c})"));
@@ -5102,11 +5391,13 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
         "//" | "/" => {
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
-            // The IR conflates first/all occurrences (`${x/p/r}` and
-            // `${x//p/r}` both arrive as `//`), so this always renders the
-            // replace-ALL form and needs `-a`: `string replace` without it
-            // replaces only the first match, which turned `${var//o/0}` on
-            // "hello world" into "hell0 world".
+            // `${x//p/r}` replaces EVERY match, `${x/p/r}` only the FIRST.
+            // The IR keeps the two DISTINCT (`param("//", …)` vs
+            // `param("/", …)` — measured on `y=one-two-one`), so they must
+            // not share a spelling: fish spells "all" as `-a` and "first" as
+            // the bare builtin, exactly the same distinction. Rendering both
+            // with `-a` printed `1-two-1` for `${y/one/1}` where bash prints
+            // `1-two-one`.
             //
             // bash's pattern here is a GLOB but the corpus uses plain
             // literals, and `string replace` without `-r` treats the pattern
@@ -5114,7 +5405,9 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // safe default. A pattern that looks like a regex (escapes or a
             // group) opts into `-r` so a capture-group pattern is not silently
             // matched as literal text.
-            let flag = if pat.contains('\\') || pat.contains('(') { " -a -r" } else { " -a" };
+            let all = if op == "//" { " -a" } else { "" };
+            let re = if pat.contains('\\') || pat.contains('(') { " -r" } else { "" };
+            let flag = format!("{all}{re}");
             if rep.is_empty() {
                 // bash `${x/p/}` DELETES the match; `string replace` with no
                 // replacement argument does exactly that.
@@ -5134,9 +5427,13 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             let default = bash_specials_to_fish(&raw_arg(args, 2)?);
             // `${arr:-d}` — bash's array form reads ELEMENT 0 when the array
             // is non-empty. The per-element vars have no scalar, so the
-            // element-0 variable is the subject of the same emptiness test.
+            // element-0 read is the subject of the same emptiness test — and it
+            // is handed over ALREADY RENDERED, because `default_if_unset_fish`
+            // would re-parse `$arr[1]` as a variable NAME and keep only its
+            // identifier characters, emitting the unrelated (and unset)
+            // `$arr1` (parse-array-plusassign printed `LIST=[]`).
             if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
-                return Ok(default_if_unset_fish(&arr_elem_ref(&name, "0"), &default));
+                return Ok(default_if_unset_expr_fish(&arr_elem_ref(&name, "0"), &default));
             }
             // `${@:-d}` / `${*:-d}` — the positionals. `"$@"` is a fish
             // PARSE ERROR, so the subject must be fish's positional list.
@@ -5180,9 +5477,11 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             let nonempty = op == ":+";
             if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
                 // `${arr+…}` — the per-element vars have no scalar, so the
-                // setness subject is element 0, the same remap `:-` uses.
-                let el = arr_elem_ref(&name, "0");
-                return Ok(set_if_fish(&setness_guard_fish(&el, nonempty), &word));
+                // subject is element 0, the same remap `:-` uses. The guard has
+                // to be built from the RENDERED element: `setness_guard_fish`
+                // takes a variable NAME, and passing it `$arr[1]` produced
+                // `set -q $arr[1]` — the element's VALUE re-read as a name.
+                return Ok(set_if_fish(&array_setness_guard_fish(&name, nonempty), &word));
             }
             if name == "@" || name == "*" {
                 // The positionals: set == `$#` > 0, which fish spells with the
@@ -5381,8 +5680,36 @@ fn param_subject_fish(name: &str) -> String {
 /// is exactly when bash substitutes the default. The `(cmd; and A; or B)`
 /// chain is fish's native conditional.
 fn default_if_unset_fish(name: &str, default: &str) -> String {
-    let subj = param_subject_fish(name);
+    default_if_unset_expr_fish(&param_subject_fish(name), default)
+}
+
+/// [`default_if_unset_fish`] for a subject that is ALREADY a fish expression
+/// rather than a bash variable NAME.
+///
+/// The array case needs this: `${arr:-d}` reads ELEMENT 0, whose fish spelling
+/// is `$arr[1]` (indexed) or `$arr_0` (assoc). Feeding that back through
+/// `param_subject_fish` re-parses it as a NAME — `[`/`]` are not identifier
+/// characters, so `var_ref_to_fish` fell through to its identifier-only
+/// fallback and emitted the unrelated `$arr1`, which is unset.
+fn default_if_unset_expr_fish(subj: &str, default: &str) -> String {
     format!("(test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {default})")
+}
+
+/// The `${arr+w}` / `${arr:+w}` guard for an ARRAY subject.
+///
+/// `:+` wants "element 0 is non-empty", which is the rendered element read.
+/// `+` wants "the array is set", which cannot go through `set -q` for an
+/// indexed array — its elements are a fish LIST, so there is no element-0
+/// NAME to test; `count` is the list's own setness. An associative array still
+/// owns the flat `{base}_0` element, so its name is testable directly.
+fn array_setness_guard_fish(name: &str, nonempty: bool) -> String {
+    if nonempty {
+        return format!("test -n \"{}\"", arr_elem_ref(name, "0"));
+    }
+    if is_assoc(name) {
+        return format!("set -q {}_0", arr_base(name));
+    }
+    format!("test (count ${}) -gt 0", arr_base(name))
 }
 
 /// `${x:=default}` — bash's `:-` PLUS the side effect: the variable is left
@@ -5542,9 +5869,20 @@ fn interp_to_fish(parts: &[InterpPart]) -> Result<String, String> {
                 // Multi-word / already-quoted forms (cmdsub lists, brace
                 // expansion, whole-array helpers) stay bare.
                 if !open && interp_expr_self_quotes(x) {
-                    out.push('"');
-                    out.push_str(&interp_expr_to_fish(x)?);
-                    out.push('"');
+                    let s = interp_expr_to_fish(x)?;
+                    // An expansion that ALREADY renders as one quoted word
+                    // (`param("")` → `"$y"`) must not be quoted a second time:
+                    // `"${y}extra"` came out as `""$y"""extra"`, and fish reads
+                    // that back as EMPTY (parse-dollar-in-param-expand printed
+                    // nothing where bash printed `extra`; same shape in
+                    // unicode-in-string / parse-and-or-chain-with-assign).
+                    if s.starts_with('"') {
+                        out.push_str(&s);
+                    } else {
+                        out.push('"');
+                        out.push_str(&s);
+                        out.push('"');
+                    }
                     continue;
                 }
                 let need_break = matches!(
@@ -5559,7 +5897,23 @@ fn interp_to_fish(parts: &[InterpPart]) -> Result<String, String> {
                     out.push('"');
                     open = false;
                 }
-                out.push_str(&interp_expr_to_fish(x)?);
+                let mut s = interp_expr_to_fish(x)?;
+                // Inside an OPEN template quote a self-contained quoted
+                // expansion must be spliced BARE. `param("")` renders one
+                // quoted word (`"$NC"`), and splicing it there closes the
+                // template quote mid-word: `"✅ …"` + `"$NC"` + the final
+                // closing quote leaves `$NC` UNQUOTED, and fish expands a word
+                // as the cartesian product of its parts — an unset variable
+                // contributes ZERO elements, so the whole word VANISHES
+                // (unicode-in-string printed nothing where bash printed
+                // `✅ All tests passed`). Bare, the same read is one empty
+                // contribution and the rest of the word survives.
+                if open {
+                    if let Some(inner) = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                        s = inner.to_string();
+                    }
+                }
+                out.push_str(&s);
             }
         }
     }
@@ -6769,6 +7123,49 @@ fn split_relational(raw: &str) -> Option<(&str, &str, &str, &str)> {
     None
 }
 
+/// The index just past the `)` that closes the command substitution whose `(`
+/// sits at `open` (0-based). `None` when it is never closed.
+///
+/// Quotes are tracked, so a `)` inside a string (`$(echo "a)b")`) does not
+/// close the substitution early, and nested substitutions and parenthesised
+/// commands balance normally.
+fn cmdsubst_span(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    let mut sq = false;
+    let mut dq = false;
+    while i < b.len() {
+        let c = b[i];
+        if sq {
+            if c == b'\'' {
+                sq = false;
+            }
+        } else if dq {
+            if c == b'"' {
+                dq = false;
+            } else if c == b'\\' {
+                i += 1;
+            }
+        } else {
+            match c {
+                b'\'' => sq = true,
+                b'"' => dq = true,
+                b'\\' => i += 1,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn arith_rewrite(t: &str) -> String {
     let b = t.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -6846,6 +7243,29 @@ fn arith_rewrite(t: &str) -> String {
                 continue;
             }
         }
+        // `$(cmd)` inside arithmetic TEXT — bash RUNS the substitution and
+        // folds its output into the expression (`$(( $(wc -l < f) + 1 ))`).
+        // fish does exactly the same when the substitution reaches it intact,
+        // because `$( … )` — unlike a bare `( … )` — IS expanded inside the
+        // enclosing double-quoted `math "…"` argument. So the whole
+        // substitution has to be copied through VERBATIM; rewriting its words
+        // as arithmetic identifiers mangled it into
+        // `$($wc -$l < /$etc/$passwd)`, which `math` then rejected so the
+        // whole value came back empty (064_14).
+        //
+        // `$((` is arithmetic, not a command substitution, and keeps its own
+        // lowering above.
+        if c == b'$' as char
+            && i + 2 < b.len()
+            && b[i + 1] == b'('
+            && b[i + 2] != b'('
+        {
+            if let Some(after) = cmdsubst_span(b, i + 1) {
+                out.push_str(&t[i..after]);
+                i = after;
+                continue;
+            }
+        }
         // bare identifier -> $(_num "$name") (bash coerces non-numeric
         // values to 0, dash errors); assignment LHS stays bare (`x` in
         // `x = y` is a write target); a postfix ++/-- rewrites first
@@ -6866,6 +7286,15 @@ fn arith_rewrite(t: &str) -> String {
                 j += 1;
             }
             let name = &t[i..j];
+            // `${#name[@]}` / `${#name}` in arithmetic text arrive as the
+            // core's self-describing placeholders (`__sh2lena_args`) — decode
+            // them here or the literal unset name reaches `math`
+            // (063_09: the option loop's bound was always empty).
+            if let Some(len) = arith_len_placeholder_fish(name) {
+                out.push_str(&len);
+                i = j;
+                continue;
+            }
             // zsh/mathfunc arithmetic CALLS (`sqrt(9)`, `int(3.7)`,
             // `hypot(3, 4)`, `fmod(7, 3)` — the deterministic subset the
             // zsh corpus exercises; the estree reference resolves the
@@ -6985,7 +7414,16 @@ fn braced_arith_to_fish(inner: &str) -> String {
         {
             let base = base.strip_prefix('$').unwrap_or(base);
             if is_plain_var(base) {
-                return format!("${base}_len");
+                // An INDEXED array is a native fish LIST, so its length is the
+                // `count` builtin — the `{base}_len` counter belongs to the
+                // retired per-element layout and is never set, which made
+                // `$((j+(100/${#arr[@]})))` come back EMPTY
+                // (parse-arithmetic-nested-array). Only the ASSOCIATIVE array
+                // still keeps a counter.
+                if is_assoc(base) {
+                    return format!("${base}_len");
+                }
+                return format!("$(count ${base})");
             }
         }
         // `${#NAME}` — the string LENGTH.
@@ -6998,11 +7436,17 @@ fn braced_arith_to_fish(inner: &str) -> String {
     if is_plain_var(bare) {
         return format!("${bare}");
     }
-    // `${NAME[num]}` — a literal element subscript in the flat layout.
+    // `${NAME[num]}` — a literal element subscript. An INDEXED array is a
+    // native fish LIST (1-based), so this is fish's own `$name[n+1]`; the flat
+    // `{base}_{idx}` scalar is only right for an ASSOCIATIVE array.
     if let Some((base, idx)) = bare.strip_suffix(']').and_then(|n| n.split_once('[')) {
         let idx = idx.trim_matches(['"', '\'']);
         if is_plain_var(base) && !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
-            return format!("${base}_{idx}");
+            if is_assoc(base) {
+                return format!("${base}_{idx}");
+            }
+            let n: i64 = idx.parse().unwrap_or(0);
+            return format!("${base}[{}]", n + 1);
         }
     }
     let cleaned: String = inner
@@ -7083,6 +7527,11 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // dotted struct-field names sanitize exactly like the setVar
             // write arm (`p.x` → `p_x`) — the read must hit the same home
             let name = name.replace('.', "_");
+            // `${#name[@]}` / `${#name}` arrive as the core's self-describing
+            // placeholders; decode them (see `arith_len_placeholder_fish`).
+            if let Some(len) = arith_len_placeholder_fish(&name) {
+                return len;
+            }
             // fish's `math` parses its argument as an EXPRESSION string: a
             // bare identifier (`i`) is read as a function call and errors
             // with "Unknown function", while `$i` is interpolated by fish
@@ -7105,35 +7554,41 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // next reader does not re-add the guard that cannot parse.
             format!("${name}")
         }
-        // Arrays are flattened into per-element scalars `a_0 a_1 …`, so the
-        // subscript selects the scalar directly. bash's `${a}[1]` is wrong
-        // here: `$a` expands to the whole list and `[1]` indexes into the
-        // NAMES (`a_1`), reading the string where the number was expected —
-        // `$(( a[1] + 1 ))` on `a=(10 20 30)` came out 1, not 21.
+        // An INDEXED array is a native fish LIST (`set a 10 20 30`), so the
+        // subscript reads the list itself. fish's own `$a[n]` is 1-based, so a
+        // literal bash index is offset by one and the value is expanded by
+        // fish BEFORE `math` sees the string.
         //
-        // A literal subscript splices straight into the element name and is
-        // read as a plain `$a_1` — the text lands inside the caller's
-        // `math "…"` string, so it must not add its own quotes (fish rejects
-        // both `${a_1}`, "variables cannot be bracketed", and a nested
-        // `"…"` string).
+        // The flat `$a_{n}` scalar this arm used to emit belongs to the retired
+        // per-element layout that commit bee7b44ad replaced; it now names an
+        // UNSET variable, so `$(( a[1] + 1 ))` on `a=(10 20 30)` came out 1
+        // instead of 21 (t85_arith_index, arith-array-index-expr,
+        // redirect-in-arithmetic).
         //
-        // A computed key (`a[i]` with a non-literal `i`) is fish's own
-        // concatenation indirection: `$a_$i` is TWO adjacent expansions, so
-        // fish joins the flat element name at runtime and looks it up. This
-        // survives the trip through the enclosing `math "…"` string — it
-        // adds no quotes and is not a function call.
+        // A COMPUTED subscript cannot be written as a fish subscript: fish
+        // does NOT evaluate arithmetic inside `[ ]`, so `"$a[$i + 1]"` is a
+        // runtime "Invalid index value". The index is evaluated first and the
+        // list indexed with the result — spelled `$( … )` rather than a bare
+        // `( … )` because it lands inside the caller's `math "…"` string,
+        // where only the `$`-form is expanded.
         //
-        // The two rejected alternatives, both verified against fish:
-        // `${a_$i}` → "variables cannot be bracketed" (fish expands $i
-        // before the name is assembled, then refuses the bracket form), and
-        // a nested `$(eval …)` → `math: Unknown function` (the inner text is
-        // parsed as a math call, not as a value).
+        // An ASSOCIATIVE array keeps the flat `{base}_{key}` layout (it has no
+        // fish equivalent), so its subscript still selects the scalar name.
         ArithAst::Index { var, key } => {
             let base = arr_base(var);
+            if is_plain_name(base) && !is_assoc(base) {
+                if let ArithAst::Num(n) = &**key {
+                    return format!("${base}[{}]", n + 1);
+                }
+                return format!(
+                    "$(set -l _i (math --scale 0 \"{} + 1\"); printf '%s' ${base}[$_i])",
+                    arith_to_fish(key)
+                );
+            }
             if let ArithAst::Num(n) = &**key {
                 return format!("${base}_{n}");
             }
-            // Computed subscript: the element name must be ASSEMBLED and then
+            // Computed assoc key: the element name must be ASSEMBLED and then
             // dereferenced once. The bare `{base}_{key}` spelling is NOT an
             // indirection — fish reads `$arr_$i` as the (unset) variable
             // `$arr_` followed by `$i`, so the text collapsed to the literal
@@ -7674,10 +8129,23 @@ mod tests {
     use super::*;
     use crate::Parser;
 
+    /// `shir_to_fish` publishes its array/assoc/int analysis in PROCESS globals
+    /// (`ARRAY_NAMES`, `ASSOC_VARS`, `NUM_VARS`, `INT_VARS`), and cargo runs
+    /// tests on parallel threads — so two renders at once clobber each other's
+    /// verdicts and a test reads another test's array as an assoc map
+    /// (measured: this module is flaky ~1 run in 5 without the lock). Every
+    /// render in this module goes through here, so no two analyses interleave.
+    static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn render_prog(prog: &IrProgram) -> Result<String, String> {
+        let _guard = RENDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        shir_to_fish(prog)
+    }
+
     fn render_sh(src: &str) -> String {
         let commands = Parser::new(src).parse().unwrap();
         let prog = crate::shir::ast_to_ir(&commands);
-        shir_to_fish(&prog).unwrap()
+        render_prog(&prog).unwrap()
     }
 
     /// An INDEXED array is a native fish LIST end to end: `set arr a b c`
@@ -7733,13 +8201,43 @@ mod tests {
     fn array_preamble_is_emitted_per_helper() {
         assert_eq!(arr_helper_preamble("set arr a b\nfor x in $arr\nend\n"), "");
         assert!(!arr_helper_preamble("echo $arr[1]").contains("_arr_expand"));
-        let assoc = arr_helper_preamble("for k in (_arr_keys_k map)\n");
-        assert!(assoc.contains("function _arr_keys_k"), "{assoc}");
-        assert!(!assoc.contains("function _arr_slice"), "unused helper: {assoc}");
+        let odd = arr_helper_preamble("echo (_arr_keys arr[@])\n");
+        assert!(odd.contains("function _arr_keys"), "{odd}");
+        assert!(!odd.contains("function _arr_slice"), "unused helper: {odd}");
         // `_arr_expand_join` calls `_arr_expand`, so the base is pulled in.
         let join = arr_helper_preamble("echo (_arr_expand_join arr)\n");
         assert!(join.contains("function _arr_expand_join"), "{join}");
         assert!(join.contains("function _arr_expand "), "dependency: {join}");
+    }
+
+    /// The ASSOC readers are native fish now: the key list is the fish LIST the
+    /// flat `{name}_{key}` write maintains, the value walk is an inline `for`
+    /// over it, and neither needs the old per-key runtime functions.
+    #[test]
+    fn assoc_reads_lower_to_native_fish() {
+        let keys = render_sh("declare -A map\nmap[foo]=bar\nfor k in \"${!map[@]}\"; do echo $k; done");
+        assert!(keys.contains("for k in $map_keys"), "key list is the fish list: {keys}");
+        assert!(!keys.contains("_arr_keys_k"), "no assoc key helper: {keys}");
+        assert!(!keys.contains("function _arr_"), "no runtime preamble: {keys}");
+
+        let join = render_sh("declare -A map\nmap[foo]=bar\necho \"${map[*]}\"");
+        assert!(
+            join.contains(
+                "(for _k in $map_keys; set -l _nk map_\"$_k\"; printf '%s\\n' $$_nk; end | string join ' ')"
+            ),
+            "the joined walk is inline: {join}"
+        );
+        assert!(!join.contains("_arr_expand_k"), "no assoc walk helper: {join}");
+    }
+
+    /// bash's `${!prefix*[@]}` is the NAMES of the variables beginning with
+    /// `prefix` — fish lists them with its own builtins. The old lowering read
+    /// `$prefix*_len`, which is never set, so it always printed nothing.
+    #[test]
+    fn indirect_name_listing_is_native() {
+        let sh = render_sh("echo \"${!prefix*[@]:0:3}\"");
+        assert!(sh.contains("(set --names | string match 'prefix*')"), "{sh}");
+        assert!(!sh.contains("_arr_keys"), "no helper for a name listing: {sh}");
     }
 
     /// `echo X | grep -oP '(?<!…)'` — the -P exec sits inside a pipeline
@@ -7787,7 +8285,7 @@ mod tests {
             {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}}
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t29 A1 ingress");
-        let sh = shir_to_fish(&prog).expect("t29 A1 render");
+        let sh = render_prog(&prog).expect("t29 A1 render");
         // fish's arith is `math`, and a command-substitution `( ... )` is
         // NOT allowed as an assignment target — the increment must land as
         // a `set x (math ...)` inside a block, with no `$(( ))` anywhere.
@@ -7831,7 +8329,7 @@ mod tests {
         let render = |op: &str| {
             let json = A1.replace("__OP__", op);
             let prog = crate::shir_json_in::shir_json_to_ir(&json).expect("A1 ingress");
-            shir_to_fish(&prog).expect("A1 render")
+            render_prog(&prog).expect("A1 render")
         };
 
         let plus = render("+");
@@ -8002,13 +8500,16 @@ mod tests {
     #[test]
     fn arith_braced_expansions_lower_to_fish() {
         assert_eq!(braced_arith_to_fish("index"), "$index");
-        // the corpus hybrids carry a sigil INSIDE the braces (`${#$arr[@]}`)
-        assert_eq!(braced_arith_to_fish("#arr[@]"), "$arr_len");
-        assert_eq!(braced_arith_to_fish("#$arr[@]"), "$arr_len");
+        // the corpus hybrids carry a sigil INSIDE the braces (`${#$arr[@]}`).
+        // An INDEXED array is a native fish LIST, so its length is `count`; the
+        // `{name}_len` counter belongs to the retired per-element layout and
+        // read as EMPTY (parse-arithmetic-nested-array: `100/$arr_len`).
+        assert_eq!(braced_arith_to_fish("#arr[@]"), "$(count $arr)");
+        assert_eq!(braced_arith_to_fish("#$arr[@]"), "$(count $arr)");
         assert_eq!(braced_arith_to_fish("#s"), "$(string length -- $s)");
 
         assert_eq!(arith_rewrite("${index}"), "$index");
-        assert_eq!(arith_rewrite("100/${#$arr[@]}"), "100/$arr_len");
+        assert_eq!(arith_rewrite("100/${#$arr[@]}"), "100/$(count $arr)");
         // refuse > guess: an unmodelled form is reduced to its identifier
         // characters, but a `${` may NEVER reach the output
         assert!(!arith_rewrite("${weird:op}").contains("${"));
@@ -8039,7 +8540,7 @@ mod tests {
                   {"type":"Str","value":"def","style":"DoubleQuoted"}]}]}]}}
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(A1).expect("A1 ingress");
-        let sh = shir_to_fish(&prog).expect("A1 render");
+        let sh = render_prog(&prog).expect("A1 render");
         assert!(
             sh.contains("$array[$_i]"),
             "the element is the native list subscript: {sh}"
@@ -8048,6 +8549,127 @@ mod tests {
             !sh.contains("${"),
             "no braced expansion may reach fish: {sh}"
         );
+    }
+
+    /// The CORE's process-substitution transform ends its synthesized block
+    /// with `rm -f $__ps_tmpN …`. Rendering that literally made the block's
+    /// status the cleanup's (always 0), so `diff <(a) <(b); echo $?` read 0
+    /// where bash read 1 (process-substitution, 064_01, 070_cmp_basic).
+    #[test]
+    fn process_substitution_cleanup_is_recognised() {
+        let exec = |cmd: &str, args: Vec<IrExpr>| IrStmt::Exec {
+            cmd: IrExpr::Str(cmd.into(), StrStyle::DoubleQuoted),
+            args,
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let st = |s: &str| IrExpr::Str(s.into(), StrStyle::DoubleQuoted);
+        let tmp = |s: &str| IrExpr::Var(s.into(), None);
+
+        assert!(is_ps_tmp_cleanup(&exec(
+            "rm",
+            vec![st("-f"), tmp("__ps_tmp0"), tmp("__ps_tmp1")]
+        )));
+        // a user-written `rm -f x` is NOT the transform's cleanup
+        assert!(!is_ps_tmp_cleanup(&exec("rm", vec![st("-f"), st("x")])));
+        assert!(!is_ps_tmp_cleanup(&exec("rm", vec![st("-f")])));
+        assert!(!is_ps_tmp_cleanup(&exec("ls", vec![st("-f"), tmp("__ps_tmp0")])));
+    }
+
+    /// `mapfile` must read through the redirect the caller appends — the bulk
+    /// `(cat)` form read the SCRIPT's stdin instead and left the array empty.
+    #[test]
+    fn mapfile_reads_through_the_appended_redirect() {
+        let sh = render_sh("mapfile -t lines\nprintf '%s' \"${lines[@]}\"");
+        assert!(sh.contains("while read -l _mf_line"), "reads line by line: {sh}");
+        assert!(sh.contains("set -a lines $_mf_line"), "appends elements: {sh}");
+        assert!(!sh.contains("(cat)"), "no bulk reader: {sh}");
+    }
+
+    /// `shift` is not a fish builtin and `set --` is not an option line — both
+    /// edit the positional list, which fish keeps in the ordinary variable
+    /// `argv`.
+    #[test]
+    fn positional_builtins_lower_to_argv() {
+        let sh = render_sh("set -- a b c d\necho \"${@:3}\"");
+        assert!(sh.contains("set argv a b c d"), "`set --` writes argv: {sh}");
+        assert!(sh.contains("$argv[3..-1]"), "the slice reads it: {sh}");
+
+        let c = render_sh("f() {\n  local l=\"$1\"\n  shift\n  echo \"$l\" \"$@\"\n}\nf a b");
+        assert!(c.contains("set -e argv[1]"), "`shift` erases argv[1]: {c}");
+        assert!(!c.contains("\n    shift\n"), "no bare shift survives: {c}");
+    }
+
+    /// A computed subscript on an INDEXED array is the native list read, not
+    /// the retired flat `{base}_{key}` scalar — which named an unset variable,
+    /// so `switch \"$args_i\"` never matched a single case (063_09).
+    #[test]
+    fn computed_subscript_never_falls_back_to_a_flat_name() {
+        assert!(
+            arr_elem_ref("args", "i").contains("$args[$_i]"),
+            "computed index reads the list: {}",
+            arr_elem_ref("args", "i")
+        );
+        assert!(!arr_elem_ref("args", "i").contains("args_i"));
+        assert_eq!(arr_elem_ref("args", "0"), "$args[1]", "literal stays literal");
+    }
+
+    /// `${#arr[@]}` / `${#x}` inside arithmetic arrive from the core as the
+    /// self-describing `__sh2lena_` / `__sh2lens_` placeholders, which this
+    /// backend must decode — leaving them named an UNSET variable, so a
+    /// `while (( i < ${#args[@]} ))` bound was always empty.
+    #[test]
+    fn core_arith_length_placeholders_are_decoded() {
+        assert_eq!(
+            arith_len_placeholder_fish("__sh2lena_args").as_deref(),
+            Some("$(count $args)")
+        );
+        assert_eq!(
+            arith_len_placeholder_fish("__sh2lens_s").as_deref(),
+            Some("$(string length -- \"$s\")")
+        );
+        assert_eq!(arith_len_placeholder_fish("args"), None);
+        // `$( … )`, not a bare paren: the value is spliced inside a
+        // double-quoted `math "…"` argument.
+        assert_eq!(arith_rewrite("__sh2lena_args"), "$(count $args)");
+        assert!(!arith_rewrite("__sh2lena_args").contains("$__sh2lena"));
+    }
+
+    /// An array element read INSIDE `$(( … ))` is the native list subscript,
+    /// not the retired flat `{base}_{n}` scalar.
+    ///
+    /// The scalar names an unset variable once indexed arrays became fish
+    /// LISTS (`set a 10 20 30`), so `$(( a[1] + 1 ))` printed 1 instead of 21
+    /// (t85_arith_index). A literal index offsets into fish's 1-based list; a
+    /// computed one is evaluated first, because fish does not do arithmetic
+    /// inside `[ ]`.
+    #[test]
+    fn arith_subscript_reads_the_native_list() {
+        let sh = render_sh("a=(10 20 30)\necho $(( a[1] + 1 ))");
+        assert!(sh.contains("$a[2]"), "literal index is a list read: {sh}");
+        assert!(!sh.contains("$a_1"), "the flat scalar is retired: {sh}");
+
+        let i = render_sh("a=(10 20 30)\ni=1\necho $(( a[i] * 2 ))");
+        assert!(
+            i.contains("$(set -l _i (math --scale 0 \"$i + 1\"); printf '%s' $a[$_i])"),
+            "a computed index is evaluated then read: {i}"
+        );
+        assert!(!i.contains("$a_1"), "no flat scalar: {i}");
+    }
+
+    /// `${arr:-}` / `${arr:+}` read ELEMENT 0, and that read is spliced into
+    /// the guard ALREADY RENDERED — it must not be fed back through the
+    /// variable-NAME renderer, which kept only the identifier characters and
+    /// emitted the unrelated (unset) `$arr1`.
+    #[test]
+    fn array_default_subject_keeps_its_subscript() {
+        let sh = render_sh("LIST=()\nLIST+=( item1 item2 )\nprintf '%s=[%s]\\n' LIST \"${LIST:-}\"");
+        assert!(
+            sh.contains("\"$LIST[1]\""),
+            "the element read survives: {sh}"
+        );
+        assert!(!sh.contains("$LIST1"), "no name-mangled subject: {sh}");
     }
 
     /// `arrayLen` in a word position — fish's `count` builtin over the native
@@ -8065,7 +8687,7 @@ mod tests {
                   {"type":"Str","value":"arr","style":"DoubleQuoted"}]}]}]}}
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(A1).expect("A1 ingress");
-        let sh = shir_to_fish(&prog).expect("A1 render");
+        let sh = render_prog(&prog).expect("A1 render");
         assert!(sh.contains("(count $arr)"), "the list is counted: {sh}");
         assert!(!sh.contains("${"), "no braced expansion: {sh}");
     }
@@ -8099,7 +8721,7 @@ mod tests {
             {"type":"Assign","targets":[{"var":"options[\"$key\"]","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"true","style":"DoubleQuoted"}}
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(A1).expect("A1 ingress");
-        let sh = shir_to_fish(&prog).expect("A1 render");
+        let sh = render_prog(&prog).expect("A1 render");
         assert!(
             sh.contains(r#"set -l _wk options_"$key"; set $_wk true"#),
             "the element name is composed and written indirectly: {sh}"
