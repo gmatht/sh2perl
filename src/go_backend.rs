@@ -2541,14 +2541,27 @@ impl Render {
             if v == "?" || self.is_arr(v) || v.starts_with('#') {
                 continue;
             }
+            // a user-function name is not a shell variable at all — hoisting
+            // it put `fn=0x…` (the func value `%v`-formatted) into the child
+            // env, which is never what bash would export.
+            if self.functions.contains(v) {
+                continue;
+            }
             if !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
-            let is_string = self.declared_go_string(v);
             let m = self.go_ident(v);
-            // A string-hoisted var needs no s2s: `"v=" + m` is already a
-            // string concat. Everything else (any/int64) still coerces.
-            let val = if is_string { m } else { format!("s2s({m})") };
+            // Choose the conversion by hoisted type, exactly as `getvar_str`
+            // does: a string var needs none, an int64 var is `strconv`'s
+            // decimal (native, and what the rest of the renderer emits for
+            // it), and only an `any` var still needs the boxing coercion.
+            let val = if self.declared_go_string(v) {
+                m
+            } else if self.declared_go_int(v) {
+                format!("strconv.FormatInt({m}, 10)")
+            } else {
+                format!("s2s({m})")
+            };
             parts.push(format!("{} + {val}", Self::go_str(&format!("{v}="))));
         }
         format!("[]string{{{}}}", parts.join(", "))
