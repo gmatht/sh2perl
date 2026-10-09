@@ -9,8 +9,9 @@
 set -uo pipefail
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CORE="/home/llm/sh2loop/otranspilerl/target/debug/otranspilerl-cli"
-export OTRANSPILER_ROOT="/home/llm/sh2loop/otranspilerl"
+ROOT="$WT/../../.."
+CORE="$ROOT/otranspilerl/target/debug/otranspilerl-cli"
+export OTRANSPILER_ROOT="$ROOT/otranspilerl"
 RENDER="$WT/target/debug/shir_render"
 
 f="$(readlink -f "$1")"; shift
