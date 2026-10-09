@@ -18848,6 +18848,17 @@ fn param_copy_alias(
             // changes. Both return the device's own static buffer,
             // which is the lifetime a capture helper's result has.
             "fb_window_key" => Some(("fb_window_key", 0)),
+            // the SURFACE SIZE, as "WxH". fbdev.h documents this as a
+            // return string precisely so a caller can capture it
+            // (`sz=$(fb_size)`), and MIMEcroft's DISPLAY row does — the
+            // AUTO/FULL cases ask the device what it actually got,
+            // because the fragment stage's vignette needs the real
+            // canvas width. Left as a statement-only primitive the
+            // capture fell to a `bash -c 'fb_size'` site, whose child
+            // has no such command: the size came back EMPTY, AUTO
+            // resolved to nothing, and every frame's vignette centred on
+            // 0x0.
+            "fb_size" => Some(("fb_size", 0)),
             _ => None,
         }
     }
