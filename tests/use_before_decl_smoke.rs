@@ -136,6 +136,7 @@ fn function_capture_of_top_level_is_clean() {
             assign("x", IrExpr::Int(5)),
             IrStmt::Function {
                 name: "f".to_string(),
+                params: vec![],
                 body: vec![out(v("x"))],
                 named_blocks: vec![],
             },
@@ -151,6 +152,7 @@ fn function_body_read_of_never_assigned_warns() {
     let f = analyze_use_before_decl(&IrProgram {
         stmts: vec![IrStmt::Function {
             name: "f".to_string(),
+            params: vec![],
             body: vec![out(IrExpr::Var("typo".to_string(), None))],
             named_blocks: vec![],
         }],

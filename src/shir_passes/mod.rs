@@ -45,10 +45,24 @@
 
 pub mod analysis;
 pub mod context;
+/// Sequential lane-nest privatization (shared analysis for CUDA
+/// nested-lane kernels; C/Vulkan later).
+pub mod lane_private;
 pub mod lifetime;
+/// Maskable unsigned lowering (shared analysis for C/CUDA/Vulkan).
+pub mod maskable;
+/// List-container profiling (docs/LISTS.MD §4): census, frequency
+/// bounds, structure selection, use scopes. Consumed by the C backend
+/// (growable-vec selection + function-local vecs); nothing else
+/// consumes the verdicts yet.
+pub mod list_profile;
 pub mod loop_opt; // LICM-lite (estree-20260813-182436/201235): hoist loop-invariant runs into loop prologues
 pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
+/// Constant-echo lowering: `echo <literals>` → native `IrStmt::Output`,
+/// so every backend emits its host language's print instead of a
+/// runtime word-printing helper.
+pub mod echo_fold;
 pub mod pattern;
 pub mod restructure;
 pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
@@ -58,6 +72,8 @@ pub mod scc; // strongly-connected-component recognition over the call graph (mu
 pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
 pub mod strip;
 pub mod transform;
+pub mod interval; // generic integer intervals (bash wrapping + Python floor-mod)
+pub mod bigint_range; // exact unbounded intervals for the Python reading (past i128, no wrapping)
 pub mod used_before_decl; // use-before-declaration lint (the "definitely uninitialized" dataflow)
 
 pub use context::PassContext;
@@ -283,9 +299,15 @@ impl Pipeline {
                 Box::new(analysis::FunctionScc),
                 Box::new(analysis::SyncFnCalls),
                 Box::new(analysis::NativeEchoFns),
+                // whole-program "needs the shell runtime at all" verdict —
+                // a `false` licences a renderer to emit plain host code
+                // (the rust backend inlines print! and drops the sink
+                // statics on this signal).
+                Box::new(analysis::RuntimeFootprint),
                 Box::new(analysis::AsyncRegionLoops),
                 Box::new(analysis::LastExitLiveness),
                 Box::new(analysis::LoopStatusDeadness),
+                Box::new(interval::Interval),
                 // use-before-declaration: the "definitely uninitialized"
                 // dataflow — independent of the lifts; a lint every backend
                 // (and the PowerShell/ESTree frontends) can surface, and a
@@ -298,6 +320,12 @@ impl Pipeline {
                 Box::new(transform::ImportMinimize),
                 Box::new(transform::StoreToNative),
                 Box::new(transform::ConstMarkup),
+                // constant-echo lowering: `echo <literals>` → native
+                // `IrStmt::Output`. After ConstantFold so propagated
+                // literals are visible; before the renderers, so every
+                // backend emits its host print instead of a word-printing
+                // runtime helper.
+                Box::new(echo_fold::EchoFold),
                 // goto elimination: frontends may emit Label/Goto (C goto,
                 // labeled-break families); shell has no goto, so this runs
                 // for EVERY backend via the shared pipeline.
@@ -489,5 +517,206 @@ mod tests {
         );
         // the input is untouched — the pipeline is pure
         assert!(prog.var_const.is_empty());
+    }
+
+    /// RuntimeFootprint: a constant echo is runtime-free; anything with a
+    /// redirect/capture/pipeline needs the runtime.
+    #[test]
+    fn runtime_footprint_verdict() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                var_storage: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+            }
+        }
+        // `echo "hi"` — builtin with a literal arg array
+        let hello = prog(vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+            ],
+        })]);
+        assert!(!super::analysis::needs_runtime(&hello));
+        let (ctx, _o, _m) = Pipeline::canonical().run(&hello);
+        assert!(!ctx.needs_runtime);
+
+        // a redirect (`echo hi > f`)
+        let redir = prog(vec![IrStmt::Redirect {
+            inner: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })],
+            redirects: vec![],
+        }]);
+        assert!(super::analysis::needs_runtime(&redir));
+
+        // a capture
+        let cap = prog(vec![IrStmt::Expr(IrExpr::Capture {
+            expr: Box::new(IrExpr::Arrow(vec![])),
+            native: false,
+        })]);
+        assert!(super::analysis::needs_runtime(&cap));
+    }
+
+    /// A function DEFINITION is not a runtime construct: what the body
+    /// CONTAINS decides. This is the verdict that lets a redirect-free
+    /// function-bearing program emit its host language's own `print`
+    /// rather than a sink-aware helper (the reason a Python `def f():
+    /// print(...)` no longer carries `__sh_puts`/`__SH_OUT`).
+    #[test]
+    fn function_bodies_decide_the_runtime_verdict() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+            IrProgram {
+                var_storage: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+            }
+        }
+        fn echo_hi() -> IrStmt {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })
+        }
+        let call = IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![]),
+            ],
+        });
+
+        // `def f(): print("hi"); f()` — a pure function body is
+        // runtime-free.
+        let pure = prog(vec![
+            IrStmt::Function {
+                name: "f".to_string(),
+                params: vec![],
+                body: vec![echo_hi()],
+                named_blocks: vec![],
+            },
+            call.clone(),
+        ]);
+        assert!(
+            !super::analysis::needs_runtime(&pure),
+            "a pure function body must not mark the program runtime-full"
+        );
+
+        // …but a redirect INSIDE the function body is a runtime need
+        // (the sink state is program-global, so it does not matter that
+        // the definition itself is not executed).
+        let redirected = prog(vec![IrStmt::Function {
+            name: "f".to_string(),
+            params: vec![],
+            body: vec![IrStmt::Redirect {
+                inner: vec![echo_hi()],
+                redirects: vec![],
+            }],
+            named_blocks: vec![],
+        }]);
+        assert!(
+            super::analysis::needs_runtime(&redirected),
+            "a redirect in a function body needs the runtime"
+        );
+
+        // …and a named block is part of the function.
+        let named = prog(vec![IrStmt::Function {
+            name: "f".to_string(),
+            params: vec![],
+            body: vec![echo_hi()],
+            named_blocks: vec![(
+                "end".to_string(),
+                vec![IrStmt::Expr(IrExpr::Capture {
+                    expr: Box::new(IrExpr::Arrow(vec![])),
+                    native: false,
+                })],
+            )],
+        }]);
+        assert!(
+            super::analysis::needs_runtime(&named),
+            "a named block's capture needs the runtime"
+        );
+
+        // A SUB body is part of the program too.
+        let mut sub_prog = prog(vec![call]);
+        sub_prog.subs = vec![crate::ir::IrSub {
+            name: "f".to_string(),
+            params: vec![],
+            body: vec![echo_hi()],
+        }];
+        assert!(
+            !super::analysis::needs_runtime(&sub_prog),
+            "a pure sub body must not mark the program runtime-full"
+        );
+    }
+
+    /// The canonical pipeline lowers a constant echo to a native Output
+    /// (the EchoFold transform), so every backend sees `print`-shaped IR
+    /// rather than an `exec echo` call.
+    #[test]
+    fn pipeline_folds_constant_echo() {
+        use crate::ir::{IrExpr, IrStmt, IrProgram, StrStyle};
+        let prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        let (_ctx, out, _m) = Pipeline::canonical().run(&prog);
+        match &out.stmts[0] {
+            IrStmt::Output { value, newline, target } => {
+                assert!(*newline);
+                assert_eq!(*target, None);
+                assert_eq!(
+                    *value,
+                    IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)
+                );
+            }
+            other => panic!("echo not folded to Output: {other:?}"),
+        }
+        // the input is untouched — the pipeline is pure
+        assert!(matches!(prog.stmts[0], IrStmt::Expr(_)));
     }
 }

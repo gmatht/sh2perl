@@ -42,7 +42,7 @@
 //! emitter needs no new arms: `IrStmt::Return` renders natively and
 //! `Call("fnValue")` renders `sh2.fnValue(...)` (the general call path).
 
-use crate::ir::{InterpPart, IrExpr, IrStmt, StrStyle};
+use crate::ir::{AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
 use std::collections::HashSet;
 
 /// Per-path echo state: no value echo yet / exactly one value echo /
@@ -115,6 +115,18 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     for st in stmts.iter_mut() {
         c |= rewrite_call_stmt(st, &eligible);
     }
+    // Pass 4 — `case` PATTERN captures. A pattern is opaque TEXT to every
+    // renderer, so a `$(f)` occupying a WHOLE pattern never reaches the
+    // lift above: the call is invisible (the callee is dropped as
+    // unreferenced) and the capture shells out to a child that cannot see
+    // the shell function → empty → the clause never matches. Hoist a
+    // whole-pattern capture of an eligible function into a preceding
+    // `__sh2_casepat_N=$(f)` capture-assign (which the normal capture
+    // path then lifts to `fnValue`) and point the pattern at the temp.
+    // Fires only for eligible (pure, echo-return) callees — a bare
+    // `echo`/external pattern is left exactly as-is.
+    let mut seq = 0usize;
+    c |= hoist_case_pattern_captures(stmts, &eligible, &mut seq);
     c
 }
 
@@ -1025,6 +1037,241 @@ fn function_body<'a>(stmts: &'a [IrStmt], name: &str) -> Option<&'a [IrStmt]> {
         }
     }
     None
+}
+
+/// Hoist whole-pattern `$(f)` / `` `f` `` captures out of `case` clause
+/// patterns. For each such pattern whose command is a SINGLE call to an
+/// ELIGIBLE function, insert a `__sh2_casepat_N = fnValue("f", […])`
+/// statement before the `case` and rewrite the pattern to the temp-var
+/// read. Recurses into every statement container. Returns changed.
+fn hoist_case_pattern_captures(
+    stmts: &mut Vec<IrStmt>,
+    eligible: &HashSet<String>,
+    seq: &mut usize,
+) -> bool {
+    let mut changed = false;
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+    for mut st in stmts.drain(..) {
+        // Scope the borrow of `st` so it can be moved into `out` after.
+        let mut hoists: Vec<IrStmt> = Vec::new();
+        {
+            if let IrStmt::Case { clauses, .. } = &mut st {
+                for clause in clauses.iter_mut() {
+                    changed |= hoist_case_pattern_captures(&mut clause.body, eligible, seq);
+                    let mut new_pats: Vec<String> = Vec::with_capacity(clause.patterns.len());
+                    for p in clause.patterns.drain(..) {
+                        match lift_pattern_capture(&p, eligible) {
+                            Some((fname, call_args, quoted)) => {
+                                let var = format!("__sh2_casepat_{seq}");
+                                *seq += 1;
+                                hoists.push(fnvalue_assign(&var, &fname, &call_args));
+                                new_pats.push(if quoted {
+                                    format!("\"${var}\"")
+                                } else {
+                                    format!("${var}")
+                                });
+                                changed = true;
+                            }
+                            None => new_pats.push(p),
+                        }
+                    }
+                    clause.patterns = new_pats;
+                }
+            } else {
+                changed |= rebuild_children(&mut st, eligible, seq);
+            }
+        }
+        out.extend(hoists);
+        out.push(st);
+    }
+    *stmts = out;
+    changed
+}
+
+/// Recurse into the statement-bearing children of a non-`case` statement.
+fn rebuild_children(st: &mut IrStmt, eligible: &HashSet<String>, seq: &mut usize) -> bool {
+    let mut changed = false;
+    match st {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(then, eligible, seq);
+            for (_, b) in elsifs.iter_mut() {
+                changed |= hoist_case_pattern_captures(b, eligible, seq);
+            }
+            changed |= hoist_case_pattern_captures(else_, eligible, seq);
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+        }
+        IrStmt::ForInit {
+            init,
+            step,
+            body,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(init, eligible, seq);
+            changed |= hoist_case_pattern_captures(step, eligible, seq);
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+        }
+        IrStmt::Redirect { inner, .. } => {
+            changed |= hoist_case_pattern_captures(inner, eligible, seq);
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for s in stages.iter_mut() {
+                changed |= hoist_case_pattern_captures(s, eligible, seq);
+            }
+        }
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+            for (_, b) in named_blocks.iter_mut() {
+                changed |= hoist_case_pattern_captures(b, eligible, seq);
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+            for e in excepts.iter_mut() {
+                changed |= hoist_case_pattern_captures(&mut e.body, eligible, seq);
+            }
+            changed |= hoist_case_pattern_captures(else_body, eligible, seq);
+            changed |= hoist_case_pattern_captures(finally_body, eligible, seq);
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// `Some((fname, args, quoted))` iff `pat` is EXACTLY a whole-pattern
+/// command substitution `$(f args…)` / `` `f args…` `` (optionally wrapped
+/// in one matched quote pair) whose command is a single call to an
+/// ELIGIBLE function. Anything else (glob text around the substitution,
+/// a builtin/external command, an ineligible callee) returns `None`.
+fn lift_pattern_capture(
+    pat: &str,
+    eligible: &HashSet<String>,
+) -> Option<(String, Vec<IrExpr>, bool)> {
+    let t = pat.trim();
+    let (inner, quoted) = strip_one_quote_pair(t);
+    let body = whole_subst_body(inner.trim())?;
+    let cmds = crate::parser::commands::Parser::new(body).parse().ok()?;
+    let stmts: Vec<IrStmt> = cmds
+        .iter()
+        .filter_map(crate::shir::stmt_for_command)
+        .collect();
+    let args = match stmts.as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if matches!(func.as_str(), "exec" | "fnCall") => {
+            args
+        }
+        _ => return None,
+    };
+    let [IrExpr::Str(fname, _), IrExpr::Array(call_args)] = args.as_slice() else {
+        return None;
+    };
+    if !eligible.contains(fname) {
+        return None;
+    }
+    Some((fname.clone(), call_args.clone(), quoted))
+}
+
+/// Strip exactly one matched surrounding quote pair (double or single).
+fn strip_one_quote_pair(t: &str) -> (&str, bool) {
+    let b = t.as_bytes();
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"')
+            || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    {
+        (&t[1..t.len() - 1], true)
+    } else {
+        (t, false)
+    }
+}
+
+/// The body of a WHOLE `$( … )` / `` ` … ` `` substitution, or `None` when
+/// `s` is not one (glob text around it, unbalanced parens). Mirrors the
+/// renderer-side `case_subst_value` balanced scan (quote/escape aware).
+fn whole_subst_body(s: &str) -> Option<&str> {
+    if s.strip_prefix("$(").is_some() {
+        let b = s.as_bytes();
+        let mut depth = 0i32;
+        let mut in_s = false;
+        let mut in_d = false;
+        let mut esc = false;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if in_s {
+                if c == '\'' {
+                    in_s = false;
+                }
+            } else if in_d {
+                if c == '"' {
+                    in_d = false;
+                }
+            } else if c == '\'' {
+                in_s = true;
+            } else if c == '"' {
+                in_d = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    // whole iff the matching close is the final byte
+                    return if i == b.len() - 1 {
+                        Some(&s[2..i])
+                    } else {
+                        None
+                    };
+                }
+            }
+            i += 1;
+        }
+        None
+    } else if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// `var = fnValue("fname", [args…])`.
+fn fnvalue_assign(var: &str, fname: &str, call_args: &[IrExpr]) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![AssignTarget {
+            var: var.to_string(),
+            sigil: None,
+            indices: vec![],
+        }],
+        expr: IrExpr::Call {
+            func: "fnValue".to_string(),
+            args: vec![
+                IrExpr::Str(fname.to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(call_args.to_vec()),
+            ],
+        },
+        asm: None,
+    }
 }
 
 #[cfg(test)]

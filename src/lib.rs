@@ -3,6 +3,24 @@
 #![allow(dead_code)]
 #![allow(unexpected_cfgs)]
 
+/// Debug traces from the shell parser/renderer, normally OFF.
+///
+/// These used to be unconditional `eprintln!`s, so ordinary constructs —
+/// `${1:-5}`, `a[0]`, `declare -A m` — wrote `DEBUG ...` lines to stderr:
+/// 26 of the 552 corpus examples did.  Set `SH2_DEBUG_PARSER=1` to get them
+/// back (the same env-gate convention `SH2_DEBUG_DEMOTE` already uses in
+/// `c_backend.rs`).
+///
+/// Defined before the `mod` declarations so textual macro scoping makes it
+/// available throughout the crate without touching the public surface.
+macro_rules! pdebug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SH2_DEBUG_PARSER").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 pub mod ast;
 pub mod ast_words;
 pub mod lexer;
@@ -13,6 +31,7 @@ pub mod estree;
 pub mod ir;
 pub mod pipeline_native;
 pub mod shir;
+pub mod naming;
 pub mod render_ext;
 pub mod render_ext_expr;
 pub mod render_ext_estree;
@@ -22,11 +41,13 @@ pub mod transforms;
 
 pub mod bc;
 pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
+pub mod perl_generator_fixed; // worktree-local: post-processor wrapping ir::shir_to_perl with targeted fixes
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees
 // (branch backend/<lang>). Each consumes the ShIR in-process and emits
 // <lang> source — one library, every target (PLAN §4 "unified otranspiler").
 pub mod c_backend;
+pub mod c_profile;
 pub mod go_backend;
 pub mod java_backend;
 pub mod mir_simple;
@@ -34,6 +55,8 @@ pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
 pub mod glsl_backend;
+pub mod vulkan_backend;
+pub mod cuda_backend; // compute-shader emitter for bash-O4 autoshaderise (docs/BASH-O4.md §4.4)
 pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;

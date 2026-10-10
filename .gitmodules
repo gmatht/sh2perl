@@ -1,0 +1,40 @@
+[submodule "frontends"]
+	path = frontends
+	url = git@github.com:gmatht/otranspiler-frontends.git
+
+# The backend gitlink paths below are WORKTREES of this same repository
+# (setup_backends.sh: backends/<lang> on branch backend/<lang>).  They are
+# tracked as gitlinks by 26c830b2 "reconcile the backend worktree gitlinks"
+# but had no .gitmodules mapping, which went unnoticed until the frontends
+# submodule added this file — git then refuses to map any gitlink it cannot
+# find here ("no submodule mapping found in .gitmodules for path ...").
+#
+# They are documented with path only: not a URL to clone from.  Two things
+# to settle in the backend subsystem:
+#   1. backends/goto-dev points at a commit whose `backend/goto-dev` branch
+#      does not exist locally, so a fresh clone cannot resolve it;
+#   2. gitlinks into sibling branches make sh2perl depend on non-default
+#      branches, which is at odds with "CI is self-contained".
+[submodule "backends/c"]
+	path = backends/c
+
+[submodule "backends/core"]
+	path = backends/core
+
+[submodule "backends/goto-dev"]
+	path = backends/goto-dev
+
+[submodule "backends/java"]
+	path = backends/java
+
+[submodule "backends/js"]
+	path = backends/js
+
+[submodule "backends/python"]
+	path = backends/python
+
+[submodule "backends/rust"]
+	path = backends/rust
+
+[submodule "backends/sh"]
+	path = backends/sh

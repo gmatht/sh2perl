@@ -3,7 +3,7 @@
 //! compatibility is explicitly out of scope for the spike): it exists so
 //! declared nodes can embed `expr`/`stmts` fields and round-trip them.
 
-use crate::ir::{IrExpr, IrStmt, StrStyle};
+use crate::ir::{InterpPart, IrExpr, IrStmt, StrStyle};
 use serde_json::json;
 use serde_json::Value;
 
@@ -84,9 +84,34 @@ pub fn expr_to_json(e: &IrExpr) -> Value {
             "kind": "BinOp", "op": format!("{op:?}"),
             "lhs": expr_to_json(lhs), "rhs": expr_to_json(rhs),
         }),
+        // The composite exprs the reductions embed in node fields — a
+        // variable read is Call{func:"param"}, a mixed string is
+        // Interpolate, a command substitution is Capture. Encoding them
+        // structurally (not as an opaque Debug repr) keeps the A1 export
+        // of a reduced program parseable by the ingress.
         IrExpr::Call { func, args } => json!({
-            "kind": "Call", "func": func,
+            "kind": "Call",
+            "func": func,
             "args": args.iter().map(expr_to_json).collect::<Vec<_>>(),
+        }),
+        IrExpr::Interpolate(parts) => json!({
+            "kind": "Interpolate",
+            "parts": parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(s) => json!({"lit": s}),
+                    InterpPart::Expr(e) => json!({"expr": expr_to_json(e)}),
+                })
+                .collect::<Vec<_>>(),
+        }),
+        IrExpr::Capture { expr, native } => json!({
+            "kind": "Capture",
+            "expr": expr_to_json(expr),
+            "native": native,
+        }),
+        IrExpr::Arrow(body) => json!({
+            "kind": "Arrow",
+            "body": stmts_to_json(body),
         }),
         IrExpr::Array(items) => json!({
             "kind": "Array",
@@ -136,6 +161,27 @@ pub fn json_to_expr(v: &Value) -> Result<IrExpr, String> {
             v["name"].as_str().ok_or("Var.name")?.to_string(),
             None,
         )),
+        Some("Interpolate") => Ok(IrExpr::Interpolate(
+            v["parts"]
+                .as_array()
+                .ok_or("Interpolate.parts")?
+                .iter()
+                .map(|p| {
+                    if let Some(s) = p.get("lit").and_then(Value::as_str) {
+                        Ok(InterpPart::Lit(s.to_string()))
+                    } else if let Some(e) = p.get("expr") {
+                        Ok(InterpPart::Expr(Box::new(json_to_expr(e)?)))
+                    } else {
+                        Err(format!("Interpolate part: {p}"))
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        Some("Capture") => Ok(IrExpr::Capture {
+            expr: Box::new(json_to_expr(&v["expr"])?),
+            native: v["native"].as_bool().unwrap_or(false),
+        }),
+        Some("Arrow") => Ok(IrExpr::Arrow(json_to_stmts(&v["body"])?)),
         // A1 contract flavor (frontend ingress): child expressions inside
         // an Ext node arrive in the standard A1 shape ("type" discriminator),
         // so delegate to the full A1 expr parser instead of failing.
@@ -147,4 +193,46 @@ pub fn json_to_expr(v: &Value) -> Result<IrExpr, String> {
 fn json_to_exprs(v: &Value) -> Result<Vec<IrExpr>, String> {
     v.as_array().ok_or("expected expr array".to_string())?
         .iter().map(json_to_expr).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt(e: IrExpr) {
+        let j = expr_to_json(&e);
+        let back = json_to_expr(&j).expect("decode");
+        assert_eq!(back, e, "round-trip");
+    }
+
+    #[test]
+    fn composite_exprs_round_trip() {
+        // The shapes reductions embed in node fields: a variable read
+        // (param call), a mixed interpolation, a capture.
+        rt(IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![
+                IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                IrExpr::Str("s".to_string(), StrStyle::DoubleQuoted),
+            ],
+        });
+        rt(IrExpr::Interpolate(vec![
+            InterpPart::Lit("a ".to_string()),
+            InterpPart::Expr(Box::new(IrExpr::Var("x".to_string(), None))),
+            InterpPart::Lit("\n".to_string()),
+        ]));
+        rt(IrExpr::Capture {
+            expr: Box::new(IrExpr::Str("pwd".to_string(), StrStyle::DoubleQuoted)),
+            native: false,
+        });
+        // A capture body: Capture(Arrow([Expr(exec pwd)])) — the shape
+        // `basename "$(pwd)"` embeds in PathName.text (999_pwd.sh).
+        rt(IrExpr::Capture {
+            expr: Box::new(IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![IrExpr::Str("pwd".to_string(), StrStyle::DoubleQuoted)],
+            })])),
+            native: false,
+        });
+    }
 }

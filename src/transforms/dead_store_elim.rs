@@ -460,6 +460,49 @@ fn census_stmt(
                 census_stmt(s, reads, writes, escapes, true);
             }
         }
+        IrStmt::Pipeline { stages, .. } => {
+            // stages run as separate processes, but their READS see
+            // the parent's values (a var read only here must keep its
+            // store — BASHC_FIX t03: `name` read only inside a pipeline
+            // was dropped as dead). Ambient escaping (like Block):
+            // stage-local writes don't outlive the stage.
+            for st in stages {
+                for s in st {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body, .. } => {
+            for s in init {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            census_expr(cond, reads, writes, escapes, escaping);
+            for s in step {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    census_expr(m, reads, writes, escapes, escaping);
+                }
+                for s in &e.body {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+            for s in else_body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in finally_body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+        }
         IrStmt::Block(v) => {
             for s in v {
                 census_stmt(s, reads, writes, escapes, escaping);
@@ -505,6 +548,7 @@ fn census_expr(
                 func.as_str(),
                 "getVar" | "arrayIndex" | "param" | "byteAt" | "jsonGet" | "jsonSet"
                     | "jsonArrGet" | "jsonArrSet" | "jsonArrAppend"
+                    | "memLoad" | "memAdvance" | "memFree"
             ) {
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
@@ -518,6 +562,18 @@ fn census_expr(
                         if escaping {
                             escapes.insert(base.to_string());
                         }
+                    }
+                    // A `name[*]` expansion reads IFS at RUNTIME: the `[*]`
+                    // join is performed by the backend runtime, which joins
+                    // the elements with the FIRST IFS character (bash uses
+                    // IFS for `*` even when quoted). Without this the
+                    // `IFS=$'\n'` store is culled and the join falls back to
+                    // a space — 064_07_complex_array_operations printed
+                    // "admin localhost" where bash printed the
+                    // newline-joined, sort-able string. `[@]` joins with a
+                    // hard space and does not read IFS.
+                    if n.ends_with("[*]") {
+                        reads.insert("IFS".to_string());
                     }
                 }
                 // byteAt's index arg is arithmetic text naming vars
@@ -537,6 +593,38 @@ fn census_expr(
             if matches!(func.as_str(), "jsonSet" | "jsonArrSet" | "jsonArrAppend") {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     writes.insert(n.clone());
+                }
+            }
+            // memStore/arrayStore write THROUGH their first-arg handle:
+            // the receiver name is both read (handle resolution) and
+            // written — its initializing stores stay live
+            if matches!(func.as_str(), "memStore" | "arrayStore") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    reads.insert(n.clone());
+                    writes.insert(n.clone());
+                }
+            }
+            // fnCall/fnValue/callDirect dispatch passes its string args
+            // as the callee's $1.. — and callees routinely use those as
+            // VARIABLE NAMES (array-by-name in-place ops: the arg "a"
+            // becomes getVar/param reads inside the body, invisible here).
+            // Mark every Str arg as a read: over-marking only shrinks
+            // elimination, never drops live stores.
+            if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                for a in args {
+                    match a {
+                        IrExpr::Str(n, _) => {
+                            reads.insert(n.clone());
+                        }
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(n, _) = it {
+                                    reads.insert(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             // a $name reference inside ANY string argument is a read —
@@ -838,8 +926,9 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
         IrStmt::Background(v) => Some(IrStmt::Background(
             v.into_iter().filter_map(|s| purge(s, dead)).collect(),
         )),
-        IrStmt::Function { name, body, .. } => Some(IrStmt::Function {
+        IrStmt::Function { name, params, body, .. } => Some(IrStmt::Function {
             name,
+            params,
             body: body.into_iter().filter_map(|s| purge(s, dead)).collect(),
             named_blocks: Vec::new(),
         }),
@@ -847,3 +936,88 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, StrStyle};
+
+    fn str_(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// BASHC_FIX t03: a var read ONLY inside a pipeline stage must keep
+    /// its store (`name="world"; echo $name | tr` dropped the assign).
+    #[test]
+    fn pipeline_read_keeps_store() {
+        let prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "name".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("world"),
+                asm: None,
+            },
+            IrStmt::Pipeline {
+                stages: vec![vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        str_("echo"),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![str_("name")],
+                        }]),
+                    ],
+                })]],
+                last_output: None,
+                capture: None,
+                cmd_str: None,
+            },
+        ];
+        let mut stmts = prog;
+        transform(&mut stmts);
+        assert_eq!(stmts.len(), 2, "pipeline-read store dropped: {stmts:?}");
+    }
+
+    /// `IFS=$'\n'; echo "${config[*]}"` must keep the IFS store.
+    ///
+    /// The `[*]` join runs in the backend runtime and uses the FIRST IFS
+    /// character, so a static census that only records the array name
+    /// culls the IFS store and the join silently degrades to a space
+    /// (064_07_complex_array_operations). `[@]` is the control: it joins
+    /// with a hard space, so its store is still dead.
+    #[test]
+    fn star_join_keeps_ifs_store() {
+        let read_of = |n: &str| {
+            IrStmt::Expr(IrExpr::Call {
+                func: "builtin".to_string(),
+                args: vec![
+                    str_("echo"),
+                    IrExpr::Array(vec![IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![str_(""), str_(n)],
+                    }]),
+                ],
+            })
+        };
+        let ifs_store = IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "IFS".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_("\n"),
+            asm: None,
+        };
+
+        let mut star = vec![ifs_store.clone(), read_of("config[*]")];
+        transform(&mut star);
+        assert_eq!(star.len(), 2, "[*] join must keep the IFS store: {star:?}");
+
+        let mut at = vec![ifs_store, read_of("config[@]")];
+        transform(&mut at);
+        assert_eq!(at.len(), 1, "[@] does not read IFS — its store is dead: {at:?}");
+    }
+}

@@ -17,6 +17,7 @@
     pub(crate) mod clone_deep;
     pub(crate) mod take_lines;
     pub(crate) mod reg_sub;
+    pub(crate) mod sub_str_extract;
     pub(crate) mod string_affix;
     pub(crate) mod char_extract;
     pub(crate) mod cgo_call;

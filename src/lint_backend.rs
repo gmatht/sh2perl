@@ -147,7 +147,7 @@ fn walk_func_defs_calls_stmts(stmts: &[IrStmt], defined: &mut HashSet<String>, c
 
 fn walk_func_defs_calls_stmt(st: &IrStmt, defined: &mut HashSet<String>, called: &mut HashSet<String>) {
     match st {
-        IrStmt::Function { name, body, named_blocks } => {
+        IrStmt::Function { name, body, named_blocks, .. } => {
             defined.insert(name.clone());
             walk_func_defs_calls_stmts(body, defined, called);
             for (_, nb) in named_blocks {

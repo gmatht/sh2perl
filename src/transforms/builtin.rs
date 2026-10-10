@@ -273,6 +273,7 @@ fn rewrite_stmt(st: &mut IrStmt) -> bool {
             }
             changed
         }
+        IrStmt::Shaderize { body, .. } => rewrite_stmts(body),
     }
 }
 
@@ -493,6 +494,7 @@ fn erase(st: &mut IrStmt) -> bool {
             }
             changed
         }
+        IrStmt::Shaderize { body, .. } => erase_stmts(body),
     }
 }
 

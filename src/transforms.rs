@@ -17,10 +17,75 @@ use crate::ir::IrStmt;
 
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
+// ── Per-backend transform selection (PLAN §11.12) ─────────────────────
+// The shared crate runs `transforms::apply()` for every backend (the §11
+// gating note). This is the missing per-backend enable/disable: a
+// thread-local "current target" set by the CLI entry, consulted by
+// `transform_applies`. Default (unset target, or a transform with no
+// restriction) = the transform applies to every backend — the historical
+// behavior, so existing transforms are unaffected and the corpus gate
+// stays green. A backend-specific transform (e.g. a node-lowering that
+// only some backends want) declares its target set here.
+use std::cell::RefCell;
+
+thread_local! {
+    static CURRENT_TARGET: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Set the current target backend for the duration of a pipeline run.
+/// `None` (unset) = every transform applies (the historical default).
+pub fn set_target(t: Option<&str>) {
+    CURRENT_TARGET.with(|c| *c.borrow_mut() = t.map(|s| s.to_string()));
+}
+
+/// The current target backend, if the CLI set one.
+pub fn target() -> Option<String> {
+    CURRENT_TARGET.with(|c| c.borrow().clone())
+}
+
+/// Does the transform `name` apply to the current target backend?
+/// Default: every backend. A backend-specific transform declares its
+/// target set here (e.g. a node-lowering that only C/JS want, so the
+/// shell-like backends never see the rich nodes — the "solve" idea).
+pub fn transform_applies(name: &str) -> bool {
+    match name {
+        // text-ops-planner (the "solve" idea): only the backends that want
+        // the rich node compositions run it. The shell-like backends (sh,
+        // glsl) never see the rich nodes — they keep the original command
+        // (or the existing text_ops lowering). Unset target = every
+        // transform applies (historical default).
+        "text-ops-planner" => matches!(
+            target().as_deref(),
+            Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "zig" | "java" | "python")
+        ),
+        // text-ops EMITS the rich Ext nodes (FieldExtract/RegSub/...). A
+        // backend whose manifest declares none of them would receive a node
+        // it cannot render — worse than the original command, which every
+        // backend already handles natively. So the transform is gated by
+        // the SAME manifest the §11.12 planner reads: the core declines to
+        // emit what the target cannot consume (the "or get the core to
+        // lower them to supported nodes" half of the node contract). An
+        // UNSET target keeps the historical behaviour (every backend).
+        "text-ops" => match target() {
+            None => true,
+            Some(t) => crate::transforms::planner::emits_renderable_nodes(&t),
+        },
+        // fbdev-gpu-calls EMITS fb_* Call nodes. Only the C backend
+        // renders those in-process (fb_call_opt); every other backend
+        // would route them to a shell-out, worse than the GpuOp
+        // file-write fallback. Explicit `c` target only — the
+        // text-ops-planner precedent (bash-o4/src/pipeline.rs sets it).
+        "fbdev-gpu-calls" => matches!(target().as_deref(), Some("c")),
+        _ => true,
+    }
+}
+
 pub mod arith_forms;
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
+pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
+pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod grep_pcre; // `grep -P 'PCRE'` → portable `grep -E 'ERE'` (lookbehind absorbed + var patterns reduced; refuse>guess)
 pub mod cat_read; // `cat [-n] FILE` → ForEachLine streaming loop (native in every backend)
@@ -33,21 +98,28 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 pub mod shir_pipeline_native;
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
+pub mod text_ops_planner; // the "solve" idea, observable: wc -l lowers per-backend by manifest (opt-in)
+pub mod planner; // backend node manifests + core solver (the "solve" idea, docs/shir-primitives.md)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+pub mod stray_reserved_word; // a command named `)` / `}` is a bash syntax error → abort (exit 2), keeping the prefix
 // New transforms merged from the workspace (core-requests/transforms/done).
 pub mod background_decide; // `&` background → THREAD/FORK class (analysis; feeds renderer hooks)
 pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (native float emulation)
 pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process Capture{Call}
 pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
 pub mod for_recovery; // counter-while → native For recovery
+pub mod fuse_fill_consume; // fill+consume loop fusion with RHS forwarding
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
 pub mod i32_provable;
+pub mod f32_narrow; // binary32-exact float verdicts (cdef-float proofs)
 pub mod const_capture_fold;
 pub mod const_condition_elim;
 pub mod copy_propagation;
 pub mod counted_while_forinit;
+pub mod counted_arith_forinit; // structured-Arith counted while → ForInit (frontend shapes)
+pub mod append_to_store; // counted-loop `a = append(a,v)` → `a[i] = v` (frontend shapes)
 pub mod dead_store_elim;
 pub mod div_mod_pow2;
 pub mod hoist_loop_invariants;
@@ -55,14 +127,21 @@ pub mod merge_init_assignments;
 pub mod redundant_store_elim;
 pub mod string_accumulator;
 pub mod test_simplification;
+pub mod else_if_flatten; // an `else` whose only statement is an `If` IS an `elif` — flatten it
 pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix/contains (polyfill speedup, CROSS_BACKEND_RUNTIME.md §8.1)
 pub mod echo_return; // pure-output "echo a value and return" functions → fnValue value-returning convention (CROSS_BACKEND_RUNTIME.md §8.3)
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
+pub mod split_set; // set[int] → small ∪ big partitions (runtime routing; speed-class, SH2_SPLIT_SETS)
+pub mod fbdev_gpu; // device write → GPU op (the §4.2 stage ② "gpu-prep" pass)
+pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
+pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)
+pub mod fbdev_gpu_calls; // GpuOp → the fb_* call it names (C target only)
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
+        ("stray-reserved-word", stray_reserved_word::transform),
         ("shir-pipeline-native", shir_pipeline_native::transform),
         ("dead-fn-elim", dead_fn_elim::transform),
         // (name, <name>::transform) — estree worker adds entries here
@@ -97,12 +176,16 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("for-recovery", for_recovery::transform),
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
+        ("f32-narrow", f32_narrow::transform),
         ("text-ops", text_ops::transform),
+        ("text-ops-planner", text_ops_planner::transform),
         // core-requests/transforms/done batch merge (12 orphaned submissions)
         ("const-capture-fold", const_capture_fold::transform),
         ("const-condition-elim", const_condition_elim::transform),
         ("copy-propagation", copy_propagation::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
+        ("counted-arith-forinit", counted_arith_forinit::transform),
+        ("append-to-store", append_to_store::transform),
         ("dead-store-elim", dead_store_elim::transform),
         ("div-mod-pow2", div_mod_pow2::transform),
         ("hoist-loop-invariants", hoist_loop_invariants::transform),
@@ -111,9 +194,32 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("string-accumulator", string_accumulator::transform),
         ("test-simplification", test_simplification::transform),
         ("test-lowering", test_lowering::transform),
+        // else-if flattening: `else { if c { … } }` → `elsifs`. Purely
+        // structural; run before the backends so every renderer sees the
+        // chain in the one shape it already handles.
+        ("else-if-flatten", else_if_flatten::transform),
         ("loop-return-lift", loop_return_lift::transform),
         ("echo-return", echo_return::transform),
         ("unreachable-after-exit", unreachable_after_exit::transform),
+        // fuse-fill-consume: covering array-fill + same-space consumer
+        // → forwarded single loop (no materialization). Runs LAST: it
+        // matches final ForInit shapes (after for-recovery / seq-range-for
+        // / counted-while-forinit) and only deletes loops, so nothing
+        // downstream needs its output except the renderers.
+        ("fuse-fill-consume", fuse_fill_consume::transform),
+        ("isolate-accumulate", isolate_accumulate::transform),
+        // isolate-accumulate: single-use loop-private temps fold into a
+        // self-referential tail (single-accumulate isolation for loop
+        // candidacies). Runs after fuse (disjoint patterns); only
+        // shrinks bodies, so order vs peers is irrelevant.
+        // split-set: set[int] → small ∪ big partitions (runtime routing).
+        // Speed-class — gated by SH2_SPLIT_SETS (set at -O3/-O4 by the
+        // CLI, mirroring set_dual_loops).
+        ("split-set", split_set::transform),
+        ("fbdev-gpu", fbdev_gpu::transform),
+        ("fbdev-gpu-batch", fbdev_gpu_batch::transform),
+        ("fbdev-gpu-elim", fbdev_gpu_elim::transform),
+        ("fbdev-gpu-calls", fbdev_gpu_calls::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
         // GC'd languages ignore the flag — see shir_passes/split_inplace)
@@ -149,8 +255,10 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
     let enabled = enabled_names();
     let mut changed = false;
     for (name, tf) in all() {
-        if enabled.is_empty() || enabled.iter().any(|e| e == name) {
-            changed |= tf(stmts);
+        if (enabled.is_empty() || enabled.iter().any(|e| e == name)) {
+            if transform_applies(name) {
+                changed |= tf(stmts);
+            }
         }
     }
     changed
@@ -165,4 +273,37 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
 pub fn transform_enabled(name: &str) -> bool {
     let enabled = enabled_names();
     enabled.is_empty() || enabled.iter().any(|e| e == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_defaults_to_none() {
+        set_target(None);
+        assert_eq!(target(), None);
+        // Default: every transform applies to every backend.
+        assert!(transform_applies("text-ops"));
+        assert!(transform_applies("dead-store-elim"));
+    }
+
+    #[test]
+    fn set_target_roundtrips() {
+        set_target(Some("c"));
+        assert_eq!(target().as_deref(), Some("c"));
+        set_target(None);
+        assert_eq!(target(), None);
+    }
+
+    #[test]
+    fn backend_specific_transform_is_filtered() {
+        // A transform that declares a target set is filtered when the
+        // current target is outside it. (The example arm is commented out
+        // in transform_applies; this test pins the mechanism shape.)
+        set_target(Some("perl"));
+        // With no restricted transforms registered, everything applies.
+        assert!(transform_applies("text-ops"));
+        set_target(None);
+    }
 }
