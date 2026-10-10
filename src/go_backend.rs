@@ -796,16 +796,16 @@ impl Render {
             },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => {
+                // bash -c fallback for a test go can't parse natively.
+                // The script text is known (`[ s ]`), so the child gets
+                // only the vars it reads (see `env_lit_for`).
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
-                    // bash -c fallback for a test go can't parse natively
-                    let env = self.env_lit();
-                    return format!(
-                        "(redirRun({}, {env}) == 0)",
-                        Self::go_str(&format!("[ {s} ]"))
-                    );
+                    let text = format!("[ {s} ]");
+                    let env = self.env_lit_for(Some(&text));
+                    return format!("(redirRun({}, {env}) == 0)", Self::go_str(&text));
                 }
                 self.sh2_stub("test")
             }
@@ -2636,11 +2636,10 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
-                    let env = self.env_lit();
-                    return format!(
-                        "(redirRun({}, {env}) == 0)",
-                        Self::go_str(&format!("[ {s} ]"))
-                    );
+                    // Same narrowed-env fallback as the bool form above.
+                    let text = format!("[ {s} ]");
+                    let env = self.env_lit_for(Some(&text));
+                    return format!("(redirRun({}, {env}) == 0)", Self::go_str(&text));
                 }
                 self.sh2_stub("test")
             }
@@ -2734,12 +2733,10 @@ impl Render {
                     }
                 }
                 if ok && !texts.is_empty() {
-                    let env = self.env_lit();
                     let sep = if func == "and" { " && " } else { " || " };
-                    return format!(
-                        "redirRun({}, {env})",
-                        Self::go_str(&texts.join(sep))
-                    );
+                    let text = texts.join(sep);
+                    let env = self.env_lit_for(Some(&text));
+                    return format!("redirRun({}, {env})", Self::go_str(&text));
                 }
                 self.sh2_stub(func)
             }
@@ -3059,8 +3056,9 @@ impl Render {
                 break;
             }
             if !texts.is_empty() {
-                let env = self.env_lit();
-                return format!("redirRun({}, {env})", Self::go_str(&texts.join(" | ")));
+                let text = texts.join(" | ");
+                let env = self.env_lit_for(Some(&text));
+                return format!("redirRun({}, {env})", Self::go_str(&text));
             }
         }
         self.sh2_stub("pipeline")
@@ -3093,6 +3091,17 @@ impl Render {
         // child and no env literal — the builtin policy is the same one the
         // pipeline stages use (see `body_single_exec_opt`).
         if !redirs.is_empty() && redirs.iter().all(null_stderr_obj) {
+            // A builtin / natively-lowered fs command needs no exec at
+            // all: its native statements run as side effects with the
+            // status read out of `st` (see `builtin_fs_speculative`).
+            if let Some(call_args) = lone_exec_args(body) {
+                if let Some(lines) = self.builtin_fs_speculative(&call_args) {
+                    for l in lines {
+                        self.sides.push(l);
+                    }
+                    return "st".to_string();
+                }
+            }
             let todo = self.todo;
             let sides = self.sides.len();
             let tmp = self.tmp;
@@ -3132,7 +3141,7 @@ impl Render {
                     return self.sh2_stub("redirect");
                 }
             }
-            let env = self.env_lit();
+            let env = self.env_lit_for(Some(&with_redirs));
             return format!("redirRun({}, {env})", Self::go_str(&with_redirs));
         }
         self.sh2_stub("redirect")
@@ -4105,6 +4114,183 @@ impl Render {
         Some(lines)
     }
 
+    /// `printf fmt args… > f` (`>> f`): write the formatted output to the
+    /// file — the same `bprintfStr` the statement (`printf_stmt`) and
+    /// capture (`echo_printf_value`) forms use, so the three can never
+    /// disagree, with the redirect target opened exactly like
+    /// `echo_redirect_write` above. `None` keeps the fork/exec weld.
+    /// REFUSE > GUESS: anything but one fd-1 file redirect; an empty,
+    /// dynamic, dash-leading (`-v` assigns a variable instead of printing,
+    /// and `--` is an option, not a format), or `%q` format (the one verb
+    /// the external printf does not implement — see
+    /// `native_stage_builtin`, the same external-agreement gate the weld
+    /// path applies). A refused shape keeps today's `exec.Command` weld,
+    /// never a stub.
+    fn printf_redirect_write(
+        &mut self,
+        inner: &[IrStmt],
+        redirs: &[crate::ir::IrRedirect],
+    ) -> Option<Vec<String>> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+            return None;
+        };
+        // Same spelling rule as `echo_redirect_write`: the frontend emits
+        // `builtin`, the prelude rewrites most of those to `exec`.
+        if func != "builtin" && func != "exec" {
+            return None;
+        }
+        let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) = (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        if echo_cmd(name).unwrap_or(name) != "printf" {
+            return None;
+        }
+        // One redirect, and it must be fd 1 opened for writing — the same
+        // admission as `echo_redirect_write` (`>&`, `2>&1`, a second
+        // redirect all keep the weld).
+        let [one] = redirs else { return None };
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let (path, append) = match self.native_redirect_spec(one) {
+            Some(NativeRedir::File {
+                fd: 1,
+                path,
+                read: false,
+                append,
+            }) => (path, append),
+            _ => {
+                self.sides.truncate(sides);
+                self.todo = todo;
+                self.tmp = tmp;
+                return None;
+            }
+        };
+        let Some(fmt_expr) = items.first() else {
+            self.sides.truncate(sides);
+            self.todo = todo;
+            self.tmp = tmp;
+            return None;
+        };
+        // The format must be a static string the external counterpart was
+        // measured against: dynamic formats cannot prove agreement, and a
+        // dash-leading word is an option (`-v`, `--`), not a format.
+        let IrExpr::Str(fmt, _) = fmt_expr else {
+            self.sides.truncate(sides);
+            self.todo = todo;
+            self.tmp = tmp;
+            return None;
+        };
+        if fmt.starts_with('-') || fmt.contains("%q") {
+            self.sides.truncate(sides);
+            self.todo = todo;
+            self.tmp = tmp;
+            return None;
+        }
+        let fmt_go = self.printf_fmt(fmt_expr);
+        let fargs: Vec<String> = items[1..].iter().map(|a| self.expr_str(a)).collect();
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.todo = todo;
+            self.tmp = tmp;
+            return None;
+        }
+        // No trailing-newline strip: a redirect preserves every byte, while
+        // a command substitution (`echo_printf_value`) strips them.
+        let text = if fargs.is_empty() {
+            format!("bprintfStr({fmt_go})")
+        } else {
+            format!("bprintfStr({fmt_go}, {})", fargs.join(", "))
+        };
+        self.sides.truncate(sides);
+        self.flush_sides();
+        let id = self.new_tmp();
+        let lines = if append {
+            let (fv, ev) = (format!("__awf{id}"), format!("__awe{id}"));
+            let tail = if self.need_st { "; st = 0" } else { "" };
+            let mut l = format!(
+                "if {fv}, {ev} := os.OpenFile({path}, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); \
+                 {ev} == nil {{ {fv}.WriteString({text}); {fv}.Close(){tail} }}"
+            );
+            if self.need_st {
+                l.push_str(" else { st = 1 }");
+            }
+            vec![l]
+        } else if self.need_st {
+            let wv = format!("__we{id}");
+            vec![format!(
+                "if {wv} := os.WriteFile({path}, []byte({text}), 0644); {wv} != nil {{ st = 1 }} else {{ st = 0 }}"
+            )]
+        } else {
+            vec![format!("os.WriteFile({path}, []byte({text}), 0644)")]
+        };
+        Some(lines)
+    }
+
+    /// A lone builtin/fs command's native statements, rendered
+    /// speculatively (UNINDENTED, exactly like `chain_builtin`) for a
+    /// stderr-discard context: the statement path's own dispatch
+    /// (`exec_builtin_stmt`, then `fs_argcmd_stmt`), so a refusal lands
+    /// exactly where the unredirected command would have gone. `None`
+    /// rolls everything back and keeps the caller fallback. The status
+    /// default mirrors `chain_builtin`.
+    fn builtin_fs_speculative(&mut self, call_args: &[IrExpr]) -> Option<Vec<String>> {
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(_))) =
+            (call_args.first(), call_args.get(1))
+        else {
+            return None;
+        };
+        let cmd = cmd.clone();
+        let todo_before = self.todo;
+        let need_st_before = self.need_st;
+        let sides_before = self.sides.len();
+        let tmp_before = self.tmp;
+        // The status is assigned below, so it is unconditionally needed.
+        self.need_st = true;
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let saved = std::mem::take(&mut self.out);
+        let handled =
+            self.exec_builtin_stmt(&cmd, call_args) || self.fs_argcmd_stmt(&cmd, call_args);
+        let stmts = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        if !handled || self.todo != todo_before {
+            self.todo = todo_before;
+            self.need_st = need_st_before;
+            self.sides.truncate(sides_before);
+            self.tmp = tmp_before;
+            return None;
+        }
+        self.need_st = true;
+        let mut stmts = stmts;
+        if !stmts.iter().any(|s| s.contains("os.Exit("))
+            && !stmts.iter().any(|s| s.contains("st ="))
+        {
+            stmts.push("st = 0;".to_string());
+        }
+        Some(stmts)
+    }
+
+    /// `cmd 2>/dev/null` (and nothing else) in statement position, where
+    /// `cmd` is a builtin or natively-lowered fs command: capture the same
+    /// native statements the plain-statement path emits, UNINDENTED, exactly
+    /// like `chain_builtin`, and reject the attempt wholesale on refusal —
+    /// so a refusal leaves no partial render behind. `None` keeps the
+    /// `exec.Command` weld below. The status default mirrors
+    /// `chain_builtin`: builtins that never assign `st` (and a taken path
+    /// that did not need it before) still leave `$?` at 0, as the weld's
+    /// `st = runCmd(…)` would on success.
+    fn discard_redirect_native(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<Vec<String>> {
+        if redirects.is_empty() || !redirects.iter().all(null_stderr_spec) {
+            return None;
+        }
+        let call_args = lone_exec_args(inner)?;
+        self.builtin_fs_speculative(&call_args)
+    }
+
     /// `redirect(Arrow(body), [redirs])` in statement position, lowered
     /// natively when the body is exactly one external exec. Speculative:
     /// the render state is rolled back when it refuses.
@@ -4464,7 +4650,7 @@ impl Render {
                     }
                     if d == 0 {
                         let cmd: String = b[i + 2..j - 1].iter().collect();
-                        let env = self.env_lit();
+                        let env = self.env_lit_for(Some(&cmd));
                         parts.push(format!("capRun({}, {env})", Self::go_str(&cmd)));
                         i = j;
                         continue;
@@ -4943,7 +5129,7 @@ impl Render {
             }
         }
         if let Some(text) = self.exec_stmt_text(cmd, args, capture, redirects, env) {
-            let envf = self.env_lit();
+            let envf = self.env_lit_for(Some(&text));
             self.flush_sides();
             match capture {
                 Some(var) => {
@@ -5403,10 +5589,47 @@ impl Render {
                 }
                 _ => {
                     let t = self.cmd_text_expr(a)?;
-                    if !is_simple_test_ref(&t) {
+                    if is_simple_test_ref(&t) {
+                        words.push(t);
+                        continue;
+                    }
+                    // A single `${…}` expansion without nesting resolves
+                    // through `test_operand` → `expand_braced` — exactly the
+                    // general expansion path — so it is admissible as-is
+                    // (`${MYVAR+set}`, `${x[0]}`…; see `test_operand`).
+                    if t.starts_with("${") && t.ends_with('}') {
+                        let inner = &t[2..t.len() - 1];
+                        if inner.is_empty() || inner.contains('{') || inner.contains('}') {
+                            return None;
+                        }
+                        words.push(t);
+                        continue;
+                    }
+                    // A fully static word is a literal operand — quote it
+                    // exactly like a `Str` item above. REFUSE > GUESS:
+                    // anything that could have expanded or reparsed in the
+                    // shell keeps the exec — `$`, backticks, backslashes
+                    // (expansion syntax), single quotes (quoting is already
+                    // resolved), glob metachars (an unquoted `*` expands to
+                    // filenames), and the test parser's own metacharacters
+                    // (`!`, `(`, `)`).
+                    if t.is_empty()
+                        || t.contains('$')
+                        || t.contains('`')
+                        || t.contains('\\')
+                        || t.contains('\'')
+                        || t.contains('*')
+                        || t.contains('?')
+                        || t.contains('[')
+                        || matches!(t.as_str(), "!" | "(" | ")")
+                    {
                         return None;
                     }
-                    words.push(t);
+                    if t.chars().any(|c| c.is_whitespace() || c == '"') {
+                        words.push(quote_sh(&t));
+                    } else {
+                        words.push(t);
+                    }
                 }
             }
         }
@@ -5512,7 +5735,7 @@ impl Render {
         if let Some(rest) = inner.strip_prefix("$(") {
             if let Some(close) = rest.rfind(')') {
                 let cmd = rest[..close].to_string();
-                let env = self.env_lit();
+                let env = self.env_lit_for(Some(&cmd));
                 return Some((format!("capRun({}, {env})", Self::go_str(&cmd)), Opnd::Str));
             }
             return None;
@@ -5865,6 +6088,27 @@ impl Render {
                     }
                     return;
                 }
+                if let Some(lines) = self.printf_redirect_write(inner, redirects) {
+                    for l in lines {
+                        self.emit(&l);
+                    }
+                    return;
+                }
+                // `builtin 2>/dev/null` / `fs-cmd 2>/dev/null`: the native
+                // helpers never write stderr (it is discarded by default —
+                // see `redirect_expr`'s null-stderr arm), so a lone
+                // builtin/fs command with only stderr discards runs as its
+                // native statements with the redirects dropped — no
+                // `exec.Command` weld and no `bash -c` child. The dispatch
+                // is the statement path's own (`exec_builtin_stmt`, then
+                // `fs_argcmd_stmt`), so a refusal lands exactly where the
+                // unredirected command would have gone (REFUSE > GUESS).
+                if let Some(lines) = self.discard_redirect_native(inner, redirects) {
+                    for l in lines {
+                        self.emit(&l);
+                    }
+                    return;
+                }
                 // `cmd argv… > f` / `cmd … 2>/dev/null` in statement
                 // position: the native counterpart of `redirRun` is
                 // `exec.Command` with its stdio welded to the redirect
@@ -6057,7 +6301,7 @@ impl Render {
                             parts.join(" | ")
                         }
                     };
-                    let env = self.env_lit();
+                    let env = self.env_lit_for(Some(&text));
                     let sync = self.sync_inline(name);
                     self.emit(&format!(
                         "{m} = capRun({}, {env});{sync}",
@@ -6586,6 +6830,22 @@ impl Render {
                 Some((Vec::new(), v))
             }
             IrExpr::Call { func, args } if func == "redirect" => {
+                // A builtin / natively-lowered fs command with only stderr
+                // discards needs no exec at all: its native statements run
+                // inline with the status in `st` (see
+                // `builtin_fs_speculative`) — before the weld below, which
+                // would fork an `exec.Command` for the same shape.
+                if let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+                    (args.first(), args.get(1))
+                {
+                    if !redirs.is_empty() && redirs.iter().all(null_stderr_obj) {
+                        if let Some(call_args) = lone_exec_args(body) {
+                            if let Some(lines) = self.builtin_fs_speculative(&call_args) {
+                                return Some((lines, "st".to_string()));
+                            }
+                        }
+                    }
+                }
                 // native first: a single external command with stdio-welded
                 // redirects runs under exec.Command, not a reconstructed
                 // `bash -c` string. The lines leave the status in `st`.
@@ -7549,11 +7809,9 @@ impl Render {
                     }
                 }
                 if ok {
-                    let env = self.env_lit();
-                    self.emit(&format!(
-                        "st = redirRun({}, {env});",
-                        Self::go_str(&parts.join(" "))
-                    ));
+                    let text = parts.join(" ");
+                    let env = self.env_lit_for(Some(&text));
+                    self.emit(&format!("st = redirRun({}, {env});", Self::go_str(&text)));
                     self.need_st = true;
                     true
                 } else {
@@ -10131,6 +10389,11 @@ fn sh_text_refs(text: &str) -> Option<BTreeSet<String>> {
     const DYNAMIC_WORDS: &[&str] = &[
         "eval", "declare", "typeset", "export", "readonly", "local", "unset", "set", "trap",
         "read", "mapfile", "readarray", "getopts", "shift", "nameref", "IFS",
+        // `source f` / `. f` run a FILE whose reads are not in the text at
+        // all, so no subset is provable — same reason the `eval`/`source`
+        // statement arms pass `None` (see `env_lit_for`). `source` rides
+        // the word list; `.` needs its own scan below (it is not a word).
+        "source",
     ];
     if text.contains("${!") || text.contains("${#") || text.contains("$#") {
         return None;
@@ -10141,6 +10404,28 @@ fn sh_text_refs(text: &str) -> Option<BTreeSet<String>> {
     for w in DYNAMIC_WORDS {
         if go_contains_word(text, w) {
             return None;
+        }
+    }
+    // `. f` (dot-sources a file): a `.` in command position — at the text
+    // start or after a separator — followed by whitespace, `/`, another
+    // separator, or the end. `a.b`, `..`, and `.foo` never match (the char
+    // after must not be `.` or an identifier char); `./x` as an ARGUMENT
+    // over-approximates to `None`, which only keeps the full env.
+    {
+        let b = text.as_bytes();
+        let is_sep = |c: u8| matches!(c, b';' | b'&' | b'|' | b'(' | b')') || c.is_ascii_whitespace();
+        for (i, &c) in b.iter().enumerate() {
+            if c != b'.' {
+                continue;
+            }
+            if i > 0 && !is_sep(b[i - 1]) {
+                continue;
+            }
+            match b.get(i + 1) {
+                None => return None,
+                Some(&n) if n == b'/' || (is_sep(n) && n != b'.') => return None,
+                _ => {}
+            }
         }
     }
     let b = text.as_bytes();
