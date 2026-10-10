@@ -15919,7 +15919,21 @@ pub(crate) fn for_iter_range(iter: &IrExpr) -> Range {
 /// The for-loop's iteration count (trip): item count / range span.
 fn for_iter_trip(iter: &IrExpr) -> Option<u64> {
     match iter {
-        IrExpr::Array(items) => Some(items.len() as u64),
+        // Only a fully-literal element list runs exactly len times. A
+        // single dynamic element (`for w in $x` lowers to
+        // `Array[split($x)]`) expands at runtime to an unknown count —
+        // claiming len is an unsound trip bound: it capped a 12K-trip
+        // word-count loop at 1, narrowed the counter to u8, the counter
+        // wrapped, and the cache-validation gate never fired. Sound
+        // direction is None (unbounded → full-width types).
+        IrExpr::Array(items)
+            if items
+                .iter()
+                .all(|it| matches!(it, IrExpr::Str(..) | IrExpr::Int(..))) =>
+        {
+            Some(items.len() as u64)
+        }
+        IrExpr::Array(_) => None,
         IrExpr::Range { start, end } => {
             let span = ((*start as i128) - (*end as i128)).unsigned_abs() + 1;
             Some(span.min(u64::MAX as u128) as u64)
@@ -59522,6 +59536,52 @@ mod struct_member_tests {
         let prog2 = crate::shir_json_in::shir_json_to_ir(plain).expect("ingress");
         let json2 = serde_json::to_string(&shir_to_estree(&prog2)).unwrap();
         assert!(json2.contains("\"name\":\"x\""), "plain name should lift: {json2}");
+    }
+}
+
+#[cfg(test)]
+mod range_trip_tests {
+    use super::*;
+
+    fn ranges_of(src: &str) -> std::collections::HashMap<String, (i128, i128)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        // RAW IR — the trip hint must already be sound here: a dynamic
+        // iterable is unbounded no matter what later transforms do.
+        let prog = ast_to_ir_raw(&cmds);
+        analyze_var_ranges(&prog)
+    }
+
+    #[test]
+    fn dynamic_split_loop_counter_stays_wide() {
+        // `for w in $words` lowers the iterable to `Array[split($words)]`
+        // — a single DYNAMIC element, not a 1-trip literal list. The trip
+        // hint must be None (unbounded) so the carried counter widens to
+        // the int domain. Counting len claimed 1 trip, capped a 12K-trip
+        // word counter at [0,1], narrowed it to u8 — the counter wrapped
+        // at 256 and a `>=` validation gate downstream never fired.
+        let r = ranges_of("n=0\nfor w in $words; do n=$((n + 1)); done");
+        let (lo, hi) = r.get("n").copied().expect("n must have a range");
+        // Fully widened to the bash int domain (the +1 wraps INTMAX to
+        // INTMIN under the shell wrapping model, so lo is INTMIN, not
+        // 0). The load-bearing property: hi is NOT ≤ 255, so no u8.
+        assert_eq!(
+            (lo, hi),
+            (i64::MIN as i128, i64::MAX as i128),
+            "unbounded counter must widen fully, got [{lo}, {hi}]"
+        );
+    }
+
+    #[test]
+    fn literal_list_loop_keeps_exact_trip_bound() {
+        // A fully-literal list still bounds by trips: 3 trips × step 1
+        // from 0. The post-loop re-walk applies the body once more to
+        // the converged state, so hi is 4, not 3 — an over-approximation
+        // by one step, still exact enough to keep narrow types. The
+        // soundness fix must not widen this to the full domain (that
+        // would regress narrow-type codegen).
+        let r = ranges_of("n=0\nfor w in 1 2 3; do n=$((n + 1)); done");
+        let (lo, hi) = r.get("n").copied().expect("n must have a range");
+        assert_eq!((lo, hi), (0, 4), "literal trips stay bounded");
     }
 }
 
