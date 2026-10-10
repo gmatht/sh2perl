@@ -184,6 +184,29 @@ const GO_RESERVED: &[&str] = &[
     "eEsc",
 ];
 
+/// An `echo`/`printf` invocation by absolute coreutils path (`/bin/echo`,
+/// `/usr/bin/printf`, …) — the same program the builtin policy was measured
+/// against, so every `echo`/`printf` lowering applies to it unchanged.
+/// Returns the bare name, or `None` for anything else.
+fn echo_cmd(cmd: &str) -> Option<&str> {
+    let base = cmd.rsplit('/').next().unwrap_or(cmd);
+    if (base == "echo" || base == "printf")
+        && matches!(
+            cmd,
+            "echo"
+                | "printf"
+                | "/bin/echo"
+                | "/usr/bin/echo"
+                | "/bin/printf"
+                | "/usr/bin/printf"
+        )
+    {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 /// Commands bash resolves to a BUILTIN rather than to an executable on
 /// PATH. `exec.Command(name, …)` does not go through bash at all, so a
 /// native stage naming one of these is only sound when
@@ -214,13 +237,104 @@ fn is_shell_builtin(cmd: &str) -> bool {
 /// not the builtin's semantics (`[` and `test` differ on argument count,
 /// and bash's is the one the IR was lowered against).
 fn native_stage_builtin(cmd: &str, argv: &[IrExpr]) -> bool {
-    match cmd {
+    match echo_cmd(cmd).unwrap_or(cmd) {
         "echo" => true,
         "printf" => match argv.first() {
             Some(IrExpr::Str(fmt, _)) => !fmt.contains("%q"),
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// An operand word is a literal path — not a glob splice, which expands to an
+/// argv only the shell knows, and not `-`, which is stdin, not a filename.
+/// A `brace` operand is a splice too (`rm -f {a,b}` is two paths, one word).
+fn fs_literal_operand(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Str(s, _) => s != "-" && !has_glob(&strip_sh2glob(s)),
+        IrExpr::Call { func, .. } => func != "brace",
+        _ => true,
+    }
+}
+
+/// `rm`'s accepted argv shape → (recursive, force, operands).
+///
+/// REFUSE (None) anything outside it rather than guess: an unknown flag has
+/// no os.* counterpart (`-v` writes to stdout, `-i` prompts, `-d`/`--one-file-
+/// system` differ), `--` changes what counts as a flag. A glob operand is
+/// admitted (it expands at run time through `globArgs`, exactly like the
+/// exec argv does); `-` and anything else the renderer cannot see keep the
+/// fork/exec.
+fn rm_native_shape(argv: &[IrExpr]) -> Option<(bool, bool, Vec<&IrExpr>)> {
+    let (mut recursive, mut force) = (false, false);
+    let mut ops: Vec<&IrExpr> = Vec::new();
+    let mut operands = false;
+    for a in argv {
+        match a {
+            IrExpr::Str(s, _) if !operands && s.len() > 1 && s.starts_with('-') => {
+                let Some(long) = s.strip_prefix("--") else {
+                    for c in s[1..].chars() {
+                        match c {
+                            'f' => force = true,
+                            'r' | 'R' => recursive = true,
+                            _ => return None,
+                        }
+                    }
+                    continue;
+                };
+                // --preserve-root is rm's default, so it is a no-op here
+                if long != "preserve-root" {
+                    return None;
+                }
+            }
+            // A glob splices its matches at run time (`rm file_*.txt`
+            // removes whatever the pattern matches then) — the emitter
+            // expands it through `globArgs`, which also reproduces the
+            // no-match-passes-literally rule, so it stays native.
+            IrExpr::Str(s, _) if s != "-" => {
+                operands = true;
+                ops.push(a);
+            }
+            _ if !fs_literal_operand(a) => return None,
+            _ => {
+                operands = true;
+                ops.push(a);
+            }
+        }
+    }
+    if ops.is_empty() {
+        None
+    } else {
+        Some((recursive, force, ops))
+    }
+}
+
+/// `mkdir`'s accepted argv shape → (parents, operands). `-m MODE` takes an
+/// operand of its own and `-v` prints to stdout, so both refuse.
+fn mkdir_native_shape(argv: &[IrExpr]) -> Option<(bool, Vec<&IrExpr>)> {
+    let mut parents = false;
+    let mut ops: Vec<&IrExpr> = Vec::new();
+    let mut operands = false;
+    for a in argv {
+        match a {
+            IrExpr::Str(s, _) if !operands && s.len() > 1 && s.starts_with('-') => {
+                if s != "-p" && s != "--parents" {
+                    return None;
+                }
+                parents = true;
+            }
+            _ if !fs_literal_operand(a) => return None,
+            _ => {
+                operands = true;
+                ops.push(a);
+            }
+        }
+    }
+    if ops.is_empty() {
+        None
+    } else {
+        Some((parents, ops))
     }
 }
 
@@ -596,6 +710,20 @@ impl Render {
                     format!("s2s({s})")
                 }
             },
+            // A `capture`/`captureWords` CALL lowers through the same
+            // capture paths (capCmd/capRun/capPipe or a native value) —
+            // already a Go string, so the coercion is a no-op. Only the
+            // stub fallback (an int `0` plus a TODO marker) needs it, so
+            // the marker decides, not the shape.
+            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
+                let todo = self.todo;
+                let v = self.call(func, args);
+                if self.todo != todo {
+                    format!("s2s({v})")
+                } else {
+                    v
+                }
+            }
             other => {
                 if self.any_is_go_string(other) {
                     // already a Go string — the coercion is a no-op
@@ -627,6 +755,9 @@ impl Render {
                 let m = self.ident_of(name);
                 if self.is_num(name) {
                     format!("({m} != 0)")
+                } else if self.declared_go_string(name) {
+                    // hoisted as Go `string` — the coercion is a no-op
+                    format!("({m} != \"\")")
                 } else {
                     format!("(s2s({m}) != \"\")")
                 }
@@ -781,6 +912,9 @@ impl Render {
                     let m = self.ident_of(name);
                     if self.is_num(name) {
                         format!("({m} != 0)")
+                    } else if self.declared_go_string(name) {
+                        // hoisted as Go `string` — the coercion is a no-op
+                        format!("({m} != \"\")")
                     } else {
                         format!("(s2s({m}) != \"\")")
                     }
@@ -979,17 +1113,35 @@ impl Render {
             if let Some(v) = self.capture_value_op(body, native) {
                 return Some(v);
             }
+            // `$(cmd <<< s)` / `$(cmd <<EOF … EOF)`: stdin fed from the
+            // string — more specific than the builtins below (it carries a
+            // redirect they refuse), so it goes first.
+            if let Some(v) = self.stdin_str_capture(body) {
+                return Some(v);
+            }
+            // `$(echo …)` / `$(printf …)`: the builtin's VALUE is a native
+            // string expression (no subprocess at all) — cheaper and more
+            // faithful than exec'ing coreutils for it (AGENTS.md §2).
+            if let Some(v) = self.echo_printf_capture_value(body) {
+                return Some(v);
+            }
+            // `$(wc -c|-l|-w|-m < f)`: the count, not a subprocess.
+            if let Some(v) = self.wc_capture_body(body) {
+                return Some(v);
+            }
             // `allow_builtin`: a lone `echo`/`printf` exec's natively when
             // coreutils agrees with the builtin (native_stage_builtin), so
             // `$(printf '%s\n' "$a")` costs one process instead of a
             // `bash -c` child plus its whole env literal.
             if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
-                let mut parts = vec![cmd];
-                parts.extend(argv);
+                // Spread-aware: a mid-list glob (`ls * .sh`) folds through
+                // `append`, which a raw `join` cannot express (see
+                // `exec_cmd_call`).
+                let call = Self::exec_cmd_call(&cmd, &argv);
                 if native {
-                    return Some(format!("capCmdRaw(exec.Command({}))", parts.join(", ")));
+                    return Some(format!("capCmdRaw({call})"));
                 }
-                return Some(format!("capCmd(exec.Command({}))", parts.join(", ")));
+                return Some(format!("capCmd({call})"));
             }
             if let Some(text) = self.cmd_text_stmts(body) {
                 // Same env narrowing the `redirRun` reconstructions use: the
@@ -1017,6 +1169,12 @@ impl Render {
     /// `exit` have NO external executable at all — exec'ing them would
     /// fail outright — and `test`'s argv form differs from the builtin's,
     /// so those keep the `bash -c` stage.
+    ///
+    /// A lone `cmd 2>/dev/null` (or `2>>/dev/null`) unwraps to the inner
+    /// command: discarding stderr is what the native `runPipe`/`capPipe`/
+    /// `runCmd`/`capCmd` helpers do with every child anyway, so the
+    /// redirect is a no-op under them. Any other redirect keeps the
+    /// `bash -c` stage (REFUSE > GUESS).
     fn body_single_exec_opt(
         &mut self,
         body: &[IrStmt],
@@ -1027,9 +1185,41 @@ impl Render {
             match s {
                 IrStmt::Expr(e) => {
                     if let IrExpr::Call { func, args } = e {
-                        if func == "exec" {
-                            execs.push(args.clone());
-                            continue;
+                        // `builtin` is what the frontend emits for echo and
+                        // friends; the prelude rewrites most of those to
+                        // `exec`, but pipeline stages (and other nested
+                        // positions) still arrive spelled `builtin` — the
+                        // builtin POLICY below (admission check) applies to
+                        // both spellings alike, so extraction accepts both.
+                        // The redirect spelling (`builtin(Arrow, redirs)`,
+                        // same as `redirect(Arrow, redirs)`) unwraps only
+                        // for stderr discards — see `lone_exec_args`.
+                        if func == "exec" || func == "builtin" {
+                            match args.first() {
+                                Some(IrExpr::Str(..)) | Some(IrExpr::Ident(..)) => {
+                                    execs.push(args.clone());
+                                    continue;
+                                }
+                                _ => {
+                                    if let Some(a) = lone_exec_stmt(s) {
+                                        execs.push(a);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // `( cmd ) 2>/dev/null` in expression position.
+                        if func == "redirect" {
+                            if let (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(redirs))) =
+                                (args.first(), args.get(1))
+                            {
+                                if redirs.iter().all(null_stderr_obj) {
+                                    if let Some(a) = lone_exec_args(inner) {
+                                        execs.push(a);
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1051,6 +1241,15 @@ impl Render {
                     execs.push(call_args);
                     continue;
                 }
+                // `cmd 2>/dev/null` in statement position — see above.
+                IrStmt::Redirect { inner, redirects } => {
+                    if redirects.iter().all(|r| null_stderr_spec(r)) {
+                        if let Some(a) = lone_exec_args(inner) {
+                            execs.push(a);
+                            continue;
+                        }
+                    }
+                }
                 _ => {}
             }
             return None;
@@ -1063,10 +1262,11 @@ impl Render {
             return None;
         }
         if let Some(IrExpr::Str(cmd, _)) = args.first() {
-            // A shell builtin is refused unless it is BOTH allowed by the
-            // caller AND has a faithful external counterpart. The plain
-            // calls (capCmd for `$(…)`) keep `allow_builtin = false`, which
-            // is the historical behaviour.
+            // A shell builtin is refused unless the caller allows builtins
+            // AND the external counterpart agrees (`native_stage_builtin`:
+            // echo, and printf without `%q`). The plain calls (capCmd for
+            // `$(…)`) keep `allow_builtin = false`, which is the historical
+            // behaviour.
             let argv_items: &[IrExpr] = match args.get(1) {
                 Some(IrExpr::Array(items)) => items,
                 _ => &[],
@@ -1085,6 +1285,736 @@ impl Render {
         } else {
             None
         }
+    }
+
+    /// `$(echo …)` / `$(printf …)` / `$(mktemp …)` as a native Go string:
+    /// the builtin's VALUE, not a subprocess. Uses the same options/parts/
+    /// format code the statement forms use (`echo_stmt` / `printf_stmt`), so
+    /// the two can never disagree; the trailing newlines a command
+    /// substitution strips are trimmed exactly like the `capCmd` path does.
+    /// `None` keeps the exec path. REFUSE > GUESS: argv the statement forms
+    /// cannot render, a non-literal command word, or an `Exec` node with
+    /// env/redirects (a `VAR=v` prefix or output redirect changes the value)
+    /// all refuse.
+    fn echo_printf_capture_value(&mut self, body: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            // The core's `Exec` node shape (flat argv). Env/redirects change
+            // the captured value, so only the bare form qualifies — the same
+            // condition `body_single_exec_opt` applies.
+            if let [IrStmt::Exec {
+                cmd: IrExpr::Str(cmd, _),
+                args: argv,
+                capture: None,
+                redirects,
+                env,
+            }] = body
+            {
+                if !redirects.is_empty() || !env.is_empty() {
+                    return None;
+                }
+                return self.builtin_capture_value(cmd, argv);
+            }
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        self.builtin_capture_value(cmd, argv)
+    }
+
+    /// The captured value of one `echo`/`printf` call (see
+    /// `echo_printf_capture_value`). `None` for any other command.
+    fn echo_printf_value(&mut self, cmd: &str, argv: &[IrExpr]) -> Option<String> {
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let out = match echo_cmd(cmd).unwrap_or(cmd) {
+            "echo" => {
+                let (items, newline, escape) = Self::echo_options(argv);
+                let parts = self.echo_parts(items, escape)?;
+                if self.todo != todo {
+                    None
+                } else {
+                    let text = self.parts_str(parts);
+                    // The substitution strips trailing newlines, whatever
+                    // produced them (the echo terminator or `-e` escapes) —
+                    // the same `TrimRight` the `capCmd` path applies.
+                    Some(if newline {
+                        format!("strings.TrimRight(({text} + \"\\n\"), \"\\n\")")
+                    } else {
+                        format!("strings.TrimRight({text}, \"\\n\")")
+                    })
+                }
+            }
+            "printf" => {
+                let Some(fmt_expr) = argv.first() else {
+                    return None;
+                };
+                let fmt = self.printf_fmt(fmt_expr);
+                if self.todo != todo {
+                    None
+                } else {
+                    let args: Vec<String> =
+                        argv[1..].iter().map(|a| self.expr_str(a)).collect();
+                    if self.todo != todo {
+                        None
+                    } else {
+                        let call = if args.is_empty() {
+                            format!("bprintfStr({fmt})")
+                        } else {
+                            format!("bprintfStr({fmt}, {})", args.join(", "))
+                        };
+                        Some(format!("strings.TrimRight({call}, \"\\n\")"))
+                    }
+                }
+            }
+            _ => None,
+        };
+        if out.is_none() {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            // `echo_parts`/`printf_fmt` signal refusal with a TODO marker;
+            // that marker belongs to the untaken path, not the output.
+            self.todo = todo;
+        }
+        out
+    }
+
+    /// `$(mktemp)` / `$(mktemp -d)` / `$(mktemp template)` as a native Go
+    /// string: `os.CreateTemp` / `os.MkdirTemp` create the entry AND yield
+    /// its name, exactly what the corpus uses mktemp for (a scratch path),
+    /// with no subprocess. A template's trailing `XXX…` run maps to Go's
+    /// `*` (both mean "random here"); the directory part must be literal
+    /// (Go fails — `""` — when it is missing, just like mktemp).
+    /// `None` keeps the exec path. REFUSE > GUESS: `-t`/`-p`/`--tmpdir`
+    /// (a different directory), `-u` (dry-run: no entry is created), a
+    /// template without a trailing `XXX` run, `X`s outside it, or a second
+    /// operand all refuse.
+    fn mktemp_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        enum Kind {
+            File,
+            Dir,
+        }
+        let (kind, pattern) = match argv {
+            [] => (Kind::File, ("".to_string(), "tmp*".to_string())),
+            [IrExpr::Str(f, _)] if f == "-d" || f == "--directory" => {
+                (Kind::Dir, ("".to_string(), "tmp*".to_string()))
+            }
+            [IrExpr::Str(t, _)] => (Kind::File, mktemp_pattern(t)?),
+            [IrExpr::Str(f, _), IrExpr::Str(t, _)]
+                if f == "-d" || f == "--directory" =>
+            {
+                (Kind::Dir, mktemp_pattern(t)?)
+            }
+            _ => return None,
+        };
+        let id = self.new_tmp();
+        let (dir, pat) = pattern;
+        let (dir, pat) = (Self::go_str(&dir), Self::go_str(&pat));
+        match kind {
+            Kind::Dir => Some(format!(
+                "func() string {{ __mkn{id}, __mke{id} := os.MkdirTemp({dir}, {pat}); \
+                 if __mke{id} != nil {{ return \"\" }}; return __mkn{id} }}()"
+            )),
+            Kind::File => Some(format!(
+                "func() string {{ __mkf{id}, __mke{id} := os.CreateTemp({dir}, {pat}); \
+                 if __mke{id} != nil {{ return \"\" }}; \
+                 __mkn{id} := __mkf{id}.Name(); __mkf{id}.Close(); return __mkn{id} }}()"
+            )),
+        }
+    }
+
+    /// `$(wc -c|-l|-w|-m < f)` as a native Go string: the count, with no
+    /// subprocess. `-c` stats the file (bytes), `-l` counts newlines,
+    /// `-w` counts words, `-m` counts runes — each `""` when the file
+    /// cannot be read, exactly like the capturing helpers' empty-on-error
+    /// contract (stderr discarded). `None` keeps the exec path.
+    /// REFUSE > GUESS: exactly one flag (no `wc`, no `-cl`, no long
+    /// `--bytes`), exactly one stdin-file redirect (no heredoc/herestring
+    /// — those are different modes — no second redirect, no env prefix).
+    fn wc_capture_value(
+        &mut self,
+        cmd: &str,
+        argv: &[IrExpr],
+        stdin_path: &IrExpr,
+    ) -> Option<String> {
+        if cmd != "wc" {
+            return None;
+        }
+        let [IrExpr::Str(flag, _)] = argv else {
+            return None;
+        };
+        if flag != "-c" && flag != "-l" && flag != "-w" && flag != "-m" {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let path = self.expr_str(stdin_path);
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return None;
+        }
+        let id = self.new_tmp();
+        let out = match flag.as_str() {
+            // Bytes: the file size. Opened for reading first so
+            // permission-denied fails like the shell's redirect does; a
+            // directory opens fine but is not a byte count.
+            "-c" => format!(
+                "func() string {{ __wf{id}, __wfe{id} := os.Open({path}); \
+                 if __wfe{id} != nil {{ return \"\" }}; \
+                 __ws{id}, __wse{id} := __wf{id}.Stat(); __wf{id}.Close(); \
+                 if __wse{id} != nil || __ws{id}.IsDir() {{ return \"\" }}; \
+                 return strconv.FormatInt(__ws{id}.Size(), 10) }}()"
+            ),
+            // Lines: newline bytes (`wc -l` counts `\n`, so a missing
+            // trailing newline is not a line — `bytes.Count`, not lines).
+            "-l" => format!(
+                "func() string {{ __wd{id}, __wde{id} := os.ReadFile({path}); \
+                 if __wde{id} != nil {{ return \"\" }}; \
+                 return strconv.FormatInt(int64(strings.Count(string(__wd{id}), \"\\n\")), 10) }}()"
+            ),
+            "-w" => format!(
+                "func() string {{ __wd{id}, __wde{id} := os.ReadFile({path}); \
+                 if __wde{id} != nil {{ return \"\" }}; \
+                 return strconv.FormatInt(int64(len(strings.Fields(string(__wd{id})))), 10) }}()"
+            ),
+            "-m" => format!(
+                "func() string {{ __wd{id}, __wde{id} := os.ReadFile({path}); \
+                 if __wde{id} != nil {{ return \"\" }}; \
+                 return strconv.FormatInt(int64(utf8.RuneCountInString(string(__wd{id}))), 10) }}()"
+            ),
+            _ => unreachable!(),
+        };
+        Some(out)
+    }
+
+    /// A capture body's `wc` + stdin-file shape → [`Render::wc_capture_value`].
+    /// Accepts the statement `Redirect` form, the `redirect` call form and
+    /// the frontend's `builtin(Arrow, redirs)` stage spelling. `None` keeps
+    /// the current lowering.
+    fn wc_capture_body(&mut self, body: &[IrStmt]) -> Option<String> {
+        // Exactly one statement, one stdin-file redirect, no env.
+        if let [IrStmt::Redirect { inner, redirects }] = body {
+            if redirects.len() != 1 {
+                return None;
+            }
+            let r = &redirects[0];
+            if r.mode != "r" || !matches!(r.fd, None | Some(0)) {
+                return None;
+            }
+            let (cmd, argv) = self.wc_body_exec(inner)?;
+            return self.wc_capture_value(&cmd, &argv, &r.target.clone());
+        }
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = body {
+            if func != "redirect" && func != "builtin" {
+                return None;
+            }
+            let (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(objs))) =
+                (args.first(), args.get(1))
+            else {
+                return None;
+            };
+            if objs.len() != 1 {
+                return None;
+            }
+            let IrExpr::Object(props) = &objs[0] else {
+                return None;
+            };
+            let (mut fd_ok, mut mode_ok, mut target) = (false, false, None);
+            for (k, v) in props {
+                match k.as_str() {
+                    "fd" => {
+                        if let IrExpr::Int(0) = v {
+                            fd_ok = true;
+                        }
+                    }
+                    "mode" => {
+                        if let IrExpr::Str(s, _) = v {
+                            if s == "r" {
+                                mode_ok = true;
+                            }
+                        }
+                    }
+                    "target" => target = Some(v.clone()),
+                    _ => {}
+                }
+            }
+            // A missing fd defaults to stdin for mode `r` (see
+            // `native_redirect`), so it qualifies too.
+            let missing_fd = !props.iter().any(|(k, _)| k == "fd");
+            if !(mode_ok && target.is_some() && (fd_ok || missing_fd)) {
+                return None;
+            }
+            let (cmd, argv) = self.wc_body_exec(inner)?;
+            return self.wc_capture_value(&cmd, &argv, &target.unwrap());
+        }
+        None
+    }
+
+    /// The single `wc` command inside a capture body → (cmd, argv items).
+    /// Reuses the lone-exec extraction (which drops `2>/dev/null`
+    /// wrappers); the caller checks the shape is really `wc`.
+    fn wc_body_exec(&mut self, inner: &[IrStmt]) -> Option<(String, Vec<IrExpr>)> {
+        let args = lone_exec_args(inner)?;
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        if cmd != "wc" {
+            return None;
+        }
+        Some((cmd.clone(), argv.clone()))
+    }
+
+    /// `$(date +fmt)` as a native Go string: `time.Now().Format` with the
+    /// strftime verbs mapped to Go's layout (`%Y` → `2006`, …) — no
+    /// subprocess. `time.Now()` and `date` share the local clock, and the
+    /// value carries no trailing newline in either form (the substitution
+    /// strips `date`'s). `None` keeps the exec path. REFUSE > GUESS: a bare
+    /// `date` (locale-dependent default format), any flag (`-u`, `-d`,
+    /// …), a dynamic format, or a verb outside the mapped set all refuse.
+    fn date_capture_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let [one] = argv else {
+            return None;
+        };
+        let fmt = date_format_lit(one)?;
+        let layout = date_layout(&fmt)?;
+        Some(format!("time.Now().Format({})", Self::go_str(&layout)))
+    }
+
+    /// `$(uname -s|-m|-r|-n|-v)` as a native Go string: `syscall.Uname`
+    /// fields — no subprocess. `None` keeps the exec path. REFUSE > GUESS:
+    /// exactly one flag from the mapped set (bare `uname` is `-s`; anything
+    /// else, including `-a` whose multi-field layout has no single-field
+    /// form, refuses).
+    fn uname_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let field = match argv {
+            [] => "Sysname",
+            [IrExpr::Str(f, _)] if f == "-s" || f == "--kernel-name" => "Sysname",
+            [IrExpr::Str(f, _)] if f == "-m" || f == "--machine" => "Machine",
+            [IrExpr::Str(f, _)] if f == "-r" || f == "--kernel-release" => "Release",
+            [IrExpr::Str(f, _)] if f == "-n" || f == "--nodename" => "Nodename",
+            [IrExpr::Str(f, _)] if f == "-v" || f == "--kernel-version" => "Version",
+            _ => return None,
+        };
+        let id = self.new_tmp();
+        Some(format!(
+            "func() string {{ var __un{id} syscall.Utsname; \
+             if syscall.Uname(&__un{id}) != nil {{ return \"\" }}; \
+             __ub{id} := make([]byte, 0, 65); \
+             for _, __uc{id} := range __un{id}.{field} {{ \
+             if __uc{id} == 0 {{ break }}; \
+             __ub{id} = append(__ub{id}, byte(__uc{id})) }}; \
+             return string(__ub{id}) }}()"
+        ))
+    }
+
+    /// `$(cmd <<< s)` / `$(cmd <<EOF … EOF)` as a native Go string: the
+    /// command run with stdin fed from the string, its output captured —
+    /// no `bash -c` child and no env literal. The builtin policy is the
+    /// same one captures use (echo/printf run as external processes).
+    /// `None` keeps the current lowering. Exactly one stdin-string
+    /// redirect; anything else keeps the fallback.
+    fn stdin_str_capture(&mut self, body: &[IrStmt]) -> Option<String> {
+        let [s] = body else {
+            return None;
+        };
+        // Normalize the three wrappings to (inner, redir-objects).
+        let (inner, objs): (&[IrStmt], Vec<IrExpr>) = match s {
+            IrStmt::Redirect { inner, redirects } => {
+                let mut objs = Vec::with_capacity(redirects.len());
+                for r in redirects {
+                    let mut props: Vec<(String, IrExpr)> = Vec::new();
+                    if let Some(fd) = r.fd {
+                        props.push(("fd".to_string(), IrExpr::Int(fd as i64)));
+                    }
+                    props.push((
+                        "mode".to_string(),
+                        IrExpr::Str(r.mode.clone(), crate::ir::StrStyle::DoubleQuoted),
+                    ));
+                    props.push(("target".to_string(), r.target.clone()));
+                    objs.push(IrExpr::Object(props));
+                }
+                (inner, objs)
+            }
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "redirect" || func == "builtin" =>
+            {
+                let (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(objs))) =
+                    (args.first(), args.get(1))
+                else {
+                    return None;
+                };
+                // The plain `builtin cmd argv…` call is not this shape.
+                if func == "builtin"
+                    && !matches!(args.first(), Some(IrExpr::Arrow(_)))
+                {
+                    return None;
+                }
+                (inner, objs.clone())
+            }
+            _ => return None,
+        };
+        if objs.len() != 1 {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let fail = |r: &mut Render| {
+            r.sides.truncate(sides);
+            r.tmp = tmp;
+            r.todo = todo;
+        };
+        let (cmd, argv) = match self.body_single_exec_opt(inner, true) {
+            Some(x) if self.todo == todo => x,
+            _ => {
+                fail(self);
+                return None;
+            }
+        };
+        let text = match self.native_redirect(&objs[0]) {
+            Some(NativeRedir::StdinStr(t)) if self.todo == todo => t,
+            _ => {
+                fail(self);
+                return None;
+            }
+        };
+        if self.todo != todo {
+            fail(self);
+            return None;
+        }
+        let call = Self::exec_cmd_call(&cmd, &argv);
+        let id = self.new_tmp();
+        Some(format!(
+            "func() string {{ __hs{id}_c := {call}; \
+             __hs{id}_c.Stdin = strings.NewReader({text}); \
+             __hs{id}_c.Stderr = io.Discard; \
+             __hs{id}_o, __hs{id}_e := __hs{id}_c.Output(); \
+             if __hs{id}_e != nil {{ return \"\" }}; \
+             return strings.TrimRight(string(__hs{id}_o), \"\\n\") }}()"
+        ))
+    }
+
+    /// `x=$(cmd <<< s)` / `x=$(cmd <<EOF … EOF)` as an `Exec`-statement
+    /// capture (see `stdin_str_capture`). Emits the assignment directly;
+    /// `true` when handled.
+    fn stdin_str_exec_capture(
+        &mut self,
+        cmd: &IrExpr,
+        args: &[IrExpr],
+        capture: &Option<String>,
+        redirects: &[IrExpr],
+        env: &[(String, IrExpr)],
+    ) -> bool {
+        if !env.is_empty() || redirects.len() != 1 {
+            return false;
+        }
+        let Some(var) = capture else {
+            return false;
+        };
+        // The single exec, under the capture builtin policy.
+        let mut call_args = vec![cmd.clone(), IrExpr::Array(args.to_vec())];
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let (c, argv) = match self.body_single_exec_opt(
+            &[IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: std::mem::take(&mut call_args),
+            })],
+            true,
+        ) {
+            Some(x) if self.todo == todo => x,
+            _ => {
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                return false;
+            }
+        };
+        let text = match self.native_redirect(&redirects[0]) {
+            Some(NativeRedir::StdinStr(t)) if self.todo == todo => t,
+            _ => {
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                return false;
+            }
+        };
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return false;
+        }
+        let call = Self::exec_cmd_call(&c, &argv);
+        let id = self.new_tmp();
+        self.flush_sides();
+        self.mark_written(var);
+        let m = self.go_ident(var);
+        let sync = self.sync_inline(var);
+        self.emit(&format!(
+            "{m} = func() string {{ __hs{id}_c := {call}; \
+             __hs{id}_c.Stdin = strings.NewReader({text}); \
+             __hs{id}_c.Stderr = io.Discard; \
+             __hs{id}_o, __hs{id}_e := __hs{id}_c.Output(); \
+             if __hs{id}_e != nil {{ return \"\" }}; \
+             return strings.TrimRight(string(__hs{id}_o), \"\\n\") }}();{sync}"
+        ));
+        true
+    }
+
+    /// `$(hostname)` as a native Go string: `os.Hostname` — no subprocess.
+    /// `None` keeps the exec path (any operand: `-f`/`-s` select different
+    /// names, which a bare call cannot reproduce).
+    fn hostname_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        if !argv.is_empty() {
+            return None;
+        }
+        let id = self.new_tmp();
+        Some(format!(
+            "func() string {{ __hn{id}, __hne{id} := os.Hostname(); \
+             if __hne{id} != nil {{ return \"\" }}; return __hn{id} }}()"
+        ))
+    }
+
+    /// `$(sha256sum f)` / `$(sha512sum f)` as a native Go string: the hex
+    /// digest plus the two-space-plus-name trailer coreutils prints —
+    /// `crypto/sha256` + `hex`, not a child. `""` when the file cannot be
+    /// read, like the capturing helpers' empty-on-error contract.
+    /// `None` keeps the exec path. REFUSE > GUESS: exactly one operand, no
+    /// flags (`-b` marks binaries with `*`, `--check` verifies instead of
+    /// hashing, `-` reads stdin which has no single-expression form here).
+    fn checksum_value(&mut self, cmd: &str, argv: &[IrExpr]) -> Option<String> {
+        let [one] = argv else {
+            return None;
+        };
+        if matches!(one, IrExpr::Str(s, _) if s == "-" || s.starts_with('-')) {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let path = self.expr_str(one);
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return None;
+        }
+        let id = self.new_tmp();
+        let sum = if cmd == "sha256sum" {
+            "sha256.Sum256"
+        } else {
+            "sha512.Sum512"
+        };
+        Some(format!(
+            "func() string {{ __cd{id}, __cde{id} := os.ReadFile({path}); \
+             if __cde{id} != nil {{ return \"\" }}; \
+             __ch{id} := {sum}(__cd{id}); \
+             return hex.EncodeToString(__ch{id}[:]) + \"  \" + {path} }}()"
+        ))
+    }
+
+    /// `command -v NAME`'s NAME operand, or `None` for any other `command`
+    /// form. Only `-v` (print the path, status = found) lowers natively:
+    /// `command ls …` runs the builtin bypass and `-V` prints a
+    /// description — neither has a single-call counterpart here. A
+    /// dash-word NAME keeps the exec (it would resolve as a flag).
+    fn command_v_name(argv: &[IrExpr]) -> Option<&IrExpr> {
+        let [one, two] = argv else {
+            return None;
+        };
+        let IrExpr::Str(flag, _) = one else {
+            return None;
+        };
+        if flag != "-v" {
+            return None;
+        }
+        if matches!(two, IrExpr::Str(s, _) if s.starts_with('-')) {
+            return None;
+        }
+        Some(two)
+    }
+
+    /// `$(command -v NAME)` as a native Go string: the resolved path, or
+    /// `""` when there is none — `exec.LookPath`, not a child. `None`
+    /// keeps the exec path (see `command_v_name`).
+    fn command_v_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let name_expr = Self::command_v_name(argv)?;
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let name = self.expr_str(name_expr);
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return None;
+        }
+        let id = self.new_tmp();
+        Some(format!(
+            "func() string {{ __cl{id}, __cle{id} := exec.LookPath({name}); \
+             if __cle{id} != nil {{ return \"\" }}; return __cl{id} }}()"
+        ))
+    }
+
+    /// One captured command's native VALUE (`echo`/`printf`/`mktemp`/`wc`/
+    /// `date`/`command`/`cat`/`readlink`/`pwd`/`dirname`/`basename`), or
+    /// `None` when the command is anything else. The caller extracts the
+    /// (cmd, argv) pair; the shapes mirror `body_single_exec_opt` (a lone
+    /// `exec`/`builtin` call, or the core's bare `Exec` node).
+    fn builtin_capture_value(&mut self, cmd: &str, argv: &[IrExpr]) -> Option<String> {
+        if cmd == "mktemp" {
+            return self.mktemp_value(argv);
+        }
+        if cmd == "uname" {
+            return self.uname_value(argv);
+        }
+        if cmd == "date" {
+            return self.date_capture_value(argv);
+        }
+        if cmd == "hostname" {
+            return self.hostname_value(argv);
+        }
+        if cmd == "sha256sum" || cmd == "sha512sum" {
+            return self.checksum_value(cmd, argv);
+        }
+        if cmd == "command" {
+            return self.command_v_value(argv);
+        }
+        if cmd == "cat" || cmd == "readlink" || cmd == "pwd" || cmd == "dirname" || cmd == "basename" {
+            return self.path_capture_value(cmd, argv);
+        }
+        self.echo_printf_value(cmd, argv)
+    }
+
+    /// `$(cat f)` / `$(readlink [-f|-e] f)` / `$(pwd)` / `$(dirname p)` /
+    /// `$(basename p [suf])` as native Go strings: `os.ReadFile`,
+    /// `filepath.EvalSymlinks`/`os.Readlink`, `os.Getwd`, `filepath.Dir`,
+    /// `filepath.Base` — the stdlib calls with the same empty-on-error
+    /// contract the capturing helpers have (stderr discarded, `""` on
+    /// failure). `None` keeps the exec path. REFUSE > GUESS: flags the
+    /// stdlib cannot reproduce (`cat -n`, `readlink -m`, any `pwd`/`mkdir`
+    /// operand, `-` for stdin, multiple `cat` operands whose partial
+    /// output on a missing middle file has no single-expression form).
+    fn path_capture_value(&mut self, cmd: &str, argv: &[IrExpr]) -> Option<String> {
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let out = match cmd {
+            "pwd" => {
+                if !argv.is_empty() {
+                    None
+                } else {
+                    let id = self.new_tmp();
+                    Some(format!(
+                        "func() string {{ __pwd{id}, __pwde{id} := os.Getwd(); \
+                         if __pwde{id} != nil {{ return \"\" }}; return __pwd{id} }}()"
+                    ))
+                }
+            }
+            "cat" => {
+                let [one] = argv else { return None };
+                if matches!(one, IrExpr::Str(s, _) if s == "-" || s.starts_with('-')) {
+                    None
+                } else {
+                    let path = self.expr_str(one);
+                    if self.todo != todo {
+                        None
+                    } else {
+                        let id = self.new_tmp();
+                        Some(format!(
+                            "func() string {{ __cd{id}, __cde{id} := os.ReadFile({path}); \
+                             if __cde{id} != nil {{ return \"\" }}; \
+                             return strings.TrimRight(string(__cd{id}), \"\\n\") }}()"
+                        ))
+                    }
+                }
+            }
+            "readlink" => {
+                // `readlink f`: the link's target (`os.Readlink`, `""`
+                // unless it IS a link). `readlink -f|-e f`: the canonical
+                // path (`filepath.EvalSymlinks`, `""` unless it resolves).
+                // `-m` (no existence requirement) has no counterpart here.
+                let (canonical, path_expr) = match argv {
+                    [] => return None,
+                    [IrExpr::Str(f, _)] if f == "-f" || f == "-e" => return None,
+                    [one] => (false, one),
+                    [IrExpr::Str(f, _), one] if f == "-f" || f == "-e" => (true, one),
+                    _ => return None,
+                };
+                if matches!(path_expr, IrExpr::Str(s, _) if s == "-") {
+                    return None;
+                }
+                let path = self.expr_str(path_expr);
+                if self.todo != todo {
+                    None
+                } else {
+                    let id = self.new_tmp();
+                    let call = if canonical {
+                        format!("filepath.EvalSymlinks({path})")
+                    } else {
+                        format!("os.Readlink({path})")
+                    };
+                    Some(format!(
+                        "func() string {{ __rl{id}, __rle{id} := {call}; \
+                         if __rle{id} != nil {{ return \"\" }}; \
+                         return strings.TrimRight(__rl{id}, \"\\n\") }}()"
+                    ))
+                }
+            }
+            "dirname" => {
+                let [one] = argv else { return None };
+                // A lone `-` is an OPERAND to dirname (prints `-`), but
+                // `filepath.Dir("-")` is `"."` — refuse it with the flags.
+                if matches!(one, IrExpr::Str(s, _) if s.starts_with('-')) {
+                    None
+                } else {
+                    let path = self.expr_str(one);
+                    if self.todo != todo {
+                        None
+                    } else {
+                        Some(format!("filepath.Dir({path})"))
+                    }
+                }
+            }
+            "basename" => {
+                // `basename p` / `basename p suf`: `filepath.Base` plus an
+                // optional `TrimSuffix`. An empty path is `""` in bash but
+                // `"."` from `filepath.Base`, so the guard reproduces it.
+                let (path_expr, suf) = match argv {
+                    [one] => (one, None),
+                    [one, IrExpr::Str(suf, _)] => (one, Some(suf.clone())),
+                    _ => return None,
+                };
+                // A lone `-` is an operand (`-`); longer dash-words are
+                // flags (`--` ends them, but then the path is missing).
+                if matches!(path_expr, IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1) {
+                    return None;
+                }
+                let path = self.expr_str(path_expr);
+                if self.todo != todo {
+                    None
+                } else {
+                    let id = self.new_tmp();
+                    let base = format!("filepath.Base({path})");
+                    let val = match suf {
+                        Some(s) => format!(
+                            "strings.TrimSuffix({base}, {})",
+                            Self::go_str(&s)
+                        ),
+                        None => base,
+                    };
+                    Some(format!(
+                        "func() string {{ if {path} == \"\" {{ return \"\" }}; return {val} }}()"
+                    ))
+                }
+            }
+            _ => None,
+        };
+        if out.is_none() {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+        }
+        out
     }
 
     /// String interpolation: "hello $name" → fmt.Sprintf(...) (string).
@@ -1866,6 +2796,63 @@ impl Render {
 
     /// An exec Call as an expression — runs the command, value = status.
     fn exec_expr(&mut self, args: &[IrExpr]) -> String {
+        // Builtins with no external executable (or none worth exec'ing)
+        // lower to their status directly — exec'ing them would fail outright
+        // (`true` has no binary behind it) or fork a child for a constant.
+        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+            if cmd == "true" || cmd == ":" {
+                return "0".to_string();
+            }
+            if cmd == "false" {
+                return "1".to_string();
+            }
+            if cmd == "test" {
+                let argv: &[IrExpr] = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items.as_slice(),
+                    _ => &[],
+                };
+                // `test` with no args is false (status 1).
+                if argv.is_empty() {
+                    return "1".to_string();
+                }
+                let todo = self.todo;
+                let sides = self.sides.len();
+                let tmp = self.tmp;
+                if let Some(c) = self.test_argv_bool(argv) {
+                    if self.todo == todo {
+                        return format!("b2i(!({c}))");
+                    }
+                }
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+            }
+            // `command -v NAME`: status = found (`exec.LookPath`).
+            if cmd == "command" {
+                let argv: &[IrExpr] = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items.as_slice(),
+                    _ => &[],
+                };
+                if let Some(name_expr) = Self::command_v_name(argv) {
+                    let todo = self.todo;
+                    let sides = self.sides.len();
+                    let tmp = self.tmp;
+                    let name = self.expr_str(name_expr);
+                    if self.todo == todo {
+                        let id = self.new_tmp();
+                        // An IIFE status: the lookup prints nothing here
+                        // (the statement form prints); the value is 0/1.
+                        return format!(
+                            "func() int64 {{ if _, __cle{id} := exec.LookPath({name}); \
+                             __cle{id} != nil {{ return 1 }}; return 0 }}()"
+                        );
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
+            }
+        }
         if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
             let call = Self::exec_cmd_call(&cmd, &argv);
             return format!("runCmd({call})");
@@ -2004,6 +2991,11 @@ impl Render {
     }
 
     /// `pipeline` Call → runPipe or bash -c reconstruction. Value = status.
+    ///
+    /// Stage-level stdio (`( b > f )` as the last stage, `2>/dev/null`
+    /// anywhere) welds into the chain instead of refusing it: without wires
+    /// the value is a `runPipe` call, with wires a status-IIFE over the
+    /// same welded emission the statement form uses (see `pipeline_chain`).
     fn pipeline_expr(&mut self, args: &[IrExpr]) -> String {
         if let Some(stages) = self.pipeline_stages(args) {
             let mut parts: Vec<String> = Vec::new();
@@ -2011,6 +3003,48 @@ impl Render {
                 parts.push(self.stage_lit(st));
             }
             return format!("runPipe([][]string{{{}}})", parts.join(", "));
+        }
+        {
+            let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+            let bodies: Option<Vec<&[IrStmt]>> = match args.first() {
+                Some(IrExpr::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    let mut ok = true;
+                    for it in items {
+                        match it {
+                            IrExpr::Arrow(body) => out.push(&body[..]),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        Some(out)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(bodies) = bodies {
+                if let Some((stagess, fi, lo, le, dup)) =
+                    self.pipeline_chain(&bodies, Vec::new())
+                {
+                    if self.todo == todo
+                        && (fi.is_some() || lo.is_some() || le.is_some() || dup)
+                    {
+                        if let Some(v) = self.welded_value(stagess, fi, lo, le, dup) {
+                            if self.todo == todo {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
         }
         if let Some(IrExpr::Array(items)) = args.first() {
             let mut texts = Vec::new();
@@ -2054,6 +3088,40 @@ impl Render {
         else {
             return self.sh2_stub("redirect");
         };
+        // `cmd 2>/dev/null` (and nothing else): discarding stderr is the
+        // native helpers' default, so this is one exec with no `bash -c`
+        // child and no env literal — the builtin policy is the same one the
+        // pipeline stages use (see `body_single_exec_opt`).
+        if !redirs.is_empty() && redirs.iter().all(null_stderr_obj) {
+            let todo = self.todo;
+            let sides = self.sides.len();
+            let tmp = self.tmp;
+            if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
+                if self.todo == todo {
+                    let call = Self::exec_cmd_call(&cmd, &argv);
+                    return format!("runCmd({call})");
+                }
+            }
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+        }
+        // `a | b > f` as a status VALUE: the same welded chain the
+        // statement form lowers to (see `stmt_pipeline_redirect`), wrapped
+        // so the value reads out instead of landing in `st`.
+        {
+            let todo = self.todo;
+            let sides = self.sides.len();
+            let tmp = self.tmp;
+            if let Some(v) = self.value_pipeline_redirect(body, redirs) {
+                if self.todo == todo {
+                    return v;
+                }
+            }
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+        }
         if let Some(text) = self.cmd_text_stmts(body) {
             let mut with_redirs = format!("( {text} )");
             for r in redirs {
@@ -2198,6 +3266,38 @@ impl Render {
                 return None;
             }
         }
+        // `<<< word` / `<<EOF … EOF`: stdin fed from a string. Only fd 0
+        // (the default for these modes) — any other fd keeps the fallback.
+        if mode == "herestring" {
+            if !matches!(fd, None | Some(0)) {
+                return None;
+            }
+            // A herestring always feeds the word plus ONE newline (even
+            // `<<< ""` feeds `"\n"`) — that newline is part of the input,
+            // so `wc -l` and `read` agree with bash.
+            let text = self.expr_str(target);
+            return Some(NativeRedir::StdinStr(format!("({text} + \"\\n\")")));
+        }
+        if mode == "heredoc" || mode == "heredoc-tabs" {
+            if !matches!(fd, None | Some(0)) {
+                return None;
+            }
+            let IrExpr::Str(content, _) = target else {
+                return None;
+            };
+            // `<<-` strips leading TABs (only tabs) from every line — at
+            // render time, since the content is static text.
+            let text = if mode == "heredoc-tabs" {
+                content
+                    .split('\n')
+                    .map(|l| l.trim_start_matches('\t'))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                content.clone()
+            };
+            return Some(NativeRedir::StdinStr(Self::go_str(&text)));
+        }
         let path = self.expr_str(target);
         let fd = fd.unwrap_or(if mode == "r" { 0 } else { 1 });
         match (fd, mode.as_str()) {
@@ -2301,10 +3401,11 @@ impl Render {
         let id = self.new_tmp();
         let cvar = format!("__rd{id}");
         let okvar = format!("__rdok{id}");
-        let mut parts = vec![cmd.to_string()];
-        parts.extend(argv.iter().cloned());
+        // Spread-aware: a mid-list glob folds through `append` (see
+        // `exec_cmd_call`) — a raw `join` would not compile.
+        let call = Self::exec_cmd_call(cmd, argv);
         let mut lines = vec![
-            format!("{cvar} := exec.Command({});", parts.join(", ")),
+            format!("{cvar} := {call};"),
             format!("{okvar} := true;"),
         ];
         let mut closes: Vec<String> = Vec::new();
@@ -2344,6 +3445,11 @@ impl Render {
                 NativeRedir::DupStdoutToStderr => {
                     lines.push(format!("{cvar}.Stderr = {cvar}.Stdout;"));
                 }
+                // `<<<`/`<<EOF`: stdin fed from a string — infallible, so
+                // no guard and no close.
+                NativeRedir::StdinStr(text) => {
+                    lines.push(format!("{cvar}.Stdin = strings.NewReader({text});"));
+                }
             }
         }
         lines.push(format!(
@@ -2351,6 +3457,566 @@ impl Render {
         ));
         lines.extend(closes);
         self.need_st = true;
+        lines
+    }
+
+    /// One pipeline stage → (argv parts, stdio plan). Accepts the bare
+    /// exec shapes (via `body_single_exec_opt`, which already drops
+    /// `2>/dev/null` wrappers) and the `builtin(Arrow, redirs)` /
+    /// `redirect(Arrow, redirs)` stage forms with any plan the chain can
+    /// place (see `pipeline_chain`). `None` keeps the `bash -c` fallback.
+    /// The render state is rolled back on refusal (never a partial render).
+    fn pipeline_stage(
+        &mut self,
+        body: &[IrStmt],
+    ) -> Option<(Vec<String>, Vec<NativeRedir>)> {
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        // Bare command (null-stderr wrappers already dropped inside).
+        if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
+            if self.todo == todo {
+                let mut s = vec![cmd];
+                s.extend(argv);
+                return Some((s, Vec::new()));
+            }
+        }
+        self.sides.truncate(sides);
+        self.tmp = tmp;
+        self.todo = todo;
+        // `cmd > f 2>e` / `( cmd ) 2>/dev/null` stage forms.
+        let (inner, objs): (&[IrStmt], &[IrExpr]) = match body {
+            [IrStmt::Expr(IrExpr::Call { func, args })]
+                if func == "builtin" || func == "redirect" =>
+            {
+                match (args.first(), args.get(1)) {
+                    (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(objs))) => (inner, objs),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let (cmd, argv) = match self.body_single_exec_opt(inner, true) {
+            Some(x) if self.todo == todo => x,
+            _ => {
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                return None;
+            }
+        };
+        let mut s = vec![cmd];
+        s.extend(argv);
+        let mut plan = Vec::with_capacity(objs.len());
+        for r in objs {
+            match self.native_redirect(r) {
+                Some(nr) if self.todo == todo => plan.push(nr),
+                _ => {
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                    return None;
+                }
+            }
+        }
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return None;
+        }
+        Some((s, plan))
+    }
+
+    /// A whole stage list plus the pipeline-LEVEL stdio plan → welded-chain
+    /// inputs: stage argv lists plus the edge wires. Middle-stage plans
+    /// must be discard-only (`2>/dev/null` — the helpers' own default, so
+    /// they drop out); the first stage may also read stdin from a file, and
+    /// the last may write stdout/stderr to files (or `2>&1` once stdout is
+    /// attached) — those join the outer plan under one affinity
+    /// (`pipeline_plan`). Anything unplaceable is `None` (the `bash -c`
+    /// fallback). The render state is rolled back on refusal.
+    fn pipeline_chain(
+        &mut self,
+        bodies: &[&[IrStmt]],
+        outer: Vec<NativeRedir>,
+    ) -> Option<(
+        Vec<Vec<String>>,
+        Option<NativeRedir>,
+        Option<NativeRedir>,
+        Option<NativeRedir>,
+        bool,
+    )> {
+        if bodies.is_empty() {
+            return None;
+        }
+        let n = bodies.len();
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let fail = |r: &mut Render| {
+            r.sides.truncate(sides);
+            r.tmp = tmp;
+            r.todo = todo;
+        };
+        let mut stagess: Vec<Vec<String>> = Vec::with_capacity(n);
+        let mut combined: Vec<NativeRedir> = Vec::new();
+        for (i, b) in bodies.iter().enumerate() {
+            let (parts, plan) = match self.pipeline_stage(b) {
+                Some(x) => x,
+                None => {
+                    fail(self);
+                    return None;
+                }
+            };
+            for nr in plan {
+                match &nr {
+                    NativeRedir::File { fd: 0, .. } => {
+                        if i != 0 {
+                            fail(self);
+                            return None;
+                        }
+                        combined.push(nr);
+                    }
+                    // A stage-level `<<<`/`<<EOF`: stdin text, first stage
+                    // only (anything later would override its pipe feed,
+                    // which the fixed emission cannot express).
+                    NativeRedir::StdinStr(_) => {
+                        if i != 0 {
+                            fail(self);
+                            return None;
+                        }
+                        combined.push(nr);
+                    }
+                    NativeRedir::File { .. } | NativeRedir::DupStdoutToStderr => {
+                        if i != n - 1 {
+                            // Mid-chain: only a stderr discard survives
+                            // (the helpers' own default — it drops out).
+                            if !is_discard_redir(&nr) {
+                                fail(self);
+                                return None;
+                            }
+                        } else {
+                            combined.push(nr);
+                        }
+                    }
+                }
+            }
+            stagess.push(parts);
+        }
+        combined.extend(outer);
+        let out = match Self::pipeline_plan(combined) {
+            Some(x) => x,
+            None => {
+                fail(self);
+                return None;
+            }
+        };
+        if self.todo != todo {
+            fail(self);
+            return None;
+        }
+        Some((stagess, out.0, out.1, out.2, out.3))
+    }
+
+    /// `pipeline > f` / `pipeline 2>e` / `pipeline < f` in statement
+    /// position (see the `IrStmt::Redirect` arm): the stages run as real
+    /// processes with the edge stdio welded to the redirect targets. Only
+    /// stdin-file on the FIRST stage and stdout/stderr files (or `2>&1`
+    /// once stdout is attached) on the LAST stage are expressible — a
+    /// middle-stage stdio redirect has no counterpart in a welded chain.
+    /// `None` keeps the `bash -c` fallback. The render state is rolled back
+    /// by the caller, so this only returns `None` (never a partial render).
+    fn stmt_pipeline_redirect(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<Vec<String>> {
+        // The pipeline's stage bodies: a statement `Pipeline` node's
+        // stages, or the Arrow bodies of an expression-form `pipeline`
+        // call in statement position.
+        let bodies: Vec<&[IrStmt]> = if let [IrStmt::Pipeline {
+            stages,
+            capture: None,
+            ..
+        }] = inner
+        {
+            stages.iter().map(|st| &st[..]).collect()
+        } else if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner {
+            if func != "pipeline" {
+                return None;
+            }
+            let Some(IrExpr::Array(items)) = args.first() else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                let IrExpr::Arrow(body) = it else {
+                    return None;
+                };
+                out.push(&body[..]);
+            }
+            out
+        } else {
+            return None;
+        };
+        if bodies.is_empty() {
+            return None;
+        }
+        // A bare subshell group around a pipeline (`( a | b )` — no
+        // redirects at all) is the pipeline itself: no `bash -c` child.
+        // Stage-level discards drop out inside the chain; anything wired
+        // keeps the welded emission below.
+        let mut native: Vec<NativeRedir> = Vec::with_capacity(redirects.len());
+        for r in redirects {
+            let mut props: Vec<(String, IrExpr)> = Vec::new();
+            if let Some(fd) = r.fd {
+                props.push(("fd".to_string(), IrExpr::Int(fd as i64)));
+            }
+            props.push((
+                "mode".to_string(),
+                IrExpr::Str(r.mode.clone(), crate::ir::StrStyle::DoubleQuoted),
+            ));
+            props.push(("target".to_string(), r.target.clone()));
+            native.push(self.native_redirect(&IrExpr::Object(props))?);
+        }
+        // A pipeline-LEVEL stdin redirect (`a | b < f`, `a | b <<< s`)
+        // feeds the LAST stage in bash (it overrides the pipe feed) — but
+        // the chain wires edge-stdin onto the FIRST. One stage is both, so
+        // only multi-stage refuses here; single-stage stays native below.
+        if bodies.len() > 1
+            && native.iter().any(|nr| {
+                matches!(
+                    nr,
+                    NativeRedir::File { fd: 0, .. } | NativeRedir::StdinStr(_)
+                )
+            })
+        {
+            return None;
+        }
+        let (stagess, first_in, last_out, last_err, last_dup) =
+            self.pipeline_chain(&bodies, native)?;
+        if redirects.is_empty()
+            && first_in.is_none()
+            && last_out.is_none()
+            && last_err.is_none()
+            && !last_dup
+        {
+            let parts: Vec<String> = stagess.iter().map(|st| Self::argv_slice(st)).collect();
+            self.need_st = true;
+            return Some(vec![format!(
+                "st = runPipe([][]string{{{}}});",
+                parts.join(", ")
+            )]);
+        }
+        if first_in.is_none() && last_out.is_none() && last_err.is_none() && !last_dup {
+            return None;
+        }
+        Some(self.emit_native_pipeline_lines(&stagess, first_in, last_out, last_err, last_dup))
+    }
+
+    /// Edge-stdio affinity for a welded pipeline chain: stdin-file only on
+    /// the first stage, stdout/stderr files (or `2>&1` once stdout is
+    /// attached) only on the last. At most one wire per stdio field — `>a
+    /// >b` (last wins in bash) keeps the fallback, as does a `2>&1`
+    /// combined with an explicit stderr file (their order decides the
+    /// winner, which the fixed emission order cannot reproduce). `None`
+    /// keeps the `bash -c` fallback.
+    fn pipeline_plan(
+        plan: Vec<NativeRedir>,
+    ) -> Option<(
+        Option<NativeRedir>,
+        Option<NativeRedir>,
+        Option<NativeRedir>,
+        bool,
+    )> {
+        let mut first_in: Option<NativeRedir> = None;
+        let mut last_out: Option<NativeRedir> = None;
+        let mut last_err: Option<NativeRedir> = None;
+        let mut last_dup = false;
+        let mut stdout_attached = false;
+        for nr in plan {
+            match &nr {
+                NativeRedir::File { fd: 0, .. } => {
+                    if first_in.is_some() {
+                        return None;
+                    }
+                    first_in = Some(nr);
+                }
+                // `<<<`/`<<EOF` stdin text joins the same first-stage
+                // affinity (one stdin source — a second keeps the fallback,
+                // since bash's last-wins has no fixed emission order here).
+                NativeRedir::StdinStr(_) => {
+                    if first_in.is_some() {
+                        return None;
+                    }
+                    first_in = Some(nr);
+                }
+                NativeRedir::File { fd: 1, .. } => {
+                    if last_out.is_some() {
+                        return None;
+                    }
+                    stdout_attached = true;
+                    last_out = Some(nr);
+                }
+                NativeRedir::File { fd: 2, .. } => {
+                    if last_err.is_some() || last_dup {
+                        return None;
+                    }
+                    last_err = Some(nr);
+                }
+                NativeRedir::DupStdoutToStderr => {
+                    if !stdout_attached || last_dup || last_err.is_some() {
+                        return None;
+                    }
+                    last_dup = true;
+                }
+                _ => return None,
+            }
+        }
+        Some((first_in, last_out, last_err, last_dup))
+    }
+
+    /// `redirect(pipeline, redirs)` as a status VALUE (see `redirect_expr`):
+    /// the same welded chain the statement form lowers to, wrapped in an
+    /// IIFE so the value reads out. A redirect-less `redirect(pipeline,
+    /// [])` is the pipeline's own status. `None` keeps the `bash -c`
+    /// fallback.
+    fn value_pipeline_redirect(
+        &mut self,
+        body: &[IrStmt],
+        redirs: &[IrExpr],
+    ) -> Option<String> {
+        // The pipeline's stage bodies (see `stmt_pipeline_redirect`).
+        let bodies: Vec<&[IrStmt]> = if let [IrStmt::Expr(IrExpr::Call { func, args })] = body
+        {
+            if func != "pipeline" {
+                return None;
+            }
+            // A redirect-less `redirect(pipeline, [])` is the pipeline's
+            // own status, no IIFE needed.
+            if redirs.is_empty() {
+                return Some(self.pipeline_expr(args));
+            }
+            let Some(IrExpr::Array(items)) = args.first() else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                let IrExpr::Arrow(stage) = it else {
+                    return None;
+                };
+                out.push(&stage[..]);
+            }
+            out
+        } else if let [IrStmt::Pipeline {
+            stages,
+            capture: None,
+            ..
+        }] = body
+        {
+            if redirs.is_empty() {
+                let bodies: Vec<&[IrStmt]> = stages.iter().map(|st| &st[..]).collect();
+                let (stagess, fi, lo, le, dup) = self.pipeline_chain(&bodies, Vec::new())?;
+                if fi.is_none() && lo.is_none() && le.is_none() && !dup {
+                    let parts: Vec<String> =
+                        stagess.iter().map(|st| Self::argv_slice(st)).collect();
+                    return Some(format!("runPipe([][]string{{{}}})", parts.join(", ")));
+                }
+                return self.welded_value(stagess, fi, lo, le, dup);
+            }
+            stages.iter().map(|st| &st[..]).collect()
+        } else {
+            return None;
+        };
+        if bodies.is_empty() {
+            return None;
+        }
+        let mut native: Vec<NativeRedir> = Vec::with_capacity(redirs.len());
+        for r in redirs {
+            native.push(self.native_redirect(r)?);
+        }
+        // Same last-stage-stdin rule as the statement form (see
+        // `stmt_pipeline_redirect`): a value-level stdin redirect on a
+        // multi-stage chain keeps the fallback.
+        if bodies.len() > 1
+            && native.iter().any(|nr| {
+                matches!(
+                    nr,
+                    NativeRedir::File { fd: 0, .. } | NativeRedir::StdinStr(_)
+                )
+            })
+        {
+            return None;
+        }
+        let (stagess, first_in, last_out, last_err, last_dup) =
+            self.pipeline_chain(&bodies, native)?;
+        if first_in.is_none() && last_out.is_none() && last_err.is_none() && !last_dup {
+            return None;
+        }
+        self.welded_value(stagess, first_in, last_out, last_err, last_dup)
+    }
+
+    /// A welded chain as a status-VALUE IIFE (see
+    /// `value_pipeline_redirect`).
+    fn welded_value(
+        &mut self,
+        stagess: Vec<Vec<String>>,
+        first_in: Option<NativeRedir>,
+        last_out: Option<NativeRedir>,
+        last_err: Option<NativeRedir>,
+        last_dup: bool,
+    ) -> Option<String> {
+        let id = self.new_tmp();
+        let result = format!("__pqv{id}");
+        let mut lines = self.emit_native_pipeline_lines_to(
+            &stagess,
+            first_in,
+            last_out,
+            last_err,
+            last_dup,
+            &result,
+        );
+        // The emitter's lines declare with `:=` — inside the IIFE the
+        // result temp needs its declaration too. Newline-joined: Go
+        // separates same-line statements with `;`, not spaces.
+        lines.insert(0, format!("var {result} int64;"));
+        lines.push(format!("return {result};"));
+        Some(format!("func() int64 {{\n{}\n}}()", lines.join("\n")))
+    }
+
+    /// The welded chain for [`Render::stmt_pipeline_redirect`]: one
+    /// `exec.Command` per stage, `StdoutPipe` links between them, the edge
+    /// stdio welded to the redirect targets, every other stderr discarded —
+    /// the same stdio contract `runPipe` implements, with the last stage's
+    /// stdout (and opt stderr) going to files instead of the terminal. The
+    /// exit status is the last stage's, exactly like `runPipe` (and bash
+    /// without `pipefail`): a wiring/start failure is status 1 with nothing
+    /// run, mirroring the guarded single-command lowering.
+    fn emit_native_pipeline_lines(
+        &mut self,
+        stages: &[Vec<String>],
+        first_in: Option<NativeRedir>,
+        last_out: Option<NativeRedir>,
+        last_err: Option<NativeRedir>,
+        last_dup: bool,
+    ) -> Vec<String> {
+        self.emit_native_pipeline_lines_to(stages, first_in, last_out, last_err, last_dup, "st")
+    }
+
+    /// [`Render::emit_native_pipeline_lines`], assigning the status to any
+    /// Go variable: `"st"` for statements (which also sets the `$?` flag),
+    /// or an IIFE-local for value contexts (see `value_pipeline_redirect`).
+    fn emit_native_pipeline_lines_to(
+        &mut self,
+        stages: &[Vec<String>],
+        first_in: Option<NativeRedir>,
+        last_out: Option<NativeRedir>,
+        last_err: Option<NativeRedir>,
+        last_dup: bool,
+        result: &str,
+    ) -> Vec<String> {
+        let id = self.new_tmp();
+        let okvar = format!("__pqok{id}");
+        let stvar = format!("__pqst{id}");
+        let mut lines = vec![format!("{okvar} := true;"), format!("{stvar} := int64(0);")];
+        let mut closes: Vec<String> = Vec::new();
+        let n = stages.len();
+        for (i, st) in stages.iter().enumerate() {
+            // Spread-aware (see `exec_cmd_call`): a mid-list glob folds
+            // through `append`, which a raw `join` cannot express.
+            let call = Self::exec_cmd_call(&st[0], &st[1..]);
+            lines.push(format!("__pq{id}_{i} := {call};"));
+        }
+        // Inter-stage links: stage i's stdout feeds stage i+1's stdin.
+        for j in 0..n.saturating_sub(1) {
+            lines.push(format!(
+                "__pq{id}_p{j}, __pq{id}_pe{j} := __pq{id}_{j}.StdoutPipe();"
+            ));
+            lines.push(format!(
+                "if __pq{id}_pe{j} != nil {{ {okvar} = false }} else {{ __pq{id}_{}.Stdin = __pq{id}_p{j} }}",
+                j + 1
+            ));
+        }
+        // Edge wires: stdin-file on the first stage…
+        if let Some(NativeRedir::File { path, read: true, .. }) = &first_in {
+            lines.push(format!("__pq{id}_fi, __pq{id}_fe := os.Open({path});"));
+            lines.push(format!(
+                "if __pq{id}_fe == nil {{ __pq{id}_0.Stdin = __pq{id}_fi }} else {{ {okvar} = false }}"
+            ));
+            closes.push(format!("if __pq{id}_fe == nil {{ __pq{id}_fi.Close() }}"));
+        }
+        // …or stdin-from-string (`<<<`/`<<EOF`) on the first stage.
+        if let Some(NativeRedir::StdinStr(text)) = &first_in {
+            lines.push(format!("__pq{id}_0.Stdin = strings.NewReader({text});"));
+        }
+        // …stdout/stderr files on the last stage.
+        let last = n - 1;
+        let wire_file = |lines: &mut Vec<String>,
+                         closes: &mut Vec<String>,
+                         field: &str,
+                         path: &str,
+                         append: bool,
+                         k: usize| {
+            let flags = if append {
+                "os.O_WRONLY|os.O_CREATE|os.O_APPEND"
+            } else {
+                "os.O_WRONLY|os.O_CREATE|os.O_TRUNC"
+            };
+            lines.push(format!(
+                "__pq{id}_f{k}, __pq{id}_fe{k} := os.OpenFile({path}, {flags}, 0644);"
+            ));
+            lines.push(format!(
+                "if __pq{id}_fe{k} == nil {{ __pq{id}_{last}.{field} = __pq{id}_f{k} }} else {{ {okvar} = false }}"
+            ));
+            closes.push(format!("if __pq{id}_fe{k} == nil {{ __pq{id}_f{k}.Close() }}"));
+        };
+        if let Some(NativeRedir::File { path, append, .. }) = &last_out {
+            wire_file(&mut lines, &mut closes, "Stdout", path, *append, 0);
+        }
+        if let Some(NativeRedir::File { path, append, .. }) = &last_err {
+            wire_file(&mut lines, &mut closes, "Stderr", path, *append, 1);
+        }
+        if last_dup {
+            lines.push(format!("__pq{id}_{last}.Stderr = __pq{id}_{last}.Stdout;"));
+        }
+        // runPipe's stdio contract for everything left unwired: every
+        // stage's stderr discarded, the last stage's stdout inherited.
+        let err_wired = last_err.is_some() || last_dup;
+        let out_wired = last_out.is_some();
+        for i in 0..n {
+            let stderr_wired = (i == last) && err_wired;
+            if !stderr_wired {
+                lines.push(format!("__pq{id}_{i}.Stderr = io.Discard;"));
+            }
+            if i == last && !out_wired {
+                lines.push(format!("__pq{id}_{last}.Stdout = os.Stdout;"));
+            }
+        }
+        // Start all but the last, Run the last, Wait the rest — runPipe's
+        // own sequence, so the status is the last stage's. A start failure
+        // skips the run (status 1), exactly like runPipe's early return.
+        lines.push(format!("if {okvar} {{"));
+        lines.push(format!("{stvar} = func() int64 {{"));
+        for i in 0..n.saturating_sub(1) {
+            lines.push(format!(
+                "if __e := __pq{id}_{i}.Start(); __e != nil {{ return 1 }}"
+            ));
+        }
+        lines.push(format!(
+            "if __e := __pq{id}_{last}.Run(); __e != nil {{ \
+             if __ee, __ok := __e.(*exec.ExitError); __ok {{ return int64(__ee.ExitCode()) }}; \
+             return 1 }}"
+        ));
+        for i in 0..n.saturating_sub(1) {
+            lines.push(format!("__pq{id}_{i}.Wait();"));
+        }
+        lines.push("return 0;".to_string());
+        lines.push("}();".to_string());
+        lines.push("} else {".to_string());
+        lines.push(format!("{stvar} = 1;"));
+        lines.push("}".to_string());
+        lines.extend(closes);
+        lines.push(format!("{result} = {stvar};"));
+        if result == "st" {
+            self.need_st = true;
+        }
         lines
     }
 
@@ -2520,12 +4186,26 @@ impl Render {
                 return "s2s(string(__b))".to_string();
             }
         }
+        // `$(echo …)` / `$(printf …)`: the builtin's VALUE is a native
+        // string expression (no subprocess at all) — same fast path as
+        // capture_str.
+        if let Some(v) = self.echo_printf_capture_value(body) {
+            return v;
+        }
+        // `$(cmd <<< s)` / `$(cmd <<EOF … EOF)`: stdin fed from the string.
+        if let Some(v) = self.stdin_str_capture(body) {
+            return v;
+        }
+        // `$(wc -c|-l|-w|-m < f)`: the count, not a subprocess.
+        if let Some(v) = self.wc_capture_body(body) {
+            return v;
+        }
         // Same builtin policy as capture_str: a lone `echo`/`printf` exec's
         // natively when coreutils agrees with the builtin.
         if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
-            let mut parts = vec![cmd];
-            parts.extend(argv);
-            return format!("capCmd(exec.Command({}))", parts.join(", "));
+            // Spread-aware (see capture_str).
+            let call = Self::exec_cmd_call(&cmd, &argv);
+            return format!("capCmd({call})");
         }
         if let Some(text) = self.cmd_text_stmts(body) {
             let env = self.env_lit_for(Some(&text));
@@ -3162,9 +4842,33 @@ impl Render {
                     if self.exec_builtin_stmt(name, &call_args) {
                         return;
                     }
+                    if self.fs_argcmd_stmt(name, &call_args) {
+                        return;
+                    }
                     if self.functions.contains(name) {
                         self.call_function(name, &call_args);
                         return;
+                    }
+                }
+            }
+            // `x=$(echo …)` / `x=$(printf …)` / `x=$(mktemp …)` as an
+            // `Exec`-statement capture: the builtin's VALUE, not a
+            // subprocess — the same lowering the `capture` paths use.
+            if let Some(var) = capture {
+                if let IrExpr::Str(name, _) = cmd {
+                    if name == "mktemp" || echo_cmd(name).is_some() {
+                        let todo = self.todo;
+                        if let Some(v) = self.builtin_capture_value(name, args) {
+                            if self.todo == todo {
+                                self.flush_sides();
+                                self.mark_written(var);
+                                let m = self.go_ident(var);
+                                let sync = self.sync_inline(var);
+                                self.emit(&format!("{m} = {v};{sync}"));
+                                return;
+                            }
+                        }
+                        self.todo = todo;
                     }
                 }
             }
@@ -3184,6 +4888,58 @@ impl Render {
                     }
                 }
                 return;
+            }
+        }
+        // `x=$(cmd <<< s)` / `x=$(cmd <<EOF … EOF)` as an Exec-statement
+        // capture: stdin fed from the string, output captured.
+        if self.stdin_str_exec_capture(cmd, args, capture, redirects, env) {
+            return;
+        }
+        // `x=$(wc -c|-l|-w|-m < f)` as an `Exec`-statement capture: the
+        // count, not a subprocess — the same lowering the `capture` paths
+        // use. Exactly one stdin-file redirect and no env prefix.
+        if env.is_empty() {
+            if let (Some(var), IrExpr::Str(name, _), [one]) = (capture, cmd, redirects) {
+                if name == "wc" {
+                    if let IrExpr::Object(props) = one {
+                        let (mut fd_ok, mut mode_ok, mut target) = (false, false, None);
+                        for (k, v) in props {
+                            match k.as_str() {
+                                "fd" => {
+                                    if let IrExpr::Int(0) = v {
+                                        fd_ok = true;
+                                    }
+                                }
+                                "mode" => {
+                                    if let IrExpr::Str(s, _) = v {
+                                        if s == "r" {
+                                            mode_ok = true;
+                                        }
+                                    }
+                                }
+                                "target" => target = Some(v.clone()),
+                                _ => {}
+                            }
+                        }
+                        let missing_fd = !props.iter().any(|(k, _)| k == "fd");
+                        if mode_ok && target.is_some() && (fd_ok || missing_fd) {
+                            let todo = self.todo;
+                            if let Some(v) =
+                                self.wc_capture_value(name, args, &target.unwrap())
+                            {
+                                if self.todo == todo {
+                                    self.flush_sides();
+                                    self.mark_written(var);
+                                    let m = self.go_ident(var);
+                                    let sync = self.sync_inline(var);
+                                    self.emit(&format!("{m} = {v};{sync}"));
+                                    return;
+                                }
+                            }
+                            self.todo = todo;
+                        }
+                    }
+                }
             }
         }
         if let Some(text) = self.exec_stmt_text(cmd, args, capture, redirects, env) {
@@ -3616,6 +5372,45 @@ impl Render {
             return None;
         }
         Some(e)
+    }
+
+    /// A `test` command's argv → native Go bool expression, via the same
+    /// `test_render` the `[ ]` conditions use. Words that would not survive
+    /// space-splitting (whitespace, quotes, `$`…) are single-quoted; every
+    /// other word — operators (`=`, `-f`), flags, plain operands — stays
+    /// bare so the parser still recognizes it. `None` keeps the
+    /// `/usr/bin/test` exec. An empty operand has no text form (it would
+    /// vanish from the join), so it refuses too. A dynamic word is only
+    /// admissible as exactly one simple reference (`$v`, `${v}`, `$1`,
+    /// `$?`, …) — anything composed (`$v/suffix`, `pre$v`) has no operand
+    /// form `test_operand` resolves faithfully, so it keeps the exec.
+    fn test_argv_bool(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let mut words = Vec::with_capacity(argv.len());
+        for a in argv {
+            match a {
+                IrExpr::Str(s, _) => {
+                    if s.is_empty() {
+                        return None;
+                    }
+                    if s.chars().any(|c| {
+                        c.is_whitespace()
+                            || matches!(c, '\'' | '"' | '\\' | '$' | '`')
+                    }) {
+                        words.push(quote_sh(s));
+                    } else {
+                        words.push(s.clone());
+                    }
+                }
+                _ => {
+                    let t = self.cmd_text_expr(a)?;
+                    if !is_simple_test_ref(&t) {
+                        return None;
+                    }
+                    words.push(t);
+                }
+            }
+        }
+        self.test_render(&words.join(" "))
     }
 
     /// Binary test operator → Go bool expr. `lraw`/`rraw` are the raw
@@ -4095,6 +5890,27 @@ impl Render {
                     self.sides.truncate(sides);
                     self.tmp = tmp;
                 }
+                // `a | b > f` / `a | b 2>e` / `a < f | b` in statement
+                // position: the stages run as real processes (the same
+                // admission as statement pipelines) with the edge stdio
+                // welded to the redirect targets — no `bash -c` child and
+                // no env literal. Only the shapes the wiring reproduces
+                // exactly (stdin-file on the first stage, stdout/stderr
+                // files or `2>&1` on the last); anything else keeps the
+                // fallback below (REFUSE > GUESS).
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let Some(lines) = self.stmt_pipeline_redirect(inner, redirects) {
+                        if self.todo == todo {
+                            for l in lines {
+                                self.emit(&l);
+                            }
+                            return;
+                        }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                }
                 if let Some(text) = self.cmd_text_stmts(inner) {
                     let mut with_redirs = format!("( {text} )");
                     let mut ok = true;
@@ -4187,6 +6003,40 @@ impl Render {
                 if let Some(name) = capture {
                     self.mark_written(name);
                     let m = self.go_ident(name);
+                    // Native first: every stage a real process (echo/printf
+                    // admitted when coreutils agrees — the same policy the
+                    // expression-level `pipeline_capture` uses), so `x=$(a |
+                    // b)` reads stdout with no `bash -c` child and no env
+                    // literal (AGENTS.md §2). Stage-level stdio keeps the
+                    // reconstruction below: a capture must read the pipe.
+                    {
+                        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                        let bodies: Vec<&[IrStmt]> =
+                            stages.iter().map(|st| &st[..]).collect();
+                        if let Some((stagess, fi, lo, le, dup)) =
+                            self.pipeline_chain(&bodies, Vec::new())
+                        {
+                            if fi.is_none()
+                                && lo.is_none()
+                                && le.is_none()
+                                && !dup
+                                && self.todo == todo
+                            {
+                                let parts: Vec<String> = stagess
+                                    .iter()
+                                    .map(|st| self.stage_lit(st))
+                                    .collect();
+                                let sync = self.sync_inline(name);
+                                self.emit(&format!(
+                                    "{m} = capPipe([][]string{{{}}});{sync}",
+                                    parts.join(", ")
+                                ));
+                                return;
+                            }
+                        }
+                        self.sides.truncate(sides);
+                        self.tmp = tmp;
+                    }
                     let text = match cmd_str {
                         Some(c) => c.clone(),
                         None => {
@@ -4215,30 +6065,48 @@ impl Render {
                     ));
                     return;
                 }
-                // plain pipeline: native chain
-                let mut stages_go: Vec<Vec<String>> = Vec::new();
-                let mut ok = true;
-                for st in stages {
-                    if let Some((cmd, argv)) = self.body_single_exec(st) {
-                        let mut s = vec![cmd];
-                        s.extend(argv);
-                        stages_go.push(s);
-                    } else {
-                        ok = false;
-                        break;
+                // plain pipeline: native chain. Builtin stages are admitted
+                // exactly like the expression-level `pipeline_stages` (echo /
+                // printf exec as real processes when coreutils agrees with
+                // the builtin — see `native_stage_builtin`), so `echo … |
+                // grep …` is a runPipe chain instead of a `bash -c` child
+                // with an env literal (AGENTS.md §2). Stage-level stdio
+                // (`2>/dev/null`, `> f` on an edge) welds into the chain
+                // instead of refusing it (see `pipeline_chain`).
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    let bodies: Vec<&[IrStmt]> = stages.iter().map(|st| &st[..]).collect();
+                    if let Some((stagess, fi, lo, le, dup)) =
+                        self.pipeline_chain(&bodies, Vec::new())
+                    {
+                        if self.todo == todo {
+                            if fi.is_none() && lo.is_none() && le.is_none() && !dup {
+                                let parts: Vec<String> = stagess
+                                    .iter()
+                                    .map(|st| self.stage_lit(st))
+                                    .collect();
+                                self.emit(&format!(
+                                    "st = runPipe([][]string{{{}}});",
+                                    parts.join(", ")
+                                ));
+                                self.need_st = true;
+                                return;
+                            }
+                            let lines = self.emit_native_pipeline_lines(
+                                &stagess, fi, lo, le, dup,
+                            );
+                            if self.todo == todo {
+                                for l in lines {
+                                    self.emit(&l);
+                                }
+                                return;
+                            }
+                        }
                     }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
                 }
-                if ok && !stages_go.is_empty() {
-                    let parts: Vec<String> = stages_go
-                        .iter()
-                        .map(|st| self.stage_lit(st))
-                        .collect();
-                    self.emit(&format!(
-                        "st = runPipe([][]string{{{}}});",
-                        parts.join(", ")
-                    ));
-                    self.need_st = true;
-                } else {
+                {
                     // bash -c fork/exec fallback (last-resort tier): a stage
                     // that isn't a single external exec (variable cmd,
                     // builtin, redirect) — reconstruct the whole pipeline
@@ -4596,6 +6464,33 @@ impl Render {
                     if let Some(r) = self.chain_builtin(cmd, args) {
                         return Some(r);
                     }
+                    if let Some(r) = self.chain_fs_argcmd(cmd, args) {
+                        return Some(r);
+                    }
+                    // `test` is not in the shared builtins namespace, so the
+                    // arms above never see it — but it lowers through the
+                    // same `test_render` as `[ ]` (see `exec_builtin_stmt`).
+                    if cmd == "test" {
+                        let argv: &[IrExpr] = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items.as_slice(),
+                            _ => &[],
+                        };
+                        // `test` with no args is false (status 1).
+                        if argv.is_empty() {
+                            return Some((Vec::new(), "1".to_string()));
+                        }
+                        let todo = self.todo;
+                        let sides = self.sides.len();
+                        let tmp = self.tmp;
+                        if let Some(c) = self.test_argv_bool(argv) {
+                            if self.todo == todo {
+                                return Some((Vec::new(), format!("b2i(!({c}))")));
+                            }
+                        }
+                        self.sides.truncate(sides);
+                        self.tmp = tmp;
+                        self.todo = todo;
+                    }
                 }
                 if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
                     let call = Self::exec_cmd_call(&cmd, &argv);
@@ -4840,6 +6735,9 @@ impl Render {
                     if self.exec_builtin_stmt(cmd, args) {
                         return;
                     }
+                    if self.fs_argcmd_stmt(cmd, args) {
+                        return;
+                    }
                     if self.functions.contains(cmd) {
                         self.call_function(cmd, args);
                         return;
@@ -5050,6 +6948,307 @@ impl Render {
         }
     }
 
+    /// `rm` rendered with Go's own filesystem calls — no child process.
+    /// Returns false, having emitted nothing, when the argv is outside
+    /// `rm_native_shape`, so the caller keeps the fork/exec.
+    fn rm_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(expanded) = self.expand_brace_argv(argv) else {
+            return false;
+        };
+        let Some((recursive, force, list)) = rm_native_shape(&expanded) else {
+            return false;
+        };
+        let ops: Vec<(String, bool)> = list
+            .iter()
+            .map(|e| {
+                let glob = matches!(e, IrExpr::Str(s, _) if has_glob(&strip_sh2glob(s)));
+                (self.expr_str(e), glob)
+            })
+            .collect();
+        self.flush_sides();
+        // rm's status is the last failure, so it starts clean and only ever
+        // rises to 1 — one failing operand fails the whole command. A glob
+        // operand expands at run time (`globArgs`, with the same
+        // no-match-passes-literally rule as the shell) and removes each
+        // match under the same per-file semantics.
+        self.emit("st = 0;");
+        let id = self.new_tmp();
+        for (item, (op, glob)) in list.iter().zip(ops.iter()) {
+            let one = |target: &str| match (recursive, force) {
+                // -f is "say nothing about a path that is not there", the one
+                // error rm swallows; every other failure keeps rc 1.
+                (false, true) => format!(
+                    "if err := os.Remove({target}); err != nil && !os.IsNotExist(err) {{ st = 1 }}"
+                ),
+                (false, false) => {
+                    format!("if err := os.Remove({target}); err != nil {{ st = 1 }}")
+                }
+                // -rf succeeds on a missing path, but -r alone does not, and
+                // os.RemoveAll cannot tell those two apart.
+                (true, true) => {
+                    format!("if err := os.RemoveAll({target}); err != nil {{ st = 1 }}")
+                }
+                (true, false) => format!(
+                    "if _, err := os.Lstat({target}); err != nil {{ st = 1 }} else if err := os.RemoveAll({target}); err != nil {{ st = 1 }}"
+                ),
+            };
+            if *glob {
+                // The glob pattern is a static literal (only `Str`
+                // operands glob) — render it raw, not through the
+                // `any`-boxing coercion of the value above.
+                let IrExpr::Str(s, _) = item else {
+                    unreachable!()
+                };
+                let pat = Self::go_str(&strip_sh2glob(s));
+                self.emit(&format!("for _, __rp{id} := range globArgs({pat}) {{"));
+                self.depth += 1;
+                self.emit(&one(&format!("__rp{id}")));
+                self.depth -= 1;
+                self.emit("}");
+            } else {
+                self.emit(&one(op));
+            }
+        }
+        self.need_st = true;
+        true
+    }
+
+    /// `mkdir` rendered with Go's own filesystem calls.
+    fn mkdir_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(expanded) = self.expand_brace_argv(argv) else {
+            return false;
+        };
+        let Some((parents, list)) = mkdir_native_shape(&expanded) else {
+            return false;
+        };
+        let ops: Vec<String> = list.iter().map(|e| self.expr_str(e)).collect();
+        self.flush_sides();
+        self.emit("st = 0;");
+        for op in &ops {
+            // bash's mkdir is mode 0777 & ~umask, and os.Mkdir applies the
+            // umask to the mode it is given — so 0o777 keeps the umask in
+            // charge of the result, exactly as the child would have been.
+            self.emit(&if parents {
+                format!("if err := os.MkdirAll({op}, 0o777); err != nil {{ st = 1 }}")
+            } else {
+                format!("if err := os.Mkdir({op}, 0o777); err != nil {{ st = 1 }}")
+            });
+        }
+        self.need_st = true;
+        true
+    }
+
+    /// Brace-expand argv items into plain words — the same expansion
+    /// `argv_strings` applies when building the exec argv, so `touch
+    /// file_{001..005}.txt` validates as its five expansions instead of
+    /// refusing on the splice. `None` when an item is not expandable —
+    /// the caller keeps the exec. (Globs still refuse downstream: an
+    /// expansion is only literal text, never a runtime splice.)
+    fn expand_brace_argv(&mut self, argv: &[IrExpr]) -> Option<Vec<IrExpr>> {
+        let mut out = Vec::with_capacity(argv.len());
+        for it in argv {
+            if let IrExpr::Call { func, args } = it {
+                if func == "brace" {
+                    for s in self.brace_expand(args)? {
+                        out.push(IrExpr::Str(s, crate::ir::StrStyle::DoubleQuoted));
+                    }
+                    continue;
+                }
+            }
+            out.push(it.clone());
+        }
+        Some(out)
+    }
+
+    /// `touch` rendered with Go's own filesystem calls: each operand is
+    /// created empty when missing and stamped with the current time
+    /// otherwise — `os.Chtimes`, falling back to create-then-stamp. Any
+    /// dash operand (`-c` skips creation, `-d`/`-t`/`-r` set explicit
+    /// times, `-a`/`-m` stamp one clock) has no counterpart here and keeps
+    /// the exec, as does `-` (stdin, not a path) or a glob splice.
+    fn touch_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(expanded) = self.expand_brace_argv(argv) else {
+            return false;
+        };
+        let argv: &[IrExpr] = &expanded;
+        if argv.is_empty() {
+            return false;
+        }
+        for a in argv {
+            match a {
+                IrExpr::Str(s, _) => {
+                    if s == "-" || s.starts_with('-') || has_glob(&strip_sh2glob(s)) {
+                        return false;
+                    }
+                }
+                IrExpr::Call { func, .. } => {
+                    if func == "brace" {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ops: Vec<String> = argv.iter().map(|e| self.expr_str(e)).collect();
+        self.flush_sides();
+        let id = self.new_tmp();
+        self.emit(&format!("__tt{id} := time.Now();"));
+        self.emit("st = 0;");
+        for op in &ops {
+            // Missing → create empty (0644, umask-applied like the child),
+            // then stamp; present → stamp. A failed create or stamp is
+            // status 1, and one failing operand fails the command.
+            self.emit(&format!(
+                "if __e := os.Chtimes({op}, __tt{id}, __tt{id}); __e != nil {{ \
+                 if __f, __fe := os.OpenFile({op}, os.O_WRONLY|os.O_CREATE, 0644); __fe != nil {{ st = 1 }} \
+                 else {{ __f.Close(); if __e := os.Chtimes({op}, __tt{id}, __tt{id}); __e != nil {{ st = 1 }} }} }}"
+            ));
+        }
+        self.need_st = true;
+        true
+    }
+
+    /// `rmdir` rendered with Go's own filesystem calls: each operand must
+    /// be an empty directory. `os.Remove` alone is not enough (it also
+    /// removes files, which `rmdir` refuses), so an `Lstat`+`IsDir` guard
+    /// precedes it. Any dash operand, `-`, a glob splice or an empty list
+    /// keeps the exec.
+    fn rmdir_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(expanded) = self.expand_brace_argv(argv) else {
+            return false;
+        };
+        let argv: &[IrExpr] = &expanded;
+        if argv.is_empty() {
+            return false;
+        }
+        for a in argv {
+            match a {
+                IrExpr::Str(s, _) => {
+                    if s == "-" || s.starts_with('-') || has_glob(&strip_sh2glob(s)) {
+                        return false;
+                    }
+                }
+                IrExpr::Call { func, .. } => {
+                    if func == "brace" {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ops: Vec<String> = argv.iter().map(|e| self.expr_str(e)).collect();
+        self.flush_sides();
+        self.emit("st = 0;");
+        for op in &ops {
+            self.emit(&format!(
+                "if __fi, __e := os.Lstat({op}); __e != nil || !__fi.IsDir() {{ st = 1 }} \
+                 else if __e := os.Remove({op}); __e != nil {{ st = 1 }}"
+            ));
+        }
+        self.need_st = true;
+        true
+    }
+
+    /// `ln` rendered with Go's own filesystem calls: `ln a b` is
+    /// `os.Link`, `ln -s a b` is `os.Symlink`, and `-f` removes the
+    /// destination first (errors ignored, exactly like `rm -f` there).
+    /// Only the `s`/`f` short flags combine; anything else (`-n`, `-b`,
+    /// `-v`, long flags), a non-2 operand count, `-`, or a glob splice
+    /// keeps the exec.
+    fn ln_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(expanded) = self.expand_brace_argv(argv) else {
+            return false;
+        };
+        let argv: &[IrExpr] = &expanded;
+        let (mut symbolic, mut force) = (false, false);
+        let mut ops: Vec<&IrExpr> = Vec::new();
+        let mut operands = false;
+        for a in argv {
+            match a {
+                IrExpr::Str(s, _) if !operands && s.len() > 1 && s.starts_with('-') => {
+                    if s.starts_with("--") {
+                        return false;
+                    }
+                    for c in s[1..].chars() {
+                        match c {
+                            's' => symbolic = true,
+                            'f' => force = true,
+                            _ => return false,
+                        }
+                    }
+                    continue;
+                }
+                _ if !fs_literal_operand(a) => return false,
+                _ => {
+                    operands = true;
+                    ops.push(a);
+                }
+            }
+        }
+        if ops.len() != 2 {
+            return false;
+        }
+        let src = self.expr_str(ops[0]);
+        let dst = self.expr_str(ops[1]);
+        self.flush_sides();
+        self.emit("st = 0;");
+        if force {
+            self.emit(&format!("os.Remove({dst});"));
+        }
+        if symbolic {
+            self.emit(&format!(
+                "if err := os.Symlink({src}, {dst}); err != nil {{ st = 1 }}"
+            ));
+        } else {
+            self.emit(&format!(
+                "if err := os.Link({src}, {dst}); err != nil {{ st = 1 }}"
+            ));
+        }
+        self.need_st = true;
+        true
+    }
+
+    /// External commands Go expresses natively, so the renderer drops the
+    /// fork/exec entirely (AGENTS.md §2). Currently `rm`, `mkdir`, `touch`,
+    /// `rmdir` and `ln`; any argv outside their exact shape falls through
+    /// to `runCmd`.
+    fn fs_argcmd_stmt(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
+        // `exec` Call shape is (cmd, [argv…]), same as exec_builtin_stmt
+        let argv: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
+            _ => &[],
+        };
+        match cmd {
+            "rm" => self.rm_stmt(argv),
+            "mkdir" => self.mkdir_stmt(argv),
+            "touch" => self.touch_stmt(argv),
+            "rmdir" => self.rmdir_stmt(argv),
+            "ln" => self.ln_stmt(argv),
+            _ => false,
+        }
+    }
+
+    /// `chain_operand`'s arm for the natively-lowered external commands:
+    /// capture the statements UNINDENTED, exactly like `chain_builtin`, and
+    /// reject the attempt wholesale if the lowerer refuses — so a refusal
+    /// leaves no read marked and no side statement queued.
+    fn chain_fs_argcmd(&mut self, cmd: &str, args: &[IrExpr]) -> Option<(Vec<String>, String)> {
+        let need_st_before = self.need_st;
+        let sides_before = self.sides.len();
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let saved = std::mem::take(&mut self.out);
+        let handled = self.fs_argcmd_stmt(cmd, args);
+        let stmts = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        if !handled {
+            self.need_st = need_st_before;
+            self.sides.truncate(sides_before);
+            return None;
+        }
+        Some((stmts, "st".to_string()))
+    }
+
     /// Builtin exec statements: echo/printf/exit/cd/let/local/… Returns
     /// true if handled.
     fn exec_builtin_stmt(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
@@ -5057,7 +7256,9 @@ impl Render {
             Some(IrExpr::Array(items)) => items.as_slice(),
             _ => &[],
         };
-        match cmd {
+        // Absolute coreutils paths lower exactly like the builtins (see
+        // `echo_cmd`).
+        match echo_cmd(cmd).unwrap_or(cmd) {
             "echo" => {
                 self.echo_stmt(argv);
                 true
@@ -5090,6 +7291,44 @@ impl Render {
                 ));
                 self.need_st = true;
                 true
+            }
+            "pwd" => {
+                // `pwd` with no operands prints the working directory —
+                // `os.Getwd`, not a `/bin/pwd` child (AGENTS.md §2). Any
+                // operand (`-P`/`-L`, which bash mostly ignores anyway)
+                // keeps the exec.
+                if !argv.is_empty() {
+                    return false;
+                }
+                self.flush_sides();
+                let id = self.new_tmp();
+                self.emit(&format!(
+                    "if __pwd{id}, __pwde{id} := os.Getwd(); __pwde{id} == nil {{ \
+                     fmt.Println(__pwd{id}); st = 0 }} else {{ st = 1 }};"
+                ));
+                self.need_st = true;
+                true
+            }
+            "date" => {
+                // `date +fmt` prints the time — `time.Now().Format` with
+                // the mapped layout, not a child (AGENTS.md §2). Same
+                // refusal set as the capture form.
+                if let [one] = argv {
+                    if let Some(fmt) = date_format_lit(one) {
+                        if let Some(layout) = date_layout(&fmt) {
+                            self.flush_sides();
+                            self.emit(&format!(
+                                "fmt.Println(time.Now().Format({}));",
+                                Self::go_str(&layout)
+                            ));
+                            if self.need_st {
+                                self.emit("st = 0;");
+                            }
+                            return true;
+                        }
+                    }
+                }
+                false
             }
             "let" => {
                 for a in argv {
@@ -5128,7 +7367,17 @@ impl Render {
                             self.emit(&format!("os.Setenv({}, {v});", Self::go_str(name)));
                         } else if self.declared(arg) {
                             let m = self.ident_of(arg);
-                            self.emit(&format!("os.Setenv({}, s2s({m}));", Self::go_str(arg)));
+                            // Convert by hoisted type, exactly as `env_lit_for`
+                            // does: only an `any` var needs the boxing
+                            // coercion.
+                            let v = if self.declared_go_string(arg) {
+                                m
+                            } else if self.declared_go_int(arg) {
+                                format!("strconv.FormatInt({m}, 10)")
+                            } else {
+                                format!("s2s({m})")
+                            };
+                            self.emit(&format!("os.Setenv({}, {v});", Self::go_str(arg)));
                         }
                     }
                 }
@@ -5190,6 +7439,44 @@ impl Render {
                 }
                 true
             }
+            "false" => {
+                self.flush_sides();
+                self.emit("st = 1;");
+                self.need_st = true;
+                true
+            }
+            "test" => {
+                // `test …` — the same `test_render` the `[ ]` conditions
+                // use, so `test -f "$f"` is a native file check instead of
+                // a `/usr/bin/test` child (AGENTS.md §2). The argv joins
+                // exactly like the shell-text reconstruction (literals
+                // single-quoted), so operands with spaces stay one word.
+                // REFUSE > GUESS: anything `test_render` cannot parse keeps
+                // the exec (and a user-defined `test` function still wins —
+                // `false` below routes there).
+                if argv.is_empty() {
+                    // `test` with no args is false (status 1).
+                    self.flush_sides();
+                    self.emit("st = 1;");
+                    self.need_st = true;
+                    return true;
+                }
+                let todo = self.todo;
+                let sides = self.sides.len();
+                let tmp = self.tmp;
+                if let Some(c) = self.test_argv_bool(argv) {
+                    if self.todo == todo {
+                        self.flush_sides();
+                        self.emit(&format!("st = b2i(!({c}));"));
+                        self.need_st = true;
+                        return true;
+                    }
+                }
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                false
+            }
             "set" | "umask" | "trap" | "wait" | "return" => true,
             "eval" => {
                 // eval 'code' — run the code in a bash -c child (native
@@ -5233,6 +7520,21 @@ impl Render {
                 }
             }
             "command" | "type" => {
+                // `command -v NAME` prints the resolved path (`exec.LookPath`
+                // reports the same found/missing) — no `bash -c` child.
+                if cmd == "command" {
+                    if let Some(name_expr) = Self::command_v_name(argv) {
+                        let name = self.expr_str(name_expr);
+                        self.flush_sides();
+                        let id = self.new_tmp();
+                        self.emit(&format!(
+                            "if __cl{id}, __cle{id} := exec.LookPath({name}); __cle{id} == nil {{ \
+                             fmt.Println(__cl{id}); st = 0 }} else {{ st = 1 }};"
+                        ));
+                        self.need_st = true;
+                        return true;
+                    }
+                }
                 // `command cmd …` / `type cmd` — run via bash -c so
                 // builtin resolution and stdout match bash.
                 let mut parts = vec![cmd.to_string()];
@@ -5992,6 +8294,9 @@ impl Render {
         text.push("import (".to_string());
         for i in [
             "\"bufio\"",
+            "\"crypto/sha256\"",
+            "\"crypto/sha512\"",
+            "\"encoding/hex\"",
             "\"fmt\"",
             "\"io\"",
             "\"os\"",
@@ -6001,6 +8306,7 @@ impl Render {
             "\"strconv\"",
             "\"strings\"",
             "\"syscall\"",
+            "\"time\"",
             "\"unicode/utf8\"",
         ] {
             text.push(format!("    {i}"));
@@ -6027,9 +8333,10 @@ impl Render {
         }
         // Trim the import list to what the kept text references.
         let all = [
-            "\"bufio\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
+            "\"bufio\"", "\"crypto/sha256\"", "\"crypto/sha512\"",
+            "\"encoding/hex\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
             "\"path/filepath\"", "\"regexp\"", "\"strconv\"", "\"strings\"",
-            "\"syscall\"", "\"unicode/utf8\"",
+            "\"syscall\"", "\"time\"", "\"unicode/utf8\"",
         ];
         let full = text.join("\n");
         let keep_paths: Vec<String> = all
@@ -6874,6 +9181,112 @@ fn quote_sh(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// A mktemp template → (dir, Go pattern), mapping the trailing `XXX…` run
+/// to Go's `*`. `None` refuses: no trailing run of 3+ `X`s, `X`s anywhere
+/// else (both parts — Go would randomize what mktemp keeps literal), or an
+/// empty file part.
+fn mktemp_pattern(t: &str) -> Option<(String, String)> {
+    if t.is_empty() || t.ends_with('/') {
+        return None;
+    }
+    let (mut dir, file) = match t.rfind('/') {
+        Some(i) => (t[..i].to_string(), &t[i + 1..]),
+        // No directory part: mktemp creates in the CWD, so Go must too
+        // (`""` would mean the temp dir instead).
+        None => (".".to_string(), t),
+    };
+    // A root-level template (`/x.XXXXXX`): the directory is `/`, not the
+    // temp dir.
+    if dir.is_empty() && t.starts_with('/') {
+        dir = "/".to_string();
+    }
+    if file.is_empty() || dir.contains('X') {
+        return None;
+    }
+    let run = file.len() - file.trim_end_matches('X').len();
+    let stem = &file[..file.len() - run];
+    if run < 3 || stem.contains('X') {
+        return None;
+    }
+    Some((dir, format!("{stem}*")))
+}
+
+/// A `date` format operand as literal text: a plain string, or an
+/// interpolation of nothing but literals. Anything dynamic refuses (the
+/// layout mapping needs the verbs statically).
+fn date_format_lit(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A `date +fmt` format → Go layout, mapping the unambiguous numeric
+/// verbs (`%Y` year, `%m` month, `%d` day, `%H` hour, `%M` minute, `%S`
+/// second; `%%` a literal percent). `None` refuses everything else —
+/// locale names (`%A`, `%b`), week/year numbers (`%U`, `%V`, `%j`),
+/// timezone (`%Z`, `%z`), epoch (`%s`) and any other verb.
+fn date_layout(fmt: &str) -> Option<String> {
+    let body = fmt.strip_prefix('+')?;
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'Y' => out.push_str("2006"),
+            'm' => out.push_str("01"),
+            'd' => out.push_str("02"),
+            'H' => out.push_str("15"),
+            'M' => out.push_str("04"),
+            'S' => out.push_str("05"),
+            '%' => out.push('%'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// True when `t` is exactly one simple shell reference — `$v`, `${v}`,
+/// `$1`, `$?`, `$#`, `$$`, `$@`, `$*` — the operand shapes `test_operand`
+/// resolves faithfully. Anything composed (`$v/suffix`, `pre$v`, `$(…)`)
+/// is `false`: re-parsing it as an operand would misread the name.
+fn is_simple_test_ref(t: &str) -> bool {
+    let inner = match t.strip_prefix('$') {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if inner.is_empty() {
+        return false;
+    }
+    if let Some(braced) = inner.strip_prefix('{') {
+        let Some(name) = braced.strip_suffix('}') else {
+            return false;
+        };
+        return !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    }
+    inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || matches!(inner, "?" | "#" | "$" | "@" | "*")
+}
+
 /// Double-quote a shell word, preserving `${...}`, `$name`, `$((…))` and
 /// `$(...)` for bash expansion inside a `bash -c` fallback.
 fn quote_sh_dq(s: &str) -> String {
@@ -7090,6 +9503,9 @@ enum NativeRedir {
         read: bool,
         append: bool,
     },
+    /// `<<< word` / `<<EOF … EOF` — stdin fed from a string. The Go
+    /// expression evaluates the word exactly once, like the shell.
+    StdinStr(String),
     /// `2>&1` — stderr duplicated from the already-attached stdout.
     DupStdoutToStderr,
 }
@@ -7114,6 +9530,148 @@ fn redirect_op_frag(fd: &str, mode: &str, word: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("{fd}{op}{word}"))
+}
+
+/// True when a `{fd, mode, target}` redirect object is exactly
+/// `2>/dev/null` (or `2>>/dev/null`): discarding stderr, which is what the
+/// native `runPipe`/`capPipe`/`runCmd`/`capCmd` helpers do with every child
+/// anyway — so the redirect is a no-op under them and unwraps (see
+/// `body_single_exec_opt`). Anything else (stdout/file/stdin redirects,
+/// fd-dups, a missing fd which defaults to stdout) is `false` and keeps the
+/// `bash -c` fallback. The target must be the literal `/dev/null`: a
+/// dynamic word could name any file.
+fn null_stderr_obj(r: &crate::ir::IrExpr) -> bool {
+    let crate::ir::IrExpr::Object(props) = r else {
+        return false;
+    };
+    let (mut fd_ok, mut mode_ok, mut target_ok) = (false, false, false);
+    for (k, v) in props {
+        match k.as_str() {
+            "fd" => {
+                if let crate::ir::IrExpr::Int(2) = v {
+                    fd_ok = true;
+                }
+            }
+            "mode" => {
+                if let crate::ir::IrExpr::Str(s, _) = v {
+                    if s == "w" || s == "a" {
+                        mode_ok = true;
+                    }
+                }
+            }
+            "target" => {
+                if let crate::ir::IrExpr::Str(s, _) = v {
+                    if s == "/dev/null" {
+                        target_ok = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fd_ok && mode_ok && target_ok
+}
+
+/// [`null_stderr_obj`] for the core's `IrRedirect` statement spec.
+fn null_stderr_spec(r: &crate::ir::IrRedirect) -> bool {
+    if r.fd != Some(2) {
+        return false;
+    }
+    if r.mode != "w" && r.mode != "a" {
+        return false;
+    }
+    matches!(&r.target, crate::ir::IrExpr::Str(s, _) if s == "/dev/null")
+}
+
+/// True when a RESOLVED redirect discards without wiring: exactly
+/// `2>/dev/null` (or `2>>/dev/null`). A middle pipeline stage carrying only
+/// these keeps the native chain (the helpers discard every stage's stderr
+/// anyway); anything else placed mid-chain refuses.
+fn is_discard_redir(nr: &NativeRedir) -> bool {
+    matches!(
+        nr,
+        NativeRedir::File {
+            fd: 2,
+            path,
+            read: false,
+            ..
+        } if path == "/dev/null"
+    )
+}
+
+/// The `exec` Call-args shape for a lone command statement: the `exec`
+/// call's own args, or the synthesized equivalent for the core's bare
+/// `Exec` node. Unwraps one `2>/dev/null`-only redirect layer (see
+/// `body_single_exec_opt`). `None` for anything else.
+fn lone_exec_args(body: &[crate::ir::IrStmt]) -> Option<Vec<crate::ir::IrExpr>> {
+    let [s] = body else {
+        return None;
+    };
+    lone_exec_stmt(s)
+}
+
+/// The `exec` Call-args shape for a lone command STATEMENT (see
+/// `lone_exec_args`).
+fn lone_exec_stmt(s: &crate::ir::IrStmt) -> Option<Vec<crate::ir::IrExpr>> {
+    match s {
+        crate::ir::IrStmt::Expr(crate::ir::IrExpr::Call { func, args })
+            if func == "exec" || func == "builtin" =>
+        {
+            match args.first() {
+                // A plain command call: the command word plus argv.
+                Some(crate::ir::IrExpr::Str(..)) | Some(crate::ir::IrExpr::Ident(..)) => {
+                    Some(args.clone())
+                }
+                // The frontend's redirect spelling: a `builtin` call of an
+                // Arrow body with a redirect list (`( cmd ) 2>/dev/null`
+                // as a stage arrives as `builtin(Arrow[cmd],
+                // [2>/dev/null])`). Same no-op unwrap as the `redirect`
+                // form below — but only when every redirect is a stderr
+                // discard; anything else keeps the `bash -c` fallback.
+                Some(crate::ir::IrExpr::Arrow(inner)) if func == "builtin" => {
+                    let Some(crate::ir::IrExpr::Array(redirs)) = args.get(1) else {
+                        return None;
+                    };
+                    if !redirs.iter().all(null_stderr_obj) {
+                        return None;
+                    }
+                    lone_exec_args(inner)
+                }
+                _ => None,
+            }
+        }
+        crate::ir::IrStmt::Exec {
+            cmd,
+            args,
+            capture: None,
+            redirects,
+            env,
+        } if redirects.is_empty() && env.is_empty() => {
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(cmd.clone());
+            call_args.push(crate::ir::IrExpr::Array(args.clone()));
+            Some(call_args)
+        }
+        crate::ir::IrStmt::Redirect { inner, redirects }
+            if redirects.iter().all(null_stderr_spec) =>
+        {
+            lone_exec_args(inner)
+        }
+        crate::ir::IrStmt::Expr(crate::ir::IrExpr::Call { func, args })
+            if func == "redirect" =>
+        {
+            let (Some(crate::ir::IrExpr::Arrow(inner)), Some(crate::ir::IrExpr::Array(redirs))) =
+                (args.first(), args.get(1))
+            else {
+                return None;
+            };
+            if !redirs.iter().all(null_stderr_obj) {
+                return None;
+            }
+            lone_exec_args(inner)
+        }
+        _ => None,
+    }
 }
 
 /// Redirect stmt → shell text (`2>/dev/null`, `<file`, `>>file`).
