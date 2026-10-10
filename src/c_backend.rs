@@ -15845,9 +15845,29 @@ fn param_copy_alias(
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
                 Err(_) => {
+                    let t = s.trim();
+                    // A HEX LITERAL IS A NUMBER, and the fallback below is
+                    // `atoll`, which stops at the `x` and yields 0 — so
+                    // `fb_clear 0xFF204060` cleared to 0 (transparent black)
+                    // and every `fb_clear 0xFF000000` in MIMEcroft_fb.sh
+                    // silently emitted `atoll("0xFF000000")`. It looked
+                    // identical (opaque black vs black under a blit that
+                    // ignores alpha), which is why it survived. Parse it as
+                    // the integer it is written as.
+                    if let Some(hex) = t
+                        .strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+                    {
+                        if let Ok(n) = i64::from_str_radix(hex, 16) {
+                            return n.to_string();
+                        }
+                        // Wider than i64 (e.g. a 0xffffffffffffffff mask):
+                        // emit the C constant and let the C type carry it.
+                        return format!("0x{hex}");
+                    }
                     // `$i` / `${i}` slice-index text: resolve the live
                     // value (a literal atoll("$i") is always 0)
-                    let t = s.trim();
                     let name = t.strip_prefix('$').map(|r| r.trim_matches('{').trim_matches('}'));
                     if let Some(name) = name {
                         if is_ident(name)
@@ -40469,6 +40489,31 @@ mod tests {
         assert!(rc_may_be_nonzero("_sh_rc = (rc == -1) ? 127 : 1;"));
         assert!(rc_may_be_nonzero("_sh_rc = (_r == 0 ? 0 : 1);"));
         assert!(!rc_may_be_nonzero("/* nothing here */"));
+    }
+
+    #[test]
+    fn fb_clear_hex_literal_lowers_as_a_number() {
+        // `fb_clear 0xFF204060` is a PACKED ARGB COLOUR, and the int
+        // coercion used to fall through to `(int)atoll("0xFF204060")` —
+        // atoll stops at the `x` and yields 0, so the surface cleared to
+        // transparent black. EVERY `fb_clear 0xFF000000` in
+        // MIMEcroft_fb.sh was affected; it looked identical (black either
+        // way under a blit that ignores alpha), which is how it survived.
+        let c = shir_to_c(&prog_of(vec![builtin(
+            "fb_clear",
+            vec![IrExpr::Str(
+                "0xFF204060".to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        )]));
+        assert!(
+            !c.contains("atoll(\"0xFF"),
+            "a hex colour must not reach atoll (it returns 0):\n{c}"
+        );
+        assert!(
+            c.contains("4280303712"),
+            "0xFF204060 must lower to its numeric value:\n{c}"
+        );
     }
 
     #[test]
