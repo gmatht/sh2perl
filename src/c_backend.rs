@@ -6605,6 +6605,15 @@ fn self_append_segs(var: &str, expr: &IrExpr) -> Option<IrExpr> {
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == var)
             }
+            // The frontend's plain-read shape: `$v`/`${v}` lower to
+            // `param("", v)` (2-arg; every other op carries extras, so
+            // exactly-2-args with an empty op IS the bare read). Without
+            // this every real self-append missed the fast path (only
+            // hand-built `Var` shapes matched) — the game's per-cell
+            // payload appends paid snprintf+xstrdup+free each.
+            IrExpr::Call { func, args } if func == "param" => {
+                matches!(args.as_slice(), [IrExpr::Str(op, _), IrExpr::Str(n, _)] if op.is_empty() && n == var)
+            }
             _ => false,
         }
     }
@@ -6622,7 +6631,12 @@ fn self_append_segs(var: &str, expr: &IrExpr) -> Option<IrExpr> {
             | IrExpr::Ident(..)
             | IrExpr::Arith(..) => true,
             IrExpr::Call { func, args } => {
-                func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(..)])
+                (func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(..)]))
+                    // tail-placed plain reads lower the same way
+                    // (`param("", v)`); anything with an op or extras
+                    // refuses below via the arg-shape match.
+                    || (func == "param"
+                        && matches!(args.as_slice(), [IrExpr::Str(op, _), IrExpr::Str(..)] if op.is_empty()))
             }
             IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
                 InterpPart::Lit(_) => true,
