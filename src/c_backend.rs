@@ -23212,6 +23212,17 @@ fn param_copy_alias(
                     self.num_temp(&self.c_ident(name))
                 } else if self.store.contains(name) {
                     self.store_ref(name)
+                } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    // positional $N in a `[ ]` operand (`[ "$1" = x ]`):
+                    // the greedy scan above would otherwise shadow the
+                    // specials arm below and read getenv("1") (always
+                    // empty) — the game's --demo flag never arrived.
+                    // Same argv shape that arm uses.
+                    self.need_sh = true;
+                    format!(
+                        "(({0} < _sh_argc && _sh_argv[{0}]) ? _sh_argv[{0}] : \"\")",
+                        name
+                    )
                 } else {
                     format!(
                         "_sh_env({})",
