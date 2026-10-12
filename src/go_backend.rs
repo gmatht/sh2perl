@@ -11026,7 +11026,7 @@ const RUNTIME_HELPERS: &[&str] = &[
     "        if cmds[i].Process != nil { cmds[i].Process.Kill() }",
     "        cmds[i].Wait()",
     "    }",
-    "    return 0",
+    "    return buf.String()",
     "}",
     "",
     "// capture a func's stdout (compound pipeline heads run in-process;",
