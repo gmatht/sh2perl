@@ -987,6 +987,11 @@ impl Render {
     /// external exec; `bash -c` reconstruction otherwise.
     fn capture_expr(&mut self, expr: &IrExpr, native: bool) -> String {
         if let IrExpr::Arrow(body) = expr {
+            // bare user-function call first (body_single_exec would
+            // route it to an external exec that cannot exist)
+            if let Some(v) = self.capture_fncall(body) {
+                return v;
+            }
             if let Some((cmd, argv)) = self.body_single_exec(body) {
                 let mut parts = vec![cmd];
                 parts.extend(argv);
@@ -995,12 +1000,209 @@ impl Render {
                 }
                 return format!("capCmd({})", exec_cmd_apply(&parts));
             }
+            // `$(echo …)` / `$(printf …)` lower natively (no child bash)
+            if let Some(s) = self.capture_builtin(body) {
+                return s;
+            }
+            // `$((…))` arithmetic lowers natively (no child bash)
+            if let Some(v) = self.capture_arith(body) {
+                return v;
+            }
+            // `$(a | b | c)` of plain external execs (plus a leading
+            // echo/printf as input) runs natively via capPipeIn
+            if let Some((input, stages)) = self.capture_pipeline(body) {
+                let parts: Vec<String> =
+                    stages.iter().map(|st| argv_slice(st)).collect();
+                let stages_go = format!("[][]string{{{}}}", parts.join(", "));
+                if native {
+                    return format!("capPipeInRaw({input}, {stages_go})");
+                }
+                return format!("capPipeIn({input}, {stages_go})");
+            }
             if let Some(text) = self.cmd_text_stmts(body) {
                 let env = self.env_lit();
                 return format!("capRun({}, {env})", Self::go_str(&text));
             }
         }
         self.sh2_stub("capture")
+    }
+
+    /// Capture of a pipeline of plain external execs (`$(grep … | wc …)`)
+    /// natively (no child bash). A leading echo/printf stage evaluates to
+    /// the pipe input instead of forking. Returns (input, stages).
+    fn capture_pipeline(&mut self, body: &[IrStmt]) -> Option<(String, Vec<Vec<String>>)> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            return None;
+        };
+        if func != "pipeline" {
+            return None;
+        }
+        let Some(IrExpr::Array(items)) = args.first() else {
+            return None;
+        };
+        let mut stages: Vec<Vec<String>> = Vec::new();
+        let mut input = String::from("\"\"");
+        for (idx, it) in items.iter().enumerate() {
+            let IrExpr::Arrow(stage) = it else {
+                return None;
+            };
+            // leading echo/printf becomes the pipe input
+            if idx == 0 {
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = stage.as_slice() {
+                    if func == "exec" || func == "builtin" {
+                        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            let argv: &[IrExpr] = match args.get(1) {
+                                Some(IrExpr::Array(it)) => it,
+                                _ => &[],
+                            };
+                            if cmd == "echo" {
+                                if let Some((s, nl)) = self.echo_capture_full(argv) {
+                                    input = if nl {
+                                        format!("{s} + \"\\n\"")
+                                    } else {
+                                        s
+                                    };
+                                    continue;
+                                }
+                            } else if cmd == "printf" {
+                                if let Some(s) = self.printf_capture(argv) {
+                                    input = s;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((cmd, argv)) = self.body_single_exec(stage) else {
+                return None;
+            };
+            let mut st = vec![cmd];
+            st.extend(argv);
+            stages.push(st);
+        }
+        if stages.is_empty() {
+            return None;
+        }
+        Some((input, stages))
+    }
+
+    /// Capture of arithmetic (`$((n % 2))`) natively (no child bash).
+    fn capture_arith(&mut self, body: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(e)] = body else {
+            return None;
+        };
+        match e {
+            IrExpr::Arith(a) => Some(self.arith(a)),
+            IrExpr::Call { func, args }
+                if func == "arith" || func == "arithEval" || func == "let" =>
+            {
+                let s = match args.first() {
+                    Some(IrExpr::Str(s, _)) => s.clone(),
+                    _ => return None,
+                };
+                let (sides, v) = self.arith_str(&s)?;
+                for sd in sides {
+                    self.sides.push(sd);
+                }
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// Capture of a bare user-function call (`x=$(greet a)`) — the
+    /// closure's stdout through a pipe (statement sides + value
+    /// expression). Temps are unique per site (nested captures would
+    /// collide on fixed names).
+    fn capture_fncall(&mut self, body: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let Some(IrExpr::Str(nm, _)) = args.first() else {
+            return None;
+        };
+        if !self.functions.contains(nm) {
+            return None;
+        }
+        let m = self.go_ident(nm);
+        self.mark_read(nm);
+        self.need_fargs = true;
+        let vals: Vec<String> = args
+            .get(1)
+            .and_then(|a| match a {
+                IrExpr::Array(elems) => {
+                    Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let t = self.new_tmp();
+        let (o, r, w, b) = (
+            format!("__fo{t}"),
+            format!("__fr{t}"),
+            format!("__fw{t}"),
+            format!("__fb{t}"),
+        );
+        self.sides.push(format!(
+            "{o} := os.Stdout; {r}, {w}, _ := os.Pipe(); os.Stdout = {w}"
+        ));
+        self.sides.push(format!(
+            "fArgs = []string{{{}}}; {m}(); fArgs = nil;",
+            vals.join(", ")
+        ));
+        self.sides.push(format!(
+            "{w}.Close(); {b}, _ := io.ReadAll({r}); os.Stdout = {o}"
+        ));
+        Some(format!("s2s(string({b}))"))
+    }
+
+    /// `$(echo …)` / `$(printf …)` captures natively (no child bash).
+    /// Refusals (glob args, bad substitutions, unlowerable argv) return
+    /// None — the caller falls back to the bash child.
+    fn capture_builtin(&mut self, body: &[IrStmt]) -> Option<String> {        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let Some(IrExpr::Str(cmd, _)) = args.first() else {
+            return None;
+        };
+        let items: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(it)) => it,
+            _ => &[],
+        };
+        match cmd.as_str() {
+            "echo" => self.echo_capture(items),
+            "printf" => self.printf_capture(items),
+            _ => None,
+        }
+    }
+
+    /// `$(printf fmt args…)` natively via the bprintfStr runtime.
+    fn printf_capture(&mut self, items: &[IrExpr]) -> Option<String> {
+        if items.iter().any(bad_subst) {
+            return None;
+        }
+        let fmt_expr = items.first()?;
+        for it in items {
+            if let IrExpr::Str(s, _) = it {
+                if has_glob(s) {
+                    return None;
+                }
+            }
+        }
+        let fmt = self.printf_fmt(fmt_expr);
+        let args: Vec<String> = items[1..].iter().map(|a| self.expr_str(a)).collect();
+        Some(if args.is_empty() {
+            format!("bprintfStr({fmt})")
+        } else {
+            format!("bprintfStr({fmt}, {})", args.join(", "))
+        })
     }
 
     /// If the body is exactly one external `exec` call, return its
@@ -1828,6 +2030,27 @@ impl Render {
 
     /// An exec Call as an expression — runs the command, value = status.
     fn exec_expr(&mut self, args: &[IrExpr]) -> String {
+        // user-function call in value position (`if is_prime $n`): run
+        // the closure for side effects, value = its status. A direct
+        // external exec would fail lookup (and spin `while` loops).
+        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+            if self.functions.contains(cmd) {
+                let vals: Vec<String> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => {
+                        items.iter().map(|i| self.expr_str(i)).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let m = self.go_ident(cmd);
+                self.mark_read(cmd);
+                self.need_fargs = true;
+                self.sides.push(format!("fArgs = []string{{{}}};", vals.join(", ")));
+                self.sides.push(format!("{m}();"));
+                self.sides.push("fArgs = nil;".to_string());
+                self.need_st = true;
+                return "st".to_string();
+            }
+        }
         if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
             let mut parts = vec![cmd];
             parts.extend(argv);
@@ -2342,10 +2565,26 @@ impl Render {
                 return "s2s(string(__b))".to_string();
             }
         }
+        if let Some(v) = self.capture_fncall(body) {
+            return v;
+        }
         if let Some((cmd, argv)) = self.body_single_exec(body) {
             let mut parts = vec![cmd];
             parts.extend(argv);
             return format!("capCmd({})", exec_cmd_apply(&parts));
+        }
+        // `$(echo …)` / `$(a | b)` lower natively (no child bash)
+        if let Some(s) = self.capture_builtin(body) {
+            return s;
+        }
+        if let Some((input, stages)) = self.capture_pipeline(body) {
+            let parts: Vec<String> =
+                stages.iter().map(|st| argv_slice(st)).collect();
+            let stages_go = format!("[][]string{{{}}}", parts.join(", "));
+            return format!("capPipeIn({input}, {stages_go})");
+        }
+        if let Some(v) = self.capture_arith(body) {
+            return v;
         }
         if let Some(text) = self.cmd_text_stmts(body) {
             let env = self.env_lit();
@@ -3466,6 +3705,21 @@ impl Render {
         });
         let quoted = t.starts_with('"') || t.starts_with('\'');
         let inner = t.trim_matches('"').trim_matches('\'');
+        // `$((…))` arithmetic operand — native (no child bash). Must
+        // precede the `$(` arm below (arithmetic also starts with `$(`).
+        if let Some(rest) = inner.strip_prefix("$((") {
+            if let Some(close) = rest.rfind("))") {
+                let arith = rest[..close].to_string();
+                if let Some((sides, v)) = self.arith_str(&arith) {
+                    for sd in sides {
+                        self.sides.push(sd);
+                    }
+                    return Some((v, true));
+                }
+            }
+            // unparseable: fall through to the command-substitution arm
+            // (bash also errors there — same observable behavior)
+        }
         if let Some(rest) = inner.strip_prefix("$(") {
             if let Some(close) = rest.rfind(')') {
                 let cmd = rest[..close].to_string();
@@ -5485,26 +5739,7 @@ impl Render {
 
     /// `echo [-n|-e|-E] args…` statement.
     fn echo_stmt(&mut self, argv: &[IrExpr]) {
-        let mut newline = true;
-        let mut escape = false;
-        let mut items = argv;
-        while let Some(IrExpr::Str(f, _)) = items.first() {
-            if f == "-n" {
-                newline = false;
-                items = &items[1..];
-            } else if f == "-e" {
-                escape = true;
-                items = &items[1..];
-            } else if f == "-E" {
-                items = &items[1..];
-            } else if f == "-en" || f == "-ne" {
-                newline = false;
-                escape = true;
-                items = &items[1..];
-            } else {
-                break;
-            }
-        }
+        let (newline, escape, items) = self.echo_flags(argv);
         let parts = match self.argv_parts(items) {
             Some(p) => p,
             None => {
@@ -5522,6 +5757,12 @@ impl Render {
             self.need_st = true;
             return;
         }
+        // `echo -e` stops at an unescaped `\c` (no trailing newline)
+        let (parts, stopped) = if escape {
+            trunc_c(parts)
+        } else {
+            (parts, false)
+        };
         let parts = if escape {
             parts
                 .into_iter()
@@ -5533,7 +5774,7 @@ impl Render {
         } else {
             parts
         };
-        let call = self.print_from_parts(parts, newline);
+        let call = self.print_from_parts(parts, newline && !stopped);
         self.flush_sides();
         self.emit(&format!("{call};"));
         if self.need_st {
@@ -6286,8 +6527,8 @@ impl Render {
         }
     }
 
-    /// Parts → one fmt.Println(fmt.Sprintf(...)) / fmt.Print(...) string.
-    fn print_from_parts(&mut self, parts: Vec<Part>, newline: bool) -> String {
+    /// Parts → the joined output string expression (no Println wrapper).
+    fn print_inner(&mut self, parts: Vec<Part>) -> String {
         let mut fmt = String::new();
         let mut raw = String::new();
         let mut args: Vec<String> = Vec::new();
@@ -6305,16 +6546,84 @@ impl Render {
                 }
             }
         }
-        let inner = if args.is_empty() {
+        if args.is_empty() {
             Self::go_str(&raw)
         } else {
             format!("fmt.Sprintf({}, {})", Self::go_str(&fmt), args.join(", "))
-        };
+        }
+    }
+
+    /// Parts → one fmt.Println(fmt.Sprintf(...)) / fmt.Print(...) string.
+    fn print_from_parts(&mut self, parts: Vec<Part>, newline: bool) -> String {
+        let inner = self.print_inner(parts);
         if newline {
             format!("fmt.Println({inner})")
         } else {
             format!("fmt.Print({inner})")
         }
+    }
+
+    /// `echo` flags → (newline, escape, remaining items).
+    fn echo_flags<'a>(&self, argv: &'a [IrExpr]) -> (bool, bool, &'a [IrExpr]) {
+        let mut newline = true;
+        let mut escape = false;
+        let mut items = argv;
+        while let Some(IrExpr::Str(f, _)) = items.first() {
+            if f == "-n" {
+                newline = false;
+                items = &items[1..];
+            } else if f == "-e" {
+                escape = true;
+                items = &items[1..];
+            } else if f == "-E" {
+                items = &items[1..];
+            } else if f == "-en" || f == "-ne" {
+                newline = false;
+                escape = true;
+                items = &items[1..];
+            } else {
+                break;
+            }
+        }
+        (newline, escape, items)
+    }
+
+    /// `$(echo …)` capture → the joined string natively (captures strip
+    /// trailing newlines, so `-n` needs no special handling). Refuses
+    /// glob args, bad substitutions, and unlowerable argv (None falls
+    /// back to the bash child).
+    fn echo_capture(&mut self, items: &[IrExpr]) -> Option<String> {
+        let (s, _) = self.echo_capture_full(items)?;
+        Some(s)
+    }
+
+    /// echo value + whether it ends with a newline (pipe input keeps it).
+    fn echo_capture_full(&mut self, items: &[IrExpr]) -> Option<(String, bool)> {
+        let (newline, escape, items) = self.echo_flags(items);
+        for it in items {
+            if let IrExpr::Str(s, _) = it {
+                if has_glob(s) {
+                    return None;
+                }
+            }
+        }
+        if items.iter().any(bad_subst) {
+            return None;
+        }
+        let mut parts = self.argv_parts(items)?;
+        let mut stopped = false;
+        if escape {
+            let (kept, st) = trunc_c(parts);
+            stopped = st;
+            parts = kept
+                .into_iter()
+                .map(|p| match p {
+                    Part::Lit(t) => Part::Arg(format!("eEsc({})", Self::go_str(&t))),
+                    other => other,
+                })
+                .collect();
+        }
+        Some((self.print_inner(parts), newline && !stopped))
     }
 
     // ── program ──────────────────────────────────────────────────────
@@ -6586,6 +6895,7 @@ impl Render {
         text.push("import (".to_string());
         for i in [
             "\"bufio\"",
+            "\"bytes\"",
             "\"fmt\"",
             "\"io\"",
             "\"os\"",
@@ -6623,7 +6933,7 @@ impl Render {
         }
         // Trim the import list to what the kept text references.
         let all = [
-            "\"bufio\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
+            "\"bufio\"", "\"bytes\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
             "\"path/filepath\"", "\"regexp\"", "\"sort\"", "\"strconv\"", "\"strings\"",
             "\"sync\"", "\"syscall\"", "\"unicode/utf8\"",
         ];
@@ -7519,6 +7829,45 @@ fn bad_subst(e: &IrExpr) -> bool {
         IrExpr::BinOp { lhs, rhs, .. } => bad_subst(lhs) || bad_subst(rhs),
         _ => false,
     }
+}
+
+/// Position of an unescaped `\c` in an echo -e literal (None if absent
+/// or escaped as `\\c`). bash stops output at `\c` with no newline.
+fn unescaped_c(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'\\' {
+            if b[i + 1] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'c' {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split echo -e parts at an unescaped `\c` (output stops there, no
+/// trailing newline). Returns (kept parts, stopped).
+fn trunc_c(parts: Vec<Part>) -> (Vec<Part>, bool) {
+    let mut out = Vec::new();
+    for p in parts {
+        match p {
+            Part::Lit(t) => {
+                if let Some(idx) = unescaped_c(&t) {
+                    out.push(Part::Lit(t[..idx].to_string()));
+                    return (out, true);
+                }
+                out.push(Part::Lit(t));
+            }
+            other => out.push(other),
+        }
+    }
+    (out, false)
 }
 
 /// Shell-safe bareword for `typeset -f` display (bash pretty-prints
@@ -8911,6 +9260,21 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return a[s:e]",
     "}",
     "",
+    "// `${a[@]:off[:len]}` element slice with bash negative rules (a",
+    "// negative length counts the end from the array end, not the start).",
+    "func arrSliceN(a []any, st, ln int64, hasLen bool) []any {",
+    "    if st < 0 { st += int64(len(a)) }",
+    "    var en int64",
+    "    if !hasLen {",
+    "        en = int64(len(a))",
+    "    } else if ln < 0 {",
+    "        en = int64(len(a)) + ln",
+    "    } else {",
+    "        en = st + ln",
+    "    }",
+    "    return arrSlice(a, st, en)",
+    "}",
+    "",
     "var fArgs []string",
     "",
     "var __wg sync.WaitGroup",
@@ -8997,6 +9361,43 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    }",
     "    for i := 0; i < len(cmds)-1; i++ { cmds[i].Wait() }",
     "    return 0",
+    "}",
+    "",
+    "// capture the stdout of a pipeline (`$(a | b | c)`), optionally fed an",
+    "// input string (a leading `echo` stage evaluates to input instead of",
+    "// forking echo). Stdout is kept even on nonzero exit, like captures.",
+    "func capPipeIn(input string, stages [][]string) string {",
+    "    return strings.TrimRight(capPipeInRaw(input, stages), \"\\n\")",
+    "}",
+    "",
+    "func capPipeInRaw(input string, stages [][]string) string {",
+    "    var cmds []*exec.Cmd",
+    "    for _, st := range stages {",
+    "        if len(st) == 0 { continue }",
+    "        c := exec.Command(st[0], st[1:]...)",
+    "        c.Stderr = io.Discard",
+    "        cmds = append(cmds, c)",
+    "    }",
+    "    if len(cmds) == 0 { return \"\" }",
+    "    for i := 0; i < len(cmds)-1; i++ {",
+    "        p, err := cmds[i].StdoutPipe()",
+    "        if err != nil { return \"\" }",
+    "        cmds[i+1].Stdin = p",
+    "    }",
+    "    if input != \"\" {",
+    "        cmds[0].Stdin = strings.NewReader(input)",
+    "    }",
+    "    var buf bytes.Buffer",
+    "    cmds[len(cmds)-1].Stdout = &buf",
+    "    for i, c := range cmds {",
+    "        if i < len(cmds)-1 {",
+    "            if err := c.Start(); err != nil { return \"\" }",
+    "        } else if err := c.Run(); err != nil {",
+    "            break",
+    "        }",
+    "    }",
+    "    for i := 0; i < len(cmds)-1; i++ { cmds[i].Wait() }",
+    "    return buf.String()",
     "}",
     "",
     "// `mapfile -t arr < path` contents (each line an element; empty input",
@@ -9337,21 +9738,51 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    }",
     "    if strings.HasSuffix(name, \"[@]\") {",
     "        base := name[:len(name)-3]",
-    "        // assoc home wins over an empty slice home (see pVal)",
-    "        if ak := assocVals(base); len(ak) > 0 {",
-    "            return ak",
-    "        }",
+    "        // assoc home wins over an empty slice home (see pVal);",
+    "        // both feed the same offset logic below",
     "        a, _ := pValRaw(base).([]any)",
+    "        if ak := assocVals(base); len(ak) > 0 {",
+    "            a = make([]any, len(ak))",
+    "            for i, v := range ak { a[i] = v }",
+    "        }",
     "        if op == \"slice\" && len(args) >= 1 {",
     "            st := int64(0)",
-    "            if len(args) > 0 { st, _ = strconv.ParseInt(args[0], 0, 64) }",
-    "            en := int64(len(a))",
-    "            if len(args) > 1 { en, _ = strconv.ParseInt(args[1], 0, 64) }",
-    "            a = arrSlice(a, st, st+en)",
+    "            if len(args) > 0 { st, _ = strconv.ParseInt(strings.TrimSpace(args[0]), 0, 64) }",
+    "            ln := int64(0)",
+    "            hasLen := len(args) > 1 && strings.TrimSpace(args[1]) != \"\"",
+    "            if hasLen { ln, _ = strconv.ParseInt(strings.TrimSpace(args[1]), 0, 64) }",
+    "            a = arrSliceN(a, st, ln, hasLen)",
     "        }",
     "        out := make([]string, 0, len(a))",
     "        for _, v := range a { out = append(out, s2s(v)) }",
     "        return out",
+    "    }",
+    "    // bare-name slice (`${arr:off:len}` arrives without `[@]` — the",
+    "    // frontend normalizes element slices to this form): array homes",
+    "    // slice elements, scalars fall through to the string op below",
+    "    if op == \"slice\" && len(args) >= 1 {",
+    "        if ak := assocVals(name); len(ak) > 0 {",
+    "            aa := make([]any, len(ak))",
+    "            for i, v := range ak { aa[i] = v }",
+    "            st, _ := strconv.ParseInt(strings.TrimSpace(args[0]), 0, 64)",
+    "            ln := int64(0)",
+    "            hasLen := len(args) > 1 && strings.TrimSpace(args[1]) != \"\"",
+    "            if hasLen { ln, _ = strconv.ParseInt(strings.TrimSpace(args[1]), 0, 64) }",
+    "            aa = arrSliceN(aa, st, ln, hasLen)",
+    "            out := make([]string, 0, len(aa))",
+    "            for _, v := range aa { out = append(out, s2s(v)) }",
+    "            return out",
+    "        }",
+    "        if a, ok := pValRaw(name).([]any); ok && a != nil {",
+    "            st, _ := strconv.ParseInt(strings.TrimSpace(args[0]), 0, 64)",
+    "            ln := int64(0)",
+    "            hasLen := len(args) > 1 && strings.TrimSpace(args[1]) != \"\"",
+    "            if hasLen { ln, _ = strconv.ParseInt(strings.TrimSpace(args[1]), 0, 64) }",
+    "            a = arrSliceN(a, st, ln, hasLen)",
+    "            out := make([]string, 0, len(a))",
+    "            for _, v := range a { out = append(out, s2s(v)) }",
+    "            return out",
+    "        }",
     "    }",
     "    return []string{pExp(op, name, args...)}",
     "}",
@@ -9403,15 +9834,15 @@ const RUNTIME_HELPERS: &[&str] = &[
     "        return filepath.Dir(v)",
     "    case \"slice\":",
     "        st := int64(0)",
-    "        if len(args) > 0 { st, _ = strconv.ParseInt(args[0], 0, 64) }",
+    "        if len(args) > 0 { st, _ = strconv.ParseInt(strings.TrimSpace(args[0]), 0, 64) }",
     "        if st < 0 { st = int64(runeLen(v)) + st }",
     "        if st > int64(runeLen(v)) { st = int64(runeLen(v)) }",
     "        if st < 0 { st = 0 }",
     "        rs := []rune(v)",
     "        if len(args) < 2 { return string(rs[st:]) }",
-    "        ln, _ := strconv.ParseInt(args[1], 0, 64)",
-    "        en := st + ln",
-    "        if en < 0 { en = int64(len(rs)) + en }",
+    "        ln, _ := strconv.ParseInt(strings.TrimSpace(args[1]), 0, 64)",
+    "        en := ln",
+    "        if en < 0 { en = int64(len(rs)) + en } else { en = st + en }",
     "        if en > int64(len(rs)) { en = int64(len(rs)) }",
     "        if en < st { en = st }",
     "        return string(rs[st:en])",
@@ -9506,6 +9937,25 @@ const RUNTIME_HELPERS: &[&str] = &[
     "                i++; v = v*8 + int(s[i]-'0')",
     "            }",
     "            out.WriteByte(byte(v))",
+    "        }",
+    "        case 'x': {",
+    "            v := 0",
+    "            n := 0",
+    "            for n < 2 && i+1 < len(s) {",
+    "                d := s[i+1]",
+    "                var h int",
+    "                switch {",
+    "                case d >= '0' && d <= '9': h = int(d - '0')",
+    "                case d >= 'a' && d <= 'f': h = int(d-'a') + 10",
+    "                case d >= 'A' && d <= 'F': h = int(d-'A') + 10",
+    "                default: d = 0",
+    "                }",
+    "                if d == 0 && !(s[i+1] == '0') { break }",
+    "                v = v*16 + h",
+    "                i++",
+    "                n++",
+    "            }",
+    "            if n == 0 { out.WriteByte('\\\\'); out.WriteByte('x') } else { out.WriteByte(byte(v)) }",
     "        }",
     "        default: out.WriteByte('\\\\'); out.WriteByte(s[i])",
     "        }",
