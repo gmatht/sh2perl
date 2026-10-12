@@ -2332,6 +2332,23 @@ impl Render {
             }
             return format!("runPipe([][]string{{{}}})", parts.join(", "));
         }
+        // compound head (`for …; done | sort`): capture natively
+        if let Some(IrExpr::Array(items)) = args.first() {
+            let mut bodies: Vec<Vec<IrStmt>> = Vec::new();
+            let mut ok = true;
+            for it in items {
+                if let IrExpr::Arrow(body) = it {
+                    bodies.push(body.clone());
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && self.pipeline_head(&bodies) {
+                self.need_st = true;
+                return "st".to_string();
+            }
+        }
         if let Some(IrExpr::Array(items)) = args.first() {
             let mut texts = Vec::new();
             for it in items {
@@ -5008,7 +5025,7 @@ impl Render {
                         parts.join(", ")
                     ));
                     self.need_st = true;
-                } else {
+                } else if !self.pipeline_head(stages) {
                     // bash -c fork/exec fallback (last-resort tier): a stage
                     // that isn't a single external exec (variable cmd,
                     // builtin, redirect) — reconstruct the whole pipeline
@@ -5477,6 +5494,86 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
         _ => {}
     }
 }
+    /// Compound-head pipeline (`for …; done | sort`): the head renders
+    /// natively in-process with stdout captured, fed to the remaining
+    /// external stages. Homes the head writes save/restore (pipeline
+    /// stages run in subshells in bash). Refuses escaping control flow,
+    /// empty tails, and non-external tails.
+    fn pipeline_head(&mut self, stages: &[Vec<IrStmt>]) -> bool {
+        if stages.len() < 2 {
+            return false;
+        }
+        let (head, tail) = stages.split_first().unwrap();
+        if head.is_empty() || head_escapes(head, 0) {
+            return false;
+        }
+        // tail: every stage a single external exec
+        let mut stages_go: Vec<Vec<String>> = Vec::new();
+        for st in tail {
+            if let Some((cmd, argv)) = self.body_single_exec(st) {
+                let mut s = vec![cmd];
+                s.extend(argv);
+                stages_go.push(s);
+            } else {
+                return false;
+            }
+        }
+        if stages_go.is_empty() {
+            return false;
+        }
+        // subshell save/restore for homes the head writes
+        let mut saved: Vec<String> = Vec::new();
+        {
+            let mut w = BTreeSet::new();
+            let mut a = BTreeSet::new();
+            collect_written(head, &mut w, &mut a);
+            for v in w {
+                if self.declared(&v) && !self.is_arr(&v) {
+                    saved.push(v);
+                }
+            }
+        }
+        let t = self.new_tmp();
+        for (i, v) in saved.iter().enumerate() {
+            let m = self.go_ident(v);
+            self.emit(&format!("__sv{t}_{i} := {m};"));
+        }
+        // render the head into the capture closure (two levels: the
+        // call plus the func literal)
+        let mut head_out = Vec::new();
+        std::mem::swap(&mut self.out, &mut head_out);
+        let saved_depth = self.depth;
+        self.depth += 2;
+        for s in head {
+            self.stmt(s);
+        }
+        self.depth = saved_depth;
+        std::mem::swap(&mut self.out, &mut head_out);
+        self.emit(&format!("__pc{t} := captureOutput(func() {{"));
+        self.depth = saved_depth + 1;
+        for line in head_out {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                self.out.push(String::new());
+            } else {
+                self.out
+                    .push(format!("{}{}", "    ".repeat(self.depth), trimmed));
+            }
+        }
+        self.depth = saved_depth;
+        self.emit("});");
+        self.emit(&format!(
+            "st = runPipeIn(__pc{t}, {});",
+            Self::pipe_stages_go(&stages_go)
+        ));
+        self.need_st = true;
+        for (i, v) in saved.iter().enumerate() {
+            let m = self.go_ident(v);
+            self.emit(&format!("{m} = __sv{t}_{i};"));
+        }
+        true
+    }
+
     fn stmt_assign(&mut self, targets: &[crate::ir::AssignTarget], expr: &IrExpr) {
         let Some(t) = targets.first() else {
             self.mark_todo("multi-target assign");
@@ -9264,6 +9361,10 @@ fn scan_flags_expr(e: &IrExpr, r: &mut Render) {
         }
         IrExpr::Index { key, .. } => scan_flags_expr(key, r),
         IrExpr::Capture { expr, .. } => scan_flags_expr(expr, r),
+        // Arrow bodies (pipeline/capture stages) contain full statements
+        // — without this, `for…|sort` never sets need_vars and assoc
+        // writes lose their vars-map syncs
+        IrExpr::Arrow(b) => scan_flags(b, r),
         IrExpr::Array(items) => {
             for it in items {
                 scan_flags_expr(it, r);
@@ -9811,13 +9912,10 @@ fn collect_decl_attrs_arith(
 /// `config[user]` address the same element — dynamic keys arrive
 /// unquoted already, and child-facing shell text is never normalized).
 fn normalize_assoc_key(name: &str) -> String {
+    // split_bracket strips one quote layer already — rebuild from the
+    // parts so `config["u"]`, `config['u']` and `config[u]` share a home
     if let Some((base, key)) = split_bracket(name) {
-        if key.len() >= 2
-            && ((key.starts_with('"') && key.ends_with('"'))
-                || (key.starts_with('\'') && key.ends_with('\'')))
-        {
-            return format!("{base}[{}]", &key[1..key.len() - 1]);
-        }
+        return format!("{base}[{key}]");
     }
     name.to_string()
 }
@@ -9914,6 +10012,75 @@ fn is_true_call(e: &IrExpr) -> bool {
     matches!(e, IrExpr::Call { func, args }
         if (func == "builtin" || func == "exec")
             && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "true" || c == ":"))
+}
+
+/// Control-flow that must not cross a capture-closure boundary (used
+/// for compound pipeline heads): top-level `return`/`exit`, and bare
+/// `break`/`continue` outside a loop. Breaks inside nested loops are
+/// fine (they target that loop); function bodies are scoped.
+fn head_escapes(stmts: &[IrStmt], loop_depth: usize) -> bool {
+    for s in stmts {
+        match s {
+            IrStmt::Return(_) | IrStmt::Die { .. } | IrStmt::Exit(_) => return true,
+            IrStmt::Break | IrStmt::Continue => {
+                if loop_depth == 0 {
+                    return true;
+                }
+            }
+            IrStmt::If {
+                then, elsifs, else_, ..
+            } => {
+                if head_escapes(then, loop_depth) {
+                    return true;
+                }
+                for (_, b) in elsifs {
+                    if head_escapes(b, loop_depth) {
+                        return true;
+                    }
+                }
+                if head_escapes(else_, loop_depth) {
+                    return true;
+                }
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                if head_escapes(body, loop_depth + 1) {
+                    return true;
+                }
+            }
+            IrStmt::For { body, .. } => {
+                if head_escapes(body, loop_depth + 1) {
+                    return true;
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    if head_escapes(&c.body, loop_depth) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                if head_escapes(b, loop_depth) {
+                    return true;
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    if head_escapes(st, loop_depth) {
+                        return true;
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                if head_escapes(inner, loop_depth) {
+                    return true;
+                }
+            }
+            IrStmt::Function { .. } | IrStmt::ForInit { .. } => {}
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_listvar_at(e: &IrExpr) -> bool {
@@ -10461,6 +10628,8 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>, arrays: &mut BTr
                 collect_written_expr(i, out, arrays);
             }
         }
+        IrExpr::Capture { expr, .. } => collect_written_expr(expr, out, arrays),
+        IrExpr::Arrow(b) => collect_written(b, out, arrays),
         IrExpr::Call { args, .. } => {
             for a in args {
                 collect_written_expr(a, out, arrays);
@@ -10857,7 +11026,25 @@ const RUNTIME_HELPERS: &[&str] = &[
     "        if cmds[i].Process != nil { cmds[i].Process.Kill() }",
     "        cmds[i].Wait()",
     "    }",
-    "    return buf.String()",
+    "    return 0",
+    "}",
+    "",
+    "// capture a func's stdout (compound pipeline heads run in-process;",
+    "// the reader drains concurrently so large outputs cannot deadlock).",
+    "func captureOutput(f func()) string {",
+    "    old := os.Stdout",
+    "    r, w, _ := os.Pipe()",
+    "    os.Stdout = w",
+    "    done := make(chan string, 1)",
+    "    go func() {",
+    "        b, _ := io.ReadAll(r)",
+    "        done <- string(b)",
+    "    }()",
+    "    f()",
+    "    w.Close()",
+    "    s := <-done",
+    "    os.Stdout = old",
+    "    return s",
     "}",
     "",
     "// run a pipeline fed an input string (status = last stage's rc,",
