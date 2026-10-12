@@ -72,6 +72,11 @@ pub struct Render {
     st_read: bool,
     /// vars written via arithmetic (cstyleFor/let/arith) — declare int64
     arith_ints: BTreeSet<String>,
+    /// Int-verdict vars with lossy string writes elsewhere: dynamic
+    /// (`any`) homes so both shapes compile and read correctly (bash is
+    /// dynamically typed; see collect_downgrade). Integer-attribute
+    /// (`-i`) vars never downgrade — the attribute coerces.
+    downgraded: BTreeSet<String>,
     /// vars with the integer attribute (`declare -i`/`typeset -i`): every
     /// assignment evaluates arithmetically (kept separate from arith_ints
     /// so `unset` can drop the attribute while the home stays declared)
@@ -385,6 +390,7 @@ impl Render {
 
     fn is_num(&self, name: &str) -> bool {
         self.var_types.get(name).copied() == Some(IrType::Int)
+            && !self.downgraded.contains(name)
     }
 
     fn is_str(&self, name: &str) -> bool {
@@ -414,8 +420,13 @@ impl Render {
         self.mark_written(name);
     }
 
-    /// Mark a var as arith-written (declared int64).
+    /// Mark a var as arith-written (declared int64) — except downgraded
+    /// homes, which stay dynamic with runtime-coerced arith ops.
     fn mark_arith(&mut self, name: &str) {
+        if self.downgraded.contains(name) {
+            self.mark_written(name);
+            return;
+        }
         self.arith_ints.insert(name.to_string());
         self.mark_written(name);
     }
@@ -1373,6 +1384,45 @@ impl Render {
 
     // ── arithmetic ───────────────────────────────────────────────────
 
+    /// Read-modify arith op (`+=`, `*=`, …) for a possibly-dynamic home:
+    /// int64 homes use bare ops; downgraded homes coerce the lhs through
+    /// s2i at runtime (with divN/modN guards). Plain `=` needs no branch
+    /// (an int64 rhs assigns into any home).
+    fn arith_rmw(&self, m: &str, var: &str, op: &str, r: String) -> String {
+        if !self.downgraded.contains(var) {
+            let goop = match op {
+                "=" => "=",
+                "+=" => "+=",
+                "-=" => "-=",
+                "*=" => "*=",
+                "/=" => "/=",
+                "%=" => "%=",
+                _ => "=",
+            };
+            return format!("{m} {goop} {r}");
+        }
+        let lhs = format!("s2i({m})");
+        match op {
+            "+=" => format!("{m} = {lhs} + ({r})"),
+            "-=" => format!("{m} = {lhs} - ({r})"),
+            "*=" => format!("{m} = {lhs} * ({r})"),
+            "/=" => format!("{m} = divN({lhs}, {r})"),
+            "%=" => format!("{m} = modN({lhs}, {r})"),
+            _ => format!("{m} = {r}"),
+        }
+    }
+
+    /// Increment/decrement assignment text on a possibly-dynamic home
+    /// (marks int homes arith; downgraded homes coerce at runtime).
+    fn arith_incdec(&mut self, m: &str, var: &str, delta: i64) -> String {
+        if self.downgraded.contains(var) {
+            format!("{m} = s2i({m}) + {delta}")
+        } else {
+            self.mark_arith(var);
+            format!("{m} = {m} + {delta}")
+        }
+    }
+
     /// Structured ArithAst → native int64 expression (may leave side
     /// effects in `self.sides` for Assign/IncDec).
     fn arith(&mut self, a: &ArithAst) -> String {
@@ -1426,32 +1476,31 @@ impl Render {
             }
             ArithAst::Assign { var, op, rhs } => {
                 let m = self.ident_of(var);
-                self.mark_arith(var);
                 let r = self.arith(rhs);
-                let goop = match op.as_str() {
-                    "=" => "=",
-                    "+=" => "+=",
-                    "-=" => "-=",
-                    "*=" => "*=",
-                    "/=" => "/=",
-                    "%=" => "%=",
-                    _ => "=",
-                };
                 let sync = self.sync_inline(var);
-                self.sides.push(format!("{m} {goop} {r};{sync}"));
+                if op.as_str() == "=" && !self.downgraded.contains(var) {
+                    self.mark_arith(var);
+                }
+                let stmt = if op.as_str() == "=" {
+                    format!("{m} = {r}")
+                } else {
+                    self.arith_rmw(&m, var, op, r)
+                };
+                self.sides.push(format!("{stmt};{sync}"));
                 m
             }
             ArithAst::IncDec { var, delta, prefix } => {
                 let m = self.ident_of(var);
-                self.mark_arith(var);
                 if *prefix {
-                    self.sides.push(format!("{m} = {m} + {delta};"));
+                    let stmt = self.arith_incdec(&m, var, *delta);
+                    self.sides.push(format!("{stmt};"));
                     m
                 } else {
                     let t = self.new_tmp();
                     self.sides.push(format!("{t} := {m};"));
                     let sync = self.sync_inline(var);
-                    self.sides.push(format!("{m} = {m} + {delta};{sync}"));
+                    let stmt = self.arith_incdec(&m, var, *delta);
+                    self.sides.push(format!("{stmt};{sync}"));
                     t
                 }
             }
@@ -1698,27 +1747,55 @@ impl Render {
             MA::Assign(name, op, rhs) => {
                 let (rs, rv) = self.ma_render(rhs)?;
                 let m = self.ident_of(name);
-                self.mark_arith(name);
+                if !self.downgraded.contains(name) {
+                    self.mark_arith(name);
+                }
                 let mut sides = rs;
                 let sync = self.sync_inline(name);
-                sides.push(format!("{m} {op} {rv};{sync}"));
+                let stmt = if self.downgraded.contains(name) {
+                    if op == "=" {
+                        format!("{m} = {rv}")
+                    } else {
+                        self.arith_rmw(&m, name, op, rv)
+                    }
+                } else {
+                    format!("{m} {op} {rv}")
+                };
+                sides.push(format!("{stmt};{sync}"));
                 Some((sides, m))
             }
             MA::IncDec(name, delta, prefix) => {
                 let m = self.ident_of(name);
-                self.mark_arith(name);
-                if *prefix {
-                    Some((vec![format!("{m} = {m} + {delta};")], m))
+                if self.downgraded.contains(name) {
+                    let stmt = self.arith_incdec(&m, name, *delta);
+                    if *prefix {
+                        Some((vec![format!("{stmt};")], m))
+                    } else {
+                        let t = self.new_tmp();
+                        let sync = self.sync_inline(name);
+                        Some((
+                            vec![
+                                format!("{t} := {m};"),
+                                format!("{stmt};{sync}"),
+                            ],
+                            t,
+                        ))
+                    }
                 } else {
-                    let t = self.new_tmp();
-                    let sync = self.sync_inline(name);
-                    Some((
-                        vec![
-                            format!("{t} := {m};"),
-                            format!("{m} = {m} + {delta};{sync}"),
-                        ],
-                        t,
-                    ))
+                    self.mark_arith(name);
+                    if *prefix {
+                        Some((vec![format!("{m} = {m} + {delta};")], m))
+                    } else {
+                        let t = self.new_tmp();
+                        let sync = self.sync_inline(name);
+                        Some((
+                            vec![
+                                format!("{t} := {m};"),
+                                format!("{m} = {m} + {delta};{sync}"),
+                            ],
+                            t,
+                        ))
+                    }
                 }
             }
         }
@@ -1738,28 +1815,47 @@ impl Render {
                     return None;
                 }
                 let m = self.ident_of(name);
-                self.mark_arith(name);
                 let sync = self.sync_inline(name);
-                Some((format!("{m} {op} {rv};{sync}"), m))
+                let stmt = if self.downgraded.contains(name) {
+                    if op == "=" {
+                        format!("{m} = {rv}")
+                    } else {
+                        self.arith_rmw(&m, name, op, rv)
+                    }
+                } else {
+                    self.mark_arith(name);
+                    format!("{m} {op} {rv}")
+                };
+                Some((format!("{stmt};{sync}"), m))
             }
             MA::IncDec(name, delta, prefix) => {
                 let m = self.ident_of(name);
-                self.mark_arith(name);
-                let stmt = if *delta == 1 {
-                    format!("{m}++;")
-                } else {
-                    format!("{m}--;")
-                };
-                let value = if *prefix {
-                    if *delta == 1 {
-                        format!("{m} + 1")
+                if self.downgraded.contains(name) {
+                    let stmt = self.arith_incdec(&m, name, *delta);
+                    let value = if *prefix {
+                        format!("s2i({m}) + {delta}")
                     } else {
-                        format!("{m} - 1")
-                    }
+                        m
+                    };
+                    Some((format!("{stmt};"), value))
                 } else {
-                    m
-                };
-                Some((stmt, value))
+                    self.mark_arith(name);
+                    let stmt = if *delta == 1 {
+                        format!("{m}++;")
+                    } else {
+                        format!("{m}--;")
+                    };
+                    let value = if *prefix {
+                        if *delta == 1 {
+                            format!("{m} + 1")
+                        } else {
+                            format!("{m} - 1")
+                        }
+                    } else {
+                        m
+                    };
+                    Some((stmt, value))
+                }
             }
             _ => None,
         }
@@ -5101,6 +5197,286 @@ impl Render {
         self.expr_any(e)
     }
 
+/// Pre-scan: Int-verdict vars with lossy string writes anywhere lose
+/// the verdict (dynamic homes). Integer-attribute vars never downgrade
+/// (the attribute coerces). Runs to fixpoint (`y=$x` downgrades after
+/// x does). Over-downgrading is safe (dynamic homes read correctly).
+fn downgrade_pass(&mut self, prog: &IrProgram) {
+    for _ in 0..4 {
+        let mut cands = Vec::new();
+        self.walk_downgrade(&prog.stmts, &mut cands);
+        let before = self.downgraded.len();
+        for c in cands {
+            if self.var_types.get(&c).copied() == Some(IrType::Int)
+                && !self.int_attrs.contains(&c)
+            {
+                self.downgraded.insert(c);
+            }
+        }
+        if self.downgraded.len() == before {
+            break;
+        }
+    }
+    // arith homes stay consistent (arith writes imply int64 only for
+    // non-downgraded vars; downgraded homes coerce arith at runtime)
+    self.arith_ints.retain(|v| !self.downgraded.contains(v));
+}
+
+/// Int verdict currently in force (for lossy checks during the walk)?
+fn verdict_int(&self, name: &str) -> bool {
+    self.var_types.get(name).copied() == Some(IrType::Int)
+        && !self.downgraded.contains(name)
+}
+
+fn walk_downgrade(&self, stmts: &[IrStmt], cands: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                // scalar writes only (array elements don't type the home)
+                if targets.len() == 1 && targets[0].indices.is_empty() {
+                    let t = &targets[0];
+                    if !t.var.contains('[')
+                        && self.verdict_int(&t.var)
+                        && lossy_for_int(expr, &|nm| self.verdict_int(nm))
+                    {
+                        cands.push(t.var.clone());
+                    }
+                }
+                self.walk_downgrade_expr(expr, cands);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                if let Some(e) = init {
+                    for d in vars {
+                        if self.verdict_int(&d.name)
+                            && lossy_for_int(e, &|nm| self.verdict_int(nm))
+                        {
+                            cands.push(d.name.clone());
+                        }
+                    }
+                    self.walk_downgrade_expr(e, cands);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    self.walk_downgrade_expr(e, cands);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                // `for x in <non-numerics>` strings the loop var
+                if self.verdict_int(var) {
+                    let items: Vec<&IrExpr> = match iter {
+                        IrExpr::Array(it) => it.iter().collect(),
+                        _ => vec![iter],
+                    };
+                    if items
+                        .iter()
+                        .any(|e| lossy_for_int(e, &|nm| self.verdict_int(nm)))
+                    {
+                        cands.push(var.clone());
+                    }
+                }
+                self.walk_downgrade_expr(iter, cands);
+                self.walk_downgrade(body, cands);
+            }
+            IrStmt::Expr(e) => self.walk_downgrade_expr(e, cands),
+            IrStmt::Output { value, .. } => self.walk_downgrade_expr(value, cands),
+            IrStmt::WriteFile { path, content, .. } => {
+                self.walk_downgrade_expr(path, cands);
+                self.walk_downgrade_expr(content, cands);
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                self.walk_downgrade_expr(cond, cands);
+                self.walk_downgrade(then, cands);
+                for (c, b) in elsifs {
+                    self.walk_downgrade_expr(c, cands);
+                    self.walk_downgrade(b, cands);
+                }
+                self.walk_downgrade(else_, cands);
+            }
+            IrStmt::While { cond, body } => {
+                self.walk_downgrade_expr(cond, cands);
+                self.walk_downgrade(body, cands);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                self.walk_downgrade(body, cands);
+                self.walk_downgrade_expr(cond, cands);
+            }
+            IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    self.walk_downgrade_expr(x, cands);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                self.walk_downgrade(b, cands)
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                self.walk_downgrade(inner, cands);
+                for r in redirects {
+                    self.walk_downgrade_expr(&r.target, cands);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                self.walk_downgrade_expr(discriminant, cands);
+                for c in clauses {
+                    self.walk_downgrade(&c.body, cands);
+                }
+            }
+            IrStmt::Function { body, .. } => self.walk_downgrade(body, cands),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    self.walk_downgrade(st, cands);
+                }
+            }
+            IrStmt::Exec {
+                cmd,
+                args,
+                redirects,
+                env,
+                ..
+            } => {
+                self.walk_downgrade_expr(cmd, cands);
+                for a in args {
+                    self.walk_downgrade_expr(a, cands);
+                }
+                for r in redirects {
+                    self.walk_downgrade_expr(r, cands);
+                }
+                for (_, e) in env {
+                    self.walk_downgrade_expr(e, cands);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_downgrade_expr(&self, e: &IrExpr, cands: &mut Vec<String>) {
+    match e {
+        IrExpr::Call { func, args } if func == "builtin" || func == "exec" => {
+            // declare-builtin values (`local x=$(…)`); -i dominates
+            let mut words: Vec<&str> = Vec::new();
+            for a in args {
+                match a {
+                    IrExpr::Str(s, _) => words.push(s.as_str()),
+                    IrExpr::Array(items) => {
+                        for it in items {
+                            if let IrExpr::Str(s, _) = it {
+                                words.push(s.as_str());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(words.first(), Some(w) if matches!(*w, "local" | "typeset" | "declare" | "readonly")) {
+                let mut saw_int = false;
+                for w in &words[1..] {
+                    if w.starts_with('-') {
+                        if w.contains('i') {
+                            saw_int = true;
+                        }
+                    } else if w.starts_with('+') {
+                        if w.contains('i') {
+                            saw_int = false;
+                        }
+                    } else if !saw_int {
+                        // name[=value]: a non-numeric value downgrades
+                        let (nm, val) = match w.split_once('=') {
+                            Some((n, v)) => (n, Some(v)),
+                            None => (*w, None),
+                        };
+                        if self.verdict_int(nm) {
+                            let lossy = match val {
+                                None => false,
+                                Some(v) => {
+                                    v.trim().parse::<i64>().is_err()
+                                }
+                            };
+                            // non-Str tails (dynamic values) also downgrade
+                            if lossy {
+                                cands.push(nm.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // `read a b` assigns arbitrary text
+            if matches!(words.first(), Some(w) if *w == "read") {
+                for w in &words[1..] {
+                    if w.starts_with('-') || w.contains('=') {
+                        continue;
+                    }
+                    if self.verdict_int(w) {
+                        cands.push(w.to_string());
+                    }
+                }
+            }
+            for a in args {
+                self.walk_downgrade_expr(a, cands);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                self.walk_downgrade_expr(a, cands);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            self.walk_downgrade_expr(lhs, cands);
+            self.walk_downgrade_expr(rhs, cands);
+        }
+        IrExpr::Arith(a) => self.walk_downgrade_arith(a, cands),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    self.walk_downgrade_expr(x, cands);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                self.walk_downgrade_expr(i, cands);
+            }
+        }
+        IrExpr::Capture { expr, .. } => self.walk_downgrade_expr(expr, cands),
+        IrExpr::Arrow(b) => self.walk_downgrade(b, cands),
+        IrExpr::Index { key, .. } => self.walk_downgrade_expr(key, cands),
+        IrExpr::Ternary { cond, then, else_ } => {
+            self.walk_downgrade_expr(cond, cands);
+            self.walk_downgrade_expr(then, cands);
+            self.walk_downgrade_expr(else_, cands);
+        }
+        _ => {}
+    }
+}
+
+fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
+    // arithmetic writes are numeric by construction — but a nested
+    // declare/assign inside is still a string write; recurse for those
+    match a {
+        ArithAst::Bin { lhs, rhs, .. } => {
+            self.walk_downgrade_arith(lhs, cands);
+            self.walk_downgrade_arith(rhs, cands);
+        }
+        ArithAst::Un { arg, .. } => self.walk_downgrade_arith(arg, cands),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            self.walk_downgrade_arith(test, cands);
+            self.walk_downgrade_arith(then, cands);
+            self.walk_downgrade_arith(else_, cands);
+        }
+        ArithAst::Index { key, .. } => self.walk_downgrade_arith(key, cands),
+        _ => {}
+    }
+}
     fn stmt_assign(&mut self, targets: &[crate::ir::AssignTarget], expr: &IrExpr) {
         let Some(t) = targets.first() else {
             self.mark_todo("multi-target assign");
@@ -5332,20 +5708,29 @@ impl Render {
                     } else {
                         self.go_ident(var)
                     };
-                    self.mark_arith(var);
                     let r = self.arith(rhs);
-                    let goop = match op.as_str() {
-                        "=" => "=",
-                        "+=" => "+=",
-                        "-=" => "-=",
-                        "*=" => "*=",
-                        "/=" => "/=",
-                        "%=" => "%=",
-                        _ => "=",
+                    let sync = self.sync_inline(var);
+                    let stmt = if self.downgraded.contains(var) {
+                        if op.as_str() == "=" {
+                            format!("{target} = {r}")
+                        } else {
+                            self.arith_rmw(&target, var, op, r)
+                        }
+                    } else {
+                        self.mark_arith(var);
+                        let goop = match op.as_str() {
+                            "=" => "=",
+                            "+=" => "+=",
+                            "-=" => "-=",
+                            "*=" => "*=",
+                            "/=" => "/=",
+                            "%=" => "%=",
+                            _ => "=",
+                        };
+                        format!("{target} {goop} {r}")
                     };
                     self.flush_sides();
-                    let sync = self.sync_inline(var);
-                    self.emit(&format!("{target} {goop} {r};{sync}"));
+                    self.emit(&format!("{stmt};{sync}"));
                     if self.need_st {
                         self.emit("st = 0;");
                     }
@@ -5357,10 +5742,10 @@ impl Render {
                     } else {
                         self.go_ident(var)
                     };
-                    self.mark_arith(var);
                     self.flush_sides();
                     let sync = self.sync_inline(var);
-                    self.emit(&format!("{target} = {target} + {delta};{sync}"));
+                    let stmt = self.arith_incdec(&target, var, *delta);
+                    self.emit(&format!("{stmt};{sync}"));
                     if self.need_st {
                         self.emit("st = 0;");
                     }
@@ -6278,29 +6663,105 @@ impl Render {
                 true
             }
             "read" => {
-                let mut names = Vec::new();
-                for a in argv {
-                    if let IrExpr::Str(s, _) = a {
-                        if s.starts_with('-') {
-                            continue;
+                // flags: -r raw (no backslash processing), -s/-e invisible,
+                // -p consumes its prompt, -a reads an array; anything else
+                // (delims, counts, timeouts, fds) refuses loudly
+                let mut names: Vec<String> = Vec::new();
+                let mut array_name: Option<String> = None;
+                let mut it = argv.iter().peekable();
+                let mut bad = false;
+                while let Some(a) = it.next() {
+                    match a {
+                        IrExpr::Str(s, _) if s == "-r" || s == "-s" || s == "-e" => {}
+                        IrExpr::Str(s, _) if s == "-p" => {
+                            if it.next().is_none() {
+                                bad = true;
+                                break;
+                            }
                         }
-                        names.push(s.clone());
+                        IrExpr::Str(s, _)
+                            if s == "-a"
+                                && array_name.is_none()
+                                && names.is_empty() =>
+                        {
+                            match it.next() {
+                                Some(IrExpr::Str(nm, _)) if is_plain_name(nm) => {
+                                    array_name = Some(nm.clone())
+                                }
+                                _ => {
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                        }
+                        IrExpr::Str(s, _) => {
+                            if s.starts_with('-') || !is_plain_name(s) {
+                                bad = true;
+                                break;
+                            }
+                            names.push(s.clone());
+                        }
+                        _ => {
+                            bad = true;
+                            break;
+                        }
                     }
                 }
-                if names.is_empty() {
+                if bad {
+                    self.mark_todo("read flags");
                     return true;
                 }
-                let mut ps = Vec::new();
-                for n in &names {
-                    self.mark_written(n);
-                    let m = self.go_ident(n);
-                    ps.push(format!("&{m}"));
+                if array_name.is_some() && !names.is_empty() {
+                    self.mark_todo("read -a with names");
+                    return true;
+                }
+                // bare `read` targets REPLY
+                if array_name.is_none() && names.is_empty() {
+                    names.push("REPLY".to_string());
                 }
                 self.flush_sides();
-                self.emit(&format!("_ = readInto({});", ps.join(", ")));
-                if self.need_st {
-                    self.emit("st = 0;");
+                if let Some(arr) = array_name {
+                    // `read -a arr`: whole line split (IFS first char)
+                    let m = self.go_ident(&arr);
+                    self.mark_arr(&arr);
+                    self.mark_written(&arr);
+                    let sync = self.sync_inline(&arr);
+                    let t = self.new_tmp();
+                    self.emit(&format!("__rl{t} := \"\";"));
+                    self.emit(&format!("__rok{t} := readInto(&__rl{t});"));
+                    self.emit(&format!("{m} = readAll(__rl{t}, ifsJoin);{sync}"));
+                    self.emit(&format!("st = b2i(!__rok{t});"));
+                    self.need_st = true;
+                    return true;
                 }
+                // read into string temps, then convert per home type
+                // (readInto needs *string; int64 homes coerce via s2i)
+                let t = self.new_tmp();
+                let tmps: Vec<String> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("__rt{t}_{i}"))
+                    .collect();
+                let zeros = vec!["\"\""; tmps.len()].join(", ");
+                self.emit(&format!("{} := {};", tmps.join(", "), zeros));
+                let refs: Vec<String> =
+                    tmps.iter().map(|x| format!("&{x}")).collect();
+                self.emit(&format!("__rok{t} := readInto({});", refs.join(", ")));
+                for (n, tmp) in names.iter().zip(tmps.iter()) {
+                    let m = self.go_ident(n);
+                    self.mark_written(n);
+                    let sync = self.sync_inline(n);
+                    if self.is_num(n)
+                        || self.arith_ints.contains(n)
+                        || self.int_attrs.contains(n)
+                    {
+                        self.emit(&format!("{m} = s2i({tmp});{sync}"));
+                    } else {
+                        self.emit(&format!("{m} = {tmp};{sync}"));
+                    }
+                }
+                self.emit(&format!("st = b2i(!__rok{t});"));
+                self.need_st = true;
                 true
             }
             "shift" => {
@@ -7415,6 +7876,10 @@ impl Render {
                 self.arrays.insert(n.clone());
             }
         }
+        // Downgrade pass: Int verdicts with lossy string writes become
+        // dynamic (must precede the arith pre-scan below, which skips
+        // downgraded homes when hoisting int64).
+        self.downgrade_pass(prog);
         // Pre-scan: vars written by ARITH assignments / inc-decs anywhere
         // (cstyleFor steps, the goto restructure's flags) hoist as int64 —
         // EVERY assignment to them must coerce numerically, including
@@ -9451,7 +9916,6 @@ fn is_true_call(e: &IrExpr) -> bool {
             && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "true" || c == ":"))
 }
 
-/// `$@`/`$*` as a whole-array value?
 fn is_listvar_at(e: &IrExpr) -> bool {
     matches!(e, IrExpr::Call { func, args }
         if func == "listVar"
@@ -9530,6 +9994,44 @@ fn object_redirect(r: &IrExpr) -> Option<crate::ir::IrRedirect> {
 fn assoc_elem(s: &str) -> Option<(&str, &str)> {
     let s = s.strip_prefix('[')?;
     s.split_once("]=")
+}
+
+/// An RHS that an int64 home cannot hold without loss (arbitrary text —
+/// only plain numerics coerce exactly; everything else truncates through
+/// s2i)? Conservative: unknown shapes count as lossy (downgrading only
+/// adds dynamism, never wrongness). `is_num` answers against the CURRENT
+/// (possibly already downgraded) verdicts — run to fixpoint.
+fn lossy_for_int(e: &IrExpr, is_num: &dyn Fn(&str) -> bool) -> bool {
+    match e {
+        IrExpr::Int(_) | IrExpr::Bool(_) => false,
+        IrExpr::Arith(_) => false,
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().is_err(),
+        IrExpr::Interpolate(parts) => {
+            // all-literal numerics are safe; any live part is text
+            let mut lit = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => lit.push_str(t),
+                    InterpPart::Expr(_) => return true,
+                }
+            }
+            lit.trim().parse::<i64>().is_err()
+        }
+        IrExpr::BinOp { op, lhs, rhs } => {
+            if *op == crate::ir::BinOpKind::Concat {
+                return true;
+            }
+            lossy_for_int(lhs, is_num) || lossy_for_int(rhs, is_num)
+        }
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => !is_num(name),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            match args.first() {
+                Some(IrExpr::Str(name, _)) => !is_num(name),
+                _ => true,
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Statically-string array key? (assoc-shaped: a non-integer literal,
@@ -10485,6 +10987,29 @@ const RUNTIME_HELPERS: &[&str] = &[
     "        if i < len(fs) { *ps[i] = fs[i] } else { *ps[i] = \"\" }",
     "    }",
     "    return true",
+    "}",
+    "",
+    "// split a line for `read -a` (all fields; IFS rules like readSplit",
+    "// with no field cap).",
+    "func readAll(line, ifs string) []any {",
+    "    if ifs == \"\" { return []any{line} }",
+    "    var fields []string",
+    "    if ifs == \" \\t\\n\" {",
+    "        fields = strings.Fields(line)",
+    "    } else if len(ifs) == 1 {",
+    "        if ifs[0] == ' ' || ifs[0] == '\\t' || ifs[0] == '\\n' {",
+    "            fields = strings.Fields(line)",
+    "        } else {",
+    "            fields = strings.Split(line, ifs)",
+    "        }",
+    "    } else {",
+    "        fields = strings.FieldsFunc(line, func(r rune) bool {",
+    "            return strings.ContainsRune(ifs, r)",
+    "        })",
+    "    }",
+    "    out := make([]any, len(fields))",
+    "    for i, v := range fields { out[i] = v }",
+    "    return out",
     "}",
     "",
     "func globMatch(pattern, s string) bool {",
