@@ -964,6 +964,20 @@ impl Render {
             IrExpr::Index { var, key } => {
                 let varname = self.nameref_resolve(var);
                 let var = &varname;
+                // an arith-looking Str key on a non-assoc home is INDEXED
+                // arith (`${a[(2*$i)-1]}`), not an assoc key: the
+                // assoc-shape rule below only sees "not an integer" and
+                // would misroute it into the `vars` map (REFUSE>GUESS —
+                // only when the key parses as arithmetic).
+                if !self.assoc_arrays.contains(var) {
+                    if let IrExpr::Str(s, _) = key.as_ref() {
+                        if let Some((_, v)) = self.arith_str(s) {
+                            self.mark_arr(var);
+                            self.ident_of(var);
+                            return format!("arrIdx({}, {v})", self.ident_of(var));
+                        }
+                    }
+                }
                 if self.assoc_arrays.contains(var) || assoc_key_shape(key) {
                     // assoc element: the `vars` map home (`base[key]`),
                     // where the baked writes sync (missing key → "").
@@ -1571,7 +1585,7 @@ impl Render {
 
     // ── the `arith("...")` string form ───────────────────────────────
 
-    fn arith_tokens(&self, s: &str) -> Option<Vec<(String, bool)>> {
+    fn arith_tokens(s: &str) -> Option<Vec<(String, bool)>> {
         // (text, is_op)
         let mut out = Vec::new();
         let b: Vec<char> = s.chars().collect();
@@ -1663,7 +1677,7 @@ impl Render {
     /// Parse + render an arith string → (side stmts, value expr).
     /// Returns None for anything outside the lowable subset.
     fn arith_str(&mut self, s: &str) -> Option<(Vec<String>, String)> {
-        let toks = self.arith_tokens(s)?;
+        let toks = Self::arith_tokens(s)?;
         let mut p = MAParser { toks, i: 0 };
         let ast = p.expr()?;
         if p.i != p.toks.len() {
@@ -2076,6 +2090,20 @@ impl Render {
                 let Some(kexpr) = args.get(1) else {
                     return self.sh2_stub("arrayIndex");
                 };
+                // an arith-looking Str key on a non-assoc home is INDEXED
+                // arith (`${a[(2*$i)-1]}`), not an assoc key: the
+                // assoc-shape rule below only sees "not an integer" and
+                // would misroute it into the `vars` map (REFUSE>GUESS —
+                // only when the key parses as arithmetic).
+                if !self.assoc_arrays.contains(&name) {
+                    if let IrExpr::Str(s, _) = kexpr {
+                        if let Some((_, v)) = self.arith_str(s) {
+                            let m = self.ident_of(&name);
+                            self.mark_arr(&name);
+                            return format!("s2s(arrIdx({m}, {v}))");
+                        }
+                    }
+                }
                 if self.assoc_arrays.contains(&name) || assoc_key_shape(kexpr) {
                     // assoc element: the `vars` map home (`base[key]`),
                     // where the baked writes sync (missing key → "").
@@ -4682,6 +4710,79 @@ impl Render {
                 self.emit(&format!("os.Exit(int({code}));"));
             }
             IrStmt::Block(b) => {
+                // statement-form `((i++))` / `((++i))` / `((x += …))`:
+                // the core wraps the same-target RMW Assign in a
+                // single-element Block (a brace group `{ i=$((…)); }`
+                // carries a non-RMW Arith or a different target, so it
+                // falls through below). Bash's `((…))` status is 0 iff
+                // the VALUE is nonzero — postfix reads the OLD value,
+                // prefix and compound-assign read the NEW one — not the
+                // plain-assignment 0 that stmt_assign would emit.
+                if let [IrStmt::Assign { targets, expr, asm: None }] = b.as_slice() {
+                    if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                        if t.indices.is_empty() {
+                            match a.as_ref() {
+                                crate::ir::ArithAst::IncDec { var, delta, prefix }
+                                    if var == &t.var =>
+                                {
+                                    self.flush_sides();
+                                    let m = self.go_ident(var);
+                                    self.mark_written(var);
+                                    let sync = self.sync_inline(var);
+                                    if *prefix {
+                                        let inc = self.arith_incdec(&m, var, *delta);
+                                        self.emit(&format!("{inc};{sync}"));
+                                        self.emit(&format!(
+                                            "if s2i({m}) != 0 {{ st = 0 }} else {{ st = 1 }}"
+                                        ));
+                                    } else {
+                                        let tmp = self.new_tmp();
+                                        self.emit(&format!("{tmp} := s2i({m});"));
+                                        let inc = self.arith_incdec(&m, var, *delta);
+                                        self.emit(&format!("{inc};{sync}"));
+                                        self.emit(&format!(
+                                            "if {tmp} != 0 {{ st = 0 }} else {{ st = 1 }}"
+                                        ));
+                                    }
+                                    self.need_st = true;
+                                    return;
+                                }
+                                crate::ir::ArithAst::Assign { var, op, rhs }
+                                    if var == &t.var =>
+                                {
+                                    let r = self.arith(rhs);
+                                    let target = self.go_ident(var);
+                                    self.mark_written(var);
+                                    let sync = self.sync_inline(var);
+                                    let stmt = if self.downgraded.contains(var) {
+                                        self.arith_rmw(&target, var, op, r)
+                                    } else {
+                                        self.mark_arith(var);
+                                        let goop = match op.as_str() {
+                                            "=" => "=",
+                                            "+=" => "+=",
+                                            "-=" => "-=",
+                                            "*=" => "*=",
+                                            "/=" => "/=",
+                                            "%=" => "%=",
+                                            _ => "=",
+                                        };
+                                        format!("{target} {goop} {r}")
+                                    };
+                                    self.flush_sides();
+                                    self.emit(&format!("{stmt};{sync}"));
+                                    let m = self.go_ident(var);
+                                    self.emit(&format!(
+                                        "if s2i({m}) != 0 {{ st = 0 }} else {{ st = 1 }}"
+                                    ));
+                                    self.need_st = true;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 for s in b {
                     self.stmt(s);
                 }
@@ -7572,7 +7673,7 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
     /// Returns (stmt, value-expr) so the caller can set `$?` (bash let
     /// status is 0 iff the value != 0).
     fn let_stmt(&mut self, s: &str) -> Option<(String, String)> {
-        let toks = self.arith_tokens(s)?;
+        let toks = Self::arith_tokens(s)?;
         let mut p = MAParser { toks, i: 0 };
         let ast = p.expr()?;
         if p.i != p.toks.len() {
@@ -7592,7 +7693,7 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
             return None;
         }
         let (init, cond, update) = (parts[0].trim(), parts[1].trim(), parts[2].trim());
-        let init_toks = self.arith_tokens(init)?;
+        let init_toks = Self::arith_tokens(init)?;
         let mut ip = MAParser {
             toks: init_toks,
             i: 0,
@@ -7602,7 +7703,7 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
             return None;
         }
         let init_go = self.ma_stmt(&iast)?.0.trim_end_matches(';').to_string();
-        let cond_toks = self.arith_tokens(cond)?;
+        let cond_toks = Self::arith_tokens(cond)?;
         let mut cp = MAParser {
             toks: cond_toks,
             i: 0,
@@ -7615,7 +7716,7 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
         if !csides.is_empty() {
             return None;
         }
-        let up_toks = self.arith_tokens(update)?;
+        let up_toks = Self::arith_tokens(update)?;
         let mut up = MAParser {
             toks: up_toks,
             i: 0,
@@ -10221,13 +10322,43 @@ fn assoc_key_shape(e: &IrExpr) -> bool {
     }
 }
 
-/// Baked `base[key]` target with a non-integer key → assoc base.
+/// A Str subscript that parses as arithmetic (`(2*$i)-1`) is INDEXED
+/// arith, never an assoc key — the assoc-shape rule above only sees
+/// "not an integer". The pre-scan (a free function with no Render)
+/// uses this so such reads/writes don't poison the base into
+/// `assoc_arrays` (the render arms re-parse with `arith_str` for the
+/// value). Same full-parse bar as `arith_str` (tokens + complete
+/// MA parse), just without the Render-dependent value rendering.
+fn arith_key_shape(s: &str) -> bool {
+    let toks = match Render::arith_tokens(s) {
+        Some(t) => t,
+        None => return false,
+    };
+    let mut p = MAParser { toks, i: 0 };
+    match p.expr() {
+        Some(_) => p.i == p.toks.len(),
+        None => false,
+    }
+}
+
+/// Assoc-shaped UNLESS arith-parseable (see `arith_key_shape`).
+fn assoc_key_shape_noarith(e: &IrExpr) -> bool {
+    if let IrExpr::Str(s, _) = e {
+        if arith_key_shape(s) {
+            return false;
+        }
+    }
+    assoc_key_shape(e)
+}
+
+/// Baked `base[key]` target with a non-integer key → assoc base
+/// (an arith-parseable key is indexed arith — see `arith_key_shape`).
 fn assoc_baked(var: &str, assoc: &mut BTreeSet<String>) {
     if let Some(close) = var.find('[') {
         if var.ends_with(']') {
             let base = &var[..close];
             let key = &var[close + 1..var.len() - 1];
-            if key.trim().parse::<i64>().is_err() && !base.is_empty() {
+            if key.trim().parse::<i64>().is_err() && !arith_key_shape(key) && !base.is_empty() {
                 assoc.insert(base.to_string());
             }
         }
@@ -10243,7 +10374,7 @@ fn collect_assoc(stmts: &[IrStmt], assoc: &mut BTreeSet<String>) {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     assoc_baked(&t.var, assoc);
-                    if !t.indices.is_empty() && assoc_key_shape(&t.indices[0]) {
+                    if !t.indices.is_empty() && assoc_key_shape_noarith(&t.indices[0]) {
                         assoc.insert(t.var.clone());
                     }
                 }
@@ -10349,7 +10480,7 @@ fn collect_assoc(stmts: &[IrStmt], assoc: &mut BTreeSet<String>) {
 fn collect_assoc_expr(e: &IrExpr, assoc: &mut BTreeSet<String>) {
     match e {
         IrExpr::Index { var, key } => {
-            if assoc_key_shape(key) {
+            if assoc_key_shape_noarith(key) {
                 assoc.insert(var.clone());
             }
             collect_assoc_expr(key, assoc);
@@ -10375,7 +10506,7 @@ fn collect_assoc_expr(e: &IrExpr, assoc: &mut BTreeSet<String>) {
         IrExpr::Arrow(b) => collect_assoc(b, assoc),
         IrExpr::Call { func, args } if func == "arrayIndex" => {
             if let (Some(IrExpr::Str(name, _)), Some(k)) = (args.first(), args.get(1)) {
-                if assoc_key_shape(k) {
+                if assoc_key_shape_noarith(k) {
                     assoc.insert(name.clone());
                 }
             }
