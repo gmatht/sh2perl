@@ -5056,30 +5056,37 @@ impl Render {
                     let mut w = BTreeSet::new();
                     let mut a = BTreeSet::new();
                     collect_written(b, &mut w, &mut a);
+                    // builtin writes (`export X=..`, `unset X`) are also
+                    // home writes — collect_written cannot see them.
+                    collect_builtin_writes(b, &mut w);
                     for v in w {
                         if self.declared(&v) && !self.is_arr(&v) {
                             saved.push(v);
                         }
                     }
                 }
-                let mut savers: Vec<String> = Vec::new();
-                for v in &saved {
+                // the environ is a third channel: export/unset inside must
+                // not leak out (bash copies the env for subshells).
+                let et = self.new_tmp();
+                self.emit(&format!("__env{et} := os.Environ();"));
+                // saver temps are t[saver_base..]; the body may allocate
+                // more temps, so the restore base is captured here, not
+                // derived from self.tmp at restore time.
+                let saver_base = self.tmp + 1;
+                for (i, v) in saved.iter().enumerate() {
                     let m = self.go_ident(v);
-                    let t = self.new_tmp();
-                    savers.push(format!("{t} := {m};"));
-                    self.out
-                        .push(format!("{}    {t} := {m};", "    ".repeat(self.depth)));
+                    let _ = self.new_tmp();
+                    self.out.push(format!(
+                        "{}    t{} := {m};",
+                        "    ".repeat(self.depth),
+                        saver_base + i
+                    ));
                 }
-                let _ = savers;
                 for s in b {
                     self.stmt(s);
                 }
-                for v in &saved {
-                    let _m = self.go_ident(v);
-                    let t = self.tmp;
-                    let _ = t;
-                }
-                self.emit_subshell_restore(&saved);
+                self.emit_subshell_restore(&saved, saver_base);
+                self.emit(&format!("os.Clearenv(); for _, __kv{et} := range __env{et} {{ if __i{et} := strings.Index(__kv{et}, \"=\"); __i{et} >= 0 {{ os.Setenv(__kv{et}[:__i{et}], __kv{et}[__i{et}+1:]) }} }}"));
             }
             IrStmt::Die { .. } => {
                 if self.in_bg > 0 {
@@ -6171,15 +6178,16 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
     }
 
     /// Restore subshell-saved vars (the tmp names were the last N allocated).
-    fn emit_subshell_restore(&mut self, saved: &[String]) {
-        let n = saved.len();
-        if n == 0 {
+    fn emit_subshell_restore(&mut self, saved: &[String], base: usize) {
+        if saved.is_empty() {
             return;
         }
-        let start = self.tmp - n + 1;
         for (i, v) in saved.iter().enumerate() {
             let m = self.go_ident(v);
-            self.emit(&format!("{m} = t{};", start + i));
+            // the vars map must forget the body's syncs too (pValRaw
+            // reads it before the home).
+            let sync = self.sync_inline(v);
+            self.emit(&format!("{m} = t{};{sync}", base + i));
         }
     }
 
@@ -6876,13 +6884,33 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                 for a in argv {
                     if let IrExpr::Str(arg, _) = a {
                         if let Some(eq) = arg.find('=') {
+                            // `export NAME=val` assigns the shell home AND
+                            // the process environ (reads use the home, the
+                            // vars map, or Getenv directly — all three must
+                            // agree; the old code only Setenv'd, so `$NAME`
+                            // read nil while `${NAME:-d}` read the env).
                             let name = &arg[..eq];
                             let value = &arg[eq + 1..];
                             let v = self.expand_str(value);
+                            self.flush_sides();
+                            let m = self.go_ident(name);
+                            self.mark_written(name);
+                            let sync = self.sync_inline(name);
+                            if self.is_num(name) {
+                                self.emit(&format!("{m} = s2i({v});{sync}"));
+                            } else {
+                                self.emit(&format!("{m} = {v};{sync}"));
+                            }
                             self.emit(&format!("os.Setenv({}, {v});", Self::go_str(name)));
+                            if self.need_st {
+                                self.emit("st = 0;");
+                            }
                         } else if self.declared(arg) {
                             let m = self.ident_of(arg);
                             self.emit(&format!("os.Setenv({}, s2s({m}));", Self::go_str(arg)));
+                            if self.need_st {
+                                self.emit("st = 0;");
+                            }
                         }
                     }
                 }
@@ -6900,10 +6928,16 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                         }
                         let m = self.go_ident(name);
                         self.mark_written(name);
+                        // the environ is a third read channel (Getenv
+                        // bypasses home and vars) — it must forget too.
+                        // Subshells snapshot/restore the environ around
+                        // the body, so this never leaks outward.
+                        self.emit(&format!("os.Unsetenv({});", Self::go_str(name)));
                         // NOTE: int/case attribute sets are pre-scanned and
                         // read-only here — the home keeps its hoisted type.
                         if self.is_arr(name) {
-                            self.emit(&format!("{m} = nil;"));
+                            let sync = self.sync_inline(name);
+                            self.emit(&format!("{m} = nil;{sync}"));
                         } else if self.is_num(name)
                             || self.arith_ints.contains(name)
                             || self.int_attrs.contains(name)
@@ -6914,9 +6948,15 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                             let sync = self.sync_inline(name);
                             self.emit(&format!("{m} = \"\";{sync}"));
                         } else {
-                            self.emit(&format!("{m} = nil;"));
+                            // the vars map must forget too (pValRaw reads
+                            // it before the home).
+                            let sync = self.sync_inline(name);
+                            self.emit(&format!("{m} = nil;{sync}"));
                         }
                     }
+                }
+                if self.need_st {
+                    self.emit("st = 0;");
                 }
                 true
             }
@@ -10884,6 +10924,76 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>, arrays: &mut BT
     }
 }
 
+/// Vars assigned through builtins (`export X=..`, `unset X`) inside a
+/// body — `collect_written` only sees structured Assign/Declare, so a
+/// subshell save/restore built on it alone would miss these and leak
+/// them outward. Recursion mirrors `collect_written`'s statement
+/// nesting; only the exact Str-arg shapes the renderer lowers are
+/// collected (REFUSE > GUESS — flags and dynamic names are skipped).
+fn collect_builtin_writes(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "exec" || func == "builtin" =>
+            {
+                let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                else {
+                    continue;
+                };
+                if cmd != "export" && cmd != "unset" {
+                    continue;
+                }
+                for it in items {
+                    if let IrExpr::Str(nm, _) = it {
+                        let nm = if cmd == "export" {
+                            nm.split('=').next().unwrap_or(nm)
+                        } else {
+                            nm.as_str()
+                        };
+                        if !nm.is_empty() && nm != "-p" && !nm.starts_with('-') && is_plain_name(nm)
+                        {
+                            out.insert(nm.to_string());
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_builtin_writes(b, out)
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                collect_builtin_writes(then, out);
+                for (_, b) in elsifs {
+                    collect_builtin_writes(b, out);
+                }
+                collect_builtin_writes(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_builtin_writes(body, out)
+            }
+            IrStmt::For { body, .. } => collect_builtin_writes(body, out),
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_builtin_writes(&c.body, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => collect_builtin_writes(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_builtin_writes(st, out);
+                }
+            }
+            IrStmt::Exec { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>, arrays: &mut BTreeSet<String>) {
     match e {
         IrExpr::Var(name, _) => {
@@ -11624,7 +11734,19 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    if n, err := strconv.Atoi(name); err == nil {",
     "        return paramAt(n)",
     "    }",
+    "    // bash pre-seeds HOSTNAME (gethostname) when it is absent from",
+    "    // the environment — which it is for child processes, since bash",
+    "    // does not export it. os.Getenv alone would read \"\".",
+    "    if name == \"HOSTNAME\" { return hostVal() }",
     "    return os.Getenv(name)",
+    "}",
+    "",
+    "// HOSTNAME with bash's seed rule: the environment wins (even when",
+    "// stale — bash keeps an exported HOSTNAME), else the real hostname.",
+    "func hostVal() string {",
+    "    if e := os.Getenv(\"HOSTNAME\"); e != \"\" { return e }",
+    "    h, _ := os.Hostname()",
+    "    return h",
     "}",
     "",
     "// assoc values synced as vars[base[key]] (baked writes) — sorted by",
