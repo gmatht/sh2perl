@@ -3705,6 +3705,19 @@ impl Render {
         });
         let quoted = t.starts_with('"') || t.starts_with('\'');
         let inner = t.trim_matches('"').trim_matches('\'');
+        // tilde expansion (unquoted only — a quoted `"~"` is literal):
+        // `~` and `~/…` prefix the home directory
+        if !quoted {
+            if inner == "~" {
+                return Some(("os.Getenv(\"HOME\")".to_string(), false));
+            }
+            if let Some(rest) = inner.strip_prefix("~/") {
+                return Some((
+                    format!("os.Getenv(\"HOME\") + {}", Self::go_str(&format!("/{rest}"))),
+                    false,
+                ));
+            }
+        }
         // `$((…))` arithmetic operand — native (no child bash). Must
         // precede the `$(` arm below (arithmetic also starts with `$(`).
         if let Some(rest) = inner.strip_prefix("$((") {
@@ -3772,6 +3785,47 @@ impl Render {
                 } else if let Ok(n) = inner.parse::<i64>() {
                     Some((n.to_string(), true))
                 } else if has_dollar {
+                    // `$name/rest` — the variable ends at the first
+                    // non-identifier char (`$HOME/Documents`); a braced
+                    // `${HOME}/rest` unwraps the same way
+                    let (nm, rest) = if let Some(braced) = inner.strip_prefix('{') {
+                        match braced.find('}') {
+                            Some(ci) => (&braced[..ci], &braced[ci + 1..]),
+                            None => ("", inner),
+                        }
+                    } else {
+                        let split = inner
+                            .find(|c: char| {
+                                !(c.is_ascii_alphanumeric() || c == '_')
+                            })
+                            .unwrap_or(inner.len());
+                        inner.split_at(split)
+                    };
+                    if !rest.is_empty() && !nm.is_empty() {
+                        if nm.chars().all(|c| c.is_ascii_digit()) {
+                            let i: i64 = nm.parse().unwrap_or(1);
+                            return Some((
+                                format!("(paramAt({i}) + {})", Self::go_str(rest)),
+                                false,
+                            ));
+                        }
+                        if is_plain_name(nm) {
+                            let base = if self.declared(nm) {
+                                let m = self.ident_of(nm);
+                                if self.is_num(nm) {
+                                    m
+                                } else {
+                                    format!("s2s({m})")
+                                }
+                            } else {
+                                format!("os.Getenv({})", Self::go_str(nm))
+                            };
+                            return Some((
+                                format!("({base} + {})", Self::go_str(rest)),
+                                false,
+                            ));
+                        }
+                    }
                     Some((format!("os.Getenv({})", Self::go_str(inner)), false))
                 } else {
                     Some((Self::go_str(inner), false))
@@ -5637,6 +5691,32 @@ impl Render {
                         self.mark_todo("builtin eval");
                         return true;
                     };
+                    // `eval "name=<quiet>"` (single assignment whose payload
+                    // prints nothing: a capture, arithmetic, or a plain
+                    // word) — a bare redirRun would lose the child-side
+                    // assignment, so read the value back through stdout
+                    if let Some((name, payload)) = split_first_eq(&text) {
+                        if is_plain_name(name)
+                            && (payload.starts_with("$(")
+                                || payload.starts_with('`')
+                                || !payload.contains([
+                                    '$', ';', '\n', ' ', '\t',
+                                ]))
+                        {
+                            let env = self.env_lit();
+                            let m = self.go_ident(name);
+                            self.mark_written(name);
+                            self.flush_sides();
+                            let sync = self.sync_inline(name);
+                            self.emit(&format!(
+                                "{m} = s2s(capRun({} + \"; printf '%s' \\\"${}\\\"\", {env}));{sync}",
+                                Self::go_str(&text),
+                                name,
+                            ));
+                            self.need_st = true;
+                            return true;
+                        }
+                    }
                     let env = self.env_lit();
                     self.emit(&format!("st = redirRun({}, {env});", Self::go_str(&text)));
                     self.need_st = true;
@@ -7868,6 +7948,20 @@ fn trunc_c(parts: Vec<Part>) -> (Vec<Part>, bool) {
         }
     }
     (out, false)
+}
+
+/// Split `name=payload` (first `=` only).
+fn split_first_eq(s: &str) -> Option<(&str, &str)> {
+    let eq = s.find('=')?;
+    Some((&s[..eq], &s[eq + 1..]))
+}
+
+/// Plain shell variable name (no subscript, no namespace)?
+fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().enumerate().all(|(i, c)| {
+            c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+        })
 }
 
 /// Shell-safe bareword for `typeset -f` display (bash pretty-prints
