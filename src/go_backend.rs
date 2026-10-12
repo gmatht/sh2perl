@@ -1613,7 +1613,54 @@ impl Render {
             }
             if c == '$' {
                 if i + 1 < b.len() && b[i + 1] == '(' {
-                    return None;
+                    // `$((…))` arithmetic is NOT a command substitution —
+                    // refuse (today's behavior; the structured Arith path
+                    // or the test-operand arm handles it).
+                    if i + 2 < b.len() && b[i + 2] == '(' {
+                        return None;
+                    }
+                    // `$(…)` command substitution as an arith operand
+                    // (`$(( $(wc -l < f) + 1 ))`): capture the balanced
+                    // span as one token (quotes/backslashes respected).
+                    // Unbalanced → refuse (today's behavior).
+                    let start = i;
+                    let mut depth = 0i64;
+                    let mut j = i + 1;
+                    while j < b.len() {
+                        let d = b[j];
+                        if d == '\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if d == '"' || d == '\'' {
+                            let q = d;
+                            j += 1;
+                            while j < b.len() && b[j] != q {
+                                if b[j] == '\\' {
+                                    j += 1;
+                                }
+                                j += 1;
+                            }
+                            j += 1;
+                            continue;
+                        }
+                        if d == '(' {
+                            depth += 1;
+                        } else if d == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    if depth != 0 || j > b.len() {
+                        return None;
+                    }
+                    out.push((b[start..j].iter().collect(), false));
+                    i = j;
+                    continue;
                 }
                 if i + 1 < b.len() && b[i + 1] == '{' {
                     let mut j = i + 2;
@@ -1816,6 +1863,14 @@ impl Render {
                         ))
                     }
                 }
+            }
+            MA::CmdSub(script) => {
+                // arith-embedded `$(…)` (`$(( $(wc -l < f) + 1 ))`): the
+                // child-bash capture seam, coerced numerically. Pure
+                // expression — no side stmts (callers splice the value
+                // inline, e.g. `echo` argv).
+                let env = self.env_lit();
+                Some((Vec::new(), format!("s2i(capRun({}, {env}))", Self::go_str(script))))
             }
         }
     }
@@ -8496,6 +8551,9 @@ enum MA {
     Cond(Box<MA>, Box<MA>, Box<MA>),
     Assign(String, String, Box<MA>),
     IncDec(String, i64, bool),
+    /// `$(…)` command substitution operand (the raw script text) —
+    /// captured via the child-bash seam, then coerced numerically.
+    CmdSub(String),
 }
 
 struct MAParser {
@@ -8727,6 +8785,15 @@ impl MAParser {
         }
         let (t, is_op) = self.next()?;
         if is_op {
+            return None;
+        }
+        // `$(…)` command-substitution operand (the tokenizer keeps the
+        // balanced span whole; `$((…))` never reaches here).
+        if let Some(rest) = t.strip_prefix("$(") {
+            if rest.ends_with(')') {
+                let inner = rest[..rest.len() - 1].to_string();
+                return Some(MA::CmdSub(inner));
+            }
             return None;
         }
         if let Some(n) = parse_arith_num(&t) {
