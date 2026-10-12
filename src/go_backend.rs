@@ -1287,10 +1287,15 @@ impl Render {
         }
         let fmt = self.printf_fmt(fmt_expr);
         let args: Vec<String> = items[1..].iter().map(|a| self.expr_str(a)).collect();
+        // command substitution strips trailing newlines (the format
+        // often ends with `\n`)
         Some(if args.is_empty() {
-            format!("bprintfStr({fmt})")
+            format!("strings.TrimRight(bprintfStr({fmt}), \"\\n\")")
         } else {
-            format!("bprintfStr({fmt}, {})", args.join(", "))
+            format!(
+                "strings.TrimRight(bprintfStr({fmt}, {}), \"\\n\")",
+                args.join(", ")
+            )
         })
     }
 
@@ -7903,7 +7908,9 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
     /// back to the bash child).
     fn echo_capture(&mut self, items: &[IrExpr]) -> Option<String> {
         let (s, _) = self.echo_capture_full(items)?;
-        Some(s)
+        // command substitution strips trailing newlines (`-e` may leave
+        // real ones in the value)
+        Some(format!("strings.TrimRight({s}, \"\\n\")"))
     }
 
     /// echo value + whether it ends with a newline (pipe input keeps it).
