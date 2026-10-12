@@ -2651,6 +2651,28 @@ impl Render {
         true
     }
 
+    /// Heredoc body → Go string expression. Quoted heredocs (`<<'EOF'`)
+    /// arrive literal; unquoted bodies (interpolate flag) expand.
+    /// Returns None for shapes needing the bash child.
+    fn heredoc_body(
+        &mut self,
+        content: &IrExpr,
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<String> {
+        let interp = redirects
+            .iter()
+            .any(|r| r.mode == "heredoc" && r.interpolate);
+        match content {
+            IrExpr::Str(text, _) => Some(if interp {
+                self.expand_str(text)
+            } else {
+                Self::go_str(text)
+            }),
+            IrExpr::Interpolate(_) => Some(self.expr_str(content)),
+            _ => None,
+        }
+    }
+
     /// A redirect object {fd, mode, target} → shell text `2>/dev/null`.
     fn redirect_text(&mut self, r: &IrExpr) -> Option<String> {
         let IrExpr::Object(props) = r else {
@@ -4463,15 +4485,70 @@ impl Render {
                 if self.redirect_mapfile(inner, redirects) {
                     return;
                 }
-                // heredoc into `cat` → print the content
+                // heredoc into `cat` → print the content (or write it
+                // when stdout itself is redirected: `cat <<EOF >f`)
                 if let Some(content) = heredoc_content(redirects) {
                     if is_single_cat(inner) {
-                        if let IrExpr::Str(text, _) = content {
-                            self.emit(&format!("fmt.Print({});", Self::go_str(text)));
-                            if self.need_st {
-                                self.emit("st = 0;");
+                        if let Some(src) = self.heredoc_body(content, redirects) {
+                            // stdout file redirect? (at most one; stderr
+                            // files are created empty — cat is quiet)
+                            let mut out_file: Option<(&crate::ir::IrRedirect)> = None;
+                            let mut ok = true;
+                            for r in redirects {
+                                if r.mode == "heredoc" || r.mode == "heredoc-tabs" {
+                                    continue;
+                                }
+                                match (r.fd.unwrap_or(1), r.mode.as_str()) {
+                                    (1, "w") | (1, "a") => {
+                                        if out_file.is_some() {
+                                            ok = false;
+                                            break;
+                                        }
+                                        out_file = Some(r);
+                                    }
+                                    (2, "w") | (2, "a") => {}
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
                             }
-                            return;
+                            if ok {
+                                self.flush_sides();
+                                // stderr files first (created empty)
+                                for r in redirects {
+                                    if matches!(r.fd.unwrap_or(1), 2)
+                                        && (r.mode == "w" || r.mode == "a")
+                                    {
+                                        let p = self.expr_str(&r.target);
+                                        self.emit(&format!(
+                                            "_ = os.WriteFile({p}, []byte{{}}, 0644);"
+                                        ));
+                                    }
+                                }
+                                match out_file {
+                                    None => {
+                                        self.emit(&format!("fmt.Print({src});"));
+                                    }
+                                    Some(r) => {
+                                        let p = self.expr_str(&r.target);
+                                        if r.mode == "a" {
+                                            let t = self.new_tmp();
+                                            self.emit(&format!(
+                                                "__f{t}, __e{t} := os.OpenFile({p}, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); if __e{t} == nil {{ __f{t}.WriteString({src}); __f{t}.Close() }}"
+                                            ));
+                                        } else {
+                                            self.emit(&format!(
+                                                "_ = os.WriteFile({p}, []byte({src}), 0644);"
+                                            ));
+                                        }
+                                    }
+                                }
+                                if self.need_st {
+                                    self.emit("st = 0;");
+                                }
+                                return;
+                            }
                         }
                     }
                 }
@@ -5612,6 +5689,21 @@ impl Render {
                         return;
                     }
                 }
+                // procsub-temp cleanup (`rm -f $__ps_tmpN`) runs without
+                // touching `$?` (see is_tmp_cleanup)
+                if let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                {
+                    if is_tmp_cleanup(cmd, items) {
+                        if let Some(argv) = self.argv_strings(items) {
+                            let mut parts = vec![Self::go_str(cmd)];
+                            parts.extend(argv);
+                            self.flush_sides();
+                            self.emit(&format!("_ = runCmd({})", exec_cmd_apply(&parts)));
+                            return;
+                        }
+                    }
+                }
                 if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
                     let mut parts = vec![cmd];
                     parts.extend(argv);
@@ -5822,6 +5914,16 @@ impl Render {
                 if self.functions.contains(c) {
                     self.call_function(c, &call_args);
                     return;
+                }
+                // procsub-temp cleanup keeps `$?` (see is_tmp_cleanup)
+                if is_tmp_cleanup(c, args) {
+                    if let Some(argv) = self.argv_strings(args) {
+                        let mut parts = vec![Self::go_str(c)];
+                        parts.extend(argv);
+                        self.flush_sides();
+                        self.emit(&format!("_ = runCmd({})", exec_cmd_apply(&parts)));
+                        return;
+                    }
                 }
             }
             let cmd_go = self.expr_str(cmd);
@@ -9063,6 +9165,50 @@ fn is_capture_words(e: &IrExpr) -> bool {
         if func == "captureWords" && matches!(args.first(), Some(IrExpr::Arrow(_))))
 }
 
+/// Procsub-temp cleanup (`rm -f $__ps_tmpN …`)? These must not clobber
+/// `$?` — the status belongs to the preceding user command (`diff …;
+/// echo "done: $?"` reads diff's code, not rm's). `rm -f` on temps is
+/// infallible for this purpose, so the cleanup runs discarding status.
+fn is_tmp_cleanup(cmd: &str, items: &[IrExpr]) -> bool {
+    if cmd != "rm" {
+        return false;
+    }
+    let mut saw_f = false;
+    let mut any_operand = false;
+    for it in items {
+        match it {
+            IrExpr::Str(s, _) => {
+                if s == "-f" || s == "-rf" || s == "-fr" {
+                    saw_f = true;
+                } else if s.starts_with('-') {
+                    return false;
+                } else if s.starts_with("__ps_tmp") {
+                    any_operand = true;
+                } else {
+                    return false;
+                }
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if n.starts_with("__ps_tmp") {
+                    any_operand = true;
+                } else {
+                    return false;
+                }
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) if n.starts_with("__ps_tmp") => {
+                        any_operand = true;
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    saw_f && any_operand
+}
+
 /// `$@`/`$*` as a whole-array value?
 fn is_listvar_at(e: &IrExpr) -> bool {
     matches!(e, IrExpr::Call { func, args }
@@ -10458,7 +10604,7 @@ const RUNTIME_HELPERS: &[&str] = &[
     "        if st > int64(runeLen(v)) { st = int64(runeLen(v)) }",
     "        if st < 0 { st = 0 }",
     "        rs := []rune(v)",
-    "        if len(args) < 2 { return string(rs[st:]) }",
+    "        if len(args) < 2 || strings.TrimSpace(args[1]) == \"\" { return string(rs[st:]) }",
     "        ln, _ := strconv.ParseInt(strings.TrimSpace(args[1]), 0, 64)",
     "        en := ln",
     "        if en < 0 { en = int64(len(rs)) + en } else { en = st + en }",
