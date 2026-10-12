@@ -715,10 +715,17 @@ impl Render {
                         return c;
                     }
                     // bash -c fallback for a test go can't parse natively
+                    // (honor the [[ kind — see the cmd_text test arm)
+                    let wrapped = match args.get(1) {
+                        Some(IrExpr::Str(k, _)) if k == "[[" => {
+                            format!("[[ {s} ]]")
+                        }
+                        _ => format!("[ {s} ]"),
+                    };
                     let env = self.env_lit();
                     return format!(
                         "(redirRun({}, {env}) == 0)",
-                        Self::go_str(&format!("[ {s} ]"))
+                        Self::go_str(&wrapped)
                     );
                 }
                 self.sh2_stub("test")
@@ -1908,9 +1915,15 @@ impl Render {
                         return c;
                     }
                     let env = self.env_lit();
+                    let wrapped = match args.get(1) {
+                        Some(IrExpr::Str(k, _)) if k == "[[" => {
+                            format!("[[ {s} ]]")
+                        }
+                        _ => format!("[ {s} ]"),
+                    };
                     return format!(
                         "(redirRun({}, {env}) == 0)",
-                        Self::go_str(&format!("[ {s} ]"))
+                        Self::go_str(&wrapped)
                     );
                 }
                 self.sh2_stub("test")
@@ -2473,6 +2486,178 @@ impl Render {
         }
         None
     }
+
+    /// `while IFS= read -r a b; do …; done < file` natively (the
+    /// fallback child can't see arrays, drops IFS, and mishandles
+    /// `[[ =~ ]]`). Only observations: file inputs (Str/Var paths),
+    /// `-r` reads into plain names, And-chained guards after the read.
+    /// Anything else refuses (the bash child keeps it).
+    fn stmt_while_read(
+        &mut self,
+        cond: &IrExpr,
+        body: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> bool {
+        // exactly one stdin-file redirect
+        let [r] = redirects else {
+            return false;
+        };
+        if r.fd.unwrap_or(0) != 0 || r.mode != "r" {
+            return false;
+        }
+        let path = match &r.target {
+            IrExpr::Str(s, _) => Self::go_str(s),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if !self.declared(n) {
+                    return false;
+                }
+                format!("s2s({})", self.ident_of(n))
+            }
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => {
+                    if !self.declared(n) {
+                        return false;
+                    }
+                    format!("s2s({})", self.ident_of(n))
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        // flatten a top-level And-chain (through single-Arrow blocks);
+        // the read must come first up to trivial `true`s, the rest are
+        // per-iteration entry guards
+        let mut operands: Vec<&IrExpr> = Vec::new();
+        if !flatten_and(cond, &mut operands) {
+            return false;
+        }
+        let mut read_idx: Option<usize> = None;
+        for (i, op) in operands.iter().enumerate() {
+            if is_read_call(op) {
+                read_idx = Some(i);
+                break;
+            }
+            if !is_true_call(op) {
+                return false;
+            }
+        }
+        let Some(ri) = read_idx else {
+            return false;
+        };
+        // parse the read call: flags + names + IFS env
+        let IrExpr::Call { func: _, args } = operands[ri] else {
+            return false;
+        };
+        let argv: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
+            _ => &[],
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut array_name: Option<String> = None;
+        let mut it = argv.iter().peekable();
+        while let Some(a) = it.next() {
+            match a {
+                IrExpr::Str(s, _) if s == "-r" || s == "-s" || s == "-e" => {}
+                IrExpr::Str(s, _) if s == "-p" => {
+                    // prompt (stderr-discarded): skip its argument
+                    if it.next().is_none() {
+                        return false;
+                    }
+                }
+                IrExpr::Str(s, _)
+                    if s == "-a" && array_name.is_none() && names.is_empty() =>
+                {
+                    match it.next() {
+                        Some(IrExpr::Str(nm, _)) => array_name = Some(nm.clone()),
+                        _ => return false,
+                    }
+                }
+                IrExpr::Str(s, _) => {
+                    if s.starts_with('-') || !is_plain_name(s) {
+                        return false;
+                    }
+                    names.push(s.clone());
+                }
+                _ => return false,
+            }
+        }
+        if array_name.is_some() && !names.is_empty() {
+            return false;
+        }
+        if array_name.is_none() && names.is_empty() {
+            return false;
+        }
+        // IFS from the call env (Object); default whitespace otherwise
+        let mut ifs_go = "\" \\t\\n\"".to_string();
+        if let Some(IrExpr::Object(props)) = args.get(2) {
+            for (k, v) in props {
+                if k == "IFS" {
+                    match v {
+                        IrExpr::Str(s, _) => {
+                            ifs_go = Self::go_str(s);
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        } else if args.len() > 2 {
+            return false;
+        }
+        // guards: remaining operands recombined as a test (rendered
+        // AFTER the loop vars are marked written, so reads use homes)
+        let guard_expr: Option<IrExpr> = {
+            if ri + 1 >= operands.len() {
+                None
+            } else {
+                let rest = &operands[ri + 1..];
+                let mut it = rest.iter();
+                let mut e = (*it.next().unwrap()).clone();
+                for r in it {
+                    e = IrExpr::BinOp {
+                        lhs: Box::new(e),
+                        op: crate::ir::BinOpKind::And,
+                        rhs: Box::new((*r).clone()),
+                    };
+                }
+                Some(e)
+            }
+        };
+        // emit the loop
+        self.flush_sides();
+        self.emit(&format!("for _, __wl := range readFileLines({path}) {{"));
+        self.loop_depth += 1;
+        self.depth += 1;
+        self.emit(&format!(
+            "__parts := readSplit(__wl, {ifs_go}, {});",
+            array_name.is_some() as usize + names.len()
+        ));
+        if let Some(arr) = array_name {
+            let m = self.go_ident(&arr);
+            self.mark_arr(&arr);
+            self.mark_written(&arr);
+            let sync = self.sync_inline(&arr);
+            self.emit(&format!("{m} = strsToAny(__parts);{sync}"));
+        } else {
+            for (i, nm) in names.iter().enumerate() {
+                let m = self.go_ident(nm);
+                self.mark_written(nm);
+                let sync = self.sync_inline(nm);
+                self.emit(&format!("{m} = s2s(__parts[{i}]);{sync}"));
+            }
+        }
+        if let Some(e) = guard_expr {
+            let g = self.expr_bool(&e);
+            self.emit(&format!("if !({g}) {{ break; }}"));
+        }
+        for s in body {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        self.loop_depth -= 1;
+        self.emit("}");
+        true
+    }
+
     /// stdout/stderr wired to the files. Returns false when the shape does
     /// not match (the caller falls through to the bash -c reconstruction
     /// or the stub). Only plain `>`/`>>` on fd 1/2 lower natively.
@@ -3604,7 +3789,13 @@ impl Render {
                     Some(IrExpr::Str(s, _)) => s.clone(),
                     _ => return None,
                 };
-                Some(format!("[ {s} ]"))
+                // second arg names the bracket kind (`[[` vs `[`) — a
+                // `=~` regex test must stay double-bracketed (`[ a=~b ]`
+                // tests a literal non-empty string, always true)
+                match args.get(1) {
+                    Some(IrExpr::Str(k, _)) if k == "[[" => Some(format!("[[ {s} ]]")),
+                    _ => Some(format!("[ {s} ]")),
+                }
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 let name = match args.first() {
@@ -4484,6 +4675,13 @@ impl Render {
                 // child-side array assignment is otherwise lost).
                 if self.redirect_mapfile(inner, redirects) {
                     return;
+                }
+                // `while IFS= read -r a b; do …; done < file` — the
+                // fallback child drops IFS and mishandles `[[ =~ ]]`
+                if let [IrStmt::While { cond, body }] = inner.as_slice() {
+                    if self.stmt_while_read(cond, body, redirects) {
+                        return;
+                    }
                 }
                 // heredoc into `cat` → print the content (or write it
                 // when stdout itself is redirected: `cat <<EOF >f`)
@@ -9209,6 +9407,50 @@ fn is_tmp_cleanup(cmd: &str, items: &[IrExpr]) -> bool {
     saw_f && any_operand
 }
 
+/// Flatten a top-level `&&` chain (through single-Arrow `block` calls
+/// used as conditions) into operand exprs.
+fn flatten_and<'a>(e: &'a IrExpr, out: &mut Vec<&'a IrExpr>) -> bool {
+    match e {
+        IrExpr::BinOp { lhs, op, rhs } if *op == crate::ir::BinOpKind::And => {
+            flatten_and(lhs, out) && flatten_and(rhs, out)
+        }
+        IrExpr::Call { func, args } if func == "block" => {
+            let Some(IrExpr::Arrow(body)) = args.first() else {
+                return false;
+            };
+            for s in body {
+                match s {
+                    IrStmt::Expr(inner) => {
+                        if !flatten_and(inner, out) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        }
+        _ => {
+            out.push(e);
+            true
+        }
+    }
+}
+
+/// A `read` builtin call (any argv — parsed by the caller)?
+fn is_read_call(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Call { func, args }
+        if (func == "builtin" || func == "exec")
+            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read"))
+}
+
+/// Trivially-true call (`true` / `:` — identity for `&&` chains)?
+fn is_true_call(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Call { func, args }
+        if (func == "builtin" || func == "exec")
+            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "true" || c == ":"))
+}
+
 /// `$@`/`$*` as a whole-array value?
 fn is_listvar_at(e: &IrExpr) -> bool {
     matches!(e, IrExpr::Call { func, args }
@@ -10177,6 +10419,60 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    parts := strings.Split(s, \"\\n\")",
     "    out := make([]any, len(parts))",
     "    for i, p := range parts { out[i] = p }",
+    "    return out",
+    "}",
+    "",
+    "// lines of a file for `while read` (empty lines PRESERVED — read",
+    "// still runs the body; only a missing/empty file yields nothing).",
+    "func readFileLines(path string) []string {",
+    "    data, err := os.ReadFile(path)",
+    "    if err != nil { return nil }",
+    "    s := string(data)",
+    "    if s == \"\" { return nil }",
+    "    s = strings.TrimSuffix(s, \"\\n\")",
+    "    return strings.Split(s, \"\\n\")",
+    "}",
+    "",
+    "// split a read line into exactly n fields (bash `read` rules with",
+    "// an IFS value: empty IFS gives the whole line to the first var;",
+    "// default whitespace collapses runs (tail spacing approximate); a",
+    "// single-char IFS splits exactly with empties kept and the tail",
+    "// intact; multi-char sets approximate like whitespace).",
+    "func readSplit(line, ifs string, n int) []string {",
+    "    out := make([]string, n)",
+    "    if n == 0 { return out }",
+    "    if ifs == \"\" {",
+    "        out[0] = line",
+    "        return out",
+    "    }",
+    "    if ifs == \" \\t\\n\" {",
+    "        fields := strings.Fields(line)",
+    "        for i := 0; i < n && i < len(fields); i++ { out[i] = fields[i] }",
+    "        if len(fields) > n {",
+    "            out[n-1] = strings.Join(fields[n-1:], \" \")",
+    "        }",
+    "        return out",
+    "    }",
+    "    if len(ifs) == 1 {",
+    "        if ifs[0] == ' ' || ifs[0] == '\\t' || ifs[0] == '\\n' {",
+    "            fields := strings.Fields(line)",
+    "            for i := 0; i < n && i < len(fields); i++ { out[i] = fields[i] }",
+    "            if len(fields) > n {",
+    "                out[n-1] = strings.Join(fields[n-1:], \" \")",
+    "            }",
+    "            return out",
+    "        }",
+    "        parts := strings.SplitN(line, ifs, n)",
+    "        copy(out, parts)",
+    "        return out",
+    "    }",
+    "    fields := strings.FieldsFunc(line, func(r rune) bool {",
+    "        return strings.ContainsRune(ifs, r)",
+    "    })",
+    "    for i := 0; i < n && i < len(fields); i++ { out[i] = fields[i] }",
+    "    if len(fields) > n {",
+    "        out[n-1] = strings.Join(fields[n-1:], string(ifs[0]))",
+    "    }",
     "    return out",
     "}",
     "",
