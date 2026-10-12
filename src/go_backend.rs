@@ -105,6 +105,11 @@ pub struct Render {
     in_func: usize,
     /// inside a `&` background body (`exit` ends the goroutine, not main)
     in_bg: usize,
+    /// current `trap '…' EXIT` body (re-trap replaces; empty/`-` clears).
+    /// Rendered at every process-exit point and at the end of main.
+    exit_trap: Vec<IrStmt>,
+    /// inside an EXIT-trap render (`exit` there must not re-fire traps).
+    in_exit_trap: bool,
     loop_depth: usize,
     /// break-target labels for open loops (`break` inside a `switch`
     /// must break the loop, not the switch — bash has no switch-break)
@@ -5123,6 +5128,7 @@ impl Render {
                     // `exit` in a background job ends the job, not main
                     self.emit("return;");
                 } else {
+                    self.emit_exit_traps();
                     self.emit("os.Exit(1);");
                 }
             }
@@ -6922,6 +6928,61 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
         self.mark_todo("exec stmt");
     }
 
+    /// `trap 'body' SIG…` — only EXIT bodies lower (rendered at every
+    /// process-exit point and at the end of main). Other signals stay
+    /// silent no-ops: an ERR trap with no failing command and an INT
+    /// trap with no signal never fire. The body parses as shell
+    /// (REFUSE > GUESS — unparseable stays silent); re-trapping EXIT
+    /// replaces, `trap ''/- EXIT` clears.
+    fn trap_builtin(&mut self, argv: &[IrExpr]) {
+        if self.need_st {
+            self.emit("st = 0;");
+        }
+        let mut it = argv.iter();
+        let body = match it.next() {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            _ => return,
+        };
+        let sigs: Vec<String> = it
+            .filter_map(|a| match a {
+                IrExpr::Str(s, _) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if sigs.is_empty() {
+            return;
+        }
+        if !sigs.iter().any(|s| s == "EXIT") {
+            return;
+        }
+        if body.is_empty() || body == "-" {
+            self.exit_trap.clear();
+            return;
+        }
+        let commands = match crate::Parser::new(&body).parse() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let prog = crate::shir::ast_to_ir(&commands);
+        self.exit_trap = prog.stmts;
+    }
+
+    /// Render the current EXIT-trap body (if any). Called at every
+    /// process-exit point and at the end of main; `exit` inside a trap
+    /// body exits directly (no re-fire).
+    fn emit_exit_traps(&mut self) {
+        if self.exit_trap.is_empty() || self.in_exit_trap {
+            return;
+        }
+        self.in_exit_trap = true;
+        let body = std::mem::take(&mut self.exit_trap);
+        for s in &body {
+            self.stmt(s);
+        }
+        self.exit_trap = body;
+        self.in_exit_trap = false;
+    }
+
     /// Builtin exec statements: echo/printf/exit/cd/let/local/… Returns
     /// true if handled.
     fn exec_builtin_stmt(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
@@ -6945,6 +7006,7 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                     self.expr_num(&argv[0])
                 };
                 self.flush_sides();
+                self.emit_exit_traps();
                 self.emit(&format!("os.Exit(int({code}));"));
                 true
             }
@@ -7190,7 +7252,11 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                 }
                 true
             }
-            "set" | "umask" | "trap" | "return" => true,
+            "set" | "umask" | "return" => true,
+            "trap" => {
+                self.trap_builtin(argv);
+                true
+            }
             "eval" => {
                 // eval 'code' — run the code in a bash -c child (native
                 // evaluation is impossible; the child inherits the written
@@ -8565,6 +8631,10 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                 }
             }
         }
+        // EXIT traps run as main returns — after the body, so the
+        // dead-var guard and st guard below account for trap-touched
+        // vars, and helper reachability sees the trap code.
+        self.emit_exit_traps();
         // dead-var guard: Go rejects declared-and-never-read variables
         let written: Vec<String> = self.written.iter().cloned().collect();
         for v in &written {

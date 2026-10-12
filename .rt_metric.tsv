@@ -1,0 +1,4 @@
+total	15668
+files	555
+per_file	28
+seam	\b(__sh_line|argsList|arrIdx|arrKeys|arrLen|arrSlice|assocVals|b2i|bEsc|bNum|bWidth|bfmtOnce|bprintf|bprintfStr|capCmd|capCmdRaw|capRun|cmpN|cond3|eEsc|expand|fileNewer|fileSame|fileTest|globArgs|globDotOK|globMatch|globRe|land|lnot|lor|pExp|pExpStr|pList|pRep|pStrip|pSuf|pVal|pValRaw|paramAt|powN|reMatch|readInto|readLines|redirRun|runCmd|runPipe|runeLen|s2i|s2s|setArrAt|truthy)\b
