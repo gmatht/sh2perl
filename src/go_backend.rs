@@ -2688,6 +2688,32 @@ impl Render {
         None
     }
 
+    /// `while read …; do …; done < file` in `whileLoop`-call form
+    /// (what pipelines lower the loop to — `stmt_while_read` covers the
+    /// `While` statement form): the same native readFileLines loop. The
+    /// loop status rides in `st` (last body status), matching the
+    /// statement form's convention. Anything else refuses (the bash
+    /// child keeps it).
+    fn redirect_while_call(
+        &mut self,
+        body: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> bool {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            return false;
+        };
+        if func != "whileLoop" {
+            return false;
+        }
+        let [IrExpr::Arrow(cond), IrExpr::Arrow(loop_body)] = args.as_slice() else {
+            return false;
+        };
+        let [IrStmt::Expr(cond_e)] = cond.as_slice() else {
+            return false;
+        };
+        self.stmt_while_read(cond_e, loop_body, redirects)
+    }
+
     /// `while IFS= read -r a b; do …; done < file` natively (the
     /// fallback child can't see arrays, drops IFS, and mishandles
     /// `[[ =~ ]]`). Only observations: file inputs (Str/Var paths),
@@ -4957,6 +4983,10 @@ impl Render {
                         return;
                     }
                 }
+                // same loop in `whileLoop`-call form (pipeline lowering).
+                if self.redirect_while_call(inner, redirects) {
+                    return;
+                }
                 // heredoc into `cat` → print the content (or write it
                 // when stdout itself is redirected: `cat <<EOF >f`)
                 if let Some(content) = heredoc_content(redirects) {
@@ -6569,6 +6599,35 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
                 self.need_st = true;
             }
             IrExpr::Call { func, args } if func == "redirect" => {
+                // `while read …; done < file` in `whileLoop`-call form
+                // (pipeline lowering) — native loop, status rides in st.
+                if let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+                    (args.first(), args.get(1))
+                {
+                    if redirs.len() == 1 {
+                        if let Some(r) = object_redirect(&redirs[0]) {
+                            // shape-check first (pure borrows), then flush:
+                            // the loop emits immediately, so pending sides
+                            // must precede it.
+                            let is_while = matches!(
+                                body.as_slice(),
+                                [IrStmt::Expr(IrExpr::Call { func, args })]
+                                if func == "whileLoop"
+                                    && matches!(
+                                        args.as_slice(),
+                                        [IrExpr::Arrow(_), IrExpr::Arrow(_)]
+                                    )
+                            );
+                            if is_while {
+                                self.flush_sides();
+                                if self.redirect_while_call(body, &[r]) {
+                                    self.need_st = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 let v = self.redirect_expr(args);
                 self.flush_sides();
                 self.emit(&format!("st = {v};"));
