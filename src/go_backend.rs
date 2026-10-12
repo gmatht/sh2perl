@@ -156,7 +156,40 @@ const GO_RESERVED: &[&str] = &[
     "nil",
     "fmt",
     "os",
+    "exec",
+    "bytes",
+    "bufio",
+    "io",
+    "filepath",
+    "regexp",
+    "sort",
+    "strconv",
+    "strings",
+    "sync",
+    "syscall",
+    "utf8",
+    "main",
     "error",
+    // Go builtins that must stay callable (append/len/… as a variable
+    // would shadow them and break helper code)
+    "append",
+    "cap",
+    "clear",
+    "close",
+    "complex",
+    "copy",
+    "delete",
+    "imag",
+    "len",
+    "make",
+    "max",
+    "min",
+    "new",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
     // runtime helpers / globals the preamble declares
     "st",
     "vars",
@@ -204,6 +237,31 @@ const GO_RESERVED: &[&str] = &[
     "pExpStr",
     "eEsc",
 ];
+
+/// Runtime helper/global names declared by the RUNTIME_HELPERS preamble
+/// (derived from the block itself so new helpers can never collide with
+/// user variables — the `exec`-shadowing build break).
+fn runtime_helper_names() -> &'static std::collections::HashSet<String> {
+    static ONCE: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        for line in RUNTIME_HELPERS {
+            if let Some(r) = line.strip_prefix("func ") {
+                if let Some(n) = r.split(['(', ' ']).next() {
+                    if !n.is_empty() {
+                        set.insert(n.to_string());
+                    }
+                }
+            } else if let Some(r) = line.strip_prefix("var ") {
+                if let Some(n) = r.split_whitespace().next() {
+                    set.insert(n.to_string());
+                }
+            }
+        }
+        set
+    })
+}
 
 /// Render an `IrProgram` to Go source (package main).
 pub fn shir_to_go(prog: &IrProgram) -> String {
@@ -283,7 +341,7 @@ impl Render {
         if m.is_empty() || m.chars().next().unwrap().is_ascii_digit() {
             m.insert_str(0, "v_");
         }
-        if GO_RESERVED.contains(&m.as_str()) {
+        if GO_RESERVED.contains(&m.as_str()) || runtime_helper_names().contains(&m) {
             m.push('_');
         }
         if m == "_" {
@@ -304,6 +362,13 @@ impl Render {
         let mut out = String::new();
         out.push('"');
         for c in s.chars() {
+            // byte-preserving markers (U+F800+byte, from the CLI's
+            // read_source): decode back to the raw byte (the C backend
+            // does the same with \xNN)
+            if (0xF800..=0xF8FF).contains(&(c as u32)) {
+                out.push_str(&format!("\\x{:02x}", (c as u32 - 0xF800) as u8));
+                continue;
+            }
             match c {
                 '\\' => out.push_str("\\\\"),
                 '"' => out.push_str("\\\""),
@@ -2049,6 +2114,20 @@ impl Render {
                 self.sides.push("fArgs = nil;".to_string());
                 self.need_st = true;
                 return "st".to_string();
+            }
+            // `exit N` in value position (`x=$(exit 1)`): terminate with
+            // the code — an external `exit` binary cannot exist
+            if cmd == "exit" {
+                let code = match args.get(1) {
+                    Some(IrExpr::Array(items)) => match items.first() {
+                        Some(p) => self.expr_num(p),
+                        None => "0".to_string(),
+                    },
+                    _ => "0".to_string(),
+                };
+                self.sides
+                    .push(format!("os.Exit(int({code}));"));
+                return "0".to_string();
             }
         }
         if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
@@ -5020,6 +5099,23 @@ impl Render {
                         return Some((
                             Vec::new(),
                             format!("b2i(os.Chdir({path}) != nil)"),
+                        ));
+                    }
+                    // `exit N` is a shell builtin — an external `exit`
+                    // binary cannot exist (the child would fail lookup and
+                    // the `|| exit` would never fire)
+                    if cmd == "exit" {
+                        let code = match args.get(1) {
+                            Some(IrExpr::Array(items)) => match items.first() {
+                                Some(p) => self.expr_num(p),
+                                None => "0".to_string(),
+                            },
+                            _ => "0".to_string(),
+                        };
+                        self.flush_sides();
+                        return Some((
+                            vec![format!("os.Exit(int({code}));")],
+                            "0".to_string(),
                         ));
                     }
                 }
