@@ -5252,14 +5252,64 @@ impl Render {
                 }
             }
             IrStmt::Background(b) => {
-                // true concurrency (bash runs `cmd &` asynchronously):
-                // the body runs in a goroutine, `wait` joins it. Shared
-                // homes are bash-visible mostly for sleeps/echoes (see
-                // limitations doc for the shared-vars caveat).
+                // bash forks `... &` with COPY semantics: the job runs on
+                // a snapshot, so its mutations never reach the parent.
+                // Homes the body writes become job-local shadows seeded
+                // from pre-spawn values (arrays keep shared backing, and
+                // function bodies still read parent globals — see the
+                // limitations doc).
+                let mut shadows: Vec<String> = Vec::new();
+                {
+                    let mut w = BTreeSet::new();
+                    let mut a = BTreeSet::new();
+                    collect_written(b, &mut w, &mut a);
+                    collect_builtin_writes(b, &mut w);
+                    for v in w {
+                        if self.declared(&v) && !self.is_arr(&v) {
+                            shadows.push(v);
+                        }
+                    }
+                }
+                let t = self.new_tmp();
+                for (i, v) in shadows.iter().enumerate() {
+                    let m = self.go_ident(v);
+                    self.emit(&format!("__bg{t}_{i} := {m};"));
+                    if self.need_vars {
+                        self.emit(&format!(
+                            "__bgv{t}_{i}, __bgok{t}_{i} := vars[{}];",
+                            Self::go_str(v)
+                        ));
+                    }
+                }
                 self.emit("__wg.Add(1);");
                 self.emit("go func() {");
                 self.depth += 1;
-                self.emit("defer __wg.Done();");
+                for (i, v) in shadows.iter().enumerate() {
+                    let m = self.go_ident(v);
+                    // `_ =` silences Go's unused error when the body only
+                    // writes the shadow (reads make it redundant, harmless).
+                    self.emit(&format!("{m} := __bg{t}_{i}; _ = {m};"));
+                }
+                // the job's vars-map syncs must not escape either: restore
+                // the parent's entries when the job ends (sequential
+                // spawn/wait programs — the corpus shape — are exact;
+                // concurrent parent+job writes to one var race in bash too).
+                if self.need_vars && !shadows.is_empty() {
+                    let mut rs = Vec::new();
+                    for (i, v) in shadows.iter().enumerate() {
+                        rs.push(format!(
+                            "if __bgok{t}_{i} {{ vars[{}] = __bgv{t}_{i} }} else {{ delete(vars, {}) }}",
+                            Self::go_str(v),
+                            Self::go_str(v)
+                        ));
+                    }
+                    self.emit(&format!(
+                        "defer func() {{ {}; __wg.Done() }}();",
+                        rs.join("; ")
+                    ));
+                } else {
+                    self.emit("defer __wg.Done();");
+                }
                 self.in_bg += 1;
                 for s in b {
                     self.stmt(s);

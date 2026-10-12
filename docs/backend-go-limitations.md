@@ -102,9 +102,12 @@ single-assign `eval` lower natively instead).
   element targets, and use-before-define inside not-yet-rendered
   closures fall back to plain homes).
 - `wait pid` waits for ALL background jobs; `wait -n` waits for all.
-- Background bodies share homes (no subshell snapshot); concurrent
-  map access with assigning bodies could race (corpus bodies are
-  sleep/echo).
+- Background bodies run on job-local shadows of the scalar homes they
+  write (bash fork-copy semantics for the sequential spawn/wait shape);
+  still shared: array backing, function bodies (they read parent
+  globals), the environ, and the vars map between spawn and job end
+  (restored at job end). Concurrent parent+job writes to one var race
+  in bash too.
 - `$(exit N)` in capture position assigns empty and continues (bash
   exits); `break`/`continue` levels (`break 2`) lower as level 1.
 - `select`, coprocessors, `~user/` tildes, terminal/job-control
