@@ -7796,9 +7796,82 @@ fn walk_downgrade_arith(&self, a: &ArithAst, cands: &mut Vec<String>) {
     }
 
     /// A for-iter → static element list or a runtime slice.
+    /// for-list words → a runtime glob-expanding list, when any word is
+    /// a glob (an SH2GLOB-marked Str or a brace expansion containing
+    /// one). None = no glob words (the caller uses the static path) or
+    /// a shape the static path handles dynamically (param/listVar/…),
+    /// which keeps today's behavior for those lists. Literals fold
+    /// into `[]string{…}` groups joined with the globs by nested
+    /// append (Go cannot mix fixed elements and `...` spreads in one
+    /// append call). Unmatched patterns stay literal — `globArgs`
+    /// already implements bash's default (non-nullglob) rule.
+    fn for_list_glob(&mut self, items: &[IrExpr]) -> Option<ForList> {
+        enum Word {
+            Lit(String),
+            Glob(String),
+        }
+        let mut words: Vec<Word> = Vec::new();
+        for it in items {
+            match it {
+                IrExpr::Str(s, _) => {
+                    if s.contains(SH2GLOB_MARK) {
+                        words.push(Word::Glob(s.replace(SH2GLOB_MARK, "")));
+                    } else {
+                        words.push(Word::Lit(s.clone()));
+                    }
+                }
+                IrExpr::Call { func, args } if func == "brace" => {
+                    let expanded = self.brace_expand(args)?;
+                    for s in expanded {
+                        if s.contains(SH2GLOB_MARK) {
+                            words.push(Word::Glob(s.replace(SH2GLOB_MARK, "")));
+                        } else {
+                            words.push(Word::Lit(s));
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !words.iter().any(|w| matches!(w, Word::Glob(_))) {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut lits: Vec<String> = Vec::new();
+        for w in words {
+            match w {
+                Word::Lit(s) => lits.push(Self::go_str(&s)),
+                Word::Glob(p) => {
+                    if !lits.is_empty() {
+                        parts.push(format!("[]string{{{}}}", std::mem::take(&mut lits).join(", ")));
+                    }
+                    parts.push(format!("globArgs({})", Self::go_str(&p)));
+                }
+            }
+        }
+        if !lits.is_empty() {
+            parts.push(format!("[]string{{{}}}", lits.join(", ")));
+        }
+        let mut acc = parts.pop().unwrap();
+        while let Some(p) = parts.pop() {
+            acc = format!("append({p}, {acc}...)");
+        }
+        let t = self.new_tmp();
+        Some(ForList::Runtime {
+            pre: format!("{t} := {acc};"),
+            slice: t,
+        })
+    }
+
     fn for_list(&mut self, iter: &IrExpr) -> Option<ForList> {
         match iter {
             IrExpr::Array(items) => {
+                // glob words (bare `*.txt` or brace expansions carrying
+                // the SH2GLOB marker) expand at RUNTIME via globArgs —
+                // the static path below would freeze them literally.
+                if let Some(rt) = self.for_list_glob(items) {
+                    return Some(rt);
+                }
                 let mut out = Vec::new();
                 for it in items {
                     if let IrExpr::Call { func, args } = it {
@@ -9062,6 +9135,10 @@ fn has_glob(s: &str) -> bool {
 fn strip_sh2glob(s: &str) -> String {
     s.strip_prefix("\u{1}SH2GLOB\u{1}").unwrap_or(s).to_string()
 }
+
+/// The SH2GLOB marker as a constant (for `contains` checks mid-word —
+/// `strip_sh2glob` only strips the prefix).
+const SH2GLOB_MARK: &str = "\u{1}SH2GLOB\u{1}";
 
 /// Extglob `!(X)` at the pattern start → (inner, literal rest).
 fn extglob_not(s: &str) -> Option<(String, String)> {
