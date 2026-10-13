@@ -406,18 +406,25 @@ static void ov_corners(double cx, double cy, double wfrac, double hfrac,
     ndc_to_px(cx, cy, &px, &py);
     /* w and h are the FULL extents as a FRACTION of the canvas, not
      * half-extents. The game's own numbers decide it: the radar is 16
-     * cells wide at CELL_W = 0.040, and 16 * 0.040 = 0.64 — a radar
-     * that covers 64% of the screen's width, which is what the game
-     * draws. Read as a half-extent the same 16 cells would be 1.28
-     * screens wide and every one of them would run off the right edge.
+     * cells at CELL_W = 0.040 on a 44-milli pitch, and 16 cells span
+     * 16 * 0.044 = 0.704 NDC units = 0.352 of the canvas width — the
+     * radar the game draws (x = 13..125 on a 320 canvas). Read as a
+     * half-extent the same 16 cells would span twice that and every
+     * second cell would swallow its neighbour.
      *
-     * So the size is `frac * S_w` across, and the corners are
-     * centre +/- half of THAT. This is the one field whose meaning
-     * cannot be guessed from its name: a half-extent reading is
-     * self-consistent and draws a plausible-looking, twice-as-large
-     * HUD, and the difference is only visible by counting cells. */
-    hw = wfrac * S_w * 0.5;
-    hh = hfrac * S_h * 0.5;
+     * NDC -1..1 maps to S_w px, so a fraction f covers f/2 * S_w px
+     * across, and the corners are centre +/- half of THAT:
+     * hw = f * S_w / 4. The previous revision used f * S_w / 2 — the
+     * full width as the half-extent — painting every overlay quad
+     * twice as wide AND twice as tall: 13px text cells on a 5px
+     * pitch (neighbours overlapped, counters closed, digits bold),
+     * a 50px gun barrel against the oracle's 22, a 205px radar
+     * against its 112. The oracle's canvas fills (w/2 halves of the
+     * full px width) are the ground truth; the old comment's "0.64
+     * of the canvas" made the same NDC-vs-fraction error (0.64 NDC
+     * units is 0.32 of the canvas, not 0.64). */
+    hw = wfrac * S_w * 0.25;
+    hh = hfrac * S_h * 0.25;
     rad = deg * 3.14159265358979323846 / 180.0;
     ca = cos(rad);
     sa = sin(rad);

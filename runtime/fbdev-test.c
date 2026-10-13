@@ -785,11 +785,16 @@ static void t_frag(void) {
  *   COMPOSITED   over the world, not under it.
  *
  * THE SIZE IS THE GAME'S OWN, and it settles the one field whose
- * meaning cannot be guessed from its name: the radar is 16 cells of
- * CELL_W = 0.040, so 16 x 0.040 = 0.64 of the canvas and w is the FULL
- * extent as a fraction. Read as a half-extent the same radar is 1.28
- * screens wide and every cell runs off the right edge — a HUD that
- * looks entirely plausible and is twice the size.
+ * meaning cannot be guessed from its name: the radar is 16 cells on a
+ * 44-milli pitch, so 16 x 0.044 = 0.704 NDC units = 0.352 of the canvas
+ * (x = 13..125 on a 320 canvas), and w is the FULL extent as a
+ * fraction. An earlier revision read the same numbers as twice the
+ * size (a 0.040-wide cell painted 13 px, a 50 px gun barrel against
+ * the oracle's 22, neighbours overlapping until the digits read bold)
+ * because the corners took the full px width as the HALF-extent — a
+ * half-extent reading is self-consistent and draws a
+ * plausible-looking, twice-as-large HUD, and the difference is only
+ * visible by counting cells against the oracle.
  */
 static void t_overlay(void) {
     int x, y, n, r, g, b;
@@ -820,8 +825,12 @@ static void t_overlay(void) {
                 if (y < y0) y0 = y; if (y > y1) y1 = y;
             }
         }
-    ckr(x1 - x0 + 1, 13, "a 0.040-wide cell is 13 px on a 320 canvas");
-    ck(n > 150 && n < 280, "and a 0.056-tall cell is roughly 13x13");
+    /* NDC -1..1 maps to the canvas, so a 0.040 fraction covers
+     * 0.040/2*320 = 6.4 px across: corners at centre +/- 3.2 round to
+     * a 6..7 px cell. The old expectation (13 px) baked in the
+     * twice-as-large corner bug the comment above describes. */
+    ckr(x1 - x0 + 1, 7, "a 0.040-wide cell is ~6.4 px on a 320 canvas");
+    ck(n > 40 && n < 80, "and a 0.056-tall cell is roughly 6x7");
     /* cy = 0.5 IS THE TOP OF THE SCREEN, because +y is up in NDC and
      * down in a row. The first version of this check probed the
      * middle of the canvas and called it a failure; the cell was
@@ -851,7 +860,7 @@ static void t_overlay(void) {
      * is the property that matters, because the game's rm[] arrays
      * erase one radar square and redraw it. An erase of 0.016 was
      * tried first and covers only a third of the cell's width (w is the
-     * FULL extent, so 0.016 of a 320 canvas is 5 px of 13), which left
+     * FULL extent, so 0.016 of a 320 canvas is ~2.6 px of ~6.4), which left
      * the centre pixel red and read as a device that ignored the
      * record.
      *
@@ -909,7 +918,11 @@ static void t_overlay(void) {
         }
     ck((x1 - x0) < (y1 - y0),
        "a bar rotated 90 degrees is TALLER than it is wide");
-    ck((y1 - y0) > 100, "and about as long as it was wide (0.4*320 = 128)");
+    /* a 0.4 fraction covers 0.4/2*320 = 64 px across (the old comment
+     * said 0.4*320 = 128 — the same NDC-vs-fraction doubling the
+     * corners had). */
+    ck((y1 - y0) > 50 && (y1 - y0) < 80,
+       "and about as long as it was wide (0.4/2*320 = 64)");
 
     /* THE FLASH LAYER IS GONE AFTER THE PRESENT: the game writes the
      * muzzle flash only while it is lit and simply stops, so a flash
