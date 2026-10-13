@@ -1100,7 +1100,7 @@ fn select_vec_arrays(
 /// in i64 ones.
 fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
     use crate::ir::{IrExpr, IrStmt};
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     fn numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
         match e {
             IrExpr::Int(_) | IrExpr::Arith(_) => true,
@@ -1212,7 +1212,7 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
     if int_set.is_empty() {
         return;
     }
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     fn is_numeric(e: &IrExpr, ints: &HashSet<String>, int_arrays: &HashSet<String>) -> bool {
         match e {
             IrExpr::Int(_) => true,
@@ -1245,6 +1245,17 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
             // (`_min_xs = min(xs)`); over a string array it is a string
             // (Python min of strings is lexicographic), so only int-homed.
             IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                match crate::c_backend::Render::str_arg(args, 0) {
+                    Some(n) => int_arrays.contains(&n),
+                    None => false,
+                }
+            }
+            // a single-element read of an INT-homed array computes an
+            // int (the native slot value — see the `expr_as_num`
+            // arrayIndex arm, which renders it without any string
+            // round-trip). Over a string array it is decimal text that
+            // must be re-parsed, so only int-homed.
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
                 match crate::c_backend::Render::str_arg(args, 0) {
                     Some(n) => int_arrays.contains(&n),
                     None => false,
@@ -1494,6 +1505,2062 @@ fn arith_divisors(a: &crate::ir::ArithAst, out: &mut Vec<crate::ir::ArithAst>) {
     }
 }
 
+
+/// Int-element arrays (C-backend-local): arrays whose every store is
+/// int-domain, that are densely initialized, and whose every element
+/// read is in int position. Such arrays home as native `long long[]`
+/// AND their element-readers type as `long long`, so the per-pixel
+/// loop does direct integer loads instead of `_sh_arr_get` + `strdup`
+/// + `atoll` per access.
+///
+/// WHY THIS EXISTS: the shared `analyze_int_arrays` marks EVERY
+/// `arrayIndex` read as a string read ("conservatively"), which vetoes
+/// native homing for any array ever indexed — including polygon/texture
+/// buffers that are only ever read numerically. The readers then stay
+/// `char*` too (no Int verdict can flow through a string copy), so the
+/// hot loop re-parses every coordinate with `atoll` per pixel.
+///
+/// SOUNDNESS (each condition load-bearing):
+/// - int-domain stores: every stored value is an integer expression
+///   (literals, any arith — a div/mod abort stores nothing, so the
+///   stored value is always an integer — canonical-`Str`, or a Var /
+///   `getVar` of an Int-seeded var). The native slot then holds exactly
+///   the value bash would store.
+/// - dense init, two classes. Class D: a literal `setArray` covers
+///   indices 0..N-1 (all literals agree on N), no appends, no
+///   whole-array reassignment, no `unset`. Constant store keys satisfy
+///   0 <= k < N. `$var` store keys sit under an enclosing `[ $k -lt N ]`
+///   / `[ $k -le N-1 ]` guard (per store site) and the key is proven
+///   non-negative (zero-init plus only `+1` increments — the
+///   polygon-buffer cursor shape). Without all three, a store could
+///   land past `len` and leave realloc-garbage holes below it (bash
+///   would read `""` there). Class A: a seed literal plus append-only
+///   growth (appends land exactly at `len`, extending contiguously, so
+///   no holes ever form), no indexed stores at all.
+/// - int-position reads: inside `Arith`, an array key/index, a
+///   `min|max|sum` arg, a pure-numeric `test` operand, or a `v = A[k]`
+///   copy whose target `v` seeds Int (see below). A read anywhere else
+///   (echo, message building, a join) vetoes — joins need `char**`
+///   (`_sh_join_arr` takes the raw store, so a native array would be a
+///   type error there).
+/// - OOB reads stay exact: the backend's len guard (`k < len ? el :
+///   `""`) yields `""`, and `atoll("") == 0` is what every int context
+///   observes — identical to bash. The `expr_as_num` arrayIndex arm
+///   renders exactly this (`... ? arr[k] : 0LL`).
+/// - reader seeding only ADDS `Int` verdicts that `demote_stringy_ints`
+///   (which runs after, with the new `is_numeric` arrayIndex arm)
+///   re-validates: any seed with a stringy assign is removed again.
+///   Seeds additionally require int-use-only (no string-position use
+///   anywhere, with positions propagated through `t = v` copies), so a
+///   runtime `""` (OOB read) can never reach a text observer as `"0"`.
+/// `SH2_NO_INT_ELEM=1` disables the whole pass (validation kill-switch).
+fn analyze_int_element_arrays(prog: &IrProgram) -> HashSet<String> {
+    if std::env::var("SH2_NO_INT_ELEM").as_deref() == Ok("1") {
+        return HashSet::new();
+    }
+    let (homed, _) = int_element_verdict(prog);
+    let shared = crate::shir::analyze_int_arrays(prog);
+    let out: HashSet<String> = homed.difference(&shared).cloned().collect();
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        let mut v: Vec<_> = out.iter().collect();
+        v.sort();
+        eprintln!("INT_ELEM homed: {:?}", v);
+    }
+    out
+}
+
+/// The full verdict: (newly-homed arrays, Int-seeded scalars). The homing
+/// here is the COMPLETE set (including arrays the shared analysis also
+/// homes); callers subtract as needed.
+/// Int-element arrays (C-backend-local): arrays whose every store is
+/// int-domain, that are densely initialized, and that are never read by
+/// a whole-array string operation. Such arrays home as native `long
+/// long[]` AND their element-readers type as `long long`, so the
+/// per-pixel loop does direct integer loads instead of `_sh_arr_get` +
+/// `strdup` + `atoll` per access.
+///
+/// WHY THIS EXISTS: the shared `analyze_int_arrays` marks EVERY
+/// `arrayIndex` read as a string read ("conservatively"), which vetoes
+/// native homing for any array ever indexed — including polygon/texture
+/// buffers that are only ever read numerically. The readers then stay
+/// `char*` too (no Int verdict can flow through a string copy), so the
+/// hot loop re-parses every coordinate with `atoll` per pixel.
+///
+/// SOUNDNESS (each condition load-bearing):
+/// - int-domain stores: every stored value always evaluates to a
+///   canonical integer whenever the store executes (literals, any arith
+///   — a div/mod abort stores nothing — canonical-`Str`, or a Var /
+///   `getVar` whose own assigns are all int-valued, recursively). The
+///   native slot then holds exactly the value bash would store.
+/// - dense init, two classes. Class D: a literal `setArray` covers
+///   indices 0..N-1 (all literals agree on N), no appends, no
+///   whole-array reassignment, no `unset`, no non-arithmetic keys.
+///   Constant store keys satisfy 0 <= k < N. `$var` store keys sit under
+///   an enclosing `[ $k -lt N ]` / `[ $k -le N-1 ]` guard (per store
+///   site) and the key is proven non-negative (zero-init plus only `+1`
+///   increments — the polygon-buffer cursor shape). Without all three,
+///   a store could land past `len` and leave realloc-garbage holes
+///   below it (bash would read `""` there). Class A: a seed literal
+///   plus append-only growth (appends land exactly at `len`, extending
+///   contiguously, so no holes ever form), no indexed stores at all.
+/// - reads: single-element reads NEVER veto (in any position — the
+///   backend renders them exactly from native storage: decimal text via
+///   `num_temp` for string contexts, the raw slot for numeric ones; an
+///   OOB read yields `""` in a string context and `0` in a numeric one,
+///   identical to bash in both). Only whole-array string operations
+///   veto — joins/slices/iteration need `char**` (`_sh_join_arr` takes
+///   the raw store, so a native array would be a type error there).
+/// - reader seeding only ADDS `Int` verdicts that `demote_stringy_ints`
+///   (which runs after, with the new `is_numeric` arrayIndex arm)
+///   re-validates: any seed with a stringy assign is removed again.
+///   Seeds additionally require int-use-only (no direct string-position
+///   use anywhere — copies are transparent, see below), so a runtime
+///   `""` (OOB read) can never reach a text observer as `"0"`.
+/// - copies are transparent: `t = v` constrains neither side's type.
+///   If `v` always holds a canonical integer (its assigns gate), then
+///   `t` observes the identical text/value whether `t` is `char*` or
+///   `long long` — the copy changes representation, never meaning.
+///   (The old design propagated string-ness through copies; that was
+///   backwards — observation does not dictate representation when all
+///   values are canonical.)
+/// `SH2_NO_INT_ELEM=1` disables the whole pass (validation kill-switch).
+fn json_expr(e: &IrExpr) -> String {
+    let s = format!("{:?}", e);
+    s.chars().take(220).collect()
+}
+fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
+    use crate::ir::{IrExpr, IrStmt};
+    // ---- pass 0: array names -------------------------------------------
+    let mut array_names: HashSet<String> = HashSet::new();
+    fn collect_arrays(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var);
+                        if crate::c_backend::is_ident(base) && t.var.contains('[') {
+                            out.insert(base.to_string());
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, .. } => {
+                    out.insert(var.clone());
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_arrays(then, out);
+                    for (_, b) in elsifs {
+                        collect_arrays(b, out);
+                    }
+                    collect_arrays(else_, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => collect_arrays(body, out),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect_arrays(init, out);
+                    collect_arrays(step, out);
+                    collect_arrays(body, out);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect_arrays(body, out);
+                    for (_, b) in named_blocks {
+                        collect_arrays(b, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect_arrays(body, out);
+                    for e in excepts {
+                        collect_arrays(&e.body, out);
+                    }
+                    collect_arrays(else_body, out);
+                    collect_arrays(finally_body, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_arrays(&c.body, out);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect_arrays(&c.body, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => collect_arrays(inner, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_arrays(st, out);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_arrays_expr(e, out)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_arrays_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+                for a in args {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Arrow(stmts) => collect_arrays(stmts, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        collect_arrays_expr(x, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_arrays(&prog.stmts, &mut array_names);
+    for sub in &prog.subs {
+        collect_arrays(&sub.body, &mut array_names);
+    }
+    // ---- pass 1: writes -------------------------------------------------
+    struct W {
+        lit_lens: Vec<usize>,
+        append: bool,
+        // dynamic store keys: "#N" for validated constants, var names
+        // for `$var` keys, plus an other-key veto flag.
+        dyn_keys: Vec<String>,
+        other_key: bool,
+        non_int_value: bool,
+        whole_reassign: bool,
+        unset_hit: bool,
+    }
+    let mut writes: HashMap<String, W> = HashMap::new();
+    let mut store_vals: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn wmut<'a>(writes: &'a mut HashMap<String, W>, a: &str) -> &'a mut W {
+        writes.entry(a.to_string()).or_insert(W {
+            lit_lens: Vec::new(),
+            append: false,
+            dyn_keys: Vec::new(),
+            other_key: false,
+            non_int_value: false,
+            whole_reassign: false,
+            unset_hit: false,
+        })
+    }
+    fn split_baked(t: &str) -> Option<(String, String)> {
+        let (base, rest) = t.split_once('[')?;
+        if !crate::c_backend::is_ident(base) {
+            return None;
+        }
+        let key = rest.strip_suffix(']')?.trim().to_string();
+        Some((base.to_string(), key))
+    }
+    enum Key {
+        Const(i64),
+        Var(String),
+        Other,
+    }
+    fn key_of(e: &IrExpr) -> Key {
+        match e {
+            IrExpr::Int(i) => Key::Const(*i),
+            IrExpr::Str(s, _) => {
+                let t = s.trim();
+                if let Ok(i) = t.parse::<i64>() {
+                    return Key::Const(i);
+                }
+                let v = t
+                    .strip_prefix('$')
+                    .unwrap_or(t)
+                    .trim_start_matches('{')
+                    .trim_end_matches('}');
+                if crate::c_backend::is_ident(v) {
+                    Key::Var(v.to_string())
+                } else {
+                    Key::Other
+                }
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Key::Var(n.clone()),
+            _ => Key::Other,
+        }
+    }
+    fn walk_w(
+        stmts: &[IrStmt],
+        writes: &mut HashMap<String, W>,
+        store_vals: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    // setArray/setArrayAppend hiding in the RHS first
+                    // (`A=(...)` / `A+=(...)` lower to Assign-of-call).
+                    walk_w_expr(expr, writes, store_vals);
+                    for t in targets {
+                        if !t.indices.is_empty() {
+                            let base = t.var.clone();
+                            if !crate::c_backend::is_ident(&base) {
+                                continue;
+                            }
+                            let w = wmut(writes, &base);
+                            store_vals.entry(base).or_default().push(expr.clone());
+                            match key_of(&t.indices[0]) {
+                                Key::Const(i) => {
+                                    if i < 0 {
+                                        w.other_key = true;
+                                    } else {
+                                        w.dyn_keys.push(format!("#{}", i));
+                                    }
+                                }
+                                Key::Var(v) => w.dyn_keys.push(v),
+                                Key::Other => w.other_key = true,
+                            }
+                        } else if let Some((b, k)) = split_baked(&t.var) {
+                            let w = wmut(writes, &b);
+                            store_vals.entry(b).or_default().push(expr.clone());
+                            match key_of(&IrExpr::Str(
+                                k,
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )) {
+                                Key::Const(i) => {
+                                    if i < 0 {
+                                        w.other_key = true;
+                                    } else {
+                                        w.dyn_keys.push(format!("#{}", i));
+                                    }
+                                }
+                                Key::Var(v) => w.dyn_keys.push(v),
+                                Key::Other => w.other_key = true,
+                            }
+                        } else if crate::c_backend::is_ident(&t.var) {
+                            // whole-var assign: an Array literal RHS is
+                            // a cover; a setArray/setArrayAppend call RHS
+                            // was already processed above (never a
+                            // reassignment); anything else destroys it.
+                            if let IrExpr::Array(items) = expr {
+                                let w = wmut(writes, &t.var);
+                                w.lit_lens.push(items.len());
+                                store_vals
+                                    .entry(t.var.clone())
+                                    .or_default()
+                                    .extend(items.iter().cloned());
+                            } else if !matches!(
+                                expr,
+                                IrExpr::Call { func, .. }
+                                    if func == "setArray" || func == "setArrayAppend"
+                            ) {
+                                wmut(writes, &t.var).whole_reassign = true;
+                            }
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let w = wmut(writes, var);
+                    w.lit_lens.push(elements.len());
+                    store_vals
+                        .entry(var.clone())
+                        .or_default()
+                        .extend(elements.iter().cloned());
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_w(then, writes, store_vals);
+                    for (_, b) in elsifs {
+                        walk_w(b, writes, store_vals);
+                    }
+                    walk_w(else_, writes, store_vals);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_w(body, writes, store_vals),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk_w(init, writes, store_vals);
+                    walk_w(step, writes, store_vals);
+                    walk_w(body, writes, store_vals);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk_w(body, writes, store_vals);
+                    for (_, b) in named_blocks {
+                        walk_w(b, writes, store_vals);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    walk_w(body, writes, store_vals);
+                    for e in excepts {
+                        walk_w(&e.body, writes, store_vals);
+                    }
+                    walk_w(else_body, writes, store_vals);
+                    walk_w(finally_body, writes, store_vals);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk_w(&c.body, writes, store_vals);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk_w(&c.body, writes, store_vals);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_w(inner, writes, store_vals),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk_w(st, writes, store_vals);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    walk_w_expr(e, writes, store_vals)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_w_expr(
+        e: &IrExpr,
+        writes: &mut HashMap<String, W>,
+        store_vals: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "setArray" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let w = wmut(writes, name);
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            w.lit_lens.push(items.len());
+                            store_vals
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(items.iter().cloned());
+                        } else {
+                            w.non_int_value = true;
+                        }
+                    }
+                } else if func == "setArrayAppend" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let w = wmut(writes, name);
+                        w.append = true;
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            store_vals
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(items.iter().cloned());
+                        } else {
+                            w.non_int_value = true;
+                        }
+                    }
+                } else if func == "exec" || func == "builtin" {
+                    // `unset A` / `unset A[i]` destroys cover / punches
+                    // holes. Narrow: first word `unset` + second word
+                    // naming a tracked array.
+                    if let Some(IrExpr::Str(c, _)) = args.first() {
+                        if c == "unset" {
+                            if let Some(IrExpr::Array(words)) = args.get(1) {
+                                for wd in words.iter().skip(1) {
+                                    if let IrExpr::Str(t, _) = wd {
+                                        let base = t
+                                            .split('[')
+                                            .next()
+                                            .unwrap_or(t)
+                                            .trim_start_matches("${")
+                                            .trim_start_matches('$');
+                                        let base = base
+                                            .trim_end_matches('}')
+                                            .split([':', '#', '%', '/'])
+                                            .next()
+                                            .unwrap_or(base);
+                                        if crate::c_backend::is_ident(base) {
+                                            wmut(writes, base).unset_hit = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    walk_w_expr(a, writes, store_vals);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_w_expr(it, writes, store_vals);
+                }
+            }
+            IrExpr::Arrow(stmts) => walk_w(stmts, writes, store_vals),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_w_expr(x, writes, store_vals);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk_w(&prog.stmts, &mut writes, &mut store_vals);
+    for sub in &prog.subs {
+        walk_w(&sub.body, &mut writes, &mut store_vals);
+    }
+    // ---- pass 2: uses ---------------------------------------------------
+    // Direct scalar uses (int vs string position) + whole-array string
+    // operations (joins/slices/iteration — the ONLY element-read veto).
+    // Single-element reads and scalar copies are position-transparent
+    // (see the module docs): they constrain nothing.
+    struct Uses {
+        int_use: HashSet<String>,
+        str_use: HashSet<String>,
+        str_read: HashSet<String>,
+        iterated: HashSet<String>,
+    }
+    let mut uses = Uses {
+        int_use: HashSet::new(),
+        str_use: HashSet::new(),
+        str_read: HashSet::new(),
+        iterated: HashSet::new(),
+    };
+    // Refs in a `test` text + whether the text reads text: pure numeric
+    // comparisons read numerically; anything else reads text.
+    fn test_refs(t: &str) -> (Vec<String>, bool) {
+        let mut all: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        let b = t.as_bytes();
+        while i < b.len() {
+            if b[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= b.len() {
+                break;
+            }
+            if b[i] == b'{' {
+                i += 1;
+                let st = i;
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                let inner = &t[st..i.min(b.len())];
+                let nm = inner
+                    .trim_start_matches(['#', '!'])
+                    .split(['[', ':', '-', '+', '#', '%', '/'])
+                    .next()
+                    .unwrap_or("");
+                if crate::c_backend::is_ident(nm) {
+                    all.push(nm.to_string());
+                }
+            } else {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if st != i && crate::c_backend::is_ident(&t[st..i]) {
+                    all.push(t[st..i].to_string());
+                }
+            }
+        }
+        let has_str = [
+            " -z ", "-n ", " = ", " != ", "=~", "-f ", "-d ", "-e ", "-s ", "-r ", "-w ",
+            "-x ", "-L ", "-h ", "-v ", "-R ",
+        ]
+        .iter()
+        .any(|op| t.contains(op))
+            || !(t.contains("-lt")
+                || t.contains("-le ")
+                || t.contains("-gt")
+                || t.contains("-ge ")
+                || t.contains("-eq")
+                || t.contains("-ne "));
+        (all, has_str)
+    }
+    fn walk_u_expr(e: &IrExpr, in_int: bool, u: &mut Uses, arrs: &HashSet<String>) {
+        match e {
+            IrExpr::Arith(a) => walk_u_arith(a, u, arrs),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if in_int {
+                    u.int_use.insert(n.clone());
+                } else {
+                    u.str_use.insert(n.clone());
+                }
+            }
+            IrExpr::Index { key, .. } => {
+                // `${A[i]}` value read: transparent in any position
+                // (exact from either storage). Only the key is
+                // arithmetic.
+                walk_u_expr(key, true, u, arrs);
+            }
+            IrExpr::Call { func, args } => {
+                if func == "arrayIndex" {
+                    // transparent (see module docs); key is arithmetic.
+                    for a in args.iter().skip(1) {
+                        walk_u_expr(a, true, u, arrs);
+                    }
+                    return;
+                }
+                if matches!(func.as_str(), "min" | "max" | "sum") {
+                    for a in args {
+                        walk_u_expr(a, true, u, arrs);
+                    }
+                    return;
+                }
+                if func == "arrayLen" {
+                    return;
+                }
+                if func == "getVar" {
+                    // `getVar(A)` of an array = element read, transparent
+                    // like arrayIndex (no mark either way).
+                    return;
+                }
+                if func == "test" {
+                    if let Some(IrExpr::Str(t, _)) = args.first() {
+                        let (refs, has_str) = test_refs(t);
+                        for r in &refs {
+                            if has_str {
+                                u.str_use.insert(r.clone());
+                            } else {
+                                u.int_use.insert(r.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+                // default: argv strings. Whole-array readers select here.
+                for a in args {
+                    if let IrExpr::Str(nm, _) = a {
+                        if func == "slice" || func == "arrayItems" || func == "listVar" {
+                            u.str_read.insert(nm.clone());
+                        }
+                        // arbitrary-precision elements CANNOT live in
+                        // long long[] (mirror of the shared
+                        // sortedBigintJoin arm): force char*.
+                        if func == "sortedBigintJoin" {
+                            u.str_read.insert(nm.clone());
+                        }
+                    }
+                    walk_u_expr(a, false, u, arrs);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_u_expr(it, in_int, u, arrs);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_u_expr(x, false, u, arrs);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_u_expr(lhs, in_int, u, arrs);
+                walk_u_expr(rhs, in_int, u, arrs);
+            }
+            IrExpr::Arrow(stmts) => walk_u_list(stmts, u, arrs),
+            IrExpr::Capture { expr, .. } => walk_u_expr(expr, false, u, arrs),
+            _ => {}
+        }
+    }
+    fn walk_u_arith(a: &ArithAst, u: &mut Uses, arrs: &HashSet<String>) {
+        match a {
+            ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                u.int_use.insert(n.clone());
+            }
+            ArithAst::Index { key, .. } => {
+                // arith subscript: transparent read, arithmetic key.
+                walk_u_arith(key, u, arrs);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_u_arith(lhs, u, arrs);
+                walk_u_arith(rhs, u, arrs);
+            }
+            ArithAst::Un { arg, .. } => walk_u_arith(arg, u, arrs),
+            ArithAst::Cond { test, then, else_ } => {
+                walk_u_arith(test, u, arrs);
+                walk_u_arith(then, u, arrs);
+                walk_u_arith(else_, u, arrs);
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                u.int_use.insert(var.clone());
+                walk_u_arith(rhs, u, arrs);
+            }
+            ArithAst::IncDec { var, .. } => {
+                u.int_use.insert(var.clone());
+            }
+            ArithAst::Cast { arg, .. } => walk_u_arith(arg, u, arrs),
+        }
+    }
+    fn walk_u_list(stmts: &[IrStmt], u: &mut Uses, arrs: &HashSet<String>) {
+        for s in stmts {
+            walk_u_stmt(s, u, arrs);
+        }
+    }
+    fn walk_u_stmt(s: &IrStmt, u: &mut Uses, arrs: &HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    for ix in &t.indices {
+                        walk_u_expr(ix, true, u, arrs);
+                    }
+                    if let Some((_, k)) = split_baked(&t.var) {
+                        let (refs, _) = test_refs(&k);
+                        for r in &refs {
+                            u.int_use.insert(r.clone());
+                        }
+                    }
+                }
+                walk_u_expr(expr, false, u, arrs);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_u_expr(e, false, u, arrs);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for el in elements {
+                    walk_u_expr(el, false, u, arrs);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(then, u, arrs);
+                for (c, b) in elsifs {
+                    walk_u_expr(c, false, u, arrs);
+                    walk_u_list(b, u, arrs);
+                }
+                walk_u_list(else_, u, arrs);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::For { iter, body, .. } => {
+                // by-value iteration records the array when visible.
+                if let IrExpr::Array(items) = iter {
+                    for it in items {
+                        if let IrExpr::Call { func, args } = it {
+                            if func == "param" {
+                                for a in args {
+                                    if let IrExpr::Str(nm, _) = a {
+                                        u.iterated.insert(nm.clone());
+                                    }
+                                    walk_u_expr(a, false, u, arrs);
+                                }
+                                continue;
+                            }
+                        }
+                        walk_u_expr(it, false, u, arrs);
+                    }
+                } else {
+                    walk_u_expr(iter, false, u, arrs);
+                }
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                walk_u_list(init, u, arrs);
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(step, u, arrs);
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                walk_u_list(body, u, arrs);
+                for (_, b) in named_blocks {
+                    walk_u_list(b, u, arrs);
+                }
+            }
+            IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => walk_u_list(body, u, arrs),
+            IrStmt::Redirect { inner, .. } => walk_u_list(inner, u, arrs),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_u_list(st, u, arrs);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_u_expr(discriminant, false, u, arrs);
+                for c in clauses {
+                    walk_u_list(&c.body, u, arrs);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    walk_u_list(&c.body, u, arrs);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                walk_u_list(body, u, arrs);
+                for e in excepts {
+                    walk_u_list(&e.body, u, arrs);
+                }
+                walk_u_list(else_body, u, arrs);
+                walk_u_list(finally_body, u, arrs);
+            }
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                walk_u_expr(e, false, u, arrs);
+            }
+            _ => {}
+        }
+    }
+    walk_u_list(&prog.stmts, &mut uses, &array_names);
+    for sub in &prog.subs {
+        walk_u_list(&sub.body, &mut uses, &array_names);
+    }
+    // ---- pass 3: scalar assigns -----------------------------------------
+    struct As {
+        rhs: Vec<IrExpr>,
+        in_copy: bool,
+    }
+    let mut assigns: HashMap<String, As> = HashMap::new();
+    fn collect_as(stmts: &[IrStmt], assigns: &mut HashMap<String, As>, in_copy: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && !t.var.contains('[') {
+                            let a = assigns.entry(t.var.clone()).or_insert(As {
+                                rhs: Vec::new(),
+                                in_copy: false,
+                            });
+                            a.rhs.push(expr.clone());
+                            a.in_copy |= in_copy;
+                        }
+                    }
+                    collect_as_expr(expr, assigns, in_copy);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for v in vars {
+                        let a = assigns.entry(v.name.clone()).or_insert(As {
+                            rhs: Vec::new(),
+                            in_copy: false,
+                        });
+                        if let Some(e) = init {
+                            a.rhs.push(e.clone());
+                        }
+                        a.in_copy |= in_copy;
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_as(then, assigns, in_copy);
+                    for (_, b) in elsifs {
+                        collect_as(b, assigns, in_copy);
+                    }
+                    collect_as(else_, assigns, in_copy);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect_as(body, assigns, in_copy),
+                IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    collect_as(body, assigns, true)
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect_as(init, assigns, in_copy);
+                    collect_as(step, assigns, in_copy);
+                    collect_as(body, assigns, in_copy);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect_as(body, assigns, in_copy);
+                    for (_, b) in named_blocks {
+                        collect_as(b, assigns, in_copy);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect_as(body, assigns, in_copy);
+                    for e in excepts {
+                        collect_as(&e.body, assigns, in_copy);
+                    }
+                    collect_as(else_body, assigns, in_copy);
+                    collect_as(finally_body, assigns, in_copy);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_as(&c.body, assigns, in_copy);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect_as(&c.body, assigns, in_copy);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => collect_as(inner, assigns, in_copy),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_as(st, assigns, in_copy);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_as_expr(e, assigns, in_copy)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_as_expr(e: &IrExpr, assigns: &mut HashMap<String, As>, in_copy: bool) {
+        match e {
+            IrExpr::Arrow(stmts) => collect_as(stmts, assigns, in_copy),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_as_expr(a, assigns, in_copy);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    collect_as_expr(a, assigns, in_copy);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_as(&prog.stmts, &mut assigns, false);
+    for sub in &prog.subs {
+        collect_as(&sub.body, &mut assigns, false);
+    }
+    // ---- pass 4: value-int, soundness, seeds -----------------------------
+    // value int-ness: an expression that always evaluates to a canonical
+    // integer whenever it produces a value. Arith counts WITH div/mod (a
+    // zero divisor aborts the expansion — no value is produced at all).
+    // Var/getVar recurse through assigns_numeric (cycle-guarded).
+    // arrayIndex/min/max/sum count when the array is structurally sound
+    // (its slots hold integers; an OOB read yields "" which every int
+    // context observes as 0 — and seeds additionally require no direct
+    // string use, so "" can never reach a text observer as "0").
+    fn val_int(
+        e: &IrExpr,
+        assigns: &HashMap<String, As>,
+        sound: &HashSet<String>,
+        big: &BTreeSet<String>,
+        visiting: &mut Vec<String>,
+    ) -> bool {
+        // bigint-tainted subtrees never fit long long[] slots: any
+        // bigint var/arith reference refuses (mirror of is_int_expr's
+        // big-gate).
+        if expr_refs_bigint(e, big) {
+            return false;
+        }
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            IrExpr::Str(s, _) => {
+                // canonical i64 text (is_int_expr's rule): all digits,
+                // no leading zeros, AND fits i64 (a 100-digit bigint is
+                // all digits but must never land in a long long slot).
+                let t = s.trim();
+                !t.is_empty()
+                    && t.strip_prefix('-').unwrap_or(t).bytes().all(|c| c.is_ascii_digit())
+                    && !(t.len() > 1 && (t.starts_with('0') || t.starts_with("-0")))
+                    && t.parse::<i64>().is_ok()
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if matches!(n.as_str(), "?" | "#" | "!" | "$") {
+                    return true;
+                }
+                assigns_numeric(n, assigns, sound, big, visiting)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Render::str_arg(args, 0).as_deref() {
+                    Some(n) => {
+                        if matches!(n, "?" | "#" | "!" | "$") {
+                            return true;
+                        }
+                        assigns_numeric(n, assigns, sound, big, visiting)
+                    }
+                    None => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            _ => false,
+        }
+    }
+    fn assigns_numeric(
+        v: &str,
+        assigns: &HashMap<String, As>,
+        sound: &HashSet<String>,
+        big: &BTreeSet<String>,
+        visiting: &mut Vec<String>,
+    ) -> bool {
+        if big.contains(v) {
+            return false;
+        }
+        if visiting.contains(&v.to_string()) {
+            return false;
+        }
+        let Some(a) = assigns.get(v) else { return false };
+        if a.rhs.is_empty() {
+            return false;
+        }
+        visiting.push(v.to_string());
+        let ok = a.rhs.iter().all(|e| val_int(e, assigns, sound, big, visiting));
+        visiting.pop();
+        ok
+    }
+    fn expr_refs_bigint(e: &IrExpr, big: &BTreeSet<String>) -> bool {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => big.contains(n),
+            IrExpr::Arith(a) => crate::shir::arith_refs_bigint(a, big),
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if big.contains(n))
+            }
+            IrExpr::Call { args, .. } => args.iter().any(|a| expr_refs_bigint(a, big)),
+            IrExpr::Array(items) => items.iter().any(|e| expr_refs_bigint(e, big)),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| {
+                matches!(p, crate::ir::InterpPart::Expr(x) if expr_refs_bigint(x, big))
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_refs_bigint(lhs, big) || expr_refs_bigint(rhs, big)
+            }
+            _ => false,
+        }
+    }
+    // non-negativity: zero-init plus only +1 increments (cursor shape),
+    // plus plain copies of proven-nonneg vars (the clip count handoff
+    // `rbf_np = rbf_m`). Cycle-guarded recursion.
+    fn proven_nonneg(var: &str, assigns: &HashMap<String, As>) -> bool {
+        fn go(
+            var: &str,
+            assigns: &HashMap<String, As>,
+            visiting: &mut Vec<String>,
+        ) -> bool {
+            if visiting.contains(&var.to_string()) {
+                return false;
+            }
+            let Some(a) = assigns.get(var) else { return false };
+            if a.rhs.is_empty() {
+                return false;
+            }
+            visiting.push(var.to_string());
+            let ok = a.rhs.iter().all(|e| match e {
+                IrExpr::Int(i) => *i >= 0,
+                IrExpr::Str(s, _) => matches!(s.trim().parse::<i64>(), Ok(n) if n >= 0),
+                IrExpr::Arith(x) => match x.as_ref() {
+                    ArithAst::Bin { op, lhs, rhs }
+                        if op == "+"
+                            && matches!(rhs.as_ref(), ArithAst::Num(1)) =>
+                    {
+                        matches!(lhs.as_ref(), ArithAst::Var(v) | ArithAst::Ident(v) if v == var)
+                    }
+                    ArithAst::Var(v) | ArithAst::Ident(v) => v == var,
+                    _ => false,
+                },
+                IrExpr::Var(w, _) | IrExpr::Ident(w) => {
+                    w == var || go(w, assigns, visiting)
+                }
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    match Render::str_arg(args, 0).as_deref() {
+                        Some(w) => w == var || go(w, assigns, visiting),
+                        None => false,
+                    }
+                }
+                _ => false,
+            });
+            visiting.pop();
+            ok
+        }
+        go(var, assigns, &mut Vec::new())
+    }
+    // per-site guard check: every dynamic indexed store A[$k] sits under
+    // an enclosing If/While guard proving $k < n (upper) — nonneg comes
+    // from `proven_nonneg` separately.
+    fn stores_guarded(prog: &IrProgram, arr: &str, var: &str, n: i64, globals: &HashMap<String, i64>) -> bool {
+        fn stmt_ok(
+            stmts: &[IrStmt],
+            guards: &HashMap<String, (Option<i64>, bool)>,
+            arr: &str,
+            var: &str,
+            n: i64,
+            globals: &HashMap<String, i64>,
+        ) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, .. } => {
+                        for t in targets {
+                            let (base, is_dyn) = if !t.indices.is_empty() {
+                                let dyn_key = !matches!(
+                                    key_of_ir(&t.indices[0]),
+                                    KeyOf::Const(_)
+                                );
+                                (t.var.clone(), dyn_key)
+                            } else if let Some((b, k)) = split_baked(&t.var) {
+                                let kk = k.trim().trim_start_matches('$').trim_start_matches('{').trim_end_matches('}');
+                                (b, kk == var)
+                            } else {
+                                continue;
+                            };
+                            if base != arr || !is_dyn {
+                                continue;
+                            }
+                            let covered = guards
+                                .get(var)
+                                .and_then(|(u, _)| *u)
+                                .map_or(false, |u| u <= n);
+                            if !covered {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard(cond, &mut g, globals);
+                        if !stmt_ok(then, &g, arr, var, n, globals) {
+                            return false;
+                        }
+                        for (c, b) in elsifs {
+                            let mut g2 = guards.clone();
+                            merge_guard(c, &mut g2, globals);
+                            if !stmt_ok(b, &g2, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                        if !stmt_ok(else_, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard(cond, &mut g, globals);
+                        if !stmt_ok(body, &g, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                        for (_, b) in named_blocks {
+                            if !stmt_ok(b, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        if !stmt_ok(init, guards, arr, var, n, globals)
+                            || !stmt_ok(step, guards, arr, var, n, globals)
+                            || !stmt_ok(body, guards, arr, var, n, globals)
+                        {
+                            return false;
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                        for e in excepts {
+                            if !stmt_ok(&e.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                        if !stmt_ok(else_body, guards, arr, var, n, globals)
+                            || !stmt_ok(finally_body, guards, arr, var, n, globals)
+                        {
+                            return false;
+                        }
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            if !stmt_ok(&c.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            if !stmt_ok(&c.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => {
+                        if !stmt_ok(inner, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            if !stmt_ok(st, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            true
+        }
+        let g0 = HashMap::new();
+        if !stmt_ok(&prog.stmts, &g0, arr, var, n, globals) {
+            return false;
+        }
+        for sub in &prog.subs {
+            if !stmt_ok(&sub.body, &g0, arr, var, n, globals) {
+                return false;
+            }
+        }
+        true
+    }
+    enum KeyOf {
+        Const(i64),
+        Other,
+    }
+    fn key_of_ir(e: &IrExpr) -> KeyOf {
+        match e {
+            IrExpr::Int(i) => KeyOf::Const(*i),
+            IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                Ok(i) => KeyOf::Const(i),
+                Err(_) => KeyOf::Other,
+            },
+            _ => KeyOf::Other,
+        }
+    }
+    fn merge_guard(cond: &IrExpr, g: &mut HashMap<String, (Option<i64>, bool)>, globals: &HashMap<String, i64>) {
+        let mut texts = Vec::new();
+        cond_texts(cond, &mut texts);
+        for t in &texts {
+            let mut i = 0usize;
+            let b = t.as_bytes();
+            let mut vars: Vec<String> = Vec::new();
+            while i < b.len() {
+                if b[i] != b'$' {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                if i < b.len() && b[i] == b'{' {
+                    i += 1;
+                    let st = i;
+                    while i < b.len() && b[i] != b'}' {
+                        i += 1;
+                    }
+                    let nm = t[st..i.min(b.len())].to_string();
+                    if crate::c_backend::is_ident(&nm) {
+                        vars.push(nm);
+                    }
+                } else {
+                    let st = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    if st != i {
+                        vars.push(t[st..i].to_string());
+                    }
+                }
+            }
+            for v in &vars {
+                if let Some((u, nn)) = guard_bound(t, v, globals) {
+                    let e = g.entry(v.clone()).or_insert((None, false));
+                    if let Some(nu) = u {
+                        e.0 = Some(e.0.map_or(nu, |x: i64| x.min(nu)));
+                    }
+                    e.1 |= nn;
+                }
+            }
+        }
+    }
+    fn cond_texts(e: &IrExpr, out: &mut Vec<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "test" => {
+                for a in args {
+                    if let IrExpr::Str(t, _) = a {
+                        out.push(t.clone());
+                    }
+                }
+            }
+            IrExpr::Arith(a) => cond_arith(a, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    cond_texts(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn cond_arith(a: &ArithAst, out: &mut Vec<String>) {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } if matches!(op.as_str(), "<" | "<=" | ">" | ">=") => {
+                out.push(format!("{} {} {}", arith_v(lhs), op, arith_v(rhs)));
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                cond_arith(lhs, out);
+                cond_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => cond_arith(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                cond_arith(test, out);
+                cond_arith(then, out);
+                cond_arith(else_, out);
+            }
+            _ => {}
+        }
+    }
+    fn arith_v(a: &ArithAst) -> String {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => format!("${}", n),
+            ArithAst::Num(n) => n.to_string(),
+            _ => String::new(),
+        }
+    }
+    // scan "$k" -lt N (and reflected N -gt "$k") in a cond text. Also
+    // resolves transitive var bounds: `$e -lt $np` takes np's global
+    // bound (counters whose every increment sits under a constant
+    // guard — see `global_upper`).
+    fn guard_bound(
+        text: &str,
+        var: &str,
+        globals: &HashMap<String, i64>,
+    ) -> Option<(Option<i64>, bool)> {
+        let mut upper: Option<i64> = None;
+        let mut nonneg = false;
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        let mut i = 0;
+        while i < toks.len() {
+            let tk = toks[i];
+            let is_ref = tk == format!("${}", var)
+                || tk == format!("${{{}}}", var)
+                || tk.trim_matches('"') == &format!("${}", var)
+                || tk.trim_matches('"') == &format!("${{{}}}", var)
+                || tk == var;
+            if is_ref {
+                let op = toks.get(i + 1).copied().unwrap_or("");
+                let rhs = toks.get(i + 2).copied().unwrap_or("");
+                // constant bound...
+                if let Ok(n) = rhs.trim_matches('"').parse::<i64>() {
+                    match op {
+                        "-lt" | "<" => upper = Some(upper.map_or(n, |u: i64| u.min(n))),
+                        "-le" | "<=" => upper = Some(upper.map_or(n + 1, |u: i64| u.min(n + 1))),
+                        "-ge" | ">=" => {
+                            if n <= 0 {
+                                nonneg = true;
+                            }
+                        }
+                        "-gt" | ">" => {
+                            if n < 0 {
+                                nonneg = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // ...or a transitively bounded var (`e < np`).
+                    let w = rhs.trim_matches('"').trim_start_matches('$').trim_start_matches('{').trim_end_matches('}');
+                    if (op == "-lt" || op == "<") && crate::c_backend::is_ident(w) {
+                        if let Some(&gn) = globals.get(w) {
+                            upper = Some(upper.map_or(gn, |u: i64| u.min(gn)));
+                        }
+                    }
+                }
+                if i >= 2 {
+                    let lop = toks[i - 1];
+                    let lhs = toks[i - 2];
+                    if let Ok(n) = lhs.trim_matches('"').parse::<i64>() {
+                        match lop {
+                            "-gt" | ">" => upper = Some(upper.map_or(n, |u: i64| u.min(n))),
+                            "-ge" | ">=" => {
+                                upper = Some(upper.map_or(n + 1, |u: i64| u.min(n + 1)))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if upper.is_none() && !nonneg {
+            return None;
+        }
+        Some((upper, nonneg))
+    }
+    // global upper bounds: var <= N when every init is a const <= N and
+    // every `v = v+1`-shaped increment sits under an enclosing `<N`
+    // guard (the cursor-counter shape: init 0, increment only while
+    // below the cover). Plain copies `v = w` resolve transitively
+    // through w's own bound (the clip count handoff `rbf_np = rbf_m`).
+    fn global_upper(prog: &IrProgram, assigns: &HashMap<String, As>) -> HashMap<String, i64> {
+        fn bound_of(
+            prog: &IrProgram,
+            v: &str,
+            assigns: &HashMap<String, As>,
+            visiting: &mut Vec<String>,
+        ) -> Option<i64> {
+            if visiting.contains(&v.to_string()) {
+                return None;
+            }
+            visiting.push(v.to_string());
+            let result = (|| {
+                let a = assigns.get(v)?;
+                if a.rhs.is_empty() || a.in_copy {
+                    return None;
+                }
+                let mut bound: Option<i64> = None;
+                for e in &a.rhs {
+                    match e {
+                        IrExpr::Int(i) => {
+                            if *i < 0 {
+                                return None;
+                            }
+                            bound = Some(bound.map_or(*i, |m: i64| m.max(*i)));
+                        }
+                        IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                            Ok(i) if i >= 0 => {
+                                bound = Some(bound.map_or(i, |m: i64| m.max(i)));
+                            }
+                            _ => return None,
+                        },
+                        IrExpr::Arith(x) => match x.as_ref() {
+                            ArithAst::Bin { op, lhs, rhs }
+                                if op == "+"
+                                    && matches!(rhs.as_ref(), ArithAst::Num(1))
+                                    && matches!(lhs.as_ref(), ArithAst::Var(w) | ArithAst::Ident(w) if w == v) =>
+                            {
+                                match guard_at_increments(prog, v) {
+                                    Some(n) => {
+                                        bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                    }
+                                    None => return None,
+                                }
+                            }
+                            _ => return None,
+                        },
+                        IrExpr::Var(w, _) | IrExpr::Ident(w) => {
+                            match bound_of(prog, w, assigns, visiting) {
+                                Some(n) => {
+                                    bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                }
+                                None => return None,
+                            }
+                        }
+                        IrExpr::Call { func, args } if func == "getVar" => {
+                            match Render::str_arg(args, 0).as_deref() {
+                                Some(w) => match bound_of(prog, w, assigns, visiting) {
+                                    Some(n) => {
+                                        bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                    }
+                                    None => return None,
+                                },
+                                None => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                bound
+            })();
+            visiting.pop();
+            result
+        }
+        let mut out = HashMap::new();
+        for v in assigns.keys() {
+            let mut visiting = Vec::new();
+            if let Some(n) = bound_of(prog, v, assigns, &mut visiting) {
+                out.insert(v.clone(), n);
+            }
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("4") {
+            for v in ["rbf_np", "rbf_e", "rbf_m", "rbf_k", "rbx_k", "rbx_idx", "rbc_tex"] {
+                let mut visiting = Vec::new();
+                eprintln!(
+                    "INT_ELEM bound {v} = {:?} guardsni={:?}",
+                    bound_of(prog, v, assigns, &mut visiting),
+                    guard_at_increments(prog, v)
+                );
+            }
+        }
+        out
+    }
+    // the tightest `<N` guard enclosing any `v = v+1` increment of v
+    // (None when an increment is unguarded or non-+1-shaped).
+    fn guard_at_increments(prog: &IrProgram, var: &str) -> Option<i64> {
+        fn is_inc(s: &IrStmt, var: &str) -> bool {
+            if let IrStmt::Assign { targets, expr, .. } = s {
+                if targets.len() == 1
+                    && targets[0].indices.is_empty()
+                    && !targets[0].var.contains('[')
+                    && targets[0].var == var
+                {
+                    if let IrExpr::Arith(x) = expr {
+                        if let ArithAst::Bin { op, lhs, rhs } = x.as_ref() {
+                            return op == "+"
+                                && matches!(rhs.as_ref(), ArithAst::Num(1))
+                                && matches!(lhs.as_ref(), ArithAst::Var(w) | ArithAst::Ident(w) if w == var);
+                        }
+                    }
+                }
+            }
+            false
+        }
+        fn scan(
+            stmts: &[IrStmt],
+            guards: &HashMap<String, (Option<i64>, bool)>,
+            var: &str,
+            best: &mut Option<i64>,
+            ok: &mut bool,
+        ) {
+            for s in stmts {
+                if is_inc(s, var) {
+                    match guards.get(var).and_then(|(u, _)| *u) {
+                        Some(n) => {
+                            *best = Some(best.map_or(n, |m: i64| m.min(n)));
+                        }
+                        None => {
+                            *ok = false;
+                            return;
+                        }
+                    }
+                }
+                match s {
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard0(cond, &mut g);
+                        scan(then, &g, var, best, ok);
+                        for (c, b) in elsifs {
+                            let mut g2 = guards.clone();
+                            merge_guard0(c, &mut g2);
+                            scan(b, &g2, var, best, ok);
+                        }
+                        scan(else_, guards, var, best, ok);
+                    }
+                    IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard0(cond, &mut g);
+                        scan(body, &g, var, best, ok);
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        scan(body, guards, var, best, ok);
+                        for (_, b) in named_blocks {
+                            scan(b, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => scan(body, guards, var, best, ok),
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        scan(init, guards, var, best, ok);
+                        scan(step, guards, var, best, ok);
+                        scan(body, guards, var, best, ok);
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        scan(body, guards, var, best, ok);
+                        for e in excepts {
+                            scan(&e.body, guards, var, best, ok);
+                        }
+                        scan(else_body, guards, var, best, ok);
+                        scan(finally_body, guards, var, best, ok);
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            scan(&c.body, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            scan(&c.body, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => scan(inner, guards, var, best, ok),
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            scan(st, guards, var, best, ok);
+                        }
+                    }
+                    _ => {}
+                }
+                if !*ok {
+                    return;
+                }
+            }
+        }
+        // guard merge without transitive globals (one level: increment
+        // guards name constants in this codebase's cursor loops).
+        fn merge_guard0(cond: &IrExpr, g: &mut HashMap<String, (Option<i64>, bool)>) {
+            let mut texts = Vec::new();
+            cond_texts(cond, &mut texts);
+            for t in &texts {
+                let mut i = 0usize;
+                let b = t.as_bytes();
+                let mut vars: Vec<String> = Vec::new();
+                while i < b.len() {
+                    if b[i] != b'$' {
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    if i < b.len() && b[i] == b'{' {
+                        i += 1;
+                        let st = i;
+                        while i < b.len() && b[i] != b'}' {
+                            i += 1;
+                        }
+                        let nm = t[st..i.min(b.len())].to_string();
+                        if crate::c_backend::is_ident(&nm) {
+                            vars.push(nm);
+                        }
+                    } else {
+                        let st = i;
+                        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                            i += 1;
+                        }
+                        if st != i {
+                            vars.push(t[st..i].to_string());
+                        }
+                    }
+                }
+                for v in &vars {
+                    // constant-only (no transitivity here by design).
+                    let mut upper: Option<i64> = None;
+                    let toks: Vec<&str> = t.split_whitespace().collect();
+                    let mut i = 0;
+                    while i < toks.len() {
+                        let tk = toks[i];
+                        let is_ref = tk == format!("${}", v)
+                            || tk == format!("${{{}}}", v)
+                            || tk.trim_matches('"') == &format!("${}", v)
+                            || tk.trim_matches('"') == &format!("${{{}}}", v)
+                            || tk == *v;
+                        if is_ref {
+                            let op = toks.get(i + 1).copied().unwrap_or("");
+                            let rhs = toks.get(i + 2).copied().unwrap_or("");
+                            if let Ok(n) = rhs.trim_matches('"').parse::<i64>() {
+                                match op {
+                                    "-lt" | "<" => {
+                                        upper = Some(upper.map_or(n, |u: i64| u.min(n)))
+                                    }
+                                    "-le" | "<=" => {
+                                        upper =
+                                            Some(upper.map_or(n + 1, |u: i64| u.min(n + 1)))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    if let Some(nu) = upper {
+                        let e = g.entry(v.clone()).or_insert((None, false));
+                        e.0 = Some(e.0.map_or(nu, |x: i64| x.min(nu)));
+                    }
+                }
+            }
+        }
+        let g0 = HashMap::new();
+        let mut best: Option<i64> = None;
+        let mut ok = true;
+        scan(&prog.stmts, &g0, var, &mut best, &mut ok);
+        for sub in &prog.subs {
+            scan(&sub.body, &g0, var, &mut best, &mut ok);
+        }
+        if ok {
+            best
+        } else {
+            None
+        }
+    }
+    let globals = global_upper(prog, &assigns);
+    // ---- pass 5: int-writes (greatest fixpoint), soundness, seeds -------
+    let big = crate::shir::analyze_bigint_vars(prog);
+    // int-writes(A): every store to A is int-valued. arrayIndex(B) leaves
+    // need int-writes(B) — which is mutually recursive for copyback pairs
+    // (`P[e] = Q[e]` + `Q[m] = P[e]`: values originate in int stores and
+    // circulate, so both hold). Least fixpoint deadlocks on the cycle;
+    // greatest fixpoint (assume all, remove violators) converges on the
+    // sound verdict: any remaining violator is genuinely non-int.
+    let mut intwrites: HashSet<String> = writes
+        .keys()
+        .filter(|a| {
+            let w = &writes[*a];
+            !w.non_int_value && !w.whole_reassign && !w.unset_hit && !w.other_key
+        })
+        .cloned()
+        .collect();
+    loop {
+        let mut removed = false;
+        // NOTE: assigns_numeric (the shared helper below) takes sound;
+        // for the intwrites fixpoint we need the intwrites variant.
+        // To avoid duplicating the recursion, run the fixpoint over a
+        // local sound-like set: temporarily reuse `sound` as the
+        // intwrites set (it is empty here and only filled below).
+        let mut todrop: Vec<String> = Vec::new();
+        for arr in intwrites.iter() {
+            let mut visiting = Vec::new();
+            let ok = store_vals.get(arr).map_or(true, |vs| {
+                vs.iter().all(|e| val_int(e, &assigns, &intwrites, &big, &mut visiting))
+            });
+            if !ok {
+                todrop.push(arr.clone());
+            }
+        }
+        for a in todrop {
+            intwrites.remove(&a);
+            removed = true;
+        }
+        // assigns_numeric for scalars (used by seeds below) also needs
+        // the intwrites-aware variant; stash it by seeding a shadow map
+        // — simpler: seeds consult val_int with `sound`, and sound is
+        // set to intwrites + dense AFTER this loop. Scalar Var leaves
+        // recurse via assigns_numeric (sound-based): sound ⊇ intwrites
+        // at that point would be UNSOUND (sound has density, a subset).
+        // Correct order: seeds must use intwrites, not sound, for
+        // arrayIndex leaves. Handled below by passing intwrites.
+        if !removed {
+            break;
+        }
+    }
+    // ---- sound: int-writes + dense --------------------------------------
+    // (single pass — the fixpoint above settled value-int-ness; density
+    // and guards are per-array static).
+    let mut sound: HashSet<String> = HashSet::new();
+    for (arr, w) in &writes {
+        if w.non_int_value || w.whole_reassign || w.unset_hit || w.other_key {
+            continue;
+        }
+        if !intwrites.contains(arr) {
+            continue;
+        }
+        let cover: Option<usize> = if w.lit_lens.is_empty() {
+            None
+        } else if w.lit_lens.iter().all(|&n| n == w.lit_lens[0]) {
+            Some(w.lit_lens[0])
+        } else {
+            None
+        };
+        let Some(n) = cover else { continue };
+        let has_indexed = !w.dyn_keys.is_empty();
+        if w.append && has_indexed {
+            continue;
+        }
+        if w.append {
+            sound.insert(arr.clone());
+            continue;
+        }
+        let mut ok = true;
+        for k in &w.dyn_keys {
+            if let Some(rest) = k.strip_prefix('#') {
+                if let Ok(i) = rest.parse::<i64>() {
+                    if i < 0 || i >= n as i64 {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                ok = false;
+                break;
+            }
+            if !stores_guarded(prog, arr, k, n as i64, &globals)
+                || !proven_nonneg(k, &assigns)
+            {
+                if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("6") {
+                    eprintln!(
+                        "INT_ELEM guardfail {arr}[{k}] n={n} guarded={} nonneg={}",
+                        stores_guarded(prog, arr, k, n as i64, &globals),
+                        proven_nonneg(k, &assigns)
+                    );
+                }
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            sound.insert(arr.clone());
+        }
+    }
+    // seeds: every assign value-int, no direct string use, plain ident,
+    // never subshell-written, at least one assign.
+    let mut seed: HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == IrType::Int)
+        .map(|(n, _)| n.clone())
+        .collect();
+    // NOTE: seeds start from the existing Int verdicts: a var the core
+    // already types Int stays seeded (demote re-validates afterward).
+    // Otherwise greatest fixpoint over candidates (all ident, non-copy,
+    // non-empty, non-string-observed vars): remove any var with a
+    // non-int-valued assign. This resolves benign swap cycles
+    // (`x1=$x2`, `x2=$t`, `t=$x1` — values originate in int stores and
+    // only permute) that a least fixpoint deadlocks on. Seed values use
+    // direct seed-membership for Var leaves (cycle-safe: removal only
+    // shrinks, and a removal cascade re-checks dependents next round).
+    fn seed_val(
+        e: &IrExpr,
+        sound: &HashSet<String>,
+        seed: &HashSet<String>,
+    ) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            IrExpr::Str(st, _) => {
+                let t = st.trim();
+                !t.is_empty()
+                    && t.strip_prefix('-').unwrap_or(t).bytes().all(|c| c.is_ascii_digit())
+                    && !(t.len() > 1 && (t.starts_with('0') || t.starts_with("-0")))
+                    && t.parse::<i64>().is_ok()
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if matches!(n.as_str(), "?" | "#" | "!" | "$") {
+                    return true;
+                }
+                seed.contains(n)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Render::str_arg(args, 0).as_deref() {
+                    Some(n) => {
+                        if matches!(n, "?" | "#" | "!" | "$") {
+                            return true;
+                        }
+                        seed.contains(n)
+                    }
+                    None => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            _ => false,
+        }
+    }
+    let mut cand: HashSet<String> = HashSet::new();
+    for (v, a) in &assigns {
+        if a.in_copy || a.rhs.is_empty() {
+            continue;
+        }
+        if !crate::c_backend::is_ident(v) {
+            continue;
+        }
+        if matches!(v.as_str(), "?" | "#" | "!" | "$") {
+            continue;
+        }
+        if uses.str_use.contains(v) {
+            continue;
+        }
+        cand.insert(v.clone());
+    }
+    // existing Int verdicts inside the candidate gate are pinned (never
+    // removed — demote re-validates afterward anyway).
+    let pinned: HashSet<String> = seed.intersection(&cand).cloned().collect();
+    let mut cur: HashSet<String> = cand.clone();
+    loop {
+        let mut todrop: Vec<String> = Vec::new();
+        for v in cur.iter() {
+            if pinned.contains(v) {
+                continue;
+            }
+            let a = &assigns[v];
+            if !a.rhs.iter().all(|e| seed_val(e, &sound, &cur)) {
+                todrop.push(v.clone());
+            }
+        }
+        if todrop.is_empty() {
+            break;
+        }
+        for v in todrop {
+            cur.remove(&v);
+        }
+    }
+    for v in cur {
+        seed.insert(v);
+    }
+    // ---- homing: sound + no whole-array string reads ----------------------
+    let mut homed: HashSet<String> = HashSet::new();
+    for (arr, _) in &writes {
+        if !sound.contains(arr) {
+            continue;
+        }
+        if uses.str_read.contains(arr) || uses.iterated.contains(arr) {
+            continue;
+        }
+        homed.insert(arr.clone());
+    }
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        let mut v: Vec<_> = homed.iter().collect();
+        v.sort();
+        eprintln!("INT_ELEM homed: {:?}", v);
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("2") {
+            for (arr, w) in &writes {
+                if arr.starts_with("RB_") || arr.starts_with("RBTEX") || arr == "RFB_ROWS" || arr.starts_with("CUBE") || arr == "FACE_N" {
+                    eprintln!(
+                        "INT_ELEM w {arr}: lit={:?} append={} dyn={:?} oob-unset=({},{}) keyother={} strread={} iterated={} sound={} homed={}",
+                        w.lit_lens, w.append, w.dyn_keys, w.whole_reassign, w.unset_hit, w.other_key,
+                        uses.str_read.contains(arr), uses.iterated.contains(arr),
+                        sound.contains(arr), homed.contains(arr),
+                    );
+                }
+            }
+            let mut sv: Vec<_> = seed.iter().collect();
+            sv.sort();
+            eprintln!("INT_ELEM seeds: {} {:?}", sv.len(), &sv[..sv.len().min(40)]);
+            for v in [
+                "rbt_x0", "rbt_x1", "rbt_x2", "rbt_y0", "rbt_y1", "rbt_y2", "rbt_s0",
+                "rbt_s1", "rbt_s2", "rbt_u0", "rbt_u1", "rbt_u2", "rbt_v0", "rbt_v1",
+                "rbt_v2", "rbt_w0", "rbt_w1", "rbt_w2", "rbt_t", "rbt_area", "rbt_cx",
+                "rbt_cy", "rbt_sh", "rbt_uu", "rbt_vv", "rbt_bw0", "rbt_bw1", "rbt_x",
+                "rbt_y", "rbt_minx", "rbt_maxx", "rbt_miny", "rbt_maxy", "rbt_texd",
+                "rbt_tsz", "rbt_in", "rbt_uw", "rbt_vw", "rbt_iw", "rbp_sx", "rbp_sy",
+                "rbf_s0", "rbf_e", "rbf_np", "rbf_m", "rbc_tex", "rbx_ti", "rbx_r",
+                "rbp_fu", "rbp_fsh", "rbt_runx", "rbt_runlen",
+            ] {
+                if seed.contains(v) {
+                    eprintln!("INT_ELEM seedhit {v}");
+                }
+            }
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("3") {
+            let mut sv: Vec<_> = uses.str_use.iter().collect();
+            sv.sort();
+            eprintln!("INT_ELEM str_use: {:?}", sv);
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("4") {
+            eprintln!("INT_ELEM globals: {:?}", globals);
+        }
+    }
+    // return homed MINUS shared (caller unions) + the seed set for
+    // reader seeding.
+    let shared = crate::shir::analyze_int_arrays(prog);
+    let out: HashSet<String> = homed.difference(&shared).cloned().collect();
+    (out, seed)
+}
+
+/// Seed `Int` verdicts for element-readers and pure-arith temps (called
+/// before `demote_stringy_ints`, which re-validates every seed: a seed
+/// with any stringy assign is removed again, so seeding is always
+/// safe — it can only ever keep vars demote would keep).
+///
+/// Only two classes are pushed (keep the diff minimal — everything else
+/// is demote's business):
+/// - readers of a homed array (`v = A[k]`): the read renders natively
+///   either way (guarded slot read), so the verdict only drops the
+///   surrounding string round-trip.
+/// - pure-arith temps (every assign an `Arith` node): both store paths
+///   render the identical guarded form for div/mod, so the verdict only
+///   drops the snprintf/strdup/atoll round-trip.
+fn seed_int_element_readers(prog: &mut IrProgram) {
+    use crate::ir::IrExpr;
+    let (homed, seed) = int_element_verdict(prog);
+    if homed.is_empty() {
+        return;
+    }
+    let mut all_homed = crate::shir::analyze_int_arrays(prog);
+    for a in &homed {
+        all_homed.insert(a.clone());
+    }
+    // collects the assigns map for the reader check below
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn collect(stmts: &[crate::ir::IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
+        for s in stmts {
+            match s {
+                crate::ir::IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && !t.var.contains('[') {
+                            out.entry(t.var.clone()).or_default().push(expr.clone());
+                        }
+                    }
+                }
+                crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, out);
+                    for (_, b) in elsifs {
+                        collect(b, out);
+                    }
+                    collect(else_, out);
+                }
+                crate::ir::IrStmt::While { body, .. }
+                | crate::ir::IrStmt::DoWhile { body, .. }
+                | crate::ir::IrStmt::For { body, .. }
+                | crate::ir::IrStmt::Block(body)
+                | crate::ir::IrStmt::Subshell(body)
+                | crate::ir::IrStmt::Background(body) => collect(body, out),
+                crate::ir::IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, out);
+                    collect(step, out);
+                    collect(body, out);
+                }
+                crate::ir::IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, out);
+                    for (_, b) in named_blocks {
+                        collect(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &mut assigns);
+    for sub in &prog.subs {
+        collect(&sub.body, &mut assigns);
+    }
+    fn reads_homed(exprs: &[IrExpr], homed: &HashSet<String>) -> bool {
+        exprs.iter().any(|e| match e {
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if homed.contains(n))
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if homed.contains(n))
+            }
+            IrExpr::Index { .. } => true,
+            _ => false,
+        })
+    }
+    let mut pushed = 0;
+    for v in &seed {
+        if prog.var_types.iter().any(|(n, _)| n == v) {
+            continue;
+        }
+        let rhs = assigns.get(v);
+        let ok = match rhs {
+            Some(es) if !es.is_empty() => {
+                reads_homed(es, &all_homed)
+                    || es.iter().all(|e| matches!(e, IrExpr::Arith(_)))
+            }
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        prog.var_types.push((v.clone(), IrType::Int));
+        pushed += 1;
+    }
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        eprintln!("INT_ELEM seeded {} readers", pushed);
+    }
+}
+
+/// Int-array verdict for the C backend: the shared analysis UNION the
+/// int-element arrays (C-backend-local — other backends keep the shared
+/// verdict exactly).
+fn int_arrays_for_c(prog: &IrProgram) -> HashSet<String> {
+    let mut out = crate::shir::analyze_int_arrays(prog);
+    let (homed, _) = int_element_verdict(prog);
+    for a in homed {
+        out.insert(a);
+    }
+    out
+}
 
 /// Pass 2: mark every array name that is READ as a value (write targets
 /// excluded). Conservative: an unknown call mentioning an array name is a
@@ -2403,7 +4470,7 @@ fn int_array_widths(
     prog: &IrProgram,
     ranges: &HashMap<String, (i128, i128)>,
 ) -> HashMap<String, Width> {
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     let state: HashMap<String, Option<(i128, i128)>> = ranges
         .iter()
         .map(|(k, v)| (k.clone(), Some(*v)))
@@ -6791,6 +8858,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // `result` is arith elsewhere but `result=$(echo ...)` here)
     // must be Str — an Int decl truncates the string pointer to 16
     // bits (garbage numbers). Numeric uses still work via atoll.
+    // Int-element readers seed first (their arrayIndex sources are
+    // numeric exactly when homed — see the `is_numeric` arrayIndex
+    // arm), so demote re-validates every seed below.
+    seed_int_element_readers(&mut prog);
     demote_stringy_ints(&mut prog);
     // sort for deterministic serialization (the C backend reads it as a
     // map, but the sort keeps output stable across runs)
@@ -6931,7 +9002,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_storage = prog.var_storage.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
-    r.int_arrays = crate::shir::analyze_int_arrays(&prog);
+    r.int_arrays = crate::c_backend::int_arrays_for_c(&prog);
     r.force_str = string_loop_vars(&prog, &r.int_arrays);
     r.reduce_arrays = crate::shir::analyze_reduce_arrays(&prog);
     r.int_array_widths = int_array_widths(&prog, &ranges);
@@ -30455,6 +32526,61 @@ fn param_copy_alias(
                 }
                 format!("(long long)atoll({})", self.expr(e))
             }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                // numeric-context element read of an int-homed array:
+                // the native slot directly (no num_temp/atoll
+                // round-trip). Out-of-bounds reads yield 0, exactly
+                // what the string form's `atoll("")` observes — the
+                // len guard below is the same one `array_index_read`
+                // emits, so the two arms can never disagree. Over a
+                // string array, fall through to the string form.
+                if let Some(name) = Self::str_arg(args, 0) {
+                    if self.int_arrays.contains(&name) {
+                        let id = self.c_ident(&name);
+                        // constant key: the guarded native read
+                        if let Some(IrExpr::Str(k, _)) = args.get(1) {
+                            if let Ok(i) = k.trim().parse::<i64>() {
+                                return format!(
+                                    "(({i} >= 0 && {i} < (long long){id}_len) ? (long long)({id}[{i}]) : 0LL)"
+                                );
+                            }
+                        }
+                        // dynamic key: evaluate once into a temp (same
+                        // shape as `array_index_read`'s dynamic arm),
+                        // then the guarded native read.
+                        let kt = format!("_ak{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let key_c = match args.get(1) {
+                            // "$v" texts read the var (atoll("$v")
+                            // would parse the literal dollar-text).
+                            Some(IrExpr::Str(k, _)) => {
+                                let t = k.trim();
+                                let v = t
+                                    .strip_prefix('$')
+                                    .unwrap_or(t)
+                                    .trim_start_matches('{')
+                                    .trim_end_matches('}');
+                                if crate::c_backend::is_ident(v) {
+                                    if self.is_num(v) {
+                                        format!("(long long)({})", self.c_ident(v))
+                                    } else {
+                                        format!("(long long)atoll({})", self.store_read(v))
+                                    }
+                                } else {
+                                    format!("(long long)({})", self.value_ll(args.get(1).unwrap()))
+                                }
+                            }
+                            Some(k) => format!("(long long)({})", self.value_ll(k)),
+                            None => "0".to_string(),
+                        };
+                        self.emit(&format!("long long {kt} = {key_c};"));
+                        return format!(
+                            "(({kt} >= 0 && {kt} < (long long){id}_len) ? (long long)({id}[{kt}]) : 0LL)"
+                        );
+                    }
+                }
+                format!("(long long)atoll({})", self.expr(e))
+            }
             _ => self.expr(e),
         }
     }
@@ -45874,15 +48000,18 @@ mod tests {
                 ],
             }
         }
-        // small ints + a string read (forces char*[] storage, like
-        // t96's sum+index mix) → native __int128 loop, no GMP.
+        // small ints + a string read (like t96's sum+index mix) →
+        // native __int128 loop, no GMP. A single-element string read no
+        // longer forces char*[] storage (int-element homing renders the
+        // exact decimal text from the native slot), so the atoll loop is
+        // gone iff the array homed natively — either shape computes the
+        // same sum; what must not appear is GMP.
         let out = shir_to_c(&prog_of(vec![
             setarray("xs", vec![IrExpr::Int(10), IrExpr::Int(20)]),
             echo_expr(sum_call("xs")),
             echo_expr(index_read("xs", "0")),
         ]));
         assert!(out.contains("_sh_i128_str"), "no native sum helper:\n{out}");
-        assert!(out.contains("atoll(xs["), "no atoll loop:\n{out}");
         assert!(!out.contains("mpz_add"), "GMP kept for small ints:\n{out}");
         // a bigint element keeps the exact GMP path.
         let out = shir_to_c(&prog_of(vec![
