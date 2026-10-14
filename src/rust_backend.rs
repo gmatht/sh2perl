@@ -268,6 +268,11 @@ pub struct Render {
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
+    /// Nesting depth of an ACTIVE output sink (capture block / fd-1
+    /// redirect). Inside one the sink is the buffer, not the process
+    /// stdout, so `sink_free_here` must refuse the direct `print!`
+    /// lowering (`val=$(echo x)` leaked the inner echo otherwise).
+    capture_depth: usize,
     /// pass-6 native loop bindings in scope: a STACK of (var, binding,
     /// kind) — nested loops push, so an inner loop shadows the outer
     /// and outer reads still resolve inside the inner body. Reads of a
@@ -2330,6 +2335,14 @@ impl Render {
     /// the whole-program case; this covers a redirect-bearing program
     /// whose individual function is still never redirected).
     fn sink_free_here(&self) -> bool {
+        // INSIDE a capture (or a redirected block) the sink is NOT the
+        // process stdout: the buffer is active and every print must go
+        // through the sink-aware helper or it leaks to the terminal
+        // (`val=$(echo x | tr ...)` printed the inner echo AND stored
+        // the raw word).
+        if self.capture_depth > 0 {
+            return false;
+        }
         if self.runtime_free {
             return true;
         }
@@ -7461,9 +7474,11 @@ impl Render {
         // the captured commands must NOT consume the stage's stdin (a
         // nested mktemp would eat the pipeline buffer)
         self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
+        self.capture_depth += 1;
         for s in stmts {
             self.stmt(s);
         }
+        self.capture_depth -= 1;
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
         self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
         self.emit("*__SH_OUT.lock().unwrap() = __old;");
@@ -11186,8 +11201,34 @@ impl Render {
                 }
             }
             IrStmt::Block(b) => {
-                for s in b {
+                // A trailing process-substitution cleanup (`rm -f
+                // $__ps_tmp*`, appended by the core transform) is bash's
+                // SUBSHELL side effect: it must not clobber the consumer
+                // command's exit status, which a following `$?` reads
+                // (`diff <(echo one) <(echo two); echo $?`). Emit it
+                // last, behind a status save/restore.
+                let (body, cleanup) = match b.split_last() {
+                    Some((IrStmt::Exec { cmd, args, .. }, rest))
+                        if matches!(cmd, IrExpr::Str(c, _) if c == "rm")
+                            && args.iter().any(|a| {
+                                matches!(a, IrExpr::Var(n, _) | IrExpr::Ident(n)
+                                    if n.starts_with("__ps_tmp"))
+                            }) =>
+                    {
+                        (rest, Some(b.last().unwrap()))
+                    }
+                    _ => (b.as_slice(), None),
+                };
+                for s in body {
                     self.stmt(s);
+                }
+                if let Some(c) = cleanup {
+                    // the save must sit immediately before the cleanup —
+                    // it is the CONSUMER's status being preserved, so it
+                    // is read after the consumer has run.
+                    self.emit("let __ps_saved_rc = __SH_RC.load(Ordering::SeqCst);");
+                    self.stmt(c);
+                    self.emit("__SH_RC.store(__ps_saved_rc, Ordering::SeqCst);");
                 }
             }
             IrStmt::Subshell(b) => self.subshell_render(b),
