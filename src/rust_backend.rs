@@ -135,6 +135,17 @@ fn borrow_word(w: &str) -> String {
     format!("&{}", Render::unparen(w))
 }
 
+/// A rendered word that is a BARE identifier (a native `&str` loop
+/// binding, a borrowable local read): it yields `&str`, not an owned
+/// `String`, so an owned-String context must append `.to_string()`.
+fn is_bare_ident(w: &str) -> bool {
+    let t = w.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !t.chars().next().unwrap().is_ascii_digit()
+}
+
 /// The bare literal text when a rendered word is `<"…">.to_string()` (the
 /// form the renderer emits for a string constant), else None. A literal is
 /// `&'static str`, so it needs no allocation and no borrow of a temporary
@@ -1054,6 +1065,16 @@ fn strip_str_lit_refs(text: &str) -> String {
             // check for `.to_string()` after the literal
             let suffix = b".to_string()";
             if j < b.len() && b[j..].starts_with(suffix) {
+                // the borrow must END at the `.to_string()`: a chained
+                // call (`&"a".to_string().to_lowercase()`) would leave a
+                // bare String where `&str` is expected (E0308) — bail
+                // (missed opt, never miscompile).
+                let after = j + suffix.len();
+                if after < b.len() && b[after] == b'.' {
+                    out.push(b[i] as char);
+                    i += 1;
+                    continue;
+                }
                 let lit_end = j; // exclusive end of the string literal
                 // emit just the string literal
                 out.push_str(&text[i + 1..lit_end]);
@@ -1442,11 +1463,47 @@ fn simplify_let_b(mut text: String) -> String {
             search_from = at + prefix.len();
             continue;
         }
+        // If the status store survived inside EXPR, the wrapper must
+        // stay: the store sequences a LIVE `__SH_RC` write (statement
+        // position — `let _ = { let __b = …; STORE; __b };` exists
+        // exactly to record the status), and stripping the binding
+        // would orphan its `__b` reference (a hard E0425) or, worse,
+        // silently drop a status `$?` later reads. `rc_strip` already
+        // removes the store wherever the register is unreachable, so a
+        // surviving store is load-bearing by construction. Bail on
+        // this occurrence (missed opt, never miscompile).
+        if expr.contains("__SH_RC.store(if __b") {
+            search_from = at + prefix.len();
+            continue;
+        }
+        // The binding is dead after this replacement, so a surviving
+        // bare `__b` reference anywhere else in EXPR would be orphaned
+        // (same E0425 class) — bail then too.
+        if has_word(&expr, "__b") {
+            search_from = at + prefix.len();
+            continue;
+        }
         let replacement = expr.to_string();
         text.replace_range(at..close + 1, &replacement);
         search_from = at + replacement.len();
     }
     text
+}
+
+/// Word-bounded `needle` search (`__b` must not match `__backup`).
+fn has_word(hay: &str, needle: &str) -> bool {
+    let mut rest = hay;
+    while let Some(k) = rest.find(needle) {
+        let before = rest[..k].chars().last();
+        let after = rest[k + needle.len()..].chars().next();
+        if !before.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+            && !after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+        {
+            return true;
+        }
+        rest = &rest[k + needle.len()..];
+    }
+    false
 }
 
 /// Split a comma-separated argument list at depth-0 commas,
@@ -3781,7 +3838,13 @@ impl Render {
                 // mirror `expr_num`'s param-len arm (borrowable locals
                 // hand over without a `.to_string()` round-trip).
                 let s = self.read_str(&name);
-                Some(format!("{}.chars().count()", Render::unparen(&s)))
+                let s = Render::unparen(&s);
+                // a numerically-homed var reads as i64 — stringify for
+                // the char count (bash counts the decimal digits).
+                if self.is_num(&name) {
+                    return Some(format!("({s}).to_string().chars().count()"));
+                }
+                Some(format!("{s}.chars().count()"))
             }
             _ => None,
         }
@@ -4933,6 +4996,16 @@ impl Render {
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 if (self.is_array(var) || self.is_assoc(var)) && self.declared(var) {
+                    // int-homed arrays hold i64 elements — no
+                    // string round-trip (`.trim()` on an i64 is a
+                    // hard E0599); the forgiving OOB-exit arm below
+                    // already yields bare indexing. Same predicate
+                    // as the `expr_num` Index arm.
+                    if self.is_int_array(var)
+                        || (self.is_local_array(var) && self.local_array_is_int(var))
+                    {
+                        return self.array_index_num(var, &k);
+                    }
                     // arith-index stays forgiving (shell `$((arr[i]))`
                     // uses this path; OOB gives 0 via unwrap_or below).
                     let e = self.array_elem(var, &k);
@@ -8243,8 +8316,21 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            // the param is String: hand over the rendered word
-                            FnParamTy::Str => (*w).to_string(),
+                            // the param is String: hand over the rendered word.
+                            // `(*w).to_string()` is the IDENTITY on the
+                            // word text (a Rust-level &str→String, not
+                            // emitted code) — right when the word already
+                            // yields an owned String, but a bare `&str`
+                            // binding (native loop var, borrowable local)
+                            // needs the conversion appended or the call
+                            // is E0308.
+                            FnParamTy::Str => {
+                                if is_bare_ident(w) {
+                                    format!("{w}.to_string()")
+                                } else {
+                                    (*w).to_string()
+                                }
+                            }
                             FnParamTy::StrRef => borrow_word(w),
                             // the param is i64: the word is a String expr — the
                             // callee's signature forces a parse at the boundary
@@ -8304,7 +8390,18 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            FnParamTy::Str => (*w).to_string(),
+                            // the param is String: a bare-`&str` word
+                            // (native loop binding, borrowable local)
+                            // needs `.to_string()` appended (see
+                            // `fn_call_value`); anything else already
+                            // yields an owned String.
+                            FnParamTy::Str => {
+                                if is_bare_ident(w) {
+                                    format!("{w}.to_string()")
+                                } else {
+                                    (*w).to_string()
+                                }
+                            },
                             FnParamTy::StrRef => borrow_word(w),
                             FnParamTy::Num => {
                                 format!("({w}).trim().parse::<i64>().unwrap_or(0)")
@@ -10496,7 +10593,12 @@ impl Render {
                 }
             }
             IrStmt::While { cond, body } => {
-                let c = self.expr_bool(cond);
+                // `expr_bool` wraps the condition in a `{ let __b = …;
+                // store; __b }` status wrapper — strip it like the `if`
+                // arms do (`unwrap_cond`): a bare `while COND; store`
+                // is a parse error, and the loop's own capture/restore
+                // apparatus owns the status here.
+                let c = Self::unwrap_cond(&self.expr_bool(cond));
                 // bash: a while whose condition never tests true exits 0;
                 // otherwise the loop's rc = the last body command's rc —
                 // the cond eval stores its own rc every iteration, so the
@@ -10843,8 +10945,13 @@ impl Render {
                             self.loop_depth += 1;
                             self.depth += 1;
                             // the value handed to the shell variable's
-                            // storage (only needed when it escapes)
-                            let elem_expr = if is_num {
+                            // storage (only needed when it escapes).
+                            // An int-list iterable already yields i64 —
+                            // no parse (`.trim()` on an integer is a
+                            // hard E0599).
+                            let elem_expr = if int_list {
+                                elem_g.clone()
+                            } else if is_num {
                                 format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)")
                             } else {
                                 format!("{elem_g}.to_string()")
@@ -12123,7 +12230,7 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r = 1;
+    let mut r: i64 = 1;
     let mut i = 0;
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
@@ -14890,6 +14997,14 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                         self.pos += 1;
                     }
                     if self.render.declared(name) {
+                        // int-homed arrays hold i64 — no string
+                        // round-trip (`.trim()` on i64 is E0599).
+                        if self.render.is_int_array(name)
+                            || (self.render.is_local_array(name)
+                                && self.render.local_array_is_int(name))
+                        {
+                            return Some(self.render.array_index_num(name, &k));
+                        }
                         let e = self.render.array_elem(name, &k);
                         return Some(format!("{e}.trim().parse::<i64>().unwrap_or(0)"));
                     }
