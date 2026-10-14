@@ -3747,6 +3747,46 @@ impl Render {
         format!("{m}.with(|v| v.borrow().len().to_string())")
     }
 
+    /// A length-valued interpolation part as usize-native text, for
+    /// `format!("{}", …)` args where the numeric path's `as i64` would
+    /// be dead text. `Some` only for the two statically-named length
+    /// nodes (`param("len", name)`, `arrayLen(name)`); `None` (fall
+    /// back to the numeric/string paths) for everything else.
+    /// `{}` formats `usize` and `i64` byte-identically, so the render
+    /// is value-identical in both arms.
+    fn len_part_usize(&mut self, x: &IrExpr) -> Option<String> {
+        match x {
+            IrExpr::Call { func, args } if func == "arrayLen" => match args.first() {
+                Some(IrExpr::Str(name, _)) if !name.is_empty() => {
+                    // LOCAL ARRAY: a compile-time constant (bare — no
+                    // `.to_string()` float-lex trap inside `format!`).
+                    if self.is_local_array(name) {
+                        let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+                        return Some(format!("{n}"));
+                    }
+                    let m = self.tls(name);
+                    Some(format!("{m}.with(|v| v.borrow().len())"))
+                }
+                _ => None,
+            },
+            IrExpr::Call { func, args } if func == "param" => {
+                let op = str_arg(args, 0).unwrap_or("");
+                if op != "len" {
+                    return None;
+                }
+                let name = str_arg(args, 1).unwrap_or("");
+                if name.is_empty() {
+                    return None;
+                }
+                // mirror `expr_num`'s param-len arm (borrowable locals
+                // hand over without a `.to_string()` round-trip).
+                let s = self.read_str(&name);
+                Some(format!("{}.chars().count()", Render::unparen(&s)))
+            }
+            _ => None,
+        }
+    }
+
     /// Declare an array var with the given element expressions.
     fn declare_array(&mut self, name: &str, items: &str) {
         let stmt = self.write_arr(name, items);
@@ -4790,11 +4830,19 @@ impl Render {
                 }
                 InterpPart::Expr(x) => {
                     fmt.push_str("{}");
-                    // A numerically-homed part IS an i64: `{}` formats it
-                    // directly, so the `.to_string()` `expr_any` would add
-                    // is a redundant allocation (t69's
-                    // `format!("value={}", x.to_string())`).
-                    if self.word_is_numeric(x) {
+                    // A length part (`param("len")`, `arrayLen`) is
+                    // usize-native: `{}` formats it directly, so the
+                    // `as i64` the numeric path's `__sh_len` peephole
+                    // adds is dead text here (same class as
+                    // `array_len_to_string` — byte-identical output for
+                    // every reachable length).
+                    if let Some(u) = self.len_part_usize(x) {
+                        args.push(u);
+                    } else if self.word_is_numeric(x) {
+                        // A numerically-homed part IS an i64: `{}` formats it
+                        // directly, so the `.to_string()` `expr_any` would add
+                        // is a redundant allocation (t69's
+                        // `format!("value={}", x.to_string())`).
                         args.push(self.expr_num(x));
                     } else {
                         args.push(self.expr_any(x));
