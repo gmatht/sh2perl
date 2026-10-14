@@ -3493,7 +3493,15 @@ impl Render {
             return self.local_write_stmt(name, e);
         }
         let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
+        // a bare-`&str` value (native loop binding, borrowable local)
+        // must be owned for the `RefCell<String>` store (E0308).
+        let e = Self::unparen(e);
+        let e = if is_bare_ident(&e) {
+            format!("{e}.to_string()")
+        } else {
+            e.to_string()
+        };
+        format!("{m}.with(|v| *v.borrow_mut() = {e});")
     }
 
     /// Bind a string loop variable from a STATIC word list: the element
@@ -4817,6 +4825,11 @@ impl Render {
                 self.mark_todo("Arrow");
                 "String::new()".into()
             }
+            // a single-element list in word position is its element
+            // (`cmd ["$x"]` — the frontend wraps one word in Array;
+            // rendering the list as a word would nest `vec![vec![…]]`
+            // and break the caller's `Vec<String>` (E0308)).
+            IrExpr::Array(items) if items.len() == 1 => self.expr_any(&items[0]),
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "String::new()".into()
@@ -6733,8 +6746,9 @@ impl Render {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     let (ws, splat) = self.call_arg_words(args.get(1));
                     // pass-3: direct call, value wrapped for word context
+                    // (the value is ONE word — `vec![v]`).
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
-                        let v = self.fn_call_value(name, ws, &sig, false);
+                        let v = self.fn_call_value(name, ws, &sig);
                         return format!("vec![{v}]");
                     }
                     let m = self.fn_ident(name);
@@ -8285,7 +8299,6 @@ impl Render {
         name: &str,
         ws: Vec<String>,
         sig: &FnSig,
-        cat: bool,
     ) -> String {
         let m = self.fn_ident(name);
         if sig.arity == 0 && !sig.argv {
@@ -8298,7 +8311,9 @@ impl Render {
         // than `{ let __a = vec![…]; f(__a.get(0)…unwrap_or_default()) }`).
         // Only when EVERY word is a single-element vec (no splat: a splat's
         // words are a runtime-sized `Vec<String>` and cannot be spread
-        // statically) and the arity matches the word count.
+        // statically) and the arity matches the word count. The caller
+        // decides the value's SHAPE (word-list callers wrap in `vec![…]`,
+        // string callers splice bare), so this returns the bare value.
         if sig.rest.is_none() && !sig.argv && ws.len() == sig.arity {
             let direct: Option<Vec<&str>> =
                 ws.iter().map(|w| Self::vec_of_one(w)).collect();
@@ -8346,13 +8361,14 @@ impl Render {
         // `ws` holds one `vec![word]` per argument; a SPLAT element holds
         // a multi-word `Vec<String>` instead, so the two cannot be
         // concatenated with `vec![a, b]` (that would nest). `__sh_cat`
-        // flattens a `&[Vec<String>]` — always correct, and what `cat`
-        // already selects.
-        if cat || ws.iter().any(|w| !w.starts_with("vec![")) {
+        // flattens a `&[Vec<String>]` — always correct. The legacy `cat`
+        // flag is now unused (kept as `_` at the top): a non-`vec![` word
+        // is ALWAYS a splat here, since every other word arrives wrapped.
+        let needs_cat = ws.iter().any(|w| !w.starts_with("vec!["));
+        if needs_cat {
             self.add_helper("cat");
         }
-        let cat = cat || ws.iter().any(|w| !w.starts_with("vec!["));
-        let constr = if cat {
+        let constr = if needs_cat {
             format!("__sh_cat(&[{}])", ws.join(", "))
         } else {
             format!("vec![{}]", ws.join(", "))
@@ -8954,6 +8970,11 @@ impl Render {
                 return;
             }
         }
+        // `call_words`' fnValue arm wraps the direct-form value in
+        // `vec![…]` ONLY when it is already a bare block (`{ let __a … }`
+        // is the word itself — wrapping again nests `vec![vec![…]]`,
+        // E0308). Every other arm yields an UNwrapped word vec that
+        // needs exactly one wrap here.
         let ws: Vec<String> = parts
             .into_iter()
             .map(|p| match p {
@@ -9066,7 +9087,17 @@ impl Render {
                     self.add_helper("split_ifs");
                     format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
                 }
-                w => format!("vec![{}]", self.expr_str(w)),
+                // a bare-`&str` word (native loop binding, borrowable
+                // local) must be owned for the `Vec<String>` element
+                // (`&vec![x]` is `&Vec<&str>`, E0308).
+                w => {
+                    let e = self.expr_str(w);
+                    if is_bare_ident(&e) {
+                        format!("vec![{e}.to_string()]")
+                    } else {
+                        format!("vec![{e}]")
+                    }
+                }
             })
             .collect();
         self.add_helper("printf");
@@ -9367,7 +9398,7 @@ impl Render {
                     // pass-3: a probed signature calls directly (the
                     // value IS the return, no __SH_RET re-read)
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
-                        return self.fn_call_value(name, ws, &sig, false);
+                        return self.fn_call_value(name, ws, &sig);
                     }
                     let m = self.fn_ident(name);
                     let constr = if splat {
@@ -11064,14 +11095,32 @@ impl Render {
                     }
                     // pass-3: the sticky __SH_RET cell becomes the return
                     // value (nested calls observe identical state: stores
-                    // still land in the cell, bare returns re-read it)
+                    // still land in the cell, bare returns re-read it).
+                    // When the value is UNUSED (`fn_value_used` false) the
+                    // signature returns `()`: keep the store (observable
+                    // state) but return nothing — `return __v` against a
+                    // `()` signature is E0308.
+                    let value_used = match self.active_fn.as_deref() {
+                        Some(f) => self.fn_value_used.contains(f),
+                        None => true,
+                    };
                     if let Some(x) = e {
                         let r = self.expr_str(x);
-                        self.emit(&format!(
-                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
-                        ));
+                        if value_used {
+                            self.emit(&format!(
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                            ));
+                        }
                     } else {
-                        self.emit("return __SH_RET.lock().unwrap().clone();");
+                        if value_used {
+                            self.emit("return __SH_RET.lock().unwrap().clone();");
+                        } else {
+                            self.emit("return;");
+                        }
                     }
                     return;
                 }
