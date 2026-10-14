@@ -3727,6 +3727,34 @@ impl Render {
                 "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
+        // LOCAL ARRAY: a fixed-size Rust array (`let a = [..]` in this
+        // scope) — read the element in place. Without this the read went
+        // to the (never-written) thread-local, yielding the default
+        // (empty/0) for every element.
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            // a `[i64; N]` element is Copy (bare read); a `[String; N]`
+            // element must be cloned out.
+            let int_home = self.local_array_is_int(name);
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                if idx >= 0 && (idx as usize) < n {
+                    return if int_home {
+                        format!("{m}[{idx}]")
+                    } else {
+                        format!("{m}[{idx}].clone()")
+                    };
+                }
+            }
+            return format!(
+                "{{ let __k = {key}; let __n = {n}; \
+                   let __i = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                   if __i < 0 || __i >= __n {{ std::process::exit(1); }} \
+                   {m}[__i as usize]{sel} }}",
+                sel = if int_home { "" } else { ".clone()" }
+            );
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
     }
