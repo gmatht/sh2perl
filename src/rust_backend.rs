@@ -3729,6 +3729,24 @@ impl Render {
         format!("{m}.with(|v| v.borrow().len() as i64)")
     }
 
+    /// `${#name[@]}` as a `String`, WITHOUT the `as i64` detour:
+    /// `usize` already implements `Display`, so `len().to_string()`
+    /// is byte-identical to `(len() as i64).to_string()` for every
+    /// reachable length (a `Vec` cannot hold more than `i64::MAX`
+    /// elements on any target this backend supports). Used at the
+    /// string-context call sites so the numeric `array_len` (with
+    /// its load-bearing `as i64`) keeps serving arithmetic contexts.
+    fn array_len_to_string(&mut self, name: &str) -> String {
+        // LOCAL ARRAY: the length is a compile-time constant.
+        // Parenthesised: a bare `5.to_string()` lexes as a float.
+        if self.is_local_array(name) {
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            return format!("({n}).to_string()");
+        }
+        let m = self.tls(name);
+        format!("{m}.with(|v| v.borrow().len().to_string())")
+    }
+
     /// Declare an array var with the given element expressions.
     fn declare_array(&mut self, name: &str, items: &str) {
         let stmt = self.write_arr(name, items);
@@ -6747,13 +6765,11 @@ impl Render {
                 .unwrap_or(len_name);
             if !len_name.is_empty() && (idx_at || name_at) {
                 self.mark_written(len_name);
-                let l = if self.is_assoc(len_name) {
-                    let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
-                } else {
-                    self.array_len(len_name)
-                };
-                return format!("vec![({l}).to_string()]");
+                // string context: no `as i64` detour (`usize`
+                // Display is byte-identical — see
+                // `array_len_to_string`).
+                let l = self.array_len_to_string(len_name);
+                return format!("vec![{l}]");
             }
         }
         let _ = op;
@@ -8982,13 +8998,10 @@ impl Render {
                 .unwrap_or(len_name);
             if !len_name.is_empty() && (idx_at || name_at) {
                 self.mark_written(len_name);
-                let l = if self.is_assoc(len_name) {
-                    let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
-                } else {
-                    self.array_len(len_name)
-                };
-                return format!("({l}).to_string()");
+                // string context: no `as i64` detour (see
+                // `array_len_to_string`).
+                let l = self.array_len_to_string(len_name);
+                return l;
             }
         }
         if name.contains('[') && name.ends_with(']') {
@@ -9256,13 +9269,19 @@ impl Render {
             "test" => "String::new()".to_string(),
             "exec" | "builtin" => self.exec_value(args),
             "arrayIndex" => self.array_index_str(args),
-            "arrayLen" => format!(
-                "({}).to_string()",
-                self.expr_num(&IrExpr::Call {
-                    func: func.to_string(),
-                    args: args.to_vec(),
-                })
-            ),
+            "arrayLen" => match args.first() {
+                // string context: render the length directly, without
+                // the numeric `expr_num` round-trip (`(len as i64)
+                // .to_string()` — see `array_len_to_string`).
+                Some(IrExpr::Str(name, _)) => self.array_len_to_string(name),
+                _ => format!(
+                    "({}).to_string()",
+                    self.expr_num(&IrExpr::Call {
+                        func: func.to_string(),
+                        args: args.to_vec(),
+                    })
+                ),
+            },
             "join" => self.join_str(args),
             "listVar" => self.listvar_joined(args),
             "split" => {
