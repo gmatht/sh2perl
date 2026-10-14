@@ -2349,6 +2349,18 @@ impl Render {
             || line.contains("process::exit")
             || line.contains("=>")
             || line.contains("__sh_fn_")
+            // A line that RUNS something (a shell-out, a spawn, a
+            // pipeline, a trap handler) has observable side effects
+            // beyond the status register — its store is not dead
+            // bookkeeping and the line must never be collapsed (the
+            // `paste a b` class: removing it silently dropped the
+            // command's output).
+            || line.contains("__sh_run(")
+            || line.contains("__sh_spawn(")
+            || line.contains("__sh_pipe(")
+            || line.contains("__sh_run_traps(")
+            || line.contains("__sh_cap_bytes(")
+            || line.contains("__sh_capture_rc(")
         {
             return false;
         }
