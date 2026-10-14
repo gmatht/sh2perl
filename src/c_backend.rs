@@ -11005,8 +11005,11 @@ impl Render {
             self.emit("  if (i < 0 || !v) return;");
             self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             // strdup: the source may be a stack temp that dies when its
-            // block closes (a capture/arith string in a loop body)
-            self.emit("  a[i] = (char*)_sh_xstrdup(v);");
+            // block closes (a capture/arith string in a loop body).
+            // Copy FIRST, then free the old slot: v may alias a[i]
+            // itself (`a[k]=${a[k]}...`), and freeing first would leave
+            // the copy reading freed memory.
+            self.emit("  { char *_nv = (char*)_sh_xstrdup(v); free(a[i]); a[i] = _nv; }");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -11019,11 +11022,16 @@ impl Render {
             let grows: Vec<String> = self.need_grow.iter().cloned().collect();
             for sfx in &grows {
                 if sfx == "str" {
-                    // string-vec grower: the array itself is char**
+                    // string-vec grower: the array itself is char**.
+                    // Zero the newly grown region: sparse indexed writes
+                    // may land past len, and element stores free the old
+                    // slot — an uninitialized slot would free garbage.
                     self.emit("static void _sh_grow_str(char ***p, size_t *cap) {");
+                    self.emit("  size_t ocap = *cap;");
                     self.emit("  size_t ncap = *cap ? *cap * 2 : 16;");
                     self.emit("  char **np = (char**)realloc(*p, ncap * sizeof *np);");
                     self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                    self.emit("  for (size_t _zi = ocap; _zi < ncap; _zi++) np[_zi] = 0;");
                     self.emit("  *p = np; *cap = ncap;");
                     self.emit("}");
                     continue;
@@ -11092,7 +11100,9 @@ impl Render {
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
-            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)_sh_xstrdup(val ? val : \"\"); return; }");
+            // copy first, then free: val may alias v[i] itself, and the
+            // k/v stores are {0}-initialized, so the free is safe.
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { char *_nv = (char*)_sh_xstrdup(val ? val : \"\"); free(v[i]); v[i] = _nv; return; }");
             self.emit("  if (*n < cap) { k[*n] = (char*)_sh_xstrdup(key); v[*n] = (char*)_sh_xstrdup(val ? val : \"\"); (*n)++; }");
             self.emit("  else { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             self.emit("}");
@@ -11709,8 +11719,14 @@ impl Render {
             self.emit("}");
             self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
             self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
-            self.emit("  /* no free: the slot may be a fixed buffer, not heap */");
-            self.emit("  *slot = val ? _sh_xstrdup(val) : \"\";");
+            self.emit("  /* Heap ownership like the scalar COPY path: decls are");
+            self.emit("     NULL-init'd and every write here strdups, so freeing");
+            self.emit("     the old value is safe — and required, else every");
+            self.emit("     loop iteration leaks the previous line. Always");
+            self.emit("     strdup (never store a \"\" literal) so the slot never");
+            self.emit("     aliases static storage a later free would fault on. */");
+            self.emit("  free(*slot);");
+            self.emit("  *slot = _sh_xstrdup(val ? val : \"\");");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
@@ -27385,7 +27401,10 @@ fn param_copy_alias(
         let store = if self.int_arrays.contains(var) {
             format!("{id}[_kk{seq}] = (long long)atoll(_vv{seq});")
         } else {
-            format!("{id}[_kk{seq}] = _sh_xstrdup(_vv{seq});")
+            // copy first, then free the old slot: _vv may alias this
+            // very slot (`a[k]=...${a[k]}...`), and the grower zeroes
+            // unwritten slots, so the free never touches garbage.
+            format!("{{ char *_nv{seq} = _sh_xstrdup(_vv{seq}); free({id}[_kk{seq}]); {id}[_kk{seq}] = _nv{seq}; }}")
         };
         // Bulk-len mode: the loop epilogue sets len = max(len, need),
         // so per-store len traffic goes quiet (callers prove this store
@@ -29417,12 +29436,19 @@ fn param_copy_alias(
                                 self.emit("}");
                             }
                             Some(s) if s.is_empty() => {
-                                // IFS= : raw whole line to the FIRST var
+                                // IFS= : raw whole line to the FIRST var.
+                                // Free-then-assign per iteration: the loop
+                                // body runs per line, so a bare strdup
+                                // leaks every previous line. Decls are
+                                // NULL-init'd, so the first free is safe;
+                                // strdup-then-free keeps `v="$v.."`-style
+                                // self-reference safe (same discipline as
+                                // the scalar COPY path).
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
                                 for v in vars_c.iter().skip(1) {
                                     let vid2 = self.c_ident(v);
-                                    self.emit(&format!("{vid2} = _sh_xstrdup(\"\");"));
+                                    self.emit(&format!("{{ char *_old = {vid2}; {vid2} = _sh_xstrdup(\"\"); free(_old); }}"));
                                 }
                             }
                             Some(cs) => {
@@ -29558,16 +29584,19 @@ fn param_copy_alias(
                                     "{{ size_t _sk{id} = 0; while (_rl{id}.p[_sk{id}] == ' ' || _rl{id}.p[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}.p, _rl{id}.p + _sk{id}, strlen(_rl{id}.p + _sk{id}) + 1); }}"
                                 ));
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
+                                // Free-then-assign per iteration (see the
+                                // sibling IFS= arm above): a bare strdup
+                                // leaks the previous line on every pass.
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
                             }
                             Some(s) if s.is_empty() => {
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
                             }
                             Some(cs) if nv == 1 => {
                                 let vid = self.c_ident(&vars_c[0]);
                                 self.emit(&format!(
-                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {vid} = _sh_xstrdup(_rl{id}.p); }}",
+                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }} }}",
                                     cs_byte = cs.as_bytes()[0]
                                 ));
                             }
@@ -30622,15 +30651,15 @@ fn param_copy_alias(
                         // free-before left the var dangling across RHS
                         // evaluation — captures read it via exports).
                         // Temp-swap is self-ref safe, so no text guard.
-                        // Applies to FILE-SCOPE vars (reassigned across
-                        // calls); end-of-main/end-of-fn free owns LAST.
-                        if self.top_vars.contains(&t.var) {
-                            let old = format!("_old{}", self.temp_seq);
-                            self.temp_seq += 1;
-                            self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
-                        } else {
-                            self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
-                        }
+                        // Applies to ALL heap-store vars, not just
+                        // top-level: function-scope strings reassigned
+                        // per call/loop leaked every previous value
+                        // (the rasterizer's per-pixel row copies).
+                        // Decls are NULL-init'd, so the first free is a
+                        // no-op; end-of-main/end-of-fn free owns LAST.
+                        let old = format!("_old{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
                         // P1 follow-up: _sh_xstrdup aborts on OOM, so the
                         // fresh copy is non-NULL by construction (plus
                         // fn-written gate).
@@ -30695,8 +30724,14 @@ fn param_copy_alias(
                                         &format!("(char*)({v})"),
                                     );
                                 } else {
+                                    // heap char*: free the old value via
+                                    // temp swap (same as the assign path —
+                                    // a `local x=...` in a loop leaks
+                                    // otherwise); decls are NULL-init'd.
+                                    let old = format!("_old{}", self.temp_seq);
+                                    self.temp_seq += 1;
                                     self.emit(&format!(
-                                        "{name} = _sh_xstrdup((char*)({v}));"
+                                        "{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({v})); free({old}); }}"
                                     ));
                                 }
                             }
