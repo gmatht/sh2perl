@@ -2951,6 +2951,134 @@ fn str_lit_value(arg: &str) -> Option<String> {
     }
 }
 
+/// The compile-time OUTPUT TEXT of a command substitution whose body is a
+/// literal `echo` of static words — `$(echo "foo|bar")` → `foo|bar`.
+///
+/// A `case` pattern holding a command substitution is evaluated before
+/// matching, and the corpus spells that as `$(echo …)` with only literals
+/// inside. Such a substitution is a compile-time constant, so folding it here
+/// retires the `__sh_capture_rc` (and the subprocess) it would otherwise
+/// spawn at every match.
+///
+/// It refuses anything else — a variable, a nested `$( … )`, a glob, `echo -e`
+/// (the unescape is the runtime's), or a command that is not `echo` — so a
+/// caller must leave the substitution alone rather than guess.
+///
+/// `$( … )` strips every trailing newline, and so does this: the value is the
+/// echoed text with its trailing `\n`s removed.
+/// The body of a word that is EXACTLY one command substitution, `$( … )` —
+/// `None` for anything with text on either side, an escaped `$`, or an
+/// unbalanced `(`.
+fn cmdsub_only_body(word: &str) -> Option<String> {
+    let ch: Vec<char> = word.chars().collect();
+    if ch.len() < 4 || ch[0] != '$' || ch[1] != '(' || ch[2] == '(' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 1usize;
+    while i < ch.len() {
+        match ch[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // only whitespace may follow the closing paren
+                    if ch[i + 1..].iter().all(|c| c.is_whitespace()) {
+                        return Some(ch[2..i].iter().collect());
+                    }
+                    return None;
+                }
+            }
+            '\\' => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn literal_echo_cmdsub(cmd: &str) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    let ch: Vec<char> = cmd.trim().chars().collect();
+    let mut i = 0usize;
+    while i < ch.len() {
+        // inter-word whitespace separates words
+        if ch[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch[i] == '\'' {
+            // single-quoted: everything to the closing quote is literal
+            let start = i + 1;
+            let mut j = start;
+            while j < ch.len() && ch[j] != '\'' {
+                j += 1;
+            }
+            if j >= ch.len() {
+                return None; // unterminated
+            }
+            words.push(ch[start..j].iter().collect());
+            i = j + 1;
+            continue;
+        }
+        if ch[i] == '"' {
+            // double-quoted: literal only while it holds no expansion
+            let start = i + 1;
+            let mut j = start;
+            while j < ch.len() && ch[j] != '"' {
+                if ch[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if ch[j] == '$' || ch[j] == '`' {
+                    return None; // an expansion — not a constant
+                }
+                j += 1;
+            }
+            if j >= ch.len() {
+                return None;
+            }
+            words.push(ch[start..j].iter().collect());
+            i = j + 1;
+            continue;
+        }
+        // bare word: reject any expansion or glob metachar
+        let start = i;
+        while i < ch.len() && !ch[i].is_whitespace() {
+            if ch[i] == '$' || ch[i] == '`' || ch[i] == '*' || ch[i] == '?' || ch[i] == '[' {
+                return None;
+            }
+            if ch[i] == '\\' {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        words.push(ch[start..i].iter().collect());
+    }
+    let mut it = words.into_iter();
+    // the command word must be a bare `echo`, and no -e/-n flag may follow
+    // (-n would drop the newline; -e needs the runtime's unescape)
+    match it.next().as_deref() {
+        Some("echo") => {}
+        _ => return None,
+    }
+    let rest: Vec<String> = it.collect();
+    if rest
+        .first()
+        .map(|w| w.starts_with('-') && w.len() > 1 && w[1..].chars().all(|c| c == 'n' || c == 'e'))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut text = rest.join(" ");
+    text.push('\n');
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    Some(text)
+}
+
 /// The compile-time text of one output statement, or `None` when the statement
 /// is not a literal `echo`/`printf` write.
 ///
@@ -4998,6 +5126,62 @@ fn prune_unused_helpers(text: String) -> String {
 /// rest of the file, so no reference can dangle. (Helper bodies are
 /// self-contained and only reach a static by name; user-var statics are
 /// only ever referenced by renderer-emitted reads/writes.)
+/// Drop the `as usize` on a NON-NEGATIVE INTEGER LITERAL index.
+///
+/// The renderer emits an array/`PIPESTATUS` read and an index-array store with
+/// the key cast unconditionally — `v.borrow().get({key} as usize)` and
+/// `let i: usize = {key} as usize;`. When the key is a compile-time constant
+/// that cast is pure noise: `0`/`1` are integer literals, and every one of
+/// these positions is a `usize` one (`get`'s argument, a `[i]` index, the
+/// `resize` count), so Rust infers the type without the cast — the same output
+/// with the token removed.
+///
+/// Only the two exact shapes the renderer emits are rewritten, and only for a
+/// BARE non-negative literal (`N`, no suffix, no sign, no expression): a
+/// computed index, a `-1`, or any other context keeps its cast. A `usize` that
+/// would be wrong there (a `i64`-typed binding) cannot occur — the binding in
+/// both shapes is the index expression itself.
+fn drop_literal_index_casts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        // `(` or `= ` immediately before `N as usize` sets the usize context;
+        // we simply look for the literal-cast shape and check what precedes it.
+        if b[i].is_ascii_digit() {
+            // scan the literal
+            let start = i;
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if s_starts_at(text, j, " as usize") {
+                // the char before the literal must not be part of a longer
+                // token (a suffix `0i64 as usize`, an identifier `a0 as usize`,
+                // or a `-` sign) — a bare literal only
+                let prev_ok = start == 0
+                    || !(b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_' || b[start - 1] == b'-');
+                // and the char after the cast must end the token
+                let after = j + " as usize".len();
+                let next_ok = after >= b.len()
+                    || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                if prev_ok && next_ok {
+                    out.push_str(&text[start..j]);
+                    i = after;
+                    continue;
+                }
+            }
+            out.push_str(&text[start..j]);
+            i = j;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn prune_unused_statics(text: String) -> String {
     const STATICS: &[&str] = &[
         "__SH_RC", "__SH_ARGV", "__SH_OUT", "__SH_OUTFILE_TL", "__SH_STDIN",
@@ -5399,6 +5583,9 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // loop; drop those calls before the prunes so the helper and its static
     // go with them.
     let text = drop_dead_trap_calls(&text);
+    // A compile-time constant index needs no `as usize` — the position is a
+    // usize one, so the literal infers without the cast.
+    let text = drop_literal_index_casts(&text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -15517,16 +15704,42 @@ impl Render {
                             } else {
                                 p.clone()
                             };
-                            // `$(cmd)` patterns are EVALUATED at runtime
-                            // (an unescaped `$(` — `\$(` is a literal)
-                            if contains_unescaped_dollar_paren(&unquoted) {
+                            // A pattern holding ANY unescaped `$` expansion is
+                            // EVALUATED before matching — bash expands the word
+                            // first. That is not only `$(cmd)`: a bare `$name`
+                            // pattern expands too, and treating it as the
+                            // literal text `"$name"` made the clause never
+                            // match (`case bar in $x)` — bash MATCH, the
+                            // translation NOMATCH). `dollar_interp` already
+                            // renders every form (`$name`, `${…}`, `$(…)`,
+                            // `$((…))`); the `$(` case additionally strips the
+                            // trailing newlines a command substitution removes.
+                            if contains_unescaped_dollar_expansion(&unquoted) {
+                                // A pattern that is EXACTLY one `$(echo LIT)`
+                                // is a compile-time constant, so fold it and
+                                // spawn nothing. Only that exact shape — a
+                                // pattern with surrounding text or an
+                                // expansion inside the substitution falls
+                                // through to `dollar_interp`.
+                                if let Some(cmd) = cmdsub_only_body(&unquoted) {
+                                    if let Some(text) = literal_echo_cmdsub(&cmd) {
+                                        return (Self::rust_str(&text), None);
+                                    }
+                                }
                                 self.add_helper("capture_rc");
                                 let interp = self.dollar_interp(&unquoted);
-                                // cmdsub strips trailing newlines
-                                (
-                                    format!("&({interp}).trim_end_matches('\\n').to_string()"),
-                                    None,
-                                )
+                                if contains_unescaped_dollar_paren(&unquoted) {
+                                    // cmdsub strips trailing newlines
+                                    (
+                                        format!("&({interp}).trim_end_matches('\\n').to_string()"),
+                                        None,
+                                    )
+                                } else {
+                                    // `dollar_interp` yields an OWNED String expr;
+                                    // the pattern slot is `&str` (`__sh_fnmatch`
+                                    // and `==`'s RHS), so borrow it.
+                                    (format!("&({interp})"), None)
+                                }
                             } else {
                                 (Self::rust_str(&unquoted), Some(unquoted))
                             }
@@ -18316,6 +18529,43 @@ fn contains_unescaped_dollar_paren(p: &str) -> bool {
     while i + 1 < ch.len() {
         if ch[i] == '\\' { i += 2; continue; }
         if ch[i] == '$' && ch[i + 1] == '(' { return true; }
+        i += 1;
+    }
+    false
+}
+
+/// Does the word contain an UNESCAPED `$` EXPANSION of ANY form — `$name`,
+/// `$1`/`$?`, `${…}`, `$( … )`, `$(( … ))`?
+///
+/// This is the test a `case` PATTERN must pass to be treated as a runtime
+/// value rather than literal text. Bash expands the pattern before matching
+/// (`case bar in $x)` matches iff `bar == "$x"`'s value), and only a QUOTED
+/// `\$` is literal. [`contains_unescaped_dollar_paren`] answers the narrower
+/// "is there a command substitution" question the `$(cmd)` lowering needs;
+/// a bare `$name` pattern is an expansion too and must not be compared as the
+/// literal text `"$name"` (that silently never matched — measured on
+/// `parse-redirect-in-case-pattern.sh` and on `case bar in $x)`, where bash
+/// printed MATCH and the translation printed nothing).
+///
+/// A `$` with nothing to expand (`$`, `$ `, a trailing `$`) is NOT an
+/// expansion and returns false, so a literal `$`-bearing word is unaffected.
+fn contains_unescaped_dollar_expansion(p: &str) -> bool {
+    let ch: Vec<char> = p.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if ch[i] == '$' && i + 1 < ch.len() {
+            let n = ch[i + 1];
+            if n == '{' || n == '(' || n == '\'' {
+                return true;
+            }
+            if n.is_ascii_alphanumeric() || matches!(n, '_' | '?' | '#' | '@' | '*' | '$' | '!') {
+                return true;
+            }
+        }
         i += 1;
     }
     false
@@ -25108,6 +25358,51 @@ mod tests {
 
 
     #[test]
+    /// A `case` pattern holding a `$( … )` is EXPANDED before matching — bash
+    /// compares against the substitution's value, not the text `"$( … )"`.
+    /// Regression pin (2026-10-14): the pattern was rendered as the literal
+    /// string, so `parse-redirect-in-case-pattern.sh` printed nothing where
+    /// bash printed `match` (the corpus gate's one red file).
+    #[test]
+    fn case_pattern_expansion_forms() {
+        // a bare `$name` pattern expands (never a literal `"$name"` compare)
+        assert!(super::contains_unescaped_dollar_expansion("$x"));
+        assert!(super::contains_unescaped_dollar_expansion("${x}"));
+        assert!(super::contains_unescaped_dollar_expansion("$(cmd)"));
+        assert!(super::contains_unescaped_dollar_expansion("pre$suf"));
+        // a `$` with nothing to expand, or an escaped one, is literal
+        assert!(!super::contains_unescaped_dollar_expansion("a$"));
+        assert!(!super::contains_unescaped_dollar_expansion("\\$x"));
+        assert!(!super::contains_unescaped_dollar_expansion("plain"));
+    }
+
+    /// A pattern that is exactly `$(echo LIT)` is a compile-time constant, so
+    /// the match needs no `__sh_capture_rc` (nor the subprocess it spawns).
+    #[test]
+    fn literal_echo_cmdsub_folds() {
+        assert_eq!(
+            super::cmdsub_only_body("$(echo \"foo|bar\")").as_deref(),
+            Some("echo \"foo|bar\"")
+        );
+        // surrounded by text, or not a substitution at all: refused
+        assert!(super::cmdsub_only_body("x$(echo a)").is_none());
+        assert!(super::cmdsub_only_body("$(echo a)x").is_none());
+        // the echoed text, with `$( … )`'s trailing newlines stripped
+        assert_eq!(
+            super::literal_echo_cmdsub("echo \"foo|bar\"").as_deref(),
+            Some("foo|bar")
+        );
+        assert_eq!(
+            super::literal_echo_cmdsub("echo a b").as_deref(),
+            Some("a b")
+        );
+        // REFUSE > GUESS: an expansion, a glob, `-e`, or a non-echo command
+        assert!(super::literal_echo_cmdsub("echo $x").is_none());
+        assert!(super::literal_echo_cmdsub("echo *").is_none());
+        assert!(super::literal_echo_cmdsub("echo -e a").is_none());
+        assert!(super::literal_echo_cmdsub("printf a").is_none());
+    }
+
     fn cat_peephole_shapes() {
         // empty and single-literal cats collapse; everything else stays
         assert_eq!(super::cat_peephole("__sh_cat(&[])"), "Vec::<String>::new()");
