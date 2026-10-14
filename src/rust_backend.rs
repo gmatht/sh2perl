@@ -8419,14 +8419,20 @@ impl Render {
         // flattens a `&[Vec<String>]` — always correct. The legacy `cat`
         // flag is now unused (kept as `_` at the top): a non-`vec![` word
         // is ALWAYS a splat here, since every other word arrives wrapped.
-        let needs_cat = ws.iter().any(|w| !w.starts_with("vec!["));
+        // `ws` is one `vec![word]` PER WORD, so the `__a` initializer
+        // must FLATTEN them (`vec![w1, w2]` would build
+        // `Vec<Vec<String>>`); `__sh_cat` does that flattening. Use it
+        // whenever the words are not already a single flat list — i.e.
+        // always, unless there is exactly one word whose vec is the whole
+        // list.
+        let needs_cat = ws.len() != 1 || !ws[0].starts_with("vec![");
         if needs_cat {
             self.add_helper("cat");
         }
         let constr = if needs_cat {
             format!("__sh_cat(&[{}])", ws.join(", "))
         } else {
-            format!("vec![{}]", ws.join(", "))
+            ws[0].clone()
         };
         let args = Self::fn_call_args(sig);
         format!("{{ let __a: Vec<String> = {constr}; {m}({args}) }}")
