@@ -1053,7 +1053,52 @@ fn scan_bracket_group(b: &[u8], at: usize) -> Option<usize> {
 /// freshly built `vec![..]` — a variable or a call could be used again
 /// afterwards, and eliding the call would move out of it (E0382). Anything
 /// not provably one-of-those is left alone (missed opt, never miscompile).
-fn concat_vec_peephole(text: &str) -> String {
+///
+/// `mixed` is the SECOND pass over the same shape (see [`mixed_cat_peephole`]);
+/// it additionally admits elements that are not plain `vec![…]`.
+fn cat_rewrite(text: &str, mixed: bool) -> String {
+    // FIXPOINT, not one pass. A rewritten `__sh_cat(&[ … ])` is emitted into
+    // the output verbatim, so a `__sh_cat` NESTED inside it (the closure body
+    // of `… .map(|p| __sh_cat(&[__sh_glob(p)]))` sitting inside the outer
+    // `__sh_cat(&[{ … }])`) is never revisited by a single left-to-right
+    // scan: the outer fold copies the inner text without rescanning it.
+    // `cat_peephole` has always looped to a fixpoint for exactly this reason;
+    // this pass must too or the inner sites survive untouched.
+    let mut cur = text.to_string();
+    loop {
+        let (next, changed) = cat_scan(&cur, mixed);
+        cur = next;
+        if !changed {
+            break;
+        }
+    }
+    // collect the helper when its last call collapsed (a definition with no
+    // callers is dead weight, and `rustc` warns on it).
+    //
+    // The test must count CALLS, not the name: a variable argument renders as
+    // `__sh_cat(&__b)`, so testing the bracket form `__sh_cat(&[` alone would
+    // delete a helper that is still called (E0425) — but testing `__sh_cat(`
+    // alone matches the DEFINITION's own `fn __sh_cat(ws: …)` header and so
+    // never collects it. Comparing the two counts separates them: the
+    // definition contributes exactly one occurrence of `fn __sh_cat(`.
+    while cur.matches("__sh_cat(").count() <= cur.matches("fn __sh_cat(").count() {
+        let def = "fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n";
+        let Some(pos) = cur.find(def) else { break };
+        let mut end = pos + def.len();
+        while cur[end..].starts_with('\n') {
+            end += 1;
+        }
+        cur.replace_range(pos..end, "");
+    }
+    cur
+}
+
+/// One left-to-right pass of the `__sh_cat` flatten (see [`cat_rewrite`]).
+///
+/// Returns the rewritten text and whether anything changed. The caller loops
+/// it to a fixpoint: the rewrite is idempotent and sound, and a nested site
+/// only becomes visible after its enclosing call has been replaced.
+fn cat_scan(text: &str, mixed: bool) -> (String, bool) {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -1125,28 +1170,45 @@ fn concat_vec_peephole(text: &str) -> String {
                 changed = true;
                 continue;
             }
+            // not all-`vec![…]` (a `__sh_glob(…)`/`__sh_split_ifs(…)` among the
+            // words): `[E1, E2, …].concat()` is the same concatenation, and it
+            // needs no helper. Refused unless every element is fresh — the
+            // array literal moves what the call only borrowed.
+            if mixed {
+                if let Some(concat) = temporaries_concat(inner) {
+                    out.push_str(&concat);
+                    i = after_open + 1;
+                    changed = true;
+                    continue;
+                }
+            }
         }
         // copy one whole UTF-8 char, never split a multi-byte literal
         let ch = text[i..].chars().next().unwrap_or('\0');
         out.push(ch);
         i += ch.len_utf8();
     }
-    if !changed {
-        return text.to_string();
-    }
-    // collect the helper when its last call collapsed (a definition with no
-    // callers is dead weight, and `rustc` warns on it)
-    let mut cur = out;
-    while !cur.contains("__sh_cat(&[") {
-        let def = "fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n";
-        let Some(pos) = cur.find(def) else { break };
-        let mut end = pos + def.len();
-        while cur[end..].starts_with('\n') {
-            end += 1;
-        }
-        cur.replace_range(pos..end, "");
-    }
-    cur
+    (out, changed)
+}
+
+/// Pass 1: the all-`vec![…]` flatten, which produces the plain `vec![..]` word
+/// list `wq_fold` reads. Runs BEFORE `wq_fold` for exactly that reason.
+fn concat_vec_peephole(text: &str) -> String {
+    cat_rewrite(text, false)
+}
+
+/// Pass 2: the same shape where the elements are a MIX of fresh `vec![…]` and
+/// other fresh values — `[E1, E2, …].concat()`.
+///
+/// This runs AFTER `wq_fold`, not with pass 1. Pass 1's `vec![..]` result is
+/// what `wq_fold` reads as a word list, and a `[…].concat()` argument is not
+/// one — folding here instead starves `wq_fold`, and the literal-command
+/// lowering behind it, of the shapes they consume. Measured on
+/// `062_hard_to_lex.sh`: with the mixed shape folded early, the
+/// `__sh_spawn("'sed' 's/old/new/g'", …)` literal degraded back to a
+/// runtime-built `__sh_wq(&__sh_cat(…))`.
+fn mixed_cat_peephole(text: &str) -> String {
+    cat_rewrite(text, true)
 }
 
 /// `__sh_wq(&[A, B, …])` is "shell-quote every word and join with spaces"
@@ -1297,6 +1359,37 @@ fn sh_q_lit(s: &str) -> String {
     o
 }
 
+/// The INVERSE of [`sh_q_lit`]: the raw text a single-quoted shell word stands
+/// for, or `None` when `s` is not exactly one such word (no surrounding
+/// quotes, or a quote its `'\''` escape does not explain).
+///
+/// The renderer hands a lowered site the VALUE `__sh_q` returned — the quoted
+/// word — while a native lowering that materialises the target itself (a
+/// `File::create` path) needs the raw text. `q_fold` makes that value a bare
+/// Rust literal (`"'/dev/null'"`), so a reader that used to see the
+/// `__sh_q(EXPR)` call and take `EXPR` must unquote the literal instead; a
+/// target that is NOT a quoted word (a raw path the renderer emitted directly)
+/// is already the raw text and is returned unchanged by the caller.
+fn sh_unq_lit(s: &str) -> Option<String> {
+    let mut rest = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut out = String::with_capacity(rest.len());
+    loop {
+        match rest.find('\'') {
+            None => {
+                out.push_str(rest);
+                return Some(out);
+            }
+            Some(k) => {
+                out.push_str(&rest[..k]);
+                // the only escape sh_q_lit emits; a quote it does not explain
+                // means this is not sh_q_lit's output
+                rest = rest[k..].strip_prefix("'\\''")?;
+                out.push('\'');
+            }
+        }
+    }
+}
+
 /// Decode a Rust string literal beginning at `s[0] == '"'` into its value,
 /// returning the value and the index just past the closing quote. Only the
 /// escapes `rust_str` emits are understood; anything else refuses.
@@ -1377,7 +1470,14 @@ fn q_fold(text: &str) -> String {
             let lit_at = i + "__sh_q(".len();
             if let Some((val, end)) = decode_rust_str_lit(&text[lit_at..]) {
                 if b.get(lit_at + end) == Some(&b')') {
-                    out.push_str(&Render::rust_str(&sh_q_lit(&val)));
+                    // `__sh_q` returns an OWNED `String`, so the fold must too:
+                    // a bare `&str` literal is only accepted where the call site
+                    // coerces, and a `vec![…]` word list (`Vec<String>`) is not
+                    // one of those — emitting the bare form there broke the
+                    // render with E0308 (measured 2026-10-09: `keyword-in-arg.sh`
+                    // and `grep_p.sh`, both a quoted literal inside a
+                    // `[..].join(" ")` word list).
+                    out.push_str(&Render::rust_str_expr(&sh_q_lit(&val)));
                     i = lit_at + end + 1;
                     changed = true;
                     continue;
@@ -1778,6 +1878,47 @@ fn flatten_vec_elements(inner: &str) -> Option<String> {
     Some(elems.join(", "))
 }
 
+/// Whether `e` is provably a FRESH `Vec<String>` value — one that can be moved
+/// into an array literal with nothing later observing the move.
+///
+/// The element's TYPE needs no inference: `__sh_cat` takes `&[Vec<String>]`,
+/// so the call could only have been emitted/compiled if every element already
+/// was a `Vec<String>`. Only the MOVE is in question.
+fn is_temporary_expr(e: &str) -> bool {
+    let e = e.trim();
+    if e.is_empty() {
+        return false;
+    }
+    // a macro (`vec![…]`), a block, or a call / method chain — all produce the
+    // value. A bare variable, a field, an index or a cast is NOT fresh: moving
+    // it out would be an E0382 the original call never had, so it is refused
+    // and the runtime call kept.
+    e.starts_with("vec![") || (e.starts_with('{') && e.ends_with('}')) || e.ends_with(')')
+}
+
+/// `__sh_cat(&[E1, E2, …])` whose elements are NOT all plain `vec![…]` — a mix
+/// of fresh `vec![…]` and other fresh values, which is what a command's word
+/// list looks like once a `__sh_glob(…)` / `__sh_split_ifs(…)` is among the
+/// words. The helper concatenates its elements, and that concatenation is the
+/// standard library's `[E1, E2, …].concat()`.
+///
+/// `[E1, …]` MOVES each element into the array where the helper only borrowed
+/// it, so every element must be provably fresh ([`is_temporary_expr`]).
+/// Anything else returns `None`: the call is left alone (missed opt, never
+/// miscompile).
+fn temporaries_concat(inner: &str) -> Option<String> {
+    let elems = split_top_commas(inner)?;
+    if elems.is_empty() || !elems.iter().all(|e| is_temporary_expr(e)) {
+        return None;
+    }
+    let joined = elems
+        .iter()
+        .map(|e| e.trim())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("[{joined}].concat()"))
+}
+
 /// Render an `IrProgram` to Rust source (fn main()).
 /// Pass-5 peephole (textual): `__sh_cat` is pure concatenation, so a
 /// single fresh `vec![..]` — or nothing at all — needs no call.
@@ -2019,6 +2160,13 @@ fn strip_str_lit_refs(text: &str) -> String {
 /// * `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`
 ///   (only when the sink-check tail is provably dead — i.e. no sink is
 ///   ever activated AND `__SH_ARITH_WORD_FAIL` is never set)
+/// * `__sh_strippre(&EXPR, "LIT", g)` / `__sh_stripsuf(…)`
+///   → `EXPR.strip_prefix("LIT")` / `EXPR.strip_suffix("LIT")`
+///   (only when `LIT` has no glob character — the scan order the `greedy`
+///   flag selects is unobservable for an exact pattern)
+/// * `__sh_split_ifs(&EXPR, " \t\n")` → `EXPR.split(…).filter(…).map(…)`
+///   (only the literal DEFAULT IFS; the composite-id guard is preserved
+///   in the emitted block — see `inline_sh_split_ifs`)
 fn inline_simple_helpers(
     text: &str,
     runtime_free: bool,
@@ -2084,6 +2232,14 @@ fn inline_simple_helpers(
     // — only when PAT is a literal with no glob characters
     out = inline_sh_replace(&out);
 
+    // __sh_strippre/__sh_stripsuf(&VAR, "LIT", greedy) → VAR.strip_prefix("LIT")
+    // / VAR.strip_suffix("LIT") — only when LIT has no glob characters
+    out = inline_sh_strip_ops(&out);
+
+    // __sh_split_ifs(&EXPR, " \t\n") → EXPR.split(…).filter(…).collect()
+    // — only for the literal default IFS (see the fn's doc)
+    out = inline_sh_split_ifs(&out);
+
     // Determine whether the output sinks (redirect capture / file sink)
     // are provably dead — i.e. the program never writes to any of them.
     // After `inline_sinks_when_unused` + `strip_str_lit_refs`, the runtime
@@ -2108,6 +2264,11 @@ fn inline_simple_helpers(
         //  `{`/`}` are not re-interpreted as format specifiers)
         inline_str_arg_helper(&mut out, "__sh_puts",
             |lit| format!("print!(\"{{}}\", {})", lit));
+        // ... and the same for the word-list forms in USER FUNCTION bodies,
+        // which the main-only pass above cannot reach. Sound here because
+        // `sinks_dead` is a whole-program verdict: no sink is ever installed,
+        // so no print anywhere can be routed to one.
+        out = inline_deadsink_prints(&out);
     }
 
     // Simplify `if { let __b = EXPR;  __b }` → `if EXPR`
@@ -2276,6 +2437,11 @@ fn brace_blocks(s: &str) -> Vec<(usize, usize)> {
 /// block. A print outside every region cannot be routed anywhere but stdout.
 /// Being generous about the bounds is safe (it costs a missed lowering);
 /// being narrow is not.
+///
+/// Both kinds of install site are emitted inside a dedicated `{ … }` block
+/// whose end IS the restore point — a capture's `__sh_cap_end`, a redirect's
+/// `= __oldout`/`= __sh_oldoutN` — so the block bound is already the sink's
+/// lifetime and no finer pairing is needed.
 fn sink_regions(text: &str) -> Vec<(usize, usize)> {
     const OPENS: &[&str] = &[
         "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(",
@@ -2562,6 +2728,566 @@ fn inline_sinkfree_prints(text: &str) -> String {
     out
 }
 
+/// The whole-program counterpart of [`inline_sinkfree_prints`], for a program
+/// whose output sinks are PROVABLY dead (`sinks_dead`: no capture buffer and
+/// no fd-1 file sink is ever installed, and the arith-word-fail guard is never
+/// tripped). `inline_sinkfree_prints` only rewrites `fn main`'s body, because
+/// a user function may be entered under a sink — but when NO sink exists
+/// anywhere in the program, a print in a user function cannot be routed
+/// either, so the same lowering is sound there too.
+///
+/// Measured 2026-10-14: 19 live `__sh_puts`/`__sh_print_words` calls across 7
+/// corpus files sat in user functions with no sink in the program at all, and
+/// every one of them was a plain `print!` the main-only pass could not reach.
+///
+/// It scans the DEFINITION lines too, so the `fn __sh_puts(`/`fn
+/// __sh_print_words(` headers are skipped explicitly (the name match requires
+/// a call, and a definition has `fn ` before the name).
+fn inline_deadsink_prints(text: &str) -> String {
+    let arith_fail = text.contains("__SH_ARITH_WORD_FAIL.store(true");
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if s_starts_at(text, i, "//") {
+            match text[i..].find('\n') {
+                Some(k) => {
+                    out.push_str(&text[i..i + k]);
+                    i += k;
+                    continue;
+                }
+                None => {
+                    out.push_str(&text[i..]);
+                    break;
+                }
+            }
+        }
+        if b[i] == b'"' || b[i] == b'\'' {
+            match scan_literal(b, i) {
+                Some(e) => {
+                    out.push_str(&text[i..e]);
+                    i = e;
+                    continue;
+                }
+                None => {
+                    let ch = text[i..].chars().next().unwrap_or('\0');
+                    out.push(ch);
+                    i += ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+        // a definition is not a call: `fn __sh_puts(` is skipped by the
+        // `fn ` test, exactly as `brace_fold` guards its own name
+        let is_def = text[..i].ends_with("fn ");
+        let hit = if !is_def && s_starts_at(text, i, "__sh_puts(") {
+            lower_puts(text, i + "__sh_puts(".len() - 1)
+        } else if !is_def && !arith_fail && s_starts_at(text, i, "__sh_print_words(") {
+            lower_print_words(text, i + "__sh_print_words(".len() - 1)
+        } else {
+            None
+        };
+        if let Some((rep, end)) = hit {
+            out.push_str(&rep);
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// A slice literal of Rust string literals, `[ "a", "b" ]` / `&[ … ]` /
+/// `vec![ … ]`. With `nested`, each element is itself such a slice (the
+/// `groups` argument); otherwise each element is one string.
+fn slice_lit_list(arg: &str, nested: bool) -> Option<Vec<Vec<String>>> {
+    let a = arg.trim();
+    let a = a.strip_prefix('&').unwrap_or(a);
+    let inner = a
+        .strip_prefix("vec![")
+        .or_else(|| a.strip_prefix('['))?
+        .strip_suffix(']')?;
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for el in split_top_commas(inner)? {
+        let el = el.trim();
+        if el.is_empty() {
+            continue;
+        }
+        if nested {
+            out.push(slice_lit_list(el, false)?.into_iter().flatten().collect());
+        } else {
+            out.push(vec![str_lit_value(el)?]);
+        }
+    }
+    Some(out)
+}
+
+/// The word list `__sh_brace(PRE, GROUPS, SEPS, SUF)` expands to, for
+/// arguments that are all literals. `None` as soon as anything is computed.
+fn brace_items(args: &str) -> Option<Vec<String>> {
+    let parts = split_top_commas(args)?;
+    if parts.len() != 4 {
+        return None;
+    }
+    let pre = str_lit_value(&parts[0])?;
+    let suf = str_lit_value(&parts[3])?;
+    let groups = slice_lit_list(&parts[1], true)?;
+    let seps: Vec<String> = slice_lit_list(&parts[2], false)?.into_iter().flatten().collect();
+    // the runtime helper's own expansion, reproduced exactly: cartesian
+    // product, then the per-group separator (only BETWEEN groups, and only
+    // when it is non-empty), then the suffix.
+    let mut out: Vec<String> = vec![pre];
+    for (gi, g) in groups.iter().enumerate() {
+        let mut next: Vec<String> = Vec::new();
+        for o in &out {
+            for item in g {
+                next.push(format!("{o}{item}"));
+            }
+        }
+        out = next;
+        if gi + 1 < groups.len() {
+            if let Some(sep) = seps.get(gi) {
+                if !sep.is_empty() {
+                    for o in out.iter_mut() {
+                        o.push_str(sep);
+                    }
+                }
+            }
+        }
+    }
+    for o in out.iter_mut() {
+        o.push_str(&suf);
+    }
+    Some(out)
+}
+
+/// `__sh_brace(PRE, GROUPS, SEPS, SUF)` is a PURE function of its four
+/// arguments — bash's brace expansion is a cartesian product with a prefix, a
+/// per-group separator and a suffix — so a call whose arguments are all
+/// literals is a compile-time constant word list:
+///
+///     __sh_brace("file_", &[&["a", "b"]], &[], ".txt")
+///         → vec!["file_a.txt".to_string(), "file_b.txt".to_string()]
+///
+/// Rust's own `vec![]` IS this construct; the call is a fallback. Any
+/// non-literal argument (a variable, a glob, a nested call) leaves the call
+/// alone rather than guessing at runtime data.
+///
+/// Runs FIRST in the post-pass chain so the peepholes behind it see `vec![ … ]`
+/// where they used to see an opaque call — `__sh_cat(&[__sh_brace(… )])`
+/// reduces to a plain `vec![ … ]` instead of being given up on.
+fn brace_fold(text: &str) -> String {
+    const NAME: &str = "__sh_brace";
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        // A call inside a string or char literal is source TEXT the renderer is
+        // emitting (a shell command it hands to a child, a message), not a call
+        // of ours — and a `//` mention is prose. Both are copied through, the
+        // same walk `inline_sinkfree_prints` makes.
+        if b[i] == b'"' || b[i] == b'\'' {
+            if let Some(e) = scan_literal(b, i) {
+                out.push_str(&text[i..e]);
+                i = e;
+                continue;
+            }
+        } else if s_starts_at(text, i, "//") {
+            match text[i..].find('\n') {
+                Some(k) => {
+                    out.push_str(&text[i..i + k]);
+                    i += k;
+                    continue;
+                }
+                None => {
+                    out.push_str(&text[i..]);
+                    break;
+                }
+            }
+        }
+        if s_starts_at(text, i, NAME) {
+            let after = i + NAME.len();
+            // the helper DEFINITION is not a call, and a bare mention is not
+            // either
+            if !text[..i].ends_with("fn ") && b.get(after) == Some(&b'(') {
+                if let Some((args, end)) = scan_paren(text, after) {
+                    if let Some(items) = brace_items(args) {
+                        out.push_str("vec![");
+                        for (n, w) in items.iter().enumerate() {
+                            if n > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(&Render::rust_str(w));
+                            out.push_str(".to_string()");
+                        }
+                        out.push(']');
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The value of a Rust string literal argument that the renderer may have
+/// spelled `"LIT"`, `&"LIT"` or `&"LIT".to_string()`. `None` unless the whole
+/// argument reduces to one literal — a computed argument is not a constant.
+fn str_lit_value(arg: &str) -> Option<String> {
+    let a = arg.trim();
+    let a = a.strip_prefix('&').unwrap_or(a);
+    let a = a.strip_suffix(".to_string()").unwrap_or(a);
+    let (v, n) = decode_rust_str_lit(a)?;
+    if n == a.len() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// The compile-time text of one output statement, or `None` when the statement
+/// is not a literal `echo`/`printf` write.
+///
+/// The renderer emits a literal `echo` as `__sh_puts("…")` (the words already
+/// joined, `-n`/`-e` applied) and a literal `printf` as
+/// `__sh_print_words(&[vec!["…".to_string()]], NL, false)`. Anything the
+/// runtime still has to compute — a variable, a `$( … )`, an `-e`/`%b`
+/// unescape — does not match, and every caller must then leave the block it
+/// came from ALONE rather than guess.
+fn literal_output_text(stmt: &str) -> Option<String> {
+    if let Some(rest) = stmt.strip_prefix("__sh_puts(") {
+        return str_lit_value(rest.strip_suffix(");")?);
+    }
+    let args = stmt
+        .strip_prefix("__sh_print_words(")?
+        .strip_suffix(");")?;
+    let parts = split_top_commas(args)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    let nl = match parts[1].trim() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    // `esc = true` is `echo -e` / `printf %b`: the unescape is the runtime's,
+    // so the text is not a compile-time constant.
+    if parts[2].trim() != "false" {
+        return None;
+    }
+    let head = parts[0].trim();
+    let inner = head
+        .strip_prefix("&vec![")
+        .or_else(|| head.strip_prefix("&["))?
+        .strip_suffix(']')?;
+    let mut words: Vec<String> = Vec::new();
+    for el in split_top_commas(inner)? {
+        let el = el.trim();
+        if el.is_empty() {
+            continue;
+        }
+        // a `vec![ … ]` element is one WORD LIST; anything else is a value the
+        // runtime has to produce, which vetoes the fold.
+        if !el.starts_with("vec![") {
+            return None;
+        }
+        let close = scan_bracket_group(el.as_bytes(), 4)?;
+        if close != el.len() {
+            return None;
+        }
+        for w in split_top_commas(&el[5..close - 1])? {
+            let w = w.trim();
+            if w.is_empty() {
+                continue;
+            }
+            words.push(str_lit_value(w)?);
+        }
+    }
+    let mut s = words.join(" ");
+    if nl {
+        s.push('\n');
+    }
+    Some(s)
+}
+
+/// `(status stores, written text)` for a block body whose ONLY effect is
+/// literal output. `None` as soon as anything else appears in it — a nested
+/// redirect, a pipeline, a `__sh_pbuf` stage buffer, a computed word.
+///
+/// The status stores are carried through verbatim rather than folded: the
+/// block they came from already writes them, so re-emitting them keeps the
+/// replacement behaviourally identical to the code it replaces.
+fn constant_block_body(body: &str) -> Option<(Vec<String>, String)> {
+    let mut stores: Vec<String> = Vec::new();
+    let mut text = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(v) = t
+            .strip_prefix("__SH_RC.store(")
+            .and_then(|r| r.strip_suffix(");"))
+            .and_then(|r| r.strip_suffix(", Ordering::SeqCst"))
+        {
+            if v.trim().parse::<i64>().is_err() {
+                return None;
+            }
+            stores.push(t.to_string());
+            continue;
+        }
+        text.push_str(&literal_output_text(t)?);
+    }
+    Some((stores, text))
+}
+
+/// Lower the two blocks the renderer outlines a SINK around when the sink can
+/// only ever receive a compile-time constant:
+///
+///     $( echo LIT )        `capture_block` — `__sh_cap_begin`/`__sh_cap_end`
+///     echo LIT > FILE      the fd-1 redirect install/restore pair
+///
+/// Both spend a runtime call per SITE on plumbing whose result is known before
+/// the program runs: a capture whose body only appends a literal string yields
+/// that string, and a redirect whose body only writes a literal string is
+/// `std::fs::write` spelt the long way — the mutex/TLS dance around it changes
+/// nothing observable. Folding them retires the calls (and, once a file's last
+/// caller is gone, the helper definitions with them).
+///
+/// The fold is deliberately limited to the EXACT block shape the renderer
+/// emits, so it cannot fire on a block that also runs commands, redirects
+/// again, or reads a variable.
+fn constant_sink_fold(text: &str) -> String {
+    let text = fold_constant_redirects(text);
+    fold_constant_captures(&text)
+}
+
+/// Fold `$( … )` captures whose body only writes a compile-time constant:
+///
+///     {
+///     let __cap_state = __sh_cap_begin();
+///     __sh_puts("hi\n");
+///     __SH_RC.store(0, Ordering::SeqCst);
+///     let __s = __sh_cap_end(__cap_state, false);
+///     __s
+///     }
+///       →
+///     {
+///     __SH_RC.store(0, Ordering::SeqCst);
+///     "hi".to_string()
+///     }
+///
+/// The block's VALUE is the constant, and `__sh_cap_begin`/`__sh_cap_end` are
+/// net no-ops on the sink state they save and restore — so dropping them
+/// changes nothing except that the two calls are gone.
+fn fold_constant_captures(text: &str) -> String {
+    const MARK: &str = "let __cap_state = __sh_cap_begin();";
+    const END: &str = "let __s = __sh_cap_end(__cap_state, false);";
+    let blocks = brace_blocks(text);
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find(MARK) {
+        let k = i + rel;
+        let adv = k + MARK.len();
+        let ls = text[..k].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let ind = &text[ls..k];
+        let fold = (|| -> Option<(usize, usize, Vec<String>, String)> {
+            // the marker is a statement on a line of its own, and its block
+            // opens with `{` on the line before: exactly one shape
+            if !ind.trim().is_empty() {
+                return None;
+            }
+            let open = text[..ls].rfind('{')?;
+            if !text[open + 1..ls].chars().all(char::is_whitespace) {
+                return None;
+            }
+            let close = blocks.iter().find(|(o, _)| *o == open).map(|(_, e)| *e)?;
+            let body_start = text[k..].find('\n').map(|p| k + p + 1)?;
+            let end_at = body_start + text[body_start..close].find(END)?;
+            let els = text[..end_at].rfind('\n').map(|p| p + 1)?;
+            if !text[els..end_at].chars().all(char::is_whitespace) {
+                return None;
+            }
+            // the block hands `__s` back on its own line, and nothing but the
+            // closing brace may follow it
+            let a = end_at + text[end_at..close].find('\n').map(|p| p + 1)?;
+            let between = text[a..close].trim();
+            if between != "__s" && between != "__s;" {
+                return None;
+            }
+            let (stores, txt) = constant_block_body(&text[body_start..els])?;
+            Some((open, close, stores, txt))
+        })();
+        let Some((open, close, stores, txt)) = fold else {
+            out.push_str(&text[i..adv]);
+            i = adv;
+            continue;
+        };
+        if open < i {
+            out.push_str(&text[i..adv]);
+            i = adv;
+            continue;
+        }
+        let mut lines: Vec<String> = stores;
+        // `__sh_cap_end` strips the trailing newlines a `$( … )` removes; the
+        // fold must produce the same value, not the raw block output.
+        let mut value = txt;
+        while value.ends_with('\n') {
+            value.pop();
+        }
+        lines.push(if value.is_empty() {
+            "String::new()".to_string()
+        } else {
+            Render::rust_str_expr(&value)
+        });
+        out.push_str(&text[i..open]);
+        out.push('{');
+        for l in &lines {
+            out.push('\n');
+            out.push_str(ind);
+            out.push_str(l);
+        }
+        out.push('\n');
+        out.push_str(&text[text[..close].rfind('\n').map(|p| p + 1).unwrap_or(0)..close]);
+        out.push('}');
+        i = close + 1;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+/// Fold `cmd > FILE` / `cmd >> FILE` blocks whose body only writes a
+/// compile-time constant:
+///
+///     {
+///     let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
+///     __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create(&T)…));
+///     __sh_puts("hi\n");
+///     __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);
+///     }
+///       →
+///     { let _ = std::io::Write::write_all(&mut std::fs::File::create(&T)…, "hi\n".as_bytes()); }
+///
+/// Installing the file into the sink static and restoring it afterwards is a
+/// net no-op, so opening the file and writing the constant is the whole
+/// construct — and it is what an idiomatic Rust program would say. The body
+/// must be literal output ONLY: a redirect whose body runs a command still
+/// needs the sink statics, and is refused.
+fn fold_constant_redirects(text: &str) -> String {
+    const TAKE_TAIL: &str = " = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());";
+    const INS_PRE: &str = "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(";
+    const INS_SUF: &str = ").unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));";
+    const CREATE: &str = "std::fs::File::create(";
+    const APPEND: &str = "std::fs::OpenOptions::new().append(true).create(true).open(";
+
+    let mut starts: Vec<usize> = Vec::new();
+    let mut p = 0usize;
+    for l in text.split('\n') {
+        starts.push(p);
+        p += l.len() + 1;
+    }
+    let line = |j: usize| -> &str {
+        let s = starts[j];
+        let e = if j + 1 < starts.len() {
+            starts[j + 1] - 1
+        } else {
+            text.len()
+        };
+        &text[s..e]
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0usize;
+    let mut j = 1usize;
+    while j + 2 < starts.len() {
+        let Some(name) = line(j).trim().strip_prefix("let ").and_then(|r| r.strip_suffix(TAKE_TAIL)) else {
+            j += 1;
+            continue;
+        };
+        let name = name.trim();
+        // the block opens on the previous line, and the install names the same
+        // local on its way back out
+        if name.is_empty() || line(j - 1).trim() != "{" {
+            j += 1;
+            continue;
+        }
+        let Some((append, target)) = line(j + 1)
+            .trim()
+            .strip_prefix(INS_PRE)
+            .and_then(|r| r.strip_suffix(INS_SUF))
+            .and_then(|mid| {
+                if let Some(e) = mid.strip_prefix(CREATE) {
+                    Some((false, e))
+                } else {
+                    mid.strip_prefix(APPEND).map(|e| (true, e))
+                }
+            })
+        else {
+            j += 1;
+            continue;
+        };
+        if target.trim().is_empty() {
+            j += 1;
+            continue;
+        }
+        // the argument is re-emitted verbatim: `strip_str_lit_refs` may have
+        // dropped a `&` from it, and the opener has to keep that exact shape
+        let opener = if append {
+            format!("std::fs::OpenOptions::new().append(true).create(true).open({target}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())")
+        } else {
+            format!("std::fs::File::create({target}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())")
+        };
+        let restore = format!("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = {name});");
+        let mut k = j + 2;
+        let mut body = String::new();
+        while k < starts.len() && line(k).trim() != restore {
+            body.push_str(line(k));
+            body.push('\n');
+            k += 1;
+        }
+        if k + 1 >= starts.len() || line(k + 1).trim() != "}" {
+            j += 1;
+            continue;
+        }
+        let Some((stores, txt)) = constant_block_body(&body) else {
+            j += 1;
+            continue;
+        };
+        let open_brace = starts[j - 1] + line(j - 1).rfind('{').unwrap();
+        let ind = &text[starts[j - 1]..open_brace];
+        let close_brace = starts[k + 1] + line(k + 1).rfind('}').unwrap();
+        if open_brace < copied || close_brace < open_brace {
+            j += 1;
+            continue;
+        }
+        out.push_str(&text[copied..open_brace]);
+        out.push('{');
+        for s in &stores {
+            out.push('\n');
+            out.push_str(ind);
+            out.push_str(s);
+        }
+        out.push('\n');
+        out.push_str(ind);
+        out.push_str(&format!(
+            "let _ = std::io::Write::write_all(&mut {opener}, {}.as_bytes());",
+            Render::rust_str(&txt)
+        ));
+        out.push('\n');
+        out.push_str(ind);
+        out.push('}');
+        copied = close_brace + 1;
+        j = k + 2;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Shell builtins that must NOT be handed to `std::process::Command`: bash
 /// runs its own builtin (with bash's own option handling — `echo -e`,
 /// `printf %b`, `cd` …) and there is no binary of that name to exec. The
@@ -2681,13 +3407,30 @@ fn parse_cmd_words(cmd: &str) -> Option<Vec<CmdWord>> {
     Some(words)
 }
 
+/// Whether `tail` — the text left after a string literal in [`cmd_template`]'s
+/// and [`push_cmd_source`]'s read-back — is the owned wrapper
+/// `stage_text` leaves on a command it could reconstruct, rather than a real
+/// suffix that makes the expression something other than the literal's text.
+///
+/// The renderer hands a STRING EXPRESSION where the lowering wants the shell
+/// TEXT, and a literal's own text is exactly what the shell would have seen,
+/// so `"..."`, `"...".to_string()`, `.to_owned()` and `.clone()` all read back
+/// identically. Shared so the two readers cannot drift: [`push_cmd_source`]
+/// always accepted the owned forms, but [`cmd_template`]'s bare-literal arm
+/// did not, which left the whole `cmd OP file` redirect class
+/// (`__sh_spawn(&format!("{} 2> {}", "'ls' …".to_string(), "/dev/null"), None)`)
+/// routed through `bash -c` for no reason but the wrapper.
+fn lit_text_tail_ok(tail: &str) -> bool {
+    tail.is_empty() || tail == ".to_string()" || tail == ".to_owned()" || tail == ".clone()"
+}
+
 /// Append one `format!` argument to the command template: a literal adds its
 /// text, a splice adds a `DYN_MARK` per word it contributes.
 fn push_cmd_source(rest: &str, tmpl: &mut String, dyns: &mut Vec<String>) -> Option<()> {
     let rest = rest.trim();
     if rest.starts_with('"') {
         let (lit, end) = decode_rust_str_lit(rest)?;
-        if !rest[end..].trim().is_empty() {
+        if !lit_text_tail_ok(rest[end..].trim()) {
             return None;
         }
         tmpl.push_str(&lit);
@@ -2729,7 +3472,7 @@ fn cmd_template(arg: &str) -> Option<(String, Vec<String>)> {
     let Some(inner) = strip_call(arg, "&format!").or_else(|| strip_call(arg, "format!")) else {
         if arg.starts_with('"') {
             let (lit, end) = decode_rust_str_lit(arg)?;
-            if !arg[end..].trim().is_empty() {
+            if !lit_text_tail_ok(arg[end..].trim()) {
                 return None;
             }
             return Some((lit, Vec::new()));
@@ -2835,6 +3578,58 @@ fn native_fed_cmd_call(chain: &str, feed: &str) -> String {
     )
 }
 
+/// The native call for a simple command whose stdout must land in the ACTIVE
+/// fd-1 sink (see [`native_sink_cmd_call_note`]).
+///
+/// `__sh_spawn` runs `bash -c "<command string>"` — a shell it has to parse,
+/// on top of the shell quoting the renderer already did with `__sh_q` just to
+/// build that string — and then routes the child's stdout by hand. Where the
+/// command is a literal SIMPLE command that whole apparatus is dead: the
+/// standard library expresses both halves, argv as `.arg(..)` and the routing
+/// as a piped fd 1 the call reads back and deposits where `__sh_spawn` would
+/// have.
+///
+///     __sh_spawn("'sed' 's/a/b/'", Some(&pbuf))  (sink live)
+///         → Command::new("sed").arg("s/a/b/").stdin(piped).spawn() + write
+///
+/// The deposit reproduces `__sh_spawn`'s tail exactly, including the
+/// `!out.is_empty()` guard and the file-redirect-first precedence, so the
+/// capture buffer (`__SH_OUT`) and a `> file` sink (`__SH_OUTFILE_TL`) both
+/// receive the same bytes the shell arm delivered. Those statics keep their
+/// uppercase names, so nothing here widens the runtime namespace.
+///
+/// A command that could not be STARTED follows the shell arm's verdict
+/// (bash reports 127/126, see [`BASH_NOCMD`]), not `__sh_spawn`'s bare
+/// `Err(_) => 1`, which only covers a failure to exec `bash` itself.
+fn native_sink_cmd_call(chain: &str, feed: Option<&str>) -> String {
+    let (stdin, write) = match feed {
+        Some(f) => (
+            ".stdin(std::process::Stdio::piped())",
+            format!(
+                "if let Some(mut __ci) = __cc.stdin.take() \
+                 {{ let _ = std::io::Write::write_all(&mut __ci, {f}); }} "
+            ),
+        ),
+        None => ("", String::new()),
+    };
+    format!(
+        "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); \
+         match {chain}{stdin}.stdout(std::process::Stdio::piped()).spawn() {{\
+         Ok(mut __cc) => {{ {write}\
+         let mut __co: Vec<u8> = Vec::new(); \
+         if let Some(mut __cs) = __cc.stdout.take() \
+         {{ let _ = std::io::Read::read_to_end(&mut __cs, &mut __co); }} \
+         let __cr = __cc.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1); \
+         if !__co.is_empty() {{ let mut __cu = false; \
+         __SH_OUTFILE_TL.with(|v| {{ if let Some(f) = v.borrow_mut().as_mut() \
+         {{ let _ = std::io::Write::write_all(f, &__co); __cu = true; }} }}); \
+         if !__cu {{ if let Some(b) = __SH_OUT.lock().unwrap().as_mut() \
+         {{ b.extend_from_slice(&__co); }} else {{ \
+         let _ = std::io::Write::write_all(&mut std::io::stdout(), &__co); }} }} }} \
+         __cr }}, Err(e) => {BASH_NOCMD} }} }}"
+    )
+}
+
 /// The `.arg(..)` chain for the literal SIMPLE command a runtime command
 /// call's first argument renders to, or `None` when it is not a shape
 /// `argv` can express. This is the shared decision point for
@@ -2902,10 +3697,166 @@ fn cmd_argv(text: &str, at: usize, spawn: bool) -> Option<(String, Option<String
     Some((native_cmd_chain(&prog, &argv), feed, end))
 }
 
+/// A redirect the renderer could not lower natively, left embedded in a
+/// runtime command string. [`Builder::redirect_render`] writes it as
+/// `&format!("{} {FD}{OP} {}", CMD, __sh_q("TARGET"))` — a file target (a
+/// pipe, a process substitution and a here-doc take their own arms), so the
+/// whole thing is a shell round-trip for a redirection the standard library
+/// expresses as an fd: `.stdout(File::create(..))`.
+struct EmbeddedRedir {
+    op: &'static str,
+    fd: &'static str,
+    cmd: String,
+    target: String,
+}
+
+/// Recognize the shape [`EmbeddedRedir`] describes, or `None` when the
+/// command string is anything else (a `2>&1` dup, a `<(…)`, a `|`).
+///
+/// The target reaches this pass already quoted by `__sh_q(&E)` — or, when its
+/// value is a compile-time constant, as the bare literal `q_fold` left in the
+/// helper's place — so both spellings are read back to the raw path
+/// expression the `File::create` takes.
+fn embedded_redir(arg: &str) -> Option<EmbeddedRedir> {
+    let inner = strip_call(arg, "&format!").or_else(|| strip_call(arg, "format!"))?;
+    let parts = split_top_commas(inner)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    let (fmt, _) = decode_rust_str_lit(parts[0].trim())?;
+    let (fd, op) = match fmt.as_str() {
+        "{} > {}" => ("", ">"),
+        "{} 2> {}" => ("2", ">"),
+        "{} >> {}" => ("", ">>"),
+        "{} 2>> {}" => ("2", ">>"),
+        "{} < {}" => ("", "<"),
+        _ => return None,
+    };
+    let t = parts[2].trim();
+    let target = match strip_call(t, "__sh_q") {
+        Some(e) => e.trim().trim_start_matches('&').trim().to_string(),
+        None => {
+            let (val, end) = decode_rust_str_lit(t)?;
+            // `q_fold` leaves a constant target as the owned `"…".to_string()`
+            // (the type `__sh_q` returned), so the owned wrapper is read back
+            // here exactly like the two command-template readers do.
+            if !lit_text_tail_ok(t[end..].trim()) {
+                return None;
+            }
+            // …and its VALUE is the shell-QUOTED word, because that is what
+            // `__sh_q` returned. A native `File::create` wants the raw path, so
+            // unquote it. A target that is not one single-quoted word was
+            // emitted raw and is used as written.
+            match sh_unq_lit(&val) {
+                Some(raw) => Render::rust_str(&raw),
+                None => t.to_string(),
+            }
+        }
+    };
+    if target.is_empty() {
+        return None;
+    }
+    Some(EmbeddedRedir {
+        op,
+        fd,
+        cmd: parts[1].trim().to_string(),
+        target,
+    })
+}
+
+/// `__sh_spawn(&format!("{} OP {}", CMD, TARGET), None)` at `at` (its `(`),
+/// lowered to a `Command` whose redirected descriptor is a real file.
+///
+/// Only the `None` arm qualifies: a `Some(..)` feed goes through fd 0, and
+/// the renderer only ever pairs a redirect with a here-doc on the fd-0 side,
+/// so a site naming both is a shape this lowering has not reasoned about.
+///
+/// `fd1_file_only` narrows it to `> FILE` / `>> FILE`, the shapes
+/// [`inline_absorbed_redirect_exec`] may apply inside a live fd-1 sink.
+fn lower_redirect_exec(text: &str, at: usize, fd1_file_only: bool) -> Option<(String, usize)> {
+    let (args, end) = scan_paren(text, at)?;
+    let parts = split_top_commas(args)?;
+    if parts.len() != 2 || parts[1].trim() != "None" {
+        return None;
+    }
+    let r = embedded_redir(parts[0].trim())?;
+    if fd1_file_only && !(r.fd.is_empty() && (r.op == ">" || r.op == ">>")) {
+        return None;
+    }
+    let (tmpl, dyns) = cmd_template(&r.cmd)?;
+    let words = parse_cmd_words(&tmpl)?;
+    // A STANDALONE redirect (`> file`, no command) is not an exec: bash applies
+    // the redirection, runs nothing and leaves `$?` at 0. `__sh_spawn` on the
+    // empty command reproduces that; lowering it to `Command::new("")` invents
+    // a program that does not exist (measured 2026-10-09:
+    // `parse-standalone-redirect.sh` — `>somefile` became
+    // `File::create("'somefile'")` + a 127 from an empty argv0).
+    let Some(CmdWord::Lit(prog)) = words.first() else {
+        return None;
+    };
+    if prog.is_empty() {
+        return None;
+    }
+    if SHELL_BUILTINS.contains(&prog.as_str()) {
+        return None;
+    }
+    let mut argv: Vec<CmdArg> = Vec::new();
+    let mut next = 0usize;
+    for w in words {
+        match w {
+            CmdWord::Lit(w) => argv.push(CmdArg::Lit(w)),
+            CmdWord::Dyn => {
+                let e = dyns.get(next)?.clone();
+                next += 1;
+                argv.push(CmdArg::Dyn(e));
+            }
+        }
+    }
+    if next != dyns.len() {
+        return None;
+    }
+    let prog = match argv.remove(0) {
+        CmdArg::Lit(p) => p,
+        CmdArg::Dyn(_) => return None,
+    };
+    let t = &r.target;
+    // bash applies the redirection BEFORE exec: a target it cannot open
+    // reports an error, runs nothing and leaves `$?` at 1 — not the 127/126
+    // `BASH_NOCMD` reserves for a command that could not be STARTED.
+    let (open, setter) = match (r.fd, r.op) {
+        ("", ">") => (format!("std::fs::File::create({t})"), ".stdout"),
+        ("2", ">") => (format!("std::fs::File::create({t})"), ".stderr"),
+        ("", ">>") => (
+            format!("std::fs::OpenOptions::new().create(true).append(true).open({t})"),
+            ".stdout",
+        ),
+        ("2", ">>") => (
+            format!("std::fs::OpenOptions::new().create(true).append(true).open({t})"),
+            ".stderr",
+        ),
+        ("", "<") => (format!("std::fs::File::open({t})"), ".stdin"),
+        _ => return None,
+    };
+    Some((
+        format!(
+            "{{ let _ = std::io::Write::flush(&mut std::io::stdout()); \
+             match {open} {{ Ok(__rf) => match {chain}{setter}(__rf).status() \
+             {{ Ok(s) => s.code().unwrap_or(1), Err(e) => {BASH_NOCMD} }}, Err(_) => 1 }} }}",
+            chain = native_cmd_chain(&prog, &argv)
+        ),
+        end,
+    ))
+}
+
 /// `__sh_run(CMD)` / `__sh_spawn(CMD, None|Some(..))` at `at` (its `(`),
 /// lowered to [`native_cmd_call`] or, when the site names an fd-0 feed,
 /// [`native_fed_cmd_call`].
 fn lower_exec_call(text: &str, at: usize, spawn: bool) -> Option<(String, usize)> {
+    if spawn {
+        if let Some(hit) = lower_redirect_exec(text, at, false) {
+            return Some(hit);
+        }
+    }
     let (chain, feed, end) = cmd_argv(text, at, spawn)?;
     let call = match feed {
         Some(f) => native_fed_cmd_call(&chain, &f),
@@ -2961,7 +3912,22 @@ fn native_capture_expr(chain: &str) -> String {
 /// `std::process::Command` would silently inherit the WRONG fd 0 there.
 fn exec_regions(body: &str) -> Vec<(usize, usize)> {
     let mut out = sink_regions(body);
+    out.extend(stdin_override_regions(body));
+    out.sort();
+    out
+}
+
+/// Only the fd-0 override spans of [`exec_regions`]: a `std::process::Command`
+/// inherits the CALLER's real fd 0, so no native lowering may run inside a
+/// `< file`, here-doc or `<(…)` region — `__sh_spawn` is the only thing that
+/// consults `__SH_STDIN`/`__SH_STDIN_PATH`.
+///
+/// The fd-1 sink spans are deliberately NOT included; a lowering that
+/// redirects fd 1 to a file is sound inside them (see
+/// [`inline_absorbed_redirect_exec`]).
+fn stdin_override_regions(body: &str) -> Vec<(usize, usize)> {
     let blocks = brace_blocks(body);
+    let mut out: Vec<(usize, usize)> = Vec::new();
     for op in [
         "*__SH_STDIN.lock().unwrap() = Some(",
         "*__SH_STDIN_PATH.lock().unwrap() = Some(",
@@ -2984,26 +3950,48 @@ fn exec_regions(body: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Which live-redirection spans disable the lowering [`rewrite_main_body`]
+/// applies. See [`stdin_override_regions`] for why fd-1 sinks and fd-0
+/// overrides are separate questions.
+const GUARD_NONE: u8 = 0;
+const GUARD_STDIN: u8 = 1;
+const GUARD_STDIN_AND_SINK: u8 = 2;
+/// The INVERSE of [`GUARD_STDIN_AND_SINK`]'s sink half: lower only where an
+/// fd-1 sink IS live, and still never where fd 0 is overridden.
+const GUARD_SINK_ONLY: u8 = 3;
+
 /// Walk `fn main`'s own body, like [`inline_sinkfree_prints`], and let
 /// `lower` rewrite a runtime command call at the byte offset it is handed.
 ///
 /// Comments and string/char literals are copied verbatim, so a call inside
-/// one is never matched. `sink_guarded` picks the region rule: the exec
-/// lowerings inherit fd 0/fd 1 from the enclosing scope, so they are only
-/// applied outside every sink and stdin override, while the capture
-/// lowering pipes fd 1 and pins fd 0 itself and is therefore unaffected by
-/// the enclosing redirect.
+/// one is never matched. `guard` picks the region rule: the exec lowerings
+/// that INHERIT fd 0/fd 1 from the enclosing scope ([`GUARD_STDIN_AND_SINK`],
+/// [`GUARD_STDIN`]) are applied only outside the spans that would make an
+/// inherited descriptor wrong, while the capture lowering pipes fd 1 and pins
+/// fd 0 itself and is therefore unaffected by the enclosing redirect
+/// ([`GUARD_NONE`]). [`GUARD_SINK_ONLY`] is the case in between — a lowering
+/// that reproduces the sink itself and so requires one to be live.
 fn rewrite_main_body(
     text: &str,
-    sink_guarded: bool,
+    guard: u8,
     mut lower: impl FnMut(&str, usize) -> Option<(String, usize)>,
 ) -> String {
     let Some((body_start, body_end)) = main_body_span(text) else {
         return text.to_string();
     };
     let body = &text[body_start..body_end];
-    let regions = if sink_guarded {
-        exec_regions(body)
+    let regions = match guard {
+        GUARD_STDIN_AND_SINK => exec_regions(body),
+        GUARD_STDIN => stdin_override_regions(body),
+        GUARD_SINK_ONLY => sink_regions(body),
+        _ => Vec::new(),
+    };
+    // `GUARD_SINK_ONLY` ADDS the fd-0 rule to the sink one: `__sh_spawn`
+    // consults `__SH_STDIN`/`__SH_STDIN_PATH` when no feed is named, and a
+    // native child inherits the caller's real fd 0, so no lowering may run
+    // inside a `< file` / here-doc / here-string region either.
+    let stdin_regions = if guard == GUARD_SINK_ONLY {
+        stdin_override_regions(body)
     } else {
         Vec::new()
     };
@@ -3041,7 +4029,14 @@ fn rewrite_main_body(
                 }
             }
         }
-        if !regions.iter().any(|(s, e)| *s < i && i < *e) {
+        let inside = regions.iter().any(|(s, e)| *s < i && i < *e);
+        let eligible = match guard {
+            GUARD_SINK_ONLY => {
+                inside && !stdin_regions.iter().any(|(s, e)| *s < i && i < *e)
+            }
+            _ => !inside,
+        };
+        if eligible {
             if let Some((rep, end)) = lower(body, i) {
                 out.push_str(&rep);
                 i = end;
@@ -3082,11 +4077,80 @@ fn rewrite_main_body(
 /// function's body can be called from inside a capture or a redirect, where
 /// the sinks ARE live, so those calls stay routed (see [`main_body_span`]).
 fn inline_sinkfree_exec(text: &str) -> String {
-    rewrite_main_body(text, true, |body, i| {
+    rewrite_main_body(text, GUARD_STDIN_AND_SINK, |body, i| {
         if s_starts_at(body, i, "__sh_run(") {
             lower_exec_call(body, i + "__sh_run".len(), false)
         } else if s_starts_at(body, i, "__sh_spawn(") {
             lower_exec_call(body, i + "__sh_spawn".len(), true)
+        } else {
+            None
+        }
+    })
+}
+
+/// `cmd > file` / `cmd >> file` where a capture or an fd-1 sink IS live.
+///
+/// The sink guard exists because a native child inherits fd 1 and would
+/// bypass the sink the runtime routes the child's output through. A
+/// redirection of fd 1 to a FILE removes that reason: the child never writes
+/// to the inherited descriptor, so `__sh_spawn` reads an empty pipe and
+/// appends nothing to the sink — and the native form appends nothing either.
+/// The sink's contents are therefore identical, which is why this pass runs
+/// without the fd-1 guard and why it only accepts the fd-1 file shape
+/// (`lower_redirect_exec`'s `fd1_file_only`): anything else leaves fd 1
+/// pointed at the inherited descriptor and would be swallowed by stdout
+/// instead of reaching the sink.
+///
+/// The fd-0 guard still applies — a `< file` region points the child's stdin
+/// through `__SH_STDIN`, which no inherited descriptor reproduces.
+fn inline_absorbed_redirect_exec(text: &str) -> String {
+    rewrite_main_body(text, GUARD_STDIN, |body, i| {
+        if s_starts_at(body, i, "__sh_spawn(") {
+            lower_redirect_exec(body, i + "__sh_spawn".len(), true)
+        } else {
+            None
+        }
+    })
+}
+
+/// `__sh_run(CMD)` / `__sh_spawn(CMD, FEED)` at `at` (its `(`) where an fd-1
+/// sink IS live, lowered to [`native_sink_cmd_call`].
+///
+/// Same argument decision as [`lower_exec_call`] — the shared
+/// [`cmd_argv`] REFUSE > GUESS subset — but a different emitter: the sink-free
+/// one may inherit fd 1, this one must reproduce what the sink would have
+/// received.
+fn lower_sink_exec_call(text: &str, at: usize, spawn: bool) -> Option<(String, usize)> {
+    let (chain, feed, end) = cmd_argv(text, at, spawn)?;
+    Some((native_sink_cmd_call(&chain, feed.as_deref()), end))
+}
+
+/// Lower a runtime fork/exec to a native `std::process::Command` where an
+/// fd-1 sink IS live — the sites [`inline_sinkfree_exec`] has to refuse.
+///
+/// That pass inherits fd 1, so it may only run where nothing is capturing:
+/// inside a `$(…)` or a redirect the child's output would escape the buffer
+/// the surrounding block reads back. Those sites do not have to keep the
+/// shell, though — they keep the *sink* instead, which is
+/// [`native_sink_cmd_call`]'s job. Measured 2026-10-09: 113 of the corpus's
+/// `__sh_spawn`/`__sh_run` sites are inside `fn main`'s sink regions and name
+/// a literal SIMPLE command, nearly all of them the consumer tail of a
+/// `printf … | grep …` pipeline whose producer is the surrounding buffer.
+///
+/// Scope is `fn main`'s own body, like [`inline_sinkfree_exec`] and for the
+/// same reason: a shell function's body may be reached from a caller whose
+/// sink state this pass cannot see from here, and unlike a local sink region
+/// that state decides whether fd 1 must be piped or inherited.
+///
+/// Runs after [`inline_absorbed_redirect_exec`], so the fd-1 file-redirect
+/// shapes that pass can express are already consumed and this one sees only
+/// the sites whose stdout really does land in the sink.
+fn inline_sink_routed_exec(text: &str) -> String {
+    rewrite_main_body(text, GUARD_SINK_ONLY, |body, i| {
+        if s_starts_at(body, i, "__sh_run(") {
+            lower_sink_exec_call(body, i + "__sh_run".len(), false)
+        } else if s_starts_at(body, i, "__sh_spawn(") {
+            lower_sink_exec_call(body, i + "__sh_spawn".len(), true)
         } else {
             None
         }
@@ -3102,7 +4166,7 @@ fn inline_sinkfree_exec(text: &str) -> String {
 /// (`fn main`), so a capture inside a helper body — which may be reached
 /// from an unrelated redirect — keeps its runtime lowering.
 fn inline_sinkfree_capture(text: &str) -> String {
-    rewrite_main_body(text, false, |body, i| {
+    rewrite_main_body(text, GUARD_NONE, |body, i| {
         if s_starts_at(body, i, "__sh_capture_rc(") {
             lower_capture_call(body, i + "__sh_capture_rc".len())
         } else {
@@ -3330,6 +4394,129 @@ fn inline_sh_replace(text: &str) -> String {
             pos = at + replacement.len();
         } else {
             pos = end;
+        }
+    }
+    out
+}
+
+/// `__sh_split_ifs(&EXPR, " \t\n")` → the standard library's own `split`.
+///
+/// `__sh_split_ifs` implements bash's GENERAL IFS word-splitting: skip the
+/// leading separators, take a maximal non-separator run as a field, then skip
+/// the whole run of separators that follows. For the DEFAULT IFS that general
+/// loop is exactly `split(sep)` with the empty pieces dropped — the empty
+/// pieces ARE what the leading, trailing and run cases produce, so filtering
+/// them reproduces "collapse runs, trim both ends" with no index arithmetic
+/// and no `Vec<char>` copy of the input.
+///
+/// The separator set stays the ASCII trio rather than `split_whitespace()`:
+/// `char::is_whitespace` also matches Unicode spaces (U+00A0, U+2028 …) while
+/// the helper tests `ifs.contains(c)`, so the corpus's utf8/unicode examples
+/// would diverge on a non-breaking space.
+///
+/// The composite-id guard is PRESERVED rather than dropped. The helper returns
+/// a `list#3`/`obj#7` id whole — including the trailing newline it tolerates —
+/// and `split` would shave that newline, so the branch (and its predicate,
+/// inlined) is kept verbatim. Inlining the predicate also stops this rewrite
+/// from keeping `__sh_is_composite_id` alive purely to guard itself.
+///
+/// Only the LITERAL default IFS is rewritten: any other separator set takes
+/// the whitespace-collapsing arm of the helper and is not this shape.
+fn inline_sh_split_ifs(text: &str) -> String {
+    let mut out = text.to_string();
+    let prefix = "__sh_split_ifs(";
+    let mut pos = 0;
+    while let Some(at) = out[pos..].find(prefix) {
+        let at = pos + at;
+        // whole-identifier match only (`x__sh_split_ifs(` is not our helper)
+        if at > 0 {
+            if let Some(c) = out[..at].chars().next_back() {
+                if c == '_' || c.is_alphanumeric() {
+                    pos = at + prefix.len();
+                    continue;
+                }
+            }
+        }
+        let rest = &out[at + prefix.len()..];
+        let Some((inner_rel, end_rel)) = parse_ident_to_paren(rest) else {
+            break;
+        };
+        let end = at + prefix.len() + end_rel;
+        let args = split_args(inner_rel);
+        // `&EXPR` and the default IFS written as Rust text — `" \t\n"`.
+        // A non-literal IFS (a variable) and the helper's own definition
+        // (`s: &str, ifs: &str`) both fail this test and are skipped.
+        let ok = args.len() == 2 && args[0].starts_with('&') && args[1] == "\" \\t\\n\"";
+        if !ok {
+            pos = end;
+            continue;
+        }
+        let expr = &args[0][1..];
+        let replacement = format!(
+            "{{ let __si = {expr}; \
+             let __st = __si.strip_suffix('\\n').unwrap_or(&__si); \
+             if __st.len() >= 6 \
+                 && (__st.starts_with(\"list#\") || __st.starts_with(\"obj#\")) \
+                 && __st[5..].parse::<usize>().is_ok() \
+             {{ vec![__si.to_string()] }} \
+             else {{ __si.split(|c| c == ' ' || c == '\\t' || c == '\\n') \
+                 .filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<String>>() }} }}"
+        );
+        out.replace_range(at..end, &replacement);
+        pos = at + replacement.len();
+    }
+    out
+}
+
+/// `__sh_strippre`/`__sh_stripsuf(&EXPR, "LIT", greedy)` → `str::strip_prefix` /
+/// `str::strip_suffix` when `LIT` is a literal with no glob characters.
+///
+/// The helper's `greedy` knob only picks the ORDER it scans candidates in: for
+/// a pattern with no metacharacter, `__sh_fnmatch(pat, cand)` is exact equality,
+/// so exactly one candidate length can match and both orders reach it. Its
+/// loop is therefore `strip_prefix`/`strip_suffix` for either value of `greedy`
+/// (an empty pattern is the identity in all four arms, which `strip_*("")`
+/// also returns).
+///
+/// Glob-bearing patterns are refused — `*`, `?`, `[`, `\` and the extglob
+/// openers are what make the scan order observable — and a non-`&` receiver is
+/// refused so the rewrite never has to guess whether the binding is owned.
+fn inline_sh_strip_ops(text: &str) -> String {
+    let mut out = text.to_string();
+    for (helper, method) in [("__sh_strippre(", "strip_prefix"), ("__sh_stripsuf(", "strip_suffix")] {
+        let mut pos = 0;
+        while let Some(at) = out[pos..].find(helper) {
+            let at = pos + at;
+            let rest = &out[at + helper.len()..];
+            let Some((inner_rel, end_rel)) = parse_ident_to_paren(rest) else {
+                break;
+            };
+            let end = at + helper.len() + end_rel;
+            let args = split_args(inner_rel);
+            let ok = args.len() == 3
+                && args[0].starts_with('&')
+                && args[1].starts_with('"')
+                && args[1].ends_with('"')
+                && args[1].len() >= 2
+                && (args[2] == "true" || args[2] == "false");
+            if !ok {
+                pos = end;
+                continue;
+            }
+            let pat_content = &args[1][1..args[1].len() - 1];
+            let has_glob =
+                pat_content.chars().any(|c| matches!(c, '*' | '?' | '[' | '\\' | '!' | '@' | '+' | '(' | '|'));
+            if has_glob {
+                pos = end;
+                continue;
+            }
+            let expr = &args[0][1..];
+            let pat = args[1];
+            let replacement = format!(
+                "{{ let __sp = {expr}; __sp.{method}({pat}).unwrap_or(&__sp).to_string() }}"
+            );
+            out.replace_range(at..end, &replacement);
+            pos = at + replacement.len();
         }
     }
     out
@@ -3645,6 +4832,42 @@ fn mentions_ident(line: &str, name: &str) -> bool {
     false
 }
 
+/// Drop `__sh_run_traps();` calls from a program that never INSTALLS a trap.
+///
+/// `__sh_run_traps()` drains the `__SH_TRAPS` queue and, for each entry, runs
+/// the trap handler. The queue's only writer is the `trap` builtin's lowering
+/// (`__SH_TRAPS.lock().unwrap().push(...)`); when the rendered text contains no
+/// such push anywhere, the vector is provably empty at every point, so the
+/// call is an empty `for` loop over nothing — a runtime callout whose result is
+/// known before the program starts.
+///
+/// The renderer emits the call on the `cd`-failure and `exit`/error paths of
+/// every program (27 corpus files call it while never installing a trap).
+/// Removing the call sites lets `prune_unused_helpers` collect `fn
+/// __sh_run_traps` and `prune_unused_statics` collect `__SH_TRAPS` with them.
+///
+/// It removes ONLY a whole line whose sole non-whitespace content is the call
+/// (the shape `program_stmt` emits) — a call embedded in a larger expression
+/// is left alone, since the surrounding text would have to be reflowed.
+fn drop_dead_trap_calls(text: &str) -> String {
+    if text.contains("__SH_TRAPS.lock().unwrap().push") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for line in text.lines() {
+        if line.trim() == "__sh_run_traps();" {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(line);
+    }
+    out
+}
+
 fn prune_unused_helpers(text: String) -> String {
     // EVERY registered helper, by its RENDERED `fn __sh_*` name — derived
     // from the registry itself (`HELPER_ORDER` × `helper_source`), so a
@@ -3652,16 +4875,35 @@ fn prune_unused_helpers(text: String) -> String {
     // `helper_source` is empty (or whose name has no `fn __sh_` prefix)
     // is skipped; the two-word `print_words` variants both render
     // `__sh_print_words`, which the duplicate-tolerant scan handles.
+    //
+    // ALL of a bundle's names, not just its leading one. This used to take
+    // `src.strip_prefix("fn ")` — the FIRST `fn` only — so a `helper_source`
+    // entry that ships several functions registered just the first, and its
+    // siblings could never be collected. `join_value` is exactly that shape
+    // (`__sh_is_composite_id`, `__sh_shave_nl`, `__sh_join_value` in one
+    // entry), and `split_ifs` needs `__sh_is_composite_id` — which kept the
+    // whole bundle alive. Measured 2026-10-09: `__sh_shave_nl` and
+    // `__sh_join_value` were each defined-and-never-called in 36 files, and
+    // the pair dragged `__sh_join_words` (their only caller) along — 216
+    // tokens corpus-wide on code no program ever ran.
     let helper_names: Vec<String> = HELPER_ORDER
         .iter()
-        .filter_map(|h| {
+        .flat_map(|h| {
             let src = helper_source(h);
-            let name: String = src
-                .strip_prefix("fn ")?
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
+            let mut names = Vec::new();
+            let mut from = 0usize;
+            while let Some(k) = src[from..].find("fn ") {
+                let at = from + k + "fn ".len();
+                let name: String = src[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.starts_with("__sh_") {
+                    names.push(name);
+                }
+                from = at;
+            }
+            names
         })
         .collect();
     let helpers: Vec<&str> = helper_names.iter().map(|s| s.as_str()).collect();
@@ -4064,7 +5306,13 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         crate::shir_passes::echo_fold::EchoFold.run(&mut prog, &ctx);
     }
     r.program(&prog);
-    let text = cat_peephole(&r.out.join("\n"));
+    // `__sh_brace(PRE, GROUPS, SEPS, SUF)` with ALL-literal arguments is a
+    // compile-time constant word list (a pure cartesian product), so fold it
+    // before anything else looks at the text: the peepholes below then see
+    // `vec![ … ]` where they used to see an opaque call, which is what lets
+    // `__sh_cat(&[__sh_brace( … )])` collapse to a plain `vec![ … ]`.
+    let text = brace_fold(&r.out.join("\n"));
+    let text = cat_peephole(&text);
     // A cat over several freshly built one-element `vec![..]`s is argv
     // concatenation — `[a, b].concat()`, with no helper call. Runs before
     // `prune_unused_helpers` so the definition is collected with its last
@@ -4076,10 +5324,11 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // is what turns `__sh_wq(&__sh_cat(&[vec![..], …]))` into the plain
     // `&[..]` list this pass understands.
     let text = wq_fold(&text);
-    // `__sh_q("LIT")` is a constant for the same reason `__sh_wq` is, and the
-    // corpus's dominant use is a literal (`__sh_q("/dev/null")` in a redirect
-    // target) — fold those so `__sh_q` retires with its last runtime caller.
-    let text = q_fold(&text);
+    // The cat shapes `wq_fold` did NOT consume — a `__sh_glob(…)`/`__sh_split_ifs(…)`
+    // among the words is not a foldable word list — are the same
+    // `[E1, E2, …].concat()` concatenation. AFTER `wq_fold`: pass 1's `vec![..]`
+    // output is what `wq_fold` folds, and a `.concat()` argument is not one.
+    let text = mixed_cat_peephole(&text);
     // Belt-and-braces: confirm in the rendered output that no sink was
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
@@ -4087,6 +5336,20 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // Strip `&"literal".to_string()` → `"literal"`: a textual peephole that
     // is sound because the `&` is always used to feed a `&str` parameter.
     let text = strip_str_lit_refs(&text);
+    // `__sh_q("LIT")` is a compile-time constant (quote+wrap, no runtime
+    // state), and the corpus's dominant use is a literal — the target of a
+    // redirect (`__sh_q("/dev/null")`) or an error-message argument — so
+    // folding it retires the call, and then `prune_unused_helpers` retires
+    // the definition with its last caller.
+    //
+    // It must run AFTER `strip_str_lit_refs`: the renderer emits a constant
+    // target as `__sh_q(&"/dev/null".to_string())`, which `q_fold` cannot see
+    // (`&` between the paren and the literal), and it is only the strip pass
+    // that reduces that to the `__sh_q("LIT")` shape this fold reads back.
+    // Folded before the strip, every constant argument survived the pass —
+    // measured 2026-10-09: 184 live `__sh_q` call sites, nearly all of them
+    // this spelling.
+    let text = q_fold(&text);
     // bash `printf` with a literal format is Rust's own `format!`/`print!`
     // — fold it (and retire the runtime `__sh_printf` with it). Runs after
     // `strip_str_lit_refs` so the format reaches this pass as a bare
@@ -4111,6 +5374,31 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // so `__sh_run`/`__sh_spawn`/`__sh_q` are collected with their last
     // caller.
     let text = inline_sinkfree_exec(&text);
+    // `cmd > file` inside a capture: the fd-1 sink no longer blocks it (the
+    // file absorbs the child's stdout, so the sink sees what the piped
+    // runtime arm would have delivered — nothing). Runs after
+    // `inline_sinkfree_exec` so the sink-free sites are already consumed.
+    let text = inline_absorbed_redirect_exec(&text);
+    // The same lowering for the sites that pass REFUSES: where a capture
+    // buffer or an fd-1 sink really is live, the child's stdout cannot be
+    // inherited — so `native_sink_cmd_call` pipes it and deposits it where
+    // `__sh_spawn` would have. Runs last of the exec lowerings so the
+    // sink-free and absorbed-redirect shapes are already consumed.
+    let text = inline_sink_routed_exec(&text);
+    // A capture or an fd-1 redirect whose body only ever writes a
+    // COMPILE-TIME CONSTANT does not need the sink machinery at all: the
+    // capture's value is the constant, and the redirect is that constant
+    // written to the file — `__sh_cap_begin`/`__sh_cap_end` are a net no-op
+    // on the state they save and restore, and so is the install/restore pair.
+    // Folding retires those calls (and, once the last caller in a file is
+    // gone, the helper definitions with them). Runs beside the other sink
+    // lowerings and before `prune_unused_helpers`; it refuses every block
+    // whose body does anything other than literal output.
+    let text = constant_sink_fold(&text);
+    // A program that never installs a trap runs `__sh_run_traps()` as an empty
+    // loop; drop those calls before the prunes so the helper and its static
+    // go with them.
+    let text = drop_dead_trap_calls(&text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -7424,14 +8712,15 @@ impl Render {
                         self.arith_i64(&l, rhs),
                         self.arith_i64(&r, lhs)
                     ),
-                    "/" => {
-                        self.add_helper("div");
-                        format!("__sh_div({l},{r})")
-                    }
-                    "%" => {
-                        self.add_helper("mod");
-                        format!("__sh_mod({l},{r})")
-                    }
+                    // bash flags a zero divisor and suppresses the whole
+                    // expansion. The operands are bound so each is evaluated
+                    // exactly once — what the retired helper's arguments did.
+                    "/" => format!(
+                        "{{ let __a = {l}; let __b = {r}; if __b == 0 {{ __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 }} else {{ __a / __b }} }}"
+                    ),
+                    "%" => format!(
+                        "{{ let __a = {l}; let __b = {r}; if __b == 0 {{ __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 }} else {{ __a % __b }} }}"
+                    ),
                     _ => format!(
                         "({} {op} {})",
                         self.arith_i64(&l, rhs),
@@ -7781,8 +9070,9 @@ impl Render {
                     Some(w) => self.expr_str(w),
                     None => "\"0\"".to_string(),
                 };
-                self.add_helper("sleep");
-                self.emit(&format!("__sh_sleep(&{v});"));
+                self.emit(&format!(
+                    "std::thread::sleep(std::time::Duration::from_secs_f64(({v}).trim().parse::<f64>().unwrap_or(0.0).max(0.0)));"
+                ));
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "wait" => {
@@ -8001,8 +9291,9 @@ impl Render {
                     Some(w) => self.expr_str(w),
                     None => "\"0\"".to_string(),
                 };
-                self.add_helper("sleep");
-                format!("{{ __sh_sleep(&{v}); __SH_RC.store(0, Ordering::SeqCst); true }}")
+                format!(
+                    "{{ std::thread::sleep(std::time::Duration::from_secs_f64(({v}).trim().parse::<f64>().unwrap_or(0.0).max(0.0))); __SH_RC.store(0, Ordering::SeqCst); true }}"
+                )
             }
             "exit" => {
                 let code = match words.first() {
@@ -12006,18 +13297,32 @@ impl Render {
                 format!("__sh_len(&{var_expr}).to_string()")
             }
             "^^" | "^^:" | ",," | ",,:" | "^" | "^:" | "," | ",:" => {
+                // `${v^^}` / `${v,,}` / `${v^}` / `${v,}` are `str`'s own case
+                // mapping; the operand is bound once, as the helper's argument
+                // was, and the mode is a render-time literal (no runtime
+                // dispatch).
                 let mode = op.trim_end_matches(':');
-                self.add_helper("case");
-                format!("__sh_case(&{var_expr}, {})", Self::rust_str(mode))
+                match mode {
+                    "^^" => format!("{var_expr}.to_uppercase()"),
+                    ",," => format!("{var_expr}.to_lowercase()"),
+                    // the operand is bound to a local first: `Chars` borrows
+                    // it, so an unbound temporary is dropped too early
+                    // (E0716) the moment the tail needs `__c.as_str()`.
+                    "^" => format!(
+                        "{{ let __t = {var_expr}; let mut __c = __t.chars(); match __c.next() {{ Some(__f) => __f.to_uppercase().collect::<String>() + __c.as_str(), None => String::new() }} }}"
+                    ),
+                    "," => format!(
+                        "{{ let __t = {var_expr}; let mut __c = __t.chars(); match __c.next() {{ Some(__f) => __f.to_lowercase().collect::<String>() + __c.as_str(), None => String::new() }} }}"
+                    ),
+                    _ => format!("{var_expr}.to_string()"),
+                }
             }
-            "basename" => {
-                self.add_helper("basename");
-                format!("__sh_basename(&{var_expr})")
-            }
-            "dirname" => {
-                self.add_helper("dirname");
-                format!("__sh_dirname(&{var_expr})")
-            }
+            "basename" => format!(
+                "{{ let __s = &{var_expr}; match __s.rfind('/') {{ Some(__i) => __s[__i + 1..].to_string(), None => __s.to_string() }} }}"
+            ),
+            "dirname" => format!(
+                "{{ let __s = &{var_expr}; match __s.rfind('/') {{ Some(__i) if __i > 0 => __s[..__i].to_string(), Some(_) => \"/\".to_string(), None => \".\".to_string() }} }}"
+            ),
             _ => {
                 self.mark_todo(&format!("param op {op}"));
                 var_expr
@@ -15361,7 +16666,10 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "json_marshal" => &["list_get"],
         // the composite-preserving value join falls back to the plain
         // text join, so it must drag it along. `split_ifs` needs only
-        // the `__sh_is_composite_id` predicate that ships with it.
+        // the `__sh_is_composite_id` predicate that ships with it — the
+        // bundle is the registry HANDLE for that predicate, and
+        // `prune_unused_helpers` collects the bundle-mates the program
+        // never calls (it knows every name a `helper_source` defines).
         "join_value" => &["join_words"],
         "split_ifs" => &["join_value"],
         _ => &[],
@@ -17648,70 +18956,45 @@ impl<'a, 'r> TestParser<'a, 'r> {
         t.to_string()
     }
 
+    /// The file-type/permission tests (`-p -S -b -c -u -g -k`) are one mask
+    /// over `std`'s `MetadataExt::mode()` — the body the retired `__sh_fmode`
+    /// helper had, spelled at the site so neither the call nor its definition
+    /// is emitted.
+    fn fmode_test_expr(operand: &str, bits: &str) -> String {
+        format!(
+            "{{ use std::os::unix::fs::MetadataExt; std::fs::metadata(&{operand}).map(|m| (m.mode() & {bits}) == {bits}).unwrap_or(false) }}"
+        )
+    }
+
     fn unary_test(&mut self, op: &str, operand: &str) -> String {
         match op {
             "-n" => format!("(!{operand}.is_empty())"),
             "-z" => format!("({operand}.is_empty())"),
-            "-f" => {
-                self.render.add_helper("freg");
-                format!("__sh_freg(&{operand})")
-            }
-            "-d" => {
-                self.render.add_helper("fdir");
-                format!("__sh_fdir(&{operand})")
-            }
-            "-e" => {
-                self.render.add_helper("fexists");
-                format!("__sh_fexists(&{operand})")
-            }
-            "-r" => {
-                self.render.add_helper("fread");
-                format!("__sh_fread(&{operand})")
-            }
-            "-w" => {
-                self.render.add_helper("fwrite");
-                format!("__sh_fwrite(&{operand})")
-            }
-            "-x" => {
-                self.render.add_helper("fexec");
-                format!("__sh_fexec(&{operand})")
-            }
-            "-s" => {
-                self.render.add_helper("fsize");
-                format!("(__sh_fsize(&{operand}) > 0)")
-            }
-            "-L" | "-h" => {
-                self.render.add_helper("fsym");
-                format!("__sh_fsym(&{operand})")
-            }
-            "-p" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o010000)")
-            }
-            "-S" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o140000)")
-            }
-            "-b" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o060000)")
-            }
-            "-c" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o020000)")
-            }
-            "-u" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o004000)")
-            }
-            "-g" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o002000)")
-            }
-            "-k" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o001000)")
-            }
+            // The file tests are `std::fs`/`std::path` predicates. Each used to
+            // call a one-line runtime helper; the construct IS the standard
+            // library's, so the predicate is spelled here instead. The bodies
+            // are the helpers' verbatim.
+            "-f" => format!("std::path::Path::new(&{operand}).is_file()"),
+            "-d" => format!("std::path::Path::new(&{operand}).is_dir()"),
+            "-e" => format!("std::path::Path::new(&{operand}).exists()"),
+            "-r" => format!("std::fs::File::open(&{operand}).is_ok()"),
+            "-w" => format!("std::fs::OpenOptions::new().write(true).open(&{operand}).is_ok()"),
+            "-x" => format!(
+                "{{ use std::os::unix::fs::PermissionsExt; std::fs::metadata(&{operand}).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) }}"
+            ),
+            "-s" => format!(
+                "(std::fs::metadata(&{operand}).map(|m| m.len() as i64).unwrap_or(0) > 0)"
+            ),
+            "-L" | "-h" => format!(
+                "std::fs::symlink_metadata(&{operand}).map(|m| m.file_type().is_symlink()).unwrap_or(false)"
+            ),
+            "-p" => Self::fmode_test_expr(operand, "0o010000"),
+            "-S" => Self::fmode_test_expr(operand, "0o140000"),
+            "-b" => Self::fmode_test_expr(operand, "0o060000"),
+            "-c" => Self::fmode_test_expr(operand, "0o020000"),
+            "-u" => Self::fmode_test_expr(operand, "0o004000"),
+            "-g" => Self::fmode_test_expr(operand, "0o002000"),
+            "-k" => Self::fmode_test_expr(operand, "0o001000"),
             "-O" => {
                 self.render.add_helper("fowner");
                 format!("__sh_fowner(&{operand})")
@@ -17922,15 +19205,19 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 self.render.add_helper("regex");
                 format!("__sh_regex(&{lhs}, &{rhs}, \"\")")
             }
+            // `-nt`/`-ot` compare `std`'s mtime, `-ef` compares the device and
+            // inode `std` exposes — the retired helpers' bodies, verbatim.
             "-nt" | "-ot" => {
-                self.render.add_helper("mtime");
                 let rs = if op == "-nt" { ">" } else { "<" };
-                format!("(__sh_mtime(&{lhs}) {rs} __sh_mtime(&{rhs}))")
+                format!(
+                    "(std::fs::metadata(&{lhs}).and_then(|m| m.modified()).map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)).unwrap_or(0) \
+                     {rs} \
+                     std::fs::metadata(&{rhs}).and_then(|m| m.modified()).map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)).unwrap_or(0))"
+                )
             }
-            "-ef" => {
-                self.render.add_helper("samefile");
-                format!("__sh_samefile(&{lhs}, &{rhs})")
-            }
+            "-ef" => format!(
+                "{{ use std::os::unix::fs::MetadataExt; match (std::fs::metadata(&{lhs}), std::fs::metadata(&{rhs})) {{ (Ok(__a), Ok(__b)) => __a.dev() == __b.dev() && __a.ino() == __b.ino(), _ => false }} }}"
+            ),
             "<" | ">" => {
                 format!("({lhs} {op} {rhs})")
             }
@@ -22846,7 +24133,13 @@ mod tests {
             !out.contains(".join(\" \")"),
             "\"$@\" collapsed to one word:\n{out}"
         );
-        assert!(out.contains("__sh_cat("), "splat not flattened:\n{out}");
+        // flattened into a `Vec<String>` splat — spelled as the helper call or
+        // as the standard-library `[…].concat()` that replaces it once every
+        // element folds to a fresh value
+        assert!(
+            out.contains("__sh_cat(") || out.contains(".concat()"),
+            "splat not flattened:\n{out}"
+        );
     }
 
     #[test]
@@ -22945,8 +24238,12 @@ mod tests {
         // statement's `__SH_RC.store(…)` deleted the whole command and the
         // heredoc body was never printed (`007_cat_EOF.sh`).
         let out = render("cat <<EOF\nalpha\nEOF\n\ncat <<FISH\noyster\nFISH\n\necho done\n");
-        let calls = out.matches("__SH_RC.store(__sh_spawn(").count();
-        assert_eq!(calls, 2, "a heredoc cat was dropped ({calls} spawn calls):\n{out}");
+        // both heredoc `cat`s are literal simple commands, so the fed lowering
+        // turns each into a native `Command` with `Stdio::piped()` stdin — the
+        // runtime `__sh_spawn` no longer appears. What must survive either way
+        // is the COMMAND itself: the pass-4 collapse used to delete it.
+        let calls = out.matches("Command::new(\"cat\").stdin(std::process::Stdio::piped())").count();
+        assert_eq!(calls, 2, "a heredoc cat was dropped ({calls} native fed calls):\n{out}");
         assert!(out.contains("\"alpha\\n\""), "first heredoc body lost:\n{out}");
         assert!(out.contains("\"oyster\\n\""), "second heredoc body lost:\n{out}");
         // the shell-out form is the same shape (`__sh_run`), not just spawn.
@@ -23314,9 +24611,13 @@ mod tests {
     fn mutated_array_keeps_owned_path() {
         // An appended/mutated array is not a static list: it must keep
         // the owned representation (the analysis vetoes any non-whole
-        // read or extra write).
+        // read or extra write). The owned value is built by the helper call
+        // or by the `[…].concat()` the peephole leaves in its place.
         let out = render("xs=(a b)\nxs+=(c)\nfor x in \"${xs[@]}\"; do echo \"$x\"; done\n");
-        assert!(out.contains("__sh_cat"), "owned path dropped:\n{out}");
+        assert!(
+            out.contains("__sh_cat") || out.contains(".concat()"),
+            "owned path dropped:\n{out}"
+        );
     }
 
     #[test]
@@ -23368,8 +24669,9 @@ mod tests {
         assert!(!out.contains("__SH_RET"), "unused value home kept:\n{out}");
         // …but a redirect INSIDE the function body keeps the runtime: the
         // sink state is program-global, so the definition's location does
-        // not matter.
-        let redir = render("f() { echo \"in-func\" > /tmp/sh2_fn_probe.txt; }\nf\n");
+        // not matter. (The body is a COMPUTED word, or the constant-sink
+        // fold would lower the whole redirect to a plain file write.)
+        let redir = render("f() { echo \"$HOME\" > /tmp/sh2_fn_probe.txt; }\nf\n");
         assert!(redir.contains("__SH_OUTFILE_TL"), "{redir}");
     }
 
@@ -23675,24 +24977,38 @@ mod tests {
 
     #[test]
     fn sinks_kept_when_used() {
-        // a redirect must keep the runtime sink: the folded constant echo
-        // goes through the sink-aware print helper, not a bare print!
-        let out = render("echo hi > /tmp/sh2_probe.txt\n");
+        // a redirect keeps the runtime sink whenever its body is NOT a
+        // constant: the sink-aware print helper carries the value. (`$HOME`
+        // is a real runtime read — an assigned local would be const-folded
+        // to a literal and take the constant path below.)
+        let out = render("echo \"$HOME\" > /tmp/sh2_probe.txt\n");
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
+        assert!(out.contains("__sh_print_words("), "{out}");
         assert!(
-            out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
-            "{out}"
+            !out.contains(r#""hi\n".as_bytes()"#),
+            "a computed body must not take the constant path:\n{out}"
+        );
+        // …but a CONSTANT body needs no sink at all: the redirect is the
+        // target language's own file write, and the bytes never reach stdout
+        let konst = render("echo hi > /tmp/sh2_probe.txt\n");
+        assert!(!konst.contains("__SH_OUTFILE_TL"), "{konst}");
+        assert!(!konst.contains("__sh_print_words"), "{konst}");
+        assert!(
+            konst.contains(
+                r#"let _ = std::io::Write::write_all(&mut std::fs::File::create("/tmp/sh2_probe.txt").unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()), "hi\n".as_bytes());"#
+            ),
+            "{konst}"
         );
     }
 
     #[test]
     fn never_redirected_function_prints_without_the_sink_check() {
         // The PER-FUNCTION sink verdict: `f` is called only at top level,
-        // so its prints can never land in a sink — yet the PROGRAM has a
-        // redirect, so the program-wide verdict keeps the runtime. The
-        // body must still print idiomatically.
-        let out = render("f() { echo a; echo b; }\nf\n{ echo g; } > /tmp/sh2_nf_probe.txt\n");
+        // so its prints can never land in a sink — yet the PROGRAM needs
+        // the runtime for the group redirect. The body must still print
+        // idiomatically.
+        let out = render("f() { echo a; echo b; }\nf\n{ echo \"$HOME\"; } > /tmp/sh2_nf_probe.txt\n");
         assert!(
             out.contains("fn f()") && out.contains("print!(\"a\\n\")"),
             "never-redirected body not idiomatic:\n{out}"
@@ -23742,15 +25058,22 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_echo_keeps_the_join_helper() {
+    fn dynamic_echo_keeps_the_word_split() {
         // an UNQUOTED variable field-splits ($IFS), so its word is a genuine
-        // multi-element Vec — the split/join helpers are needed. The PRINTER
-        // is not: nothing installs a sink here, so the output goes straight
-        // to `println!` (`inline_sinkfree_prints`).
+        // multi-element Vec — the SPLIT must survive as a Vec of fields. It is
+        // no longer the general-IFS helper: the default IFS lowers to the
+        // standard library's own `split`, which is why the assertion pins the
+        // emitted separator closure instead of the helper's name. The PRINTER
+        // is not needed either: nothing installs a sink here, so the output
+        // goes straight to `println!` (`inline_sinkfree_prints`).
         let out = render("echo $x\n");
-        assert!(out.contains("__sh_split_ifs("), "{out}");
+        assert!(out.contains("collect::<Vec<String>>()"), "{out}");
+        assert!(out.contains("c == ' '"), "{out}");
         assert!(out.contains(".join(\" \")"), "{out}");
         assert!(out.contains("println!("), "{out}");
+        // the split is inlined FOR THIS PROGRAM, so the general-IFS helper is
+        // unreferenced and pruned
+        assert!(!out.contains("fn __sh_split_ifs"), "{out}");
         assert!(!out.contains("__sh_print_words("), "{out}");
     }
 
@@ -23782,6 +25105,7 @@ mod tests {
         assert!(!out.contains("for __sh_lv"), "{out}");
         assert!(out.contains("__SHV_i"), "{out}");
     }
+
 
     #[test]
     fn cat_peephole_shapes() {
@@ -23820,6 +25144,7 @@ mod tests {
         );
         // UTF-8 passes through unsplit
         assert_eq!(super::cat_peephole("x = \"caf\u{e9}\";"), "x = \"caf\u{e9}\";");
+
         // an orphaned helper is collected with its last call
         assert_eq!(
             super::cat_peephole("fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n\nuse x;\n"),
@@ -23889,7 +25214,9 @@ mod tests {
             "__sh_cat(&[__sh_glob(p)])"
         );
         assert_eq!(super::concat_vec_peephole("__sh_cat(&__b)"), "__sh_cat(&__b)");
-        // a non-vec element is not a freshly built Vec<String>
+        // a non-vec element belongs to pass 2, and pass 1 must NOT take it:
+        // its `vec![..]` output is what `wq_fold` folds, so folding this
+        // shape here would starve that pass.
         assert_eq!(
             super::concat_vec_peephole("__sh_cat(&[vec![a], x.to_vec()])"),
             "__sh_cat(&[vec![a], x.to_vec()])"
@@ -23907,6 +25234,53 @@ mod tests {
         assert!(out.contains("[a, b]"));
     }
 
+    /// Pass 2 of the cat rewrite: the elements that are NOT plain `vec![…]`.
+    /// Its shape is `[E1, …].concat()`, and it must only fire once `wq_fold`
+    /// has had its pass (see [`super::mixed_cat_peephole`]) — the caller wires
+    /// it there; these cases pin the rewrite itself.
+    #[test]
+    fn mixed_cat_shapes() {
+        // a single non-vec element: the cat is a no-op copy
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[__sh_glob(p)])"),
+            "[__sh_glob(p)].concat()"
+        );
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[vec![a], x.to_vec()])"),
+            "[vec![a], x.to_vec()].concat()"
+        );
+        assert_eq!(
+            super::mixed_cat_peephole(
+                "__sh_cat(&[vec![\"ls\".to_string()], __sh_glob(\"*.sh\")])"
+            ),
+            "[vec![\"ls\".to_string()], __sh_glob(\"*.sh\")].concat()"
+        );
+        // a block element is a fresh value too, and its braces/comma must not
+        // split the element list
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[{ let v = g(a, b); v }])"),
+            "[{ let v = g(a, b); v }].concat()"
+        );
+        // REFUSE: a value the scan cannot prove fresh — moving it could be an
+        // E0382 the original call never had
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[vec![a], v])"),
+            "__sh_cat(&[vec![a], v])"
+        );
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[vec![a], v.words])"),
+            "__sh_cat(&[vec![a], v.words])"
+        );
+        assert_eq!(
+            super::mixed_cat_peephole("__sh_cat(&[vec![a], v[0]])"),
+            "__sh_cat(&[vec![a], v[0]])"
+        );
+        // the definition goes with the last call
+        let src = "fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {\n    let mut o = Vec::new();\n    for w in ws { o.extend(w.iter().cloned()); }\n    o\n}\n\nuse x;\n__sh_cat(&[__sh_glob(p)])\n";
+        let out = super::mixed_cat_peephole(src);
+        assert!(!out.contains("fn __sh_cat"), "helper should be collected: {out}");
+        assert!(out.contains("[__sh_glob(p)].concat()"), "{out}");
+    }
 
     #[test]
     fn assigns_and_echo() {
@@ -24468,13 +25842,112 @@ mod tok2_tests {
         assert!(out.contains(".arg(\"-f\").arg(a).arg(b)"), "{out}");
     }
 
-    /// `__sh_spawn(cmd, None)` is `__sh_run(cmd)`; a `Some(..)` input is a
-    /// pipeline/here-string feed the lowering does not reproduce.
+    /// `__sh_spawn(cmd, None)` is `__sh_run(cmd)`; a `Some(..)` input is the
+    /// pipeline/here-string feed, which lowers to the standard library's own
+    /// piped stdin (`Stdio::piped()` + `write_all`) rather than to a
+    /// `bash -c` that exists only to receive the bytes.
     #[test]
-    fn spawn_lowers_only_with_a_none_input() {
+    fn spawn_lowers_with_a_none_or_a_fed_input() {
         let out = lower_exec(r#"__sh_spawn("'sha256sum' 'f'", None)"#, true).unwrap();
         assert!(out.contains("Command::new(\"sha256sum\").arg(\"f\")"), "{out}");
-        assert!(lower_exec(r#"__sh_spawn("'cat'", Some(&buf))"#, true).is_none());
+        assert!(!out.contains("__sh_spawn"), "{out}");
+        let fed = lower_exec(r#"__sh_spawn("'cat'", Some(&buf))"#, true).unwrap();
+        assert!(fed.contains("Command::new(\"cat\")"), "{fed}");
+        assert!(fed.contains("std::process::Stdio::piped()"), "{fed}");
+        assert!(fed.contains("write_all(&mut __ci, &buf)"), "{fed}");
+        assert!(!fed.contains("__sh_spawn"), "{fed}");
+    }
+
+    /// A `cmd OP file` redirect whose command part `stage_text` wrapped in
+    /// `.to_string()` still lowers to the native `Command` with the file as a
+    /// real descriptor.
+    ///
+    /// The owned wrapper is transparent to a reader that wants the shell TEXT,
+    /// and [`push_cmd_source`] always accepted it — but [`cmd_template`]'s
+    /// bare-literal arm used to refuse it, so the whole class kept its
+    /// `bash -c` round-trip for no reason but the wrapper. Measured
+    /// 2026-10-09: 28 sites (`__sh_spawn(&format!("{} 2> {}",
+    /// "'ls' …".to_string(), "/dev/null"), None)`).
+    #[test]
+    fn owned_literal_command_still_lowers_its_redirect() {
+        let out = lower_exec(
+            r#"__sh_spawn(&format!("{} 2> {}", "'ls' 'a' 'b'".to_string(), "/dev/null"), None)"#,
+            true,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Command::new(\"ls\").arg(\"a\").arg(\"b\").stderr("),
+            "{out}"
+        );
+        assert!(out.contains("File::create(\"/dev/null\")"), "{out}");
+        assert!(!out.contains("__sh_spawn"), "{out}");
+    }
+
+    /// The SAME redirect once `q_fold` has already replaced the target with the
+    /// shell-QUOTED literal `__sh_q` returned — which is the state the pass
+    /// actually sees, since `q_fold` runs before the exec lowerings.
+    ///
+    /// `File::create` takes a raw path, so the quoted word has to come back
+    /// apart: reading `'/dev/null'` as the path creates a file whose NAME
+    /// carries the quotes (measured 2026-10-09: `parse-standalone-redirect.sh`
+    /// and `000__04e_file_manipulation.sh` were both regressed this way).
+    #[test]
+    fn folded_quoted_redirect_target_is_unquoted() {
+        let out = lower_exec(
+            r#"__sh_spawn(&format!("{} 2> {}", "'ls' 'a' 'b'".to_string(), "'/dev/null'".to_string()), None)"#,
+            true,
+        )
+        .unwrap();
+        assert!(out.contains("File::create(\"/dev/null\")"), "{out}");
+        assert!(!out.contains("'/dev/null'"), "{out}");
+    }
+
+    /// A STANDALONE redirect (`> file`, no command) is not an exec, so it keeps
+    /// its runtime lowering: bash applies the redirection, runs nothing and
+    /// leaves `$?` at 0, where `Command::new("")` invents a program that does
+    /// not exist and reports 127.
+    #[test]
+    fn standalone_redirect_is_not_an_exec() {
+        assert!(lower_exec(
+            r#"__sh_spawn(&format!("{} > {}", "''".to_string(), "'somefile'".to_string()), None)"#,
+            true,
+        )
+        .is_none());
+    }
+
+    /// [`super::sh_unq_lit`] is [`super::sh_q_lit`]'s inverse, and refuses text
+    /// that is not one single-quoted word (a raw path the renderer emitted
+    /// directly, which must be used as written).
+    #[test]
+    fn unq_lit_inverts_q_lit() {
+        assert_eq!(super::sh_unq_lit("'/dev/null'").as_deref(), Some("/dev/null"));
+        assert_eq!(super::sh_unq_lit("'it'\\''s'").as_deref(), Some("it's"));
+        assert_eq!(super::sh_unq_lit("/dev/null"), None);
+        assert_eq!(super::sh_unq_lit("'unbalanced"), None);
+    }
+
+    /// A constant `__sh_q` argument — the renderer's redirect target and
+    /// error-message spelling — is a compile-time constant, so it folds and
+    /// the helper retires with its last caller.
+    ///
+    /// This is also the regression guard for the pass ORDER: the renderer
+    /// emits the argument as `__sh_q(&"…".to_string())`, and only
+    /// `strip_str_lit_refs` reduces that to the `__sh_q("…")` shape `q_fold`
+    /// reads back. Folded before the strip, no constant argument folded at
+    /// all — 184 live call sites survived.
+    ///
+    /// The folded form is the OWNED `"…".to_string()`, not a bare literal:
+    /// `__sh_q` returns a `String`, and a bare `&str` is rejected where the
+    /// call site wants one (a `vec![…]` word list — see [`super::q_fold`]).
+    #[test]
+    fn constant_q_folds_only_after_the_ref_strip() {
+        let rendered = r#"__sh_capture_rc(&format!("{} 2> {}", "'stat' '-c%s' 'somefile'".to_string(), __sh_q(&"/dev/null".to_string())))"#;
+        // the fold cannot see the `&…to_string()` spelling …
+        assert!(super::q_fold(rendered).contains("__sh_q("));
+        // … and the strip is what produces the spelling it can see.
+        let folded = super::q_fold(&super::strip_str_lit_refs(rendered));
+        assert!(!folded.contains("__sh_q("), "{folded}");
+        assert!(folded.contains("\"'/dev/null'\".to_string()"), "{folded}");
     }
 
     /// REFUSE > GUESS: every shape `argv` cannot express keeps its runtime
@@ -24516,9 +25989,13 @@ mod tok2_tests {
         assert!(out.contains(".output()"), "{out}");
         assert!(out.contains("std::process::Stdio::inherit()"), "{out}");
         assert!(!out.contains("__sh_capture_rc"), "{out}");
-        // the helper's `$(...)` newline trim and status contract
+        // the helper's `$(...)` newline trim and status contract. The spawn
+        // failure arm is NOT the helper's blanket `1`: with no shell left to
+        // report it, the lowering reproduces the shell's own codes
+        // (`127` command-not-found / `126` not-executable), so a missing
+        // command keeps the status `bash` would have produced.
         assert!(out.contains("ends_with('\\n')"), "{out}");
-        assert!(out.contains("Err(_) => (String::new(), 1)"), "{out}");
+        assert!(out.contains("std::io::ErrorKind::NotFound { 127 } else { 126 }"), "{out}");
     }
 
     /// A dynamic word splices as a whole argument, exactly like the exec
@@ -24691,6 +26168,25 @@ mod cat_literal_scan {
         assert!(super::prune_unused_helpers(src.to_string()).contains("fn __sh_q("));
     }
 
+    /// The prune must know EVERY name a `helper_source` entry DEFINES, not just
+    /// its leading one. `join_value` ships `__sh_is_composite_id`,
+    /// `__sh_shave_nl` and `__sh_join_value` in a single entry, and
+    /// `split_ifs` pulls that entry in for the predicate alone — so the two
+    /// uncalled functions used to survive in every program that word-split
+    /// anything (measured 2026-10-09: 36 files, 216 tokens corpus-wide).
+    #[test]
+    fn prune_collects_every_name_a_bundle_defines() {
+        // the bundle as the preamble emits it, with only the predicate called
+        let src = format!(
+            "{}\nlet a = __sh_is_composite_id(\"x\");\n",
+            super::helper_source("join_value")
+        );
+        let out = super::prune_unused_helpers(src);
+        assert!(out.contains("fn __sh_is_composite_id("), "kept: {out}");
+        assert!(!out.contains("fn __sh_shave_nl("), "not pruned: {out}");
+        assert!(!out.contains("fn __sh_join_value("), "not pruned: {out}");
+    }
+
     /// A `//` comment carrying prose apostrophes must not abort the rewrite:
     /// this is the whole-file bail-out the scanner fix removed.
     #[test]
@@ -24826,6 +26322,188 @@ mod cat_literal_scan {
         ] {
             assert_eq!(super::printf_fold(src), src, "should have refused {src}");
         }
+    }
+}
+
+/// The constant-sink fold: a capture or an fd-1 redirect whose body only ever
+/// writes a compile-time constant is lowered to the target language's own
+/// write, and EVERY other shape is left alone.
+#[cfg(test)]
+mod brace_fold_tests {
+    /// A literal brace expansion IS a `vec![ … ]`: prefix, cartesian product,
+    /// suffix — Rust's own list, with no runtime call.
+    #[test]
+    fn folds_a_literal_expansion() {
+        assert_eq!(
+            super::brace_fold(r#"let v = __sh_brace("file_", &[&["a", "b"]], &[], ".txt");"#),
+            r#"let v = vec!["file_a.txt".to_string(), "file_b.txt".to_string()];"#
+        );
+        // an empty prefix/suffix and several groups
+        assert_eq!(
+            super::brace_fold(r#"__sh_brace("", &[&["a", "b"], &["1", "2"]], &["-"], "")"#),
+            r#"vec!["a-1".to_string(), "a-2".to_string(), "b-1".to_string(), "b-2".to_string()]"#
+        );
+        // the separator applies only BETWEEN groups; an empty one appends nothing
+        assert_eq!(
+            super::brace_fold(r#"__sh_brace("x", &[&["1", "2"], &["3"]], &[""], "y")"#),
+            r#"vec!["x13y".to_string(), "x23y".to_string()]"#
+        );
+        assert_eq!(
+            super::brace_fold(r#"__sh_brace("x", &[&["1", "2"], &["3"]], &["-"], "y")"#),
+            r#"vec!["x1-3y".to_string(), "x2-3y".to_string()]"#
+        );
+        // one group, so the (present) separator must NOT be applied
+        assert_eq!(
+            super::brace_fold(r#"__sh_brace("", &[&["1", "2"]], &["-"], "!")"#),
+            r#"vec!["1!".to_string(), "2!".to_string()]"#
+        );
+    }
+
+    /// A single empty group expands to nothing, exactly as the runtime helper
+    /// does — the prefix and suffix do not resurrect it.
+    #[test]
+    fn an_empty_group_collapses() {
+        assert_eq!(super::brace_fold(r#"__sh_brace("a", &[&[]], &[], "z")"#), "vec![]");
+    }
+
+    /// REFUSE: any computed argument leaves the call in place.
+    #[test]
+    fn refuses_computed_arguments() {
+        for src in [
+            r#"__sh_brace("file_", &[&[x]], &[], "")"#,
+            r#"__sh_brace(PRE, &[&["a"]], &[], "")"#,
+            r#"__sh_brace("", &[&["a"]], &[], SUF)"#,
+            r#"__sh_brace("", &g, &[], "")"#,
+            r#"__sh_brace("", &[&["a"]])"#,
+        ] {
+            assert_eq!(super::brace_fold(src), src, "should have refused {src}");
+        }
+    }
+
+    /// The helper DEFINITION is not a call and must survive untouched, so
+    /// `prune_unused_helpers` — not this pass — decides its fate.
+    #[test]
+    fn leaves_the_definition_alone() {
+        let src = "fn __sh_brace(pre: &str, groups: &[&[&str]], seps: &[&str], suf: &str) -> Vec<String> {\n    out\n}\n";
+        assert_eq!(super::brace_fold(src), src);
+    }
+}
+
+/// The constant-sink fold: a capture or an fd-1 redirect whose body only ever
+/// writes a compile-time constant is lowered to the target language's own
+/// write, and EVERY other shape is left alone.
+#[cfg(test)]
+mod constant_sink_fold_tests {
+    /// `$( echo hi )` — the capture's value IS the literal, so the begin/end
+    /// pair and the print call all go.
+    #[test]
+    fn folds_a_literal_capture() {
+        let src = concat!(
+            "fn main() {\n    let x = {\n",
+            "    let __cap_state = __sh_cap_begin();\n",
+            "    __sh_puts(\"hi\\n\");\n",
+            "    __SH_RC.store(0, Ordering::SeqCst);\n",
+            "    let __s = __sh_cap_end(__cap_state, false);\n",
+            "    __s\n};\n}\n"
+        );
+        let out = super::fold_constant_captures(src);
+        assert!(!out.contains("__sh_cap_begin"), "{out}");
+        assert!(!out.contains("__sh_cap_end"), "{out}");
+        assert!(!out.contains("__sh_puts("), "{out}");
+        // `$( … )` strips the trailing newline, and the status write survives
+        assert!(out.contains(r#""hi".to_string()"#), "{out}");
+        assert!(out.contains("__SH_RC.store(0, Ordering::SeqCst);"), "{out}");
+    }
+
+    /// A capture of a command with no output is the empty string — still two
+    /// runtime calls that do not need to run.
+    #[test]
+    fn folds_an_empty_capture() {
+        let src = concat!(
+            "fn main() {\n    let x = {\n",
+            "    let __cap_state = __sh_cap_begin();\n",
+            "    let __s = __sh_cap_end(__cap_state, false);\n",
+            "    __s\n};\n}\n"
+        );
+        let out = super::fold_constant_captures(src);
+        assert!(out.contains("String::new()"), "{out}");
+        assert!(!out.contains("__sh_cap_begin"), "{out}");
+    }
+
+    /// REFUSE: a capture that RUNS something still needs the sink — the child
+    /// writes into the capture buffer.
+    #[test]
+    fn refuses_a_capture_that_runs_a_command() {
+        let src = concat!(
+            "fn main() {\n    let x = {\n",
+            "    let __cap_state = __sh_cap_begin();\n",
+            "    __SH_RC.store(__sh_spawn(&format!(\"ls\"), None), Ordering::SeqCst);\n",
+            "    let __s = __sh_cap_end(__cap_state, false);\n",
+            "    __s\n};\n}\n"
+        );
+        assert_eq!(super::fold_constant_captures(src), src);
+    }
+
+    /// `echo -e` is a RUNTIME unescape, not a constant: the `esc = true` arm
+    /// must not fold.
+    #[test]
+    fn refuses_an_escape_processed_print() {
+        assert_eq!(
+            super::literal_output_text(r#"__sh_print_words(&[vec!["a\tb".to_string()]], true, true);"#),
+            None
+        );
+        // …while the same words with no unescape are a constant, newline and all
+        assert_eq!(
+            super::literal_output_text(r#"__sh_print_words(&[vec!["a".to_string(), "b".to_string()]], true, false);"#),
+            Some("a b\n".to_string())
+        );
+    }
+
+    /// `echo hi > out.txt` with a literal body is a native file write; the
+    /// install/restore pair and the print call all disappear.
+    #[test]
+    fn folds_a_literal_redirect() {
+        let src = concat!(
+            "{\n",
+            "    let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());\n",
+            "    __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create(&\"out.txt\").unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));\n",
+            "    __sh_puts(\"hi\\n\");\n",
+            "    __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);\n",
+            "}\n"
+        );
+        let out = super::fold_constant_redirects(src);
+        assert!(!out.contains("__SH_OUTFILE_TL"), "{out}");
+        assert!(!out.contains("__sh_puts("), "{out}");
+        assert!(
+            out.contains(
+                r#"let _ = std::io::Write::write_all(&mut std::fs::File::create(&"out.txt").unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()), "hi\n".as_bytes());"#
+            ),
+            "{out}"
+        );
+    }
+
+    /// REFUSE: a redirect whose body runs a command must keep the sink
+    /// statics — that is where the command's output is deposited.
+    #[test]
+    fn refuses_a_redirect_that_runs_a_command() {
+        let src = concat!(
+            "{\n",
+            "    let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());\n",
+            "    __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create(&\"o\").unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));\n",
+            "    __SH_RC.store(__sh_run(\"ls\"), Ordering::SeqCst);\n",
+            "    __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);\n",
+            "}\n"
+        );
+        assert_eq!(super::fold_constant_redirects(src), src);
+    }
+
+    /// The fold must not reach into a block that is NOT the sink shape — a
+    /// bare brace block with a literal print keeps its print.
+    #[test]
+    fn refuses_a_block_that_never_installed_a_sink() {
+        let src = "{\n    __sh_puts(\"hi\\n\");\n}\n";
+        assert_eq!(super::fold_constant_redirects(src), src);
+        assert_eq!(super::fold_constant_captures(src), src);
     }
 }
 

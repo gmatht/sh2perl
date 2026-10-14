@@ -1,68 +1,66 @@
-# c backend (worktree: /home/llm/sh2loop/sh2perl/backends/c, branch: backend/c)
+# rust backend (worktree: /mnt/wsl/projects/sh2loop/sh2perl/backends/rust, branch: backend/rust)
 
 Shared core (do NOT fork): src/shir.rs (ShIR + lowering), src/ir.rs,
 src/estree.rs (node model), src/parser/. Consume the ShIR; render it in
 your language's idioms.
 
 Yours (in THIS worktree): the renderer, the runtime namespace, the corpus
-gate, and the sh2.*-usage metric for zig.
-
-## The renderer
-
-- `src/zig_backend.rs` — `sh2perl core::zig_backend::shir_to_zig(&IrProgram) -> String`.
-  A crate library consuming the ShIR in-process (ask B, docs/backend-c-core-needs.md).
-- CLI entry: `shir_render --target zig -` (worktree `cli/src/lib.rs`), mirroring
-  `--shir-in-perl`/`--shir-in-estree`: reads shIR JSON (file or stdin via `-`),
-  `shir_json_in::shir_json_to_ir` → `shir_to_zig` → stdout.
-
-## Design decisions (draft)
-
-- A2 `var_types` verdicts: `Int` → Zig `i64`, `Str` → `[]const u8`, anything
-  else → `[]const u8` (the runtime store — shell vars are strings; Zig has
-  no `any`, so the store is the string map). `sh2ToInt`/`sh2IntStr`/
-  `sh2Truthy` convert at the type boundaries and the output always compiles.
-- Native subset (byte-faithful where it matters): echo (one `stdout.print`
-  per command — no double newline), `exit N`, Assign (incl. `$(( ))` native
-  i64 arith), if/else if/else, while, do/while, for-in over `Array`/`Range`
-  iterators, `[ ]` tests (-gt/-lt/-ge/-le/-eq/-ne numeric, =/==/!= string —
-  incl. the parser's space-stripped `"$a"="b"` form, -n/-z/truthiness),
-  `&&`/`||`/`!` conds, `WriteFile` (non-append).
-- Everything outside the lowable subset emits a compile-able `sh2.*` stub
-  (`sh2TODO` → stderr + `std.process.exit(2)`) or a `// TODO(unsupported)`
-  marker.
-- Identifiers: sanitized to Zig identifier syntax, mangled against Zig
-  keywords/builtins (`fn` → `fn_`, `a-b` → `a_b`), de-duplicated.
-- Zig gotchas handled: no implicit conversions (`@intFromBool` for
-  bool→int, `sh2IntStr` for int→string, `sh2B2S` for bool→string);
-  string equality/ordering via `std.mem.eql`/`std.mem.order`; runtime
-  slice concat via `sh2StrCat` (allocPrint); `**` via `std.math.pow`;
-  declared-but-never-read vars get a `_ = x;` guard; helper fns (and the
-  `const stdout` line) are only emitted when used.
-- Format specs are chosen statically per part (`{d}`/`{s}`/`{}`) — Zig's
-  print format is comptime-checked, so each arg's type is known at render
-  time (`$x` in interpolation arrives as a `getVar` Call — typed by the
-  A2 verdict).
-- `--shir-in-zig` reports the ingress marker ("ShIR JSON ingress") on stderr
-  and exits 0 for invalid JSON: the backend gate probes the flag by feeding
-  intentionally-invalid JSON and grepping the marker, and the harness runs
-  under `set -euo pipefail` (a nonzero exit would abort the gate before the
-  corpus loop). Renderer panics still exit 101 and fail the corpus loop.
-
-## Next steps (in order)
-
-1. Native `printf` builtin, `WriteFile` append, `Redirect` (fd/mode table),
-   `Function`/`Case` (functions as Zig fns, case as switch).
-2. The sh2.* runtime port (harness/sh2-namespace.json) — stubs are fine for
-   the first green.
-3. A `zig build-exe` step in the gate once a Zig toolchain is available to
-   the harness (none is installed on the worker today; the emitted code
-   targets 0.13+ idioms).
+gate, and the sh2.*-usage metric for rust.
 
 Merge discipline:
-- commit on backend/zig; merge main BEFORE each verification run
+- commit on backend/rust; merge main BEFORE each verification run
 - push to main only when the commit does NOT touch the shared core
 - core changes are single-owner (the estree worker during the lowering
   phase) — queue, don't fork
 
-Verify: the corpus gate (`setup_backends.sh --backend-gate zig`) must stay
-100% and the metric must only go down.
+Verify: the corpus gate must stay 100% and the metric must only go down.
+
+## The `__sh_*` callout metric
+
+The seam is the runtime-call namespace the renderer emits: `__sh_[A-Za-z_0-9]+`
+in the rendered Rust (NOT `sh2.*`, which the stub gate greps for). The metric
+tallies tokens over `sh2perl/examples/*.sh`, rendered through
+`otranspilerl-cli --target shir | shir_render --target=rust -` — the same path
+the gate uses. `rt_metric_wt.sh`/`rt_profile.sh` measure through the worktree
+renderer; `harness/backend_runtime_metric.sh` sends rust down its default arm
+(`$CLI --target rust`), which links the MAIN tree's `src/rust_backend.rs` and
+therefore reports a **different** renderer — never compare the two.
+
+Measured 2026-10-14 (this worktree, 560 files): **3732 → 3581 tokens**
+(772 → 713 fn definitions). The corpus gate is unchanged at
+PASS=644 SKIP=7 FAIL=1, the one failure being the pre-existing parser bug
+`parse-redirect-in-case-pattern.sh` (a `case` pattern holding `$( … )` renders
+the literal `"$__sh_case2_casepat_0"` — unrelated to callouts).
+
+Two unneeded-callout classes were retired, both in the textual post-pass chain
+in `shir_to_rust`:
+
+1. **`__sh_cat` fixpoint.** `cat_rewrite` (the `concat_vec_peephole` /
+   `mixed_cat_peephole` fold) was a single left-to-right pass, so a `__sh_cat`
+   NESTED inside a region it had already rewritten was copied through
+   untouched — e.g. the `__sh_cat(&[__sh_glob(p)])` inside
+   `__sh_cat(&[{ … .map(|p| …) }])` on `064_19_*`. `cat_peephole` has always
+   looped to a fixpoint; `cat_rewrite` now does too (`cat_scan` is the pass).
+   Its helper-prune predicate also had to stop testing the bracket form
+   `__sh_cat(&[`: a variable argument renders as `__sh_cat(&__b)`, and
+   collecting the definition while that call survives is an E0425.
+2. **Dead-sink prints in user functions.** `inline_sinkfree_prints` rewrites
+   only `fn main`'s body, because a user function may be entered under a
+   capture/file sink. When the program has NO sink anywhere (`sinks_dead`),
+   that reason does not hold, so `inline_deadsink_prints` lowers the
+   `__sh_puts`/`__sh_print_words` word-list forms over the WHOLE text — 19
+   live calls across 7 files sat in user functions of sink-free programs.
+
+A third, narrower fold rides the same idea: `drop_dead_trap_calls` removes
+`__sh_run_traps();` from a program whose rendered text contains no
+`__SH_TRAPS.lock().unwrap().push` (27 corpus files call it while never
+installing a trap, so it drains an always-empty queue — an empty `for` loop).
+Dropping the calls lets `prune_unused_helpers`/`prune_unused_statics` collect
+the helper and its static, which also retires the `__sh_spawn` it called.
+
+Policy (2026-08-25, AGENTS.md §Backend worktree discipline — binding):
+merge main before every verification run; translate constructs into
+NATIVE backend idioms (fork/exec is a last-resort fallback, catalogued
+in docs/backend-<lang>-limitations.md); share reusable lowerings as
+drop-in shIR->shIR transforms under src/transforms/ linked via
+build.rs codegen — never fork shared dispatch code.
