@@ -3340,14 +3340,40 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::While { cond, body } => {
-            let cond_str = ir_expr_to_perl(cond);
-            emit_indent(out, indent);
-            out.push_str(&format!("while ({}) {{\n", cond_str));
-            for s in body.iter() {
-                emit_stmt(out, s, indent + 1);
+            // A multi-command condition (`while read -r l && [ -n "$l" ]
+            // && (( n < 2 )); do …; done`) arrives as
+            // `Call{block, [Arrow[stmts…]]}`. Rendering it through
+            // ir_expr_to_perl collapsed the whole block to a one-line
+            // `system('bash','-c', …)`, which ran each iteration's `read`
+            // in a CHILD: the value was assigned in the child and the
+            // Perl `$line` stayed undef, so the loop body never fired
+            // (063_11, 091_while_pipe_var, 063_hard_to_parse all printed
+            // nothing). Emit the arrow's statements INSIDE the loop, one
+            // level deeper, and make the last statement's status decide —
+            // the same shape as the native `while read` arm.
+            if let Some((stmts, tail)) = block_cond_parts(cond) {
+                emit_indent(out, indent);
+                out.push_str("while (1) {\n");
+                for s in &stmts {
+                    emit_stmt(out, s, indent + 1);
+                }
+                emit_indent(out, indent + 1);
+                out.push_str(&format!("last unless ({});\n", ir_expr_to_perl(tail)));
+                for s in body.iter() {
+                    emit_stmt(out, s, indent + 1);
+                }
+                emit_indent(out, indent);
+                out.push_str("}\n");
+            } else {
+                let cond_str = ir_expr_to_perl(cond);
+                emit_indent(out, indent);
+                out.push_str(&format!("while ({}) {{\n", cond_str));
+                for s in body.iter() {
+                    emit_stmt(out, s, indent + 1);
+                }
+                emit_indent(out, indent);
+                out.push_str("}\n");
             }
-            emit_indent(out, indent);
-            out.push_str("}\n");
         }
         IrStmt::ForInit { init, cond, step, body } => {
             let cond_str = ir_expr_to_perl(cond);
@@ -6312,6 +6338,44 @@ fn redirect_call_to_cmd(call: &IrExpr) -> Option<String> {
 
 /// Rebuild a shell command string from a `block` Call: multiple statements
 /// run in sequence (`;`-joined) — used in condition position.
+/// Split a multi-command loop CONDITION into the statements that must run
+/// each iteration plus the expression whose truth decides the loop.
+///
+/// `while read -r l && [ -n "$l" ] && (( n < 2 )); do …; done` arrives as
+/// `Call{block, [Arrow[stmts…]]}`. Those statements (`read`, `test`, …)
+/// MUST be emitted inside the loop body — a one-line `system('bash','-c',…)`
+/// runs `read` in a child and the value never reaches the Perl variable.
+///
+/// Returns `(leading statements, deciding expression)`:
+///   * every statement but the last, verbatim;
+///   * the last statement's expression, which supplies the status.
+///
+/// `None` for any shape that is not a block-wrapped arrow whose body is all
+/// expression statements — the caller keeps the plain `while (expr)` form.
+fn block_cond_parts(cond: &IrExpr) -> Option<(Vec<IrStmt>, &IrExpr)> {
+    let IrExpr::Call { func, args } = cond else {
+        return None;
+    };
+    if func != "block" {
+        return None;
+    }
+    let arrow = args.iter().find_map(|a| match a {
+        IrExpr::Arrow(stmts) => Some(stmts),
+        _ => None,
+    })?;
+    // Every statement must be a bare expression, and there must be at least
+    // one: a statement with side effects we cannot render natively would be
+    // dropped silently, which is worse than the shell-out.
+    if arrow.is_empty() || !arrow.iter().all(|s| matches!(s, IrStmt::Expr(_))) {
+        return None;
+    }
+    let (last, lead) = arrow.split_last()?;
+    let IrStmt::Expr(tail) = last else {
+        return None;
+    };
+    Some((lead.to_vec(), tail))
+}
+
 fn block_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
         if func == "block" {
