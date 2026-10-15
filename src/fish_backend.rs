@@ -2471,6 +2471,17 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             out.push_str(&t.var);
             out.push(' ');
             out.push_str(&rhs);
+            // A COMMAND SUBSTITUTION capture must carry the COMMAND's status,
+            // not `string collect`'s. bash's `result=$(grep pat missing)`
+            // leaves `$?` as grep's 2, which the next statement reads; fish's
+            // `set r (grep … | string collect)` leaves `$status` as the
+            // collect stage's 1 (test_grep printed `exit: 1` where bash
+            // printed 2). `$pipestatus[1]` is the first stage's status and is
+            // still readable here, so it is re-asserted as a following
+            // statement.
+            if matches!(expr, IrExpr::Capture { .. }) && rhs.contains("| string collect)") {
+                out.push_str("; test $pipestatus[1] -eq 0");
+            }
             continue;
         }
         // `arr[i]=x` — a dynamic subscript needs runtime evaluation
