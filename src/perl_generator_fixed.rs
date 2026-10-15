@@ -2585,6 +2585,10 @@ fn fixups(prog: &IrProgram) -> IrProgram {
     // it must run over the ALREADY-FIXED stmts, not the original (passing
     // `&prog.stmts` here discards every correction fix_stmts made above).
     fixed.stmts = fix_eval_stmts(&fixed.stmts);
+    // Fix 24 — `. FILE` / `source FILE` shares state with the caller, so a
+    // file this program wrote from a literal is inlined rather than
+    // delegated to a subprocess.
+    fixed.stmts = fix_dot_source_stmts(&fixed.stmts);
     // Fix 9 — the materialised process-substitution consumer's OWN status.
     // Same ordering rule as Fix 7: it walks whole statements (a rewrite of
     // the block's shape), so it runs over the ALREADY-FIXED statements.
@@ -3068,6 +3072,183 @@ fn unquote_operand(e: &IrExpr) -> Option<String> {
 //     program and running the fixes again would double-apply Fix 4.
 
 /// Fix 7 — expand `eval "<shell text>"` into inline statements.
+/// Fix 24 — `. FILE` / `source FILE` must share state with the caller.
+///
+/// bash sources a file INTO THE CURRENT SHELL: its assignments, function
+/// definitions and `set` changes all persist. Delegating to a subprocess
+/// (`bash -c '. ./lib'`) loses every one of them, so
+/// dot-source-lib printed `shared=` where bash prints `shared=secret`.
+///
+/// The general case (an arbitrary file on disk) cannot be resolved at
+/// translation time. The one shape that CAN is a file this very program
+/// wrote earlier from a known literal — the corpus's
+/// `echo 'v=secret' > lib.sh` then `. ./lib.sh` — so this pass collects the
+/// literal bodies written to each path and INLINES the parsed statements at
+/// the source site. `parse_shell_text` (shared with the eval lowering)
+/// supplies them, and `ast_to_ir_raw` keeps every statement (nothing in a
+/// sourced file is dead — the whole point is its side effects).
+///
+/// A path the program never wrote, or one written from a non-literal, is
+/// left alone: the delegated call is wrong for it too, but guessing would be
+/// worse than the status quo.
+fn fix_dot_source_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    use std::collections::HashMap;
+    /// path -> literal body, in source order.
+    fn collect_writes(stmts: &[IrStmt], out: &mut HashMap<String, String>) {
+        for s in stmts {
+            match s {
+                // `echo LIT > FILE` arrives as Redirect{inner:[Expr(echo …)]}.
+                IrStmt::Redirect { inner, redirects } => {
+                    if let Some(r) = redirects.iter().find(|r| {
+                        matches!(r.mode.as_str(), "w" | "wc")
+                            && matches!(r.fd, None | Some(1))
+                    }) {
+                        if let Some(path) = crate::ir::call_arg_str(&r.target) {
+                            if let Some(body) = echo_body_text(inner) {
+                                out.insert(path, body);
+                            }
+                        }
+                    }
+                    collect_writes(inner, out);
+                }
+                // The neutral `echo LIT > FILE` form.
+                IrStmt::WriteFile { path, content, .. } => {
+                    if let (Some(p), Some(c)) =
+                        (crate::ir::call_arg_str(path), word_source_text(content))
+                    {
+                        out.insert(p, c);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_writes(then, out);
+                    for (_, b) in elsifs {
+                        collect_writes(b, out);
+                    }
+                    collect_writes(else_, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body) => collect_writes(body, out),
+                _ => {}
+            }
+        }
+    }
+    /// The literal text an `echo LIT` body writes (with its newline).
+    fn echo_body_text(inner: &[IrStmt]) -> Option<String> {
+        // The native-statement transform folds `echo LIT` into an `Output`
+        // before this pass runs, but the un-folded `Expr(builtin("echo"))`
+        // form also occurs. Accept both.
+        let [one] = inner else { return None };
+        match one {
+            IrStmt::Output { value, newline, .. } => {
+                let text = word_source_text(value)?;
+                Some(if *newline { format!("{text}\n") } else { text })
+            }
+            IrStmt::Expr(e) => {
+                let IrExpr::Call { func, args } = e else { return None };
+                if func != "builtin" && func != "exec" {
+                    return None;
+                }
+                if crate::ir::call_arg_str(args.first()?)?.as_str() != "echo" {
+                    return None;
+                }
+                let mut words: Vec<String> = Vec::new();
+                for a in crate::ir::exec_word_args(args) {
+                    words.push(word_source_text(a)?);
+                }
+                if words.is_empty() {
+                    return Some("\n".to_string());
+                }
+                // `echo -n` suppresses the terminator.
+                let (nl, rest) = if words[0] == "-n" {
+                    ("", &words[1..])
+                } else {
+                    ("\n", &words[..])
+                };
+                Some(format!("{}{nl}", rest.join(" ")))
+            }
+            _ => None,
+        }
+    }
+
+    let mut writes: HashMap<String, String> = HashMap::new();
+    collect_writes(stmts, &mut writes);
+
+    fn walk(stmts: &[IrStmt], writes: &HashMap<String, String>) -> Vec<IrStmt> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            match s {
+                IrStmt::Expr(expr) => {
+                    if let Some(path) = dot_source_path(expr) {
+                        // Try the literal path, then the `./`-stripped and
+                        // `./`-prefixed spellings (`./lib.sh` vs `lib.sh`).
+                        let bare = path.strip_prefix("./").unwrap_or(&path).to_string();
+                        let dotted = format!("./{bare}");
+                        let body = writes
+                            .get(&path)
+                            .or_else(|| writes.get(&bare))
+                            .or_else(|| writes.get(&dotted));
+                        if let Some(body) = body {
+                            if let Some(inner) = parse_shell_text(body) {
+                                out.extend(inner);
+                                continue;
+                            }
+                        }
+                    }
+                    out.push(s.clone());
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => out.push(IrStmt::If {
+                    cond: cond.clone(),
+                    then: walk(then, writes),
+                    elsifs: elsifs
+                        .iter()
+                        .map(|(c, b)| (c.clone(), walk(b, writes)))
+                        .collect(),
+                    else_: walk(else_, writes),
+                }),
+                IrStmt::While { cond, body } => out.push(IrStmt::While {
+                    cond: cond.clone(),
+                    body: walk(body, writes),
+                }),
+                IrStmt::DoWhile { cond, body, until } => out.push(IrStmt::DoWhile {
+                    cond: cond.clone(),
+                    body: walk(body, writes),
+                    until: *until,
+                }),
+                IrStmt::For { var, iter, body } => out.push(IrStmt::For {
+                    var: var.clone(),
+                    iter: iter.clone(),
+                    body: walk(body, writes),
+                }),
+                IrStmt::Block(b) => out.push(IrStmt::Block(walk(b, writes))),
+                IrStmt::Subshell(b) => out.push(IrStmt::Subshell(walk(b, writes))),
+                other => out.push(other.clone()),
+            }
+        }
+        out
+    }
+    walk(stmts, &writes)
+}
+
+/// The literal path of a `. FILE` / `source FILE` call, if that is its shape.
+fn dot_source_path(expr: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = expr else {
+        return None;
+    };
+    if func != "builtin" && func != "exec" {
+        return None;
+    }
+    let cmd = crate::ir::call_arg_str(args.first()?)?;
+    if cmd != "." && cmd != "source" {
+        return None;
+    }
+    let words = crate::ir::exec_word_args(args);
+    let [one] = &words[..] else { return None };
+    word_source_text(one)
+}
+
 fn fix_eval_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
     let mut out = Vec::with_capacity(stmts.len());
     for s in stmts {
