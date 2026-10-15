@@ -2479,8 +2479,18 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             // printed 2). `$pipestatus[1]` is the first stage's status and is
             // still readable here, so it is re-asserted as a following
             // statement.
-            if matches!(expr, IrExpr::Capture { .. }) && rhs.contains("| string collect)") {
-                out.push_str("; test $pipestatus[1] -eq 0");
+            if matches!(expr, IrExpr::Capture { .. }) && rhs.contains("| string collect)")
+            {
+                // The status must be the COMMAND's EXACT code, not a
+                // success/failure flag: bash's `r=$(grep pat missing)` leaves
+                // `$?` as grep's 2, and test_grep reads it. fish cannot set an
+                // arbitrary status from a compound, so the code is re-raised
+                // through a child shell — and only when it is NONZERO, which
+                // keeps the common (successful) case free of the spawn.
+                out.push_str(
+                    "; set -l __sh2_rc $pipestatus[1]; \
+                     test $__sh2_rc -eq 0; or sh -c \"exit $__sh2_rc\"",
+                );
             }
             continue;
         }
