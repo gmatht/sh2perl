@@ -5658,7 +5658,20 @@ fn var_exports_str(cmd: &str) -> String {
                                 .unwrap_or(false)
                             && seen.insert(name.clone())
                         {
+                            // An ARRAY name exports its elements joined by IFS
+                        // (bash's `$name` on an indexed array is `${name[0]}`,
+                        // but the exports here serve a rebuilt command that
+                        // reads `${name[@]}` — the list is what it needs).
+                        // Emitting `$ENV{name} = $name` on an array was a
+                        // `use strict` error / an empty export.
+                        if array_var(&name) {
+                            out.push_str(&format!(
+                                "$ENV{{{}}} = join(' ', @{});\n",
+                                name, name
+                            ));
+                        } else {
                             out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+                        }
                         }
                         continue;
                     }
@@ -5676,7 +5689,20 @@ fn var_exports_str(cmd: &str) -> String {
                             .unwrap_or(false)
                         && seen.insert(name.clone())
                     {
-                        out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+                        // An ARRAY name exports its elements joined by IFS
+                        // (bash's `$name` on an indexed array is `${name[0]}`,
+                        // but the exports here serve a rebuilt command that
+                        // reads `${name[@]}` — the list is what it needs).
+                        // Emitting `$ENV{name} = $name` on an array was a
+                        // `use strict` error / an empty export.
+                        if array_var(&name) {
+                            out.push_str(&format!(
+                                "$ENV{{{}}} = join(' ', @{});\n",
+                                name, name
+                            ));
+                        } else {
+                            out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+                        }
                     }
                     continue;
                 }
@@ -8040,6 +8066,31 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                             } else if c == 'A' {
                                 sigil = '%';
                             }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+                // `local arr=("$@")` / `local -a arr=(…)` arrives as a
+                // `setArray` CALL, not a `NAME=VALUE` word — the word
+                // handling below could not read it and emitted NOTHING, so
+                // the array stayed empty and `"${arr[@]}"` later ran a
+                // command named after the first (missing) element
+                // (realpath-cmdsub's `try` helper).
+                if let IrExpr::Call { func, args } = words[i] {
+                    if func == "setArray" || func == "setArrayAppend" {
+                        let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                        let elems: Vec<&IrExpr> = match args.get(1) {
+                            Some(IrExpr::Array(e)) => e.iter().collect(),
+                            _ => args.get(1..).map(|s| s.iter().collect()).unwrap_or_default(),
+                        };
+                        let items: Vec<String> =
+                            elems.iter().map(|e| render_word_list(e)).collect();
+                        emit_indent(out, indent);
+                        if func == "setArrayAppend" {
+                            out.push_str(&format!("push @{}, ({});\n", name, items.join(", ")));
+                        } else {
+                            out.push_str(&format!("my @{} = ({});\n", name, items.join(", ")));
                         }
                         i += 1;
                         continue;
@@ -11650,6 +11701,37 @@ fn dq_value_expr(content: &str) -> Option<String> {
 ///
 /// Returns None when the shape is not expressible (globs, `$(...)`, `&&`,
 /// `||`, subshells, backticks) so the caller keeps the plain shell-out.
+///
+/// `"${arr[@]}" REST` as a Perl expression: the array's elements JOINED
+/// (so the shell text carries the words) and the rest of the command
+/// appended verbatim, all left UNQUOTED for bash to word-split.
+///
+/// `None` unless the command BEGINS with an array expansion — that is the
+/// only shape where bash's word-splitting is the whole point.
+fn array_command_expr(cmd: &str) -> Option<String> {
+    // The head may or may not still carry the source quotes: the renderer
+    // sometimes strips them, so accept both `"${arr[@]}"` and `${arr[@]}`.
+    let rest = cmd
+        .strip_prefix("\"${")
+        .or_else(|| cmd.strip_prefix("${"))?;
+    let close = rest
+        .find("}\"")
+        .or_else(|| rest.find('}'))?;
+    let inner = &rest[..close];
+    let base = inner.strip_suffix("[@]").or_else(|| inner.strip_suffix("[*]"))?;
+    if base.is_empty() || !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    let tail = after.strip_prefix('"').unwrap_or(after);
+    let tail_q = if tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" . {}", safe_perl_q_string(tail))
+    };
+    Some(format!("join(' ', @{base}){tail_q}"))
+}
+
 fn sh_cmd_value_expr(cmd: &str) -> Option<String> {
     if cmd.contains("||") || cmd.contains("|&") {
         return None;
@@ -11679,6 +11761,22 @@ fn sh_cmd_value_expr(cmd: &str) -> Option<String> {
                 if !lit.is_empty() {
                     parts.push(safe_perl_q_string(&lit));
                     lit.clear();
+                }
+                // An ARRAY expansion supplies MULTIPLE argv words, so it must
+                // reach bash UNQUOTED: `__sh_q(join(' ', @cmd))` is one word
+                // and bash then looks for a command literally named
+                // `echo hello` (realpath-cmdsub's `try` helper — "rc=127").
+                // `join` + UNQUOTED reaches bash as separate fields, which is
+                // what the command position needs.
+                // An ARRAY expansion supplies MULTIPLE argv words, so it
+                // cannot be quoted into ONE word — `__sh_q(join(' ', @cmd))`
+                // made bash look for a command literally named
+                // `echo hello` (realpath-cmdsub's `try` helper: rc=127).
+                // Refuse the whole value form instead: the caller then keeps
+                // the NATIVE shell text, where `"${cmd[@]}"` splits into
+                // argv exactly as bash does.
+                if expr.starts_with("@") || expr.starts_with("concat_list(") {
+                    return None;
                 }
                 parts.push(format!("__sh_q({})", expr));
                 i = next;
@@ -11774,13 +11872,20 @@ fn compound_expansion_expr(inner: &str) -> Option<String> {
         if rest.is_empty() || !var_is_declarable(rest) {
             return None;
         }
-        if array_var(rest) {
-            // bash "${arr[@]}" inside double quotes joins on the first IFS
-            // char; a space matches the corpus' `IFS=$'\n' sorted=(...)` and
-            // `echo "${arr[@]}"` spellings that flow through here.
-            return Some(ifs_join(&format!("@{{{rest}}}")));
+        // `${name[@]}` on an ASSOCIATIVE array is its VALUES; on an INDEXED
+        // array it is its ELEMENTS. The census decides, and an UNKNOWN name
+        // defaults to the ARRAY reading: `@` is index syntax, and a name the
+        // census never saw is overwhelmingly an array (a `local arr=("$@")`
+        // inside a function is reached before the census is consulted for
+        // that body, so `cmd` was unknown here and the join emitted
+        // `values %{cmd}` — a HASH read on an array — which bash then tried
+        // to run as a command, so bash reported the name as not found
+        // (realpath-cmdsub, and every `try()`-style helper).
+        if !hash_var(rest) {
+            // `concat_list(...)` marks an expansion that supplies MULTIPLE
+            // argv words; `sh_cmd_value_expr` refuses to quote it into one.
+            return Some(format!("concat_list({})", ifs_join(&format!("@{{{rest}}}"))));
         }
-        // A hash: `${h[@]}` is its VALUES.
         return Some(ifs_join(&format!("values %{{{rest}}}")));
     }
     // `${name[key]}` — one element. `key` may be a nested expansion; handle
@@ -11809,7 +11914,8 @@ fn compound_expansion_expr(inner: &str) -> Option<String> {
 }
 
 /// Build a PERL EXPRESSION that evaluates to a pipeline command string with
-/// runtime values substituted for `"$var"` arguments. The `coreutils-ffi`
+/// runtime values substituted for a double-quoted variable argument. The
+/// `coreutils-ffi`
 /// pipeline grammar has no expansion, so a `$var` in the reconstructed shell
 /// text would be passed literally; splice the VALUE in instead (shell-quoted
 /// by `__sh_q`, so a value with spaces stays one argv). None when the shape
@@ -12275,6 +12381,22 @@ fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Stri
                                     continue;
                                 }
                             }
+                            // A `setArray` VALUE binds an array whether or
+                            // not `-a` was given: `local arr=("$@")` is
+                            // array syntax on its own (realpath-cmdsub's
+                            // `try()` helper — without this the name stayed
+                            // out of the census, so `"${arr[@]}"` rendered
+                            // as a HASH read and bash ran it as a command).
+                            if let IrExpr::Call { func: sf, args: sa } = w {
+                                if sf == "setArray" || sf == "setArrayAppend" {
+                                    if let Some(n) = sa.first().and_then(crate::ir::call_arg_str) {
+                                        if var_is_declarable(&n) {
+                                            out.insert(n);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                             if is_array {
                                 match w {
                                     IrExpr::Call { func: sf, args: sa }
@@ -12533,9 +12655,18 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
             return sh_uu_capture_expr(&argv);
         }
     }
+    // An ARRAY expansion at the head of the command (`"${cmd[@]}" 2> f`)
+    // supplies the argv as SEPARATE words. `sh_cmd_value_expr` refuses that
+    // shape (it cannot be quoted into one word), so fall back to the NATIVE
+    // shell text with the array left UNQUOTED: bash then splits it into argv
+    // exactly as it does — quoting it made bash look for a command literally
+    // named `realpath /bin` (realpath-cmdsub).
     let quoted = match sh_cmd_value_expr(cmd) {
         Some(expr) => expr,
-        None => safe_perl_q_string(cmd),
+        None => match array_command_expr(cmd) {
+            Some(expr) => expr,
+            None => safe_perl_q_string(cmd),
+        },
     };
     // Same env-export prologue as expr_to_open_perl — `$n` inside the
     // single-quoted bash -c text must reach the child via %ENV.
