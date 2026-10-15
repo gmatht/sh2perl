@@ -1147,91 +1147,41 @@ fn bash_b_operand_slots(fmt: &str) -> Vec<usize> {
     slots
 }
 
-// ── Fix 14 — an unrebuildable condition must be TRUE, not a bare `0` ──────
+// ── Fix 14 — an unbuildable condition must be TRUE, not a bare `0` ──────
 //
 // The shared renderer lowers a condition-position `redirect` / `block` /
 // `exec` to `(system('bash', '-c', q{…}) == 0)`. The `== 0` is the whole
 // point: it converts a bash STATUS into a Perl BOOLEAN, which is what the
-// condition slot needs. When the inner command cannot be rebuilt the
-// renderer falls back to the bare string `"0"` — a *status*, in a boolean
-// slot, where Perl reads it as FALSE.
-//
-// Nothing downstream of the renderer corrects it, and the result is not a
-// wrong value but a runaway: a `while` whose condition is a constant.
+// condition slot needs. When the inner command cannot be rebuilt the arm
+// now emits `ir::UNBUILDABLE_COND` — a `0` carrying a distinguishing
+// comment — which this pass rewrites to `1`.
 //
 //   sh:  while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done
-//   pl:  while (!(0)) { print "waiting\n"; }        # !0 is TRUE in Perl
+//   pl:  while (!(0/*sh2:unbuildable-cond*/)) …   ->  while (!(1)) …
 //
-// bash's `!` on a zero status is false, so bash runs zero iterations; Perl
-// runs forever and the gate kills it at the 20 s timeout. Same shape
-// inverts a plain `if`, where it produces a silently missing branch.
+// bash's `!` on a zero status is false, so bash runs zero iterations; a bare
+// falsy `0` would make Perl run forever and the gate would kill it at the
+// 20 s timeout.
 //
-// The fix is the renderer's own convention, applied to its fallback: a
-// condition-position arm that fell through to `"0"` was standing in for a
-// status it could not compute, and "this condition holds" is the only
-// answer that keeps the control flow a loop rather than a hang. Rewriting
-// the bare `(0)` to `1` keeps the Perl boolean the slot requires.
-//
-// A rendered `== 0` is already a boolean and is deliberately untouched, so
-// a real status test is not inverted (see the a_real_status_comparison_is_
-// left_alone control test).
+// Keyed on the MARKER, never on the shape: a legitimately computed
+// `Bool(false)` also renders as a bare `0`, and rewriting that inverted real
+// conditions (redirect-all: `if ! command -v CMD` renders `!(0)` = TRUE).
+/// Rewrite the renderer's UNBUILDABLE-condition placeholder to `1`.
+///
+/// The renderer marks a condition-position command it cannot rebuild with
+/// `0/*sh2:unbuildable-cond*/` (see `ir::UNBUILDABLE_COND`). A bare `0` is a
+/// STATUS, and Perl reads it as FALSE — so a `while` never runs and an `if`
+/// silently drops its branch. `"this holds"` is the only answer that keeps
+/// the control flow a loop rather than a hang.
+///
+/// The rewrite is keyed on that exact marker, NOT on a bare `(0)`. An earlier
+/// version matched the shape instead, which also caught a legitimately
+/// computed `Bool(false)`: `if ! command -v CMD > /dev/null` renders
+/// `!(0)` — TRUE, which is what bash means — and the blanket
+/// `(!(0))`→`(!(1))` rewrite inverted it and dropped the branch
+/// (redirect-all lost its `not found` line).
 fn fix_condition_booleans(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        out.push_str(&fix_condition_booleans_in_line(line));
-    }
-    out
-}
-
-/// Rewrite the renderer's bare-`(0)` condition fallback in one line.
-fn fix_condition_booleans_in_line(line: &str) -> String {
-    // Cheap reject: a real status comparison always has the `== 0` that
-    // makes it a boolean, so a line carrying one is already correct. The
-    // defect needs a parenthesised `0` in a control-flow head.
-    if !line.contains("(0)") {
-        return line.to_string();
-    }
-    let mut fixed = line.to_string();
-    for open in ["(!(0))", "((0))", "(0)"] {
-        let mut from = 0usize;
-        while let Some(rel) = fixed[from..].find(open) {
-            let start = from + rel;
-            let end = start + open.len();
-            // `(system('bash', …) == 0)` ends in `(0)`? No — it ends `== 0)`.
-            // Guard on the character that would have preceded a real
-            // comparison, so an `== 0` tail can never be matched here.
-            let preceded_by_comparison = fixed[..start].trim_end().ends_with('=')
-                || fixed[..start].trim_end().ends_with('!')
-                || fixed[..start].trim_end().ends_with('<')
-                || fixed[..start].trim_end().ends_with('>')
-                || fixed[..start].trim_end().ends_with('~');
-            if preceded_by_comparison {
-                from = end;
-                continue;
-            }
-            // Only a CONTROL-FLOW head is a condition slot. A bare `(0)` in
-            // an arithmetic or list context is legitimately the number zero,
-            // and rewriting that would corrupt the program.
-            let head = fixed[..start].trim_end();
-            if !(head.ends_with("while")
-                || head.ends_with("if")
-                || head.ends_with("elsif")
-                || head.ends_with("unless")
-                || head.ends_with("while (")
-                || head.ends_with("if ("))
-            {
-                from = end;
-                continue;
-            }
-            let replacement = match open {
-                "(!(0))" => "(!(1))",
-                _ => "(1)",
-            };
-            fixed.replace_range(start..end, replacement);
-            from = start + replacement.len();
-        }
-    }
-    fixed
+    src.replace(crate::ir::UNBUILDABLE_COND, "1")
 }
 
 // ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
@@ -4632,7 +4582,11 @@ mod pgf_tests {
         let prog = crate::shir::ast_to_ir(&cmds);
         let out = generate(&prog);
         assert!(
-            !out.contains("while (!(0))") && !out.contains("(!(0))") && !out.contains("if (!(0))"),
+            !out.contains(crate::ir::UNBUILDABLE_COND),
+            "the unbuildable-condition marker survived into the output:\n{out}"
+        );
+        assert!(
+            !out.contains("while (!(0))"),
             "condition slot holds a bare falsy 0:\n{out}"
         );
     }
@@ -4648,16 +4602,38 @@ mod pgf_tests {
     /// `a_bare_zero_outside_a_condition_is_untouched` pins.
     #[test]
     fn every_unbuildable_condition_arm_is_a_perl_boolean() {
+        // Each arm emits `0/*sh2:unbuildable-cond*/`, which the pass must
+        // turn into `1` in every control-flow head.
+        for src in [
+            "use strict;\nif (!(0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nwhile ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nelsif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+        ] {
+            let out = fix_condition_booleans(src);
+            assert!(
+                !out.contains(crate::ir::UNBUILDABLE_COND) && out.contains('1'),
+                "the marker was not rewritten to a truthy boolean:\n{out}"
+            );
+        }
+    }
+
+    /// A legitimately computed `Bool(false)` renders as a bare `0` and must
+    /// NOT be rewritten. This is the redirect-all regression: `if !
+    /// command -v CMD > /dev/null` is TRUE in bash, the renderer emitted
+    /// `!(0)`, and the old shape-matching rewrite turned it into `!(1)` and
+    /// dropped the branch.
+    #[test]
+    fn a_computed_false_condition_is_not_inverted() {
         for src in [
             "use strict;\nif (!(0)) { print \"x\\n\"; }\n",
             "use strict;\nif ((0)) { print \"x\\n\"; }\n",
             "use strict;\nwhile ((0)) { print \"x\\n\"; }\n",
-            "use strict;\nelsif ((0)) { print \"x\\n\"; }\n",
         ] {
-            let out = fix_condition_booleans(src);
-            assert!(
-                !out.contains("!(0)") && !out.contains("(0)"),
-                "still a falsy status in a boolean slot:\n{out}"
+            assert_eq!(
+                fix_condition_booleans(src),
+                src,
+                "a computed falsy condition was rewritten:\n{src}"
             );
         }
     }

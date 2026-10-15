@@ -924,6 +924,13 @@ pub struct IrProgram {
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
 
+/// Placeholder for a condition-position command the renderer cannot rebuild.
+/// A Perl comment keeps it inert and unambiguous; the post-pass rewrites the
+/// whole marker to `1` (see `fix_condition_booleans`), so a legitimately
+/// computed `Bool(false)` — which also renders as a bare `0` — is never
+/// mistaken for it.
+pub const UNBUILDABLE_COND: &str = "0/*sh2:unbuildable-cond*/";
+
 /// Convert a single IR statement to a Perl source string.
 /// This is the public entry point for the generator to produce clean
 /// Perl from IR nodes without constructing a full IrProgram.
@@ -3298,6 +3305,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             else_,
         } => {
             let cond_str = ir_expr_to_perl(cond);
+            eprintln!("DBG_IFCOND {:?} -> {}", cond, cond_str);
             // If the condition was derived from a shell test command by
             // native_if_test_cond (indicated by IrExpr::Str), set
             // $CHILD_ERROR so $? reflects the test result for subsequent
@@ -10672,7 +10680,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                 .unwrap_or_else(|| safe_perl_q_string(&cmd));
                             format!("(system('bash', '-c', {}) == 0)", quoted)
                         }
-                        None => "0".to_string(),
+                        None => UNBUILDABLE_COND.to_string(),
                     }
                 }
                 "block" => {
@@ -10682,7 +10690,20 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         Some(cmd) => {
                             format!("(system('bash', '-c', {}) == 0)", safe_perl_q_string(&cmd))
                         }
-                        None => "0".to_string(),
+                        // UNREBUILDABLE condition — a status this arm cannot
+                        // compute. `"this holds"` is the only answer that
+                        // keeps the control flow a loop rather than a hang
+                        // (Perl would read a bare status `0` as FALSE and a
+                        // `while` would never run; the historical
+                        // `while ! { :; }` hang). Emitted DIRECTLY as `1`,
+                        // not as a bare `0` for the post-pass to rewrite:
+                        // the post-pass cannot tell this placeholder from a
+                        // legitimately-computed `Bool(false)`, and rewriting
+                        // THAT inverted real conditions (redirect-all:
+                        // `if ! command -v CMD` rendered `!(0)` = true and
+                        // the rewrite turned it into `!(1)` = false, dropping
+                        // the branch).
+                        None => UNBUILDABLE_COND.to_string(),
                     }
                 }
                 "arrayIndex" => {
@@ -10823,7 +10844,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                 "(system('bash', '-c', {}) == 0)",
                                 safe_perl_q_string(&cmd)
                             ),
-                            None => "0".to_string(),
+                            None => UNBUILDABLE_COND.to_string(),
                         }
                     }
                 },
