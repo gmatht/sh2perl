@@ -1464,6 +1464,47 @@ fn valret_body_to_fish(s: &IrStmt, d: usize, out: &mut String) -> Result<(), Str
             discriminant,
             clauses,
         } => {
+            // A negated character class cannot be a fish `case` (fish's glob
+            // has no negation) — see the block renderer's arms for the
+            // reasoning. The value-returning form keeps each arm's body going
+            // through `valret_body_to_fish`.
+            if clauses
+                .iter()
+                .any(|cl| cl.patterns.iter().any(|p| p.contains("[^")))
+            {
+                let subj = word_to_fish(discriminant)?;
+                let mut first = true;
+                for cl in clauses {
+                    if cl.patterns.is_empty() {
+                        continue;
+                    }
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .map(|p| match glob_to_regex(&unescape_case_pattern(p), false) {
+                            Some(re) => format!("string match -rq {} -- {subj}", fish_single_quoted(&re)),
+                            None => format!(
+                                "string match -q {} -- {subj}",
+                                case_patterns_fish(std::slice::from_ref(p))
+                            ),
+                        })
+                        .collect();
+                    indent(out, d + if first { 0 } else { 1 });
+                    out.push_str(if first { "if " } else { "else if " });
+                    out.push_str(&conds.join("; or "));
+                    out.push('\n');
+                    let inner = d + if first { 1 } else { 2 };
+                    first = false;
+                    for b in &cl.body {
+                        valret_body_to_fish(b, inner, out)?;
+                    }
+                }
+                if !first {
+                    indent(out, d);
+                    out.push_str("end\n");
+                }
+                return Ok(());
+            }
             indent(out, d);
             out.push_str("switch ");
             out.push_str(&word_to_fish(discriminant)?);
@@ -1806,6 +1847,59 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             discriminant,
             clauses,
         } => {
+            // A pattern using a NEGATED CHARACTER CLASS (`[^…]`) cannot be a
+            // fish `case`: fish's glob has no negation at all (measured —
+            // `[^}]` and `[!}]` both fail to match, while `string match -r`
+            // succeeds), so the whole case lowers to an `if`/`else if` chain
+            // over REGEX matches. bash's `[^…]` is exactly a regex negated
+            // class, and the rest of a glob pattern is regex-compatible after
+            // unescaping.
+            let needs_regex = clauses
+                .iter()
+                .any(|cl| cl.patterns.iter().any(|p| p.contains("[^")));
+            if needs_regex {
+                let subj = word_to_fish(discriminant)?;
+                let mut first = true;
+                for cl in clauses {
+                    let pads = "    ".repeat(d + if first { 0 } else { 1 });
+                    if cl.patterns.is_empty() {
+                        continue;
+                    }
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .map(|p| {
+                            match glob_to_regex(&unescape_case_pattern(p), false) {
+                                Some(re) => format!("string match -rq {} -- {subj}", fish_single_quoted(&re)),
+                                // A pattern the converter refuses keeps the
+                                // glob spelling; the arm then behaves as
+                                // before rather than vanishing.
+                                None => format!(
+                                    "string match -q {} -- {subj}",
+                                    case_patterns_fish(std::slice::from_ref(p))
+                                ),
+                            }
+                        })
+                        .collect();
+                    indent(out, d);
+                    out.push_str(&pads[d.min(d)..].trim_start());
+                    out.push_str(if first { "if " } else { "else if " });
+                    out.push_str(&conds.join("; or "));
+                    out.push_str("\n");
+                    first = false;
+                    let inner = if first { d + 1 } else { d + 2 };
+                    for b in &cl.body {
+                        stmt_to_fish(b, inner, out)?;
+                    }
+                }
+                // bash's `case` with no matching arm falls through silently,
+                // which is the `if` chain's implicit else.
+                if !first {
+                    indent(out, d);
+                    out.push_str("end\n");
+                }
+                return Ok(());
+            }
             indent(out, d);
             out.push_str("switch ");
             out.push_str(&word_to_fish(discriminant)?);
@@ -2870,8 +2964,15 @@ fn fish_pattern_lit(p: &str) -> String {
         return p.to_string();
     }
     let unquoted: String = p.chars().filter(|c| *c != '\'' && *c != '"').collect();
+    // BASH STRIPS backslashes from a case pattern before matching; fish's
+    // `case` takes them LITERALLY inside the quotes, so `*\$\(*\)*` became a
+    // pattern demanding a literal backslash and its arm never fired
+    // (063_11's whole switch printed nothing). A backslash here escapes the
+    // NEXT character from bash's lexer, so dropping it yields the pattern bash
+    // actually matched.
+    let unescaped = unescape_case_pattern(&unquoted);
     let mut q = String::from("'");
-    for c in unquoted.chars() {
+    for c in unescaped.chars() {
         if c == '\'' {
             q.push_str("\\'");
         } else {
@@ -2880,6 +2981,35 @@ fn fish_pattern_lit(p: &str) -> String {
     }
     q.push('\'');
     q
+}
+
+/// Drop bash's pattern backslashes, keeping the escaped character.
+///
+/// `\*` in a case pattern means a LITERAL `*` in bash, and fish needs the
+/// same; but `\(` means a literal `(` too, and fish's quoted pattern already
+/// treats `(` as literal, so the backslash is redundant AND harmful (it makes
+/// the matcher look for a backslash). Only a backslash before a character that
+/// fish's glob WOULD treat specially is kept.
+fn unescape_case_pattern(p: &str) -> String {
+    let b: Vec<char> = p.chars().collect();
+    let mut out = String::with_capacity(p.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' && i + 1 < b.len() {
+            let n = b[i + 1];
+            // `*`/`?`/`[` are fish glob metacharacters: a bash-escaped literal
+            // must stay escaped to keep its literal meaning.
+            if matches!(n, '*' | '?' | '[') {
+                out.push('\\');
+            }
+            out.push(n);
+            i += 2;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// A `switch` arm's pattern list.
@@ -4020,6 +4150,43 @@ fn exec_line_to_fish(
             // so the prefix is dropped for `read` only (for any other
             // command it is a real environment override and stays).
             if cmd_name == Some("read") && k == "IFS" {
+                // `IFS=:` is NOT the empty-IFS idiom: it asks for FIELD
+                // SPLITTING on that character, and fish's `read` has no
+                // delimiter option at all — it split on whitespace and handed
+                // the WHOLE line to the first variable (088 printed `a:1` for
+                // `$name` and nothing for `$num`). The faithful lowering reads
+                // the line whole and then splits it, which needs a statement
+                // sequence rather than the `read` command itself.
+                if let Ok(sep) = raw_arg(&[v.clone()], 0) {
+                    if !sep.is_empty() {
+                        let vars: Vec<String> = args
+                            .iter()
+                            .filter_map(|a| match a {
+                                IrExpr::Str(n, _)
+                                    if !(n.starts_with('-') && n.len() > 1) =>
+                                {
+                                    Some(n.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if !vars.is_empty() {
+                            let mut body = String::from("read -l __sh2_ifs_line; ");
+                            body.push_str(&format!(
+                                "set __sh2_ifs_parts (string split {} -- $__sh2_ifs_line); ",
+                                dq_word(&sep)
+                            ));
+                            for (i, n) in vars.iter().enumerate() {
+                                body.push_str(&format!(
+                                    "set {n} $__sh2_ifs_parts[{}]; ",
+                                    i + 1
+                                ));
+                            }
+                            body.push_str("test (count $__sh2_ifs_parts) -gt 0");
+                            return Ok(format!("begin; {body}; end"));
+                        }
+                    }
+                }
                 continue;
             }
             out.push_str(k);
@@ -6539,7 +6706,24 @@ fn glob_to_regex(pat: &str, lazy_star: bool) -> Option<String> {
                 out.push_str(&cls);
                 i = j + 1;
             }
-            '{' | '}' => return None,
+            // A BRACE is a LITERAL in a `case` pattern (bash's brace
+            // expansion runs before the case is parsed, and a pattern that
+            // reached the matcher with braces kept them literal). Returning
+            // None here refused the whole pattern, which sent the arm back to
+            // the glob spelling — and a pattern containing `[^` is not a valid
+            // fish glob, so the arm matched NOTHING (063_11 lost its
+            // parameter-expansion line).
+            // NOTE: every arm must ADVANCE `i` — these two did not, so the
+            // loop spun forever on the first brace (an infinite render that
+            // grew to 25 GB RSS).
+            '{' => {
+                out.push_str("\\{");
+                i += 1;
+            }
+            '}' => {
+                out.push_str("\\}");
+                i += 1;
+            }
             '\\' => {
                 // glob quote: the next char is literal, whatever it is
                 if i + 1 < chars.len() {
@@ -8915,6 +9099,54 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             // switch block"), unbalanced the enclosing loop ("Missing end
             // to balance this while loop"), and left the rest of the
             // program as stray statements.
+            // A negated character class has no fish `case` spelling, so the
+            // arms become an `if`/`else if` chain over regex matches — the
+            // same rewrite the two block renderers make.
+            if clauses
+                .iter()
+                .any(|cl| cl.patterns.iter().any(|p| p.contains("[^")))
+            {
+                let subj = word_to_fish(discriminant)?;
+                let mut out = String::new();
+                let mut first = true;
+                for cl in clauses {
+                    if cl.patterns.is_empty() {
+                        continue;
+                    }
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .map(|p| match glob_to_regex(&unescape_case_pattern(p), false) {
+                            Some(re) => {
+                                format!("string match -rq {} -- {subj}", fish_single_quoted(&re))
+                            }
+                            None => format!(
+                                "string match -q {} -- {subj}",
+                                case_patterns_fish(std::slice::from_ref(p))
+                            ),
+                        })
+                        .collect();
+                    if !first {
+                        out.push_str("; else if ");
+                    }
+                    out.push_str(&conds.join("; or "));
+                    let body = if cl.body.is_empty() {
+                        ":".to_string()
+                    } else {
+                        stmts_inline(&cl.body)?
+                    };
+                    out.push_str(&format!("; {body}"));
+                    if first {
+                        out.insert_str(0, "if ");
+                        first = false;
+                    }
+                }
+                if first {
+                    return Ok(":".into());
+                }
+                out.push_str("; end");
+                return Ok(out);
+            }
             let mut out = format!("switch {}", word_to_fish(discriminant)?);
             for cl in clauses {
                 out.push_str(&format!(
