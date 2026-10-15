@@ -9531,6 +9531,29 @@ pub(crate) fn tokenize_test(s: &str) -> Vec<String> {
                         chars.next();
                         paren = 1;
                     }
+                    // `$'…'` — ANSI-C quoting. The inner text is a LITERAL
+                    // (escapes only), so `'` must not be taken as an
+                    // ordinary quote toggle and `=`/whitespace inside must
+                    // not split. Without this the `==` in
+                    // `[[ $s == *$'\x00'* ]]` split the token and the glob
+                    // was truncated to `*$x00` — the trailing `*` lost and
+                    // realpath-cmdsub's NUL branch never taken.
+                    Some('\'') => {
+                        cur.push('\'');
+                        chars.next();
+                        while let Some(c2) = chars.next() {
+                            cur.push(c2);
+                            if c2 == '\\' {
+                                if let Some(c3) = chars.next() {
+                                    cur.push(c3);
+                                }
+                                continue;
+                            }
+                            if c2 == '\'' {
+                                break;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
