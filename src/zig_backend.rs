@@ -3519,10 +3519,20 @@ impl Render {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
+        if self.need_env || self.need_run {
+            // Process handle for the runtime helpers. `Init` is only available
+            // inside the emitted `main`, and zig has no way to thread it into a
+            // free helper without changing every call site, so the emitted main
+            // publishes it here (see the `sh2_io = init.io;` injection).
+            self.emit("");
+            self.emit("var sh2_io: ?std.Io = null;");
+        }
         if self.need_env {
+            self.emit("var sh2_environ: ?*std.process.Environ.Map = null;");
             self.emit("");
             self.emit("fn sh2Env(name: []const u8) []const u8 {");
-            self.emit("    return std.process.getEnvVar(name) catch \"\";");
+            self.emit("    const m = sh2_environ orelse return \"\";");
+            self.emit("    return m.get(name) orelse \"\";");
             self.emit("}");
         }
         if self.need_fexist {
@@ -3767,8 +3777,12 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         if self.need_run {
             self.emit("");
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
-            self.emit("    const result = std.process.Child.run(.{ .allocator = std.heap.page_allocator, .argv = argv }) catch return \"\";");
-            self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
+            self.emit("    const io = sh2_io orelse return \"\";");
+            self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
+            self.emit("        .argv = argv,");
+            self.emit("        .stdout_limit = .limited(1 << 20),");
+            self.emit("    }) catch return \"\";");
+            self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
             self.emit("}");
         }
         if self.need_glob {
@@ -3910,20 +3924,26 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 self.emit(d);
             }
         }
-        if self.need_stdout {
-            self.emit("");
-            // zig 0.16 removed std.io.getStdOut: stdout writing needs the
-            // process Init's Io. Rewrite the already-emitted main signature
-            // and set up a buffered File.Writer as `stdout` — generated
-            // statements (`try stdout.print(...)`) are unchanged, each one
-            // is followed by an explicit flush (early returns / exit() must
-            // not lose buffered output).
+        // zig 0.16 removed std.io.getStdOut, and 0.14's std.process.getEnvVar /
+        // std.process.Child.run went with it: stdout writing, env reads and
+        // child capture ALL need the process `Init` now. So `main` takes
+        // `init` whenever any of the three is needed, and the ones that cannot
+        // be threaded into a free helper read it back through these globals.
+        let need_init = self.need_stdout || self.need_env || self.need_run;
+        if need_init {
+            // Rewrite the already-emitted main signature. Generated statements
+            // (`try stdout.print(...)`) are unchanged; each print is followed
+            // by an explicit flush (early returns / exit() must not lose
+            // buffered output).
             for line in self.out.iter_mut() {
                 if line == "pub fn main() !void {" {
                     *line = "pub fn main(init: std.process.Init) !void {".to_string();
                     break;
                 }
             }
+        }
+        if self.need_stdout {
+            self.emit("");
             self.out
                 .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
             self.out.push(
@@ -3933,7 +3953,17 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
         }
-        if !self.need_stdout {
+        if self.need_env || self.need_run {
+            self.out
+                .push("    sh2_io = init.io;".to_string());
+        }
+        if self.need_env {
+            self.out
+                .push("    sh2_environ = init.environ_map;".to_string());
+        }
+        if !self.need_stdout && !self.need_env && !self.need_run {
+            // `main` always takes `init`; if nothing consumed the handle the
+            // parameter is unused and zig rejects it.
             self.emit("    _ = init;");
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
