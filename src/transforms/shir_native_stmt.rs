@@ -882,9 +882,14 @@ fn native_echo_bc_stmt(st: &mut IrStmt) -> bool {
     if cmd != "bc" || !bc_args.is_empty() { return false; }
     let Ok(out) = bc_eval(&expr) else { return false; };
     let out = if out.is_empty() { String::new() } else { out };
+    // The value MUST be a QUOTED string, not a raw literal: bc's output
+    // format is significant (`scale=2; 5/2` is `2.50`, `0.5+0.25` is
+    // `.75`), and a bare Perl number literal numifies — `print(2.50)`
+    // emits `2.5` and `print(.75)` emits `0.75`. Quoting preserves the
+    // exact bytes the evaluator produced.
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(out, StrStyle::Raw),
+            value: IrExpr::Str(out, StrStyle::SingleQuoted),
             newline: true,
             target: None,
         },
@@ -984,6 +989,17 @@ fn native_eval_assign_stmt(st: &mut IrStmt) -> bool {
     let Some((name, value)) = eval_assign_parts(word) else {
         return false;
     };
+    // The value is the TEXT eval will RE-PARSE, so a shell expansion in it
+    // must be evaluated, not copied: `eval "result=\$(( \$var + 1 ))"` sets
+    // result to the ARITHMETIC RESULT, not to the literal `$(( … ))`.
+    // Copying the text was right only for a value with no expansion
+    // (`y=5+1`). Return false so the renderer's parse-the-text lowering
+    // handles it (063_12).
+    if let Some(text) = crate::ir::static_word_text(&value) {
+        if text.contains("$((") || text.contains("${") || text.contains("$(") || text.contains('`') {
+            return false;
+        }
+    }
     *st = IrStmt::Assign {
         targets: vec![crate::ir::AssignTarget {
             var: name,
@@ -5655,10 +5671,26 @@ fn native_while_multi_cond(st: &mut IrStmt) -> bool {
         cond: rendered,
         then: vec![],
         elsifs: vec![],
-        else_: vec![IrStmt::Expr(IrExpr::Call {
-            func: "break".to_string(),
-            args: vec![],
-        })],
+        // The condition FAILED. bash reports 0 for a `while` whose body
+        // never ran, whatever the condition's own status was, so zero the
+        // status on this exit path:
+        //
+        //     while echo c; test -f /nope; do echo hi; break; done; echo $?
+        //     # c
+        //     # 0        <- not 1, the failing `test`'s status
+        //
+        // `$CHILD_ERROR` still holds that failing status at this point
+        // (the `test` lowering just set it), which is what the old code
+        // leaked (parse-multi-command-while-condition printed 1).
+        // Two statements, not one RawText: `break` must reach the IR's
+        // `last;` mapping, and a raw `break` is a strict-subs bareword.
+        else_: vec![
+            IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 0;".to_string()),
+            IrStmt::Expr(IrExpr::Call {
+                func: "break".to_string(),
+                args: vec![],
+            }),
+        ],
     });
     new_body.extend(body.iter().cloned());
     match st {

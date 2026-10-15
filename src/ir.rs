@@ -3430,6 +3430,39 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Exec {
             cmd, args, capture, ..
         } => {
+            // `eval "TEXT"` — bash PARSES TEXT as source and runs it in the
+            // CURRENT shell, so its assignments persist. Parse it here and
+            // emit what that source means:
+            //   eval "result=$(( $var + 1 ))"  ⇒  $result = $var + 1;
+            // The generic path emitted the literal TEXT, so 063_12 printed
+            // the raw source (`Eval result: $(( ${var:-0} + … ))`) and
+            // 063_hard_to_parse printed nothing.
+            //
+            // STATIC literal text only (the common corpus shape). A dynamic
+            // argument cannot be resolved at translation time; it falls
+            // through to the shell-out, where the child parses it exactly
+            // like bash (assignments then live only in that child — the
+            // honest limit of the model).
+            if capture.is_none() && call_arg_str(cmd).as_deref() == Some("eval") {
+                if let Some(text) = args.iter().find_map(static_word_text) {
+                    if let Ok(cmds) = crate::parser::commands::parse(&text) {
+                        if !cmds.is_empty() {
+                            let sub = crate::shir::ast_to_ir(&cmds);
+                            for st in &sub.stmts {
+                                emit_stmt(out, st, indent);
+                            }
+                            return;
+                        }
+                    }
+                    // Not a parseable command line: bash reports a syntax
+                    // error and leaves a nonzero status.
+                    emit_indent(out, indent);
+                    out.push_str(
+                        "(print STDERR \"$0: eval: syntax error\\n\"); $main_exit_code = $CHILD_ERROR = 1;\n",
+                    );
+                    return;
+                }
+            }
             let cmd_str = ir_expr_to_perl(cmd);
             // Quote a string VALUE as a bash single-quoted shell word.
             // (Perl-style `\'` escaping is NOT understood by bash inside
@@ -3838,8 +3871,14 @@ fn var_read(name: &str) -> String {
         }
         let key = idx.trim_matches('"').trim_matches('\'');
         // A variable subscript (`${words[$counter]}`) indexes with the
-        // variable's value, not the literal name.
-        if key.starts_with('$') || key.starts_with("${") {
+        // variable's value, not the literal name. A BRACED expansion
+        // (`${words[${i:-0}]}`) must be recursively lowered — leaving the
+        // text `$array{${index:-0}}` put a shell `${…}` in Perl source,
+        // which `use strict` rejected (063_12).
+        if key.starts_with("${") && key.ends_with('}') {
+            return format!("${}{{{}}}", base, param_inner_perl(&key[2..key.len() - 1]));
+        }
+        if key.starts_with('$') {
             return format!("${}{{{}}}", base, key);
         }
         return format!("${}{{'{}'}}", base, key.replace('\'', "\\'"));
@@ -5073,7 +5112,69 @@ fn param_inner_perl(inner: &str) -> String {
         let base = rest.trim_end_matches("[@]").trim_end_matches('*');
         return format!("keys %{}", base);
     }
-    var_read(inner)
+    // `${name OP WORD}` — the parameter-expansion OPERATORS. This function
+    // is the arithmetic-context lowering, and the text it receives is the
+    // INNER of a `${…}` whose operands are typically plain names
+    // (`${var:-0}`, `${array[i]:-0}`). Falling through to `var_read` on the
+    // WHOLE string ran the sanitize fallback, which maps `-` to `_`:
+    // `${var:-0}` rendered as `${var:_0}` — a Perl compile error — instead
+    // of "var, or 0 if unset" (063_12).
+    //
+    // Locate the operator SKIPPING any `[...]` subscript: the first `:` in
+    // `${array[${index:-0}]:-0}` belongs to the nested expansion.
+    let mut head_end = inner.len();
+    {
+        let bytes = inner.as_bytes();
+        let mut depth = 0i32;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            match c {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                ':' | '-' | '+' | '=' | '?' if depth == 0 => {
+                    head_end = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    if head_end == inner.len() {
+        return var_read(inner);
+    }
+    let (name, op_tail) = inner.split_at(head_end);
+    if name.is_empty() || op_tail.is_empty() {
+        return var_read(inner);
+    }
+    let name_read = var_read(name);
+    let (test_unset_only, tail) = match op_tail.strip_prefix(':') {
+        Some(t) => (false, t),
+        None => (true, op_tail),
+    };
+    let Some(opch) = tail.chars().next() else {
+        return name_read;
+    };
+    let word = &tail[opch.len_utf8()..];
+    let word_perl = if word.starts_with('{') && word.ends_with('}') {
+        param_inner_perl(&word[1..word.len() - 1])
+    } else if word.starts_with('$') {
+        var_read(word.trim_start_matches('$').trim_matches(|c| c == '{' || c == '}'))
+    } else {
+        format!("\"{}\"", word.replace('"', "\\\""))
+    };
+    let is_set = if test_unset_only {
+        format!("defined({name_read})")
+    } else {
+        format!("(defined({name_read}) && length({name_read}))")
+    };
+    match opch {
+        '-' => format!("({is_set} ? {name_read} : {word_perl})"),
+        '+' => format!("({is_set} ? {word_perl} : \"\")"),
+        '=' => format!("({is_set} ? {name_read} : ({name_read} = {word_perl}))"),
+        _ => name_read,
+    }
 }
 
 /// A word as bash syntax: literals shell-quoted, captures as `$(…)`
@@ -5775,6 +5876,66 @@ pub(crate) fn render_brace_iter(args: &[IrExpr]) -> String {
 
 /// Extract (cmd, words) from an `exec` Call's args (arg0 = command name;
 /// the remaining args are the flattened word list — see exec_word_args).
+/// The literal TEXT of a word that is fully static — a plain string, or an
+/// interpolation whose parts are all literals. `None` when any part is
+/// dynamic (a variable read, a command substitution), i.e. when the text
+/// cannot be known at translation time (used by the `eval` lowering).
+/// Like `static_word_text`, but renders an INTERPOLATED word as shell
+/// SOURCE: literals verbatim and each interpolated expansion as the shell
+/// spelling of its value (`getVar("x")` → `${x}`). Used by the `eval`
+/// lowering, where bash substitutes the words FIRST and then parses the
+/// result: `eval "echo \"n=$x\""` runs `echo "n=42"` when x=42.
+///
+/// `None` when a literal-only reading is enough (the caller's static path
+/// handles that) or when a part cannot be expressed as shell source.
+fn eval_word_shell_text(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            let mut had_expr = false;
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    InterpPart::Expr(e) => {
+                        had_expr = true;
+                        let name = match e.as_ref() {
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                args.first().and_then(call_arg_str)
+                            }
+                            IrExpr::Var(n, _) => Some(n.clone()),
+                            _ => None,
+                        };
+                        out.push_str(&format!("${{{}}}", name?));
+                    }
+                }
+            }
+            if had_expr {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn static_word_text(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
     let cmd = call_arg_str(args.first()?)?;
     Some((cmd, exec_word_args(args)))
@@ -7184,6 +7345,53 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         }
         _ => true,
     });
+    // `eval "TEXT"` — bash PARSES TEXT as source and runs it in the
+    // CURRENT shell, so its assignments persist. Parse it here and emit what
+    // that source means:
+    //   eval "result=$(( $var + 1 ))"  ⇒  $result = $var + 1;
+    // The generic path emitted the literal TEXT, so 063_12 printed the raw
+    // source (`Eval result: $(( ${var:-0} + … ))`) and 063_hard_to_parse
+    // printed nothing at all.
+    //
+    // STATIC literal text only (the common corpus shape). A dynamic argument
+    // cannot be resolved at translation time; it falls through to the
+    // shell-out, where the child parses it exactly like bash.
+    if cmd == "eval" {
+        if let Some(text) = words.iter().find_map(|w| static_word_text(w)) {
+            if let Ok(cmds) = crate::parser::commands::parse(&text) {
+                if !cmds.is_empty() {
+                    let sub = crate::shir::ast_to_ir(&cmds);
+                    for st in &sub.stmts {
+                        emit_stmt(out, st, indent);
+                    }
+                    return;
+                }
+            }
+            emit_indent(out, indent);
+            out.push_str(
+                "(print STDERR \"$0: eval: syntax error\\n\"); $main_exit_code = $CHILD_ERROR = 1;\n",
+            );
+            return;
+        }
+        // An INTERPOLATED eval argument (`eval "echo \"… $x\""`): bash
+        // expands the words BEFORE eval parses the result, so the text is
+        // "the literals with each expansion substituted". Rebuild exactly
+        // that as shell source and lower it — which keeps the value
+        // semantics (a substituted `$x` becomes the VALUE's shell spelling)
+        // instead of handing bash a mangled nested-quoting string
+        // (075_eval_complex printed nothing).
+        if let Some(expanded) = words.iter().find_map(|w| eval_word_shell_text(w)) {
+            if let Ok(cmds) = crate::parser::commands::parse(&expanded) {
+                if !cmds.is_empty() {
+                    let sub = crate::shir::ast_to_ir(&cmds);
+                    for st in &sub.stmts {
+                        emit_stmt(out, st, indent);
+                    }
+                    return;
+                }
+            }
+        }
+    }
     if let Some(native) = crate::pipeline_native::native_exec_stmt(call) {
         emit_indent(out, indent);
         // A value-channel leaf (`$__sh_cap`) used in STATEMENT position must
