@@ -11552,8 +11552,45 @@ impl Render {
             self.emit("  return n;");
             self.emit("}");
             self.emit("/* export a var value so `$name` in a bash -c child sees it */");
+            // setenv() allocates a FRESH `name=value` block on every call
+            // and does not reuse it at a stable address, so re-exporting
+            // one variable with a large value per frame grows the heap
+            // without bound. Measured on MIMEcroft_fb (the fb0 rasterizer
+            // exports its 41 KB `rbp_chunk` 15x per presented frame):
+            // uordblks 324 MB and climbing at f=1420 in the menu loop,
+            // RSS 55 MB and rising, versus FLAT once the exported value is
+            // capped at 1 KB — so the growth is O(exported value) per
+            // export, not the program's own allocations.
+            //
+            // Keep ONE parent-owned block per name and hand the CHILD that
+            // block directly via putenv(): the environ entry then points at
+            // our buffer instead of a fresh glibc copy, so a re-export
+            // costs a memcpy into a buffer that is only realloc'd when the
+            // value grows. The block is intentionally never freed (the
+            // environment outlives every call, and putenv keeps the
+            // pointer); the name copy is owned by the same table.
             self.emit("static void _sh_export(const char *name, const char *val) {");
-            self.emit("  setenv(name, val ? val : \"\", 1);");
+            self.emit("  struct _sh_xe { char *n; char *blk; size_t cap; };");
+            self.emit("  static struct _sh_xe _xe[64];");
+            self.emit("  static int _xn = 0;");
+            self.emit("  const char *v = val ? val : \"\";");
+            self.emit("  size_t ln = strlen(name), lv = strlen(v);");
+            self.emit("  int k = -1;");
+            self.emit("  for (int i = 0; i < _xn; i++) if (strcmp(_xe[i].n, name) == 0) { k = i; break; }");
+            self.emit("  if (k < 0) {");
+            self.emit("    if (_xn >= 64) { setenv(name, v, 1); return; }");
+            self.emit("    k = _xn++; _xe[k].n = _sh_xstrdup(name); _xe[k].blk = 0; _xe[k].cap = 0;");
+            self.emit("  }");
+            self.emit("  if (lv + ln + 2 > _xe[k].cap) {");
+            self.emit("    _xe[k].cap = lv + ln + 2;");
+            self.emit("    _xe[k].blk = (char*)realloc(_xe[k].blk, _xe[k].cap);");
+            self.emit("    if (!_xe[k].blk) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  }");
+            self.emit("  memcpy(_xe[k].blk, name, ln);");
+            self.emit("  _xe[k].blk[ln] = '=';");
+            self.emit("  memcpy(_xe[k].blk + ln + 1, v, lv + 1);");
+            self.emit("  unsetenv(name);");
+            self.emit("  putenv(_xe[k].blk);");
             self.emit("}");
             // getenv-or-empty as a HELPER, not an inline ternary. clang's
             // analyzer cannot correlate the two separate getenv() calls in
@@ -21016,9 +21053,17 @@ fn param_copy_alias(
                                 self.arrays.insert(var.clone());
                                 let id = self.c_ident(&var);
                                 if let Ok(i) = key.parse::<i64>() {
-                                    self.emit(&format!(
-                                        "if ({i} < {id}_len) {id}[{i}] = 0;"
-                                    ));
+                                    // free the dropped slot before clearing
+                                    // (a bare `= 0` orphaned its string)
+                                    if self.is_string_array(&var) {
+                                        self.emit(&format!(
+                                            "if ({i} < {id}_len) {{ free({id}[{i}]); {id}[{i}] = 0; }}"
+                                        ));
+                                    } else {
+                                        self.emit(&format!(
+                                            "if ({i} < {id}_len) {id}[{i}] = 0;"
+                                        ));
+                                    }
                                 }
                                 continue;
                             }
@@ -21028,6 +21073,12 @@ fn param_copy_alias(
                             if self.assoc_arrays.contains(&name) {
                                 self.emit(&format!("{id}_n = 0;"));
                             } else {
+                                // `unset arr` drops every element — free the
+                                // string slots first (a plain `_len = 0`
+                                // orphaned them).
+                                if self.is_string_array(&name) {
+                                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                                }
                                 self.emit(&format!("{id}_len = 0;"));
                             }
                         } else if !self.is_num(&name) {
@@ -27670,9 +27721,9 @@ fn param_copy_alias(
             }
         };
         let n = items.len();
-        // redefine clears: free orphaned string elements for vecs (see
-        // emit_set_array)
-        if self.vec_arrays.contains(arr) && !self.int_arrays.contains(arr) {
+        // redefine clears: free orphaned string elements for string
+        // arrays (fixed AND vec — see emit_set_array)
+        if self.is_string_array(arr) {
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
         }
         self.emit(&format!("{id}_len = 0;"));
@@ -27870,10 +27921,16 @@ fn param_copy_alias(
         // empty literal (`arr=()`) clears a previously-populated array
         // (the item loop below re-sets _len per element; without this a
         // function-local array reused across calls keeps its old length).
-        // A string vec frees its orphaned elements first (fixed arrays
-        // leak them — pre-existing; a vec redefine in a loop would leak
-        // unboundedly and trip LSan).
-        if self.vec_arrays.contains(var) && !self.int_arrays.contains(var) {
+        // A string array frees its orphaned elements first. This used to
+        // be vec-only, with the comment "fixed arrays leak them —
+        // pre-existing"; that leak is real and observable: a capped array
+        // re-literalized per call (`lgi=(...)` in label_glyphs runs once
+        // per glyph) overwrote `_len` slots and dropped the old strings
+        // forever. LSan on MIMEcroft_fb points straight at it (`_sh_xstrdup`
+        // -> label_glyphs -> gen_label_tex -> load_labels). Fixed arrays
+        // are `static char *a[cap] = {0}` (zero-init, so the first free is
+        // a no-op) exactly like the vec case, so the same loop is safe.
+        if self.is_string_array(var) {
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
         }
         self.emit(&format!("{id}_len = 0;"));
@@ -27981,6 +28038,19 @@ fn param_copy_alias(
             return self.int_array_widths.get(var).copied().unwrap_or(Width::I64).suffix();
         }
         "str"
+    }
+
+    /// Does this array own a heap `char*` per element (so a bulk redefine
+    /// must `free` the old slots)? False for int arrays (inline values),
+    /// the `mpz_t[]` array-return arrays (mpz_clear, not free) and assoc
+    /// arrays (`_k`/`_v` pairs, handled by `_sh_assoc_set`). Every string
+    /// array — fixed `char *a[cap]` AND growable `char **a` — is
+    /// `_sh_xstrdup`-stored and zero-initialized, so `free(a[i])` is
+    /// always safe for `i < a_len`.
+    fn is_string_array(&self, var: &str) -> bool {
+        !self.int_arrays.contains(var)
+            && !self.assoc_arrays.contains(var)
+            && !self.array_return_arrays.values().any(|ra| ra == var)
     }
 
 
@@ -32035,6 +32105,18 @@ fn param_copy_alias(
             IrStmt::DeclareArray { var, elements, .. } => {
                 self.arrays.insert(var.clone());
                 let id = self.c_ident(var);
+                // A re-declaration REPLACES the array (`declare -a x=(...)`
+                // in a loop / twice in one function body). Free the string
+                // elements the old length owns before the stores below
+                // overwrite the slots — the stores strdup into `[0..n)`
+                // and would otherwise orphan everything the previous
+                // population held. Also shortens `_len` below when the new
+                // literal is shorter, so the freed prefix is exactly the
+                // dropped set.
+                if self.is_string_array(var) {
+                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                    self.emit(&format!("{id}_len = 0;"));
+                }
                 // P1: the literal indices are compile-time constants — a
                 // literal longer than the fixed [ARR_CAP] decl is a
                 // statically-known overflow, so refuse without emitting
@@ -32048,8 +32130,7 @@ fn param_copy_alias(
                     let v = self.value_c(e);
                     self.emit(&format!("{id}[{i}] = _sh_xstrdup((char*)({v}));"));
                 }
-                self.emit(&format!("{id}_len = {};", elements.len()));
-            }
+                self.emit(&format!("{id}_len = {};", elements.len()));            }
             IrStmt::Exec { cmd, args, capture, redirects, .. } => {
                 let mut call_args = vec![cmd.clone()];
                 call_args.push(IrExpr::Array(args.clone()));
