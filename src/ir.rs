@@ -9790,6 +9790,28 @@ fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
                         let cmp = if op == "-nt" { ">" } else { "<" };
                         return format!("(-e {l} && -e {r} && (stat({l}))[9] {cmp} (stat({r}))[9])");
                     }
+                    // `[[ X == PATTERN ]]` is a GLOB match, not string
+                    // equality: a pattern with `*`/`?`/`[`/extglob must
+                    // become an anchored regex. Emitting `eq` with the
+                    // pattern text compared the literal characters, so
+                    // `[[ "$s" == *$'\x00'* ]]` was false for every value
+                    // (realpath-cmdsub took the wrong branch even after the
+                    // NUL escape was decoded).
+                    if matches!(op, "==" | "=" | "!=")
+                        && (rhs.contains('*') || rhs.contains('?') || rhs.contains('['))
+                    {
+                        let l = render_test_operand(lhs);
+                        let pat = rhs
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'');
+                        let re = glob_to_regex(pat);
+                        return if op == "!=" {
+                            format!("(!({l} =~ /^{re}$/))")
+                        } else {
+                            format!("({l} =~ /^{re}$/)")
+                        };
+                    }
                     let perl_op = perl_compare_op(op);
                     let l = render_test_operand(lhs);
                     let r = render_test_operand(rhs);
