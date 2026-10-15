@@ -3850,9 +3850,9 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    sh2_environ = init.environ_map;".to_string());
         }
-        if need_init && !self.need_stdout && !self.need_env && !self.need_run {
-            // `main(init: ...)` takes the process handle; if nothing consumed
-            // it, the parameter is unused and zig rejects it.
+        if !self.need_stdout && !self.need_env && !self.need_run {
+            // `main` always takes `init`; if nothing consumed the handle the
+            // parameter is unused and zig rejects it.
             self.out.push("    _ = init;".to_string());
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
