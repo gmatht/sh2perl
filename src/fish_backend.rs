@@ -6867,6 +6867,21 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // through the same bash-text rewriter every other raw word uses;
             // an ordinary word (`${x:-hello}`) comes back unchanged.
             let default = bash_specials_to_fish(&raw_arg(args, 2)?);
+            // `${arr[SUB]:-d}` — the SUBSCRIPTED form. It must be tested
+            // BEFORE the plain-array arm: that arm asks ARRAY_NAMES about the
+            // WHOLE `arr[SUB]` string, which is never a registered name, so it
+            // fell to `arr_elem_ref` with the bracket text as the array base
+            // and the expansion produced an empty word (063_hard_to_parse lost
+            // a line to a stray blank).
+            if let Some((base, sub)) = name
+                .strip_suffix(']')
+                .and_then(|t| t.split_once('['))
+            {
+                if !base.is_empty() && is_plain_var(base) {
+                    let subj = subscript_read_fish(base, sub);
+                    return Ok(default_if_unset_expr_fish(&subj, &default));
+                }
+            }
             // `${arr:-d}` — bash's array form reads ELEMENT 0 when the array
             // is non-empty. The per-element vars have no scalar, so the
             // element-0 read is the subject of the same emptiness test — and it
