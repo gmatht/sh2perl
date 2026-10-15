@@ -3349,7 +3349,15 @@ impl Render {
                 }
             }
         }
-        // dead-var guard: Zig rejects declared-but-never-read variables
+        // dead-var guard: Zig rejects declared-but-never-read variables.
+        // `_ = x;` is NOT enough on the 0.16+ target: a variable that was
+        // ASSIGNED (which is what `written` holds) makes the discard itself an
+        // error — "pointless discard of local variable" (verified on 0.16.0 and
+        // 0.17.0). Discarding the ADDRESS (`_ = &x;`) keeps the declaration
+        // live for both cases: it reads the variable AND satisfies
+        // "never mutated" for an unassigned one (taking the address counts as a
+        // potential mutation). This is a compile error the corpus-c zig column
+        // caught in 005/006/013/014 (e.g. `t = sh2ToInt(___t1); ... _ = t;`).
         for v in &written {
             if !self.read.contains(v) && !self.fn_locals.contains(v) {
                 let m = self
@@ -3357,7 +3365,7 @@ impl Render {
                     .get(v)
                     .cloned()
                     .unwrap_or_else(|| self.zig_ident(v));
-                self.emit(&format!("_ = {m};"));
+                self.emit(&format!("_ = &{m};"));
             }
         }
         std::mem::swap(&mut self.out, &mut body_stmts);
