@@ -138,6 +138,10 @@ pub struct Render {
     need_fexist: bool,
     need_writefile: bool,
     need_run: bool,
+    /// an FFI-eligible (whitelisted) external command was emitted under
+    /// SH2_UU_FFI — the in-process `uu_run` arm is only emitted when this is
+    /// set, so a render with no coreutils commands carries no FFI extern.
+    need_uu_run: bool,
     loop_depth: usize,
     todo: usize,
     /// inside a user-function body (A1 Function): getVar("N") reads the
@@ -299,6 +303,42 @@ impl Render {
         }
         self.mangle.insert(name.to_string(), m.clone());
         m
+    }
+
+    /// UU-FFI.md gate: is the in-process coreutils arm requested at RENDER
+    /// time? Mirrors the C backend's `SH2_UU_FFI` switch (opt OUT with
+    /// `SH2_UU_FFI=0`, on if set to anything else). Off by default so the
+    /// emitted program keeps the dependency-free fork/exec path unless the
+    /// invoker has built/linked libcoreutils_ffi.so.
+    fn uu_ffi_enabled() -> bool {
+        match std::env::var("SH2_UU_FFI") {
+            Ok(v) => v != "0",
+            Err(_) => false,
+        }
+    }
+
+    /// Commands compiled into libcoreutils_ffi.so — kept in sync with
+    /// `runtime/build_uu_ffi.sh` FEATURES (the same list the C backend and
+    /// the perl preamble gate on). `uu_run` returns 127 for anything else
+    /// and prints NOTHING, so an unwhitelisted command routed through the
+    /// FFI would silently lose its output; those stay on fork/exec.
+    fn uu_cmd_ok(cmd: &str) -> bool {
+        matches!(
+            cmd,
+            "cat"
+                | "wc"
+                | "ls"
+                | "sort"
+                | "sed"
+                | "awk"
+                | "grep"
+                | "date"
+                | "sha256sum"
+                | "uname"
+                | "basename"
+                | "dirname"
+                | "cp"
+        )
     }
 
     /// A Zig string literal. Escaped byte-wise so arbitrary (non-UTF-8)
@@ -2056,7 +2096,16 @@ impl Render {
         }
         let argv = self.build_argv(&cmd, args);
         self.need_run = true;
-        Some(format!("sh2Run(&[_][]const u8{{{}}})", argv.join(", ")))
+        // Route through the in-process uutils arm only for a command the
+        // linked library actually provides (uu_run returns 127 and prints
+        // NOTHING otherwise, which would silently drop the output).
+        let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(&cmd) {
+            self.need_uu_run = true;
+            "sh2UuRun"
+        } else {
+            "sh2Run"
+        };
+        Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
     fn sh2_stub(&mut self, name: &str, note: &str) -> String {
@@ -2867,10 +2916,17 @@ impl Render {
                                     }
                                 }
                             }
-                            // external command: fork/exec via sh2Run
+                            // external command: in-process uutils when the
+                            // library provides it, else fork/exec
                             let argv = self.build_argv(cmd, args);
                             self.need_run = true;
-                            self.emit(&format!("_ = sh2Run(&[_][]const u8{{{}}});", argv.join(", ")));
+                            let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(cmd) {
+                                self.need_uu_run = true;
+                                "sh2UuRun"
+                            } else {
+                                "sh2Run"
+                            };
+                            self.emit(&format!("_ = {entry}(&[_][]const u8{{{}}});", argv.join(", ")));
                             return;
                         }
                     }
@@ -3823,6 +3879,9 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         }
         if self.need_run {
             self.emit("");
+            // fork/exec arm — always emitted: it is the fallback for any
+            // command the FFI library does not provide, and the only arm
+            // when SH2_UU_FFI is off.
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
             self.emit("    const io = sh2_io orelse return \"\";");
             self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
@@ -3830,6 +3889,28 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("        .stdout_limit = .limited(1 << 20),");
             self.emit("    }) catch return \"\";");
             self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
+            self.emit("}");
+        }
+        if self.need_uu_run {
+            // UU-FFI.md: the in-process uutils coreutils arm. `uu_run(util,
+            // argc, argv)` takes the SAME argv we already build, so only the
+            // entry point differs. The emitted program must be linked against
+            // libcoreutils_ffi.so WITH libc — a Rust cdylib does not
+            // initialise without it (measured: identical zig segfaulted
+            // without `-lc` and printed correctly with it). The invoker
+            // supplies the link flags.
+            self.emit("");
+            self.emit("extern fn uu_run(util: [*:0]const u8, argc: c_int, argv: [*]const [*:0]const u8) c_int;");
+            self.emit("");
+            self.emit("fn sh2UuRun(argv: []const []const u8) []const u8 {");
+            self.emit("    if (argv.len == 0) return \"\";");
+            self.emit("    const util_z = std.heap.page_allocator.dupeSentinel(u8, argv[0], 0) catch return \"\";");
+            self.emit("    const zargs = std.heap.page_allocator.alloc([*:0]const u8, argv.len) catch return \"\";");
+            self.emit("    for (argv, 0..) |a, i| {");
+            self.emit("        zargs[i] = std.heap.page_allocator.dupeSentinel(u8, a, 0) catch return \"\";");
+            self.emit("    }");
+            self.emit("    _ = uu_run(util_z, @intCast(argv.len), zargs.ptr);");
+            self.emit("    return \"\";");
             self.emit("}");
         }
         if self.need_glob {
