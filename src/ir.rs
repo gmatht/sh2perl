@@ -3305,7 +3305,6 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             else_,
         } => {
             let cond_str = ir_expr_to_perl(cond);
-            eprintln!("DBG_IFCOND {:?} -> {}", cond, cond_str);
             // If the condition was derived from a shell test command by
             // native_if_test_cond (indicated by IrExpr::Str), set
             // $CHILD_ERROR so $? reflects the test result for subsequent
@@ -3984,6 +3983,84 @@ fn case_pattern_var_name(pat: &str) -> Option<String> {
     None
 }
 
+/// Decode bash `$'…'` ANSI-C quoting to the bytes bash would produce.
+///
+/// Only the escapes the corpus uses are handled (`\xHH`, `\n`, `\t`, `\r`,
+/// `\\`, `\'`, `\0`); an unknown escape keeps its escaped form. A value
+/// that decodes to NUL (`$'\x00'`) becomes the EMPTY string, which is what
+/// bash does — a shell variable cannot hold a NUL byte, so the expansion is
+/// truncated.
+fn decode_ansi_c_quotes(s: &str) -> String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'\'' {
+            // find the closing unescaped `'`
+            let mut j = i + 2;
+            let mut body = String::new();
+            while j < b.len() {
+                if b[j] == b'\\' && j + 1 < b.len() {
+                    body.push('\\');
+                    body.push(b[j + 1] as char);
+                    j += 2;
+                    continue;
+                }
+                if b[j] == b'\'' {
+                    break;
+                }
+                body.push(b[j] as char);
+                j += 1;
+            }
+            out.push_str(&decode_c_escapes(&body));
+            i = if j < b.len() { j + 1 } else { j };
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The escape-expansion half of {@link decode_ansi_c_quotes}.
+fn decode_c_escapes(body: &str) -> String {
+    let b = body.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 >= b.len() {
+            if b[i] != 0 {
+                out.push(b[i] as char);
+            }
+            i += 1;
+            continue;
+        }
+        match b[i + 1] {
+            b'n' => { out.push('\n'); i += 2; }
+            b't' => { out.push('\t'); i += 2; }
+            b'r' => { out.push('\r'); i += 2; }
+            b'\\' => { out.push('\\'); i += 2; }
+            b'\'' => { out.push('\''); i += 2; }
+            b'0' => { i += 2; } // NUL: bash drops it
+            b'x' if i + 3 < b.len() => {
+                let hex = &body[i + 2..i + 4];
+                if let Ok(n) = u8::from_str_radix(hex, 16) {
+                    // A NUL byte cannot live in a shell variable.
+                    if n != 0 {
+                        out.push(n as char);
+                    }
+                    i += 4;
+                    continue;
+                }
+                out.push_str("\\x");
+                i += 2;
+            }
+            c => { out.push('\\'); out.push(c as char); i += 2; }
+        }
+    }
+    out
+}
+
 fn glob_to_regex(pat: &str) -> String {
     glob_to_regex_greedy(pat, true)
 }
@@ -3991,6 +4068,13 @@ fn glob_to_regex(pat: &str) -> String {
 /// `*` → `.*` when greedy, `.*?` when non-greedy (bash #/%% shortest vs
 /// ##/%% longest prefix/suffix removal).
 fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
+    // `$'…'` (ANSI-C quoting) is decoded FIRST. `$'\x00'` is the whole
+    // reason: bash CANNOT store a NUL in a shell variable, so it truncates
+    // the escape to the EMPTY string — `[[ "$s" == *$'\x00'* ]]` is the glob
+    // `**`, which matches everything. Leaving it as the literal text
+    // `$'\x00'` produced the regex `^.*\$'\x00'.*$`, which matches
+    // NOTHING, so realpath-cmdsub took the wrong branch.
+    let pat = &decode_ansi_c_quotes(pat);
     let star = if greedy { ".*" } else { ".*?" };
     let mut out = String::new();
     let mut chars = pat.chars().peekable();
@@ -9252,6 +9336,7 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
 /// as flattened by ast_to_ir) as a Perl boolean expression.
 fn render_test_expr(s: &str) -> String {
+    eprintln!("DBG_RTE in=[{}]", s);
     // `[[ ]]` tests flatten to NO-WHITESPACE forms ("$s==*.txt",
     // "$s=~^re$", "$f1==!(*.min).js", ""$y"="5"") that the spaced
     // tokenizer can't parse. Spaced strings (with -gt/-a/etc.) keep the
