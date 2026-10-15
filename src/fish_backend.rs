@@ -5295,7 +5295,31 @@ fn heredoc_expand_line_fish(line: &str) -> Option<String> {
                     expanded = true;
                     i = j;
                 }
-                // a lone `$`, `$1`, `$@`: not a plain name expansion
+                // `$1` … `$9` — bash POSITIONAL parameters. They expand in an
+                // unquoted heredoc like any other variable, and fish spells
+                // them `$argv[N]` (which, inside the `printf` argument this
+                // becomes, must use the `$( )` form to expand between the
+                // double quotes). Without this the whole line fell back to the
+                // literal spelling and `$1` was printed verbatim
+                // (parse-heredoc-paren printed `$1` where bash printed the
+                // empty first argument).
+                Some(&d) if d.is_ascii_digit() => {
+                    if d == '0' {
+                        out.push_str("$(set -q SH2_ARGV0; and printf '%s' \"$SH2_ARGV0\"; or status filename)");
+                    } else {
+                        out.push_str(&format!("$argv[{d}]"));
+                    }
+                    expanded = true;
+                    i += 2;
+                }
+                // `$@` / `$*` — the positional list, space-joined in a heredoc
+                // body the same way bash joins it.
+                Some('@') | Some('*') => {
+                    out.push_str("(string join ' ' -- $argv)");
+                    expanded = true;
+                    i += 2;
+                }
+                // a lone `$`: not an expansion
                 _ => return None,
             },
             c => {
@@ -6899,12 +6923,31 @@ fn default_if_unset_fish(name: &str, default: &str) -> String {
 /// characters, so `var_ref_to_fish` fell through to its identifier-only
 /// fallback and emitted the unrelated `$arr1`, which is unset.
 fn default_if_unset_expr_fish(subj: &str, default: &str) -> String {
-    // The WHOLE conditional is piped through `string collect`: fish's command
-    // substitution splits its output on NEWLINES, so a multi-line default
-    // (`${x:-bar\nbaz}`) came back as a list and `"$x"` then joined it with
-    // spaces — `bar baz` where bash prints two lines (param-expand-multiline).
+    // `string collect` is added ONLY when the default can carry a NEWLINE, and
+    // that restriction is load-bearing in both directions. It is needed for a
+    // multi-line default (`${x:-bar\nbaz}`), where fish's command substitution
+    // would otherwise split the value into a list and `"$x"` rejoin it with
+    // spaces. It is HARMFUL otherwise: `string collect` drops a leading or
+    // trailing newline, so a subject that IS a newline (`IFS=$'\n'`) collapsed
+    // to empty (`parse-heredoc-paren` printed `IFS=[]` where bash prints a
+    // newline).
+    // A subject that is a BARE VARIABLE needs no conditional at all when the
+    // default is empty: `"${IFS:-}"` is just the value. The command
+    // substitution used below STRIPS a trailing newline, so wrapping it
+    // turned a newline-valued IFS into the empty string (parse-heredoc-paren
+    // printed `IFS=[]` where bash prints a newline).
+    if default.is_empty() && subj.starts_with('$') && !subj.contains('[') {
+        return format!("\"{subj}\"");
+    }
+    let needs_collect = default.contains('\n') || default.contains("\\n");
+    if needs_collect {
+        return format!(
+            "(begin; test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {}; end | string collect)",
+            dq_word(default)
+        );
+    }
     format!(
-        "(begin; test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {}; end | string collect)",
+        "(test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {})",
         dq_word(default)
     )
 }
