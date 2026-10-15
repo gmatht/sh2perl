@@ -1547,6 +1547,7 @@ mod tests {
         // must union onto the caller's actual.
         let f = IrStmt::Function {
             name: "f".to_string(),
+            params: vec![],
             body: vec![
                 assign("xs", IrExpr::Var("1".to_string(), None)),
                 assign("xs", append("xs")),

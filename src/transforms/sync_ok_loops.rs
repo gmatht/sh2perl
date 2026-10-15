@@ -418,7 +418,7 @@ fn brace_count(e: &IrExpr) -> Option<u64> {
         IrExpr::Call { func, args, .. } if func == "brace" && args.len() >= 2 => match &args[1] {
             IrExpr::Json(serde_json::Value::Array(groups)) => {
                 let range = groups.first()?.as_array()?.first()?.get("range")?;
-                let start: i64 = range.as_array()?.first()?.as_str()?.parse().ok()?;
+                let start = range.as_array()?.first()?.as_str()?.parse().ok()?;
                 let end: i64 = range.as_array()?.get(1)?.as_str()?.parse().ok()?;
                 if end >= start {
                     Some((end - start + 1) as u64)

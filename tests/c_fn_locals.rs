@@ -22,7 +22,34 @@ fn render(json: &str) -> String {
     debashl::c_backend::shir_to_c(&prog)
 }
 
+/// Byte offset of `name` as a whole identifier (not a substring of a
+/// longer identifier), if present.
+fn whole_ident_pos(line: &str, name: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = line[start..].find(name) {
+        let i = start + rel;
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let j = i + name.len();
+        let after_ok = j >= b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+        if before_ok && after_ok {
+            return Some(i);
+        }
+        start = j;
+    }
+    None
+}
+
 fn is_decl_of(line: &str, name: &str) -> bool {
+    // A name inside a function parameter list — `static char *f(long long n);`
+    // (prototype) or its definition — is a PARAMETER, not a file-scope
+    // variable. Only a name before any unmatched `(` can be a var decl.
+    if let Some(pos) = whole_ident_pos(line, name) {
+        let prefix = &line[..pos];
+        if prefix.matches('(').count() > prefix.matches(')').count() {
+            return false;
+        }
+    }
     // `long long n = 0;` / `char* n = NULL;` / `uint8_t n = 0;` …
     // the declared name is the first identifier after the type words.
     let mut toks = line
@@ -59,6 +86,19 @@ fn col0_decl(c: &str, name: &str) -> bool {
 fn indented_decl(c: &str, name: &str) -> bool {
     c.lines()
         .any(|l| (l.starts_with(' ') || l.starts_with('\t')) && is_decl_of(l, name))
+}
+
+/// `name` is a parameter of `fname` in a signature line (`f(long long n)`).
+fn signature_param(c: &str, fname: &str, name: &str) -> bool {
+    c.lines()
+        .filter(|l| l.contains(&format!("{fname}(")))
+        .any(|l| {
+            let Some(open) = l.find('(') else { return false };
+            let close = l[open..].find(')').map(|i| open + i).unwrap_or(l.len());
+            l[open + 1..close]
+                .split(',')
+                .any(|p| p.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).any(|t| t == name))
+        })
 }
 
 /// t86 shape, minimized: param `n` (Declare + `n = $1`) and loop
@@ -106,8 +146,11 @@ fn param_and_loop_counter_are_function_locals() {
         "loop counter `i` leaked to file scope:\n{c}"
     );
     assert!(
-        indented_decl(&c, "n"),
-        "param `n` has no function-local declaration:\n{c}"
+        // the numeric param is named directly in the signature now
+        // (865f147b); an indented local (the pre-865f147b `_p1` copy)
+        // is equally function-local.
+        signature_param(&c, "f", "n") || indented_decl(&c, "n"),
+        "param `n` is neither a signature parameter nor a function-local decl:\n{c}"
     );
     assert!(
         indented_decl(&c, "i"),

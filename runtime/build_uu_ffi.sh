@@ -47,5 +47,20 @@ cp "$UU_FFI_DIR/coreutils-ffi/uu_ffi.h" "$LIBDIR/" 2>/dev/null \
   || cp "$UU_FFI_DIR/src/uu_ffi.h" "$LIBDIR/" 2>/dev/null \
   || true
 
+# ── pipeline front end (coreutils-ffi-pipeline) ─────────────────────
+# The Perl backend routes LINEAR pipelines (`a | b | c` + redirections)
+# through `uu_pipeline_run_str` instead of `bash -c` (check_qx). The
+# crate's `cdylib` ABI is Perl-friendly (FFI::Platypus). Its process
+# backends exec the `coreutils-ffi-multicall` helper; ship it alongside
+# (without it, `Auto` falls back to the in-process `sequential` backend).
+(
+  cd "$UU_FFI_DIR"
+  rustup run "$TOOLCHAIN" cargo build --release -p coreutils-ffi-pipeline
+  rustup run "$TOOLCHAIN" cargo build --release -p coreutils-ffi-multicall
+)
+cp "$UU_FFI_DIR/target/release/libcoreutils_ffi_pipeline.so" "$LIBDIR/"
+cp "$UU_FFI_DIR/target/release/coreutils-ffi-multicall" "$LIBDIR/"
+chmod +x "$LIBDIR/coreutils-ffi-multicall"
+
 echo "== done. artifacts in $LIBDIR =="
 ls -l "$LIBDIR"

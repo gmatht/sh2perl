@@ -86,7 +86,7 @@ fn is_dead_function(st: &IrStmt, dead: &HashSet<&str>) -> bool {
 fn collect_function_names(stmts: &[IrStmt], out: &mut HashSet<String>) {
     for st in stmts {
         match st {
-            IrStmt::Function { name, body, named_blocks } => {
+            IrStmt::Function { name, body, named_blocks, .. } => {
                 out.insert(name.clone());
                 collect_function_names(body, out);
                 for (_, nb) in named_blocks {
@@ -349,7 +349,7 @@ mod tests {
     use crate::ir::{IrExpr, IrStmt, StrStyle};
 
     fn fn_def(name: &str, body: Vec<IrStmt>) -> IrStmt {
-        IrStmt::Function { name: name.to_string(), body, named_blocks: vec![] }
+        IrStmt::Function { name: name.to_string(), params: vec![], body, named_blocks: vec![] }
     }
     fn exec_call(name: &str) -> IrStmt {
         IrStmt::Expr(IrExpr::Call {

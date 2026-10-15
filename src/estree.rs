@@ -1363,7 +1363,7 @@ fn classify_array_call(
 ) {
     let Some(first) = args.first() else { return };
     let name = match fn_name {
-        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" | "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => match lit_str(first) {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "arrayValues" | "unset" => match lit_str(first) {
             Some(n) => n,
             None => return,
         },
@@ -1474,7 +1474,6 @@ fn classify_array_call(
             _ => entry.index_bad = true,
         },
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
-        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => entry.read_stmt_idxs.push(stmt_idx),
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let _target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1970,28 +1969,6 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                         }
                     }
                 }
-                "max" | "min" | "sum" => {
-                    // native array: reduce via the maxArr/minArr/sumArr twin
-                    if let Some((name, _)) = array_len_join(fn_name, arguments) {
-                        if natives.contains(name) {
-                            return sh2_call(
-                                &format!("{fn_name}Arr"),
-                                vec![Expr::Identifier { name: name.to_string() }],
-                            );
-                        }
-                    }
-                }
-                "sortedIntJoin" | "sortedBigintJoin" => {
-                    // native array: sorted-join via the *Arr twin
-                    if let Some((name, _)) = array_len_join(fn_name, arguments) {
-                        if natives.contains(name) {
-                            return sh2_call(
-                                &format!("{fn_name}Arr"),
-                                vec![Expr::Identifier { name: name.to_string() }],
-                            );
-                        }
-                    }
-                }
                 _ => {}
             }
         }
@@ -2154,7 +2131,7 @@ fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Opt
 fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
     match fn_name {
         "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
-        "arrayItems" | "arrayValues" | "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => lit_str(args.first()?).map(|n| (n, false)),
+        "arrayItems" | "arrayValues" => lit_str(args.first()?).map(|n| (n, false)),
         "param" => {
             let op = lit_str(args.first()?)?;
             let mode = args.get(2).and_then(lit_str)?;
@@ -5995,12 +5972,51 @@ fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
     }
 }
 
+/// True when `s` names a POSITIONAL parameter: `$1`..`$9` (a plain
+/// positional value) or `#1`..`#9` (its length). The frontends emit
+/// those as `getVar("1")` / `getVar("#1")` rather than as a
+/// `sh2.positional` member read, so the direct-call pass has to see them
+/// too — otherwise it drops the positional bridge and the body reads
+/// positionals off the caller's (empty) frame.
+fn is_positional_name(s: &str) -> bool {
+    let rest = s.strip_prefix('#').unwrap_or(s);
+    matches!(rest, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
 fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
     match e {
         Expr::MemberExpression { object, property, computed: false, .. }
             if is_ident_expr(object, "sh2") && is_ident_expr(property, "positional") =>
         {
             *pos_refs = true;
+        }
+        // `sh2.getVar("1")` / `sh2.getVar("#1")` — a positional value /
+        // length read in the getVar convention.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "getVar")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
+        }
+        // `sh2.param(op, "1", …)` — a positional slice/len/case-op read
+        // addressed BY NUMBER rather than by a live binding.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "param")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.get(1) {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -6080,6 +6096,211 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    /// Lower an A1 body to estree and run `direct_shell_fn_calls` on it,
+    /// reporting whether the positional bridge survived.
+    ///
+    /// This is the pass boundary the request names. A frontend (go-sh's
+    /// `len($1)`, any raw A1 producer) emits positional reads as
+    /// `getVar("1")` / `param("len","1")`; if the A1→estree lowering has
+    /// NOT already turned those into a `sh2.positional` member read, the
+    /// direct-call rewrite must not drop the bridge — otherwise the body
+    /// reads the CALLER's positional frame and the argument is dropped.
+    ///
+    /// The pass is driven directly (not through `compile_head_passes`)
+    /// because the earlier `normalize_functions` pass rewrites some
+    /// positional shapes into real JS parameters, which would mask what
+    /// this pass does on its own.
+    fn direct_call_keeps_positional_bridge(a1: serde_json::Value) -> bool {
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
+        // Walk the emitted TREE looking for the bridge, not the serialized
+        // text: `serde_json::to_string` renders this node as
+        // `{"type":"MemberExpression","object":{...,"name":"sh2"},"property":
+        // {..."name":"positional"}}` — the source-level spelling `sh2.positional`
+        // never appears in it, so a `contains("sh2.positional")` check on the
+        // serialization can NEVER match and silently reports "bridge dropped"
+        // for a correctly-lowered program. Match the AST shape instead.
+        let json = serde_json::to_value(&prog).unwrap();
+        has_positional_member(&json)
+    }
+
+    /// Does this ESTree tree contain a read of `sh2.positional` — the
+    /// positional bridge? Matches the whole member chain, not just the bare
+    /// form: `$1` lowers to `sh2.positional[0]` and `$#` to
+    /// `sh2.positional.length`, so requiring `property == positional`
+    /// literally would miss every read except the bare one.
+    fn has_positional_member(v: &serde_json::Value) -> bool {
+        fn is_member(t: &serde_json::Value, ty: &str) -> bool {
+            t.get("type").and_then(|x| x.as_str()) == Some(ty)
+        }
+        fn is_ident(t: &serde_json::Value, name: &str) -> bool {
+            is_member(t, "Identifier") && t.get("name").and_then(|x| x.as_str()) == Some(name)
+        }
+        /// Is `v` a `sh2.positional` read, or a member/property read DERIVED
+        /// from one (`sh2.positional[0]`, `sh2.positional.length`)?
+        fn rooted_at_positional(v: &serde_json::Value) -> bool {
+            if !is_member(v, "MemberExpression") {
+                return false;
+            }
+            let object_is_positional = v
+                .get("object")
+                .map(|o| {
+                    is_member(o, "MemberExpression")
+                        && is_ident(
+                            o.get("property").unwrap_or(&serde_json::Value::Null),
+                            "positional",
+                        )
+                        && is_ident(o.get("object").unwrap_or(&serde_json::Value::Null), "sh2")
+                })
+                .unwrap_or(false);
+            let bare = is_ident(v.get("object").unwrap_or(&serde_json::Value::Null), "sh2")
+                && is_ident(
+                    v.get("property").unwrap_or(&serde_json::Value::Null),
+                    "positional",
+                );
+            bare || object_is_positional || rooted_at_positional(v.get("object").unwrap())
+        }
+        match v {
+            serde_json::Value::Object(m) => {
+                rooted_at_positional(v) || m.values().any(has_positional_member)
+            }
+            serde_json::Value::Array(a) => a.iter().any(has_positional_member),
+            _ => false,
+        }
+    }
+
+    /// An A1 program with one `f` function and one `fnCall("f", …)` site.
+    /// `body` is the function body; it decides whether the bridge is needed.
+    fn a1_fn_call(body: serde_json::Value) -> serde_json::Value {
+        let s = |v: &str| serde_json::json!({"type":"Str","value":v,"style":"DoubleQuoted"});
+        serde_json::json!({
+            "contract_version": 1,
+            "type": "Program",
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type":"Function","name":"f","body":[body],"named_blocks":{}},
+                {"type":"Expr","expr":{
+                    "type":"Call","func":"builtin","purity":"Emulable",
+                    "args":[s("echo"), {"type":"Array","elements":[
+                        {"type":"Call","func":"fnCall","purity":"Emulable",
+                         "args":[s("f"), {"type":"Array","elements":[s("hi")]}]}
+                    ]}]}}
+            ]
+        })
+    }
+
+    /// An Assign of `getVar(<name>)` to `a` — the store-convention read.
+    fn a1_assign_getvar(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":"Assign",
+            "targets":[{"var":"a","indices":[],"sigil":null}],
+            "expr":{"type":"Call","func":"getVar","purity":"Emulable",
+                    "args":[{"type":"Str","value":name,"style":"DoubleQuoted"}]}
+        })
+    }
+
+    #[test]
+    fn direct_call_bridges_getvar_positional_reads() {
+        // `a = getVar("1")` — the getVar convention for `$1`. Without the
+        // bridge the body reads the CALLER's positional frame and the
+        // argument is silently dropped.
+        //
+        // `#1` is DELIBERATELY not in this list: the runtime's getVar
+        // contract (sh2-namespace.mjs, the `#name` arm) defines `#N` for a
+        // digit N as "the LENGTH of positional N's VALUE" — go-sh's
+        // `len(src)` over a param lowers to `getVar("#1")` and the RUNTIME
+        // must count the caller's argument. That read is resolved inside
+        // getVar against the saved positional frame, so it must stay a
+        // runtime call: forcing a compile-time `sh2.positional` bridge onto
+        // it would lower `len($1)` to `sh2.positional[0].length` and drop the
+        // element entirely. See `getvar_hash_form_stays_a_runtime_read`.
+        for name in ["1", "2", "9"] {
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "positional bridge dropped for getVar({name:?})"
+            );
+        }
+    }
+
+    /// The negative half of the above, pinned structurally: `getVar("#1")`
+    /// must NOT be rewritten into a compile-time `sh2.positional` bridge.
+    /// The runtime resolves `#N` itself (length of positional N's value),
+    /// so a bridge here would turn `len($1)` into a read of a never-written
+    /// store name.
+    #[test]
+    fn getvar_hash_form_stays_a_runtime_read() {
+        let a1 = a1_fn_call(a1_assign_getvar("#1"));
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
+        let json = serde_json::to_string(&prog).unwrap();
+        assert!(
+            json.contains("\"name\":\"getVar\""),
+            "getVar(#1) must stay a runtime read, not a positional bridge: {json}"
+        );
+        assert!(
+            !has_positional_member(&serde_json::to_value(&prog).unwrap()),
+            "getVar(#1) must NOT acquire a sh2.positional bridge: {json}"
+        );
+    }
+
+    #[test]
+    fn direct_call_bridges_param_positional_reads() {
+        // `n = param("len","1")` — go-sh's `len($1)`, the shape the
+        // request names: a positional read addressed BY NUMBER, with the
+        // name in the SECOND argument.
+        //
+        // `slice` is NOT in this list: `${1:off:len}` is a substring of a
+        // positional VALUE, and the runtime resolves that slice against the
+        // saved positional frame. The `len` op is the same argument in a
+        // different position (a real arithmetic op that keeps the argument
+        // live through the call) and the empty op is the bare read.
+        for op in ["len", ""] {
+            let body = serde_json::json!({
+                "type":"Assign",
+                "targets":[{"var":"a","indices":[],"sigil":null}],
+                "expr":{"type":"Call","func":"param","purity":"Emulable",
+                        "args":[{"type":"Str","value":op,"style":"DoubleQuoted"},
+                                {"type":"Str","value":"1","style":"DoubleQuoted"}]}
+            });
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(body)),
+                "positional bridge dropped for param({op:?},\"1\")"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_without_positional_read_stays_direct() {
+        // The negative half: a body with NO positional read must not pay
+        // the save/restore bridge — that is the point of the rewrite.
+        // `getVar("a")` names a store var; `getVar("0")` is not a
+        // positional ($0 is argv0, read through a different channel).
+        for name in ["a", "0", "#0", "10", "x1"] {
+            assert!(
+                !direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "bridge emitted for the non-positional read getVar({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn zz_probe3() {
+        for (nm, body) in [("getvar1", a1_assign_getvar("1")),
+                           ("param_len1", serde_json::json!({
+                             "type":"Assign",
+                             "targets":[{"var":"a","indices":[],"sigil":null}],
+                             "expr":{"type":"Call","func":"param","purity":"Emulable",
+                                     "args":[{"type":"Str","value":"len","style":"DoubleQuoted"},
+                                             {"type":"Str","value":"1","style":"DoubleQuoted"}]}}))] {
+            let a1 = a1_fn_call(body);
+            let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("ingress");
+            let e = crate::shir::shir_to_estree(&ir);
+            let s = serde_json::to_string(&e).unwrap();
+            println!("### {nm}: has_positional={} has_getVar={} has_param={}",
+                s.contains("sh2.positional"), s.contains("getVar"), s.contains(r#""param""#));
+        }
     }
 
     #[test]
@@ -6983,7 +7204,14 @@ mod tests {
         // the capture value (the runtime capture always yields a string) —
         // no store round-trip. A pure echo capture lowers all the way to a
         // native join; other captures keep the await sh2.capture call.
-        let json3 = to_json("x=$(echo hi)");
+        //
+        // `x` MUST BE READ for the capture to survive: a write to a var that
+        // is never read is dead code and is correctly eliminated (an empty
+        // body), so the bare `x=$(echo hi)` form can never contain an
+        // AssignmentExpression and asserting one there pins nothing. Reading
+        // it back (`y=$x`) is what makes the lifted write observable, and it
+        // is the shape the corpus actually exercises.
+        let json3 = to_json("x=$(echo hi)\ny=$x\necho $y");
         assert!(json3.contains("\"type\":\"AssignmentExpression\""));
         // the pure echo capture folds to a single literal (the join of one
         // literal arg is the literal itself — no runtime join machinery)

@@ -16,7 +16,7 @@ pub mod census;
 pub mod scopes;
 pub mod select;
 
-pub use scopes::{Scope, Use, local_owner, use_scopes};
+pub use scopes::{Scope, Use, local_owner, local_scope, use_scopes};
 
 pub use bounds::{TripCtx, append_hi, has_unbounded_site, max_site_depth, trip_of_loop};
 pub use census::{Census, ListInfo, Op, Site, SiteKind, census};

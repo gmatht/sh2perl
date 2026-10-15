@@ -65,11 +65,13 @@ fn lint_report_covers_easy_lints() {
             assign("unused_var", IrExpr::Int(42)), // unused-var unused_var
             IrStmt::Function {
                 name: "foo".to_string(),
+                params: vec![],
                 body: vec![out(IrExpr::Str("in foo".into(), StrStyle::DoubleQuoted))],
                 named_blocks: vec![],
             },
             IrStmt::Function {
                 name: "bar".to_string(),
+                params: vec![],
                 body: vec![out(IrExpr::Str("in bar".into(), StrStyle::DoubleQuoted))],
                 named_blocks: vec![],
             },

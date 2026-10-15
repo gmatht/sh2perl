@@ -3,9 +3,11 @@
 //! proposal estree-20260813-183713 (a1-ssa-const-copy-prop). The GLSL
 //! backend's own fragment output shows the shape every backend has:
 //!
-//!     g_fx = g_frag_x;                    // copy, never re-assigned
-//!     g_hash = ((g_fx) * (7)) + ((g_fy) * (13));
-//!     g_corrupt = ... g_hash ...;         // hash is a dead intermediate
+//! ```text
+//! g_fx = g_frag_x;                    // copy, never re-assigned
+//! g_hash = ((g_fx) * (7)) + ((g_fy) * (13));
+//! g_corrupt = ... g_hash ...;         // hash is a dead intermediate
+//! ```
 //!
 //! ## Need
 //! The renderers are literal statement→code translators with zero value

@@ -363,27 +363,55 @@ default `1.96.1`).
 | `runtime/tests/parity_vs_bash.sh` | §7.5 gate: same argv via uu-ffi vs real coreutils; asserts byte-identical stdout + exit code. 8 cases green, incl. a loud-refusal check. |
 | `runtime/tests/c_backend_uu_ffi.sh` | End-to-end C-backend gate: default render stays shell-out (no uu_run) **and** matches bash; `SH2_UU_FFI=1` render uses `sh2_uu_run` **and** matches bash. |
 
-### 10.2 C backend (first consumer, env-opt-in)
+### 10.2 C backend (default-on; was env-opt-in)
 
-`src/c_backend.rs` adds a `need_uu` flag + `uu_run_opt()`:
+`src/c_backend.rs` (`uu_cmd_ok` / `uu_argv` / `uu_run_opt` /
+`uu_capture_opt`, plus the `word_single_argv` / `static_needs_shell` /
+`uu_grep_ok` guards):
 
-- **Only `SH2_UU_FFI=1` at render time changes output.** Default
-  (env-unset) render is byte-identical to before — `uu_run_opt` returns
-  `None` immediately, the existing `shell_exec` path is untouched. The
-  no-regression gate holds.
-- When set, a **statically-known** genuinely-external command
-  (`cat wc ls sort sed awk`), with **all-static string words and no
-  env/Object prefix**, renders as an inline `char *_sh_uu_avN[]` + a
-  `sh2_uu_run(...)` statement instead of `_sh_site_N`/`bash -c`. Any
-  dynamic word, array, or env-prefix keeps the shell site.
-- The generated C `#include <uu_run.h>`; it must link the runtime
-  (§7.3 deployment): `gcc -I runtime -I runtime/lib out.c runtime/uu_run.c
-  runtime/lib/libcoreutils_ffi.so -lpthread -Wl,-rpath,runtime/lib`.
+- **ON by default, opt out with `SH2_UU_FFI=0`** at RENDER time (was
+  opt-in `SH2_UU_FFI=1`). The fallback render is the old shell site.
+- Dispatch set = the built library's FEATURES:
+  `cat wc ls sort sed awk grep date sha256sum uname basename dirname
+  cp` (was 6; `build_uu_ffi.sh` FEATURES and the renderer list are
+  kept in sync).
+- Words may be STATIC or DYNAMIC (dynamic words render via `value_c`
+  into a runtime argv array, `(char *)`-cast — the array stays `char
+  *[]` as in `native_pipeline`). Refused (shell site kept): glob
+  words (`SH2GLOB` marker), env-prefix `Object` args, static brace
+  (`{a,b}` — the core passes them as ONE word for the child to
+  expand) / tilde words, and any word that can expand to N argv
+  entries (`brace`, `split`, `captureWords`, `listVar`/`arrayItems`,
+  `pipeline`, ranges — `word_single_argv`, refuse > guess).
+- Captures: `$(uu-cmd args)` (single-stmt shape, via `capture_call` /
+  `capture_expr`) lowers to `sh2_uu_capture` into a vbuf with bash
+  trailing-newline stripping and `_sh_rc` set — no `_cap_N` site.
+- `grep` argv allowlist (`uu_grep_ok`, mirroring the frontend's proven
+  subset): bare, `-i -v -c(single path) -n -F -e --`. Refused: `-H`
+  (prints `N:` for `file:`), `-l` (drops the filename), `-o` (prints
+  whole lines), `-r` (prints the dir), multi-path `-c` (running
+  totals), `-h` (keeps `file:` on multi-path), `-q -m -b -L`
+  `-A/-B/-C -Z --color -x -w -I` and clustering (loud rc 2 where GNU
+  differs), double `-e` / bare-operand+`-e` (pattern-set semantics),
+  `-` stdin. Dynamic words are assumed operands (a dynamic
+  flag-valued var is pathological; the corpus gate is the backstop).
+- Emitted names use the `_sh_` prefix (`_sh_uu_run`,
+  `_sh_uu_capture`, `_sh_uu_avN` — thin wrappers in `runtime/uu_run.c`,
+  declared in `runtime/uu_run.h`): the corpus gate's stub probe
+  rejects any `sh2_*` identifier in generated C.
+- Native (no-`.so`) arms alongside uu in `exec_call`: `mkdir [-p]`
+  (via `_sh_mkdir_p`), `touch` (fopen `"a"`), `rmdir`, `rm -f`
+  (best-effort `unlink`, missing files ignored). Anything else in
+  those families (`rm -r`, flags, globs, multi-words) keeps the shell.
+- The generated C `#include <uu_run.h>`; link with `runtime/uu_run.c`
+  + `runtime/lib/libcoreutils_ffi.so -lpthread -Wl,-rpath,...`
+  (`harness/c_gate_main.sh` links this when the `.so` is present,
+  else renders the `SH2_UU_FFI=0` fallback).
 
-Both gates currently pass:
-- `runtime/tests/parity_vs_bash.sh` → 8 cases, 0 divergences.
-- `runtime/tests/c_backend_uu_ffi.sh` → 5 checks, 0 failures (default
-  and uu-ffi modes each match bash).
+Corpus effect (552-file A/B render): shell-out sites 1674 → 1492
+(-182, -11%), 30 files use in-process uu; `harness/c_gate_main.sh`
+unchanged at 637/644 PASS (0 regressions, 0 newly-fixed cells — the
+win is performance, not coverage).
 
 ### 10.3 One real dependency bug fixed
 
@@ -401,6 +429,10 @@ The parity gate caught that uu-ffi's `grep` frontend defaulted
   the uutils monorepo `feat_wasm` is a separate path).
 - `diff`/`cmp` (vendored diffutils fork does not compile against current
   crates).
-- A release pipeline for the `.so` and a per-backend corpus-gate
-  sign-off (the "cell green under SH2_UU_FFI" proof) before the C-arm is
-  enabled outside the env flag.
+- A release pipeline for the `.so`.
+- Upstream grep-frontend fixes (filed from gate evidence, worked around
+  in the renderer allowlist meanwhile): `-H` filename conflation,
+  multi-path `-c` totals, `-r` dir-vs-file paths, `-o` whole-line
+  output. The `-l` no-output case from the first gate run did NOT
+  reproduce in isolation (prints correctly) — treated as unproven,
+  stays refused.

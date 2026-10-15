@@ -419,7 +419,7 @@ impl Render {
                 }
             }
             IrExpr::Arith(a) => {
-                if arith_is_bigint(a, &self.bigint_vars) {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
                     return format!("@intCast({t}.toConst().toInt(i64) catch 0)");
@@ -521,7 +521,7 @@ impl Render {
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
             IrExpr::Arith(a) => {
-                if arith_is_bigint(a, &self.bigint_vars) {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
                     return format!("sh2BigIntStr({t})");
@@ -645,10 +645,10 @@ impl Render {
                 if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
                     code
                 } else {
-                    let ctx = crate::render_ext_expr::ExprRenderCtx {
-                        backend: crate::render_ext_expr::Backend::Zig,
-                        indent: 0,
-                    };
+                    let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                        crate::render_ext_expr::Backend::Zig,
+                        0,
+                    );
                     if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                         code
                     } else {
@@ -738,7 +738,7 @@ impl Render {
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => {
-                if arith_is_bigint(a, &self.bigint_vars) {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.bigint_cond(a)
                 } else {
                     format!("({} != 0)", self.arith(a))
@@ -843,10 +843,10 @@ impl Render {
                 if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
                     code
                 } else {
-                    let ctx = crate::render_ext_expr::ExprRenderCtx {
-                        backend: crate::render_ext_expr::Backend::Zig,
-                        indent: 0,
-                    };
+                    let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                        crate::render_ext_expr::Backend::Zig,
+                        0,
+                    );
                     if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                         code
                     } else {
@@ -2107,7 +2107,7 @@ impl Render {
                 }
             }
             IrExpr::Arith(a) => {
-                if arith_is_bigint(a, &self.bigint_vars) {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
                     vec![('s', format!("sh2BigIntStr({t})"))]
@@ -3328,7 +3328,7 @@ impl Render {
         self.bigint_arrays = bigint_arrays;
 
         // bigint vars (arith beyond i64) — lowered to Managed
-        self.bigint_vars = analyze_bigint_vars(prog);
+        self.bigint_vars = crate::shir::analyze_bigint_vars(prog);
         if !self.bigint_vars.is_empty() {
             self.need_bigint = true;
         }
@@ -3807,99 +3807,9 @@ fn camel(s: &str) -> String {
 /// Is this arith bigint-tainted (contains a sized Cast — the frontend's
 /// >i64 marker — or reads a bigint var)? Such subtrees render via
 /// std.math.big.int.Managed statements, never native i64 operators.
-fn arith_is_bigint(a: &ArithAst, vars: &BTreeSet<String>) -> bool {
-    match a {
-        ArithAst::Num(_) => false,
-        ArithAst::Var(n) | ArithAst::Ident(n) => vars.contains(n),
-        ArithAst::Index { key, .. } => arith_is_bigint(key, vars),
-        ArithAst::Bin { lhs, rhs, .. } => {
-            arith_is_bigint(lhs, vars) || arith_is_bigint(rhs, vars)
-        }
-        ArithAst::Un { arg, .. } => arith_is_bigint(arg, vars),
-        ArithAst::Cond { test, then, else_ } => {
-            arith_is_bigint(test, vars)
-                || arith_is_bigint(then, vars)
-                || arith_is_bigint(else_, vars)
-        }
-        ArithAst::Assign { rhs, .. } => arith_is_bigint(rhs, vars),
-        ArithAst::IncDec { var, .. } => vars.contains(var),
-        ArithAst::Sizeof(_) => false,
-        ArithAst::Cast { ty, .. } => matches!(
-            ty,
-            IrType::Int64 | IrType::UInt64 | IrType::Int32 | IrType::UInt32
-        ),
-    }
-}
 
 /// Bigint vars: a var assigned an arith that is bigint-tainted (a sized
 /// Cast or a bigint var read). Fixed-point over the assign pairs.
-fn analyze_bigint_vars(prog: &IrProgram) -> BTreeSet<String> {
-    fn harvest(stmts: &[IrStmt], out: &mut Vec<(String, ArithAst)>) {
-        for s in stmts {
-            match s {
-                IrStmt::Assign { targets, expr, .. } => {
-                    if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
-                        if t.indices.is_empty()
-                            && !out.iter().any(|(v, _)| v == &t.var)
-                        {
-                            out.push((t.var.clone(), (**a).clone()));
-                        }
-                    }
-                }
-                IrStmt::If { then, elsifs, else_, .. } => {
-                    harvest(then, out);
-                    for (_, b) in elsifs {
-                        harvest(b, out);
-                    }
-                    harvest(else_, out);
-                }
-                IrStmt::While { body, .. }
-                | IrStmt::DoWhile { body, .. }
-                | IrStmt::For { body, .. }
-                | IrStmt::Function { body, .. }
-                | IrStmt::Subshell(body)
-                | IrStmt::Background(body)
-                | IrStmt::Block(body) => harvest(body, out),
-                IrStmt::ForInit { init, step, body, .. } => {
-                    harvest(init, out);
-                    harvest(step, out);
-                    harvest(body, out);
-                }
-                IrStmt::Try { body, else_body, finally_body, .. } => {
-                    harvest(body, out);
-                    harvest(else_body, out);
-                    harvest(finally_body, out);
-                }
-                IrStmt::Case { clauses, .. } => {
-                    for c in clauses {
-                        harvest(&c.body, out);
-                    }
-                }
-                IrStmt::Redirect { inner, .. } => harvest(inner, out),
-                _ => {}
-            }
-        }
-    }
-    let mut pairs = Vec::new();
-    harvest(&prog.stmts, &mut pairs);
-    for sub in &prog.subs {
-        harvest(&sub.body, &mut pairs);
-    }
-    let mut vars = BTreeSet::new();
-    loop {
-        let mut changed = false;
-        for (v, a) in &pairs {
-            if !vars.contains(v) && arith_is_bigint(a, &vars) {
-                vars.insert(v.clone());
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    vars
-}
 
 /// Arrays whose setArray/setArrayAppend elements are bigint-tainted —
 /// lowered to a std.math.big.int.Managed array (an i64 array would
@@ -3914,7 +3824,7 @@ fn collect_bigint_arrays(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTr
                             if let Some(IrExpr::Str(name, _)) = args.first() {
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
                                     if items.iter().any(|it| {
-                                        matches!(it, IrExpr::Arith(a) if arith_is_bigint(a, big))
+                                        matches!(it, IrExpr::Arith(a) if crate::shir::arith_refs_bigint(a, big))
                                     }) {
                                         out.insert(name.clone());
                                     }

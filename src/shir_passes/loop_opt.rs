@@ -1024,6 +1024,7 @@ mod tests {
     fn fn_def(name: &str, body: Vec<IrStmt>) -> IrStmt {
         IrStmt::Function {
             name: name.to_string(),
+            params: vec![],
             body,
             named_blocks: vec![],
         }

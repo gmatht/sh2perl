@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# tests/c_backend_uu_ffi.sh — end-to-end check that the C backend, when
-# SH2_UU_FFI=1 is set at RENDER time, lowers a static genuinely-external
-# command to an in-process `sh2_uu_run` call (not `bash -c`), and that BOTH
-# modes (default and uu-ffi) produce byte-identical output matching bash.
+# tests/c_backend_uu_ffi.sh — end-to-end check that the C backend lowers
+# genuinely-external commands to in-process `_sh_uu_run` calls (not
+# `bash -c`) BY DEFAULT, with opt-out via SH2_UU_FFI=0 at RENDER time,
+# and that BOTH modes produce byte-identical output matching bash.
 #
-# UU-FFI.md §5/§9: C is the first consumer. This keeps the property that the
-# default (env-unset) render is byte-identical to before the change — the
-# no-regression gate — while proving the opt-in path works and matches.
+# UU-FFI.md §5/§9: C is the first consumer. The uu-ffi arm is the default
+# (dynamic words included — argv is built at RUNTIME via value_c); the
+# shell-out path remains as the SH2_UU_FFI=0 fallback for glob words,
+# env-prefixes, and commands outside the built library's set.
 #
 # Usage: [OTRANSPILER=/path/to/otranspilerl-cli] tests/c_backend_uu_ffi.sh
 set -u
@@ -28,13 +29,11 @@ EOF
 # reference output (real bash)
 REAL="$(bash "$SCRIPT" 2>/dev/null)"; total=$((total+1))
 
-# default render: must still shell out (no uu_run), and match bash
+# default render: must use uu_run for the external commands, and match bash
 "$OT" "$SCRIPT" - --target c 2>/dev/null > "$TMP/def.c" || { echo "default render failed"; exit 2; }
 total=$((total+1))
-if grep -q "sh2_uu_run" "$TMP/def.c"; then
-  fails=$((fails+1)); echo "  FAIL: default render must NOT use uu_run (no-regression)"
-fi
-if gcc -o "$TMP/def" "$TMP/def.c" 2>/dev/null; then
+grep -q "_sh_uu_run" "$TMP/def.c" || { fails=$((fails+1)); echo "  FAIL: default render must use uu_run"; }
+if gcc -I"$ROOT" -I"$LIB" -o "$TMP/def" "$TMP/def.c" "$ROOT/uu_run.c" "$LIB/libcoreutils_ffi.so" -lpthread -Wl,-rpath,"$LIB" 2>/dev/null; then
   DEF="$("$TMP/def" 2>/dev/null)"
   total=$((total+1))
   [ "$DEF" = "$REAL" ] || { fails=$((fails+1)); echo "  FAIL: default render output ≠ bash"; }
@@ -42,16 +41,18 @@ else
   fails=$((fails+1)); echo "  FAIL: default render did not compile"
 fi
 
-# SH2_UU_FFI render: must use uu_run for the static external commands
-SH2_UU_FFI=1 "$OT" "$SCRIPT" - --target c 2>/dev/null > "$TMP/uu.c" || { echo "uu render failed"; exit 2; }
+# SH2_UU_FFI=0 render: must still shell out (no uu_run), and match bash
+SH2_UU_FFI=0 "$OT" "$SCRIPT" - --target c 2>/dev/null > "$TMP/sh.c" || { echo "fallback render failed"; exit 2; }
 total=$((total+1))
-grep -q "sh2_uu_run" "$TMP/uu.c" || { fails=$((fails+1)); echo "  FAIL: SH2_UU_FFI render must use uu_run"; }
-if gcc -I"$ROOT" -I"$LIB" -o "$TMP/uu" "$TMP/uu.c" "$ROOT/uu_run.c" "$LIB/libcoreutils_ffi.so" -lpthread -Wl,-rpath,"$LIB" 2>/dev/null; then
-  UU="$("$TMP/uu" 2>/dev/null)"
+if grep -q "_sh_uu_run" "$TMP/sh.c"; then
+  fails=$((fails+1)); echo "  FAIL: SH2_UU_FFI=0 render must NOT use uu_run (fallback)"
+fi
+if gcc -o "$TMP/sh" "$TMP/sh.c" 2>/dev/null; then
+  SH="$("$TMP/sh" 2>/dev/null)"
   total=$((total+1))
-  [ "$UU" = "$REAL" ] || { fails=$((fails+1)); echo "  FAIL: uu_ffi render output ≠ bash"; }
+  [ "$SH" = "$REAL" ] || { fails=$((fails+1)); echo "  FAIL: fallback render output ≠ bash"; }
 else
-  fails=$((fails+1)); echo "  FAIL: uu_ffi render did not compile"
+  fails=$((fails+1)); echo "  FAIL: fallback render did not compile"
 fi
 
 echo "C backend uu-ffi: $total checks, $fails failures"

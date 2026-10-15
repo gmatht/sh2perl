@@ -403,4 +403,87 @@ mod tests {
         let src = "let \"x+=1\" \"y++\"";
         assert_eq!(lower(src), lower(src));
     }
+
+    // ── `(( ))` arithmetic context (the GLOB_MAGIC regression) ──────────
+    //
+    // `((x *= 2))` is a STANDALONE `(( ))` command, not a quoted `let`.
+    // The parser synthesizes `Simple{name:"let", args:[<arith text>]}`
+    // for it. When that arg was synthesized UNQUOTED (`None`), arg_word_ir
+    // glob-tagged it: `exec let \x01SH2GLOB\x01x *= 2`. The marker made
+    // let_arg_text/parse_arith fail, so this transform REFUSED the node
+    // and the `(( ))` stayed an opaque exec. Every backend except estree
+    // (whose JS runtime implements `let` natively in evalArith) then
+    // emitted a `subprocess.call(["let", ...])` for a binary that does not
+    // exist, silently dropping the store write.
+    //
+    // These tests pin the *observable* outcome — the A1 must carry the
+    // structured Assign{Arith} and must NOT carry GLOB_MAGIC or a bare
+    // `let` exec. They FAIL against the pre-fix parser.
+
+    #[test]
+    fn double_paren_compound_assign_is_not_glob_tagged() {
+        let json = lower("x=3\n((x *= 2))\necho $x");
+        assert!(
+            !json.contains("SH2GLOB"),
+            "arith arg was glob-tagged — it must stay a literal formula: {json}"
+        );
+        assert!(
+            !json.contains("\"let\""),
+            "the `let` exec survived: arith_forms must lower `(( ))`: {json}"
+        );
+        assert!(json.contains("\"*=\""), "compound op missing: {json}");
+        assert!(json.contains("\"x\""), "target var missing: {json}");
+    }
+
+    #[test]
+    fn double_paren_incdec_is_lowered() {
+        let json = lower("i=0\n((i++))\necho $i");
+        assert!(!json.contains("SH2GLOB"), "arith arg glob-tagged: {json}");
+        assert!(!json.contains("\"let\""), "`let` exec survived: {json}");
+        assert!(json.contains("\"IncDec\""), "missing IncDec: {json}");
+    }
+
+    #[test]
+    fn double_paren_condition_is_not_glob_tagged() {
+        // `if ((x > 1))` — a comparison EVALUATES; it assigns nothing, so
+        // the `let` call is the correct final shape here (arith_forms only
+        // rewrites Assign/IncDec forms). What must not happen is the glob
+        // tag: the runtime reads the arg through the GLOB_MAGIC expander,
+        // and a tagged `x > 1` would be glob-matched against the
+        // filesystem instead of evaluated. Quoting the synthesized arg
+        // (this change) is what keeps the condition evaluable.
+        let json = lower("x=3\nif ((x > 1)); then echo big; fi");
+        assert!(
+            !json.contains("SH2GLOB"),
+            "arith condition was glob-tagged: {json}"
+        );
+        assert!(
+            json.contains("\"let\""),
+            "a comparison `(( ))` must still evaluate via let: {json}"
+        );
+        assert!(json.contains("x > 1"), "condition text lost: {json}");
+    }
+
+    #[test]
+    fn double_paren_comma_list_lowered() {
+        // the comma-separated branch synthesizes one `let` per part; all
+        // of them carry the same arithmetic-context rule.
+        let json = lower("x=0\n((x++, x++))\necho $x");
+        assert!(!json.contains("SH2GLOB"), "arith arg glob-tagged: {json}");
+        assert!(!json.contains("\"let\""), "`let` exec survived: {json}");
+        assert!(json.contains("\"IncDec\""), "missing IncDec: {json}");
+    }
+
+    #[test]
+    fn plain_unquoted_exec_arg_still_globs() {
+        // The regression guard on the OTHER side: arithmetic context is
+        // not glob context, but ordinary exec args (`echo *.txt`) still
+        // must be tagged. If this ever stops, GLOB_MAGIC is dead weight
+        // and every `ls *.txt` silently regresses.
+        let json = lower("echo *.txt");
+        assert!(
+            json.contains("SH2GLOB"),
+            "a real exec-arg glob lost its tag: {json}"
+        );
+    }
 }

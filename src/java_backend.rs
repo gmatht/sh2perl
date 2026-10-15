@@ -44,6 +44,29 @@ fn sanitize(name: &str) -> String {
     s
 }
 
+/// A Java method name for a user shell function. Keep the user's name
+/// unless it collides with a Java reserved word or the generated
+/// `sh*`/`__*` helper namespace — `def f()` must render `f()`, not
+/// `fn_f()`.
+fn fn_name(name: &str) -> String {
+    let base = sanitize(name);
+    if JAVA_RESERVED.contains(&base.as_str()) || base.starts_with("__") || base.starts_with("sh") && base.len() > 2 {
+        format!("fn_{base}")
+    } else {
+        base
+    }
+}
+
+const JAVA_RESERVED: &[&str] = &[
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
+    "null", "var", "record", "yield", "sealed", "permits",
+];
+
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
@@ -211,7 +234,7 @@ impl JavaRender {
         collect_fns(&prog.stmts, &mut fn_list, &mut seen_fns);
         let mut fn_buf = String::new();
         for (name, body) in fn_list.iter() {
-                let fname = format!("fn_{}", sanitize(name));
+                let fname = fn_name(name);
                 fn_buf.push_str(&format!("    static boolean {fname}() throws Exception {{\n"));
                 fn_buf.push_str("        List<String> __saved = new ArrayList<>(__SH_ARGV);\n");
                 fn_buf.push_str("        try {\n");
@@ -267,6 +290,12 @@ impl JavaRender {
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
         "aslice",
+        // The Ext-node helpers (text_ops' rich nodes; see
+        // src/render_ext_expr/handlers/all_nodes.rs): each implements ONE
+        // verified leaf so the shared handler stays a one-liner and the
+        // semantics live in a single place.
+        "wcwords","cutfield","regsub","regsuball","regcount","takelines",
+        "chartrans",
         ];
         for h in all_helpers {
             if let Some(src) = helper_src(h) {
@@ -1214,7 +1243,7 @@ impl JavaRender {
                         self.emit("__SH_ARGV = __callArgv;");
                         self.emit("}");
                     }
-                    self.emit(&format!("fn_{}();", sanitize(other)));
+                    self.emit(&format!("{}();", fn_name(other)));
                     return Ok(());
                 }
                 let mut pieces: Vec<(String, bool)> = Vec::new();
@@ -1390,7 +1419,7 @@ impl JavaRender {
                 if !flat.is_empty() {
                     return Err("function call with args not supported in condition position".into());
                 }
-                Ok(format!("fn_{}()", sanitize(other)))
+                Ok(format!("{}()", fn_name(other)))
             }
             _ => {
                 let words = self.words_to_args(rest)?;
@@ -1993,6 +2022,22 @@ impl JavaRender {
             IrExpr::Regex { pattern, flags } => {
                 self.helper("regex");
                 Ok(format!("String.valueOf(shRegex({}, {}))", jstr(pattern), jstr(flags)))
+            }
+            IrExpr::Ext(n) => {
+                // Transform-declared semantic nodes (text_ops' cut/tr/sed/
+                // head/tail/wc/basename compositions). The SHARED handler
+                // registry owns the semantics; this backend supplies its own
+                // child renderer so a handler can build a java expression.
+                let mut child = JavaChild { r: self };
+                crate::render_ext_expr::render_with(
+                    n.as_ref(),
+                    crate::render_ext_expr::Backend::Java,
+                    0,
+                    &mut child,
+                )
+                .ok_or_else(|| {
+                    format!("ext node not renderable by the java renderer: {}", n.tag())
+                })
             }
             other => Err(format!("expr not in the java subset (str ctx): {other:?}")),
         }
@@ -2871,6 +2916,19 @@ fn stmt_exprs(st: &IrStmt) -> Vec<&IrExpr> {
 }
 
 /// Runtime helper methods, emitted into Sh2Program on demand.
+/// The shared handler registry's child-renderer hook for java: delegates
+/// to this backend's own `expr_str`, so a shared handler emits a real java
+/// expression tree instead of a stub.
+struct JavaChild<'a> {
+    r: &'a mut JavaRender,
+}
+
+impl crate::render_ext_expr::ChildExprRenderer for JavaChild<'_> {
+    fn render_child(&mut self, e: &IrExpr) -> Option<String> {
+        self.r.expr_str(e).ok()
+    }
+}
+
 fn helper_src(name: &str) -> Option<&'static str> {
     Some(match name {
         "env" => r#"    static String shCwd() { return __SH_CWD; }
@@ -2881,6 +2939,172 @@ fn helper_src(name: &str) -> Option<&'static str> {
     static String shEnv(String n) {
         String v = System.getenv(n);
         return v == null ? "" : v;
+    }
+"#,
+        "chartrans" => r#"    // `tr SET1 SET2` (translate), `tr -d SET` (delete), `tr -s SET`
+    // (squeeze). SET2 shorter than SET1 repeats its LAST char (bash); an
+    // empty SET2 means "no translation" for -s.
+    static String shTrTranslate(String s, String from, String to) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            int k = from.indexOf(c);
+            if (k < 0) { b.append(c); continue; }
+            b.append(to.isEmpty() ? c : to.charAt(Math.min(k, to.length() - 1)));
+        }
+        return b.toString();
+    }
+    static String shTrDelete(String s, String set) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            if (set.indexOf(s.charAt(i)) < 0) b.append(s.charAt(i));
+        }
+        return b.toString();
+    }
+    static String shTrSqueeze(String s, String set) {
+        StringBuilder b = new StringBuilder();
+        char prev = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == prev && set.indexOf(c) >= 0) continue;
+            b.append(c);
+            prev = c;
+        }
+        return b.toString();
+    }
+    // `xargs`-style trim: remove leading/trailing whitespace AND squeeze
+    // internal whitespace runs to one space (the bare-xargs contract).
+    static String shXargsTrim(String s) {
+        StringBuilder b = new StringBuilder();
+        boolean spaced = false, started = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isWhitespace(c)) { spaced = true; continue; }
+            if (started && spaced) b.append(' ');
+            b.append(c);
+            started = true;
+            spaced = false;
+        }
+        return b.toString();
+    }
+    // CutsetTrim: strip ALL leading/trailing chars present in the cutset
+    // (side: "left"/"right" = one end only, else both).
+    static String shCutsetTrim(String s, String cut, String side) {
+        int a = 0, z = s.length();
+        if (side == null || !side.equals("right")) {
+            while (a < z && cut.indexOf(s.charAt(a)) >= 0) a++;
+        }
+        if (side == null || !side.equals("left")) {
+            while (z > a && cut.indexOf(s.charAt(z - 1)) >= 0) z--;
+        }
+        return s.substring(a, z);
+    }
+"#,
+        "wcwords" => r#"    // `wc -w`: whitespace-delimited word count (runs of whitespace are ONE
+    // separator; leading/trailing whitespace never counts). The transition
+    // scan needs no allocation and is exact for every input.
+    static long shWcWords(String s) {
+        long n = 0;
+        boolean in = false;
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isWhitespace(s.charAt(i))) { in = false; }
+            else if (!in) { in = true; n++; }
+        }
+        return n;
+    }
+"#,
+        // GNU `cut -d D -f LIST` over a SINGLE line, exactly as the Perl arm
+        // renders it: a missing trailing field contributes NOTHING, and the
+        // selection is ascending regardless of the requested order.
+        "cutfield" => r#"    static String shCutField(String s, String delim, int[] fields) {
+        if (!s.contains(delim)) return s;
+        String[] parts = s.split(java.util.regex.Pattern.quote(delim), -1);
+        java.util.Arrays.sort(fields);
+        StringBuilder out = new StringBuilder();
+        boolean first = true;
+        for (int f : fields) {
+            if (f < 0 || f >= parts.length) continue;
+            if (!first) out.append(delim);
+            out.append(parts[f]);
+            first = false;
+        }
+        return out.toString();
+    }
+"#,
+        // `sed 's/PAT/REP/'` and `sed 's/PAT/REP/g'`. Java's replaceFirst/
+        // replaceAll take the replacement LITERALLY, so `&` (the whole match)
+        // and `\1` (a group) are expanded HERE — the sed replacement
+        // semantics, implemented once.
+        "regsub" => r#"    static String shRegSub(String s, String pat, String rep) {
+        return shRegSubImpl(s, pat, rep, false);
+    }
+    static String shRegSubAll(String s, String pat, String rep) {
+        return shRegSubImpl(s, pat, rep, true);
+    }
+    static String shRegSubImpl(String s, String pat, String rep, boolean global) {
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pat);
+        java.util.regex.Matcher m = p.matcher(s);
+        if (!m.find()) return s;
+        StringBuilder out = new StringBuilder();
+        int last = 0;
+        int start = m.start();
+        out.append(s, 0, start);
+        do {
+            out.append(shExpandSed(m, rep));
+            last = m.end();
+            if (!global) break;
+        } while (m.find());
+        out.append(s, last, s.length());
+        return out.toString();
+    }
+    static String shExpandSed(java.util.regex.Matcher m, String rep) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < rep.length(); i++) {
+            char c = rep.charAt(i);
+            if (c == '&') { b.append(m.group()); continue; }
+            if (c == '\\' && i + 1 < rep.length()) {
+                char d = rep.charAt(++i);
+                if (d >= '1' && d <= '9') {
+                    int g = d - '0';
+                    String v = g <= m.groupCount() ? m.group(g) : null;
+                    b.append(v == null ? "" : v);
+                } else { b.append(d); }
+                continue;
+            }
+            b.append(c);
+        }
+        return b.toString();
+    }
+"#,
+        // `wc -l`-family / `grep -c`: count NON-OVERLAPPING regex matches.
+        "regcount" => r#"    static long shRegCount(String s, String pat) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(pat).matcher(s);
+        long n = 0;
+        while (m.find()) n++;
+        return n;
+    }
+"#,
+        // head/tail in LINE mode and BYTE mode. Line mode splits on '\n'
+        // (keeping empty fields, like the Perl/JS arms) and rejoins.
+        "takelines" => r#"    static String shTakeLines(String s, int n) {
+        if (n <= 0) return "";
+        String[] l = s.split("\\n", -1);
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < l.length && i < n; i++) { if (i > 0) b.append("\n"); b.append(l[i]); }
+        return b.toString();
+    }
+    static String shTakeLinesEnd(String s, int n) {
+        if (n <= 0) return "";
+        String[] l = s.split("\\n", -1);
+        StringBuilder b = new StringBuilder();
+        for (int i = Math.max(0, l.length - n); i < l.length; i++) { if (i > Math.max(0, l.length - n)) b.append("\n"); b.append(l[i]); }
+        return b.toString();
+    }
+    static String shTakeBytes(String s, int n) {
+        return n <= 0 ? "" : s.substring(0, Math.min(n, s.length()));
+    }
+    static String shTakeBytesEnd(String s, int n) {
+        return n <= 0 ? "" : s.substring(Math.max(0, s.length() - n));
     }
 "#,
         "len" => r#"    static long shLen(String s) {
@@ -3001,6 +3225,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
                     used++;
                     if (n == 'd' || n == 'i') {
                         try { sb.append(Long.parseLong(arg.trim())); } catch (Exception e) { sb.append("0"); }
+                        if (ai < args.length) ai++;
                     } else if (n == 's') {
                         StringBuilder padded = new StringBuilder(arg);
                         while (padded.length() < width) {
@@ -3207,15 +3432,23 @@ fn helper_src(name: &str) -> Option<&'static str> {
 "#,
         "basename" => r#"    static String shBasename(String s) {
         while (s.endsWith("/") && s.length() > 1) s = s.substring(0, s.length() - 1);
+        // An all-slash input ("/" or "//") basenames to "/" — the naive
+        // substring(1) would yield "" (verified against bash).
+        if (s.equals("/")) return "/";
         int i = s.lastIndexOf('/');
         return i < 0 ? s : s.substring(i + 1);
     }
 "#,
         "dirname" => r#"    static String shDirname(String s) {
+        // GNU: strip trailing '/'s first, then the last component; a
+        // pathless word is "."; the prefix is re-stripped and "" -> "/".
+        // (The naive lastIndexOf-only form got "a/b/" -> "a/b" wrong.)
+        while (s.length() > 1 && s.endsWith("/")) s = s.substring(0, s.length() - 1);
         int i = s.lastIndexOf('/');
         if (i < 0) return ".";
-        if (i == 0) return "/";
-        return s.substring(0, i);
+        String d = s.substring(0, i);
+        while (d.length() > 1 && d.endsWith("/")) d = d.substring(0, d.length() - 1);
+        return d.isEmpty() ? "/" : d;
     }
 "#,
         "div" => r#"    static long shDiv(long a, long b) {
@@ -3498,6 +3731,22 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
             seq.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
         } else if let Some(n) = it.get("nested") {
             expand_group(n)?
+        } else if let Some(p) = it.get("product") {
+            // a Compound alternative: cartesian concatenation of the
+            // sub-groups (`x/{p,q}` -> `x/p`, `x/q`)
+            let subs = p.as_array().ok_or("product not array")?;
+            let mut combos: Vec<String> = vec![String::new()];
+            for g in subs {
+                let alts = expand_group(g)?;
+                let mut next = Vec::new();
+                for c in &combos {
+                    for a in &alts {
+                        next.push(format!("{c}{a}"));
+                    }
+                }
+                combos = next;
+            }
+            combos
         } else {
             return Err("unknown brace item".into());
         };
@@ -3622,4 +3871,55 @@ fn sh_aslice_src() -> &'static str {
         return String.join(" ", a.subList((int) start, (int) end));
     }
 "#
+}
+
+#[cfg(test)]
+mod shprintf_tests {
+    /// Every numeric conversion must advance the argument cursor.
+    ///
+    /// `shPrintf` drives its outer loop with `do { ... } while (ai < args.length)`,
+    /// so a branch that appends a value but never increments `ai` makes the
+    /// program spin forever — the java cell then produces NO output at all and
+    /// every example looks like an opaque "backend differs". The `%d`/`%i`
+    /// branch was the one missing the increment, so `printf "%d\n" $((x+3))`
+    /// hung on every integer format.
+    ///
+    /// This pins the increment structurally: the `%d` arm must advance `ai`
+    /// exactly like the `%s`/`%b`/default arms do. It is a source assertion
+    /// on purpose — compiling and running the generated java would need a JDK
+    /// in the unit-test sandbox, and a hang is exactly the failure a
+    /// behavioural test cannot time out of cheaply.
+    #[test]
+    fn numeric_conversion_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        // isolate the numeric branch
+        let start = src
+            .find("if (n == 'd' || n == 'i')")
+            .expect("shPrintf must handle %d/%i");
+        let rest = &src[start..];
+        let end = rest.find("} else").expect("numeric branch must be bounded");
+        let arm = &rest[..end];
+        assert!(
+            arm.contains("ai++"),
+            "the %d/%i branch of shPrintf must increment `ai`, else the \
+             `do/while (ai < args.length)` outer loop never terminates and \
+             every integer printf hangs the generated program. Arm was:\n{arm}"
+        );
+    }
+
+    /// The other arms must keep advancing too — a guard against the same
+    /// regression landing on %s/%b/default later.
+    #[test]
+    fn every_conversion_arm_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        for arm in ["n == 's'", "n == 'b'"] {
+            let start = src.find(arm).expect("arm must exist");
+            let rest = &src[start..];
+            let end = rest.find("} else").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("ai++"),
+                "the `{arm}` branch must increment `ai`"
+            );
+        }
+    }
 }

@@ -11,6 +11,7 @@ use crate::ast::*;
 use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
+use num_bigint::BigInt;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -98,6 +99,186 @@ pub fn set_shaderize_enabled(on: bool) {
 
 pub fn shaderize_enabled() -> bool {
     SHADERIZE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `-Os`: optimise for output SIZE. Unlike `-O3` (speed) this trades a
+/// faithful expression for a shorter one, so it turns on the purely
+/// literal arithmetic fold (`shir_passes::optimize::fold_arith_literals`:
+/// `1 + 2` → `3`). Off at `-Og` (the default), whose contract is that the
+/// output resembles the input — a human should see `1 + 2` there.
+static SIZE_OPT: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable `-Os` size-oriented lowering (default off).
+pub fn set_size_opt(on: bool) {
+    SIZE_OPT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn size_opt_enabled() -> bool {
+    SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Serializes every test that flips [`SIZE_OPT`].
+///
+/// `SIZE_OPT` is a process-global, and cargo runs tests on parallel
+/// threads: a test that calls [`set_size_opt`] while ANOTHER test is
+/// rendering observes the wrong level. This is the same hazard the
+/// dual-loop tests already serialize (see `dual_loop_tests`), and it is
+/// a real flake, not a theoretical one — `literal_literal_ops_are_widened`
+/// failed on ~2 runs in 5 purely from scheduling, with no source change.
+///
+/// Hold this for the whole set/render/reset sequence. The guard is
+/// re-entrant across the module so several `set_size_opt` tests can each
+/// take it.
+#[cfg(test)]
+pub(crate) static SIZE_OPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `-Oz`: golf for output SIZE. `-Os` plus a renderer text pass that
+/// strips what humans need but compilers don't: full-line `//`
+/// comments, indentation/blank lines, and long renderer-owned
+/// identifiers (helpers, statics, gensyms → a `__`-prefixed short
+/// pool). Other backends treat Oz as Os; the Rust backend golfs.
+static GOLF: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable `-Oz` golf lowering (default off).
+pub fn set_golf(on: bool) {
+    GOLF.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn golf_enabled() -> bool {
+    GOLF.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// ── Source-language facts (the pipeline's INPUT language) ─────────────
+// The renderers answer "what did this program come from?" — not just
+// "what does it say". The shell-only semantics (`$?`, the exit status
+// register each backend carries: `__SH_RC`/`_sh_rc`/`sh2.lastExit`/
+// `$CHILD_ERROR`) are meaningful only when the SOURCE language has a
+// `$?` equivalent. Python's `subprocess.run(...).returncode` is lowered
+// to a shell command status by the py frontend, so the register is still
+// needed there; a Python program with no command status (every other
+// program) must not carry the register at all — it is dead weight the
+// source can never observe, and the old output-shaped heuristic
+// (`body_rc_is_zero`) only caught the shapes it happened to recognise.
+//
+// Set by the CLI/render ingress from the source file's language
+// (`otranspilerl::render_with_source`); unset = the shell, the
+// historical behaviour, so every existing A1 entry point is unchanged.
+// A thread-local (the `transforms::CURRENT_TARGET` idiom): the flag is
+// per-compilation context — a renderer running on another thread (the
+// unit tests, a future parallel driver) must not see this thread's
+// source language.
+thread_local! {
+    static SOURCE_LANG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Languages whose `$?` (or an equivalent status variable the frontend
+/// lowers onto `$?`) exists: the shell family. Everything else — `py`,
+/// `c`, `pl`, `go`, `fish`, `zsh`-as-a-source-extension for frontends
+/// that do not lower a status, `powershell`, … — has no shell status and
+/// no observable `$?`.
+///
+/// NOTE: `zsh`/`fish`/`posix-sh`/`bat` DO have `$?`; only the frontends
+/// that emit no status lowering are listed as status-free. The list is
+/// the languages whose frontend lowers `$?` reads: everything that
+/// reaches the core through `ast_to_ir` (the shell parser) keeps them.
+fn lang_has_exit_status(lang: &str) -> bool {
+    let l = lang.trim().trim_start_matches('.');
+    match l {
+        // the shell family — `$?` is a source-level construct
+        "sh" | "bash" | "zsh" | "dash" | "posix" | "posix-sh" | "ksh" | "" => true,
+        // A1 passthrough: the source is unknown/opaque, keep the status
+        "shir" => true,
+        // frontend languages without a `$?`. `py` is special-cased only
+        // to document the `returncode` exception below.
+        _ => false,
+    }
+}
+
+/// Record the language the program was lowered FROM (`"sh"`, `"py"`,
+/// `"c"`, …). Called by the render ingress; `None`/unset restores the
+/// shell default.
+pub fn set_source_lang(lang: Option<&str>) {
+    SOURCE_LANG.with(|c| *c.borrow_mut() = lang.map(|s| s.to_string()));
+}
+
+/// The recorded source language, if any.
+pub fn source_lang() -> Option<String> {
+    SOURCE_LANG.with(|c| c.borrow().clone())
+}
+
+/// Does the source language have a `$?` (a shell exit status) that the
+/// generated program must be able to observe? Consulted by the backends
+/// before emitting their status register; `true` when unset (the shell
+/// default, and the conservative answer for an unknown source).
+pub fn source_has_exit_status() -> bool {
+    SOURCE_LANG.with(|c| match c.borrow().as_deref() {
+        None => true,
+        Some(l) => lang_has_exit_status(l),
+    })
+}
+
+/// Does the PROGRAM observe the exit status at all — a `$?` read
+/// (`getVar("?")`/`Var("?")`) anywhere? Independent of the source
+/// language: a Python program that captures
+/// `subprocess.run(...).returncode` lowers to exactly such a read (the
+/// py frontend models the child status as `$?`), so the register must
+/// survive even though Python itself has no `$?` variable. A program
+/// with no read has nothing to observe a status with.
+pub fn prog_observes_exit_status(prog: &IrProgram) -> bool {
+    fn stmts(v: &[IrStmt]) -> bool {
+        v.iter().any(stmt)
+    }
+    fn stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Assign { expr, .. } => expr_reads(expr),
+            IrStmt::Declare { init, .. } => init.as_ref().map(expr_reads).unwrap_or(false),
+            IrStmt::Expr(e) => expr_reads(e),
+            IrStmt::Exec { cmd, args, .. } => expr_reads(cmd) || args.iter().any(expr_reads),
+            IrStmt::Output { value, .. } => expr_reads(value),
+            IrStmt::WriteFile { path, content, .. } => expr_reads(path) || expr_reads(content),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                expr_reads(cond)
+                    || stmts(then)
+                    || elsifs.iter().any(|(c, b)| expr_reads(c) || stmts(b))
+                    || stmts(else_)
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                expr_reads(cond) || stmts(body)
+            }
+            IrStmt::For { iter, body, .. } => expr_reads(iter) || stmts(body),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => stmts(b),
+            IrStmt::Redirect { inner, redirects } => {
+                stmts(inner)
+                    || redirects.iter().any(|r| match r {
+                        IrRedirect { target, .. } => expr_reads(target),
+                    })
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                stmts(body) || named_blocks.iter().any(|(_, b)| stmts(b))
+            }
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| stmts(s)),
+            _ => false,
+        }
+    }
+    fn expr_reads(e: &IrExpr) -> bool {
+        // the shIR status-read predicate (Var("?") / getVar("?") /
+        // `$?` text in an arith string) — the ONE definition, shared
+        // with the lastExit-liveness analysis.
+        ir_expr_reads_status(e)
+    }
+    stmts(&prog.stmts) || prog.subs.iter().any(|s| stmts(&s.body))
+}
+
+/// The register-elision verdict every backend can use: the source
+/// language has no `$?` AND the program never lowers a status read, so
+/// no emitted status variable can ever be observed.
+pub fn exit_status_is_unobservable(prog: &IrProgram) -> bool {
+    !source_has_exit_status() && !prog_observes_exit_status(prog)
 }
 
 /// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
@@ -485,7 +666,12 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
                 };
             }
             ArithAst::Var(n) => {
-                if slot_var_index(n).is_none() {
+                // A `${#name[@]}` / `${#name}` length placeholder is already
+                // runtime-exact AND decodes back to the arrayLen/getVar().length
+                // leaf in arith_to_estree — leaving it raw lets that decode
+                // fire; wrapping it instead renders the placeholder NAME as a
+                // store read of an unset variable (reads 0).
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -496,7 +682,7 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
             // a non-slot Var (the A1 export only emits Ident for lifted
             // vars, and a lifted var is never slot-homed).
             ArithAst::Ident(n) => {
-                if slot_var_index(n).is_none() {
+                if slot_var_index(n).is_none() && arith_len_leaf(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
                         arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
@@ -846,6 +1032,176 @@ static TEST_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 /// protocol is dropped only when the clone's own liveness says the write
 /// is unread). Active only during the define-arrow construction.
 static ARROW_BODY_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+/// Install the Plan-4 lastExit-write liveness verdict for a renderer that
+/// is NOT the ESTree emitter (the Rust backend carries its own status
+/// register, `__SH_RC`). Same analysis, same pointer keys: the IR tree is
+/// immutable during a render, so the caller MUST call this on the exact
+/// `prog` it then renders. `errexit` is the caller's `set -e` verdict
+/// (`ir_may_enable_errexit`); under a possible errexit no write is
+/// droppable.
+pub fn install_lastexit_deadness(prog: &IrProgram, errexit: bool) {
+    *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+}
+
+/// Renderer-facing accessor for [`LASTEXIT_DEAD`]: true when this
+/// statement's status write is provably unread (so a renderer carrying a
+/// status register may drop the store). Unset ⇒ conservative (false).
+pub fn stmt_lastexit_write_is_dead(stmt: &IrStmt) -> bool {
+    lastexit_write_is_dead(stmt)
+}
+
+/// General status-write liveness for renderers that carry their own status
+/// register (the Rust backend's `__SH_RC`): the set of statements that
+/// WRITE a status (`ir_stmt_writes_lastexit`) but which the backward scan
+/// proved unread. [`LASTEXIT_DEAD`] is the ESTree emitter's narrow map
+/// (only shapes it has a dead twin for); this is the general verdict.
+static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Install the general unread-status-write set (see [`LASTEXIT_UNREAD`]).
+/// Same pointer keys as [`LASTEXIT_DEAD`]: the caller MUST pass the exact
+/// `prog` it then renders.
+pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
+    if errexit {
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        return;
+    }
+    // SOURCE-LANGUAGE STATUS VERDICT: no source `$?` and no status read
+    // means NO status write can ever be observed — every statement that
+    // writes one is unread by construction (not a liveness guess). This is
+    // what lets a renderer drop the status bookkeeping an `if` with an
+    // empty else would otherwise manufacture.
+    if exit_status_is_unobservable(prog) {
+        let mut unread: HashSet<usize> = HashSet::new();
+        fn all(stmts: &[IrStmt], unread: &mut HashSet<usize>) {
+            for st in stmts {
+                if ir_stmt_writes_lastexit(st) {
+                    unread.insert(st as *const IrStmt as usize);
+                }
+                match st {
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::Block(body) => all(body, unread),
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        all(init, unread);
+                        all(step, unread);
+                        all(body, unread);
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        all(then, unread);
+                        for (_, arm) in elsifs {
+                            all(arm, unread);
+                        }
+                        all(else_, unread);
+                    }
+                    IrStmt::Subshell(b) | IrStmt::Background(b) => all(b, unread),
+                    IrStmt::Redirect { inner, .. } => all(inner, unread),
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st2 in stages {
+                            all(st2, unread);
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        all(body, unread);
+                        for (_, nb) in named_blocks {
+                            all(nb, unread);
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body } => {
+                        all(body, unread);
+                        for e in excepts {
+                            all(&e.body, unread);
+                        }
+                        all(else_body, unread);
+                        all(finally_body, unread);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        all(&prog.stmts, &mut unread);
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+        return;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    walk_lastexit_liveness(&prog.stmts, true, &mut live);
+    let mut unread: HashSet<usize> = HashSet::new();
+    fn collect(stmts: &[IrStmt], live: &HashSet<usize>, unread: &mut HashSet<usize>) {
+        for st in stmts {
+            let key = st as *const IrStmt as usize;
+            if ir_stmt_writes_lastexit(st) && !live.contains(&key) {
+                unread.insert(key);
+            }
+            match st {
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect(body, live, unread),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, live, unread);
+                    collect(step, live, unread);
+                    collect(body, live, unread);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, live, unread);
+                    for (_, arm) in elsifs {
+                        collect(arm, live, unread);
+                    }
+                    collect(else_, live, unread);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) => collect(b, live, unread),
+                IrStmt::Redirect { inner, .. } => collect(inner, live, unread),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st2 in stages {
+                        collect(st2, live, unread);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, live, unread);
+                    for (_, nb) in named_blocks {
+                        collect(nb, live, unread);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    collect(body, live, unread);
+                    for e in excepts {
+                        collect(&e.body, live, unread);
+                    }
+                    collect(else_body, live, unread);
+                    collect(finally_body, live, unread);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &live, &mut unread);
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+}
+
+/// Renderer-facing accessor for [`LASTEXIT_UNREAD`]: true when this
+/// statement writes a status that the backward scan proved unread. Unset ⇒
+/// conservative (false — keep the write).
+pub fn stmt_status_write_is_unread(stmt: &IrStmt) -> bool {
+    LASTEXIT_UNREAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
+        .unwrap_or(false)
+}
+
+
 fn test_cond_write_is_dead(stmt: &IrStmt) -> bool {
     if let Some(m) = ARROW_BODY_COND_DEAD.lock().unwrap().as_ref() {
         if let Some(dead) = m.get(&(stmt as *const IrStmt as usize)) {
@@ -1000,11 +1356,14 @@ pub(crate) fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
         }
         IrStmt::Expr(e) => match e {
             IrExpr::BinOp { op, .. } => matches!(op, BinOpKind::And | BinOpKind::Or),
-            IrExpr::Call { func, args } => {
-                args.iter().any(ir_expr_reads_status)
-                    || matches!(func.as_str(), "and" | "or" | "exit" | "return")
+            // delegate to the expression predicate FIRST: it knows the
+            // `getVar("?")` form of a status read (the `$?` word-level
+            // lowering), which a bare `args.any(...)` scan misses.
+            other => {
+                ir_expr_reads_status(other)
+                    || matches!(other, IrExpr::Call { func, .. }
+                        if matches!(func.as_str(), "and" | "or" | "exit" | "return"))
             }
-            other => ir_expr_reads_status(other),
         },
         IrStmt::While { cond, .. } | IrStmt::If { cond, .. } => ir_expr_reads_status(cond),
         IrStmt::DoWhile { cond, .. } => ir_expr_reads_status(cond),
@@ -2348,6 +2707,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
 /// reference). The i32-provable pattern: a pure shIR analysis every
 /// backend can re-derive (the Perl renderer's status tracking, the C
 /// renderer's `_sh_rc`, …).
+#[allow(dead_code)]
 fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     fn expr_zero(e: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
         match e {
@@ -2525,6 +2885,53 @@ fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     walk(&prog.stmts, &fns)
 }
 
+/// Every statement pointer in the tree, as a `HashMap`-valued `true` set
+/// (the `TEST_COND_DEAD` / `LOOP_STATUS_DEAD` "everything is dead" verdict
+/// for a program whose source language has no exit status: there is no
+/// status to keep anywhere).
+fn all_statements(prog: &IrProgram) -> HashMap<usize, bool> {
+    fn walk(stmts: &[IrStmt], out: &mut HashMap<usize, bool>) {
+        for s in stmts {
+            out.insert(s as *const IrStmt as usize, true);
+            match s {
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, out),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk(then, out);
+                    for (_, arm) in elsifs {
+                        walk(arm, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, out),
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk(body, out);
+                    for (_, nb) in named_blocks {
+                        walk(nb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(&prog.stmts, &mut out);
+    out
+}
+
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
@@ -2533,16 +2940,37 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
         *TEST_COND_DEAD.lock().unwrap() = Some(HashMap::new());
         return dead;
     }
+    // SOURCE-LANGUAGE STATUS VERDICT: the source language has no shell
+    // `$?` and the program reads no status
+    // (`crate::shir::exit_status_is_unobservable`), so EVERY status write
+    // is dead by construction — not a liveness guess but a fact about the
+    // source. Walk with an empty live set (and empty end-liveness): each
+    // writer's entry drops through the SAME dead-twin emitters Plan 4
+    // already trusts, so the generated JS carries no `sh2.lastExit` for a
+    // Python program (and `py -> rs` no `__SH_RC`, similarly). Shell
+    // sources are untouched: the verdict is false there.
+    if crate::shir::exit_status_is_unobservable(prog) {
+        let live: HashSet<usize> = HashSet::new();
+        mark_lastexit_dead(&prog.stmts, &live, &mut dead);
+        *TEST_COND_DEAD.lock().unwrap() = Some(all_statements(prog));
+        *LOOP_STATUS_DEAD.lock().unwrap() = Some(all_statements(prog));
+        return dead;
+    }
     let mut live: HashSet<usize> = HashSet::new();
     // the exit code is PROVABLY 0 (no $? reads, every status 0): the
     // runner's exit-code read of the final status is a no-op — walk with
     // end_live=false so the final statement's record drops (t87_bignum's
-    // trailing `sh2.lastExit = 0`).
-    let ec_zero = exit_code_provably_zero(prog);
-    if std::env::var("SH2_DBG_ECZ").is_ok() {
-        eprintln!("DBG exit_code_provably_zero = {}", ec_zero);
-    }
-    let end_live = !ec_zero;
+    // The program's final status is ALWAYS observable: `sh2._finish()`
+    // exits with `sh2.lastExit`. The final statement's write must stay —
+    // even when the program is exit-code-provably-zero, an EARLIER status
+    // write can survive into `sh2.lastExit` (e.g. `if false; then ...; fi`
+    // records `sh2.lastExit = 1` at the condition; bash exits 0 but a
+    // dropped final `= 0` would make `_finish` exit 1). This is the old
+    // `end_live = !exit_code_provably_zero(prog)`: the provably-zero proof
+    // only bounds the FINAL status, never an intermediate leak, so it was
+    // unsound as a drop license (dead_flags_* / last_exit_hoist_* pin the
+    // correct behaviour).
+    let end_live = true;
     walk_lastexit_liveness(&prog.stmts, end_live, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     *TEST_COND_DEAD.lock().unwrap() = Some(compute_test_cond_deadness(&prog.stmts, &live));
@@ -3530,8 +3958,29 @@ static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// The CURRENT function's param arity, pushed while the define arrow's
 /// body lowers — `positional_read`/`native_special_var` render `$i` as
-/// the `pi` param identifier inside it.
+/// the `p{pos}` param identifier inside it.
 static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+
+/// The CURRENT function's A1-DECLARED parameter NAMES, pushed while the
+/// define arrow's body lowers. A named parameter is bound by the arrow's
+/// own parameter list (the emitters below pass them through), so a body
+/// read of one is a bare JS identifier — NOT a `sh2.vars` store read.
+/// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+/// `IrStmt::Function` arm bound `name`/`body`/`named_blocks` and dropped
+/// `params`, so every A1 function emitted `() => …` and its body's
+/// parameter reads fell through to the empty `sh2.vars` store.
+static NAMED_PARAMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Is `name` one of the enclosing function's A1-declared parameters?
+/// A read of one renders as the bare arrow parameter.
+fn is_named_param(name: &str) -> bool {
+    NAMED_PARAMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
 
 /// STORE-ONLY vars (the StoreToNative pass's verdict): written only via
 /// setVar/getVar with literal names — the native binding renders bare
@@ -3727,7 +4176,7 @@ fn collect_named_block_fns(stmts: &[IrStmt], out: &mut HashSet<String>) {
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
-fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
+pub(crate) fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
     fn walk_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
         for st in stmts {
             match st {
@@ -5831,10 +6280,46 @@ fn st(s: &str) -> IrExpr {
     IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
 }
 
+/// A QUOTED literal (`'...'` or `"..."` with no expansions — the parser
+/// produced Word::Literal, so there is nothing to expand): SingleQuoted
+/// style pins it verbatim. The ESTree render emits these opaquely
+/// (`sh2.lit("...")`) so downstream interpolation (JS lift passes turn
+/// `"$v"` text into `${v}` templates) cannot rewrite single-quoted
+/// payloads like the mimecroft fragment shader's `putb $b`.
+fn st_single(s: &str) -> IrExpr {
+    IrExpr::Str(s.to_string(), StrStyle::SingleQuoted)
+}
+
 // ── AST → IR ─────────────────────────────────────────────────────────
 
 pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     ast_to_ir_with_lines(commands, &[])
+}
+
+/// Map each element of `new` to the index of the element of `old` it came
+/// from, matching by value in order.
+///
+/// Both IR passes filter and rewrite statement lists, so an index into one
+/// list does NOT name the same statement in another. Greedy in-order
+/// matching recovers the correspondence for the common case (a pass
+/// dropped or kept statements); an element with no unclaimed match — one a
+/// pass inserted or rewrote — maps to nothing and is simply skipped by the
+/// caller, which is the safe outcome: a missing source line is recoverable,
+/// a misattributed one is not.
+fn align_by_identity(new: &[IrStmt], old: &[IrStmt]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(new.len());
+    let mut cursor = 0usize;
+    for st in new {
+        let found = old[cursor..].iter().position(|o| o == st).map(|i| cursor + i);
+        match found {
+            Some(i) => {
+                cursor = i + 1;
+                out.push(Some(i));
+            }
+            None => out.push(None),
+        }
+    }
+    out
 }
 
 /// `ast_to_ir` + the shIR `stmt_lines` markup: `lines[i]` is the 1-based
@@ -5848,19 +6333,29 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // dead-assignment elimination) benefit both consumers of the IR.
     // Then apply worker-submitted transforms (gated by SH2_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
-    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
-    let mut stmts: Vec<IrStmt> = Vec::new();
+    // The LINE is collected here, but the statement INDEX is assigned only
+    // after both passes below have finished.
+    //
+    // `optimize_stmts` drops dead assignments and `transforms::apply` can
+    // add, remove, or rewrite statements, so a map indexed against the
+    // input list is stale the moment anything moves: for `x=hi` + `echo $x`
+    // the dead assignment is elided, the old map still claimed `echo` was
+    // statement 1, and that statement does not exist. A consumer resolving
+    // `stmt` against the final list (the web GUI's source-line map) then
+    // reads past the end or attributes a statement to the wrong source.
+    //
+    // Carrying the line alongside the statement and matching survivors back
+    // to their origin keeps the map aligned with whatever actually
+    // survives. A statement a pass INSERTED has no origin and gets no entry:
+    // a missing line is recoverable, a wrong one is not.
+    let mut origins: Vec<(usize, IrStmt)> = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
         if let Some(st) = stmt_for_command(cmd) {
-            if let Some(&l) = lines.get(i) {
-                if l > 0 {
-                    stmt_lines.push((stmts.len(), l));
-                }
-            }
-            stmts.push(st);
+            origins.push((lines.get(i).copied().unwrap_or(0), st));
         }
     }
-    let mut stmts = crate::ir::optimize_stmts(&stmts);
+    let src: Vec<IrStmt> = origins.iter().map(|(_, s)| s.clone()).collect();
+    let mut stmts = crate::ir::optimize_stmts(&src);
     // Serialize against the shir_to_estree compile lock: the
     // sync-ok-loops transform stores per-compilation POINTER-keyed
     // verdicts in shared statics, and a parallel compilation's unlocked
@@ -5868,7 +6363,31 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // compile concurrently). Never re-entered: shir_to_estree does not
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    let after_optimize = stmts.clone();
     crate::transforms::apply(&mut stmts);
+    // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
+    // from it again, so the source line is recovered by two order-preserving
+    // subsequence matches rather than by using either list's indices
+    // directly — a filtered list's index does not name the same statement.
+    let to_src = align_by_identity(&after_optimize, &src);
+    let to_after_optimize = align_by_identity(&stmts, &after_optimize);
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
+    for (i, via) in to_after_optimize.iter().enumerate() {
+        // stmts[i] -> after_optimize[via] -> src[to_src[via]] -> origins[...]
+        // `via` is a `&Option<usize>`; `and_then` needs the Option by
+        // value, so dereference it (a second `&` in the pattern would
+        // bind the pattern to `&usize` and hand `to_src.get` a
+        // reference where it wants the index).
+        let Some(si) = (*via).and_then(|a| to_src.get(a).copied().flatten()) else {
+            continue;
+        };
+        let Some(&(line, _)) = origins.get(si) else {
+            continue;
+        };
+        if line > 0 {
+            stmt_lines.push((i, line));
+        }
+    }
     IrProgram {
         imports: vec![],
         requires: vec![],
@@ -6072,7 +6591,11 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     ) -> Option<u64> {
         let (v, c, n) = bound?;
         let (blo, bhi) = ranges.get(&v).copied()?;
-        let (mn, _) = body_step_bounds(body, &v)?;
+        let mut carried = HashSet::new();
+        for s in body {
+            collect_assigned(s, &mut carried);
+        }
+        let (mn, _) = body_step_bounds(body, &v, ranges, &carried)?;
         while_iterations(c, n, blo, bhi, mn as i128)
     }
 
@@ -7309,7 +7832,7 @@ pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
 
 pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
     let numeric = numeric_lift_vars(prog);
-    let string = string_lift_vars(prog, &numeric);
+    let (string, ascii) = string_lift_vars(prog, &numeric);
     let mut names: std::collections::HashSet<String> = numeric.iter().cloned().collect();
     for s in &string {
         names.insert(s.clone());
@@ -7321,12 +7844,133 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
         .map(|n| {
             let t = if numeric.contains(&n) {
                 crate::ir::IrType::Int
+            } else if ascii.contains(&n) {
+                crate::ir::IrType::AsciiStr
             } else {
                 crate::ir::IrType::Str
             };
             (n, t)
         })
         .collect()
+}
+
+/// Promote `Str`-typed variables to `AsciiStr` when every assignment is
+/// a pure ASCII literal or an already-promoted `AsciiStr` var.  Call
+/// after the frontend's `var_types` are loaded (e.g. from ShIR JSON);
+/// the Go frontend sets `Str` for all string vars — this pass refines
+/// the ones that are provably ASCII-only.
+pub fn promote_ascii_vars(prog: &mut IrProgram) {
+    use std::collections::HashMap;
+    // Collect all assignment expressions per variable.
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn walk(stmts: &[IrStmt], assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        for st in stmts {
+            match st {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            assigns.entry(t.var.clone()).or_default().push(expr.clone());
+                        }
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Function { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, assigns),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, assigns);
+                    walk(else_, assigns);
+                    for (_, b) in elsifs {
+                        walk(b, assigns);
+                    }
+                }
+                IrStmt::For { var, body, .. } => {
+                    assigns.entry(var.clone()).or_default();
+                    walk(body, assigns);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk(init, assigns);
+                    walk(step, assigns);
+                    walk(body, assigns);
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk(stage, assigns);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, assigns),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, assigns);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_expr(e, assigns);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_expr(e: &IrExpr, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match e {
+            IrExpr::Arrow(stmts) => walk(stmts, assigns),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_expr(a, assigns);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    collect_expr(el, assigns);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut assigns);
+
+    // Build a set of current Str-typed names.
+    let str_vars: std::collections::HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == IrType::Str)
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    // Fixed-point: promote to AsciiStr when all assigns are ASCII.
+    let mut ascii: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &str_vars {
+            if ascii.contains(name) {
+                continue;
+            }
+            if let Some(exprs) = assigns.get(name) {
+                let all_ascii = !exprs.is_empty()
+                    && exprs.iter().all(|e| match e {
+                        IrExpr::Str(v, _) => v.is_ascii(),
+                        IrExpr::Var(n, _) => ascii.contains(n.as_str()),
+                        _ => false,
+                    });
+                if all_ascii {
+                    ascii.insert(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Patch var_types.
+    for (name, ty) in &mut prog.var_types {
+        if *ty == IrType::Str && ascii.contains(name) {
+            *ty = IrType::AsciiStr;
+        }
+    }
 }
 
 /// Conservative const/var verdicts (the const-markup transform; sibling
@@ -7638,6 +8282,24 @@ use std::collections::{HashMap, HashSet};
                     if t.indices.is_empty() && !t.var.contains('[') {
                         site(acc, &t.var, multi_run);
                     } else {
+                        // the index expressions are READS — walk them
+                        for i in &t.indices {
+                            walk_expr(i, acc, multi_run);
+                        }
+                        // ... and the index may instead be BAKED into the
+                        // name (`arr[$i]=v` → var "arr[$i]", indices empty).
+                        // Those `$name` refs are reads too. Without them the
+                        // variable feeding the index looks unused (single
+                        // site, not multi-run) and is classified Const, so
+                        // the assignment that feeds it is elided as dead
+                        // code and the remaining positional args RENUMBER:
+                        //   set_pos() { ti=$1; tx=$2; tpx[$ti]=$tx; }
+                        // lost `ti=$1`, taking tx=$2 as sh2.positional[1],
+                        // so every `tpx[...]` write collapsed onto the dead
+                        // key `tpx[]` (mimecroft recorded 1 of 10 artifacts).
+                        for name in index_name_refs(&t.var) {
+                            site(acc, &name, multi_run);
+                        }
                         acc.index_written
                             .insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
                     }
@@ -7812,6 +8474,31 @@ use std::collections::{HashMap, HashSet};
     let mut acc = Acc::default();
     for s in &prog.stmts {
         walk_stmt(s, &mut acc, false);
+    }
+    // A TERNARY is ONE definition, not two: the frontends lower
+    // `a if c else b` to an `If` whose branches each assign the same name.
+    // Exactly one branch runs, so the name has a single effective assignment
+    // site — without this the two sites make it `Var`, which blocks both the
+    // local verdict and the borrow verdict (t30's `y` then keeps an owned
+    // thread-local home).
+    {
+        let mut ternary: Vec<String> = Vec::new();
+        for s in &prog.stmts {
+            ternary_targets(s, &mut ternary);
+        }
+        for t in ternary {
+            if let Some(n) = acc.sites.get_mut(&t) {
+                if *n > 1 {
+                    *n -= 1;
+                }
+            }
+            if acc.sites.get(&t).copied().unwrap_or(0) <= 1 {
+                acc.multi_run.remove(&t);
+            }
+            acc.runtime_written.remove(&t);
+            acc.arith_written.remove(&t);
+            acc.index_written.remove(&t);
+        }
     }
     for sub in &prog.subs {
         for s in &sub.body {
@@ -8429,7 +9116,7 @@ pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
     for body in fn_bodies {
         let mut state: State = HashMap::new();
         for s in body {
-            walk_stmt_ranges(s, &mut state);
+            walk_stmt_ranges(s, &mut state, true);
         }
         let nz = scope_nonzero(state.clone());
         let mut mentions = HashSet::new();
@@ -8490,7 +9177,7 @@ pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
 pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
     let mut state: HashMap<String, Option<(i128, i128)>> = HashMap::new();
     for s in &prog.stmts {
-        walk_stmt_ranges(s, &mut state);
+        walk_stmt_ranges(s, &mut state, true);
     }
     state
         .into_iter()
@@ -8501,6 +9188,5394 @@ pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
 /// Width a [lo, hi] range maps to (target type table — C/Rust/GLSL).
 /// u64 fires only past signed-64 — a range only a C-frontend unsigned
 /// integer can produce (bash's arithmetic never leaves i64).
+// ── py2cy analysis support: exact evaluation, use-safety, widths ──
+// (A1 ports of the Go autocython proof rules in
+// frontends/py-sh-go/autocython_ranges.go `unsafeTypedNames` and
+// autocython_width.go. The shell-oriented `arith_range` above models bash
+// WRAPPING (`wrap_interval`); everything here is the Python-int reading:
+// unbounded values, any overflow is unknown.)
+
+/// Frontend `%` desugar `((a % b) + b) % b` (emitted when the operands
+/// are not plain-provable): returns the source `(a, b)`. Structural
+/// (`ArithAst: PartialEq`) — a hand-written identical shape means the
+/// same exact computation.
+fn as_mod_desugar<'a>(
+    lhs: &'a crate::ir::ArithAst,
+    rhs: &'a crate::ir::ArithAst,
+) -> Option<(&'a crate::ir::ArithAst, &'a crate::ir::ArithAst)> {
+    use crate::ir::ArithAst::Bin;
+    let Bin { op: o1, lhs: l1, rhs: r1 } = lhs else {
+        return None;
+    };
+    if o1 != "+" {
+        return None;
+    }
+    let Bin { op: o2, lhs: a, rhs: b1 } = &**l1 else {
+        return None;
+    };
+    if o2 != "%" || r1.as_ref() != rhs || b1.as_ref() != rhs {
+        return None;
+    }
+    Some((a, b1.as_ref()))
+}
+
+/// Frontend `//` desugar `(a - pythonmod(a, b)) / b` → the source
+/// `(a, b)`. The subtraction is exact (remainder removed), so C
+/// truncation coincides with Python floor — no veto inside.
+fn as_div_desugar<'a>(
+    lhs: &'a crate::ir::ArithAst,
+    rhs: &'a crate::ir::ArithAst,
+) -> Option<(&'a crate::ir::ArithAst, &'a crate::ir::ArithAst)> {
+    use crate::ir::ArithAst::Bin;
+    let Bin { op: o1, lhs: a, rhs: pm } = lhs else {
+        return None;
+    };
+    if o1 != "-" {
+        return None;
+    }
+    // pm must be `((a % b) + b) % b` over the SAME a, b
+    let Bin { op: o2, lhs: inner, rhs: b3 } = &**pm else {
+        return None;
+    };
+    if o2 != "%" || b3.as_ref() != rhs {
+        return None;
+    }
+    let (pa, pb) = as_mod_desugar(inner, rhs)?;
+    if pa != a.as_ref() || pb != rhs {
+        return None;
+    }
+    Some((a.as_ref(), rhs))
+}
+
+/// Exact (non-wrapping) interval evaluation of an arith tree for the
+/// Python-int reading: vars from `env` (absent = unknown), Nums exact,
+/// checked i128 operators — overflow, divide-by-zero, negative `**`
+/// exponent, unknown nodes, and float-producing `/` yield None.
+/// `%`/`//` use Python floor semantics (divisor range containing 0, or a
+/// non-point divisor straddling signs the analysis cannot bound, yields
+/// None). Comparisons yield [0,1] (always i64-safe — C comparison of two
+/// long longs cannot wrap).
+pub fn arith_range_exact(
+    a: &crate::ir::ArithAst,
+    env: &std::collections::HashMap<String, (i128, i128)>,
+) -> Option<(i128, i128)> {
+    use crate::ir::ArithAst::*;
+    match a {
+        Num(n) => Some((*n as i128, *n as i128)),
+        Var(n) | Ident(n) => env.get(n).copied(),
+        Index { .. } => None,
+        Bin { op, lhs, rhs } => {
+            let o = op.as_str();
+            // comparisons are always i64-contained
+            if matches!(o, "==" | "!=" | "<" | ">" | "<=" | ">=") {
+                return Some((0, 1));
+            }
+            // `%` desugar: evaluate the source op (floor), not the
+            // branchless lowering (whose inner `+` would veto sound
+            // participants — t90's loop counter)
+            if o == "%" {
+                if let Some((a, b)) = as_mod_desugar(lhs, rhs) {
+                    let (l0, l1) = arith_range_exact(a, env)?;
+                    let (r0, r1) = arith_range_exact(b, env)?;
+                    let _ = (l0, l1);
+                    if r0 > 0 {
+                        return Some((0, r1 - 1));
+                    } else if r1 < 0 {
+                        return Some((r0 + 1, 0));
+                    }
+                    return None;
+                }
+            }
+            // `//` desugar: source floor-div (exact division inside)
+            if o == "/" {
+                if let Some((a, b)) = as_div_desugar(lhs, rhs) {
+                    let (l0, l1) = arith_range_exact(a, env)?;
+                    let (r0, r1) = arith_range_exact(b, env)?;
+                    if r0 <= 0 && r1 >= 0 {
+                        return None;
+                    }
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &bb in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, bb)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    return Some((lo.checked_sub(1)?, hi.checked_add(1)?));
+                }
+            }
+            let (l0, l1) = arith_range_exact(lhs, env)?;
+            let (r0, r1) = arith_range_exact(rhs, env)?;
+            match o {
+                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
+                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+                "*" => {
+                    let vs = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    Some((*vs.iter().min()?, *vs.iter().max()?))
+                }
+                "**" => {
+                    if !(r0 == r1 && r0 >= 0 && l0 == l1) {
+                        return None;
+                    }
+                    pow_exact(l0, r0)
+                }
+                "%" => {
+                    // Python sign-of-divisor: the DIVISOR decides alone
+                    // (`a % m` needs no dividend bound). Point or
+                    // sign-constant range; a straddling/zero divisor
+                    // may raise -> unknown.
+                    if r0 > 0 {
+                        Some((0, r1 - 1))
+                    } else if r1 < 0 {
+                        Some((r0 + 1, 0))
+                    } else {
+                        None
+                    }
+                }
+                "//" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        // divisor range contains 0 (or straddles it)
+                        return None;
+                    }
+                    // hull over endpoint divisors × endpoint dividends,
+                    // ±1 seam slack for the floor step
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &b in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, b)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    Some((lo.checked_sub(1)?, hi.checked_add(1)?))
+                }
+                // `/` is true division (float) OR plain `//` (floor —
+                // the frontend maps plain `//` to `/`). Floor applies
+                // when both operands evaluate: a true-division claim
+                // would be float, and no Int-kind consumer consults a
+                // `/` claim, so the ambiguity is harmless either way.
+                "/" => {
+                    let (l0, l1) = arith_range_exact(lhs, env)?;
+                    let (r0, r1) = arith_range_exact(rhs, env)?;
+                    if r0 <= 0 && r1 >= 0 {
+                        return None;
+                    }
+                    let mut lo = i128::MAX;
+                    let mut hi = i128::MIN;
+                    for &bb in &[r0, r1] {
+                        for &x in &[l0, l1] {
+                            let q = floor_div_exact(x, bb)?;
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
+                    Some((lo.checked_sub(1)?, hi.checked_add(1)?))
+                }
+                "<<" | ">>" | "&" | "|" | "^" => None, // usage veto (below), never proven here
+                _ => None,
+            }
+        }
+        Un { op, arg } => {
+            let (l0, l1) = arith_range_exact(arg, env)?;
+            match op.as_str() {
+                "-" => {
+                    if l0 == i64::MIN as i128 {
+                        return None;
+                    }
+                    Some((0i128.checked_sub(l1)?, 0i128.checked_sub(l0)?))
+                }
+                "+" => Some((l0, l1)),
+                "~" => Some((
+                    0i128.checked_sub(l1)?.checked_sub(1)?,
+                    0i128.checked_sub(l0)?.checked_sub(1)?,
+                )),
+                _ => None,
+            }
+        }
+        Cond { test, then, else_ } => {
+            let (t0, t1) = arith_range_exact(test, env)?;
+            let (a0, a1) = arith_range_exact(then, env)?;
+            let (b0, b1) = arith_range_exact(else_, env)?;
+            let _ = (t0, t1);
+            Some((a0.min(b0), a1.max(b1)))
+        }
+        Assign { rhs, .. } => arith_range_exact(rhs, env),
+        IncDec { .. } => None,
+        Sizeof(_) => None,
+        Cast { arg, .. } => arith_range_exact(arg, env),
+    }
+}
+
+fn pow_exact(b: i128, e: i128) -> Option<(i128, i128)> {
+    if e < 0 {
+        return None;
+    }
+    if e == 0 {
+        return Some((1, 1));
+    }
+    let mut acc: i128 = 1;
+    let mut base = b;
+    let mut exp = e;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = acc.checked_mul(base)?;
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base = base.checked_mul(base)?;
+        }
+    }
+    Some((acc, acc))
+}
+
+fn floor_div_exact(a: i128, b: i128) -> Option<i128> {
+    if b == 0 {
+        return None;
+    }
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    // Rust truncates; Python floors: adjust when remainder disagrees
+    if r != 0 && ((r < 0) != (b < 0)) {
+        q.checked_sub(1)
+    } else {
+        Some(q)
+    }
+}
+
+/// The use-safety veto set (A1 port of Go `unsafeTypedNames`): names that
+/// must NOT be C-typed. A typed variable forces its whole expression into
+/// C, so every wrap-prone producer (`+ - * **` that is not exactly
+/// provable, always-veto shifts/bitwise `<< >> & | ^`, negating
+/// `i64::MIN`) vetoes every variable in its subtree. Comparisons,
+/// `%`, `//`, `/` never veto (Cython's default `cdivision=False` gives
+/// them Python semantics). Nested `Function` bodies are their own scope.
+/// Universe: callers intersect with their Int candidates.
+/// Stmts-level use-safety veto (per-scope entry): `env` is the scope's
+/// proved ranges (unknown vars simply absent). Returns names that must
+/// not be C-typed in this scope: vars in unprovable wrap-prone producers
+/// or shifts/bitwise, plus (when `quarantine`) quarantine vetoes (narrow
+/// claimed ranges with an inexactly-evaluable assigned RHS — wrap
+/// artifacts). Quarantine is for unbounded-int readings (Python); bash
+/// wrapping is exact, so bash callers pass `false`. Nested `Function`
+/// bodies are NOT descended (each scope runs this itself).
+/// `bigenv`: exact-BigInt ranges for the scope (empty for bash) — lets
+/// the quarantine tell a proven-huge value from a wrap artifact (see
+/// `quarantine_stmt`).
+pub fn analyze_use_safety_stmts(
+    stmts: &[crate::ir::IrStmt],
+    env: &std::collections::HashMap<String, (i128, i128)>,
+    quarantine: bool,
+    bigenv: &std::collections::HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+) -> std::collections::HashSet<String> {
+    analyze_use_safety_stmts_big(stmts, env, quarantine, bigenv)
+}
+
+/// `analyze_use_safety_stmts` with exact-BigInt ranges for the quarantine
+/// (see `quarantine_stmt`): pass the scope's BigInt map where one exists
+/// (the analyze path); empty for bash, which has no BigInt walk.
+pub fn analyze_use_safety_stmts_big(
+    stmts: &[crate::ir::IrStmt],
+    env: &std::collections::HashMap<String, (i128, i128)>,
+    quarantine: bool,
+    bigenv: &std::collections::HashMap<String, (BigInt, BigInt)>,
+) -> std::collections::HashSet<String> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+    use std::collections::{HashMap, HashSet};
+    fn vars_in_arith(a: &ArithAst, out: &mut HashSet<String>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                out.insert(n.clone());
+            }
+            ArithAst::Index { key, .. } => vars_in_arith(key, out),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                vars_in_arith(lhs, out);
+                vars_in_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => vars_in_arith(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                vars_in_arith(test, out);
+                vars_in_arith(then, out);
+                vars_in_arith(else_, out);
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                out.insert(var.clone());
+                vars_in_arith(rhs, out);
+            }
+            ArithAst::IncDec { var, .. } => {
+                out.insert(var.clone());
+            }
+            ArithAst::Cast { arg, .. } => vars_in_arith(arg, out),
+            ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        }
+    }
+    fn veto_arith(
+        a: &ArithAst,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } => {
+                let o = op.as_str();
+                // `%`/`//` desugars never veto their internals (the
+                // branchless lowering is exact; only the SOURCE operands
+                // are visited) — t90's loop counter
+                if o == "%" {
+                    if let Some((a, b)) = as_mod_desugar(lhs, rhs) {
+                        veto_arith(a, env, out);
+                        veto_arith(b, env, out);
+                        return;
+                    }
+                }
+                if o == "/" {
+                    if let Some((a, b)) = as_div_desugar(lhs, rhs) {
+                        veto_arith(a, env, out);
+                        veto_arith(b, env, out);
+                        return;
+                    }
+                }
+                if matches!(o, "+" | "-" | "*" | "**") {
+                    // wrap-prone: veto unless exactly provable AND
+                    // i64-contained (an exact-but-huge value, e.g.
+                    // `2**100`, is just as untypable as unknown)
+                    let ok = match arith_range_exact(a, env) {
+                        Some((lo, hi)) => {
+                            lo >= i64::MIN as i128 && hi <= i64::MAX as i128
+                        }
+                        None => false,
+                    };
+                    if !ok {
+                        let mut vs = HashSet::new();
+                        vars_in_arith(a, &mut vs);
+                        out.extend(vs);
+                    }
+                } else if matches!(o, "<<" | ">>" | "&" | "|" | "^") {
+                    // shifts/bitwise: always veto (matches Go)
+                    let mut vs = HashSet::new();
+                    vars_in_arith(a, &mut vs);
+                    out.extend(vs);
+                }
+                veto_arith(lhs, env, out);
+                veto_arith(rhs, env, out);
+            }
+            ArithAst::Un { op, arg } => {
+                if op == "-" {
+                    let ok = match arith_range_exact(arg, env) {
+                        Some((lo, _)) => lo > i64::MIN as i128,
+                        None => false,
+                    };
+                    if !ok {
+                        let mut vs = HashSet::new();
+                        vars_in_arith(arg, &mut vs);
+                        out.extend(vs);
+                    }
+                }
+                veto_arith(arg, env, out);
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                veto_arith(test, env, out);
+                veto_arith(then, env, out);
+                veto_arith(else_, env, out);
+            }
+            ArithAst::Assign { rhs, .. } => veto_arith(rhs, env, out),
+            ArithAst::Cast { arg, .. } => veto_arith(arg, env, out),
+            ArithAst::Index { key, .. } => veto_arith(key, env, out),
+            ArithAst::Var(_)
+            | ArithAst::Ident(_)
+            | ArithAst::Num(_)
+            | ArithAst::IncDec { .. }
+            | ArithAst::Sizeof(_) => {}
+        }
+    }
+    fn veto_expr(
+        e: &IrExpr,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match e {
+            IrExpr::Arith(a) => veto_arith(a, env, out),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                veto_expr(lhs, env, out);
+                veto_expr(rhs, env, out);
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        veto_expr(x, env, out);
+                    }
+                }
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                veto_expr(cond, env, out);
+                veto_expr(then, env, out);
+                veto_expr(else_, env, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                veto_expr(expr, env, out);
+                veto_expr(default, env, out);
+            }
+            IrExpr::Index { key, .. } => veto_expr(key, env, out),
+            IrExpr::MethodCall { obj, args, .. } => {
+                veto_expr(obj, env, out);
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+            }
+            IrExpr::Capture { expr, .. } => veto_expr(expr, env, out),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    veto_expr(v, env, out);
+                }
+            }
+            IrExpr::Splice(x) => veto_expr(x, env, out),
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                veto_expr(iter, env, out);
+                veto_expr(elem, env, out);
+                if let Some(c) = cond {
+                    veto_expr(c, env, out);
+                }
+            }
+            IrExpr::Int(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Var(_, _)
+            | IrExpr::Ident(_)
+            | IrExpr::Bool(_)
+            | IrExpr::Json(_)
+            | IrExpr::Range { .. }
+            | IrExpr::RawExpr(_)
+            | IrExpr::Regex { .. }
+            | IrExpr::Arrow(_)
+            | IrExpr::Lambda { .. }
+            | IrExpr::Ext(_) => {}
+        }
+    }
+    fn veto_stmt(
+        s: &IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        out: &mut HashSet<String>,
+    ) {
+        match s {
+            IrStmt::Assign { expr, .. } => veto_expr(expr, env, out),
+            IrStmt::Expr(e) => veto_expr(e, env, out),
+            IrStmt::Output { value, .. } => veto_expr(value, env, out),
+            IrStmt::WriteFile { path, content, .. } => {
+                veto_expr(path, env, out);
+                veto_expr(content, env, out);
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                veto_expr(cond, env, out);
+                for b in then {
+                    veto_stmt(b, env, out);
+                }
+                for (c, b) in elsifs {
+                    veto_expr(c, env, out);
+                    for x in b {
+                        veto_stmt(x, env, out);
+                    }
+                }
+                for b in else_ {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    veto_stmt(b, env, out);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        veto_expr(m, env, out);
+                    }
+                    for b in &e.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                veto_expr(iter, env, out);
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for b in init.iter().chain(step).chain(body) {
+                    veto_stmt(b, env, out);
+                }
+                veto_expr(cond, env, out);
+            }
+            IrStmt::While { cond, body } => {
+                veto_expr(cond, env, out);
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+                veto_expr(cond, env, out);
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                veto_expr(discriminant, env, out);
+                for c in clauses {
+                    for b in &c.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for b in inner {
+                    veto_stmt(b, env, out);
+                }
+                for r in redirects {
+                    veto_expr(&r.target, env, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    veto_expr(x, env, out);
+                }
+            }
+            IrStmt::SetChildError(e) => veto_expr(e, env, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    veto_expr(e, env, out);
+                }
+            }
+            IrStmt::Exec { cmd, args, env: en, redirects, .. } => {
+                veto_expr(cmd, env, out);
+                for a in args {
+                    veto_expr(a, env, out);
+                }
+                for (_, v) in en {
+                    veto_expr(v, env, out);
+                }
+                for r in redirects {
+                    veto_expr(r, env, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(e) = &c.ch {
+                        veto_expr(e, env, out);
+                    }
+                    if let Some(e) = &c.value {
+                        veto_expr(e, env, out);
+                    }
+                    for b in &c.body {
+                        veto_stmt(b, env, out);
+                    }
+                }
+            }
+            IrStmt::Shaderize { body, .. } => {
+                for b in body {
+                    veto_stmt(b, env, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    veto_stmt(x, env, out);
+                }
+            }
+            IrStmt::Ext(n) => {
+                for c in crate::shir_nodes::ExtNode::children(&**n) {
+                    veto_stmt(c, env, out);
+                }
+            }
+            IrStmt::Asm { inputs, outputs, .. } => {
+                for (_, e) in inputs.iter().chain(outputs) {
+                    veto_expr(e, env, out);
+                }
+            }
+            // nested functions are their own scope; labels/gotos,
+            // die/warn/raw text carry no arith
+            IrStmt::Function { .. }
+            | IrStmt::Die { .. }
+            | IrStmt::Warn { .. }
+            | IrStmt::RawText(_)
+            | IrStmt::Require(_)
+            | IrStmt::Label(_)
+            | IrStmt::Goto(_)
+            | IrStmt::Continue
+            | IrStmt::Break
+            | IrStmt::DeclareArray { .. } => {}
+        }
+    }
+    // merged exact claim for a var (BigInt preferred, else i128 widened)
+    fn merged_claim(
+        name: &str,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        env: &HashMap<String, (i128, i128)>,
+    ) -> Option<(num_bigint::BigInt, num_bigint::BigInt)> {
+        if let Some((lo, hi)) = bigenv.get(name) {
+            return Some((lo.clone(), hi.clone()));
+        }
+        env.get(name)
+            .map(|(lo, hi)| (num_bigint::BigInt::from(*lo), num_bigint::BigInt::from(*hi)))
+    }
+    // quarantine helper (see rhs_exact_ok): narrow claimed ranges are
+    // distrusted wherever an assigned RHS is not exactly evaluable.
+    // BigInt-exact RHS whose merged claim covers it exactly is NOT a
+    // wrap artifact (exact evaluation cannot mislead), so it is
+    // skipped — otherwise every proven-huge literal (u64 and up) would
+    // stay vetoed and no wide tier could ever emit.
+    #[allow(clippy::too_many_arguments)]
+    // BigInt-exact CONSTANT RHS (no variables) whose merged claim covers
+    // it: exact evaluation of literals cannot be a wrap artifact, so the
+    // quarantine skips it. Anything mentioning a variable keeps the
+    // legacy rule — subexpression C-safety there is what veto_arith and
+    // the quarantine exist for (a fitting exact value beside wrapping
+    // participants, e.g. `z = y + y + y`, must stay vetoed).
+    fn big_exact_covered(
+        a: &ArithAst,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        env: &HashMap<String, (i128, i128)>,
+        targets: &[crate::ir::AssignTarget],
+    ) -> bool {
+        fn var_free(x: &ArithAst) -> bool {
+            match x {
+                ArithAst::Var(_) | ArithAst::Ident(_) => false,
+                ArithAst::Bin { lhs, rhs, .. } => var_free(lhs) && var_free(rhs),
+                ArithAst::Un { arg, .. } => var_free(arg),
+                ArithAst::Cond { test, then, else_, .. } => {
+                    var_free(test) && var_free(then) && var_free(else_)
+                }
+                // an in-expression write mentions its target: not free
+                ArithAst::Assign { .. } | ArithAst::IncDec { .. } => false,
+                ArithAst::Cast { arg, .. } => var_free(arg),
+                ArithAst::Index { key, .. } => var_free(key),
+                ArithAst::Num(_) | ArithAst::Sizeof(_) => true,
+            }
+        }
+        if !var_free(a) {
+            return false;
+        }
+        let empty: HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)> =
+            HashMap::new();
+        let exact = match crate::shir_passes::bigint_range::big_arith_range(a, &empty) {
+            Some(r) => r,
+            None => return false,
+        };
+        // The skip exists so a proven-huge literal a wide tier CAN home
+        // (u64 `ulonglong`) is not vetoed as a wrap artifact. But a
+        // value no tier can home (`2**100` exceeds u64) must stay
+        // quarantined: exact evaluation is not the question, homeability
+        // is. Gate the skip on the exact range fitting i64 or u64.
+        let homeable = {
+            use num_bigint::BigInt;
+            let i64_lo = BigInt::from(i64::MIN);
+            let i64_hi = BigInt::from(i64::MAX);
+            let u64_hi = BigInt::from(u64::MAX);
+            let zero = BigInt::from(0);
+            (exact.0 >= i64_lo && exact.1 <= i64_hi)
+                || (exact.0 >= zero && exact.1 <= u64_hi)
+        };
+        if !homeable {
+            return false;
+        }
+        targets.iter().all(|t| {
+            if !t.indices.is_empty() {
+                return false;
+            }
+            match merged_claim(&t.var, bigenv, env) {
+                Some((lo, hi)) => lo <= exact.0 && exact.1 <= hi,
+                None => false,
+            }
+        })
+    }
+    fn quarantine_stmt(
+        s: &crate::ir::IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        out: &mut HashSet<String>,
+    ) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    if big_exact_covered(a, bigenv, env, targets) {
+                        return;
+                    }
+                    // quarantine: the RHS is not exactly i64-contained
+                    // (unknown OR provably huge) yet the claimed range is
+                    // narrow — the narrow claim may be a wrap artifact
+                    let contained = match arith_range_exact(a, env) {
+                        Some((lo, hi)) => {
+                            lo >= i64::MIN as i128 && hi <= i64::MAX as i128
+                        }
+                        None => false,
+                    };
+                    if !contained {
+                        for t in targets {
+                            if t.indices.is_empty() {
+                                if let Some((lo, hi)) = env.get(&t.var) {
+                                    if *lo >= i64::MIN as i128 && *hi <= i64::MAX as i128
+                                    {
+                                        out.insert(t.var.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn quarantine_walk(
+        s: &crate::ir::IrStmt,
+        env: &HashMap<String, (i128, i128)>,
+        bigenv: &HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+        out: &mut HashSet<String>,
+    ) {
+        quarantine_stmt(s, env, bigenv, out);
+        // recurse into inline nesting (never into nested Function bodies
+        // — the caller runs each scope separately)
+        match s {
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        quarantine_walk(x, env, bigenv, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        quarantine_walk(b, env, bigenv, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. } => {
+                for b in body {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                for b in init.iter().chain(step).chain(body) {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        quarantine_walk(b, env, bigenv, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        quarantine_walk(b, env, bigenv, out);
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    quarantine_walk(x, env, bigenv, out);
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        quarantine_walk(b, env, bigenv, out);
+                    }
+                }
+            }
+            IrStmt::Shaderize { body, .. } => {
+                for b in body {
+                    quarantine_walk(b, env, bigenv, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in stmts {
+        veto_stmt(s, env, &mut out);
+        if quarantine {
+            quarantine_walk(s, env, bigenv, &mut out);
+        }
+    }
+    out
+}
+
+/// Whole-program entry (top scope only; function bodies need their own
+/// scope runs — see otranspilerl `analyze`). Uses the bash-walk ranges
+/// as env (callers with python() ranges should use the stmts entry).
+pub fn analyze_use_safety(prog: &crate::ir::IrProgram) -> std::collections::HashSet<String> {
+    let env = analyze_var_ranges(prog);
+    analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new())
+}
+
+// ── per-scope facts for annotation consumers (py2cy.js) ──
+
+/// Stmts-level range entry (fresh state): lets callers run scopes
+/// separately. Same walk as `analyze_var_ranges` (bash wrapping
+/// semantics — Python consumers must apply the wrap-poison quarantine
+/// in `analyze_use_safety_stmts`, not trust narrow ranges blindly).
+pub fn analyze_var_ranges_stmts(
+    stmts: &[crate::ir::IrStmt],
+) -> std::collections::HashMap<String, (i128, i128)> {
+    let mut state: std::collections::HashMap<String, Option<(i128, i128)>> =
+        std::collections::HashMap::new();
+    for s in stmts {
+        walk_stmt_ranges(s, &mut state, true);
+    }
+    state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect()
+}
+
+/// Names assigned in `stmts`. `descend_fn` includes nested Function
+/// bodies (for whole-program assigned sets); the per-scope declare
+/// candidacy uses `false` (a scope declares what IT assigns, minus params).
+pub fn assigned_names(stmts: &[crate::ir::IrStmt], descend_fn: bool) -> std::collections::HashSet<String> {
+    use crate::ir::IrStmt;
+    use std::collections::HashSet;
+    fn walk(s: &IrStmt, descend_fn: bool, out: &mut HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        out.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                out.insert(var.clone());
+            }
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                for b in body {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                if descend_fn {
+                    for b in body {
+                        walk(b, descend_fn, out);
+                    }
+                    for (_, b) in named_blocks {
+                        for x in b {
+                            walk(x, descend_fn, out);
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    walk(b, descend_fn, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        walk(x, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                for b in body.iter().chain(else_body).chain(finally_body) {
+                    walk(b, descend_fn, out);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for x in body {
+                    walk(x, descend_fn, out);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                for b in init.iter().chain(step).chain(body) {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    walk(b, descend_fn, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Select { clauses, .. } => {
+                for c in clauses {
+                    if let Some(t) = &c.target {
+                        out.insert(t.clone());
+                    }
+                    for b in &c.body {
+                        walk(b, descend_fn, out);
+                    }
+                }
+            }
+            IrStmt::Exec { capture, env, .. } => {
+                if let Some(c) = capture {
+                    out.insert(c.clone());
+                }
+                for (v, _) in env {
+                    out.insert(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in stmts {
+        walk(s, descend_fn, &mut out);
+    }
+    out
+}
+
+/// One scope's facts for annotation consumers.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeFacts {
+    /// scope name ("<top>" or the function name)
+    pub name: String,
+    /// names assigned in this scope (declare candidacy before params cut)
+    pub assigned: Vec<String>,
+    /// proved ranges in this scope
+    pub ranges: std::collections::HashMap<String, (i128, i128)>,
+    /// exact unbounded ranges in this scope (Python reading only;
+    /// empty for bash) — preferred over `ranges` wherever present
+    /// (the i128 walk wraps past i64, which once presented 1e19 as
+    /// -8446744073709551616)
+    pub bigranges: std::collections::HashMap<String, (num_bigint::BigInt, num_bigint::BigInt)>,
+    /// use-safety + quarantine vetoes in this scope
+    pub vetoed: std::collections::HashSet<String>,
+    /// storage widths ("i32"/"i64") for Int vars with i64-contained ranges
+    pub widths: std::collections::HashMap<String, String>,
+}
+
+/// Per-scope facts: top scope (Function bodies excluded, then hulled
+/// with every function scope's ranges for same-named vars — a function
+/// may `global`-write them) plus one entry per Function body (fresh
+/// state, so parameters stay unknown). `var_types` (the frontend's
+/// Int/Str/Float domains) is read from the program by the caller.
+/// `python` selects the Python reading: floor `%`/`//` tolerance, the
+/// wrap-poison quarantine in each scope's veto, and the nested-loop-var
+/// fill below. Bash callers pass `false` (wrapping is exact there, and
+/// unset reads are `""`, not NameError).
+pub fn analyze_scopes(prog: &crate::ir::IrProgram, python: bool) -> Vec<ScopeFacts> {
+    use crate::ir::IrStmt;
+    // top-level statements minus nested Function subtrees
+    let top_only: Vec<IrStmt> = prog
+        .stmts
+        .iter()
+        .filter(|s| !matches!(s, IrStmt::Function { .. }))
+        .cloned()
+        .collect();
+    let top_ranges = analyze_var_ranges_stmts(&top_only);
+    // exact unbounded ranges (Python reading only) — preferred over
+    // `top_ranges` wherever present (see bigint_range.rs).
+    let top_big = if python {
+        crate::shir_passes::bigint_range::analyze_var_ranges_big(&top_only)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let top_assigned = assigned_names(&prog.stmts, false);
+    let top_vetoed = analyze_use_safety_stmts(&top_only, &top_ranges, python, &top_big);
+    // function scopes
+    let mut fn_scopes: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            fn_scopes.push((name.clone(), body.clone()));
+        }
+    }
+    let mut fn_facts: Vec<ScopeFacts> = Vec::new();
+    for (name, body) in &fn_scopes {
+        let ranges = analyze_var_ranges_stmts(body);
+        let big = if python {
+            crate::shir_passes::bigint_range::analyze_var_ranges_big(body)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let vetoed = analyze_use_safety_stmts(body, &ranges, python, &big);
+        let assigned: Vec<String> = {
+            let mut v: Vec<String> = assigned_names(body, false).into_iter().collect();
+            v.sort();
+            v
+        };
+        let widths = analyze_widths(body, &ranges);
+        fn_facts.push(ScopeFacts {
+            name: name.clone(),
+            assigned,
+            ranges,
+            vetoed,
+            widths,
+            bigranges: big,
+        });
+    }
+    // module hull: same-named function writes widen top ranges (global
+    // writes are invisible in A1, so union conservatively)
+    let mut top_hulled = top_ranges.clone();
+    for f in &fn_facts {
+        for (n, (lo, hi)) in &f.ranges {
+            top_hulled
+                .entry(n.clone())
+                .and_modify(|e| {
+                    e.0 = e.0.min(*lo);
+                    e.1 = e.1.max(*hi);
+                })
+                .or_insert((*lo, *hi));
+        }
+    }
+    // same hull over the exact ranges (BigInt union)
+    let mut top_big_hulled = top_big.clone();
+    for f in &fn_facts {
+        for (n, (lo, hi)) in &f.bigranges {
+            top_big_hulled
+                .entry(n.clone())
+                .and_modify(|e| {
+                    if lo < &e.0 {
+                        e.0 = lo.clone();
+                    }
+                    if hi > &e.1 {
+                        e.1 = hi.clone();
+                    }
+                })
+                .or_insert((lo.clone(), hi.clone()));
+        }
+    }
+    // Python-only nested-loop-var fill: the shared walk drops an inner
+    // loop var's range post-outer-loop (`join(None, [1,2])` = unknown),
+    // but a provably-nonempty iter bounds every VALUE ever observed —
+    // and an unbound read raises NameError identically typed or not, so
+    // filling is sound. (Bash unset reads `""`: never fill there.)
+    if python {
+        fn fill_for_vars(
+            stmts: &[crate::ir::IrStmt],
+            ranges: &mut std::collections::HashMap<String, (i128, i128)>,
+        ) {
+            for s in stmts {
+                match s {
+                    crate::ir::IrStmt::For { var, iter, body } => {
+                        if !ranges.contains_key(var) {
+                            if let Some((lo, hi)) = for_iter_range(iter) {
+                                // nonempty provable iter only
+                                let nonempty = match iter {
+                                    crate::ir::IrExpr::Array(items) => !items.is_empty(),
+                                    crate::ir::IrExpr::Range { start, end } => start <= end,
+                                    _ => false,
+                                };
+                                if nonempty {
+                                    ranges.insert(var.clone(), (lo, hi));
+                                }
+                            }
+                        }
+                        fill_for_vars(body, ranges);
+                    }
+                    _ => {}
+                }
+            }
+            // recurse into nesting for deeper fors (single-level match
+            // above covers the common shapes; walk the rest structurally)
+            for s in stmts {
+                match s {
+                    crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                        for b in then.iter().chain(else_) {
+                            fill_for_vars(std::slice::from_ref(b), ranges);
+                        }
+                        for (_, b) in elsifs {
+                            fill_for_vars(b, ranges);
+                        }
+                    }
+                    crate::ir::IrStmt::While { body, .. }
+                    | crate::ir::IrStmt::DoWhile { body, .. } => fill_for_vars(body, ranges),
+                    _ => {}
+                }
+            }
+        }
+        let mut filled = top_hulled.clone();
+        fill_for_vars(&prog.stmts, &mut filled);
+        top_hulled = filled;
+        for f in fn_facts.iter_mut() {
+            // fn bodies are walked per-scope already; nested fors inside
+            // them need the same fill (find the body by name)
+            for s in &prog.stmts {
+                if let crate::ir::IrStmt::Function { name, body, .. } = s {
+                    if name == &f.name {
+                        fill_for_vars(body, &mut f.ranges);
+                    }
+                }
+            }
+        }
+    }
+    let mut top_assigned: Vec<String> = top_assigned.into_iter().collect();
+    top_assigned.sort();
+    let top_widths = analyze_widths(&top_only, &top_hulled);
+    let mut out = vec![ScopeFacts {
+        name: "<top>".to_string(),
+        assigned: top_assigned,
+        ranges: top_hulled,
+        vetoed: top_vetoed,
+        bigranges: top_big_hulled,
+        widths: top_widths,
+    }];
+    out.extend(fn_facts);
+    out
+}
+
+/// One scope's final declare decisions for annotation consumers.
+/// Computed here (not in consumers) so the policy lives in exactly
+/// one place: this function is the `decide()` that harness/py2cy.js
+/// used to reimplement, byte-identical by gate.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeDeclares {
+    /// scope name ("<top>" or the function name)
+    pub name: String,
+    /// decided declarations, sorted by name
+    pub declares: Vec<VarDeclare>,
+}
+
+/// A single decided declaration: the Cython type is determined by
+/// kind+width (`int`+`i32` -> `cython.int`, `int`+other ->
+/// `cython.longlong`, `float` -> `cython.double`).
+#[derive(Clone, Debug)]
+pub struct VarDeclare {
+    /// variable name
+    pub name: String,
+    /// "int" or "float"
+    pub kind: String,
+    /// Some("i32") iff the evidence width is i32 (else longlong)
+    pub width: Option<String>,
+}
+
+/// Final declare decisions per scope: the policy harness/py2cy.js
+/// `decide()` encoded (moved here so consumers render, never analyze).
+///
+/// Per scope S, per assigned name V (sorted), excluding parameters and
+/// `global`/`nonlocal` names (a C local would shadow the outer binding):
+/// - float iff the frontend typed V float (its float domain is
+///   authoritative — no veto/range/width checks, exactly as before);
+/// - int V iff the type is int-like, the range is i64-contained, V is
+///   neither vetoed nor bigint-homed. Module candidates additionally
+///   require no veto of V in ANY scope (a function may `global`-write
+///   V — invisible in A1 — so the union vetoes).
+///
+/// `var_types` maps names to frontend type strings ("int", "float",
+/// "str", "any", "int32", ...; missing means "any"). `bigint` is the
+/// union of bigint-homed and i53 names. `params`/`scope_globals` map
+/// scope names to their parameter and (globals, nonlocals) lists.
+pub fn analyze_declares(
+    scopes: &[ScopeFacts],
+    var_types: &std::collections::HashMap<String, String>,
+    bigint: &std::collections::HashSet<String>,
+    params: &std::collections::HashMap<String, Vec<String>>,
+    scope_globals: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+) -> Vec<ScopeDeclares> {
+    const I64MIN: i128 = -(1i128 << 63);
+    const I64MAX: i128 = (1i128 << 63) - 1;
+    fn is_int_kind(t: Option<&String>) -> bool {
+        matches!(
+            t.map(String::as_str),
+            Some("int" | "int32" | "int64" | "uint32" | "uint64")
+        )
+    }
+    // union vetoes across scopes by name (global-write invisibility)
+    let mut veto_union: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for s in scopes {
+        for n in s.vetoed.iter() {
+            veto_union.insert(n.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for s in scopes {
+        let is_top = s.name == "<top>";
+        let param_set: std::collections::HashSet<&String> = params
+            .get(&s.name)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        let (globs, nonlocs): (
+            std::collections::HashSet<&String>,
+            std::collections::HashSet<&String>,
+        ) = match scope_globals.get(&s.name) {
+            Some((g, n)) => (g.iter().collect(), n.iter().collect()),
+            None => Default::default(),
+        };
+        let mut names: Vec<&String> = s.assigned.iter().collect();
+        names.sort();
+        let mut declares = Vec::new();
+        for n in names {
+            if param_set.contains(n) || globs.contains(n) || nonlocs.contains(n) {
+                continue;
+            }
+            let ty = var_types.get(n).cloned().unwrap_or_else(|| "any".to_string());
+            if ty == "float" {
+                declares.push(VarDeclare {
+                    name: (*n).clone(),
+                    kind: "float".to_string(),
+                    width: None,
+                });
+                continue;
+            }
+            if !is_int_kind(var_types.get(n)) {
+                continue;
+            }
+            // merged exact range (BigInt preferred — the i128 walk wraps
+            // past i64, which once presented 1e19 as -8446744073709551616)
+            let merged: Option<(BigInt, BigInt)> = match s.bigranges.get(n) {
+                Some((lo, hi)) => Some((lo.clone(), hi.clone())),
+                None => s
+                    .ranges
+                    .get(n)
+                    .map(|(lo, hi)| (BigInt::from(*lo), BigInt::from(*hi))),
+            };
+            let in_i64 = match &merged {
+                Some((lo, hi)) => *lo >= BigInt::from(I64MIN) && *hi <= BigInt::from(I64MAX),
+                None => false,
+            };
+            // u64 tier: non-negative past i64, within one machine word.
+            // Subexpression safety comes from the vetoes below (any
+            // wrapping use vetoes the var first) — the width only ever
+            // names the value's own range.
+            let in_u64 = match &merged {
+                Some((lo, hi)) => *lo >= BigInt::from(0) && *hi < BigInt::from(1u128 << 64),
+                None => false,
+            };
+            if !in_i64 && !in_u64 {
+                continue;
+            }
+            if s.vetoed.contains(n) {
+                continue;
+            }
+            // Homed/i53 bigints stay out — UNLESS the value is BigInt-proven
+            // to need exactly the u64 tier (past i64, within one machine
+            // word): a non-negative sub-2^64 exact value has a sound C
+            // word, so "needs GMP somewhere" must not block it. The
+            // re-admit requires a BigInt-exact range (i128-only claims
+            // stay homed — wrap-lies must never re-enter here).
+            let big_exact_u64 = match s.bigranges.get(n) {
+                Some((lo, hi)) => {
+                    *hi > BigInt::from(I64MAX)
+                        && *lo >= BigInt::from(0)
+                        && *hi < BigInt::from(1u128 << 64)
+                }
+                None => false,
+            };
+            if bigint.contains(n) && !big_exact_u64 {
+                continue;
+            }
+            // NOTE: no separate range-derived-bigint check is needed —
+            // anything beyond u64 (or below the i64 floor) already fails
+            // both gates above, and the homed set covers the rest.
+            if is_top && veto_union.contains(n) {
+                continue;
+            }
+            let width = if in_u64 && !in_i64 {
+                Some("u64".to_string())
+            } else {
+                match s.widths.get(n).map(String::as_str) {
+                    Some("i32") => Some("i32".to_string()),
+                    _ => None,
+                }
+            };
+            declares.push(VarDeclare {
+                name: (*n).clone(),
+                kind: "int".to_string(),
+                width,
+            });
+        }
+        out.push(ScopeDeclares {
+            name: s.name.clone(),
+            declares,
+        });
+    }
+    out
+}
+
+/// Storage widths for one scope's statements: "i32" iff the (hulled)
+/// value range AND every assigned Arith RHS exactly evaluate within
+/// i32; "i64" likewise for 64 bits; "i128" when the value fits 128 bits
+/// but not 64 (the __int128 middle tier — Cython has no bigint, so the
+/// .pyx tier rewrites these). Only names present in `ranges` are
+/// considered (callers intersect with Int); beyond-i128 ranges get no
+/// entry (object).
+pub fn analyze_widths(
+    stmts: &[crate::ir::IrStmt],
+    ranges: &std::collections::HashMap<String, (i128, i128)>,
+) -> std::collections::HashMap<String, String> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+    const I32MIN: i128 = i32::MIN as i128;
+    const I32MAX: i128 = i32::MAX as i128;
+    const I64MIN: i128 = i64::MIN as i128;
+    const I64MAX: i128 = i64::MAX as i128;
+    const I128MIN: i128 = i128::MIN;
+    const I128MAX: i128 = i128::MAX;
+    fn fits(v: (i128, i128), lo: i128, hi: i128) -> bool {
+        v.0 >= lo && v.1 <= hi
+    }
+    // assigned Arith RHS per var in this scope
+    fn collect_rhs(s: &IrStmt, out: &mut Vec<(String, ArithAst)>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Arith(a) = expr {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            out.push((t.var.clone(), (**a).clone()));
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    collect_rhs(b, out);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        collect_rhs(x, out);
+                    }
+                }
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+                for b in body {
+                    collect_rhs(b, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for x in b {
+                    collect_rhs(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rhs_list: Vec<(String, ArithAst)> = Vec::new();
+    for s in stmts {
+        collect_rhs(s, &mut rhs_list);
+    }
+    // tier predicate: value range AND every assigned-RHS subexpression
+    // must fit (same subexpression rule as i32, generalized)
+    fn subexpr_fits(
+        a: &ArithAst,
+        ranges: &std::collections::HashMap<String, (i128, i128)>,
+        lo: i128,
+        hi: i128,
+    ) -> bool {
+        let ok_here = match arith_range_exact(a, ranges) {
+            Some(rr) => fits(rr, lo, hi),
+            None => false,
+        };
+        if !ok_here {
+            return false;
+        }
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => {
+                subexpr_fits(lhs, ranges, lo, hi) && subexpr_fits(rhs, ranges, lo, hi)
+            }
+            ArithAst::Un { arg, .. } => subexpr_fits(arg, ranges, lo, hi),
+            ArithAst::Cond { test, then, else_, .. } => {
+                subexpr_fits(test, ranges, lo, hi)
+                    && subexpr_fits(then, ranges, lo, hi)
+                    && subexpr_fits(else_, ranges, lo, hi)
+            }
+            ArithAst::Assign { rhs, .. } => subexpr_fits(rhs, ranges, lo, hi),
+            ArithAst::Cast { arg, .. } => subexpr_fits(arg, ranges, lo, hi),
+            ArithAst::Index { key, .. } => subexpr_fits(key, ranges, lo, hi),
+            _ => true,
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (n, r) in ranges {
+        // collect this var's assigned RHS once
+        let rhs_of: Vec<&ArithAst> = rhs_list
+            .iter()
+            .filter(|(v, _)| v == n)
+            .map(|(_, a)| a)
+            .collect();
+        let fits_tier = |lo: i128, hi: i128| {
+            fits(*r, lo, hi)
+                && rhs_of
+                    .iter()
+                    .all(|a| subexpr_fits(a, ranges, lo, hi))
+        };
+        if fits_tier(I32MIN, I32MAX) {
+            out.insert(n.clone(), "i32".to_string());
+        } else if fits_tier(I64MIN, I64MAX) {
+            out.insert(n.clone(), "i64".to_string());
+        } else if fits_tier(I128MIN, I128MAX) {
+            out.insert(n.clone(), "i128".to_string());
+        }
+    }
+    out
+}
+
+/// Numeric variables whose `: i64` annotation can be safely omitted from a
+/// `let` binding in the Rust backend.
+///
+/// The Rust backend currently emits `let x: i64 = …;` for every Int-homed
+/// pass-2 local. For variables whose proven value range fits in i32, the
+/// annotation is redundant: Rust infers i32 from an unsuffixed integer literal,
+/// and all arithmetic (`+`, `-`, `<`, etc.) between i32 values yields i32
+/// — identical semantics for values that never exceed i32.
+///
+/// Soundness vetoes (any one is enough to WITHHOLD the variable):
+///  * width ≠ i32 (the range escapes i32 — i64 annotation is needed);
+///  * the variable is ever read as an *array index key* — the Rust backend
+///    renders index keys through `expr_num`, which types them as i64 (the
+///    `__k: i64` temporaries in index rendering). An i32 variable fed into
+///    `let __k: i64 = …` would be a hard E0308.
+///
+/// Only `IrExpr::Index { key }` and `ArithAst::Index { key }` shape a key
+/// in the IR — both are checked. A `param("slice", "v", …)` call passes the
+/// variable NAME as a `Str`, not a numeric read, so it does not veto.
+/// Result of `analyze_i64_omittable`: both the set of variables whose `: i64`
+/// annotation can be omitted, and the set of index-key variables proven
+/// non-negative (whose index rendering can use `usize` instead of `i64`).
+pub struct I64OmitInfo {
+    pub omittable: std::collections::HashSet<String>,
+    /// Index-key variables whose range lower bound is >= 0 — safe to render
+    /// with `usize` in `array_index_strict` (no negative-wrap, no `as usize`
+    /// at the indexing site).
+    pub nonneg_idx_keys: std::collections::HashSet<String>,
+}
+
+pub fn analyze_i64_omittable(prog: &IrProgram) -> I64OmitInfo {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+    use std::collections::HashSet;
+
+    let ranges = analyze_var_ranges(prog);
+    let widths = analyze_widths(&prog.stmts, &ranges);
+
+    // Collect every variable name that appears as an array-index KEY in
+    // the IR. The Rust backend renders index keys as i64 temporaries
+    // (`let __k: i64 = <key>`), so an i32 local used as a key would
+    // produce a hard E0308 when the `: i64` annotation is dropped.
+    let mut index_keys: HashSet<String> = HashSet::new();
+
+    // Extract a bare variable name from an IrExpr if it is a simple
+    // variable read (Var, Ident, or getVar("name")).
+    fn var_name_in(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(n.clone()),
+            IrExpr::Call { func, args } if *func == "getVar" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if !n.is_empty() {
+                        Some(n.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn arith_var_name(a: &ArithAst) -> Option<String> {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
+    // Walk an expression, recursing into all children, but ONLY recording
+    // a name when it is the DIRECT key of an Index node.
+    fn walk_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Index { key, .. } => {
+                if let Some(n) = var_name_in(key) {
+                    out.insert(n);
+                }
+                walk_expr(key, out);
+            }
+            IrExpr::Arith(a) => walk_arith(a, out),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, out);
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, out);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr(i, out);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, out);
+                }
+            }
+            IrExpr::Arrow(b) => {
+                for s in b {
+                    walk_stmt(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_arith(a: &ArithAst, out: &mut HashSet<String>) {
+        match a {
+            ArithAst::Index { key, .. } => {
+                if let Some(n) = arith_var_name(key) {
+                    out.insert(n);
+                }
+                walk_arith(key, out);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith(lhs, out);
+                walk_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => walk_arith(arg, out),
+            ArithAst::Cond { test, then, else_, .. } => {
+                walk_arith(test, out);
+                walk_arith(then, out);
+                walk_arith(else_, out);
+            }
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs, out),
+            ArithAst::Cast { arg, .. } => walk_arith(arg, out),
+            _ => {}
+        }
+    }
+
+    fn walk_stmt(s: &IrStmt, out: &mut HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    for ix in &t.indices {
+                        walk_expr(ix, out);
+                    }
+                }
+                walk_expr(expr, out);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_expr(e, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    walk_expr(e, out);
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, out),
+            IrStmt::Output { value, .. } => walk_expr(value, out),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, out);
+                walk_expr(content, out);
+            }
+            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                walk_expr(cmd, out);
+                for a in args {
+                    walk_expr(a, out);
+                }
+                for r in redirects {
+                    walk_expr(r, out);
+                }
+                for (_, v) in env {
+                    walk_expr(v, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for s in stage {
+                        walk_stmt(s, out);
+                    }
+                }
+            }
+            IrStmt::Return(oe) | IrStmt::Exit(oe) => {
+                if let Some(e) = oe {
+                    walk_expr(e, out);
+                }
+            }
+            IrStmt::SetChildError(e) => walk_expr(e, out),
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, out);
+                for s in then {
+                    walk_stmt(s, out);
+                }
+                for (_, b) in elsifs {
+                    for s in b {
+                        walk_stmt(s, out);
+                    }
+                }
+                for s in else_ {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, out);
+                for s in body {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, out);
+                for s in body {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                for s in init {
+                    walk_stmt(s, out);
+                }
+                walk_expr(cond, out);
+                for s in step {
+                    walk_stmt(s, out);
+                }
+                for s in body {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                for s in b {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                for s in body {
+                    walk_stmt(s, out);
+                }
+                for (_, b) in named_blocks {
+                    for s in b {
+                        walk_stmt(s, out);
+                    }
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr(discriminant, out);
+                for c in clauses {
+                    for s in &c.body {
+                        walk_stmt(s, out);
+                    }
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for s in body {
+                    walk_stmt(s, out);
+                }
+                for e in excepts {
+                    if let Some(g) = &e.match_expr {
+                        walk_expr(g, out);
+                    }
+                    for s in &e.body {
+                        walk_stmt(s, out);
+                    }
+                }
+                for s in else_body {
+                    walk_stmt(s, out);
+                }
+                for s in finally_body {
+                    walk_stmt(s, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(ch) = &c.ch {
+                        walk_expr(ch, out);
+                    }
+                    if let Some(v) = &c.value {
+                        walk_expr(v, out);
+                    }
+                    for s in &c.body {
+                        walk_stmt(s, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Walk the program to collect all variables used as index keys
+    for s in &prog.stmts {
+        walk_stmt(s, &mut index_keys);
+    }
+
+    // A variable qualifies if: Int-typed, width is i32, not an index key
+    let mut out: HashSet<String> = HashSet::new();
+    let mut nonneg_idx_keys: HashSet<String> = HashSet::new();
+    for (name, ty) in &prog.var_types {
+        if *ty == crate::ir::IrType::Int {
+            let w = widths.get(name).cloned().unwrap_or_else(|| "i64".to_string());
+            if w == "i32" && !index_keys.contains(name) {
+                out.insert(name.clone());
+            }
+            // If this variable is an index key AND its proven lower bound is
+            // >= 0, the Rust renderer can use `usize` instead of `i64` —
+            // no negative-wrap, no `as usize` at the indexing site.
+            if index_keys.contains(name) {
+                if let Some((lo, _)) = ranges.get(name) {
+                    if *lo >= 0 {
+                        nonneg_idx_keys.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    I64OmitInfo { omittable: out, nonneg_idx_keys }
+}
+
+/// True when an arith tree reads a bigint-homed var (or a sized-int
+/// cast) — shared by the C/Zig exact-int lowerings.
+
+/// True when an arith tree reads a bigint-homed var (or a sized-int
+/// cast) — shared by the C/Zig exact-int lowerings.
+pub fn arith_refs_bigint(a: &crate::ir::ArithAst, vars: &std::collections::BTreeSet<String>) -> bool {
+    match a {
+        crate::ir::ArithAst::Num(_) => false,
+        crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => vars.contains(n),
+        crate::ir::ArithAst::Index { key, .. } => arith_refs_bigint(key, vars),
+        crate::ir::ArithAst::Bin { lhs, rhs, .. } => {
+            arith_refs_bigint(lhs, vars) || arith_refs_bigint(rhs, vars)
+        }
+        crate::ir::ArithAst::Un { arg, .. } => arith_refs_bigint(arg, vars),
+        crate::ir::ArithAst::Cond { test, then, else_ } => {
+            arith_refs_bigint(test, vars)
+                || arith_refs_bigint(then, vars)
+                || arith_refs_bigint(else_, vars)
+        }
+        crate::ir::ArithAst::Assign { rhs, .. } => arith_refs_bigint(rhs, vars),
+        crate::ir::ArithAst::IncDec { var, .. } => vars.contains(var),
+        crate::ir::ArithAst::Sizeof(_) => false,
+        crate::ir::ArithAst::Cast { ty, .. } => matches!(
+            ty,
+            crate::ir::IrType::Int64 | crate::ir::IrType::UInt64 | crate::ir::IrType::Int32 | crate::ir::IrType::UInt32
+        ),
+    }
+}
+
+/// SH2_PROFILE_WIDE candidates: scalar vars that look like unbounded
+/// *growers* — a self-RMW arithmetic assignment using `*`, `**` or `<<`
+/// (`x = x * 2`), and never read in a loop/if condition. Homing these in
+/// GMP for the instrumented build lets the wide probe measure the true
+/// magnitude instead of the wrapped `long long` (which saturates the
+/// bucket at 8 and hides the difference between 64 and 128 bits).
+
+/// Vars homed in bigint storage: every arithmetic assignment recorded
+/// (not just the first — a mixed accumulator typed plain once and
+/// `Cast(Int64)` later is bigint; first-wins left `long long` decls
+/// feeding `mpz_add`). Fixpoint over the recorded trees.
+pub fn analyze_bigint_vars(prog: &crate::ir::IrProgram) -> std::collections::BTreeSet<String> {
+    fn harvest(stmts: &[IrStmt], out: &mut Vec<(String, crate::ir::ArithAst)>) {
+        for s in stmts {
+            match s {
+                crate::ir::IrStmt::Assign { targets, expr, .. } => {
+                    if let (Some(t), crate::ir::IrExpr::Arith(a)) = (targets.first(), expr) {
+                        // Record EVERY arithmetic assignment, not just the
+                        // first: a var assigned a plain arith once and a
+                        // `Cast(Int64)`-wrapped arith later (a mixed
+                        // accumulator) is bigint, and the old “first wins”
+                        // dedup missed it — leaving `long long v` declared
+                        // while the later assign rendered `mpz_add(v, …)`.
+                        if t.indices.is_empty() {
+                            out.push((t.var.clone(), (**a).clone()));
+                        }
+                    }
+                }
+                crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                    harvest(then, out);
+                    for (_, b) in elsifs {
+                        harvest(b, out);
+                    }
+                    harvest(else_, out);
+                }
+                crate::ir::IrStmt::While { body, .. }
+                | crate::ir::IrStmt::DoWhile { body, .. }
+                | crate::ir::IrStmt::For { body, .. }
+                | crate::ir::IrStmt::Function { body, .. }
+                | crate::ir::IrStmt::Subshell(body)
+                | crate::ir::IrStmt::Background(body)
+                | crate::ir::IrStmt::Block(body) => harvest(body, out),
+                crate::ir::IrStmt::ForInit { init, step, body, .. } => {
+                    harvest(init, out);
+                    harvest(step, out);
+                    harvest(body, out);
+                }
+                crate::ir::IrStmt::Try { body, else_body, finally_body, .. } => {
+                    harvest(body, out);
+                    harvest(else_body, out);
+                    harvest(finally_body, out);
+                }
+                crate::ir::IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        harvest(&c.body, out);
+                    }
+                }
+                crate::ir::IrStmt::Redirect { inner, .. } => harvest(inner, out),
+                _ => {}
+            }
+        }
+    }
+    let mut pairs = Vec::new();
+    harvest(&prog.stmts, &mut pairs);
+    for sub in &prog.subs {
+        harvest(&sub.body, &mut pairs);
+    }
+    let mut vars = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (v, a) in &pairs {
+            if !vars.contains(v) && arith_refs_bigint(a, &vars) {
+                vars.insert(v.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vars
+}
+
+// ── static word-list facts (shared; C/C++/Zig/Rust storage selection) ──
+
+/// The compile-time text of a word-list ELEMENT, or `None` when it
+/// involves any expansion/glob. Mirrors `shir_passes::echo_fold`'s
+/// private helper (the fold's own definition of "constant word"): a bare
+/// `Str`, or an `Interpolate` whose parts are ALL literal text.
+///
+/// This is the primitive every static-typed backend needs to decide
+/// whether a word list can live in read-only static storage
+/// (`&[&str]`, `static const char*[]`, `[]const []const u8`,
+/// `std::string_view`) instead of an owned/heap container.
+pub fn static_word_text(w: &IrExpr) -> Option<String> {
+    use crate::ir::InterpPart;
+    match w {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A word list is STATIC when it is an `Array` whose every element is a
+/// compile-time literal (`["a", "b", "c"]` — the Python `for x in [...]`
+/// and constant-arg shapes). Such a list never allocates, never mutates
+/// and never escapes: every backend can materialize it once in read-only
+/// static storage and BORROW each element.
+///
+/// Returns the element texts (in order) so a backend emits the literal
+/// array directly, or `None` when any element is dynamic.
+pub fn static_word_list(items: &[crate::ir::IrExpr]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(static_word_text(it)?);
+    }
+    Some(out)
+}
+
+/// The whole-list READ of an array: `${arr[@]}` (a slice with no
+/// bounds), `listVar("arr")`, or a bare `Var`/`Ident` read. Returns the
+/// array name when the expression reads the WHOLE list (a bounded slice
+/// or a single-element read is not a whole-list consumer and keeps the
+/// owned path).
+pub fn static_list_read(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(n.clone()),
+        IrExpr::Call { func, args } if func == "listVar" => match args.first() {
+            Some(IrExpr::Str(n, _)) => Some(n.clone()),
+            _ => None,
+        },
+        IrExpr::Call { func, args } if func == "param" => {
+            // param("slice", name, "@", "") — the whole array, no bounds
+            let arg_str = |i: usize| match args.get(i) {
+                Some(IrExpr::Str(s, _)) => Some(s.clone()),
+                _ => None,
+            };
+            let op = arg_str(0)?;
+            let name = arg_str(1)?;
+            let at = arg_str(2)?;
+            let len = arg_str(3)?;
+            if op == "slice" && at == "@" && len.is_empty() && is_ident_name(&name) {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        // A word-list wrapper around exactly one whole-list read.
+        IrExpr::Array(items) if items.len() == 1 => static_list_read(&items[0]),
+        _ => None,
+    }
+}
+
+fn is_ident_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Program-wide verdict: the arrays whose LENGTH is a compile-time
+/// constant for the whole program.
+///
+/// A fixed-length array can be materialized as a Rust array (`[T; N]`)
+/// with an element store (`a[i] = v`) rather than a growable `Vec`, and
+/// the renderer can then offer direct indexing (no `resize` arm) — the
+/// `a = [1,2,3]; print(a[1])` shape.
+///
+/// Qualification is deliberately narrow, because a WRONG length is a
+/// miscompile, not a missed optimization:
+///
+///  * the array has exactly one (or more) writes, and ALL of them are
+///    literal lists (`setArray`/`DeclareArray`/array-literal assign) at a
+///    non-loop, top-level position — so the length is known and the
+///    array is never re-grown;
+///  * no append (`setArrayAppend`, `push`, `+=`), no `unset`, no
+///    whole-array replacement by a non-literal, no dynamic-name builtin
+///    (`eval`/`read`/`declare -a "$name"`) that could reach it;
+///  * every write's element count agrees (a program-wide constant);
+///  * every element STORE (`a[i] = v`, `a[k] += …`) is inside the proven
+///    index range `0 <= i < N` — otherwise bash would grow the array and
+///    the constant length would be a lie. A non-constant key, a negative
+///    key, or a key that could reach N vetoes.
+///
+/// The result maps each qualifying array to its constant length. Element
+/// stores are permitted here (unlike `analyze_static_arrays`, which
+/// requires whole-list reads only) — the point of this verdict is the
+/// store-plus-index shape, not just iteration.
+pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+
+    #[derive(Default)]
+    struct Acc {
+        /// array -> literal length of its init (all inits must agree)
+        len: HashMap<String, usize>,
+        /// arrays with no literal init, or disagreeing/again-written
+        bad: std::collections::HashSet<String>,
+        /// arrays whose element store may reach outside `0..len`
+        store_bad: std::collections::HashSet<String>,
+        /// a dynamic-name builtin appeared anywhere (any array may be
+        /// reached by name at runtime) — vetoes everything
+        dynamic: bool,
+    }
+
+    fn literal_len(e: &IrExpr) -> Option<usize> {
+        match e {
+            IrExpr::Array(items) => {
+                // an assoc-map init (`declare -A d; d=([a]=1 [b]=2)`)
+                // arrives with `[k]=v` element words — those are KEY/VALUE
+                // pairs, not list elements; a const-length INDEX array
+                // decision must not claim them
+                if items.iter().any(|it| match it {
+                    IrExpr::Str(s, _) => s.trim_start().starts_with('['),
+                    _ => false,
+                }) {
+                    return None;
+                }
+                Some(items.len())
+            }
+            _ => None,
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<&str> {
+        match e {
+            IrExpr::Str(s, _) if is_ident_name(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Is `key` provably in `0..=last` (the only element a store may
+    /// touch for a length-N array)? Literal ints and small constant
+    /// arithmetic only — anything else vetoes.
+    fn provable_index(key: &IrExpr, last: usize) -> bool {
+        match key {
+            IrExpr::Int(n) => *n >= 0 && (*n as usize) <= last,
+            IrExpr::Str(s, _) => match s.trim().parse::<i128>() {
+                Ok(n) => n >= 0 && (n as usize) <= last,
+                Err(_) => false,
+            },
+            IrExpr::Arith(a) => match const_arith(a) {
+                Some(n) => n >= 0 && (n as usize) <= last,
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Constant-fold a small integer arith tree (no vars, no calls).
+    fn const_arith(a: &ArithAst) -> Option<i128> {
+        match a {
+            ArithAst::Num(n) => Some(*n as i128),
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = const_arith(lhs)?;
+                let r = const_arith(rhs)?;
+                match op.as_str() {
+                    "+" => Some(l + r),
+                    "-" => Some(l - r),
+                    "*" => Some(l * r),
+                    "/" if r != 0 => Some(l / r),
+                    "%" if r != 0 => Some(l % r),
+                    _ => None,
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let v = const_arith(arg)?;
+                match op.as_str() {
+                    "-" => Some(-v),
+                    _ => Some(v),
+                }
+            }
+            ArithAst::Cast { arg, .. } => const_arith(arg),
+            _ => None,
+        }
+    }
+
+    /// Record a write of `name` from `rhs` (a literal list or not).
+    fn write(acc: &mut Acc, name: &str, rhs: &IrExpr) {
+        if acc.bad.contains(name) {
+            return;
+        }
+        match literal_len(rhs) {
+            Some(n) => match acc.len.get(name) {
+                Some(prev) if *prev != n => {
+                    acc.len.remove(name);
+                    acc.bad.insert(name.to_string());
+                }
+                Some(_) => {}
+                None => {
+                    acc.len.insert(name.to_string(), n);
+                }
+            },
+            None => {
+                acc.len.remove(name);
+                acc.bad.insert(name.to_string());
+            }
+        }
+    }
+
+    fn walk_expr(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr(i, acc);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, acc),
+            IrExpr::Call { func, args } => {
+                // Name-taking builtins can reach an array by name at
+                // runtime — but only when the NAME is dynamic. A literal
+                // identifier argument (`getVar("x")`, the lowering of a
+                // plain `print(x)`) names exactly one scalar, so it can
+                // never reach an unrelated array: it is a static read,
+                // not a dynamic one. Veto only when no literal name is
+                // available (a computed name, or a variable holding one).
+                if matches!(
+                    func.as_str(),
+                    "eval" | "read" | "getVar" | "unset" | "declare" | "local" | "typeset"
+                ) {
+                    let literal_name = args.iter().any(|a| match a {
+                        IrExpr::Str(s, _) => {
+                            let t = s.trim();
+                            is_ident_name(t) || t.split('[').next().map(is_ident_name).unwrap_or(false)
+                        }
+                        _ => false,
+                    });
+                    if !literal_name {
+                        acc.dynamic = true;
+                    }
+                }
+                for a in args {
+                    walk_expr(a, acc);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_expr(x, acc);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, acc);
+                walk_expr(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, acc);
+                walk_expr(then, acc);
+                walk_expr(else_, acc);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, acc);
+                walk_expr(default, acc);
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, acc),
+            IrExpr::Arith(a) => walk_arith(a, acc),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, acc);
+                }
+            }
+            IrExpr::Splice(x) => walk_expr(x, acc),
+            _ => {}
+        }
+    }
+
+    fn walk_arith(a: &ArithAst, acc: &mut Acc) {
+        match a {
+            ArithAst::Index { key, .. } => walk_arith(key, acc),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith(lhs, acc);
+                walk_arith(rhs, acc);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => walk_arith(arg, acc),
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs, acc),
+            ArithAst::IncDec { var, .. } => {
+                // `a[i]++`-style: the walker sees the var via Index
+                let _ = var;
+            }
+            ArithAst::Cond { test, then, else_ } => {
+                walk_arith(test, acc);
+                walk_arith(then, acc);
+                walk_arith(else_, acc);
+            }
+            _ => {}
+        }
+    }
+
+    /// A statement is a top-level init of `name` when it is an Assign to a
+    /// bare name whose RHS is a literal list (possibly wrapped in the
+    /// frontend's `setArray(name, Array[…])` call).
+    fn init_of(expr: &IrExpr) -> Option<&IrExpr> {
+        match expr {
+            IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => args.get(1),
+            _ => None,
+        }
+    }
+
+    fn walk(stmts: &[IrStmt], acc: &mut Acc, in_loop: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    // an element store (`a[i] = …`) must stay in range
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                        if !t.indices.is_empty() {
+                            let Some(n) = acc.len.get(&base).copied() else {
+                                // unknown-length array: an element store
+                                // does not make it constant, but it must
+                                // not silently qualify later either
+                                for ix in &t.indices {
+                                    walk_expr(ix, acc);
+                                }
+                                continue;
+                            };
+                            let last = n.saturating_sub(1);
+                            let ok = t.indices.iter().all(|k| {
+                                // a nested index (`a[x[i]]`) is not
+                                // provable from constants
+                                provable_index(k, last)
+                            });
+                            if !ok {
+                                acc.store_bad.insert(base);
+                            }
+                            for ix in &t.indices {
+                                walk_expr(ix, acc);
+                            }
+                        } else if is_ident_name(&t.var) {
+                            if let Some(rhs) = init_of(expr) {
+                                write(acc, &t.var, rhs);
+                            } else {
+                                write(acc, &t.var, expr);
+                            }
+                        }
+                    }
+                    if let Some(rhs) = init_of(expr) {
+                        walk_expr(rhs, acc);
+                    } else {
+                        walk_expr(expr, acc);
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    if in_loop {
+                        let mut a = IrExpr::Array(vec![]);
+                        // a re-init inside a loop: length is still the
+                        // literal count (a `Vec::from_elem`-style write)
+                        a = IrExpr::Array(elements.clone());
+                        write(acc, var, &a);
+                    } else {
+                        let arr = IrExpr::Array(elements.clone());
+                        write(acc, var, &arr);
+                    }
+                    for e in elements {
+                        walk_expr(e, acc);
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setArray" && args.len() >= 2 => {
+                    if let Some(n) = name_arg(&args[0]) {
+                        write(acc, n, &args[1]);
+                    }
+                    walk_expr(&args[1], acc);
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setArrayAppend" => {
+                    // an append breaks the constant length
+                    if let Some(n) = name_arg(args.first().unwrap_or(&IrExpr::Bool(false))) {
+                        acc.len.remove(n);
+                        acc.bad.insert(n.to_string());
+                    }
+                    walk_expr(&IrExpr::Array(args.to_vec()), acc);
+                }
+                IrStmt::Expr(e) => walk_expr(e, acc),
+                IrStmt::Output { value, .. } => walk_expr(value, acc),
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    walk_expr(cond, acc);
+                    walk(then, acc, in_loop);
+                    for (c, b) in elsifs {
+                        walk_expr(c, acc);
+                        walk(b, acc, in_loop);
+                    }
+                    walk(else_, acc, in_loop);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, acc, in_loop);
+                    walk_expr(cond, acc);
+                    walk(step, acc, in_loop);
+                    walk(body, acc, true);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, acc, in_loop);
+                    for (_, b) in named_blocks {
+                        walk(b, acc, in_loop);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, acc, in_loop)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, acc, in_loop),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc, in_loop);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, acc, in_loop);
+                    for e in excepts {
+                        walk(&e.body, acc, in_loop);
+                    }
+                    walk(else_body, acc, in_loop);
+                    walk(finally_body, acc, in_loop);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    walk_expr(discriminant, acc);
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        walk_expr(e, acc);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        walk_expr(x, acc);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    walk_expr(path, acc);
+                    walk_expr(content, acc);
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, acc),
+                _ => {}
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc, false);
+    for sub in &prog.subs {
+        // a function body runs later, but a literal re-init still fixes
+        // the length; an element store there is judged the same way
+        walk(&sub.body, &mut acc, false);
+    }
+    if acc.dynamic {
+        return HashMap::new();
+    }
+    acc.len
+        .into_iter()
+        .filter(|(n, _)| !acc.store_bad.contains(n))
+        .collect()
+}
+
+/// How a function's output sink looks at its call sites — the per-function
+/// verdict sibling of the program-wide [`crate::shir_passes::analysis::needs_runtime`].
+///
+/// A shell function's `echo` must honour whatever fd-1 redirection is
+/// active where it is CALLED (`f > file` routes the body's output to the
+/// file), which is why every print goes through a sink-aware helper. But a
+/// function that is never called under a redirect can never see a non-stdout
+/// sink, so its body can print straight to stdout — idiomatic host code
+/// with no sink arm at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkContext {
+    /// Every call site is outside any redirect/capture: the sink is the
+    /// process stdout at every entry, so a body print is a plain print.
+    Never,
+    /// Every call site is inside a redirect/capture: the body always
+    /// writes to an active sink.
+    Always,
+    /// Both (or the verdict could not be established — a dynamic caller,
+    /// no call site at all, an exported/ambiguous name): the body must
+    /// keep the runtime sink check. The CONSERVATIVE default.
+    Sometimes,
+}
+
+/// Per-function sink-context verdict — see [`SinkContext`].
+///
+/// The walk tracks whether it is inside a redirect/capture region and
+/// records that fact at every call site of a DEFINED function. Callers the
+/// analysis cannot see (a dynamic `eval`/`source`, a name that is also a
+/// sub, a function called before its definition is known, a function with
+/// no call site in the program) leave the verdict at `Sometimes`, so a
+/// `Never` verdict is always a licence and never a guess.
+///
+/// Redirect kinds that establish a sink: `IrStmt::Redirect` (a `{ … } > f`
+/// group / `f > f` command redirect), a `Capture` expression (command
+/// substitution — an implicit fd-1 sink), and a pipeline stage that is not
+/// the LAST (its stdout goes into the pipe). A pipeline's last stage keeps
+/// the caller's sink.
+pub fn analyze_fn_sink_contexts(prog: &IrProgram) -> HashMap<String, SinkContext> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    // every function name defined anywhere (nested defs included) — a call
+    // to one of these is what we classify
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // names defined more than once, or colliding with a sub: ambiguous
+    // bodies → conservative
+    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn collect_defs(
+        stmts: &[IrStmt],
+        defined: &mut std::collections::HashSet<String>,
+        ambiguous: &mut std::collections::HashSet<String>,
+    ) {
+        for st in stmts {
+            match st {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks, ..
+                } => {
+                    if !defined.insert(name.clone()) {
+                        ambiguous.insert(name.clone());
+                    }
+                    collect_defs(body, defined, ambiguous);
+                    for (_, nb) in named_blocks {
+                        collect_defs(nb, defined, ambiguous);
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => collect_defs(body, defined, ambiguous),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    collect_defs(then, defined, ambiguous);
+                    for (_, arm) in elsifs {
+                        collect_defs(arm, defined, ambiguous);
+                    }
+                    collect_defs(else_, defined, ambiguous);
+                }
+                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                    collect_defs(body, defined, ambiguous)
+                }
+                IrStmt::Redirect { inner, .. } => collect_defs(inner, defined, ambiguous),
+                _ => {}
+            }
+        }
+    }
+    collect_defs(&prog.stmts, &mut defined, &mut ambiguous);
+    for sub in &prog.subs {
+        // a sub sharing a shell function's name makes the callee ambiguous
+        // (the outparam channel is invisible here)
+        if defined.contains(&sub.name) {
+            ambiguous.insert(sub.name.clone());
+        }
+    }
+
+    /// Every call site's sink state, per function name: (saw_never,
+    /// saw_always). A name absent from the map was never observed as a
+    /// call.
+    type Sites = HashMap<String, (bool, bool)>;
+    struct Walk<'a> {
+        defined: &'a std::collections::HashSet<String>,
+        sites: Sites,
+        in_sink: bool,
+        /// set while walking a function BODY definition: a call inside one
+        /// function's body happens wherever THAT function is called, so the
+        /// textual sink state there says nothing about the callee. Marked
+        /// "unclassifiable" instead of recording a spurious site.
+        in_def: usize,
+    }
+    impl<'a> Walk<'a> {
+        fn call(&mut self, name: &str) {
+            if !self.defined.contains(name) {
+                return;
+            }
+            let e = self.sites.entry(name.to_string()).or_insert((false, false));
+            if self.in_def > 0 {
+                // inside a body: the sink depends on the CALLER's caller —
+                // conservative (leave both flags alone; absence of a
+                // Never/Always observation keeps the verdict Sometimes)
+                return;
+            }
+            if self.in_sink {
+                e.1 = true;
+            } else {
+                e.0 = true;
+            }
+        }
+        fn stmts(&mut self, stmts: &[IrStmt]) {
+            for s in stmts {
+                self.stmt(s);
+            }
+        }
+        fn stmt(&mut self, s: &IrStmt) {
+            match s {
+                // a redirect region: fd-1 (or any fd) is remapped for the
+                // inner statements — a nested group redirect nests
+                IrStmt::Redirect { inner, .. } => {
+                    let saved = self.in_sink;
+                    self.in_sink = true;
+                    self.stmts(inner);
+                    self.in_sink = saved;
+                }
+                // a function DEFINITION body: not executed here
+                IrStmt::Function {
+                    body, named_blocks, ..
+                } => {
+                    self.in_def += 1;
+                    self.stmts(body);
+                    for (_, nb) in named_blocks {
+                        self.stmts(nb);
+                    }
+                    self.in_def -= 1;
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    self.expr(cond);
+                    self.stmts(body);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    self.expr(iter);
+                    self.stmts(body);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    self.stmts(init);
+                    self.expr(cond);
+                    self.stmts(step);
+                    self.stmts(body);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => self.stmts(b),
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    self.expr(cond);
+                    self.stmts(then);
+                    for (c, arm) in elsifs {
+                        self.expr(c);
+                        self.stmts(arm);
+                    }
+                    self.stmts(else_);
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                } => {
+                    self.expr(discriminant);
+                    for c in clauses {
+                        self.stmts(&c.body);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    self.stmts(body);
+                    for e in excepts {
+                        self.stmts(&e.body);
+                    }
+                    self.stmts(else_body);
+                    self.stmts(finally_body);
+                }
+                IrStmt::Expr(e) => self.expr(e),
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    ..
+                } => {
+                    // `f > file` at command level: the redirects list on
+                    // an Exec is the same sink
+                    let saved = self.in_sink;
+                    if !redirects.is_empty() {
+                        self.in_sink = true;
+                    }
+                    self.expr(cmd);
+                    for a in args {
+                        self.expr(a);
+                    }
+                    self.in_sink = saved;
+                }
+                IrStmt::Output { value, target, .. } => {
+                    let saved = self.in_sink;
+                    if target.is_some() {
+                        self.in_sink = true;
+                    }
+                    self.expr(value);
+                    self.in_sink = saved;
+                }
+                IrStmt::Assign { expr, .. } => self.expr(expr),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        self.expr(i);
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        self.expr(e);
+                    }
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => self.expr(e),
+                // a pipeline: every stage but the LAST writes into the pipe
+                // (a sink); the last stage inherits the caller's sink
+                IrStmt::Pipeline { stages, .. } => {
+                    let n = stages.len();
+                    for (i, st) in stages.iter().enumerate() {
+                        let saved = self.in_sink;
+                        if i + 1 < n {
+                            self.in_sink = true;
+                        }
+                        self.stmts(st);
+                        self.in_sink = saved;
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn expr(&mut self, e: &IrExpr) {
+            match e {
+                // command substitution: an implicit fd-1 sink for its body
+                IrExpr::Capture { expr, .. } => match &**expr {
+                    IrExpr::Arrow(body) => {
+                        let saved = self.in_sink;
+                        self.in_sink = true;
+                        self.stmts(body);
+                        self.in_sink = saved;
+                    }
+                    other => self.expr(other),
+                },
+                IrExpr::Arrow(body) => self.stmts(body),
+                IrExpr::Call { func, args } => {
+                    // the FRONTEND spelling of a command substitution:
+                    // `capture(Arrow([…]))` — same implicit fd-1 sink as the
+                    // `Capture` node above. Without this arm a function
+                    // called inside a capture body was recorded as a
+                    // NEVER-sinked site, so the renderer printed straight to
+                    // stdout (bypassing the capture buffer) and the value
+                    // came back empty (t52/t41 shape: `x = f()` printed the
+                    // function's output AND an extra blank line).
+                    if func == "capture" {
+                        let saved = self.in_sink;
+                        self.in_sink = true;
+                        for a in args {
+                            self.expr(a);
+                        }
+                        self.in_sink = saved;
+                        return;
+                    }
+                    // the fn-call shapes (see the backend's is_fn_capture):
+                    // `fnCall("f")` / `exec("f", [...])` / `builtin(...)`
+                    if matches!(func.as_str(), "fnCall" | "fnValue") {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            self.call(name);
+                        }
+                    } else if func == "exec" || func == "builtin" {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            self.call(name);
+                        }
+                    }
+                    // A PIPELINE call carries its stages as `Arrow` bodies:
+                    // every stage but the LAST writes into the pipe (a
+                    // sink); the last stage keeps the caller's sink.
+                    if func == "pipeline" {
+                        let stages: &[IrExpr] = match args.first() {
+                            Some(IrExpr::Array(items)) => items,
+                            _ => &[],
+                        };
+                        let n = stages.len();
+                        for (i, st) in stages.iter().enumerate() {
+                            let saved = self.in_sink;
+                            if i + 1 < n {
+                                self.in_sink = true;
+                            }
+                            self.expr(st);
+                            self.in_sink = saved;
+                        }
+                        for a in args.iter().skip(1) {
+                            self.expr(a);
+                        }
+                        return;
+                    }
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                IrExpr::BinOp { lhs, rhs, .. } => {
+                    self.expr(lhs);
+                    self.expr(rhs);
+                }
+                IrExpr::Ternary { cond, then, else_ } => {
+                    self.expr(cond);
+                    self.expr(then);
+                    self.expr(else_);
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            self.expr(x);
+                        }
+                    }
+                }
+                IrExpr::Index { key, .. } => self.expr(key),
+                IrExpr::DefinedOr { expr, default } => {
+                    self.expr(expr);
+                    self.expr(default);
+                }
+                IrExpr::Array(items) => {
+                    for i in items {
+                        self.expr(i);
+                    }
+                }
+                IrExpr::MethodCall { obj, args, .. } => {
+                    self.expr(obj);
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut w = Walk {
+        defined: &defined,
+        sites: HashMap::new(),
+        in_sink: false,
+        in_def: 0,
+    };
+    w.stmts(&prog.stmts);
+    for sub in &prog.subs {
+        // a sub body runs at its call sites (outparam), which this walk
+        // does not model → its name stays conservative
+        let _ = sub;
+    }
+
+    let mut out: HashMap<String, SinkContext> = HashMap::new();
+    for name in &defined {
+        if ambiguous.contains(name) {
+            out.insert(name.clone(), SinkContext::Sometimes);
+            continue;
+        }
+        // a function DEFINED but never called in-program: the sink at its
+        // (unknown, possibly external) call sites is not established
+        match w.sites.get(name) {
+            Some((true, false)) => {
+                out.insert(name.clone(), SinkContext::Never);
+            }
+            Some((false, true)) => {
+                out.insert(name.clone(), SinkContext::Always);
+            }
+            _ => {
+                out.insert(name.clone(), SinkContext::Sometimes);
+            }
+        }
+    }
+    out
+}
+
+/// Program-wide verdict: the ARRAYS whose value is a compile-time literal
+/// list. An array qualifies when every write is a single, loop-free
+/// all-literal `setArray`/`DeclareArray`/`Array`-assign and the array is
+/// only consumed as a whole list (iterated, `listVar`-ed) — never
+/// index-written, appended, sliced, or passed to a mutating builtin.
+///
+/// This is the `xs = ["a","b","c"]` shape a Python frontend emits for
+/// `for x in xs:` (the iterable is `param("slice", "xs", "@", "")`).
+/// Every statically-typed backend can then materialize the list once from
+/// literals and BORROW the elements instead of allocating an owned
+/// container (and, in the Rust backend's case, cloning the whole vector
+/// per loop iteration).
+pub fn analyze_static_arrays(prog: &IrProgram) -> HashMap<String, Vec<String>> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    #[derive(Default)]
+    struct Acc {
+        /// name -> the literal element texts of its (only) init
+        init: HashMap<String, Vec<String>>,
+        /// arrays written more than once, or by a non-literal source
+        veto: std::collections::HashSet<String>,
+        /// arrays read as anything other than the whole list
+        used_otherwise: std::collections::HashSet<String>,
+    }
+
+    fn elements_of(e: &IrExpr) -> Option<&Vec<IrExpr>> {
+        match e {
+            IrExpr::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Record a write to `name`: a literal init first, a veto after.
+    fn write_init(acc: &mut Acc, name: &str, texts: Option<Vec<String>>) {
+        if acc.veto.contains(name) {
+            return;
+        }
+        match texts {
+            Some(t) => {
+                if acc.init.insert(name.to_string(), t).is_some() {
+                    // a second init: not a single static definition
+                    acc.init.remove(name);
+                    acc.veto.insert(name.to_string());
+                }
+            }
+            None => {
+                acc.init.remove(name);
+                acc.veto.insert(name.to_string());
+            }
+        }
+    }
+
+    fn name_arg(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) if is_ident_name(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Any whole-list read of `e` is fine; every other mention of an array
+    /// name is a veto. Conservative: an unknown call mentioning a name
+    /// counts as "used otherwise".
+    fn scan_expr_reads(e: &IrExpr, acc: &mut Acc) {
+        if static_list_read(e).is_some() {
+            return;
+        }
+        match e {
+            IrExpr::Call { func, args } => {
+                // a mutating/partial consumer of any array name in the args
+                if matches!(
+                    func.as_str(),
+                    "setArray"
+                        | "setArrayAppend"
+                        | "arrayIndex"
+                        | "arrayStore"
+                        | "join"
+                        | "arrayLen"
+                        | "arrayItems"
+                        | "split"
+                ) {
+                    for a in args {
+                        if let Some(n) = name_arg(a) {
+                            acc.used_otherwise.insert(n);
+                        }
+                        scan_expr_reads(a, acc);
+                    }
+                    return;
+                }
+                for a in args {
+                    scan_expr_reads(a, acc);
+                }
+            }
+            IrExpr::Array(items) => {
+                // a multi-element Array is a word list, not a whole-array
+                // read of one name — scan the parts
+                for it in items {
+                    scan_expr_reads(it, acc);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        scan_expr_reads(x, acc);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                scan_expr_reads(lhs, acc);
+                scan_expr_reads(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr_reads(cond, acc);
+                scan_expr_reads(then, acc);
+                scan_expr_reads(else_, acc);
+            }
+            IrExpr::Capture { expr, .. } => scan_expr_reads(expr, acc),
+            IrExpr::Index { var, key } => {
+                acc.used_otherwise.insert(var.clone());
+                scan_expr_reads(key, acc);
+            }
+            IrExpr::Arith(a) => scan_arith_reads(a, acc),
+            IrExpr::DefinedOr { expr, default } => {
+                scan_expr_reads(expr, acc);
+                scan_expr_reads(default, acc);
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    scan_expr_reads(v, acc);
+                }
+            }
+            IrExpr::Splice(x) => scan_expr_reads(x, acc),
+            _ => {}
+        }
+    }
+
+    fn scan_arith_reads(a: &ArithAst, acc: &mut Acc) {
+        match a {
+            ArithAst::Index { var, key } => {
+                acc.used_otherwise.insert(var.clone());
+                scan_arith_reads(key, acc);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith_reads(lhs, acc);
+                scan_arith_reads(rhs, acc);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => scan_arith_reads(arg, acc),
+            ArithAst::Assign { rhs, .. } => scan_arith_reads(rhs, acc),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith_reads(test, acc);
+                scan_arith_reads(then, acc);
+                scan_arith_reads(else_, acc);
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a statement: record array writes, scan reads. `in_loop` marks
+    /// a write that runs 0..N times (never a single static init).
+    fn walk(stmts: &[IrStmt], acc: &mut Acc, in_loop: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if (func == "setArray" || func == "setArrayAppend") && args.len() >= 2 =>
+                {
+                    if let Some(n) = name_arg(&args[0]) {
+                        if func == "setArrayAppend" || in_loop {
+                            write_init(acc, &n, None);
+                        } else {
+                            let texts = elements_of(&args[1])
+                                .and_then(|items| static_word_list(items));
+                            write_init(acc, &n, texts);
+                        }
+                    }
+                    scan_expr_reads(&args[1], acc);
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let texts = static_word_list(elements);
+                    if in_loop {
+                        write_init(acc, var, None);
+                    } else {
+                        write_init(acc, var, texts);
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    // `xs = ["a","b","c"]` arrives as Assign with a
+                    // `setArray("xs", Array[...])` RHS (the frontend's
+                    // array-init form), or directly as an Array RHS.
+                    let set_array_elems = match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            elements_of(&args[1])
+                        }
+                        _ => None,
+                    };
+                    for t in targets {
+                        if t.indices.is_empty() && is_ident_name(&t.var) {
+                            if let Some(items) = set_array_elems.or_else(|| elements_of(expr)) {
+                                if !in_loop {
+                                    let texts = static_word_list(items);
+                                    write_init(acc, &t.var, texts);
+                                    continue;
+                                }
+                            }
+                            // any other assignment to the name vetoes it
+                            write_init(acc, &t.var, None);
+                        } else if !t.indices.is_empty() {
+                            acc.used_otherwise.insert(t.var.clone());
+                        }
+                    }
+                    // the init's OWN setArray must not be read as a
+                    // "partial consumer" — re-scan the element exprs only.
+                    match expr {
+                        IrExpr::Call { func, args } if func == "setArray" && args.len() >= 2 => {
+                            scan_expr_reads(&args[1], acc);
+                        }
+                        _ => scan_expr_reads(expr, acc),
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    scan_expr_reads(iter, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    scan_expr_reads(cond, acc);
+                    walk(body, acc, true);
+                }
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    scan_expr_reads(cond, acc);
+                    walk(then, acc, in_loop);
+                    for (c, b) in elsifs {
+                        scan_expr_reads(c, acc);
+                        walk(b, acc, in_loop);
+                    }
+                    walk(else_, acc, in_loop);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    walk(init, acc, in_loop);
+                    scan_expr_reads(cond, acc);
+                    walk(step, acc, in_loop);
+                    walk(body, acc, true);
+                }
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk(body, acc, in_loop);
+                    for (_, b) in named_blocks {
+                        walk(b, acc, in_loop);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, acc, in_loop)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, acc, in_loop),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, acc, in_loop);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, acc, in_loop);
+                    for e in excepts {
+                        walk(&e.body, acc, in_loop);
+                    }
+                    walk(else_body, acc, in_loop);
+                    walk(finally_body, acc, in_loop);
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                } => {
+                    scan_expr_reads(discriminant, acc);
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, acc, in_loop);
+                    }
+                }
+                IrStmt::Output { value, .. } => scan_expr_reads(value, acc),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        scan_expr_reads(e, acc);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    scan_expr_reads(path, acc);
+                    scan_expr_reads(content, acc);
+                }
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr_reads(expr, acc),
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    env,
+                    ..
+                } => {
+                    scan_expr_reads(cmd, acc);
+                    for a in args {
+                        scan_expr_reads(a, acc);
+                    }
+                    for r in redirects {
+                        scan_expr_reads(r, acc);
+                    }
+                    for (_, e) in env {
+                        scan_expr_reads(e, acc);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        scan_expr_reads(x, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk(&prog.stmts, &mut acc, false);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut acc, true);
+    }
+    acc.init
+        .into_iter()
+        .filter(|(n, _)| !acc.used_otherwise.contains(n))
+        .collect()
+}
+
+/// Loop-variable escape facts: for each `For` in the program (pre-order
+/// position), whether its loop variable is READ anywhere outside that
+/// loop's own body. When it is not, the loop's per-iteration write-back
+/// of the variable (the store a shell-typed backend must otherwise keep,
+/// so a later `$var` sees the last element — bash leaves the loop var set
+/// after the loop) is unobservable and may be dropped.
+///
+/// This is the shared half of the "bind the element natively" decision:
+/// the backend supplies the other half (the body must not write the var,
+/// shadow it, or hand its NAME to a name-taking builtin — see the Rust
+/// backend's `loop_var_scan`).
+///
+/// Keyed by pre-order `For` position, like the other iterator facts.
+/// Conservative: a name appearing as a FUNCTION parameter, in another
+/// function body, or in a subshell counts as a read (over-approximate —
+/// a missed escape would drop a live store).
+pub fn analyze_loop_var_escapes(prog: &IrProgram) -> HashMap<usize, bool> {
+    use crate::ir::IrStmt;
+    use crate::shir_passes::optimize::{stmt_reads, stmts_read};
+
+    fn walk(stmts: &[IrStmt], seq: &mut usize, out: &mut HashMap<usize, bool>) {
+        for (i, s) in stmts.iter().enumerate() {
+            if let IrStmt::For { var, body, .. } = s {
+                let here = *seq;
+                *seq += 1;
+                // read OUTSIDE this loop = sibling statements at this
+                // level (before and after) + the rest of the program
+                let mut escapes = false;
+                for (j, other) in stmts.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    if stmt_reads(var, other) {
+                        escapes = true;
+                        break;
+                    }
+                }
+                out.insert(here, escapes);
+                walk(body, seq, out);
+                continue;
+            }
+            // nested containers: their For loops are still visited
+            walk_children(s, seq, out);
+        }
+    }
+
+    fn walk_children(s: &IrStmt, seq: &mut usize, out: &mut HashMap<usize, bool>) {
+        match s {
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                walk(then, seq, out);
+                for (_, b) in elsifs {
+                    walk(b, seq, out);
+                }
+                walk(else_, seq, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => walk(body, seq, out),
+            IrStmt::ForInit {
+                init,
+                step,
+                body,
+                ..
+            } => {
+                walk(init, seq, out);
+                walk(step, seq, out);
+                walk(body, seq, out);
+            }
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                walk(body, seq, out);
+                for (_, b) in named_blocks {
+                    walk(b, seq, out);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                walk(body, seq, out);
+                for e in excepts {
+                    walk(&e.body, seq, out);
+                }
+                walk(else_body, seq, out);
+                walk(finally_body, seq, out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    walk(&c.body, seq, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    walk(&c.body, seq, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => walk(inner, seq, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk(st, seq, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut seq = 0usize;
+    let mut out = HashMap::new();
+    walk(&prog.stmts, &mut seq, &mut out);
+    // A subroutine is a separate scope but may still observe a top-level
+    // loop variable; scan its body conservatively.
+    for sub in &prog.subs {
+        let mut sub_stmts = sub.body.clone();
+        walk(&mut sub_stmts, &mut seq, &mut out);
+    }
+    let _ = stmts_read;
+    out
+}
+
+// ── int-array facts (hoisted from the C backend verbatim — the list-tier
+// verdicts every consumer reads: homed native int stores, reductions).
+// Behavior-identical move; the C backend calls these.
+
+// ── argv shift-offset facts (shared shIR analysis) ────────────────────
+// A shell function that does `local desc="$1"; shift` (a CONSTANT shift,
+// exactly once, at fn top level) re-bases its positionals: post-shift
+// `$i` is pre-shift `$(i+k)` and post-shift `$@` is pre-shift `${@:k+1}`.
+// The verdict maps the function name to its constant shift amount `k`.
+//
+// Qualification is deliberately narrow, because a WRONG offset is a
+// miscompile, not a missed optimization:
+//   * exactly ONE `shift` in the body, with a CONSTANT non-negative
+//     amount (bare `shift` = 1), at the function's top level (not inside
+//     a loop/if — re-execution would shift again);
+//   * no `set --` (rebinds the whole argv), no `$#` read (its value
+//     changes under shift), no positional WRITE, no nested-function
+//     shift of the same argv;
+//   * no dynamic call that could observe argv opaquely (`eval`,
+//     `source`, `command -v`-style probes are reads, not calls — the
+//     call scan below only vetoes EXEC-position callees it cannot see
+//     through).
+// A function with no `shift` at all maps to 0 (callers may pass position
+// 0..n directly). Anything else is ABSENT from the map (conservative:
+// the legacy argv save/restore dance stays).
+/// How a function PARAMETER is consumed in its body — the licence for a
+/// borrowed (`&str`) parameter in the ownership-model backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamUse {
+    /// The parameter is only ever BORROWED: printed, interpolated,
+    /// compared, tested, parsed, hashed — every consumer needs only
+    /// `&str`. A borrow-typed parameter (`p: &str`) serves all of them, so
+    /// the caller need not hand over ownership (no `to_string()`).
+    Borrow,
+    /// The parameter (or a value derived from it) is STORED: assigned into
+    /// a variable, pushed into an owned collection, returned, or captured
+    /// into a closure that outlives the call. The callee keeps the value,
+    /// so the caller must hand over an owned `String`.
+    Own,
+}
+
+/// Per-function, per-parameter consumption verdict — see [`ParamUse`].
+///
+/// Keyed by function name → a `Vec` indexed by parameter (0-based, the
+/// shell `$1` is index 0). A function that is not in the map has no
+/// established verdict: its parameters must stay owned (the conservative
+/// default — see the ambiguity rules below).
+///
+/// WHY THIS IS A CORE ANALYSIS: every ownership-model backend (Rust's
+/// `String` vs `&str`, C++'s `std::string` vs `std::string_view`, Zig's
+/// `[]u8` vs `[]const u8`, …) pays the same avoidable copy at the call
+/// boundary. The decision is a property of the SOURCE program — how the
+/// callee uses the value — not of any one renderer, so it belongs here and
+/// is consumed by each backend that can express a borrow.
+///
+/// Deliberately conservative, because a wrong `Borrow` is a miscompile
+/// (the callee would store a reference that dies with the call frame):
+///   * the body must be a SINGLE unambiguous definition (a redefinition
+///     marks the name ambiguous);
+///   * positionals must not be REBOUND in the body (`set --`, `shift`) —
+///     the parameter then no longer identifies one caller word;
+///   * any construct the walk cannot classify (`eval`, `source`, a
+///     shell-out whose command text contains the positional, an unknown
+///     `ext`/method node) marks EVERY parameter owned;
+///   * a nested-function definition inside the body marks the parameters
+///     it could capture owned (the nested body may run after the call).
+pub fn analyze_param_use(prog: &IrProgram) -> HashMap<String, Vec<ParamUse>> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+    use std::collections::HashSet;
+
+    struct Acc {
+        /// parameter index -> usage (grows as reads are seen)
+        uses: Vec<ParamUse>,
+        /// the body rebinds the positional list (`set --` / `shift`) or
+        /// does something opaque — no verdict at all
+        veto: bool,
+        /// the body reads `$@`/`$*`/`$#` (a whole-argv read: not a single
+        /// parameter, but it makes the parameter model unsafe with a
+        /// rebinding — the shift verdict owns that case)
+        wild: bool,
+    }
+
+    /// The positional index of a `$N` read, if this expression is one.
+    fn positional_index(e: &IrExpr) -> Option<usize> {
+        let name = match e {
+            IrExpr::Var(n, _) => n.as_str(),
+            IrExpr::Str(n, _) => n.trim(),
+            IrExpr::Call { func, args } if func == "getVar" || func == "param" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => n.trim(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // `$0` is the script name, not a parameter
+        let n: usize = name.parse().ok()?;
+        (n >= 1).then(|| n - 1)
+    }
+
+    /// Does this expression CONTAIN a positional read (any position)?
+    fn mentions_positional(e: &IrExpr) -> bool {
+        let mut hit = false;
+        walk_expr_generic(e, &mut |x| {
+            if positional_index(x).is_some() {
+                hit = true;
+            }
+        });
+        hit
+    }
+
+    /// A generic expression walker used only by `mentions_positional`.
+    fn walk_expr_generic(e: &IrExpr, f: &mut impl FnMut(&IrExpr)) {
+        f(e);
+        match e {
+            IrExpr::Index { key, .. } => walk_expr_generic(key, f),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr_generic(lhs, f);
+                walk_expr_generic(rhs, f);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr_generic(cond, f);
+                walk_expr_generic(then, f);
+                walk_expr_generic(else_, f);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr_generic(expr, f);
+                walk_expr_generic(default, f);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_generic(x, f);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr_generic(i, f);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr_generic(a, f);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr_generic(obj, f);
+                for a in args {
+                    walk_expr_generic(a, f);
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr_generic(expr, f),
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    if let IrStmt::Expr(x) = s {
+                        walk_expr_generic(x, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    impl Acc {
+        fn mark(&mut self, i: usize, u: ParamUse) {
+            if self.uses.len() <= i {
+                self.uses.resize(i + 1, ParamUse::Borrow);
+            }
+            if u == ParamUse::Own {
+                self.uses[i] = ParamUse::Own;
+            }
+        }
+        /// Every positional mentioned in `e` is consumed by value.
+        fn mark_owned_in(&mut self, e: &IrExpr) {
+            let mut hits: Vec<usize> = Vec::new();
+            walk_expr_generic(e, &mut |x| {
+                if let Some(i) = positional_index(x) {
+                    hits.push(i);
+                }
+            });
+            for i in hits {
+                self.mark(i, ParamUse::Own);
+            }
+        }
+        /// Every positional mentioned in `e` is merely borrowed.
+        fn mark_borrowed_in(&mut self, e: &IrExpr) {
+            let mut hits: Vec<usize> = Vec::new();
+            walk_expr_generic(e, &mut |x| {
+                if let Some(i) = positional_index(x) {
+                    hits.push(i);
+                }
+            });
+            for i in hits {
+                self.mark(i, ParamUse::Borrow);
+            }
+        }
+    }
+
+    /// Walk a statement list. `owned_ctx` is true where the value's storage
+    /// is RETAINED past the expression (assignment RHS, collection store,
+    /// return value, a closure the callee keeps).
+    fn walk_stmts(stmts: &[IrStmt], acc: &mut Acc) {
+        for s in stmts {
+            walk_stmt(s, acc);
+        }
+    }
+
+    fn walk_stmt(s: &IrStmt, acc: &mut Acc) {
+        match s {
+            // STORING a positional (or anything derived from one) retains
+            // the value: `local x="$1"`, `arr=("$1")`, `x=$1`.
+            IrStmt::Assign { expr, .. } => acc.mark_owned_in(expr),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    acc.mark_owned_in(i);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    acc.mark_owned_in(e);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                acc.mark_owned_in(path);
+                acc.mark_owned_in(content);
+            }
+            // A `return "$1"` hands the value to the CALLER — retained.
+            IrStmt::Return(Some(e)) => acc.mark_owned_in(e),
+            // An output is a borrow: the print consumes the text.
+            IrStmt::Output { value, .. } => acc.mark_borrowed_in(value),
+            // A plain expression statement. `builtin`/`exec` carries the
+            // DECL/WRITE words (`local x="$1"`, `declare -a`, `export
+            // X="$1"`, `read x`) whose value is RETAINED in a variable —
+            // those must mark the positional owned, not borrowed.
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if matches!(func.as_str(), "builtin" | "exec") =>
+            {
+                // the command HEAD name: `builtin("eval", [...])`
+                let head = match args.first() {
+                    Some(IrExpr::Str(h, _)) => h.as_str(),
+                    _ => "",
+                };
+                // `eval`/`source`/`.` build a command string interpreted
+                // later; `set --`/`shift` rebind the positionals. None of
+                // these can be analysed from the IR — veto the function so
+                // every parameter stays owned.
+                if matches!(head, "eval" | "source" | "." | "set" | "shift") {
+                    acc.veto = true;
+                    return;
+                }
+                let retains = matches!(
+                    head,
+                    "local" | "declare" | "typeset" | "export" | "readonly"
+                        | "read" | "mapfile" | "readarray"
+                );
+                for a in args.iter().skip(1) {
+                    if retains {
+                        // a decl word `name=` (its VALUE word follows) or a
+                        // `name=value` literal: the assignment stores into
+                        // the variable, so the value is retained
+                        acc.mark_owned_in(a);
+                        // `local x=` + a separate value word: the word after
+                        // an empty `name=` is the stored value
+                        if let IrExpr::Str(n, _) = a {
+                            if n.ends_with('=') {
+                                // the FOLLOWING array element is the value
+                                // (handled by the flat mark above for the
+                                // `name=value` form; an empty `name=` is
+                                // followed by the value word in the same
+                                // array, which the mark above already covers
+                                // because the whole array is walked)
+                                let _ = n;
+                            }
+                        }
+                    } else {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+                // a non-decl `exec`/`builtin` (echo, printf, test, …)
+                // borrows its words
+                if !retains {
+                    for a in args.iter().skip(1) {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr_borrowed(e, acc),
+            // conditions/iterables: borrowed (compared, tested, iterated)
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                acc.mark_borrowed_in(cond);
+                walk_stmts(then, acc);
+                for (c, b) in elsifs {
+                    acc.mark_borrowed_in(c);
+                    walk_stmts(b, acc);
+                }
+                walk_stmts(else_, acc);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                acc.mark_borrowed_in(cond);
+                walk_stmts(body, acc);
+            }
+            IrStmt::For { iter, body, .. } => {
+                acc.mark_borrowed_in(iter);
+                walk_stmts(body, acc);
+            }
+            IrStmt::ForInit {
+                init, cond, step, body,
+            } => {
+                walk_stmts(init, acc);
+                acc.mark_borrowed_in(cond);
+                walk_stmts(step, acc);
+                walk_stmts(body, acc);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => walk_stmts(b, acc),
+            IrStmt::Background(b) => {
+                // a background body may outlive the call frame
+                for st in b {
+                    match st {
+                        IrStmt::Assign { expr, .. } => acc.mark_owned_in(expr),
+                        _ => walk_stmt(st, acc),
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    acc.mark_owned_in(&r.target);
+                }
+                walk_stmts(inner, acc);
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                acc.mark_borrowed_in(discriminant);
+                for c in clauses {
+                    walk_stmts(&c.body, acc);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                walk_stmts(body, acc);
+                for e in excepts {
+                    walk_stmts(&e.body, acc);
+                }
+                walk_stmts(else_body, acc);
+                walk_stmts(finally_body, acc);
+            }
+            // A nested function definition may be called AFTER this frame
+            // returns — anything it mentions is retained.
+            IrStmt::Function { body, named_blocks, .. } => {
+                for st in body.iter().chain(named_blocks.iter().flat_map(|(_, b)| b.iter())) {
+                    if let IrStmt::Expr(e) = st {
+                        acc.mark_owned_in(e);
+                    } else if let IrStmt::Assign { expr, .. } = st {
+                        acc.mark_owned_in(expr);
+                    }
+                }
+                acc.veto = true;
+            }
+            IrStmt::Exit(Some(e)) => acc.mark_owned_in(e),
+            IrStmt::Exit(None) | IrStmt::Return(None) | IrStmt::Break | IrStmt::Continue => {}
+            // `$@`/`$*`/`$#`: a whole-argv read
+            IrStmt::Exec { cmd, args, .. } => {
+                walk_exec(cmd, args, acc);
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_stmts(st, acc);
+                }
+            }
+            IrStmt::RawText(_) | IrStmt::Ext(_) => {
+                // opaque: we cannot see what the text does with argv
+                acc.veto = true;
+            }
+            // `die`/`warn` build a message from their expression (the
+            // value is consumed to build the text — a borrow, but the
+            // node is rare enough that the conservative answer is fine)
+            IrStmt::Die { .. } | IrStmt::Warn { .. } => acc.veto = true,
+            IrStmt::Label(_)
+            | IrStmt::Goto(_)
+            | IrStmt::Require(_)
+            | IrStmt::SetChildError(_)
+            | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. }
+            | IrStmt::Select { .. } => acc.veto = true,
+            _ => acc.veto = true,
+        }
+    }
+
+    /// A command: the positional in an ARGUMENT position is borrowed (the
+    /// child reads it), but `eval`/`source`, a write builtin, and anything
+    /// opaque retain it.
+    fn walk_exec(cmd: &IrExpr, args: &[IrExpr], acc: &mut Acc) {
+        let head = match cmd {
+            IrExpr::Str(h, _) => h.as_str(),
+            _ => {
+                acc.veto = true;
+                return;
+            }
+        };
+        // `eval`/`source`/`.` build a command STRING that is interpreted
+        // later — whether the positional is retained is not visible in the
+        // IR, so no verdict is safe: veto the whole function rather than
+        // guess (a wrong `Borrow` would hand the callee a reference that
+        // dies with the call frame).
+        if matches!(head, "eval" | "source" | ".") {
+            acc.veto = true;
+            return;
+        }
+        let opaque = matches!(head, "trap" | "alias" | "export" | "readonly");
+        // `shift` / `set --` rebind the positionals
+        if head == "shift" {
+            acc.veto = true;
+            return;
+        }
+        // a write builtin (`printf -v x`, `read x`, `mapfile`) stores
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) if s == "-v" => {
+                    acc.veto = true;
+                    return;
+                }
+                IrExpr::Str(s, _) if s.starts_with('=') || s.contains('=') => {
+                    // a VAR=value word — the value is retained
+                    acc.mark_owned_in(a);
+                }
+                _ => {}
+            }
+        }
+        if head == "set" {
+            acc.veto = true;
+            return;
+        }
+        if head == "read" || head == "mapfile" || head == "readarray" {
+            acc.veto = true;
+            return;
+        }
+        for a in args {
+            if opaque {
+                acc.mark_owned_in(a);
+            } else {
+                acc.mark_borrowed_in(a);
+            }
+        }
+    }
+
+    /// An expression in a position whose value is consumed by the very
+    /// next operation (a print argument, a test operand, a command word).
+    /// A bare positional is a BORROW; a positional inside a CALL that
+    /// produces a new value is still a borrow of the input.
+    fn walk_expr_borrowed(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            // `capture`/`pipeline` bodies run in a CHILD — the value is
+            // copied at the boundary, so it is borrowed
+            IrExpr::Capture { expr, .. } => match &**expr {
+                IrExpr::Arrow(body) => walk_stmts(body, acc),
+                other => walk_expr_borrowed(other, acc),
+            },
+            IrExpr::Arrow(body) => walk_stmts(body, acc),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr_borrowed(lhs, acc);
+                walk_expr_borrowed(rhs, acc);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr_borrowed(cond, acc);
+                walk_expr_borrowed(then, acc);
+                walk_expr_borrowed(else_, acc);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr_borrowed(expr, acc);
+                walk_expr_borrowed(default, acc);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr_borrowed(x, acc);
+                    }
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr_borrowed(key, acc),
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr_borrowed(i, acc);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr_borrowed(obj, acc);
+                for a in args {
+                    walk_expr_borrowed(a, acc);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // `setVar`/`setArray` RETAIN; `getVar`/`param`/`test`/…
+                // borrow
+                let retains = matches!(
+                    func.as_str(),
+                    "setVar" | "setArray" | "setArrayAppend" | "listVar"
+                );
+                for a in args {
+                    if retains {
+                        acc.mark_owned_in(a);
+                    } else {
+                        walk_expr_borrowed(a, acc);
+                    }
+                }
+            }
+            IrExpr::Str(..) | IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Var(..) => {
+                acc.mark_borrowed_in(e)
+            }
+            _ => acc.mark_owned_in(e),
+        }
+    }
+
+    // ── driver: one verdict per unambiguous function definition ────────
+    let mut defs: HashMap<String, &Vec<IrStmt>> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    fn collect<'a>(
+        stmts: &'a [IrStmt],
+        defs: &mut HashMap<String, &'a Vec<IrStmt>>,
+        ambiguous: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Function { name, body, named_blocks, .. } => {
+                    if defs.insert(name.clone(), body).is_some() {
+                        ambiguous.insert(name.clone());
+                    }
+                    for (_, b) in named_blocks {
+                        collect(b, defs, ambiguous);
+                    }
+                    collect(body, defs, ambiguous);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. }
+                | IrStmt::For { body: b, .. }
+                | IrStmt::Redirect { inner: b, .. } => collect(b, defs, ambiguous),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, defs, ambiguous);
+                    for (_, b) in elsifs {
+                        collect(b, defs, ambiguous);
+                    }
+                    collect(else_, defs, ambiguous);
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, defs, ambiguous);
+                    collect(step, defs, ambiguous);
+                    collect(body, defs, ambiguous);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, defs, ambiguous);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &mut defs, &mut ambiguous);
+    for sub in &prog.subs {
+        // a sub is not a shell function; a name collision makes callers
+        // ambiguous
+        if defs.contains_key(&sub.name) {
+            ambiguous.insert(sub.name.clone());
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (name, body) in defs {
+        if ambiguous.contains(&name) {
+            continue;
+        }
+        let mut acc = Acc {
+            uses: Vec::new(),
+            veto: false,
+            wild: false,
+        };
+        walk_stmts(body, &mut acc);
+        // A body that rebinds the positionals, or that we could not fully
+        // classify, keeps every parameter owned.
+        if acc.veto || acc.wild {
+            continue;
+        }
+        // A parameter the body never mentions is a borrow (nothing to
+        // retain).
+        out.insert(name, acc.uses);
+    }
+    out
+}
+
+/// The single-assignment variables whose value is only ever BORROWED —
+/// the variable-level generalisation of [`ParamUse`].
+///
+/// A variable qualifies when BOTH hold:
+///
+///   * it is IMMUTABLE: written exactly once, that write at most once per
+///     run, and never re-written by a runtime store, native arith
+///     (`x++`), an index element, or anything whose value we cannot see —
+///     i.e. exactly the existing `analyze_var_const` `Const` verdict.
+///     This is what makes a borrowed type sound: the storage is bound once
+///     and never re-assigned, so a `&str` pointing at that binding cannot
+///     be invalidated by a later store.
+///   * every READ of the value is a borrow — printed, interpolated,
+///     tested, compared, formatted, concatenated INTO A NEW VALUE, passed
+///     to a child process. Nothing reads it in order to retain it (an
+///     array-element store, a `return`, a closure the callee keeps, a
+///     write builtin's target).
+///
+/// Together those are the licence an ownership-model backend needs to bind
+/// the variable as a `&str` (Rust), `string_view` (C++), `[]const u8`
+/// (Zig) instead of an owned string — no `.to_string()` at the binding and
+/// no `.clone()` at every read.
+///
+/// Returns the set of variable names that qualify. As with
+/// [`analyze_param_use`], an unanalysable construct (`eval`/`source`, an
+/// opaque node) simply withholds the verdict, so a name absent from the
+/// set is the conservative answer, never a guess.
+/// Names bound by a TERNARY `If` (both branches assign the same name) — ONE
+/// definition rather than two, since the branches are exclusive.
+fn ternary_targets(s: &IrStmt, out: &mut Vec<String>) {
+    use crate::ir::IrStmt;
+    fn one(b: &[IrStmt]) -> Option<String> {
+        match b {
+            [IrStmt::Assign { targets, .. }] if targets.len() == 1 => Some(targets[0].var.clone()),
+            _ => None,
+        }
+    }
+    fn walk(list: &[IrStmt], out: &mut Vec<String>) {
+        for s in list {
+            if let IrStmt::If { then, elsifs, else_, .. } = s {
+                if elsifs.is_empty() {
+                    if let (Some(a), Some(b)) = (one(then), one(else_)) {
+                        if a == b {
+                            out.push(a);
+                        }
+                    }
+                }
+                for b in then.iter().chain(else_).chain(elsifs.iter().flat_map(|(_, b)| b.iter())) {
+                    walk(std::slice::from_ref(b), out);
+                }
+            }
+        }
+    }
+    walk(std::slice::from_ref(s), out);
+}
+
+pub fn analyze_var_borrowable(prog: &IrProgram) -> std::collections::HashSet<String> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt, VarKind};
+    use std::collections::HashSet;
+
+    // ── 1. immutability: exactly the const verdict ────────────────────
+    let immutable: HashSet<String> = analyze_var_const(prog)
+        .into_iter()
+        .filter(|(_, k)| *k == VarKind::Const)
+        .map(|(n, _)| n)
+        .collect();
+    if immutable.is_empty() {
+        return HashSet::new();
+    }
+
+    // ── 2. every read of the value is a borrow ────────────────────────
+    // `retained` collects names read in a retaining position; `read`
+    // collects every name read at all (a name that is never read is not
+    // borrowable — there is nothing to borrow, and removing its binding
+    // would change the program's shape for no benefit).
+    #[derive(Default)]
+    struct Acc {
+        retained: HashSet<String>,
+        read: HashSet<String>,
+        veto: bool,
+    }
+
+    impl Acc {
+        fn mark_read(&mut self, name: &str) {
+            self.read.insert(name.to_string());
+        }
+        fn mark_retained(&mut self, name: &str) {
+            self.read.insert(name.to_string());
+            self.retained.insert(name.to_string());
+        }
+    }
+
+    /// The variable name a value-read expression names, if any.
+    fn read_var(e: &IrExpr) -> Option<&str> {
+        match e {
+            IrExpr::Var(n, _) => Some(n.as_str()),
+            // the A1 read form: getVar("name") / param("", "name", …)
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) if !n.is_empty() => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The variable NAMES a call carries as string arguments — the
+    /// frontend convention where a value builtin takes the operand's name
+    /// as a `Str` (`param("slice", "s", …)` for `s[1:3]`, `arrayLen("a")`,
+    /// `join("a")`, `arrayIndex("a", …)`, `assocGet("m", …)`, `split("s",
+    /// …)`, `sum`/`min`/`max("a")`). These are READS of the named variable:
+    /// without them `analyze_var_borrowable` sees no read at all and
+    /// withholds, so the var stays an owned thread_local and every use
+    /// clones it (t37/t38: `let s = "hello".to_string();` then
+    /// `__sh_len(&s.clone())`).
+    ///
+    /// Only the exact funcs and arg positions the renderers consult as a
+    /// NAME are listed (see `param_str`, `listvar_joined`, `join_str`,
+    /// `array_index_str`, `assoc_get`). Anything else returns nothing, so
+    /// an unrecognised call cannot accidentally promote a string literal
+    /// into a read.
+    fn name_args(e: &IrExpr) -> Vec<&str> {
+        let (func, args) = match e {
+            IrExpr::Call { func, args } => (func.as_str(), args),
+            _ => return Vec::new(),
+        };
+        // (index, strips an `[@]`/`[*]` suffix)
+        let at: Option<usize> = match func {
+            // param(op, name, …) — `op` selects the operation, `name` is
+            // the variable (`slice`, `#`, `%`, `len`, `[@]`, …)
+            "param" => Some(1),
+            // the single-name value builtins
+            "arrayLen" | "arrayIndex" | "arrayItems" | "listVar" | "join" | "split" | "sum"
+            | "min" | "max" | "assocGet" | "assocKeys" => Some(0),
+            _ => None,
+        };
+        let idx = match at {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        if let Some(IrExpr::Str(n, _)) = args.get(idx) {
+            // `#x[@]` / `!m[@]` carry a sigil prefix and an `[@]`/`[*]`
+            // suffix in the name string
+            let n = n.trim_start_matches('#').trim_start_matches('!');
+            let n = n
+                .strip_suffix("[@]")
+                .or_else(|| n.strip_suffix("[*]"))
+                .unwrap_or(n);
+            if !n.is_empty() && n != "@" && n != "*" {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Every variable read inside `e`, reported as borrows unless the
+    /// expression is a retaining position (handled by the caller).
+    fn mark_reads(e: &IrExpr, acc: &mut Acc) {
+        // a call whose args NAME variables (`param("slice", "s", …)`)
+        // reads those variables
+        for n in name_args(e) {
+            acc.mark_read(n);
+        }
+        walk(e, &mut |x| {
+            if let Some(n) = read_var(x) {
+                acc.mark_read(n);
+            }
+            for n in name_args(x) {
+                acc.mark_read(n);
+            }
+        });
+    }
+    fn mark_retains(e: &IrExpr, acc: &mut Acc) {
+        walk(e, &mut |x| {
+            if let Some(n) = read_var(x) {
+                acc.mark_retained(n);
+            }
+        });
+    }
+
+    /// A generic expression walk (mentions, not ownership semantics).
+    fn walk(e: &IrExpr, f: &mut impl FnMut(&IrExpr)) {
+        f(e);
+        match e {
+            IrExpr::Index { key, .. } => walk(key, f),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk(lhs, f);
+                walk(rhs, f);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk(cond, f);
+                walk(then, f);
+                walk(else_, f);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk(expr, f);
+                walk(default, f);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk(x, f);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk(i, f);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk(a, f);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk(obj, f);
+                for a in args {
+                    walk(a, f);
+                }
+            }
+            // A test TEXT (`-z "$x"`, `"$a" = "$b"`): the frontends bake the
+            // operand spelling into the arg string, so the `$` references
+            // live only there. The py frontend lowers `if not x:` to
+            // `test("-z \"$x\"")` — without this arm the read never
+            // registers, the borrow verdict silently withholds, and the
+            // variable stays an owned thread_local (t27).
+            IrExpr::Str(text, _) => {
+                for v in crate::shir_passes::list_profile::scopes::dollar_vars(text) {
+                    f(&IrExpr::Var(v, Some(crate::ir::Sigil::Scalar)));
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk(expr, f),
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    if let IrStmt::Expr(x) = s {
+                        walk(x, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a statement list.
+    fn stmts(list: &[IrStmt], acc: &mut Acc) {
+        for s in list {
+            stmt(s, acc);
+        }
+    }
+
+    fn stmt(s: &IrStmt, acc: &mut Acc) {
+        match s {
+            // The BINDING itself: the TARGET is written, not read here.
+            // The RHS is routed through `expr` so the retaining shapes are
+            // recognised — an array store (`arr = [a]`, the `setArray`
+            // call form) keeps every element value, while a scalar
+            // binding consumes its RHS to build the new value (a borrow).
+            IrStmt::Assign { expr: rhs, .. } => expr(rhs, acc),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    mark_reads(i, acc);
+                }
+            }
+            // a collection STORE retains every element read
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    mark_retains(e, acc);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                mark_reads(path, acc);
+                mark_retains(content, acc);
+            }
+            // returning a value hands it to the caller — retained
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => mark_retains(e, acc),
+            IrStmt::Output { value, .. } => mark_reads(value, acc),
+            IrStmt::Expr(e) => expr(e, acc),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                mark_reads(cond, acc);
+                stmts(then, acc);
+                for (c, b) in elsifs {
+                    mark_reads(c, acc);
+                    stmts(b, acc);
+                }
+                stmts(else_, acc);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                mark_reads(cond, acc);
+                stmts(body, acc);
+            }
+            IrStmt::For { iter, body, .. } => {
+                mark_reads(iter, acc);
+                stmts(body, acc);
+            }
+            IrStmt::ForInit {
+                init, cond, step, body,
+            } => {
+                stmts(init, acc);
+                mark_reads(cond, acc);
+                stmts(step, acc);
+                stmts(body, acc);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => stmts(b, acc),
+            // a background body may outlive the enclosing frame — any
+            // read of a borrowed value there is retained
+            IrStmt::Background(b) => {
+                for st in b {
+                    match st {
+                        IrStmt::Expr(e) => mark_retains(e, acc),
+                        IrStmt::Assign { expr, .. } => mark_retains(expr, acc),
+                        other => stmt(other, acc),
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    mark_reads(&r.target, acc);
+                }
+                stmts(inner, acc);
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                mark_reads(discriminant, acc);
+                for c in clauses {
+                    stmts(&c.body, acc);
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                stmts(body, acc);
+                for e in excepts {
+                    stmts(&e.body, acc);
+                }
+                stmts(else_body, acc);
+                stmts(finally_body, acc);
+            }
+            // a nested function definition may run AFTER this frame — a
+            // borrowed local would dangle, so every value it reads is
+            // retained and the body is unanalysable
+            IrStmt::Function { body, named_blocks, .. } => {
+                for st in body.iter().chain(named_blocks.iter().flat_map(|(_, b)| b.iter())) {
+                    match st {
+                        IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => mark_retains(e, acc),
+                        _ => {}
+                    }
+                }
+                acc.veto = true;
+            }
+            IrStmt::Exec { cmd, args, .. } => {
+                mark_reads(cmd, acc);
+                for a in args {
+                    mark_reads(a, acc);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    stmts(st, acc);
+                }
+            }
+            IrStmt::RawText(_) | IrStmt::Ext(_) => acc.veto = true,
+            IrStmt::Label(_) | IrStmt::Goto(_) | IrStmt::Require(_) | IrStmt::Die { .. }
+            | IrStmt::Warn { .. } | IrStmt::SetChildError(_) | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. } | IrStmt::Select { .. } => acc.veto = true,
+            _ => {}
+        }
+    }
+
+    fn expr(e: &IrExpr, acc: &mut Acc) {
+        match e {
+            // a write builtin RETAINS: `setVar(x, v)` stores v in x's
+            // storage, so v is retained
+            IrExpr::Call { func, args } if func == "setVar" => {
+                mark_reads(args.first().unwrap_or(&IrExpr::Int(0)), acc);
+                for a in args.iter().skip(2) {
+                    mark_reads(a, acc);
+                }
+                if let Some(v) = args.get(1) {
+                    mark_retains(v, acc);
+                }
+            }
+            IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+                for a in args {
+                    mark_retains(a, acc);
+                }
+            }
+            // a command/child reads the value at the process boundary
+            IrExpr::Call { .. } | IrExpr::MethodCall { .. } => mark_reads(e, acc),
+            IrExpr::Capture { expr: inner, .. } => match &**inner {
+                IrExpr::Arrow(body) => stmts(body, acc),
+                other => expr(other, acc),
+            },
+            IrExpr::Arrow(body) => stmts(body, acc),
+            other => mark_reads(other, acc),
+        }
+    }
+
+    let mut acc = Acc::default();
+    stmts(&prog.stmts, &mut acc);
+    for sub in &prog.subs {
+        stmts(&sub.body, &mut acc);
+    }
+    if acc.veto {
+        // an unclassifiable construct anywhere: withhold the whole verdict
+        // rather than risk a dangling borrow
+        return HashSet::new();
+    }
+    immutable
+        .into_iter()
+        .filter(|n| acc.read.contains(n) && !acc.retained.contains(n))
+        .collect()
+}
+
+pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    fn shift_amount_of(body: &[IrStmt]) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        for s in body {
+            if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+                if func != "builtin" && func != "exec" {
+                    continue;
+                }
+                let (head, words) = match args.as_slice() {
+                    [IrExpr::Str(h, _), IrExpr::Array(w)] => (h.as_str(), w.as_slice()),
+                    _ => continue,
+                };
+                if head != "shift" {
+                    continue;
+                }
+                let n = match words {
+                    [] => 1usize,
+                    [IrExpr::Int(n)] if *n >= 0 => *n as usize,
+                    [IrExpr::Str(t, _)] => match t.trim().parse::<i64>() {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                if found.replace(n).is_some() {
+                    return None; // second shift — dynamic re-base
+                }
+            }
+        }
+        found
+    }
+
+    fn body_vetoes(body: &[IrStmt], defined: &std::collections::HashSet<String>) -> bool {
+        fn walk(stmts: &[IrStmt], defined: &std::collections::HashSet<String>) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Expr(IrExpr::Call { func, args }) => {
+                        if func == "builtin" || func == "exec" {
+                            if let Some(IrExpr::Str(h, _)) = args.first() {
+                                // `set --` rebinds argv; `eval`/`source`
+                                // observe it opaquely
+                                if h == "set" {
+                                    return true;
+                                }
+                                if matches!(h.as_str(), "eval" | "source" | ".") {
+                                    return true;
+                                }
+                            }
+                            // a bare `shift` nested in a loop/if is still
+                            // top-level here (walk only descends into
+                            // bodies below) — the amount scan required
+                            // top-level position already
+                        } else if func == "getVar" {
+                            // `$#` changes under shift
+                            if matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "#") {
+                                return true;
+                            }
+                        } else if defined.contains(func) {
+                            // a nested user-function call re-reads argv
+                            // through the callee's own frame — safe (the
+                            // callee gets its own offset verdict), so do
+                            // NOT veto; just keep walking
+                        }
+                        for a in args {
+                            if expr_vetoes(a) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Assign { targets, expr, .. } => {
+                        for t in targets {
+                            // writing a positional rebinds argv
+                            if t.var.chars().all(|c| c.is_ascii_digit()) && !t.var.is_empty() {
+                                return true;
+                            }
+                        }
+                        if expr_vetoes(expr) {
+                            return true;
+                        }
+                    }
+                    IrStmt::If { cond, then, elsifs, else_ } => {
+                        if expr_vetoes(cond) {
+                            return true;
+                        }
+                        if walk(then, defined) {
+                            return true;
+                        }
+                        for (c, b) in elsifs {
+                            if expr_vetoes(c) || walk(b, defined) {
+                                return true;
+                            }
+                        }
+                        if walk(else_, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                        if expr_vetoes(cond) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::For { iter, body, .. } => {
+                        if expr_vetoes(iter) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::ForInit { init, cond, step, body } => {
+                        if walk(init, defined) || expr_vetoes(cond) || walk(step, defined) || walk(body, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        // a NESTED function definition: its own frame —
+                        // walk it separately (its shift is its own)
+                        let _ = (body, named_blocks);
+                    }
+                    IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                        if walk(b, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => {
+                        if walk(inner, defined) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            if walk(st, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body } => {
+                        if walk(body, defined)
+                            || walk(else_body, defined)
+                            || walk(finally_body, defined)
+                        {
+                            return true;
+                        }
+                        for e in excepts {
+                            if walk(&e.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Case { discriminant, clauses } => {
+                        if expr_vetoes(discriminant) {
+                            return true;
+                        }
+                        for c in clauses {
+                            if walk(&c.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            if walk(&c.body, defined) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Return(e) | IrStmt::Exit(e) => {
+                        if let Some(x) = e {
+                            if expr_vetoes(x) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::Output { value, .. } => {
+                        if expr_vetoes(value) {
+                            return true;
+                        }
+                    }
+                    IrStmt::Declare { init, .. } => {
+                        if let Some(e) = init {
+                            if expr_vetoes(e) {
+                                return true;
+                            }
+                        }
+                    }
+                    IrStmt::WriteFile { path, content, .. } => {
+                        if expr_vetoes(path) || expr_vetoes(content) {
+                            return true;
+                        }
+                    }
+                    IrStmt::DeclareArray { elements, .. } => {
+                        for e in elements {
+                            if expr_vetoes(e) {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        fn expr_vetoes(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { func, args } => {
+                    if func == "getVar" {
+                        if matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "#") {
+                            return true;
+                        }
+                    }
+                    args.iter().any(expr_vetoes)
+                }
+                IrExpr::Array(items) => items.iter().any(expr_vetoes),
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    crate::ir::InterpPart::Expr(x) => expr_vetoes(x),
+                    _ => false,
+                }),
+                IrExpr::BinOp { lhs, rhs, .. } => expr_vetoes(lhs) || expr_vetoes(rhs),
+                IrExpr::Ternary { cond, then, else_ } => {
+                    expr_vetoes(cond) || expr_vetoes(then) || expr_vetoes(else_)
+                }
+                IrExpr::DefinedOr { expr, default } => expr_vetoes(expr) || expr_vetoes(default),
+                IrExpr::Capture { expr, .. } => expr_vetoes(expr),
+                IrExpr::Arith(_) => false,
+                IrExpr::Index { key, .. } => expr_vetoes(key),
+                IrExpr::Object(props) => props.iter().any(|(_, v)| expr_vetoes(v)),
+                IrExpr::Splice(x) => expr_vetoes(x),
+                _ => false,
+            }
+        }
+        walk(body, defined)
+    }
+
+    let mut defined = std::collections::HashSet::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, .. } = s {
+            defined.insert(name.clone());
+        }
+    }
+    let mut out = HashMap::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            // no shift at all → offset 0 (callers pass positionals
+            // straight through; the renderer already does this via
+            // pass-3 signatures — the map just records it uniformly)
+            let mut has_shift = false;
+            for b in body.iter() {
+                if let IrStmt::Expr(IrExpr::Call { func, args }) = b {
+                    if (func == "builtin" || func == "exec")
+                        && matches!(args.first(), Some(IrExpr::Str(h, _)) if h == "shift")
+                    {
+                        has_shift = true;
+                        break;
+                    }
+                }
+            }
+            if !has_shift {
+                out.insert(name.clone(), 0);
+                continue;
+            }
+            let Some(k) = shift_amount_of(body) else {
+                continue;
+            };
+            if body_vetoes(body, &defined) {
+                continue;
+            }
+            out.insert(name.clone(), k);
+        }
+    }
+    out
+}
+
+/// Functions that read the WHOLE argv (`$@`/`$*`/`$#`) without rebinding
+/// it: no `shift`, no `set --`, no positional write, no `$#`-changing
+/// construct. Such a function can take the caller's words as a trailing
+/// `&[String]` parameter instead of the caller swapping `__SH_ARGV` — a
+/// renderer-level rewrite (the verdict is just "the argv is the caller's
+/// words, verbatim, for the whole body").
+///
+/// Distinct from [`analyze_shift_offsets`]: that one re-bases a constant
+/// shift; this one is the no-shift case (`$#` is allowed here — it is the
+/// slice's length — but vetoes the shift rewrite, which cannot model it).
+pub fn analyze_whole_argv_fns(prog: &IrProgram) -> HashSet<String> {
+    use crate::ir::{IrExpr, IrStmt};
+
+    fn walk(stmts: &[IrStmt], reads: &mut bool, veto: &mut bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    if func == "builtin" || func == "exec" {
+                        if let Some(IrExpr::Str(h, _)) = args.first() {
+                            // rebinding the argv ends the model
+                            if h == "shift" || h == "set" {
+                                *veto = true;
+                            }
+                        }
+                    } else if func == "getVar" || func == "listVar" {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            if n == "@" || n == "*" || n == "#" {
+                                *reads = true;
+                            }
+                        }
+                    }
+                    for a in args {
+                        expr_walk(a, reads, veto);
+                    }
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if !t.var.is_empty() && t.var.chars().all(|c| c.is_ascii_digit()) {
+                            *veto = true; // positional write
+                        }
+                    }
+                    expr_walk(expr, reads, veto);
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    expr_walk(cond, reads, veto);
+                    walk(then, reads, veto);
+                    for (c, b) in elsifs {
+                        expr_walk(c, reads, veto);
+                        walk(b, reads, veto);
+                    }
+                    walk(else_, reads, veto);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    expr_walk(cond, reads, veto);
+                    walk(body, reads, veto);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    expr_walk(iter, reads, veto);
+                    walk(body, reads, veto);
+                }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, reads, veto);
+                    expr_walk(cond, reads, veto);
+                    walk(step, reads, veto);
+                    walk(body, reads, veto);
+                }
+                // a NESTED function has its own argv frame — skip it
+                IrStmt::Function { .. } => {}
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    walk(b, reads, veto)
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, reads, veto),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, reads, veto);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, reads, veto);
+                    for e in excepts {
+                        walk(&e.body, reads, veto);
+                    }
+                    walk(else_body, reads, veto);
+                    walk(finally_body, reads, veto);
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    expr_walk(discriminant, reads, veto);
+                    for c in clauses {
+                        walk(&c.body, reads, veto);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk(&c.body, reads, veto);
+                    }
+                }
+                IrStmt::Return(e) | IrStmt::Exit(e) => {
+                    if let Some(x) = e {
+                        expr_walk(x, reads, veto);
+                    }
+                }
+                IrStmt::Output { value, .. } => expr_walk(value, reads, veto),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(e) = init {
+                        expr_walk(e, reads, veto);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr_walk(path, reads, veto);
+                    expr_walk(content, reads, veto);
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        expr_walk(e, reads, veto);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn expr_walk(e: &IrExpr, reads: &mut bool, veto: &mut bool) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "getVar" || func == "listVar" {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n == "@" || n == "*" || n == "#" {
+                            *reads = true;
+                        }
+                    }
+                }
+                for a in args {
+                    expr_walk(a, reads, veto);
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    expr_walk(i, reads, veto);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        expr_walk(x, reads, veto);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_walk(lhs, reads, veto);
+                expr_walk(rhs, reads, veto);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_walk(cond, reads, veto);
+                expr_walk(then, reads, veto);
+                expr_walk(else_, reads, veto);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_walk(expr, reads, veto);
+                expr_walk(default, reads, veto);
+            }
+            IrExpr::Capture { expr, .. } => expr_walk(expr, reads, veto),
+            IrExpr::Index { key, .. } => expr_walk(key, reads, veto),
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    expr_walk(v, reads, veto);
+                }
+            }
+            IrExpr::Splice(x) => expr_walk(x, reads, veto),
+            _ => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    for s in &prog.stmts {
+        if let IrStmt::Function { name, body, .. } = s {
+            let (mut reads, mut veto) = (false, false);
+            walk(body, &mut reads, &mut veto);
+            if reads && !veto {
+                out.insert(name.clone());
+            }
+        }
+    }
+    out
+}
+
+pub fn analyze_int_arrays(prog: &IrProgram) -> HashSet<String> {
+    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    let bigint_vars = analyze_bigint_vars(prog);
+    let mut all_arrays: HashSet<String> = HashSet::new();
+    let mut int_consumed: HashSet<String> = HashSet::new();
+    let mut non_int_write: HashSet<String> = HashSet::new();
+    let mut string_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        walk_int_array_stmt(
+            s,
+            &mut all_arrays,
+            &mut int_consumed,
+            &mut non_int_write,
+            &mut string_read,
+            &vt,
+            &bigint_vars,
+        );
+    }
+    // Pass 2: every array READ anywhere (not just the known string
+    // reads). A write-only int list may be homed natively; one that is
+    // read by an unhandled consumer (slice/join/…) falls back to the old
+    // int-consumer requirement, so no string consumer can be surprised by
+    // a native representation.
+    let mut any_read: HashSet<String> = HashSet::new();
+    for s in &prog.stmts {
+        mark_reads_stmt(s, &all_arrays, &mut any_read);
+    }
+    all_arrays
+        .into_iter()
+        .filter(|a| {
+            // Home as a native int store when EVERY write is int-domain,
+            // no element is read as text, and the array is either an int
+            // consumer or never read at all (docs/PY_BENCH.md finding C:
+            // an explicit accumulator instead of `sum(xs)` used to force
+            // snprintf+strdup per element).
+            !non_int_write.contains(a)
+                && !string_read.contains(a)
+                && (int_consumed.contains(a) || !any_read.contains(a))
+        })
+        .collect()
+}
+
+pub fn analyze_reduce_arrays(prog: &IrProgram) -> HashSet<String> {
+    let int_arrays = analyze_int_arrays(prog);
+    let mut reduce: HashSet<String> = HashSet::new();
+    fn walk(stmts: &[IrStmt], reduce: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, reduce),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, reduce),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    for b in then { walk(std::slice::from_ref(b), reduce); }
+                    for (_, b) in elsifs { walk(b, reduce); }
+                    for b in else_ { walk(std::slice::from_ref(b), reduce); }
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body, reduce),
+                IrStmt::For { body, .. } => walk(body, reduce),
+                IrStmt::Function { body, .. } => walk(body, reduce),
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    walk(body, reduce)
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages.iter().flatten() { walk(std::slice::from_ref(st), reduce); }
+                }
+                IrStmt::Ext(n) => {
+                    for c in n.children() { walk(std::slice::from_ref(c), reduce); }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, reduce: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if matches!(func.as_str(), "max" | "min" | "sum") {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        reduce.insert(name.clone());
+                    }
+                }
+                for a in args { walk_expr(a, reduce); }
+            }
+            IrExpr::Array(items) => {
+                for it in items { walk_expr(it, reduce); }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, reduce);
+                walk_expr(rhs, reduce);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p { walk_expr(x, reduce); }
+                }
+            }
+            IrExpr::Ext(n) => {
+                for c in n.children() { walk_expr(c, reduce); }
+            }
+            _ => {}
+        }
+    }
+    walk(&prog.stmts, &mut reduce);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut reduce);
+    }
+    // only int arrays (the aggregate is a plain i64)
+    reduce.retain(|a| int_arrays.contains(a));
+    reduce
+}
+
+pub fn walk_int_array_stmt(
+    s: &IrStmt,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) {
+    match s {
+        IrStmt::Expr(e) => walk_int_array_expr(e, all, consumed, non_int, str_read, vt, big),
+        IrStmt::Assign { targets, expr, .. } => {
+            // direct index-assigns `a[k]=v` register the array (the
+            // bulk-oriented arms below never see them): int values
+            // consume-int, anything else poisons — same rule as
+            // setArray items. Reads of the index/key stay invisible
+            // (arith-context reads never stringify).
+            for t in targets {
+                if !t.indices.is_empty() || t.var.contains('[') {
+                    let base = t.var.split('[').next().unwrap_or(&t.var);
+                    if !base.is_empty() {
+                        all.insert(base.to_string());
+                        if is_int_expr(expr, vt, big) {
+                            consumed.insert(base.to_string());
+                        } else {
+                            non_int.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            walk_int_array_expr(expr, all, consumed, non_int, str_read, vt, big);
+        }
+        IrStmt::Output { value, .. } => walk_int_array_expr(value, all, consumed, non_int, str_read, vt, big),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for b in then { walk_int_array_stmt(b, all, consumed, non_int, str_read, vt, big); }
+            for (c, b) in elsifs {
+                walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big);
+                for st in b { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            }
+            for st in else_ { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::While { cond, body, .. } => {
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is a `slice` read of
+            // the array; walking only the body missed it, so an array
+            // iterated as strings could still home natively.
+            walk_int_array_expr(iter, all, consumed, non_int, str_read, vt, big);
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            // C-style loops were invisible to homing (no arm): counted
+            // fills like `for ((i=0;i<n;i++)) a[$i]=...` stayed char*
+            // with a strdup per store. Walk every part.
+            for st in init { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            walk_int_array_expr(cond, all, consumed, non_int, str_read, vt, big);
+            for st in step { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Function { body, .. } => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Block(body) => {
+            for st in body { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() { walk_int_array_stmt(st, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() { walk_int_array_stmt(c, all, consumed, non_int, str_read, vt, big); }
+        }
+        _ => {}
+    }
+}
+
+pub fn walk_int_array_expr(
+    e: &IrExpr,
+    all: &mut HashSet<String>,
+    consumed: &mut HashSet<String>,
+    non_int: &mut HashSet<String>,
+    str_read: &mut HashSet<String>,
+    vt: &HashMap<String, IrType>,
+    big: &BTreeSet<String>,
+) {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "setArray" | "setArrayAppend" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    // the values are args[1] (an Array of items)
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            if !is_int_expr(it, vt, big) {
+                                non_int.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "sortedIntJoin" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "max" | "min" | "sum" => {
+                // a typed reduction over the array — an int consumer
+                // (keeps the array on the long long[] fast path)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    consumed.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "sortedBigintJoin" => {
+                // arbitrary-precision elements CANNOT live in long long[] —
+                // force char* (exact decimal text, mpz order).
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    non_int.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "exec" | "builtin" => {
+                // the array may appear in the argv (a string context)
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "slice" => {
+                // `${arr[@]}` / `${arr[@]:a:b}` — a string-element read:
+                // args[0] is the literal "slice", args[1] the array.
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "arrayIndex" | "arrayItems" => {
+                // reading elements as values — if used in a string
+                // context this is a string read; conservatively mark it.
+                // (arrayLen is NOT here: `${#xs[@]}` reads only the
+                // count, never the elements, so it can't force string
+                // storage.)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    all.insert(name.clone());
+                    str_read.insert(name.clone());
+                }
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "arrayLen" => {
+                // `${#xs[@]}` — the element count only; never reads
+                // (and never stringifies) elements.
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+            "getVar" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if all.contains(name) {
+                        str_read.insert(name.clone());
+                    }
+                }
+            }
+            _ => {
+                for a in args { walk_int_array_expr(a, all, consumed, non_int, str_read, vt, big); }
+            }
+        },
+        IrExpr::Array(items) => {
+            for it in items { walk_int_array_expr(it, all, consumed, non_int, str_read, vt, big); }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_int_array_expr(x, all, consumed, non_int, str_read, vt, big);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_int_array_expr(lhs, all, consumed, non_int, str_read, vt, big);
+            walk_int_array_expr(rhs, all, consumed, non_int, str_read, vt, big);
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() { walk_int_array_expr(c, all, consumed, non_int, str_read, vt, big); }
+        }
+        _ => {}
+    }
+}
+
+pub fn mark_reads_stmt(s: &IrStmt, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match s {
+        IrStmt::Expr(e) => mark_reads_expr(e, all, out),
+        IrStmt::Output { value, .. } => mark_reads_expr(value, all, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            mark_reads_expr(path, all, out);
+            mark_reads_expr(content, all, out);
+        }
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets {
+                for ix in &t.indices {
+                    mark_reads_expr(ix, all, out);
+                }
+            }
+            mark_reads_expr(expr, all, out);
+        }
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            mark_reads_expr(cond, all, out);
+            for b in then.iter().chain(else_) {
+                mark_reads_stmt(b, all, out);
+            }
+            for (c, b) in elsifs {
+                mark_reads_expr(c, all, out);
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for b in body.iter().chain(else_body).chain(finally_body) {
+                mark_reads_stmt(b, all, out);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    mark_reads_expr(m, all, out);
+                }
+                for b in &e.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            // `for x in "${arr[@]}"` — the iterable is the read.
+            mark_reads_expr(iter, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for st in init.iter().chain(step).chain(body) {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Continue | IrStmt::Break => {}
+        IrStmt::While { cond, body } => {
+            mark_reads_expr(cond, all, out);
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+            mark_reads_expr(cond, all, out);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => mark_reads_expr(expr, all, out),
+        IrStmt::Exec { cmd, args, redirects, .. } => {
+            mark_reads_expr(cmd, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(r, all, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages.iter().flatten() {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                mark_reads_expr(x, all, out);
+            }
+        }
+        IrStmt::SetChildError(e) => mark_reads_expr(e, all, out),
+        IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Label(_) | IrStmt::Goto(_) => {}
+        IrStmt::Case { discriminant, clauses } => {
+            mark_reads_expr(discriminant, all, out);
+            for c in clauses {
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                mark_reads_stmt(b, all, out);
+            }
+            for r in redirects {
+                mark_reads_expr(&r.target, all, out);
+            }
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+            for (_, b) in named_blocks {
+                for st in b {
+                    mark_reads_stmt(st, all, out);
+                }
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    mark_reads_expr(ch, all, out);
+                }
+                if let Some(v) = &c.value {
+                    mark_reads_expr(v, all, out);
+                }
+                for b in &c.body {
+                    mark_reads_stmt(b, all, out);
+                }
+            }
+        }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs) {
+                mark_reads_expr(e, all, out);
+            }
+        }
+        IrStmt::Shaderize { body, .. } => {
+            for b in body {
+                mark_reads_stmt(b, all, out);
+            }
+        }
+        IrStmt::Ext(n) => {
+            for c in n.children() {
+                mark_reads_stmt(c, all, out);
+            }
+        }
+    }
+}
+
+pub fn mark_reads_expr(e: &IrExpr, all: &HashSet<String>, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "setArray" || func == "setArrayAppend" {
+                // args[0] is the WRITE target — recurse the rest only.
+                for a in args.iter().skip(1) {
+                    mark_reads_expr(a, all, out);
+                }
+                return;
+            }
+            if func == "arrayLen" {
+                // `${#xs[@]}` / `len(xs)` — the element COUNT only, never
+                // an element: a count read must not defeat native homing.
+                return;
+            }
+            // Any string argument naming an array is a conservative READ:
+            // consumers that reference the array by name (a slice's
+            // `slice("arr", …)`, a join, an echo) must not be handed a
+            // native int store.
+            for a in args {
+                if let IrExpr::Str(name, _) = a {
+                    if all.contains(name) {
+                        out.insert(name.clone());
+                    }
+                }
+                mark_reads_expr(a, all, out);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            mark_reads_expr(obj, all, out);
+            for a in args {
+                mark_reads_expr(a, all, out);
+            }
+        }
+        // A direct element read (`x[0]`, `IrExpr::Index`, distinct from
+        // the `arrayIndex` call) is a read. Marking it here (rather than
+        // in `string_read`) keeps the relaxation narrow: an array that is
+        // also an int consumer (`sum(xs)`) still homes as before, while a
+        // pure index-read array is not newly homed.
+        IrExpr::Index { var, key } => {
+            if all.contains(var) {
+                out.insert(var.clone());
+            }
+            mark_reads_expr(key, all, out);
+        }
+        IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+            if all.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            mark_reads_expr(lhs, all, out);
+            mark_reads_expr(rhs, all, out);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            mark_reads_expr(cond, all, out);
+            mark_reads_expr(then, all, out);
+            mark_reads_expr(else_, all, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            mark_reads_expr(expr, all, out);
+            mark_reads_expr(default, all, out);
+        }
+        IrExpr::Capture { expr, .. } => mark_reads_expr(expr, all, out),
+        IrExpr::Array(items) => {
+            for it in items {
+                mark_reads_expr(it, all, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            mark_reads_expr(iter, all, out);
+            mark_reads_expr(elem, all, out);
+            if let Some(c) = cond {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        IrExpr::Arrow(body) | IrExpr::Lambda { body, .. } => {
+            for st in body {
+                mark_reads_stmt(st, all, out);
+            }
+        }
+        IrExpr::Object(vals) => {
+            for (_, v) in vals {
+                mark_reads_expr(v, all, out);
+            }
+        }
+        IrExpr::Splice(x) => mark_reads_expr(x, all, out),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    mark_reads_expr(x, all, out);
+                }
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                mark_reads_expr(c, all, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String>) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        // a string literal that parses as a 64-bit integer (the
+        // frontend emits list literals as Str)
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+        IrExpr::Arith(a) => !arith_refs_bigint(a, big),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
+            vt.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        ) && !big.contains(name),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                matches!(
+                    vt.get(name),
+                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+                ) && !big.contains(name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Range analysis under parameter hypotheses (the dual-arm analysis):
+/// run the range walk with `assumes` seeded as known entry ranges (e.g.
+/// a guarded parameter `n` in `[0, 2^63)`). Never-assigned names keep
+/// their seed (parameters are not carried, so fixpoints cannot disturb
+/// them); assigned names overwrite normally. Callers propose a hypothesis
+/// (guard bounds) and check whether the body proves i64-contained under
+/// it — that check is the fast-arm gate; emission stays source-side.
+pub fn analyze_var_ranges_with_assumes(
+    stmts: &[crate::ir::IrStmt],
+    assumes: &std::collections::HashMap<String, (i128, i128)>,
+) -> std::collections::HashMap<String, (i128, i128)> {
+    let mut state: std::collections::HashMap<String, Option<(i128, i128)>> =
+        std::collections::HashMap::new();
+    for (n, r) in assumes {
+        state.insert(n.clone(), Some(*r));
+    }
+    for s in stmts {
+        walk_stmt_ranges(s, &mut state, true);
+    }
+    state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect()
+}
+
 pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
     if lo >= 0 && hi <= u8::MAX as i128 {
         "u8"
@@ -9512,6 +15587,49 @@ fn cond_bound_resolved(
             }
             _ => None,
         },
+        // structured arith comparison (frontend A1: py `while i < 3` —
+        // the shell path lowers conds to test/let TEXT, so this arm is a
+        // no-op there and pure gain for frontends). Integer `< <= > >=
+        // ==` only (`!=` cannot cap a range).
+        IrExpr::Arith(a) => {
+            let (op, l, r) = match a.as_ref() {
+                crate::ir::ArithAst::Bin { op, lhs, rhs } => (op.as_str(), lhs, rhs),
+                _ => return None,
+            };
+            let cmp = match op {
+                "<" => Cmp::Lt,
+                "<=" => Cmp::Le,
+                ">" => Cmp::Gt,
+                ">=" => Cmp::Ge,
+                "==" | "=" => Cmp::Eq,
+                _ => return None,
+            };
+            let var_name = |x: &crate::ir::ArithAst| match x {
+                crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => Some(n.clone()),
+                _ => None,
+            };
+            let num_val = |x: &crate::ir::ArithAst| match x {
+                crate::ir::ArithAst::Num(n) => Some(*n as i128),
+                crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
+                    // loop-invariant provable constant (mirrors resolve)
+                    if carried.contains(n) {
+                        return None;
+                    }
+                    match pre.get(n).copied().flatten() {
+                        Some((lo, hi)) if lo == hi => Some(lo),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let (Some(v), Some(n)) = (var_name(l), num_val(r)) {
+                Some((v, cmp, n))
+            } else if let (Some(n), Some(v)) = (num_val(l), var_name(r)) {
+                Some((v, cmp_flip(cmp), n))
+            } else {
+                None
+            }
+        }
         // `until cond` wraps the cond in BinOp(Not, cond, cond)
         IrExpr::BinOp {
             op: BinOpKind::Not,
@@ -9588,7 +15706,7 @@ fn arith_text_bound(text: &str) -> Option<(String, Cmp, i128)> {
 /// The for-loop variable's range from its iterable: min/max over integer
 /// items (`for i in 1 2 3`), a Range node (`for i in $(seq 1 100)` after
 /// the seq_range_for transform), or None (a non-numeric item → Any).
-fn for_iter_range(iter: &IrExpr) -> Range {
+pub(crate) fn for_iter_range(iter: &IrExpr) -> Range {
     match iter {
         IrExpr::Array(items) => {
             let mut lo = i128::MAX;
@@ -9660,27 +15778,112 @@ fn plus_step(expr: &IrExpr, v: &str) -> Option<i64> {
     }
 }
 
+/// Vars read in an arith tree (for step-operand carried checks).
+fn arith_operand_vars(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            out.insert(n.clone());
+        }
+        ArithAst::Index { key, .. } => arith_operand_vars(key, out),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_operand_vars(lhs, out);
+            arith_operand_vars(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => arith_operand_vars(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_operand_vars(test, out);
+            arith_operand_vars(then, out);
+            arith_operand_vars(else_, out);
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            out.insert(var.clone());
+            arith_operand_vars(rhs, out);
+        }
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        ArithAst::Cast { arg, .. } => arith_operand_vars(arg, out),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+    }
+}
+
 /// The per-iteration step bounds of var v in a loop body — provable only
 /// when EVERY write to v (on every path) is `v = v + k` / `v += k` with
-/// literal k ≥ 1. Returns (min_step, max_step); None → not a provable
-/// counter (the widening stands alone). min drives the trip count (fewer
-/// iterations when the body may add more); max drives the other vars'
-/// trip caps.
-fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
+/// literal k ≥ 1, or `v = v + e` with e exactly evaluable to [lo,hi],
+/// lo ≥ 1, over loop-invariant operands (no operand carried by the loop
+/// — `carried` — since their ranges shift per iteration). Returns
+/// (min_step, max_step); None → not a provable counter (the widening
+/// stands alone). min drives the trip count (fewer iterations when the
+/// body may add more); max drives the other vars' trip caps.
+/// True when `a` names `v` (a `Var`/`Ident` read of `v`), looking through
+/// any number of `Cast { arg, .. }` wrappers that the py-sh-go frontend
+/// emits around typed variable reads in arithmetic.
+fn is_var_through_cast(a: &ArithAst, v: &str) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => n == v,
+        ArithAst::Cast { arg, .. } => is_var_through_cast(arg, v),
+        _ => false,
+    }
+}
+
+fn body_step_bounds(
+    stmts: &[IrStmt],
+    v: &str,
+    env: &HashMap<String, (i128, i128)>,
+    carried: &HashSet<String>,
+) -> Option<(i64, i64)> {
+    // steps evaluate in the exact reading (bash wrap would understate a
+    // step and over-tighten the cap — steps need the true magnitudes)
+    let exact_env = env;
     let mut mn: Option<i64> = None;
     let mut mx: Option<i64> = None;
     for s in stmts {
         let r: Option<(i64, i64)> = match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if targets.iter().any(|t| t.indices.is_empty() && t.var == v) {
-                    return plus_step(expr, v).map(|k| (k, k));
+                    if let Some(k) = plus_step(expr, v) {
+                        return Some((k, k));
+                    }
+                    // range-bounded step: `v = v + e` / `v = e + v`
+                    if let IrExpr::Arith(a) = expr {
+                        if let ArithAst::Bin { op, lhs, rhs } = a.as_ref() {
+                            if op == "+" {
+                                // look through Cast wrappers: the py-sh-go
+                                // frontend emits `Cast(Var(v), Int64)` so the
+                                // bare Var check would miss the step entirely
+                                let e = if is_var_through_cast(lhs.as_ref(), v) {
+                                    Some(rhs.as_ref())
+                                } else if is_var_through_cast(rhs.as_ref(), v) {
+                                    Some(lhs.as_ref())
+                                } else {
+                                    None
+                                };
+                                if let Some(step) = e {
+                                    let mut vs = HashSet::new();
+                                    arith_operand_vars(step, &mut vs);
+                                    if vs.iter().all(|n| !carried.contains(n)) {
+                                        if let Some((lo, hi)) = arith_range_exact(step, &exact_env) {
+                                            if lo >= 0 {
+                                                if let (Ok(lo), Ok(hi)) =
+                                                    (i64::try_from(lo), i64::try_from(hi))
+                                                {
+                                                    return Some((lo, hi));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return None;
                 }
                 None
             }
             IrStmt::Block(b)
             | IrStmt::Subshell(b)
             | IrStmt::Background(b)
-            | IrStmt::Redirect { inner: b, .. } => body_step_bounds(b, v),
+            | IrStmt::Redirect { inner: b, .. } => body_step_bounds(b, v, env, carried),
             IrStmt::If {
                 then,
                 elsifs,
@@ -9688,15 +15891,15 @@ fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
                 ..
             } => {
                 // every path through the body must increase v
-                let (a, b) = body_step_bounds(then, v)?;
+                let (a, b) = body_step_bounds(then, v, env, carried)?;
                 let mut lo = a;
                 let mut hi = b;
                 for (_, arm) in elsifs {
-                    let (x, y) = body_step_bounds(arm, v)?;
+                    let (x, y) = body_step_bounds(arm, v, env, carried)?;
                     lo = lo.min(x);
                     hi = hi.max(y);
                 }
-                let (x, y) = body_step_bounds(else_, v)?;
+                let (x, y) = body_step_bounds(else_, v, env, carried)?;
                 Some((lo.min(x), hi.max(y)))
             }
             // statements that don't write v impose no constraint
@@ -9767,6 +15970,7 @@ fn loop_fixpoint(
     body: &[IrStmt],
     skip_var: Option<&str>,
     bound: Option<(String, Cmp, i128)>,
+    trip_hint: Option<u64>,
 ) {
     let pre = state.clone();
     let mut carried: HashSet<String> = HashSet::new();
@@ -9779,6 +15983,12 @@ fn loop_fixpoint(
     if carried.is_empty() {
         return; // the loop cannot change any variable's range
     }
+    // entry ranges, flattened, for range-bounded step operands
+    // (non-carried vars are loop-invariant, so pre-state is exact)
+    let exact_pre: HashMap<String, (i128, i128)> = pre
+        .iter()
+        .filter_map(|(n, r)| r.map(|r| (n.clone(), r)))
+        .collect();
 
     // the cond variable's entry range (for the trip count)
     let (cond_var, cmp, n) = match &bound {
@@ -9790,21 +16000,26 @@ fn loop_fixpoint(
         .and_then(|v| pre.get(v).copied().flatten());
 
     // trip: how many times can the loop run? Requires the cond var to be
-    // a provable counter with a known entry lower bound.
+    // a provable counter with a known entry lower bound — or an explicit
+    // hint (a For iterable's exact length).
     let trip: Option<u64> = match (&cond_var, cond_pre) {
-        (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v) {
-            Some((mn, _)) => while_iterations(cmp, n, blo, bhi, mn as i128),
-            None => None,
+        (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v, &exact_pre, &carried) {
+            // a step that can be 0 (e.g. `i` ranging 0..3 in a For body)
+            // is not a provable trip counter — while_iterations would
+            // divide by zero; fall through to trip_hint instead
+            Some((mn, _)) if mn >= 1 => while_iterations(cmp, n, blo, bhi, mn as i128),
+            _ => None,
         },
         _ => None,
-    };
+    }
+    .or(trip_hint);
 
     // entry-invariant state (widening + caps)
     let mut ls = pre.clone();
     for _ in 0..FIXPOINT_ITER_LIMIT {
         let mut ns = ls.clone();
         for s in body {
-            walk_stmt_ranges(s, &mut ns);
+            walk_stmt_ranges(s, &mut ns, false);
         }
         if let Some(sk) = skip_var {
             // the for-loop variable is re-set from the item list
@@ -9833,7 +16048,7 @@ fn loop_fixpoint(
             }
             // trip cap: a carried counter can move at most trip·step
             if let (Some(t), Some(r)) = (trip, joined) {
-                if let Some((_, max_step)) = body_step_bounds(body, v) {
+                if let Some((_, max_step)) = body_step_bounds(body, v, &exact_pre, &carried) {
                     let t = t.saturating_mul(max_step as u64);
                     let lo0 = pre.get(v).copied().flatten().map_or(INT_DOMAIN.0, |r| r.0);
                     let hi0 = pre.get(v).copied().flatten().map_or(INT_DOMAIN.1, |r| r.1);
@@ -9862,8 +16077,14 @@ fn loop_fixpoint(
         // write from `pre` alone would be unsound)
         post.insert(v.clone(), ls.get(v).copied().flatten());
     }
+    // NOTE: overwrite (not join) here — the re-walk must preserve the
+    // fixpoint's narrowing (modulo caps, entry invariants); joining would
+    // union one more unrolling into converged state and widen it back
+    // out (rolling-hash h regressed i64→i128). Multi-writes inside
+    // a loop body therefore still collapse to the last write — the
+    // pre-existing residual hole, same as before this change.
     for s in body {
-        walk_stmt_ranges(s, &mut post);
+        walk_stmt_ranges(s, &mut post, false);
     }
     // join the pre-loop values back (the loop may never run)
     for v in &carried {
@@ -9872,30 +16093,58 @@ fn loop_fixpoint(
         post.insert(v.clone(), join(a, b));
     }
     // the for-loop variable: the item range (bash re-sets it per
-    // iteration; an empty list keeps the pre-loop value)
+    // iteration; an empty list keeps the pre-loop value). Join (not
+    // overwrite) so a pre-loop value or body write stays covered.
     if let Some(sk) = skip_var {
         if let Some(r) = pre.get(sk).copied().flatten() {
-            post.insert(sk.to_string(), Some(r));
+            let cur = post.get(sk).copied().flatten();
+            post.insert(sk.to_string(), join(Some(r), cur));
         }
     }
     *state = post;
 }
 
-fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
+/// Bind a written range: JOIN with any previous range, never overwrite.
+/// Every written value exists at runtime — straight-line redefinition
+/// (`x=3000000000` then `x=1`), sibling branches, and loop bodies all
+/// execute their writes — so the reported range must cover the whole
+/// life. Last-write-wins emits a C type that wraps or raises on the
+/// earlier values (py2cy.js `put()` rule, same hazard); `join` with
+/// unknown stays unknown.
+fn bind(state: &mut HashMap<String, Range>, name: String, r: Range, join_binds: bool) {
+    if join_binds {
+        let next = match state.get(&name) {
+            Some(prev) => join(*prev, r),
+            None => r,
+        };
+        state.insert(name, next);
+    } else {
+        state.insert(name, r);
+    }
+}
+
+/// `join_binds`: straight-line contexts (top level, branch arms, the
+/// post-loop re-walk) JOIN every write into the state — the reported
+/// range covers the variable's whole life. Fixpoint round bodies pass
+/// `false`: recompute-then-overwrite lets narrowing transfer functions
+/// (modulo caps, entry invariants) converge across rounds; the round
+/// merge joins explicitly, so whole-life coverage across iterations is
+/// kept there.
+fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>, join_binds: bool) {
     match s {
-        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state); } }
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state, join_binds); } }
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
         // inline asm operands are runtime exprs — no static range
         IrStmt::Asm { .. } => {}
         IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
-            state.insert(name, ir_range(expr, state));
+            bind(state, name, ir_range(expr, state), join_binds);
             // in-expression arith writes (`x=$((x++))`, `((x+=1))` — the
             // Assign's RANGE is the expression's VALUE; the write updates
             // the var's post-statement state (the IncDec postfix value is
             // the OLD value, the var's own state the NEW one)
             if let IrExpr::Arith(a) = expr {
-                arith_stmt_writes(a, state);
+                arith_stmt_writes(a, state, join_binds);
             }
         }
         // multi-target / indexed assignments — no single-variable range
@@ -9907,16 +16156,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         // range would masquerade as a proof — i in t86 looked like [1,1]
         // forever).
         IrStmt::Expr(IrExpr::Arith(a)) => {
-            arith_stmt_writes(a, state);
+            arith_stmt_writes(a, state, join_binds);
         }
         // setVar(name, v) — the plain write; `assign(name, op, v)` — the
         // runtime compound form (v+=1, a && v=x): both name the target
         // first and store the ARITHMETIC result (always an integer).
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
             if let [IrExpr::Str(name, _), ..] = args.as_slice() {
-                state.insert(name.clone(), ir_range(args.last().unwrap(), state));
+                bind(state, name.clone(), ir_range(args.last().unwrap(), state), join_binds);
                 if let Some(IrExpr::Arith(a)) = args.last() {
-                    arith_stmt_writes(a, state);
+                    arith_stmt_writes(a, state, join_binds);
                 }
             }
         }
@@ -9937,7 +16186,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
                                         })
                                         && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                                     {
-                                        state.insert(n.to_string(), Some((nv as i128, nv as i128)));
+                                        bind(state, n.to_string(), Some((nv as i128, nv as i128)), join_binds);
                                     }
                                 }
                             }
@@ -9952,26 +16201,26 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Declare { vars, init, .. } => {
             if let Some(init) = init {
                 if vars.len() == 1 {
-                    state.insert(vars[0].name.clone(), ir_range(init, state));
+                    bind(state, vars[0].name.clone(), ir_range(init, state), join_binds);
                 }
             }
         }
         IrStmt::Block(stmts) => {
             for s in stmts {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         // Select comm clause bodies may hold range-tracking statements.
         IrStmt::Select { clauses } => {
             for c in clauses {
                 for s in &c.body {
-                    walk_stmt_ranges(s, state);
+                    walk_stmt_ranges(s, state, join_binds);
                 }
             }
         }
         IrStmt::Redirect { inner, .. } => {
             for s in inner {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         IrStmt::If {
@@ -9982,16 +16231,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         } => {
             let mut s1 = state.clone();
             for s in then {
-                walk_stmt_ranges(s, &mut s1);
+                walk_stmt_ranges(s, &mut s1, join_binds);
             }
             let mut s2 = state.clone();
             for (_, b) in elsifs {
                 for s in b {
-                    walk_stmt_ranges(s, &mut s2);
+                    walk_stmt_ranges(s, &mut s2, join_binds);
                 }
             }
             for s in else_ {
-                walk_stmt_ranges(s, &mut s2);
+                walk_stmt_ranges(s, &mut s2, join_binds);
             }
             // meet (join): a var's range after the if is the union of what
             // each branch (or the pre-state, when a branch didn't assign it)
@@ -10019,20 +16268,20 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             for s in body {
                 collect_assigned(s, &mut carried);
             }
-            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried), None);
         }
         IrStmt::ForInit { init, cond, step, body } => {
             for i in init {
-                walk_stmt_ranges(i, state);
+                walk_stmt_ranges(i, state, join_binds);
             }
             for st in step {
-                walk_stmt_ranges(st, state);
+                walk_stmt_ranges(st, state, join_binds);
             }
             let mut carried = HashSet::new();
             for s in body {
                 collect_assigned(s, &mut carried);
             }
-            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried), None);
         }
         IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, until } => {
@@ -10046,15 +16295,20 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             } else {
                 b
             };
-            loop_fixpoint(state, body, None, b);
+            loop_fixpoint(state, body, None, b, None);
         }
         IrStmt::For { var, iter, body } => {
             // the loop variable is re-set from the item list every
-            // iteration (bash semantics — body writes to it are lost)
+            // iteration (bash semantics — body writes to it are lost);
+            // join (not overwrite) so the range still covers a pre-loop
+            // value and any body write, which both exist at runtime.
             if let Some(r) = for_iter_range(iter) {
-                state.insert(var.clone(), Some(r));
+                bind(state, var.clone(), Some(r), join_binds);
             }
-            loop_fixpoint(state, body, Some(var), None);
+            // trip hint: a literal iterable runs exactly len/span times
+            // (bash expands the words once), so carried accumulators get
+            // trip-bounded instead of widened (t48's `s += n` over 3 items)
+            loop_fixpoint(state, body, Some(var), None, for_iter_trip(iter));
         }
         // Subshell / Background / Function: definitions or child scopes —
         // they cannot change the parent's ranges.
@@ -10071,18 +16325,18 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             // string-length verdicts, where widening is safe).
             let pre = state.clone();
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             for e in excepts {
                 for s in &e.body {
-                    walk_stmt_ranges(s, state);
+                    walk_stmt_ranges(s, state, join_binds);
                 }
             }
             for s in else_body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             for s in finally_body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
             let mut post = state.clone();
             for (k, v) in pre {
@@ -10094,7 +16348,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         // (the global map over-approximates across functions — safe).
         IrStmt::Function { body, .. } => {
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
         IrStmt::Subshell(_)
@@ -10116,13 +16370,13 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         | IrStmt::Expr(_) => {}
         IrStmt::Shaderize { body, .. } => {
             for s in body {
-                walk_stmt_ranges(s, state);
+                walk_stmt_ranges(s, state, join_binds);
             }
         }
     }
 }
 
-fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
+pub(crate) fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
     match s {
         IrStmt::Assign { targets, .. } => {
             for t in targets {
@@ -10210,6 +16464,10 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
             _ => None,
         },
         IrExpr::Arith(a) => arith_range(a, state),
+        // Boolean literals are NOT integers for typing: Python `True`
+        // prints as "True", not "1" — a native-int declaration would
+        // change output (the py-sh-go frontend lowers True to Bool).
+        IrExpr::Bool(_) => None,
         _ => None,
     }
 }
@@ -10518,6 +16776,18 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
         // an array element read is unprovable
         ArithAst::Index { .. } => None,
         // C-frontend casts: the wrapped value of the inner expression
+        ArithAst::Un { op, arg } => {
+            let r = arith_range(arg, state)?;
+            match op.as_str() {
+                "-" => {
+                    if r.0 == INT_DOMAIN.0 { return None; }
+                    Some((0 - r.1, 0 - r.0))
+                }
+                "+" => Some(r),
+                "~" => Some((!(r.1), !(r.0))),
+                _ => None,
+            }
+        }
         ArithAst::Cast { arg, .. } => arith_range(arg, state),
         ArithAst::Sizeof(ty) => {
             let n = ty.c_sizeof().unwrap_or(4) as i128;
@@ -10531,7 +16801,7 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
 /// may read a var an inner write changes, but the common shapes are
 /// sequential). The expression's own VALUE is arith_range's job; this is
 /// the var's post-statement state.
-fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    match a {
+fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>, join_binds: bool) {    match a {
         ArithAst::Assign { var, op, rhs } => {
             let r = arith_range(rhs, state);
             let next: Range = match op.as_str() {
@@ -10557,31 +16827,31 @@ fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    matc
                 _ => None,
             };
             if let Some(nv) = next {
-                state.insert(var.clone(), Some(nv));
+                bind(state, var.clone(), Some(nv), join_binds);
             } else {
-                state.insert(var.clone(), None);
+                bind(state, var.clone(), None, join_binds);
             }
-            arith_stmt_writes(rhs, state);
+            arith_stmt_writes(rhs, state, join_binds);
         }
         ArithAst::IncDec { var, delta, .. } => {
             let next = match state.get(var).copied().flatten() {
                 Some((lo, hi)) => Some(wrap_interval(lo + *delta as i128, hi + *delta as i128)),
                 None => None,
             };
-            state.insert(var.clone(), next);
+            bind(state, var.clone(), next, join_binds);
         }
         ArithAst::Bin { lhs, rhs, .. } => {
-            arith_stmt_writes(lhs, state);
-            arith_stmt_writes(rhs, state);
+            arith_stmt_writes(lhs, state, join_binds);
+            arith_stmt_writes(rhs, state, join_binds);
         }
-        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state, join_binds),
         ArithAst::Cond { test, then, else_ } => {
-            arith_stmt_writes(test, state);
-            arith_stmt_writes(then, state);
-            arith_stmt_writes(else_, state);
+            arith_stmt_writes(test, state, join_binds);
+            arith_stmt_writes(then, state, join_binds);
+            arith_stmt_writes(else_, state, join_binds);
         }
-        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state),
-        ArithAst::Index { key, .. } => arith_stmt_writes(key, state),
+        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state, join_binds),
+        ArithAst::Index { key, .. } => arith_stmt_writes(key, state, join_binds),
         _ => {}
     }
 }
@@ -10589,7 +16859,7 @@ fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {    matc
 /// The var names a bare-arith statement writes (the IncDec/Assign
 /// targets) — the `collect_assigned` counterpart of
 /// `arith_stmt_writes`.
-fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
+pub(crate) fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
     match a {
         ArithAst::Assign { var, rhs, .. } => {
             out.insert(var.clone());
@@ -10759,6 +17029,10 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         }
         Command::Function(f) => IrStmt::Function {
             name: f.name.clone(),
+            // bash functions take POSITIONAL args only ($1, $2) and carry
+            // no parameter names; the named-`params` list is for the
+            // frontends (core request rust-20260927-121500).
+            params: vec![],
             body: body_stmts(&Command::Block(f.body.clone())),
             named_blocks: vec![],
         },
@@ -11006,28 +17280,16 @@ fn merged_words_ir(words: &[Word], single: &dyn Fn(&Word) -> IrExpr) -> Vec<IrEx
     let mut out: Vec<IrExpr> = Vec::new();
     let mut i = 0;
     while i < words.len() {
-        // A plain LITERAL immediately before a brace is the brace's
-        // prefix: `source.{bat,c}` is ONE bash word → `source.bat
-        // source.c` (the parser splits it into Literal("source.") +
-        // BraceExpansion, exactly like `{a,b}{1,2}` splits into two
-        // braces — the merge below re-joins it).
-        let mut pending_prefix: Option<String> = None;
-        if let Word::Literal(s, _) = &words[i] {
-            if i + 1 < words.len() {
-                if matches!(words[i + 1], Word::BraceExpansion(..)) {
-                    pending_prefix = Some(s.clone());
-                    i += 1;
-                }
-            }
-        }
+        // NOTE: a literal that is part of the SAME source word as the
+        // brace (`source.{bat,c}`) is already folded into the brace's
+        // `prefix` by the parser — do NOT re-merge a preceding word's
+        // literal here: `mkdir -p a/{x,y}` is two argv words (`-p`,
+        // `a/x`, `a/y`) and the old merge glued them into `-pa/x`.
         if let Word::BraceExpansion(be, _) = &words[i] {
             let mut groups = vec![brace_items_json(&be.items)];
             let mut middles: Vec<serde_json::Value> = Vec::new();
             let mut suffix = be.suffix.clone().unwrap_or_default();
-            let prefix = match &pending_prefix {
-                Some(p) => format!("{}{}", p, be.prefix.as_deref().unwrap_or("")),
-                None => be.prefix.clone().unwrap_or_default(),
-            };
+            let prefix = be.prefix.clone().unwrap_or_default();
             i += 1;
             while i < words.len() {
                 if let Word::BraceExpansion(be2, _) = &words[i] {
@@ -11116,6 +17378,8 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
             // marker the AST cannot distinguish `'*.txt'` from `*.txt`.
             if ann.is_none() && has_glob_chars(&s2) {
                 st(&format!("{GLOB_MAGIC}{s2}"))
+            } else if ann.is_some() {
+                st_single(&s2)
             } else {
                 st(&s2)
             }
@@ -11156,7 +17420,10 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
 /// from the raw-text path).
 fn array_element_ir(w: &Word) -> IrExpr {
     match w {
-        Word::Literal(s, ann) => st(&shell_quote_removal(s, ann.is_some())),
+        Word::Literal(s, ann) => {
+            let s2 = shell_quote_removal(s, ann.is_some());
+            if ann.is_some() { st_single(&s2) } else { st(&s2) }
+        }
         Word::Variable(name, _, _) if name != "@" && name != "*" => {
             call("split", vec![call("getVar", vec![st(name)])])
         }
@@ -11932,6 +18199,10 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::UseAlternative(w, need_nonempty) => (
+            if *need_nonempty { ":+" } else { "+" }.into(),
+            vec![st(w)],
+        ),
         ParameterExpansionOperator::ZshFlags(flags, sep) => {
             // zsh `${(flags)var}` / `${(flag:sep:)var}` — the zsh-only
             // flag expansion; the A1 `param("", name, flags[, sep])`
@@ -11966,25 +18237,40 @@ fn brace_ir(be: &BraceExpansion) -> IrExpr {
     )
 }
 
+/// JSON encoding of one level's comma-separated alternatives. An
+/// alternative is a String, a `{range:[…]}`, a `{nested:[…]}` group, or
+/// a `{product:[[…],…]}` — the cartesian concatenation of sub-groups
+/// (each sub-group a list of alternatives). `{a,{b,c}}d` and
+/// `a{x/{p,q},y}z` need `product`: the nested brace there is a FACTOR of
+/// one alternative, not a sibling alternative, so its values must be
+/// concatenated with the surrounding text rather than unioned with the
+/// other alternatives.
 fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
-    serde_json::Value::Array(
-        items
-            .iter()
-            .map(|it| match it {
-                BraceItem::Literal(s) => serde_json::Value::String(s.clone()),
-                BraceItem::Range(r) => serde_json::json!({
-                    "range": [r.start, r.end, r.step, r.format]
-                }),
-                BraceItem::Sequence(seq) => serde_json::Value::Array(
-                    seq.iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-                BraceItem::Nested(n) => serde_json::json!({ "nested": brace_items_json(&n.items) }),
-                BraceItem::Compound(c) => serde_json::json!({ "nested": brace_items_json(c) }),
-            })
-            .collect(),
-    )
+    serde_json::Value::Array(items.iter().map(brace_item_json).collect())
+}
+
+/// One alternative part → its JSON encoding (the body of
+/// `brace_items_json`'s match, shared so Compound sub-groups agree).
+fn brace_item_json(it: &BraceItem) -> serde_json::Value {
+    match it {
+        BraceItem::Literal(s) => serde_json::Value::String(s.clone()),
+        BraceItem::Range(r) => serde_json::json!({
+            "range": [r.start, r.end, r.step, r.format]
+        }),
+        BraceItem::Sequence(seq) => serde_json::Value::Array(
+            seq.iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
+        BraceItem::Nested(n) => serde_json::json!({ "nested": brace_items_json(&n.items) }),
+        BraceItem::Compound(c) => {
+            let sub: Vec<serde_json::Value> = c
+                .iter()
+                .map(|p| serde_json::Value::Array(vec![brace_item_json(p)]))
+                .collect();
+            serde_json::json!({ "product": sub })
+        }
+    }
 }
 
 /// Emit-time evaluation of `sh2.brace(prefix, groups, middles, suffix)` —
@@ -12192,12 +18478,33 @@ fn brace_expand(
                     out.extend(brace_range_value(r));
                 } else if let Some(n) = it.get("nested") {
                     out.extend(brace_nested(n));
+                } else if let Some(p) = it.get("product") {
+                    out.extend(brace_product(p));
                 } else if it.is_array() {
                     out.extend(brace_nested(it));
                 }
             }
         }
         out
+    }
+    /// A `{product:[g0,g1,…]}`: the cartesian concatenation of the
+    /// sub-groups — a Compound alternative's value set (`x/{p,q}` →
+    /// `x/p`, `x/q`). Each sub-group is a list of alternatives.
+    fn brace_product(sub: &serde_json::Value) -> Vec<String> {
+        let mut combos = vec![String::new()];
+        if let Some(gs) = sub.as_array() {
+            for g in gs {
+                let alts = brace_group(g);
+                let mut next = Vec::new();
+                for c in &combos {
+                    for a in &alts {
+                        next.push(format!("{c}{a}"));
+                    }
+                }
+                combos = next;
+            }
+        }
+        combos
     }
     /// `expandBraceGroup(g)` — a range inside a comma-separated group stays
     /// LITERAL (`{1..3,7..9}`); only a lone range expands.
@@ -12215,6 +18522,8 @@ fn brace_expand(
                     }
                 } else if let Some(n) = it.get("nested") {
                     out.extend(brace_nested(n));
+                } else if let Some(p) = it.get("product") {
+                    out.extend(brace_product(p));
                 } else if it.is_array() {
                     out.extend(brace_nested(it));
                 }
@@ -13060,6 +19369,7 @@ fn arith_var_read(name: &str) -> Expr {
 fn arith_bigint_safe_operand(a: &ArithAst) -> Expr {
     if let ArithAst::Var(name) = a {
         if slot_var_index(name).is_none()
+            && arith_len_leaf(name).is_none()
             && !matches!(var_type_of(name), Some(IrType::Int64 | IrType::UInt64))
         {
             // Exact BigInt read. A lifted-num var is included too: in a
@@ -13503,6 +19813,12 @@ fn in_dual_wide_arm() -> bool {
 /// int64 wrap contexts are excluded: C-typed (`var_type_of`), --true64,
 /// slots, and the dual-loop wide arm (which must stay mod-2^64-exact).
 fn exact_bigint_var_read(n: &str) -> bool {
+    // `${#x[@]}` / `${#x}` length placeholders are their own runtime-exact
+    // leaf (arith_len_leaf decodes them in arith_to_estree) — never read the
+    // placeholder NAME as a store variable.
+    if arith_len_leaf(n).is_some() {
+        return false;
+    }
     if in_dual_wide_arm() {
         return false;
     }
@@ -24939,6 +31255,15 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         eprintln!("DBG unsafe: {:?}", unsafe_v);
         eprintln!("DBG store_only_var(__fl0) = {}", store_only_var("__fl0"));
     }
+    // Same JS-identifier rule as the LIFTED_NUMERIC/LIFTED_STRING filter
+    // below: a store-only var gets a native `let <name> = null;`
+    // binding, so a reserved-word name (`var`, `let`, `class`, …) would
+    // be a JS syntax error that loses the whole program. Un-lifted, the
+    // var keeps the string-keyed `sh2.vars` store and is unaffected.
+    let store_only: std::collections::HashSet<String> = store_only
+        .into_iter()
+        .filter(|v| is_plain_fn_name_safe(v))
+        .collect();
     *STORE_ONLY_VARS.lock().unwrap() = Some(store_only);
     // Int64 leaf wrapping (the `--true64` machinery, now also the i53
     // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
@@ -24974,7 +31299,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
-        &string_lift_vars(prog, &numeric_lift_vars(prog)),
+        &string_lift_vars(prog, &numeric_lift_vars(prog)).0,
     );
     // `--true64`: slot vars are homed in the array — exclude them from
     // BOTH lifts (their reads/writes route through __t64[k]; a lifted
@@ -25000,6 +31325,25 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let persist_fd1 = ir_has_persist_fd1(prog);
     let mut functions = HashSet::new();
     collect_program_functions(&prog.stmts, &mut functions);
+    // A native binding is emitted as `let <name> = …` / the store-only
+    // prologue's `let <name> = null;`. A shell variable whose name is a
+    // JS reserved word (`var`, `let`, `class`, `in`, …) is perfectly legal
+    // bash — `var=test; eval "$var"` — but `let var = null;` is a JS
+    // SYNTAX ERROR, so the WHOLE program fails to parse and every
+    // statement is lost (heredoc-subshell-redirects.sh,
+    // subshell-heredoc-close.sh, which both name their variable `var`).
+    //
+    // The fix is to NOT lift such a name: a non-lifted var keeps the
+    // `sh2.vars` store protocol, whose key is a string and is therefore
+    // immune to identifier rules. `is_plain_fn_name_safe` is exactly the
+    // existing predicate for "safe as a bare JS identifier" (reserved
+    // words, shadowed globals, generated `__` temps); the function-binding
+    // path already routes through `direct_binding_name`, which renames
+    // rather than refuses — but a VARIABLE cannot be renamed, because its
+    // reads are the bare `Var(name)` expressions. So refuse, don't rename.
+    let js_bindable = |v: &String| is_plain_fn_name_safe(v);
+    let num: HashSet<String> = num.iter().filter(|v| js_bindable(v)).cloned().collect();
+    let str: HashSet<String> = str.iter().filter(|v| js_bindable(v)).cloned().collect();
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     // C typed vars (frontend-emitted var_types): the arith read coercion
@@ -25280,6 +31624,17 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // loop bodies are emitted from the ORIGINAL references, so the pointer
     // keys hold).
     *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+    // The GENERAL unread-status-write set — every statement that writes a
+    // status (`ir_stmt_writes_lastexit`) but which the backward scan proved
+    // unread. `LASTEXIT_DEAD` above is the ESTree emitter's NARROW map: it
+    // only carries the shapes it has a hand-written dead twin for (`(( ))`,
+    // native echo, `declare`). A `cmd > file` redirect is a status writer
+    // with no entry there, so its writeFile `.then` closure would look live
+    // no matter what the analysis proved. The Rust backend installs this map
+    // for its own status register; the ESTree path needs the same verdict for
+    // the writeFile status closure (core request
+    // estree-20260813-182443).
+    install_unread_status_writes(prog, errexit);
     // Native-loop passes: (a) which loops may be capture producers (they
     // keep the runtime loop — a native loop would lose the producer bound),
     // (b) which loops' final status write is dead (the native while drops
@@ -25665,6 +32020,39 @@ fn call_is_always_true(e: &Expr) -> bool {
 pub fn shir_to_estree_compiled(prog: &IrProgram) -> Program {
     let estree = crate::estree::fix_control_flow(shir_to_estree(prog));
     crate::estree::compile_head_passes(estree)
+}
+
+/// variable references inside a BAKED array-index name: `"tpx[$ti]"` /
+/// `"arr[${i}]"` → ["ti"] / ["i"]. Positional (`$1`) and special
+/// (`$?`, `$@`) names are not vars, so they are skipped.
+pub(crate) fn index_name_refs(name: &str) -> Vec<String> {
+    let b = name.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            let braced = b[i + 1] == b'{';
+            let mut j = i + 1 + usize::from(braced);
+            let start = j;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > start {
+                let nm = &name[start..j];
+                let positional = nm.bytes().all(|c| c.is_ascii_digit());
+                let arr_decor = name[j..].starts_with("[@]") || name[j..].starts_with("[*]");
+                if !positional && !arr_decor {
+                    out.push(nm.to_string());
+                }
+                i = if braced { j + 1 } else { j };
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {
@@ -26539,7 +32927,7 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
 /// programs that provably never enable it. Conservative: a dynamic command
 /// name (`$cmd ...` may be `set`), a non-literal set argument (may be
 /// `-e`), or `-e` in any flag cluster all keep the guards.
-fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
+pub(crate) fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     /// A literal `exec("set", [...])` call — the runtime's set builtin
     /// parses (see sh2-namespace.mjs): `--` first or a first arg without a
     /// `-`/`+` prefix means positional assignment (no flags); otherwise
@@ -26730,7 +33118,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
 /// runtime's case/test matching is case-insensitive once enabled, so a
 /// native substring lift must lowercase to stay exact. `shopt -u` after a
 /// `-s` still counts (a static scan cannot prove the runtime state).
-fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
+pub(crate) fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
     ir_nocase_shopt_mask(prog) & 1 != 0
 }
 
@@ -26957,7 +33345,7 @@ const CASE_VALUE_TMP: &str = "$sh_case_v";
 /// dispatch mandatory. Walks the whole ShIR (stmt + expression forms); the
 /// estree path only constructs the subset matched below, so `_ => false`
 /// is exact for it. Conservative direction: any doubt resolves to `true`.
-fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
+pub(crate) fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
     fn stmt_has(s: &IrStmt) -> bool {
         match s {
             // statement-form redirect: persist = inner is a bare literal
@@ -27158,7 +33546,11 @@ fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<
     ]))
 }
 
-fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
+fn try_native_echo_redirect(
+    inner: &[IrStmt],
+    specs: &[(i64, &str, &IrExpr)],
+    status_dead: bool,
+) -> Option<Expr> {
     if program_defines_function("echo") {
         return None;
     }
@@ -27291,15 +33683,38 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
                     right: Box::new(str_lit("EACCES")),
                 }),
                 consequent: Box::new(str_lit("Permission denied")),
-                alternate: Box::new(Expr::MemberExpression {
-                    object: Box::new(Expr::Identifier {
-                        name: "e".to_string(),
+                // non-EACCES failures (device errors like the webgl
+                // 'need both shaders first') carry no .code — report
+                // .message so the redirect error is diagnosable instead
+                // of 'bash: <target>: undefined'
+                alternate: Box::new(Expr::LogicalExpression {
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "code".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    property: Box::new(Expr::Identifier {
-                        name: "code".to_string(),
+                    operator: "??".to_string(),
+                    right: Box::new(Expr::LogicalExpression {
+                        left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "message".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    computed: false,
-                    optional: false,
+                        operator: "??".to_string(),
+                        right: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                    }),
                 }),
             }),
         }),
@@ -27326,14 +33741,21 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         arguments: vec![err_msg],
         optional: false,
     };
-    let set1 = Expr::AssignmentExpression {
-        operator: "=".to_string(),
-        left: Box::new(sh2_member("lastExit")),
-        right: Box::new(Expr::Literal {
-            value: serde_json::Value::from(1),
-            raw: None,
-            regex: None,
-        }),
+    let set1 = if status_dead {
+        // the write's exit status is provably unread, so the failure path
+        // reports to stderr and nothing else — the `sh2.lastExit = 1` store
+        // exists only to record `$?` for a reader that does not exist.
+        stderr_write.clone()
+    } else {
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        }
     };
     let then = Expr::ArrowFunctionExpression {
         params: vec![Expr::Identifier {
@@ -27362,20 +33784,31 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         expression: true,
         r#async: false,
     };
-    let chained = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(write),
-                    property: Box::new(Expr::Identifier {
-                        name: "then".to_string(),
-                    }),
-                    computed: false,
-                    optional: false,
+    // The `.then` status closure exists ONLY to record `$?` on success. When
+    // the write's status is lastexit-dead nothing reads it, so the chain
+    // collapses to `await write(...).catch(report)` — one fewer promise
+    // reaction and closure per write. The `.catch` is NOT droppable: it
+    // REPORTS the failure to stderr (core request
+    // go-sh-writefile-eacces), so a failing device still surfaces.
+    let after_write: Expr = if status_dead {
+        write
+    } else {
+        Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(write),
+                property: Box::new(Expr::Identifier {
+                    name: "then".to_string(),
                 }),
-                arguments: vec![then],
+                computed: false,
                 optional: false,
             }),
+            arguments: vec![then],
+            optional: false,
+        }
+    };
+    let chained = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(after_write),
             property: Box::new(Expr::Identifier {
                 name: "catch".to_string(),
             }),
@@ -28570,13 +35003,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::If {
             cond,
             then,
-            elsifs: _,
+            elsifs,
             else_,
         } => {
             let consequent = Box::new(Stmt::BlockStatement {
                 body: then.iter().filter_map(stmt_to_estree).collect(),
             });
-            let alternate: Option<Box<Stmt>> = if else_.is_empty() {
+            let alternate: Option<Box<Stmt>> = if else_.is_empty() && elsifs.is_empty() {
                 if lastexit_write_is_dead(stmt) {
                     // Plan 4: the if's status write is provably unread
                     // (no `$?` reader before the next writer; the runner
@@ -28605,14 +35038,57 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }))
                 }
             } else {
-                Some(match else_.as_slice() {
-                    [IrStmt::If { .. }] => Box::new(
-                        stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
-                    ),
-                    _ => Box::new(Stmt::BlockStatement {
-                        body: else_.iter().filter_map(stmt_to_estree).collect(),
-                    }),
-                })
+                // The else-if ladder. `elsifs` is a flat `[cond, body]`
+                // list; JS has no `elif`, so it lowers to the SAME nesting
+                // the AST already uses for `else { if … }` — each arm's
+                // alternate is the next arm (or the final `else`).
+                //
+                // This arm previously bound `elsifs: _` and DROPPED every
+                // `elif` in the corpus — `if A; then …; elif B; then …; fi`
+                // rendered as `if (A) { … }` with the whole `elif` chain
+                // silently discarded (param-expand-default-operator.sh:
+                // the `[ "${BASH_VERSION-}" ]` arm and its `echo bash` never
+                // reached the output, so the program printed nothing).
+                //
+                // `$?` for a failing elif: bash leaves the LAST evaluated
+                // condition's status, which the chain reproduces because
+                // every arm is an ordinary `if` whose test writes the
+                // status (the dead-status unwrap applies per arm exactly as
+                // it does for a top-level if).
+                let mut tail: Option<Box<Stmt>> = if else_.is_empty() {
+                    None
+                } else {
+                    Some(match else_.as_slice() {
+                        [IrStmt::If { .. }] => Box::new(
+                            stmt_to_estree(&else_[0]).unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                        ),
+                        _ => Box::new(Stmt::BlockStatement {
+                            body: else_.iter().filter_map(stmt_to_estree).collect(),
+                        }),
+                    })
+                };
+                for (econd, ebody) in elsifs.iter().rev() {
+                    let arm_consequent = Box::new(Stmt::BlockStatement {
+                        body: ebody.iter().filter_map(stmt_to_estree).collect(),
+                    });
+                    // Each elif arm is an ordinary `if` whose test is
+                    // evaluated for truthiness only — the same
+                    // `unwrap_test_bool` treatment the outer condition gets
+                    // (see the `test:` arm below). The dead-status elision
+                    // (`test_cond_write_is_dead`) is keyed by the enclosing
+                    // `IrStmt::If` POINTER, not per-arm, so an arm is not
+                    // given the unstatused form here: the statused sequence
+                    // is the byte-identical behavior-preserving choice, and
+                    // `$?` after a failing elif is exactly the last arm's
+                    // condition status.
+                    let ealt = tail.take();
+                    tail = Some(Box::new(Stmt::IfStatement {
+                        test: unwrap_test_bool(cond_to_estree(econd)),
+                        consequent: arm_consequent,
+                        alternate: ealt,
+                    }));
+                }
+                tail
             };
             Stmt::IfStatement {
                 test: {
@@ -29765,6 +36241,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::Function {
             name,
+            params,
             body,
             named_blocks,
         } => {
@@ -29859,6 +36336,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             if let Some(k) = lifted_arity {
                 *PARAM_FRAME.lock().unwrap() = Some(k);
             }
+            // A1-DECLARED parameters (core request rust-20260930-031500):
+            // the arrow takes them as real JS parameters, and the body's
+            // reads of them render bare (see [`is_named_param`]). Empty
+            // for every bash-sourced function — the corpus's `ast_to_ir`
+            // path emits no `params` — so this is a no-op there.
+            // A param-lifted function already takes `p1..pk` and is
+            // positional-free by construction; the two shapes are disjoint
+            // in practice, but the lift wins if both are present.
+            let named_params: Vec<Expr> = if lifted_arity.is_some() {
+                Vec::new()
+            } else {
+                params
+                    .iter()
+                    .filter(|p| is_plain_ident(p))
+                    .map(|p| ident(p))
+                    .collect()
+            };
+            let named_set: HashSet<String> = named_params
+                .iter()
+                .filter_map(|e| match e {
+                    Expr::Identifier { name } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let pushed_named = !named_set.is_empty();
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = Some(named_set);
+            }
             let arrow = if !named_blocks.is_empty() {
                 // PowerShell named-block function (core-request
                 // powershell-sh-go): the define arrow wraps the blocks in
@@ -29870,7 +36375,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else if fn_call_is_sync(name) {
                 let params = lifted_arity
                     .map(|k| (1..=k).map(|i| ident(&format!("p{i}"))).collect())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| named_params.clone());
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
@@ -29880,9 +36385,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     arrow_sink_sync(params, IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
-                arrow_native_echo(vec![], IrExpr::Arrow(cloned_body))
+                arrow_native_echo(named_params.clone(), IrExpr::Arrow(cloned_body))
             } else {
-                arrow_sink(vec![], IrExpr::Arrow(cloned_body))
+                arrow_sink(named_params.clone(), IrExpr::Arrow(cloned_body))
             };
             // The arrow construction is complete — restore the previous
             // arrow-body deadness (the clone's statements are dropped with
@@ -29893,6 +36398,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             FUNCTION_STACK.lock().unwrap().pop();
             if lifted_arity.is_some() {
                 *PARAM_FRAME.lock().unwrap() = None;
+            }
+            if pushed_named {
+                *NAMED_PARAMS.lock().unwrap() = None;
             }
             let binding = if lifted_arity.is_some() {
                 // param-lifted: the runtime map is never consulted (the
@@ -30127,7 +36635,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .iter()
                 .map(|r| (r.fd.unwrap_or(0) as i64, r.mode.as_str(), &r.target))
                 .collect::<Vec<_>>();
-            if let Some(native) = try_native_echo_redirect(inner, &redirect_specs) {
+            if let Some(native) =
+                try_native_echo_redirect(inner, &redirect_specs, stmt_status_write_is_unread(stmt))
+            {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // `grep -q PAT <<< TEXT` (statement position): the fd-0
@@ -30792,18 +37302,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Warn { expr, carp: _ } => {
-            // Warning: `console.warn(value)` or fallback `sh2.warn(value)`.
+            // Warning: `sh2.warn(value)` — the runtime writes it to stderr.
+            // It must go through the `sh2.*` namespace like every other
+            // builtin: the structural gate rejects ANY non-sh2 callee
+            // (harness/estree_gate.pl check (b)), so a raw
+            // `console.warn` fails the gate by construction.
             Stmt::ExpressionStatement {
-                expression: Expr::CallExpression {
-                    callee: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier { name: "console".to_string() }),
-                        property: Box::new(Expr::Identifier { name: "warn".to_string() }),
-                        computed: false,
-                        optional: false,
-                    }),
-                    arguments: vec![expr_to_estree(expr)],
-                    optional: false,
-                },
+                expression: sh2_call("warn", vec![expr_to_estree(expr)]),
             }
         }
         IrStmt::SetChildError(e) => {
@@ -30838,7 +37343,8 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Label(_name) => {
-            // Label: `name:` — used by Goto.
+            // Label: `name:` — a Goto jump target. A Label on its own is
+            // inert (it only names a position), so dropping it is exact.
             Stmt::ExpressionStatement {
                 expression: Expr::Literal {
                     value: serde_json::Value::Null,
@@ -30847,15 +37353,46 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
-        IrStmt::Goto(_target) => {
-            // Goto: emit a runtime call (the restructure pass normally
-            // resolves gotos; if one reaches here, use the runtime fallback).
-            // Target is unused — the runtime resolves it from state.
+        IrStmt::Goto(target) => {
+            // Goto: REFUSE loudly. The old lowering emitted a bare `null`
+            // literal here, so an un-restructured `goto` was a SILENT
+            // no-op — the program ran straight through the jump and
+            // printed the statements the goto was meant to skip (bat
+            // t06_goto printed `never`; c t27_goto's backward loop ran
+            // once and printed `1` where native prints `3`). The comment
+            // here used to claim "the runtime resolves it from state";
+            // no such runtime helper exists (nothing in
+            // harness/sh2-namespace.mjs resolves a goto), so that was
+            // never true.
+            //
+            // Why refuse rather than restructure: the shared
+            // restructure_goto pass (shir_passes/restructure.rs) already
+            // rewrites the C goto shapes (c-sh-go t27/t30/t31 — backward
+            // guarded, mid-test, forward cleanup) into structured flow at
+            // A1 ingress, and the estree target deliberately SKIPS that
+            // pass (otranspilerl/src/lib.rs: `if kind != "estree"`)
+            // because the estree emitter was expected to handle goto
+            // natively. A survivor here is a goto shape OUTSIDE that
+            // pass's subset — the frontend must be fixed or the pass
+            // widened, and guessing produces wrong output. Fail closed,
+            // matching the sh (`# TODO(unsupported): goto ... not
+            // restructured`) and java (`goto not supported by the java
+            // renderer`) backends. `sh2.unsupported` throws at runtime and
+            // is flagged by the structural gate.
             Stmt::ExpressionStatement {
-                expression: Expr::Literal {
-                    value: serde_json::Value::Null,
-                    raw: None,
-                    regex: None,
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "sh2".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "unsupported".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![str_lit(&format!("goto {target}"))],
+                    optional: false,
                 },
             }
         }
@@ -31122,6 +37659,14 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
     // A dynamically-changing nocasematch state cannot be folded statically
     // — the runtime test consults the real state.
     if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
+        return None;
+    }
+    // bash only globs an UNQUOTED pattern operand (see
+    // [`test_operand_is_quoted`]): `[ "abc" = "a*" ]` is a literal compare
+    // and `[[ "abc" == "a*" ]]` is too (only the unquoted `[[ ]]` pattern
+    // globs). A quoted operand must stay on the exact-equality path, so
+    // refuse here and let the caller emit `===`.
+    if test_operand_is_quoted(rhs) {
         return None;
     }
     let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
@@ -32078,7 +38623,22 @@ fn native_capture_cat(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Optio
     } else {
         let mut out = Vec::new();
         for a in cmd_args {
-            let _ = is_plain_path_arg(a)?;
+            // static paths AND dynamic ones (interpolated `$var`
+            // segments, getVar reads): read_file_value evaluates any
+            // expression at runtime via async readFile, so only refuse
+            // shapes that are never paths (empty, flags, glob magic)
+            match a {
+                IrExpr::Str(sv, _) => {
+                    if sv.is_empty()
+                        || sv.starts_with('-')
+                        || sv.starts_with(GLOB_MAGIC)
+                        || sv.starts_with(PS_MAGIC)
+                    {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
             out.push(read_file_value(expr_to_estree(a), Some("utf8"), 0, 1));
         }
         if out.is_empty() {
@@ -38540,6 +45100,33 @@ fn try_native_test(s: &str) -> Option<Expr> {
     try_native_test_unstatused(s).map(native_test_statused)
 }
 
+/// Is the `=`/`==`/`!=` RHS operand QUOTED in the source test string?
+///
+/// This is the `[[ ]]` vs `[ ]` glob rule. bash's `[` (the `test` BUILTIN)
+/// does NOT glob its operands at all: it receives them as already-expanded
+/// argv, and an unquoted `a*` reaches it as the LITERAL two-character-plus
+/// string `a*` (bash 5 reports "too many arguments" for the split form and
+/// never matches). Only `[[ ]]` — a KEYWORD — performs pathname expansion on
+/// an unquoted pattern, so `[[ abc == a* ]]` is true while `[[ abc == "a*" ]]`
+/// is a literal compare.
+///
+/// The emitter therefore must not lower a `[ ]` equality to a glob regex
+/// (`startsWith`/`includes`/`^…$`) unless the source operand is genuinely an
+/// unquoted pattern. This was the `test-glob-rhs-fallback.sh` failure:
+/// `[ "abc" = "a*" ]` and `[[ "abc" == "a*" ]]` both emitted
+/// `String("abc").startsWith("a")` and took the `bad` branch (a quoted
+/// pattern must compare literally), and `[ "abc" = "[ab]*" ]` emitted the
+/// char-class regex `(/^[ab].*$/s).test("abc")` — also `bad`.
+///
+/// A quoted operand is a fully-quoted string (`"a*"`), possibly built by
+/// concatenating quoted runs and literal text (`"a"\*`, `a"*"`). Any quote
+/// character anywhere in the operand makes it quoted: bash removes the quote
+/// and suppresses globbing for the WHOLE word, so a single quoted character
+/// anywhere in it is enough.
+fn test_operand_is_quoted(op: &str) -> bool {
+    op.contains('"') || op.contains('\'')
+}
+
 /// The value-only native test (no lastExit write): the single-op scans,
 /// the file-test / `-n`/`-z` / `=~` / glob lowerings, and the compound
 /// `-a`/`-o` chain. `try_native_test` applies the status protocol ONCE at
@@ -40336,12 +46923,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         positional_read(name).or_else(|| {
             // param ops need the actual store value even when the var
             // appears never-written (the optimizer may have eliminated
-            // the only write while preserving the param read).
+            // the only write while preserving the param read, and a
+            // never-written name may still be SET in the caller's
+            // environment). The native plain-object store read keeps
+            // the env fallback (`sh2.vars.<n> ?? process.env.<n> ?? ''`)
+            // — the exact value getVar would yield for a plain name,
+            // without the dispatch.
             let r = store_var_read(name);
             if matches!(&r, Expr::Literal { value, .. } if value == "")
                 && never_written_read(name)
             {
-                Some(sh2_call("getVar", vec![str_lit(name)]))
+                Some(store_var_read_no_fold(name))
             } else {
                 Some(r)
             }
@@ -42698,7 +49290,10 @@ fn collect_local_decls(st: &IrStmt, out: &mut HashSet<String>) {
     }
 }
 
-pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+pub(crate) fn string_lift_vars(
+    prog: &IrProgram,
+    numeric: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut string_ctx: HashSet<String> = HashSet::new();
@@ -42911,7 +49506,35 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
             break;
         }
     }
-    lifted
+
+    // Subset of `lifted` whose every assignment is a pure ASCII literal
+    // or an already-identified ASCII var.  Command captures, interpolations,
+    // and getVar reads are excluded — their content is runtime-dependent.
+    let mut ascii: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &lifted {
+            if ascii.contains(name) {
+                continue;
+            }
+            if let Some(exprs) = assigns.get(name) {
+                let all_ascii = exprs.iter().all(|e| match e {
+                    IrExpr::Str(v, _) => v.is_ascii(),
+                    IrExpr::Var(n, _) => ascii.contains(n.as_str()),
+                    _ => false,
+                });
+                if all_ascii {
+                    ascii.insert(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    (lifted, ascii)
 }
 
 /// SH2_ASSUME_NO_ENV=0 — turn off the never-written-var read fold (see
@@ -43092,6 +49715,14 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
             IrExpr::Call { func, args } => {
                 match func.as_str() {
                     "setVar" | "setArray" | "setArrayAppend" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, written);
+                        }
+                    }
+                    // getLine("b") writes b (the c frontend's getline
+                    // bridge) — without this, a var only ever written
+                    // through getLine folds to "" at every read
+                    "getLine" | "getLineD" => {
                         if let Some(IrExpr::Str(n, _)) = args.first() {
                             mark_word(n, written);
                         }
@@ -44559,10 +51190,21 @@ fn call_free_expr(e: &Expr) -> Option<Expr> {
     }
 }
 
-/// A store write where the RHS is provably already a STRING (a string
-/// literal or template — the runtime's `String(...)` coercion is an
-/// identity), vs a number-valued RHS (native arith) that needs the
-/// coercion.
+/// A store write where the RHS must be handed to the store RAW — the
+/// runtime's `String(...)` coercion would destroy it.
+///
+/// Two classes qualify:
+///  • values already a STRING (a string literal or template — `String(...)`
+///    is an identity);
+///  • an ObjectExpression (a record value, core request
+///    rust-frontend-20260823-record-storage). `String({x:"3"})` is
+///    `"[object Object]"`, and the site this guards is the DIRECT
+///    `sh2.vars[name] = <expr>` write, which preserves any raw value —
+///    so the coercion is the only thing destroying the record, and every
+///    later field read off it yields undefined. Object literals are
+///    emitted ONLY by frontends lowering record/map literals (no shell
+///    path constructs one — bash assoc arrays go through setArray), so
+///    widening the set cannot change bash-semantics output.
 fn store_rhs_string(e: &Expr) -> bool {
     matches!(
         e,
@@ -44571,6 +51213,7 @@ fn store_rhs_string(e: &Expr) -> bool {
                 value: serde_json::Value::String(_),
                 ..
             }
+            | Expr::ObjectExpression { .. }
     )
 }
 
@@ -44649,11 +51292,27 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             raw: None,
             regex: None,
         },
-        IrExpr::Str(s, _) => Expr::Literal {
-            value: serde_json::Value::String(s.clone()),
-            raw: None,
-            regex: None,
-        },
+        IrExpr::Str(s, style) => {
+            // SingleQuoted holding `$` (a quoted literal the parser left
+            // unexpanded, e.g. 'putb $b') renders opaquely: downstream
+            // interpolation turns Literal text into templates, which
+            // would rewrite verbatim payloads. sh2.lit is the runtime
+            // identity — passes treat it as opaque and the value is
+            // byte-identical. Gated on `$` so plain quoted text keeps
+            // the exact current rendering (no behavior change elsewhere).
+            if matches!(style, StrStyle::SingleQuoted) && s.contains('$') {
+                return sh2_call_estree("lit", vec![Expr::Literal {
+                    value: serde_json::Value::String(s.clone()),
+                    raw: None,
+                    regex: None,
+                }]);
+            }
+            Expr::Literal {
+                value: serde_json::Value::String(s.clone()),
+                raw: None,
+                regex: None,
+            }
+        }
         IrExpr::Bool(b) => Expr::Literal {
             value: serde_json::Value::Bool(*b),
             raw: None,
@@ -45043,6 +51702,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         return slot_read(k);
                     }
                     if is_lifted(name) {
+                        return Expr::Identifier { name: name.clone() };
+                    }
+                    // A1-DECLARED parameter of the function being emitted:
+                    // the arrow binds it as a real JS parameter, so the read
+                    // is the bare identifier. Checked AFTER the lifted arms
+                    // (a lifted binding wins — a `local` of the same name
+                    // shadows the parameter) and BEFORE the store read,
+                    // which is empty for a param (the runtime's function map
+                    // carries the args, not `sh2.vars`). Core request
+                    // rust-20260930-031500 — go-sh `t109_bool_func.go`.
+                    if is_named_param(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
                     // NOTE (2026-09-09, t89 list-append): a concurrent
@@ -46033,7 +52703,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                     if ok {
-                        if let Some(native) = try_native_echo_redirect(stmts, &specs) {
+                        // EXPRESSION position: the chain's boolean VALUE is
+                        // the command's truth value (a `$(cmd > f)` capture,
+                        // a `&&`/`||` operand), so the `true`/`false` tails
+                        // are load-bearing here regardless of `$?`
+                        // liveness — always the full `.then/.catch` form.
+                        if let Some(native) = try_native_echo_redirect(stmts, &specs, false) {
                             return native;
                         }
                         // `grep -q PAT <<< TEXT` — the fd-0 herestring
@@ -49354,6 +56029,11 @@ mod lowering_shape_tests {
         // [`arith_has_div_mod`] excludes nonzero literals (no abort
         // possible — correct for the wrapper decision); the syntactic
         // detector must still see the operation (the zero-cmp gate).
+        // Hermetic: the divisor proof consults the process-global
+        // NONZERO_VARS verdict, which render tests leak across parallel
+        // workers — clear it so the conservative (unset) reading holds
+        // deterministically rather than by scheduling lottery.
+        *crate::shir::NONZERO_VARS.lock().unwrap() = None;
         assert!(arith_has_div_mod(&pct(var("n"), var("i"))));
         assert!(!arith_has_div_mod(&pct(var("n"), num(2))));
         assert!(arith_has_any_div_mod(&pct(var("n"), var("i"))));
@@ -50585,6 +57265,175 @@ mod const_analysis_tests {
 }
 
 #[cfg(test)]
+mod arith_len_placeholder_tests {
+    use super::*;
+
+    /// `${#arr[@]}` / `${#arr}` inside an arith text is stripped by
+    /// [`native_arith_text_len`] to the self-describing placeholder
+    /// `__sh2lena_arr` / `__sh2lens_arr`, which the emitter must ALWAYS
+    /// decode back to the runtime-exact `arrayLen` / `getVar().length` leaf.
+    ///
+    /// Regression (063_hard_to_parse.sh): when a true64 SLOT-homed index var
+    /// shared the arith tree, the wrapper wrapped the placeholder in a
+    /// `Cast(Int64, …)` and [`arith_bigint_safe_operand`] rendered the
+    /// placeholder NAME as a plain store read — a variable nothing ever sets,
+    /// so `${#args[@]}` read 0 and the loop never ran (`Processed 0 options`).
+    #[test]
+    fn length_placeholder_is_never_read_as_a_raw_store_var() {
+        assert!(arith_len_leaf("__sh2lena_arr").is_some());
+        assert!(arith_len_leaf("__sh2lens_s").is_some());
+        // The exact-BigInt shortcut must decline a placeholder (a placeholder
+        // name is not a variable), so the read falls through to the decode.
+        assert!(!exact_bigint_var_read("__sh2lena_arr"));
+        assert!(!exact_bigint_var_read("__sh2lens_s"));
+
+        let js = serde_json::to_string(&arith_bigint_safe_operand(&ArithAst::Var(
+            "__sh2lena_arr".to_string(),
+        )))
+        .unwrap();
+        assert!(js.contains("arrayLen"), "length ref not decoded: {js}");
+        assert!(
+            !js.contains("__sh2lena_arr"),
+            "raw length placeholder leaked into the emit: {js}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stmt_lines_tests {
+    use super::*;
+
+    /// Build the A1 line map for `src` the way the CLI does (parse WITH
+    /// lines, so every statement carries a source line).
+    fn line_map(src: &str) -> (Vec<IrStmt>, Vec<(usize, usize)>) {
+        let (cmds, lines) = crate::Parser::new(src).parse_with_lines().expect("parse");
+        let prog = ast_to_ir_with_lines(&cmds, &lines);
+        (prog.stmts, prog.stmt_lines)
+    }
+
+    /// Every `stmt` index in the map must name a statement that EXISTS.
+    ///
+    /// This is the contract the web GUI's source-line map depends on. It
+    /// broke because the indices were assigned BEFORE `optimize_stmts`
+    /// ran: for `x=hi` + `echo $x` the dead assignment is elided, so the
+    /// map claimed `echo` was statement 1 while only statement 0's worth
+    /// of statements survived. No corpus example caught it because the
+    /// A1 corpus path never reads the map back.
+    #[test]
+    fn stmt_line_indices_stay_in_range_after_dead_assignment_elision() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        // Precondition: the dead assignment really is elided, which is
+        // what used to invalidate the map.
+        assert!(
+            stmts.len() < 2,
+            "expected `x=hi` to be elided as a dead store, got {} stmts",
+            stmts.len()
+        );
+        for (stmt, line) in &lines {
+            assert!(
+                *stmt < stmts.len(),
+                "stmt_lines names statement {} but only {} statements survive (line {})",
+                stmt,
+                stmts.len(),
+                line
+            );
+        }
+    }
+
+    /// The surviving `echo` must map to ITS OWN source line (2), not to
+    /// the elided assignment's line (1). A stale-by-one map silently
+    /// points a consumer at the wrong source, which is worse than a
+    /// missing entry.
+    ///
+    /// `x=hi` alone is NOT used as the assignment here. Since
+    /// `copy-propagation` (transforms/copy_propagation.rs, 2026-09-15)
+    /// folds single-def literal variables into their reads, `x=hi` +
+    /// `echo $x` collapses to ONE synthesized `echo` that matches NO
+    /// original statement — so `stmt_lines` is legitimately EMPTY and an
+    /// assertion on the echo's line can never hold (that shape is pinned
+    /// separately, by `a_folded_away_statement_leaves_no_stale_map_entry`).
+    /// An assignment nothing reads is a DIFFERENT drop —
+    /// `dead-store-elim` — and the echo keeps its own origin: exactly the
+    /// stale-by-one shape this test exists to catch.
+    #[test]
+    fn surviving_statement_keeps_its_own_source_line() {
+        let (stmts, lines) = line_map("x=hi\necho done\n");
+        // Precondition: the dead store is still elided, the echo survives.
+        assert_eq!(
+            stmts.len(),
+            1,
+            "expected only the echo to survive, got {:?}",
+            stmts
+        );
+        let echo_idx = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::Expr { .. }))
+            .expect("the echo statement survives");
+        let mapped = lines.iter().find(|(s, _)| *s == echo_idx).map(|(_, l)| *l);
+        assert_eq!(
+            mapped,
+            Some(2),
+            "the echo must map to source line 2, got {:?}",
+            mapped
+        );
+    }
+
+    /// Nothing is elided when every assignment is READ, so the map must be
+    /// complete and in order — the fix must not disturb the ordinary path.
+    ///
+    /// Same fold caveat as above: command substitutions stand in for
+    /// literals so each of the four statements keeps a distinct origin.
+    #[test]
+    fn map_is_complete_when_nothing_is_elided() {
+        let (stmts, lines) =
+            line_map("x=$(date +%s)\ny=$(date +%T)\necho \"$x\"\necho \"$y\"\n");
+        assert_eq!(stmts.len(), 4, "nothing is dead, nothing is dropped");
+        assert_eq!(
+            lines,
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+            "every surviving statement keeps its own line"
+        );
+    }
+
+    /// A statement `copy-propagation` FOLDS AWAY must leave the map EMPTY,
+    /// not stale. This is the shape the two tests above could no longer
+    /// assert directly once folding landed: `x=hi` + `echo $x` lowers to a
+    /// synthesized `echo` that originates from no input statement, so a
+    /// naive pre-pass map would still claim `echo` was statement 1 — a
+    /// reference to a statement that no longer exists. A missing entry is
+    /// recoverable; a dangling index is not.
+    #[test]
+    fn a_folded_away_statement_leaves_no_stale_map_entry() {
+        let (stmts, lines) = line_map("x=hi\necho $x\n");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "copy-propagation folds the pair into one echo"
+        );
+        assert!(
+            lines.is_empty(),
+            "a synthesized statement has no origin, so the map must be empty, got {:?}",
+            lines
+        );
+    }
+
+    /// A fold that keeps ONE surviving statement on both sides of a drop
+    /// must still attribute it to its OWN line. `x=hi` folds away, `y=2`
+    /// folds away, but the two `echo`s are distinct origins at lines 2 and
+    /// 4 — the map must not shift by the number of dropped statements.
+    #[test]
+    fn dropped_statements_do_not_shift_the_survivors_lines() {
+        let (stmts, lines) = line_map("x=hi\necho done\ny=2\necho bye\n");
+        assert_eq!(stmts.len(), 2, "both assignments folded away");
+        assert_eq!(
+            lines,
+            vec![(0, 2), (1, 4)],
+            "survivors keep lines 2 and 4 despite two dropped statements"
+        );
+    }
+}
+
+#[cfg(test)]
 mod range_analysis_tests {
     use super::*;
 
@@ -50593,6 +57442,56 @@ mod range_analysis_tests {
         // RAW IR — see consts_of rationale
         let prog = ast_to_ir_raw(&cmds);
         analyze_var_ranges(&prog)
+    }
+
+    /// A tiny constant `range` collapses a modular recurrence: with N=1 the
+    /// body runs exactly once, so `h = (h*31 + i) % M` is `0` and the bound
+    /// should be [0,0] — NOT the modulus cap, and certainly not a straddling
+    /// interval.
+    ///
+    /// KNOWN GAP (2026-09-15) — the analysis is exact for the UNROLLED form and
+    /// wrong for the loop form, which localises the cause:
+    ///
+    ///   h=0; h=$(( (h*31 + 0) % M ))          -> h (0,0)      exact
+    ///   h=0; i=0; h=$(( (h*31 + i) % M ))     -> h (0,0)      exact
+    ///   h=0; for ((i=0;i<1;i++)); do ...      -> h (-(M-1),M-1)   loose
+    ///
+    /// ...and the tell is the counter: the loop form reports `i (1,1)` as the
+    /// body-entry range.  `walk_stmt_ranges`' ForInit arm walks the STEP into
+    /// the ENTRY state before `loop_fixpoint`, so the body is analysed with the
+    /// post-increment value (0 -> 1), the body's own result moves outward, and
+    /// `loop_fixpoint`'s widening then collapses it to the domain/straddle.
+    /// The counter is not in `carried` either (that set is the BODY's writes),
+    /// so nothing caps it back to the cond bound: the entry invariant is never
+    /// applied to it.
+    ///
+    /// Impact is precision, not a miscompile: the returned post-state is
+    /// widened so it still contains the true values (`i (1,1)` is even the
+    /// correct value AT loop exit); the body-entry state is the unsound part,
+    /// and it only feeds the body's own transfer.  Every consumer of
+    /// `analyze_var_ranges` — the i53/bigint homing gate, `range_width_name`'s
+    /// width choice, the GLSL mediump proof, and any annotator that displays
+    /// these bounds — inherits the lost precision.
+    #[test]
+    #[ignore = "known gap: the ForInit step is walked into the entry state, so the body sees the post-increment counter and the loop bound widens to a straddle"]
+    fn tiny_range_collapses_a_modular_recurrence() {
+        let r = ranges_of(
+            "h=0\nfor ((i=0;i<1;i++)); do h=$(( (h*31 + i) % 1000000007 )); done\necho $h\n",
+        );
+        assert_eq!(r.get("h"), Some(&(0, 0)), "h should collapse to [0,0], got {:?}", r.get("h"));
+        assert_eq!(r.get("i"), Some(&(0, 0)), "i should be [0,0], got {:?}", r.get("i"));
+    }
+
+    /// The large-trip counterpart genuinely IS capped at the modulus — the
+    /// difference is the trip count, not the analysis's mood.  This half
+    /// passes today and guards the other direction.
+    #[test]
+    fn large_trip_caps_at_the_modulus() {
+        let r = ranges_of(
+            "h=0\nfor ((i=0;i<2000000;i++)); do h=$(( (h*31 + i) % 1000000007 )); done\necho $h\n",
+        );
+        let h = r.get("h").copied().expect("h has a range");
+        assert!(h.0 <= 0 && h.1 >= 1000000006, "large trip must include the modulus range, got {h:?}");
     }
 
     /// The grep-contains lift treats `printf '%s\n' ARG | grep PAT >/dev/null`
@@ -50635,6 +57534,225 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// A `cmd > file` redirect lowers to a native
+    /// `await sh2.fs.writeFile(path, text).then(...).catch(...)` chain. The
+    /// `.then` arm exists ONLY to record `$?` on success. When the write's
+    /// status is unread nothing observes it, so the `.then` closure and the
+    /// catch's `sh2.lastExit = 1` store are both droppable and the chain
+    /// collapses to `await writeFile(...).catch(report)`.
+    ///
+    /// The `.catch` must SURVIVE: it reports the failure to stderr (a
+    /// dropped report would make a failing write silent). These two tests are
+    /// the two halves of that contract — one pins the elision, one pins the
+    /// report, and the second also pins that a LIVE `$?` keeps the full form.
+    #[test]
+    fn writefile_status_dead_drops_the_then_closure() {
+        // The shadowing statement AFTER the write is what makes the write's
+        // status unread. A LONE `echo hi > f` would NOT: with no following
+        // writer the write's status IS the program's exit code, so
+        // `sh2._finish` still reports it and the `.then` is load-bearing
+        // there (pinned by `writefile_program_final_write_keeps_the_then_closure`).
+        let src = "echo hi > /tmp/wf_dead\necho done\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            !js.contains("\"then\""),
+            "lastexit-dead write must not emit the .then status closure: {js}"
+        );
+        // …and the error report is still there, so a failed write is visible.
+        assert!(
+            js.contains("\"catch\""),
+            "the .catch report must survive the status elision: {js}"
+        );
+        assert!(
+            js.contains("Permission denied"),
+            "the EACCES report text must survive the status elision: {js}"
+        );
+    }
+
+    /// The negative half: when the script DOES read `$?` after the write, the
+    /// status is live and the full `.then/.catch` chain is mandatory —
+    /// dropping it would make `echo $?` print the PREVIOUS command's status.
+    #[test]
+    fn writefile_status_live_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_live\necho \"rc=$?\"\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "a write whose $? is read must keep the .then status closure: {js}"
+        );
+    }
+
+    /// A write in FINAL POSITION keeps its `.then` even though the script
+    /// never mentions `$?`. With no later statement to shadow it, the write's
+    /// status is the program's own exit code (`sh2._finish` reports the last
+    /// command's status), so dropping the closure would make a failed write
+    /// exit 0 — the exact silent-wrong-output this elision must not cause.
+    ///
+    /// This is the guard that makes the elision safe by construction: the
+    /// deadness scan is only allowed to fire when a later writer shadows the
+    /// read, never at end-of-program.
+    #[test]
+    fn writefile_program_final_write_keeps_the_then_closure() {
+        let src = "echo hi > /tmp/wf_final\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"then\""),
+            "the program-final write's status IS the exit code and must stay live: {js}"
+        );
+    }
+
+    /// A `Goto` that survives to the ESTree renderer used to lower to a
+    /// bare `null` literal — a SILENT no-op, so the program ran straight
+    /// through the jump and executed the statements the goto was meant to
+    /// skip (bat t06_goto printed `never`; c t27_goto's backward loop ran
+    /// once and printed `1` where native prints `3`). The emitter's own
+    /// comment claimed "the runtime resolves it from state"; no such
+    /// runtime helper exists. It must now REFUSE loudly via
+    /// `sh2.unsupported`, matching the sh and java backends.
+    ///
+    /// Built at the IR level (not from bash source) because no shell source
+    /// produces a Goto — only frontends (c-sh-go, bat-sh-go) do, and both
+    /// emit it via the A1 ingress, not the shell parser.
+    #[test]
+    fn goto_lowers_to_unsupported_not_a_silent_null() {
+        let blank = || IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let prog = IrProgram {
+            stmts: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("before")])],
+                }),
+                IrStmt::Goto("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("never")])],
+                }),
+                IrStmt::Label("skip".to_string()),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![st("echo"), IrExpr::Array(vec![st("after")])],
+                }),
+            ],
+            ..blank()
+        };
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        assert!(
+            js.contains("\"name\":\"unsupported\""),
+            "an un-restructured goto must refuse loudly, not lower to a silent null: {js}"
+        );
+        assert!(
+            js.contains("goto skip"),
+            "the refusal must NAME the jump it cannot lower: {js}"
+        );
+        // the Label arm stays an inert `null` — it only names a position,
+        // so dropping it is exact. Pinned so a future Label fix does not
+        // start refusing on a node that needs no runtime support.
+        let label_only = IrProgram {
+            stmts: vec![IrStmt::Label("skip".to_string())],
+            ..blank()
+        };
+        let js2 = serde_json::to_string(&shir_to_estree(&label_only)).unwrap();
+        assert!(
+            !js2.contains("\"name\":\"unsupported\""),
+            "a lone Label is inert and must NOT refuse: {js2}"
+        );
+    }
+
+    /// A brace level's comma alternatives may contain nested braces. The
+    /// parser must group each alternative's parts into a Compound (a
+    /// cartesian factor), not flatten them into sibling alternatives —
+    /// `a{x/{p,q},y}z` expands to `ax/pz ax/qz ayz`, not `ax/z ayz`.
+    #[test]
+    fn nested_brace_alternatives_are_compound_groups() {
+        let src = "echo a{x/{p,q},y}z\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let c = crate::c_backend::shir_to_c(&prog);
+        for want in ["ax/pz", "ax/qz", "ayz"] {
+            assert!(c.contains(want), "missing {want:?} in C:\n{c}");
+        }
+        assert!(!c.contains("ax/z"), "flattened alternative in C:\n{c}");
+
+        // `{a,{b,c}}d` → ad bd cd (the nested brace is one alternative).
+        let src2 = "echo {a,{b,c}}d\n";
+        let cmds2 = crate::Parser::new(src2).parse().expect("parse");
+        let prog2 = ast_to_ir(&cmds2);
+        let c2 = crate::c_backend::shir_to_c(&prog2);
+        for want in ["ad", "bd", "cd"] {
+            assert!(c2.contains(want), "missing {want:?} in C:\n{c2}");
+        }
+    }
+
+    /// A literal before a brace on a SEPARATE source word stays a separate
+    /// argv word: `mkdir -p a/{x,y}` is `-p a/x a/y`, never `-pa/x`.
+    ///
+    /// `mkdir` is NOT the vehicle any more. `mkdir`/`mkdir -p` lower to
+    /// native Perl (`File::Path::make_path`), so the `-p` FLAG NO LONGER
+    /// APPEARS IN THE OUTPUT AT ALL and this assertion can never hold —
+    /// the same stale-expectation shape this round found in
+    /// `stmt_lines_tests`. What the test actually pins is WORD SEPARATION:
+    /// a literal on one source word must not fuse with the brace expansion
+    /// on the next. `echo` keeps its argv native (`print` + `join`) with no
+    /// shell-out, so the same contract is testable there — and the native
+    /// `mkdir` lowering it moved off is pinned separately, by
+    /// `native_brace_expansion_reaches_mkdir_args_intact` below.
+    #[test]
+    fn brace_prefix_does_not_glue_a_separate_word() {
+        let src = "echo -p a/{x,y}\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("-p") && perl.contains("a/x") && perl.contains("a/y"),
+            "separate `-p` word must stay separate: {perl}"
+        );
+        assert!(
+            !perl.contains("-pa/x"),
+            "`-p` must not glue to the brace prefix: {perl}"
+        );
+    }
+
+    /// The companion guard for the source the test above moved off: the
+    /// NATIVE `mkdir` lowering must still receive both brace-expanded
+    /// directories as separate arguments. Without this, moving `mkdir` out
+    /// of the test above would leave the `mkdir` path unasserted — a
+    /// native lowering that silently collapsed `a/{x,y}` to a single
+    /// argument would still pass.
+    #[test]
+    fn native_brace_expansion_reaches_mkdir_args_intact() {
+        let src = "mkdir -p a/{x,y}\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("a/x") && perl.contains("a/y"),
+            "both brace-expanded dirs must reach make_path: {perl}"
+        );
+        assert!(
+            !perl.contains("a/{x,y}"),
+            "the brace expansion must be applied, not passed through: {perl}"
+        );
+    }
+
     /// `cat <<'EOF' … EOF` (the print-heredoc idiom) lowers to a native
     /// `print` with no bash -c.
     #[test]
@@ -50670,8 +57788,10 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
+        // The differ wording ("byte" vs "char") follows the local cmp
+        // (see pipeline_native::capabilities::cmp); accept either.
         assert!(
-            perl.contains("differ: byte")
+            perl.contains("differ: byte") || perl.contains("differ: char")
                 && perl.contains("%s %s differ")
                 && !perl.contains("system('bash'"),
             "bare cmp should lower to a native differ compare: {perl}"
@@ -50948,7 +58068,8 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
 
     #[test]
     fn for_loop_ranges() {
-        // integer item list → the loop var's range; body writes are lost
+        // integer item list → the loop var's range (joined with any
+        // pre-loop value or body write, which both exist at runtime)
         let r = ranges_of("for i in 1 2 3; do echo $i; done");
         assert_eq!(r.get("i"), Some(&(1, 3)));
         // non-numeric item → Any
@@ -50964,6 +58085,46 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         }
         let r3 = analyze_var_ranges(&prog);
         assert_eq!(r3.get("i"), Some(&(1, 5)));
+    }
+
+    /// Straight-line redefinition joins (whole-life range): `x=3000000000`
+    /// then `x=1` must report [1,3000000000], not [1,1] — last-write-wins
+    /// emits a C type that wraps on the earlier value (py2cy.js `put()`
+    /// rule, same hazard).
+    #[test]
+    fn straight_line_redefinition_joins() {
+        let r = ranges_of("x=3000000000; echo $x; x=1");
+        assert_eq!(r.get("x"), Some(&(1, 3000000000)));
+    }
+
+    /// Boolean literals are not integers: Python `True` prints as "True",
+    /// not "1" — a native-int declaration would change output. The
+    /// py-sh-go frontend lowers True to `IrExpr::Bool`, which carries no
+    /// integer range and never lifts.
+    #[test]
+    fn bool_assign_has_no_range_and_no_lift() {
+        use crate::ir::{AssignTarget, IrExpr, IrProgram, IrStmt};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![AssignTarget { var: "flag".into(), sigil: None, indices: vec![] }],
+                expr: IrExpr::Bool(true),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let r = analyze_var_ranges(&prog);
+        assert!(!r.contains_key("flag"));
+        assert!(!numeric_lift_vars(&prog).contains("flag"));
     }
 
     #[test]
@@ -51006,15 +58167,26 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
     fn arith_assign_incdec_cond_ranges() {
         let r = ranges_of("x=5\ny=$((x++))\nz=$((x+=10))\nw=$((1 ? 7 : 100))");
         // x++: value 5 (the OLD value), x becomes 6 — the RANGE walker
-        // tracks x's final value from the last write
+        // tracks x's whole life (every held value), not the last write:
+        // a C type sized for the last write alone wraps on the earlier
+        // values (py2cy.js `put()` rule, same hazard).
         assert_eq!(r.get("y"), Some(&(5, 5)));
-        assert_eq!(r.get("x"), Some(&(16, 16)));
-        assert_eq!(r.get("z"), Some(&(16, 16)));
+        assert_eq!(r.get("x"), Some(&(5, 16)));
+        // `z=$((x+=10))` widens with x's whole life ([5,6]+10 — the
+        // flow-exact answer is 16, but x's joined range is the honest
+        // input; same C width either way).
+        assert_eq!(r.get("z"), Some(&(15, 16)));
         assert_eq!(r.get("w"), Some(&(7, 7)));
         // an IncDec past the domain wraps exactly (bash: i++ at MAX → MIN)
         let r2 = ranges_of("i=9223372036854775807\nj=$((i++))");
         assert_eq!(r2.get("j"), Some(&(9223372036854775807, 9223372036854775807)));
-        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, -9223372036854775808)));
+        // the wrap straddles the fold, so the whole-life hull is the full
+        // domain (an interval cannot name {MAX, MIN} tighter than that).
+        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, 9223372036854775807)));
+        // width-straddling redefinition: the old last-write-wins rule
+        // reported [1,1] here and a C int wrapped the 3e9 write.
+        let r3 = ranges_of("x=3000000000\nx=$((x-2999999999))");
+        assert_eq!(r3.get("x"), Some(&(1, 3000000000)));
     }
 
     /// The i53 escalation set: proven out-of-±2^53 vars with all-integer
@@ -51146,6 +58318,866 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod var_borrowable_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn borrowable(src: &str) -> std::collections::HashSet<String> {
+        analyze_var_borrowable(&prog_of(src))
+    }
+
+    /// A single-assignment string whose every read is a borrow qualifies:
+    /// the value is bound once and only ever printed/formatted.
+    #[test]
+    fn single_assignment_borrowed_reads_qualify() {
+        // the t24 shape: two constants concatenated for a print
+        let b = borrowable("a=foo\nb=bar\necho \"$a$b\"\n");
+        assert!(b.contains("a"), "{b:?}");
+        assert!(b.contains("b"), "{b:?}");
+        // a read consumed to build a NEW value, and a plain print
+        assert!(borrowable("a=foo\necho \"$a\"\n").contains("a"));
+        assert!(borrowable("a=foo\nc=\"$a bar\"\necho \"$c\"\n").contains("a"));
+    }
+
+    /// A REASSIGNED variable is not single-assignment — it must stay owned.
+    #[test]
+    fn reassigned_vars_do_not_qualify() {
+        assert!(!borrowable("a=foo\na=bar\necho \"$a\"\n").contains("a"));
+        // a self-referential append mutates the binding
+        assert!(!borrowable("a=foo\na=\"$a x\"\necho \"$a\"\n").contains("a"));
+    }
+
+    /// A value read in a RETAINING position cannot be borrowed: an array
+    /// element store keeps the value past the binding.
+    #[test]
+    fn retaining_reads_do_not_qualify() {
+        // array element (the frontend's structured array assignment)
+        let src = "{\"type\":\"Program\",\"contract_version\":1,\"imports\":[],\"requires\":[],\"var_types\":[],\"stmt_lines\":[],\"subs\":[],\"stmts\":[\
+{\"type\":\"Assign\",\"targets\":[{\"var\":\"a\",\"sigil\":null,\"indices\":[]}],\"expr\":{\"type\":\"Str\",\"value\":\"foo\",\"style\":\"DoubleQuoted\"}},\
+{\"type\":\"Assign\",\"targets\":[{\"var\":\"arr\",\"sigil\":null,\"indices\":[]}],\"expr\":{\"type\":\"Call\",\"func\":\"setArray\",\"args\":[{\"type\":\"Str\",\"value\":\"arr\",\"style\":\"DoubleQuoted\"},{\"type\":\"Array\",\"elements\":[{\"type\":\"Call\",\"func\":\"getVar\",\"args\":[{\"type\":\"Str\",\"value\":\"a\",\"style\":\"DoubleQuoted\"}]}]}]}}]}";
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("A1 ingress");
+        let b = analyze_var_borrowable(&prog);
+        assert!(!b.contains("a"), "an array store retains: {b:?}");
+    }
+
+    /// An unanalysable construct withholds the WHOLE verdict (a dangling
+    /// borrow would be a miscompile, so nothing is claimed).
+    #[test]
+    fn opaque_constructs_withhold_the_verdict() {
+        assert!(borrowable("a=foo\neval \"echo $a\"\n").is_empty());
+    }
+
+    /// A name that is never read is not borrowable (there is nothing to
+    /// borrow, and removing the binding would change the program's shape
+    /// for no benefit).
+    #[test]
+    fn unread_vars_do_not_qualify() {
+        assert!(!borrowable("a=foo\necho hi\n").contains("a"));
+    }
+}
+
+#[cfg(test)]
+mod array_key_lift_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    /// Every array element read in the program, as (base, key-channel).
+    ///
+    /// Two lowering shapes reach an array element and BOTH are collected:
+    ///   * `sh2.arrayIndex(BASE, KEY)` — a runtime call
+    ///   * `BASE[KEY]` on a native JS array — a computed MemberExpression
+    ///
+    /// The key's CHANNEL is what decides correctness. A key naming a
+    /// LIFTED binding must be a native read (`mi`); a store-bound name
+    /// must be read from the store (`sh2.vars.gi ?? …`). Reading one
+    /// through the other channel is the desync: the store never holds a
+    /// lifted name (→ "" → index 0), and a native binding of a
+    /// store-bound name is undefined.
+    fn array_reads(json: &str) -> Vec<(String, String)> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        let mut out = Vec::new();
+
+        fn ident(v: &serde_json::Value, name: &str) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                && v.get("name").and_then(|n| n.as_str()) == Some(name)
+        }
+        /// `sh2.vars` — the store object: a MemberExpression whose object
+        /// is the `sh2` identifier and whose property is `vars`.
+        fn is_store_obj(v: &serde_json::Value) -> bool {
+            v.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                && v.get("object").map(|o| ident(o, "sh2")).unwrap_or(false)
+                && v.get("property").map(|p| ident(p, "vars")).unwrap_or(false)
+        }
+        fn str_of(v: &serde_json::Value) -> String {
+            v.get("name")
+                .or_else(|| v.get("value"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
+                .to_string()
+        }
+        /// Classify a key subtree by CHANNEL, per name. A name read
+        /// through both the store and a bare binding is the desync; read
+        /// through exactly one is correct (which one depends on how the
+        /// variable is written — the caller pairs this with that fact).
+        fn channel(k: &serde_json::Value) -> String {
+            let mut store: std::collections::HashSet<String> = Default::default();
+            let mut native: std::collections::HashSet<String> = Default::default();
+            fn w(
+                v: &serde_json::Value,
+                store: &mut std::collections::HashSet<String>,
+                native: &mut std::collections::HashSet<String>,
+            ) {
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| w(x, store, native)),
+                    serde_json::Value::Object(m) => {
+                        let ty = m.get("type").and_then(|t| t.as_str());
+                        if ty == Some("Identifier") {
+                            if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                                native.insert(n.to_string());
+                            }
+                        }
+                        // `<store>.<name>` — the store read of a name
+                        if m.get("object").map(is_store_obj).unwrap_or(false) {
+                            if let Some(n) = m
+                                .get("property")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|x| x.as_str())
+                            {
+                                store.insert(n.to_string());
+                            }
+                        }
+                        for (field, child) in m {
+                            // The `property` of a NON-computed member is a
+                            // property NAME, not a value expression — it
+                            // must not count as a native binding read. A
+                            // COMPUTED member's property IS the value.
+                            let is_name_only = field == "property"
+                                && ty == Some("MemberExpression")
+                                && m.get("computed") != Some(&serde_json::Value::Bool(true));
+                            if !is_name_only {
+                                w(child, store, native);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            w(k, &mut store, &mut native);
+            let both: Vec<&String> = store.intersection(&native).collect();
+            if !both.is_empty() {
+                return format!("MIXED{both:?}");
+            }
+            if store.is_empty() {
+                "native"
+            } else {
+                "store"
+            }
+            .to_string()
+        }
+
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(m) => {
+                    // sh2.arrayIndex(BASE, KEY)
+                    if m.get("callee")
+                        .and_then(|c| c.get("property"))
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("arrayIndex")
+                    {
+                        if let Some(args) = m.get("arguments").and_then(|a| a.as_array()) {
+                            if let (Some(b), Some(k)) = (args.first(), args.get(1)) {
+                                out.push((str_of(b), channel(k)));
+                            }
+                        }
+                    }
+                    // BASE[KEY]
+                    if m.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
+                        && m.get("computed") == Some(&serde_json::Value::Bool(true))
+                    {
+                        if let (Some(obj), Some(k)) = (m.get("object"), m.get("property")) {
+                            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                                out.push((name.to_string(), channel(k)));
+                            }
+                        }
+                    }
+                    m.values().for_each(|x| walk(x, out));
+                }
+                _ => {}
+            }
+        }
+        walk(&v, &mut out);
+        out
+    }
+
+    /// estree-20260813-182439 (function-LOCAL lifted vars): a local the
+    /// emitter lifts to a native JS binding must be indexed by its
+    /// NATIVE binding, not by a store-key string. A `"$mi"` store key
+    /// expands to "" against a store that never holds the name, so
+    /// index 0 → every read returns element 0.
+    #[test]
+    fn local_lifted_array_key_is_native() {
+        let json = shir_to_estree_json(&prog_of(
+            "mx=(10 20 30)\nmime_count=3\nmime_at() {\n  mi=0\n  while [ \"$mi\" -lt \"$mime_count\" ]; do\n    if [ \"${mx[$mi]}\" -eq 20 ]; then echo found; fi\n    mi=$((mi + 1))\n  done\n}\nmime_at\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "mx" && ch == "native"),
+            "lifted local key must be a NATIVE read, got {reads:?}\n{json}"
+        );
+        assert!(
+            !json.contains("sh2.vars.mi"),
+            "a lifted local must not round-trip through the store:\n{json}"
+        );
+    }
+
+    /// estree-20260813-182438 (params): the store-bound twin of the test
+    /// above. `gi` is NOT lifted here — it is written and read through
+    /// `sh2.vars.gi` — so the correct key is the STORE read. The
+    /// invariant both tests share is that the key's channel matches how
+    /// the key variable is written; `MIXED` is the desync in either
+    /// direction.
+    #[test]
+    fn param_store_bound_array_key_uses_the_store() {
+        let json = shir_to_estree_json(&prog_of(
+            "map=(0 1 2 3 4 5 6 7)\nmap_get() { gi=$1; gv=${map[$gi]}; }\nmap_get 5\necho \"$gv\"\n",
+        ))
+        .expect("render");
+        let reads = array_reads(&json);
+        assert!(
+            reads.iter().any(|(b, ch)| b == "map" && ch == "store"),
+            "a store-bound key must read the store, got {reads:?}\n{json}"
+        );
+        assert!(
+            !reads.iter().any(|(_, ch)| ch == "MIXED"),
+            "key read through both channels at once: {reads:?}\n{json}"
+        );
+        // the write and the read must agree: `gi` is store-bound
+        assert!(
+            json.contains("\"name\":\"gi\"") && json.contains("\"name\":\"vars\""),
+            "gi must be store-bound for a store key to be correct:\n{json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod param_use_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn use_of(src: &str, name: &str, i: usize) -> Option<ParamUse> {
+        analyze_param_use(&prog_of(src))
+            .get(name)
+            .and_then(|v| v.get(i).copied())
+    }
+
+    /// A parameter the body only BORROWS (printed, tested, formatted) can
+    /// be a `&str` in an ownership-model backend.
+    #[test]
+    fn borrowed_params() {
+        assert_eq!(
+            use_of("f() { echo \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+        assert_eq!(
+            use_of("f() { test -n \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+        assert_eq!(
+            use_of("f() { printf \"%s\" \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Borrow)
+        );
+    }
+
+    /// A parameter the body STORES (or returns) is retained: the caller
+    /// must hand over an owned value.
+    #[test]
+    fn owned_params() {
+        // assignment
+        assert_eq!(
+            use_of("f() { x=\"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // local decl (`local x="$1"` lowers to a builtin decl word)
+        assert_eq!(
+            use_of("f() { local x=\"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // array element
+        assert_eq!(
+            use_of("f() { a=(\"$1\"); }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+        // return hands the value to the caller
+        assert_eq!(
+            use_of("f() { return \"$1\"; }\nf hi\n", "f", 0),
+            Some(ParamUse::Own)
+        );
+    }
+
+    /// Nothing unsafe survives: `eval`/`source` (opaque command text),
+    /// `set --`/`shift` (the positional no longer names one caller word),
+    /// an ambiguous redefinition — all are vetoed, so the parameters stay
+    /// owned and the key is absent from the verdict.
+    #[test]
+    fn unanalysable_bodies_are_vetoed() {
+        for src in [
+            "f() { eval \"echo $1\"; }\nf hi\n",
+            "f() { source /dev/null; echo \"$1\"; }\nf hi\n",
+            "f() { set -- a b; echo \"$1\"; }\nf hi\n",
+            "f() { x=\"$1\"; }\nf() { echo \"$1\"; }\nf hi\n",
+        ] {
+            let v = analyze_param_use(&prog_of(src));
+            assert!(
+                !v.contains_key("f"),
+                "unanalysable body got a verdict ({src}): {v:?}"
+            );
+        }
+    }
+
+    /// Several parameters are indexed independently: `$1` stored, `$2`
+    /// borrowed.
+    #[test]
+    fn per_parameter_verdict() {
+        let v = analyze_param_use(&prog_of("f() { y=\"$1\"; echo \"$2\"; }\nf a b\n"));
+        let f = v.get("f").expect("verdict for f");
+        assert_eq!(f.first().copied(), Some(ParamUse::Own), "the first param is stored");
+        assert_eq!(f.get(1).copied(), Some(ParamUse::Borrow), "the second param is printed");
+    }
+}
+
+#[cfg(test)]
+mod sink_context_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn ctx_of(src: &str, name: &str) -> SinkContext {
+        *analyze_fn_sink_contexts(&prog_of(src))
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from the verdict:\n{src}"))
+    }
+
+    /// A function only ever called at top level is NEVER redirected: its
+    /// prints cannot land in a non-stdout sink.
+    #[test]
+    fn never_redirected_function() {
+        assert_eq!(ctx_of("f() { echo a; echo b; }\nf\n", "f"), SinkContext::Never);
+        // a redirect elsewhere in the program does not change f's verdict
+        assert_eq!(
+            ctx_of("f() { echo a; }\nf\n{ echo g; } > /tmp/x\n", "f"),
+            SinkContext::Never
+        );
+    }
+
+    /// A function whose only call site is under a redirect/capture ALWAYS
+    /// sees a sink.
+    #[test]
+    fn always_redirected_function() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf > /tmp/x\n", "f"),
+            SinkContext::Always
+        );
+        // a command substitution is an implicit fd-1 sink
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nx=$(f)\n", "f"),
+            SinkContext::Always
+        );
+        // a non-final pipeline stage routes into the pipe
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf | cat\n", "f"),
+            SinkContext::Always
+        );
+    }
+
+    /// Both call shapes at once: the sink check must survive (the
+    /// conservative verdict).
+    #[test]
+    fn sometimes_redirected_function_is_conservative() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\nf\nf > /tmp/x\n", "f"),
+            SinkContext::Sometimes
+        );
+    }
+
+    /// Unknown callers are conservative: a defined-but-never-called
+    /// function, a function called from inside ANOTHER function's body
+    /// (whose own sink depends on its callers), and an ambiguous
+    /// redefinition.
+    #[test]
+    fn unknown_callers_are_conservative() {
+        assert_eq!(
+            ctx_of("f() { echo a; }\n", "f"),
+            SinkContext::Sometimes,
+            "a defined-but-uncalled function has unknown callers"
+        );
+        assert_eq!(
+            ctx_of("g() { echo a; }\nf() { g; }\nf\n", "g"),
+            SinkContext::Sometimes,
+            "a call inside a body depends on that body's callers"
+        );
+        assert_eq!(
+            ctx_of("f() { echo a; }\nf() { echo b; }\nf\n", "f"),
+            SinkContext::Sometimes,
+            "a redefinition makes the callee ambiguous"
+        );
+    }
+
+    /// A nested redirect does not "cancel" the sink — the inner statements
+    /// are still inside one.
+    #[test]
+    fn nested_redirect_stays_always() {
+        assert_eq!(
+            ctx_of("f() { echo a; echo b; }\n{ f; echo g; } > /tmp/x\n", "f"),
+            SinkContext::Always
+        );
+    }
+
+    /// The FRONTEND spelling of a command substitution — a `capture` CALL
+    /// whose argument is the body arrow — is a sink for the calls inside
+    /// it, exactly like the `Capture` node. Missing this arm made a
+    /// function called in a capture body look never-sinked, so the
+    /// renderer printed straight to stdout and the captured value came
+    /// back empty (t52's `for n in names: print(greet(n))` printed the
+    /// greeting twice plus a blank line).
+    #[test]
+    fn frontend_capture_call_is_a_sink() {
+        let prog = crate::ir::IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    params: vec![],
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+                // x = capture(Arrow([Expr(exec("f", []))]))
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        indices: vec![],
+                        sigil: None,
+                    }],
+                    expr: IrExpr::Call {
+                        func: "capture".to_string(),
+                        args: vec![IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![]),
+                            ],
+                        })])],
+                    },
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        assert_eq!(
+            analyze_fn_sink_contexts(&prog).get("f").copied(),
+            Some(SinkContext::Always),
+            "a call inside capture(...) writes to the capture, not stdout"
+        );
+    }
+
+    /// The Rust backend decides the same thing from its own call-shape
+    /// recognition (the `exec("f", [...])` form the frontends emit).
+    #[test]
+    fn fn_call_shape_is_recognised() {
+        let prog = crate::ir::IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    params: vec![],
+                    body: vec![],
+                    named_blocks: vec![],
+                },
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        assert_eq!(
+            analyze_fn_sink_contexts(&prog).get("f").copied(),
+            Some(SinkContext::Never)
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_language_tests {
+    use super::*;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        ast_to_ir_raw(&cmds)
+    }
+
+    /// The shell (and an unset source, and the opaque A1 passthrough)
+    /// has a `$?`; the frontend languages that lower no status do not.
+    #[test]
+    fn status_bearing_languages() {
+        for lang in ["sh", "bash", "zsh", "posix-sh", "shir"] {
+            set_source_lang(Some(lang));
+            assert!(source_has_exit_status(), "{lang} should have a status");
+        }
+        for lang in ["py", "python", "c", "pl", "go", "fish", "unknown"] {
+            set_source_lang(Some(lang));
+            assert!(!source_has_exit_status(), "{lang} should have no status");
+        }
+        set_source_lang(None);
+        assert!(source_has_exit_status(), "unset = the shell default");
+    }
+
+    /// A `$?` read is what makes the register observable — regardless of
+    /// the source language (`subprocess.run(...).returncode` lowers to
+    /// exactly this read, so a Python program that captures a child
+    /// status still needs the register).
+    #[test]
+    fn status_reads_are_detected() {
+        assert!(!prog_observes_exit_status(&prog_of("echo hi\n")));
+        assert!(prog_observes_exit_status(&prog_of("false\nr=$?\necho $r\n")));
+        // the word-level lowering of `$?` in an interpolation
+        assert!(prog_observes_exit_status(&prog_of("false\necho \"x$?\"\n")));
+        // inside a function body / a loop body (the tree walk recurses)
+        assert!(prog_observes_exit_status(&prog_of(
+            "f() { echo $?; }\nwhile true; do break; done\n"
+        )));
+    }
+
+    /// The register-elision verdict: no source status AND no read.
+    #[test]
+    fn unobservable_verdict() {
+        let quiet = prog_of("echo hi\n");
+        set_source_lang(Some("py"));
+        assert!(exit_status_is_unobservable(&quiet));
+        set_source_lang(Some("sh"));
+        assert!(!exit_status_is_unobservable(&quiet));
+        set_source_lang(Some("py"));
+        let reader = prog_of("false\nr=$?\n");
+        assert!(!exit_status_is_unobservable(&reader), "a $? read keeps it");
+        set_source_lang(None);
+    }
+}
+
+#[cfg(test)]
+mod py2cy_analysis_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn prog_of(src: &str) -> crate::ir::IrProgram {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        // RAW IR: the full pipeline sets process-global verdict statics
+        // (NONZERO_VARS etc.) that leak across parallel tests — the
+        // range-analysis convention (see consts_of rationale)
+        ast_to_ir_raw(&cmds)
+    }
+
+    fn env_of(pairs: &[(&str, (i128, i128))]) -> HashMap<String, (i128, i128)> {
+        pairs.iter().map(|(n, r)| (n.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn exact_eval_no_wrap() {
+        // exact i128 reading: `2**100` is its TRUE value (NOT wrapped to
+        // 0) — callers test i64-containment themselves; only i128
+        // overflow (or unknown/div-zero) is None
+        let env = env_of(&[]);
+        let pow = crate::ir::ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(2)),
+            rhs: Box::new(crate::ir::ArithAst::Num(100)),
+        };
+        assert_eq!(
+            arith_range_exact(&pow, &env),
+            Some((
+                1267650600228229401496703205376,
+                1267650600228229401496703205376
+            ))
+        );
+        let pow200 = crate::ir::ArithAst::Bin {
+            op: "**".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(2)),
+            rhs: Box::new(crate::ir::ArithAst::Num(200)),
+        };
+        assert_eq!(arith_range_exact(&pow200, &env), None);
+        // small exact cases
+        let mul = crate::ir::ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(100)),
+            rhs: Box::new(crate::ir::ArithAst::Num(200)),
+        };
+        assert_eq!(arith_range_exact(&mul, &env), Some((20000, 20000)));
+        // i64 overflow is exact-but-huge (callers check containment)
+        let big = crate::ir::ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(i64::MAX)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&big, &env).expect("fits i128");
+        assert!(hi > i64::MAX as i128, "outside i64: {lo}..{hi}");
+    }
+
+    #[test]
+    fn exact_floor_mod() {
+        // Python floor semantics, decided by the divisor alone
+        let env = env_of(&[("a", (-7, -7)), ("b", (7, 7))]);
+        let neg_mod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("a".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(3)),
+        };
+        assert_eq!(arith_range_exact(&neg_mod, &env), Some((0, 2)));
+        let pos_mod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("b".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(3)),
+        };
+        assert_eq!(arith_range_exact(&pos_mod, &env), Some((0, 2)));
+        // zero divisor is unknown
+        let zmod = crate::ir::ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("b".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(0)),
+        };
+        assert_eq!(arith_range_exact(&zmod, &env), None);
+        // floor division contains the true value
+        let div = crate::ir::ArithAst::Bin {
+            op: "//".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(7)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&div, &env).expect("fdiv evaluable");
+        assert!(lo <= 3 && 3 <= hi, "7//2=3 in [{lo},{hi}]");
+        let ndiv = crate::ir::ArithAst::Bin {
+            op: "//".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Num(-7)),
+            rhs: Box::new(crate::ir::ArithAst::Num(2)),
+        };
+        let (lo, hi) = arith_range_exact(&ndiv, &env).expect("neg fdiv evaluable");
+        assert!(lo <= -4 && -4 <= hi, "-7//2=-4 in [{lo},{hi}]");
+    }
+
+    #[test]
+    fn veto_overflow_chain() {
+        // Go pin: x = 2**63-1; y = x + 1 leaves BOTH untyped
+        let prog = prog_of("x=$((2**63-1))\ny=$((x + 1))\necho $y");
+        let env = analyze_var_ranges(&prog);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
+        assert!(vetoed.contains("x"), "x feeds overflowing +1: {vetoed:?}");
+        assert!(vetoed.contains("y"), "y is the overflowing store: {vetoed:?}");
+    }
+
+    #[test]
+    fn veto_shifts_bitwise() {
+        // shifts/bitwise always veto (matches Go), even when provable
+        for src in ["y=$((x & 255))\necho $y", "y=$((x << 2))\necho $y"] {
+            let prog = prog_of(src);
+            let env = analyze_var_ranges(&prog);
+            let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
+            assert!(vetoed.contains("x"), "{src}: {vetoed:?}");
+        }
+    }
+
+    #[test]
+    fn veto_spares_comparisons_and_mod() {
+        // comparisons and cdivision ops never veto
+        let prog = prog_of("x=5\nif [ $x -lt 10 ]; then y=$((x % 3)); echo $y; fi");
+        let env = analyze_var_ranges(&prog);
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
+        assert!(!vetoed.contains("x"), "comparison/mod use is safe: {vetoed:?}");
+    }
+
+    #[test]
+    fn quarantine_wrap_artifact() {
+        // `2**100` wraps to [0,0] under bash semantics; the narrow claim
+        // with an inexactly-evaluable RHS must veto (else i32 typing)
+        let prog = prog_of("big=$((2**100))\necho $big");
+        let env = analyze_var_ranges(&prog);
+        assert_eq!(env.get("big"), Some(&(0, 0)), "bash wrap precondition");
+        let vetoed = analyze_use_safety_stmts(&prog.stmts, &env, true, &std::collections::HashMap::new());
+        assert!(vetoed.contains("big"), "wrap artifact vetoed: {vetoed:?}");
+    }
+
+    #[test]
+    fn width_i128_tier() {
+        // 65..128-bit values (past i64, within i128) get the __int128
+        // tier; beyond-i128 gets no entry (object)
+        let mut ranges = std::collections::HashMap::new();
+        ranges.insert("w".to_string(), (i64::MAX as i128 + 1, i64::MAX as i128 + 100));
+        ranges.insert("top".to_string(), (0, i128::MAX));
+        ranges.insert("s".to_string(), (0, 10));
+        let w = analyze_widths(&[], &ranges);
+        assert_eq!(w.get("w").map(String::as_str), Some("i128"));
+        assert_eq!(w.get("top").map(String::as_str), Some("i128"), "i128::MAX boundary");
+        assert_eq!(w.get("s").map(String::as_str), Some("i32"));
+    }
+
+    #[test]
+    fn trip_bounded_accumulation() {
+        // `s=0; for n in 1 2 3; do s=$((s+n)); done`: the 3-trip hint
+        // caps the accumulator instead of widening to top (true max 6).
+        // Post-loop single re-walk lands one unrolling past the cap —
+        // a deterministic superset, pinned here, not exactness.
+        let cmds = crate::Parser::new("s=0\nfor n in 1 2 3; do s=$((s + n)); done").parse().expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let env = analyze_var_ranges(&prog);
+        let (lo, hi) = env.get("s").copied().expect("s has a range");
+        assert!(lo <= 0 && 0 <= hi, "covers pre-loop 0: [{lo},{hi}]");
+        assert!(6 <= hi && hi <= 12, "covers true max 6, trip-capped: [{lo},{hi}]");
+        let (nlo, nhi) = env.get("n").copied().expect("n has a range");
+        assert_eq!((nlo, nhi), (1, 3));
+    }
+
+    #[test]
+    fn widths_value_and_intermediate() {
+        // rolling-hash loop shape: h is mod-bounded (fits i32 by VALUE)
+        // but h*31 needs 64 bits, so h is i64 by INTERMEDIATE
+        let prog = prog_of("h=0\ni=0\nwhile [ $i -lt 100 ]; do h=$(((h*31 + i) % 1000000007)); i=$((i+1)); done");
+        let env = analyze_var_ranges(&prog);
+        let w = analyze_widths(&prog.stmts, &env);
+        assert_eq!(w.get("h").map(String::as_str), Some("i64"), "h*31: {w:?} env: {env:?}");
+    }
+}
+
+#[cfg(test)]
+mod bigint_hoist_tests {
+    use super::*;
+    use crate::ir::{ArithAst, AssignTarget, IrExpr, IrProgram, IrStmt};
+
+    fn assign(var: &str, rhs: ArithAst) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget { var: var.to_string(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(rhs)),
+            asm: None,
+        }
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn mixed_accumulator_is_bigint() {
+        // the every-assign fixpoint (hoisted from the C backend): a var
+        // assigned plain arith once and Int64-cast arith later is bigint
+        // (first-wins missed the later tree and left `long long` decls
+        // feeding mpz ops)
+        let p = prog(vec![
+            assign("v", ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("a".to_string())),
+                rhs: Box::new(ArithAst::Num(1)),
+            }),
+            assign("v", ArithAst::Cast {
+                ty: crate::ir::IrType::Int64,
+                arg: Box::new(ArithAst::Var("b".to_string())),
+            }),
+        ]);
+        assert!(analyze_bigint_vars(&p).contains("v"));
+    }
+
+    #[test]
+    fn plain_only_stays_out() {
+        let p = prog(vec![assign(
+            "v",
+            ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("a".to_string())),
+                rhs: Box::new(ArithAst::Num(1)),
+            },
+        )]);
+        assert!(!analyze_bigint_vars(&p).contains("v"));
+    }
+}
+
+#[cfg(test)]
+mod hypothesis_tests {
+    use super::*;
+    use crate::ir::{ArithAst, AssignTarget, IrExpr, IrStmt};
+
+    #[test]
+    fn assumes_seed_params() {
+        // y = x * 2 with x assumed [0,100] proves y = [0,200];
+        // unassumed, y is unknown
+        let stmt = IrStmt::Assign {
+            targets: vec![AssignTarget { var: "y".to_string(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(ArithAst::Var("x".to_string())),
+                rhs: Box::new(ArithAst::Num(2)),
+            })),
+            asm: None,
+        };
+        let mut assumes = std::collections::HashMap::new();
+        assumes.insert("x".to_string(), (0, 100));
+        let r = analyze_var_ranges_with_assumes(&[stmt.clone()], &assumes);
+        assert_eq!(r.get("y"), Some(&(0, 200)));
+        assert_eq!(r.get("x"), Some(&(0, 100)), "seed persists");
+        let r2 = analyze_var_ranges_with_assumes(
+            &[stmt],
+            &std::collections::HashMap::new(),
+        );
+        assert!(!r2.contains_key("y"), "unassumed x proves nothing");
     }
 }
 
@@ -51563,3 +59595,1222 @@ mod dual_loop_tests {
         assert!(!json.contains("isSafeInteger"), "must refuse:\n{json}");
     }
 }
+
+#[cfg(test)]
+mod declare_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn facts(
+        name: &str,
+        assigned: &[&str],
+        ranges: &[(&str, i128, i128)],
+        vetoed: &[&str],
+        widths: &[(&str, &str)],
+    ) -> ScopeFacts {
+        ScopeFacts {
+            name: name.to_string(),
+            assigned: assigned.iter().map(|s| s.to_string()).collect(),
+            ranges: ranges
+                .iter()
+                .map(|(n, lo, hi)| (n.to_string(), (*lo, *hi)))
+                .collect(),
+            vetoed: vetoed.iter().map(|s| s.to_string()).collect(),
+            widths: widths
+                .iter()
+                .map(|(n, w)| (n.to_string(), w.to_string()))
+                .collect(),
+            bigranges: std::collections::HashMap::new(),
+        }
+    }
+
+    fn decide(
+        scopes: &[ScopeFacts],
+        types: &[(&str, &str)],
+        bigint: &[&str],
+        params: &[(&str, &[&str])],
+        globals: &[(&str, &[&str], &[&str])],
+    ) -> HashMap<String, HashMap<String, (String, Option<String>)>> {
+        let vt: HashMap<String, String> = types
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        let bi: HashSet<String> = bigint.iter().map(|s| s.to_string()).collect();
+        let pm: HashMap<String, Vec<String>> = params
+            .iter()
+            .map(|(s, v)| (s.to_string(), v.iter().map(|x| x.to_string()).collect()))
+            .collect();
+        let gm: HashMap<String, (Vec<String>, Vec<String>)> = globals
+            .iter()
+            .map(|(s, g, n)| {
+                (
+                    s.to_string(),
+                    (
+                        g.iter().map(|x| x.to_string()).collect(),
+                        n.iter().map(|x| x.to_string()).collect(),
+                    ),
+                )
+            })
+            .collect();
+        let mut out: HashMap<String, HashMap<String, (String, Option<String>)>> =
+            HashMap::new();
+        for sd in analyze_declares(scopes, &vt, &bi, &pm, &gm) {
+            let mut m = HashMap::new();
+            for v in sd.declares {
+                m.insert(v.name.clone(), (v.kind.clone(), v.width.clone()));
+            }
+            out.insert(sd.name.clone(), m);
+        }
+        out
+    }
+
+    #[test]
+    fn int_widths_and_float_passthrough() {
+        let scopes = vec![facts(
+            "<top>",
+            &["a", "b", "c", "d"],
+            &[("a", 0, 5), ("b", 0, 1 << 40), ("c", 0, 0)],
+            &[],
+            &[("a", "i32"), ("b", "i64")],
+        )];
+        let d = decide(
+            &scopes,
+            &[("a", "int"), ("b", "int"), ("c", "float"), ("d", "int")],
+            &[],
+            &[],
+            &[],
+        );
+        let top = &d["<top>"];
+        assert_eq!(
+            top["a"],
+            ("int".to_string(), Some("i32".to_string())),
+            "i32 evidence -> cython.int"
+        );
+        assert_eq!(
+            top["b"],
+            ("int".to_string(), None),
+            "i64 evidence -> cython.longlong"
+        );
+        assert_eq!(
+            top["c"],
+            ("float".to_string(), None),
+            "float passes with no checks"
+        );
+        assert!(!top.contains_key("d"), "unranged int never declares");
+    }
+
+    #[test]
+    fn veto_bigint_and_kind_gates() {
+        let scopes = vec![facts(
+            "<top>",
+            &["v", "b", "s", "big", "o"],
+            &[
+                ("v", 0, 1),
+                ("b", 0, 1),
+                ("s", 0, 1),
+                ("big", 0, 1),
+                ("o", 0, 1),
+            ],
+            &["v"],
+            &[],
+        )];
+        let d = decide(
+            &scopes,
+            &[
+                ("v", "int"),
+                ("b", "int"),
+                ("s", "str"),
+                ("big", "int"),
+                ("o", "int"),
+            ],
+            &["big"],
+            &[],
+            &[],
+        );
+        let top = &d["<top>"];
+        assert!(!top.contains_key("v"), "vetoed refutes");
+        assert!(!top.contains_key("big"), "bigint-homed refutes");
+        assert!(!top.contains_key("s"), "non-int kinds never declare");
+        assert!(top.contains_key("o"), "plain int declares");
+    }
+
+    /// u64 tier: a non-negative value past i64 but within one machine
+    /// word declares with width "u64" (the harness renders
+    /// `cython.ulonglong`) — provided no veto.
+    #[test]
+    fn u64_literal_declares_u64_width() {
+        let cmds = crate::Parser::new("big=10000000000000000000")
+            .parse()
+            .expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let scopes = analyze_scopes(&prog, true);
+        let d = decide(&scopes, &[("big", "int")], &[], &[], &[]);
+        assert_eq!(
+            d["<top>"]["big"],
+            ("int".to_string(), Some("u64".to_string())),
+            "u64 value, no veto → ulonglong"
+        );
+    }
+
+    /// A vetoed u64 still declines: `y + y + y` wraps i64, so
+    /// use-safety vetoes y and z even though z's value fits u64.
+    #[test]
+    fn vetoed_u64_still_declines() {
+        let cmds = crate::Parser::new("y=4611686018427387904\nz=$((y + y + y))")
+            .parse()
+            .expect("parse");
+        let prog = ast_to_ir_raw(&cmds);
+        let scopes = analyze_scopes(&prog, true);
+        let d = decide(&scopes, &[("y", "int"), ("z", "int")], &[], &[], &[]);
+        assert!(
+            !d["<top>"].contains_key("y") && !d["<top>"].contains_key("z"),
+            "wrapping use vetoes both: {:?}",
+            d["<top>"]
+        );
+    }
+
+    #[test]
+    fn quarantine_skips_bigexact_assign() {
+        // Horner conveyance ((0*10+1)*10+0): BigInt-exact [100], merged
+        // claim covers it — no wrap artifact, so no quarantine veto.
+        use crate::ir::{ArithAst, AssignTarget, IrExpr, IrStmt, IrType};
+        use std::collections::{HashMap, HashSet};
+        fn num(n: i64) -> ArithAst { ArithAst::Num(n) }
+        fn cst(e: ArithAst) -> ArithAst {
+            ArithAst::Cast { ty: IrType::Int64, arg: Box::new(e) }
+        }
+        fn bin(op: &str, l: ArithAst, r: ArithAst) -> ArithAst {
+            ArithAst::Bin { op: op.to_string(), lhs: Box::new(l), rhs: Box::new(r) }
+        }
+        let tree = bin("+", bin("*", cst(bin("+", bin("*", cst(num(0)), cst(num(10))), cst(num(1)))), cst(num(10))), cst(num(0)));
+        let stmts = vec![IrStmt::Assign {
+            targets: vec![AssignTarget { var: "v".into(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Arith(Box::new(tree)),
+            asm: None,
+        }];
+        let big = crate::shir_passes::bigint_range::analyze_var_ranges_big(&stmts);
+        assert!(big.contains_key("v"));
+        let env: HashMap<String, (i128, i128)> = HashMap::new();
+        let out = analyze_use_safety_stmts_big(&stmts, &env, true, &big);
+        assert!(!out.contains("v"), "big-exact assign must not quarantine: {:?}", out);
+    }
+
+    /// A homed bigint with a u64 range still declares: the homed set is
+    /// shared with backend homing, but a non-negative sub-2^64 value has
+    /// an exact C word — "needs GMP somewhere" must not block it.
+    #[test]
+    fn homed_u64_readmits() {
+        use num_bigint::BigInt;
+        let mut scopes = vec![facts("<top>", &["w"], &[], &[], &[])];
+        scopes[0].bigranges.insert(
+            "w".to_string(),
+            (BigInt::from(0), BigInt::from(1u128 << 64) - 1u32),
+        );
+        let d = decide(&scopes, &[("w", "int")], &["w"], &[], &[]);
+        assert_eq!(
+            d["<top>"]["w"],
+            ("int".to_string(), Some("u64".to_string())),
+            "homed but u64-ranged → ulonglong"
+        );
+    }
+
+    #[test]
+    fn params_globals_nonlocals_excluded() {
+        let scopes = vec![
+            facts("<top>", &["g"], &[], &[], &[]),
+            facts("f", &["g", "p", "q", "r"], &[], &[], &[]),
+        ];
+        let d = decide(
+            &scopes,
+            &[("g", "int"), ("p", "int"), ("q", "int"), ("r", "int")],
+            &[],
+            &[("f", &["p"])],
+            &[("f", &["g"], &["q"])],
+        );
+        assert!(
+            d["f"].is_empty(),
+            "params + global + nonlocal all excluded: {:?}",
+            d["f"]
+        );
+    }
+
+    #[test]
+    fn union_veto_hits_top_only() {
+        // a veto anywhere refuses the MODULE declare (global-write
+        // invisibility); unvetoed function scopes keep their own.
+        let scopes = vec![
+            facts("<top>", &["x"], &[("x", 0, 0)], &[], &[("x", "i32")]),
+            facts("f", &["x"], &[("x", 0, 5)], &[], &[("x", "i32")]),
+            facts("g", &["x"], &[("x", 0, 7)], &["x"], &[]),
+        ];
+        let d = decide(&scopes, &[("x", "int")], &[], &[], &[]);
+        assert!(
+            !d["<top>"].contains_key("x"),
+            "union veto refuses module x"
+        );
+        assert!(
+            d["f"].contains_key("x"),
+            "unvetoed function scope keeps its declare"
+        );
+        assert!(
+            !d["g"].contains_key("x"),
+            "own veto refuses its own scope"
+        );
+    }
+
+    #[test]
+    fn missing_range_or_width_is_safe() {
+        // unranged ints never declare; missing width evidence falls
+        // back to longlong (never int).
+        let scopes = vec![facts(
+            "<top>",
+            &["u", "w"],
+            &[("w", 0, 3)],
+            &[],
+            &[],
+        )];
+        let d = decide(&scopes, &[("u", "int"), ("w", "int")], &[], &[], &[]);
+        assert!(!d["<top>"].contains_key("u"));
+        assert_eq!(
+            d["<top>"]["w"],
+            ("int".to_string(), None),
+            "missing width -> longlong"
+        );
+    }
+}
+
+/// Static word-list facts (the `for n in ["a","b","c"]` shape): the
+/// decision that a list needs no allocation belongs in the SHARED core so
+/// C/C++/Zig/Rust all reach the same verdict from one analysis.
+#[cfg(test)]
+mod static_word_list_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    #[test]
+    fn literal_list_is_static() {
+        let items = vec![s("a"), s("b"), s("c")];
+        assert_eq!(
+            static_word_list(&items),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn all_literal_interpolation_is_static() {
+        // a quoted one-part interpolation is still compile-time text
+        let e = IrExpr::Interpolate(vec![crate::ir::InterpPart::Lit("hi".to_string())]);
+        assert_eq!(static_word_list(&[e]), Some(vec!["hi".to_string()]));
+    }
+
+    #[test]
+    fn dynamic_element_is_not_static() {
+        // a variable read is not a compile-time literal
+        assert_eq!(static_word_list(&[s("a"), IrExpr::Var("y".to_string(), None)]), None);
+        // an interpolation with an expression part is dynamic
+        let e = IrExpr::Interpolate(vec![crate::ir::InterpPart::Expr(Box::new(
+            IrExpr::Var("x".to_string(), None),
+        ))]);
+        assert_eq!(static_word_list(&[e]), None);
+    }
+
+    #[test]
+    fn loop_var_escape_verdict() {
+        // `for n in a b c; do echo "$n"; done` — n is not read after the
+        // loop, so its write-back is droppable.
+        let mk = |tail: Vec<crate::ir::IrStmt>| {
+            let mut stmts = vec![IrStmt::For {
+                var: "n".to_string(),
+                iter: IrExpr::Array(vec![s("a"), s("b")]),
+                body: vec![crate::ir::IrStmt::Expr(IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![s("n")],
+                })],
+            }];
+            stmts.extend(tail);
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts,
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_storage: vec![],
+                var_bash_env: vec![],
+            }
+        };
+        let v = analyze_loop_var_escapes(&mk(vec![]));
+        assert_eq!(v.get(&0), Some(&false), "no escape expected: {v:?}");
+
+        // a read AFTER the loop is an escape (bash leaves the var set)
+        let after = crate::ir::IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s("n")],
+        });
+        let v2 = analyze_loop_var_escapes(&mk(vec![after]));
+        assert_eq!(v2.get(&0), Some(&true), "escape expected: {v2:?}");
+    }
+
+    #[test]
+    fn named_literal_array_is_static() {
+        // `xs = ["a","b","c"]` (frontend setArray-assign) then a
+        // whole-list read: the array is a static literal list.
+        let set = IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![
+                s("xs"),
+                IrExpr::Array(vec![s("a"), s("b"), s("c")]),
+            ],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "xs".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: set,
+                    asm: None,
+                },
+                IrStmt::For {
+                    var: "x".to_string(),
+                    iter: IrExpr::Array(vec![IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![
+                            s("slice"),
+                            s("xs"),
+                            s("@"),
+                            s(""),
+                        ],
+                    }]),
+                    body: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let v = analyze_static_arrays(&prog);
+        assert_eq!(
+            v.get("xs"),
+            Some(&vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            "named literal array not static: {v:?}"
+        );
+    }
+
+    #[test]
+    fn mutated_array_is_not_static() {
+        // An append (or any non-whole read) vetoes the static verdict.
+        let set = IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![s("xs"), IrExpr::Array(vec![s("a"), s("b")])],
+        };
+        let append = IrExpr::Call {
+            func: "setArrayAppend".to_string(),
+            args: vec![s("xs"), IrExpr::Array(vec![s("c")])],
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "xs".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: set,
+                    asm: None,
+                },
+                IrStmt::Expr(append),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let v = analyze_static_arrays(&prog);
+        assert!(v.get("xs").is_none(), "appended array marked static: {v:?}");
+    }
+
+    #[test]
+    fn for_list_verdict_is_program_wide() {
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::For {
+                    var: "n".to_string(),
+                    iter: IrExpr::Array(vec![s("a"), s("b")]),
+                    body: vec![],
+                },
+                // a dynamic list must not be keyed
+                IrStmt::For {
+                    var: "m".to_string(),
+                    iter: IrExpr::Array(vec![IrExpr::Var("y".to_string(), None)]),
+                    body: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        // the old position-keyed verdict is gone; a For over a NAMED
+        // static array is covered by analyze_static_arrays (below). This
+        // test now pins the inline-list path through static_word_list.
+        let _ = analyze_static_arrays(&prog);
+        assert_eq!(
+            static_word_list(&[s("a"), s("b")]),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod const_len_array_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn init(name: &str, n: usize) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    s(name),
+                    IrExpr::Array((0..n).map(|i| s(&i.to_string())).collect()),
+                ],
+            },
+            asm: None,
+        }
+    }
+
+    fn elem_store(name: &str, key: IrExpr, val: &str) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![key],
+            }],
+            expr: s(val),
+            asm: None,
+        }
+    }
+
+    #[test]
+    fn literal_init_has_constant_length() {
+        // t21: `a = [1,2,3]` then an in-range read.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Output {
+                value: IrExpr::Index {
+                    var: "a".to_string(),
+                    key: Box::new(IrExpr::Int(1)),
+                },
+                newline: true,
+                target: None,
+            },
+        ]));
+        assert_eq!(v.get("a"), Some(&3));
+    }
+
+    #[test]
+    fn reinit_with_a_different_length_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![init("a", 3), init("a", 4)]));
+        assert_eq!(v.get("a"), None, "disagreeing lengths must not qualify");
+    }
+
+    #[test]
+    fn in_range_element_store_keeps_the_length() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(0), "9"),
+        ]));
+        assert_eq!(v.get("a"), Some(&3), "an in-range store keeps the length");
+    }
+
+    #[test]
+    fn out_of_range_element_store_vetoes() {
+        // `a[3] = 9` GROWS a length-3 bash array: the constant length
+        // would be a lie.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(3), "9"),
+        ]));
+        assert_eq!(v.get("a"), None, "an out-of-range store must veto");
+    }
+
+    #[test]
+    fn dynamic_element_store_vetoes() {
+        // `a[$i] = 9` could grow the array at runtime.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Var("i".to_string(), None), "9"),
+        ]));
+        assert_eq!(v.get("a"), None, "a non-constant index must veto");
+    }
+
+    #[test]
+    fn append_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "setArrayAppend".to_string(),
+                args: vec![s("a"), IrExpr::Array(vec![s("4")])],
+            }),
+        ]));
+        assert_eq!(v.get("a"), None, "an append must veto");
+    }
+
+    #[test]
+    fn non_literal_reinit_vetoes() {
+        let v = analyze_const_len_arrays(&prog(vec![init("a", 3), IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "a".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Var("b".to_string(), None),
+            asm: None,
+        }]));
+        assert_eq!(v.get("a"), None, "a dynamic re-init must veto");
+    }
+
+    #[test]
+    fn dynamic_name_builtin_vetoes_everything() {
+        // `eval`/`read`/`getVar` can name any array at runtime.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "eval".to_string(),
+                args: vec![s("a+=(4)")],
+            }),
+        ]));
+        assert!(v.is_empty(), "a dynamic-name builtin must veto");
+    }
+
+    #[test]
+    fn literal_name_getvar_does_not_veto() {
+        // `print(x)` lowers to `getVar("x")` — a LITERAL name that reads
+        // exactly one scalar and can never reach an unrelated array. It
+        // must not veto the constant-length verdict (the `for x in a`
+        // shape over a literal int list).
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![s("x")],
+            }),
+        ]));
+        assert_eq!(v.get("a"), Some(&3), "a literal-name getVar must not veto");
+    }
+
+    #[test]
+    fn dynamic_name_getvar_vetoes() {
+        // A getVar whose name is not a literal identifier can reach any
+        // array at runtime, so the verdict must stay empty.
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Var("n".to_string(), None)],
+            }),
+        ]));
+        assert!(v.is_empty(), "a dynamic-name getVar must veto");
+    }
+
+    #[test]
+    fn const_arith_index_is_provable() {
+        let v = analyze_const_len_arrays(&prog(vec![
+            init("a", 3),
+            elem_store("a", IrExpr::Int(1 + 1), "9"),
+        ]));
+        assert_eq!(v.get("a"), Some(&3));
+    }
+}
+
+#[cfg(test)]
+mod unread_status_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn echo(word: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![s("echo"), IrExpr::Array(vec![s(word)])],
+        })
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn consecutive_writers_leave_only_the_last_live() {
+        // two status writers, no reader: the FIRST is unread (the second
+        // overwrites it), the LAST carries the program's final status.
+        let p = prog(vec![echo("a"), echo("b")]);
+        install_unread_status_writes(&p, false);
+        let (a, b) = match (&p.stmts[0], &p.stmts[1]) {
+            (x, y) => (x, y),
+        };
+        assert!(stmt_status_write_is_unread(a), "first writer must be unread");
+        assert!(!stmt_status_write_is_unread(b), "last writer must stay live");
+    }
+
+    #[test]
+    fn errexit_vetoes_every_drop() {
+        // under a possible `set -e` the guard consumes the status
+        let p = prog(vec![echo("a"), echo("b")]);
+        install_unread_status_writes(&p, true);
+        for st in &p.stmts {
+            assert!(!stmt_status_write_is_unread(st), "errexit must veto");
+        }
+    }
+
+    #[test]
+    fn status_read_keeps_the_preceding_write() {
+        // `echo a; echo "$?"` — the reader pins the first write live
+        let p = prog(vec![
+            echo("a"),
+            IrStmt::Expr(IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![s("?")],
+            }),
+            echo("b"),
+        ]);
+        install_unread_status_writes(&p, false);
+        assert!(
+            !stmt_status_write_is_unread(&p.stmts[0]),
+            "a $? read must keep the preceding write live"
+        );
+    }
+}
+
+#[cfg(test)]
+mod whole_argv_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn call(func: &str, args: Vec<IrExpr>) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call { func: func.to_string(), args })
+    }
+
+    fn fn_stmt(name: &str, body: Vec<IrStmt>) -> IrStmt {
+        IrStmt::Function { name: name.to_string(), params: vec![], body, named_blocks: vec![] }
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn argv_read_without_rebind_qualifies() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("getVar", vec![s("#")]),
+                call("listVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn shift_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("builtin", vec![s("shift"), IrExpr::Array(vec![])]),
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn set_dashdash_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                call("builtin", vec![s("set"), IrExpr::Array(vec![s("--"), s("x")])]),
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn no_argv_read_does_not_qualify() {
+        // a function that never touches `$@`/`$#` gets no argv param
+        let p = prog(vec![fn_stmt("f", vec![call("getVar", vec![s("1")])])]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+
+    #[test]
+    fn positional_write_vetoes_whole_argv() {
+        let p = prog(vec![fn_stmt(
+            "f",
+            vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "1".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: s("x"),
+                    asm: None,
+                },
+                call("getVar", vec![s("@")]),
+            ],
+        )]);
+        assert!(!analyze_whole_argv_fns(&p).contains("f"));
+    }
+}
+
+#[cfg(test)]
+mod shift_offset_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn prog(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn shift_fn(name: &str, words: Vec<IrExpr>, rest: Vec<IrStmt>) -> IrStmt {
+        let mut body = vec![IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![s("shift"), IrExpr::Array(words)],
+        })];
+        body.extend(rest);
+        IrStmt::Function {
+            name: name.to_string(),
+            params: vec![],
+            body,
+            named_blocks: vec![],
+        }
+    }
+
+    fn getvar(n: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s(n)],
+        })
+    }
+
+    #[test]
+    fn bare_shift_is_offset_one() {
+        // `f() { local d=$1; shift; echo "$@" }` — const shift 1
+        let p = prog(vec![shift_fn(
+            "f",
+            vec![],
+            vec![getvar("@")],
+        )]);
+        let _ = &p.stmts;
+        assert_eq!(analyze_shift_offsets(&p).get("f"), Some(&1));
+    }
+
+    #[test]
+    fn no_shift_is_offset_zero() {
+        let p = prog(vec![IrStmt::Function {
+            name: "g".to_string(),
+            params: vec![],
+            body: vec![getvar("1")],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("g"), Some(&0));
+    }
+
+    #[test]
+    fn const_shift_two() {
+        let p = prog(vec![shift_fn(
+            "h",
+            vec![IrExpr::Int(2)],
+            vec![getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("h"), Some(&2));
+    }
+
+    #[test]
+    fn dynamic_shift_vetoes() {
+        // `shift $n` — amount unknown at analysis time
+        let p = prog(vec![shift_fn(
+            "d",
+            vec![IrExpr::Var("n".to_string(), None)],
+            vec![getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("d"), None);
+    }
+
+    #[test]
+    fn double_shift_vetoes() {
+        let p = prog(vec![IrStmt::Function {
+            name: "dd".to_string(),
+            params: vec![],
+            body: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+            ],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("dd"), None);
+    }
+
+    #[test]
+    fn hash_read_vetoes() {
+        // `$#` changes under shift — the offset model cannot see it
+        let p = prog(vec![shift_fn("hh", vec![], vec![getvar("#")])]);
+        assert_eq!(analyze_shift_offsets(&p).get("hh"), None);
+    }
+
+    #[test]
+    fn positional_write_vetoes() {
+        let p = prog(vec![IrStmt::Function {
+            name: "w".to_string(),
+            params: vec![],
+            body: vec![
+                IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![s("shift"), IrExpr::Array(vec![])],
+                }),
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "1".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: s("x"),
+                    asm: None,
+                },
+            ],
+            named_blocks: vec![],
+        }]);
+        assert_eq!(analyze_shift_offsets(&p).get("w"), None);
+    }
+
+    #[test]
+    fn plain_digit_and_at_reads_are_fine() {
+        // `local d=$1; shift; cmd "$@"` — the corpus shape
+        let p = prog(vec![shift_fn(
+            "t",
+            vec![],
+            vec![getvar("1"), getvar("@")],
+        )]);
+        assert_eq!(analyze_shift_offsets(&p).get("t"), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod named_param_emission_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    fn getvar(n: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s(n)],
+        })
+    }
+
+    /// `func isYes(s) { … }` — an A1 function with a DECLARED parameter.
+    /// Core request rust-20260930-031500 (go-sh `t109_bool_func.go`): the
+    /// `IrStmt::Function` arm dropped `params`, so the arrow emitted
+    /// `() => …` and the body's read of `s` fell through to the empty
+    /// `sh2.vars` store — every predicate saw "".
+    fn param_fn() -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Function {
+                name: "isYes".to_string(),
+                params: vec!["s".to_string()],
+                body: vec![IrStmt::Return(Some(s("y")))],
+                named_blocks: vec![],
+            }],
+        }
+    }
+
+    /// The declared parameter must reach the emitted arrow's parameter list —
+    /// it is a real JS parameter, not a store lookup.
+    #[test]
+    fn declared_param_reaches_the_arrow_parameter_list() {
+        let js = serde_json::to_string(&shir_to_estree(&param_fn())).unwrap();
+        assert!(
+            js.contains(r#"ArrowFunctionExpression","params":[{"type":"Identifier","name":"s"}"#),
+            "the declared parameter must be an arrow parameter: {js}"
+        );
+    }
+
+    /// A body READ of the declared parameter must render as the bare
+    /// identifier — not a `sh2.vars` read, which yields "" (the runtime
+    /// carries function args in its function map, never in the var store).
+    #[test]
+    fn declared_param_read_renders_bare_not_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("s")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            js.contains(r#"{"type":"Identifier","name":"s"}"#),
+            "the param read must be the bare identifier: {js}"
+        );
+    }
+
+    /// The negative half: a body read of a name that is NOT a declared
+    /// parameter must NOT render bare — the frame must not leak.
+    #[test]
+    fn non_param_read_still_uses_the_store() {
+        let mut p = param_fn();
+        let IrStmt::Function { body, .. } = &mut p.stmts[0] else {
+            unreachable!()
+        };
+        *body = vec![getvar("other")];
+        let js = serde_json::to_string(&shir_to_estree(&p)).unwrap();
+        assert!(
+            !js.contains(r#"{"type":"Identifier","name":"other"}"#),
+            "a non-param must not render bare: {js}"
+        );
+    }
+}
+
+/// Record (struct) VALUES must reach the store RAW (core request
+/// rust-frontend-20260823-record-storage). A frontends-emitted Object
+/// literal assigned to a name is a record; the direct `sh2.vars[name] = …`
+/// write preserves any raw value, so the `String(…)` wrapper that
+/// `store_rhs_string` used to force turns the record into
+/// `"[object Object]"` and every later field read yields undefined.
+#[cfg(test)]
+mod record_store_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    fn s(t: &str) -> IrExpr {
+        IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// A one-statement program: `<var> = <value>`, the shape the native
+    /// direct-store write (`sh2.vars[<var>] = <rhs>`) is chosen for.
+    fn assign_prog(var: &str, value: IrExpr) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: value,
+                asm: None,
+            }],
+        }
+    }
+
+    /// The rendered store statement for `assign_prog`, as JSON. Returned
+    /// alone (not the whole program) so an assertion on `"String"` cannot
+    /// be satisfied by an unrelated part of the output.
+    fn store_expr_of(prog: IrProgram) -> String {
+        let js = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        // The assignment is the first statement; render just it.
+        serde_json::to_string(&v["body"][0]).unwrap()
+    }
+
+    /// `let p = Point { x: "3", y: "4" };` — a record literal bound to `p`.
+    fn record_assign() -> IrProgram {
+        assign_prog(
+            "p",
+            IrExpr::Object(vec![
+                ("x".to_string(), s("3")),
+                ("y".to_string(), s("4")),
+            ]),
+        )
+    }
+
+    /// The record must be stored as an ObjectExpression, NOT as
+    /// `String(<object>)`. This is the exact bug: `String({x:"3",y:"4"})`
+    /// stringifies to `"[object Object]"`, so the stored value is a string
+    /// and every `p.x` after it reads undefined.
+    #[test]
+    fn record_literal_reaches_the_store_uncoerced() {
+        let js = store_expr_of(record_assign());
+        assert!(
+            js.contains(r#""ObjectExpression""#),
+            "the record must be stored as an ObjectExpression: {js}"
+        );
+        assert!(
+            !js.contains(r#""String""#),
+            "the record must NOT be wrapped in String(...): {js}"
+        );
+    }
+
+    /// The negative half — the widening must be SCOPED to records, not
+    /// "anything that is not a string literal". These pin the predicate
+    /// itself (`store_rhs_string`), which is the thing that changed: a
+    /// numeric RHS and a call RHS both still NEED the runtime's
+    /// `String(...)` coercion, and only a string or a record is exempt.
+    #[test]
+    fn store_rhs_string_exempts_only_strings_and_records() {
+        let string_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::String("s".into()),
+            raw: None,
+            regex: None,
+        };
+        let number_lit = crate::estree::Expr::Literal {
+            value: serde_json::Value::from(5),
+            raw: None,
+            regex: None,
+        };
+        let record = crate::estree::Expr::ObjectExpression {
+            properties: vec![],
+        };
+        assert!(store_rhs_string(&string_lit), "a string stays exempt");
+        assert!(
+            store_rhs_string(&record),
+            "a record is now exempt (the fix)"
+        );
+        assert!(
+            !store_rhs_string(&number_lit),
+            "a number must still take the String() coercion"
+        );
+        assert!(
+            !store_rhs_string(&crate::estree::Expr::ArrayExpression { elements: vec![] }),
+            "an array must still take the String() coercion"
+        );
+    }
+}
+

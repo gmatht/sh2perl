@@ -20,11 +20,8 @@ impl super::Analysis for NumericLift {
     fn name(&self) -> &'static str {
         "numeric_lift"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {
-        // Stage 0: pass-through. The real implementation walks the IR
-        // looking for variables whose every assignment is provably
-        // numeric (no string interpolation, no command substitution,
-        // no mixed-type re-assignment). Lives in shir.rs:4641 today.
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.lifted_numeric = crate::shir::numeric_lift_vars(prog);
     }
 }
 
@@ -36,8 +33,10 @@ impl super::Analysis for StringLift {
     fn name(&self) -> &'static str {
         "string_lift"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {
-        // Stage 0: pass-through. Lives in shir.rs:12884 today.
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        // string lift is defined as "not numeric, but provably string"
+        // and consults the numeric verdict (shir.rs:string_lift_vars).
+        ctx.lifted_string = crate::shir::string_lift_vars(prog, &ctx.lifted_numeric).0;
     }
 }
 
@@ -86,10 +85,8 @@ impl super::Analysis for ErrexitMayEnable {
     fn name(&self) -> &'static str {
         "errexit_may_enable"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {
-        // Stage 0: default. The real implementation scans every
-        // assignment and exec for `set -e` / `set +e` / `set -o errexit`.
-        // Default field is `false`; `PassContext::default()` provides it.
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.may_errexit = crate::shir::ir_may_enable_errexit(prog);
     }
 }
 
@@ -102,7 +99,9 @@ impl super::Analysis for NocaseMayEnable {
     fn name(&self) -> &'static str {
         "nocase_may_enable"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.case_nocase = crate::shir::ir_may_enable_nocasematch(prog);
+    }
 }
 
 /// A persistent fd-1 redirect exists somewhere in the program
@@ -115,7 +114,9 @@ impl super::Analysis for PersistFd1 {
     fn name(&self) -> &'static str {
         "persist_fd1"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.persist_fd1 = crate::shir::ir_has_persist_fd1(prog);
+    }
 }
 
 /// Every function name defined in the program. Drives the sync-fn
@@ -126,7 +127,11 @@ impl super::Analysis for ProgramFunctions {
     fn name(&self) -> &'static str {
         "program_functions"
     }
-    fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        let mut set = std::collections::HashSet::new();
+        crate::shir::collect_program_functions(&prog.stmts, &mut set);
+        ctx.program_functions = set;
+    }
 }
 
 /// Strongly-connected components of the function call graph — the
@@ -174,11 +179,315 @@ impl super::Analysis for NativeEchoFns {
     fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
 }
 
+/// Whether the program needs the shell runtime at all. A program whose
+/// only statement kinds are assignments, declarations, `if`/`for`/`while`,
+/// `Output` to stdout and plain arithmetic/string expressions is a
+/// straight-line "hello world" that any backend can render with its host
+/// language's native constructs — no `sh2.*`/`__sh_*` runtime shims, no
+/// redirect/capture buffers, no process spawning.
+///
+/// The verdict is a conservative OVER-approximation of "needs runtime":
+/// any construct whose faithful lowering requires shared mutable state,
+/// a child process, or I/O redirection marks the program as runtime-full.
+/// A `false` verdict is therefore a licence for a renderer to emit plain
+/// host code (the rust backend uses it to inline `print!` and drop the
+/// sink statics); a `true` verdict only means the renderer must keep the
+/// runtime. Missing a runtime need would be a soundness bug, so the walk
+/// treats unknown/extension nodes as runtime-full.
+pub struct RuntimeFootprint;
+
+impl super::Analysis for RuntimeFootprint {
+    fn name(&self) -> &'static str {
+        "runtime_footprint"
+    }
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.needs_runtime = crate::shir_passes::analysis::needs_runtime(prog);
+    }
+}
+
+/// The `RuntimeFootprint` walk — see that struct's docs for the contract.
+pub fn needs_runtime(prog: &IrProgram) -> bool {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    fn stmt_needs(s: &IrStmt, out: &mut bool) {
+        if *out {
+            return;
+        }
+        match s {
+            // pure data / control flow — recurse into children
+            IrStmt::Output { value, target, .. } => {
+                if target.is_some() {
+                    *out = true; // `>&N`-style fd target
+                }
+                expr_needs(value, out);
+            }
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    for i in &t.indices {
+                        expr_needs(i, out);
+                    }
+                }
+                expr_needs(expr, out);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    expr_needs(i, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    expr_needs(e, out);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                expr_needs(cond, out);
+                for s in then {
+                    stmt_needs(s, out);
+                }
+                for (c, b) in elsifs {
+                    expr_needs(c, out);
+                    for s in b {
+                        stmt_needs(s, out);
+                    }
+                }
+                for s in else_ {
+                    stmt_needs(s, out);
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                expr_needs(iter, out);
+                for s in body {
+                    stmt_needs(s, out);
+                }
+            }
+            IrStmt::While { cond, body } => {
+                expr_needs(cond, out);
+                for s in body {
+                    stmt_needs(s, out);
+                }
+            }
+            IrStmt::DoWhile { body, cond, until: _ } => {
+                for s in body {
+                    stmt_needs(s, out);
+                }
+                expr_needs(cond, out);
+            }
+            IrStmt::Block(b) => {
+                for s in b {
+                    stmt_needs(s, out);
+                }
+            }
+            // A function DEFINITION is not itself a runtime construct:
+            // the body lowers to the host language's own function, and an
+            // unredirected `print` inside it is that language's own print.
+            // What the body CONTAINS still decides (a redirect/capture/
+            // pipeline/shell-out anywhere — in main or in any function —
+            // marks the whole program runtime-full, since the sink state
+            // is program-global). Named blocks run inside the function
+            // (PowerShell begin/process/end), so they are part of it.
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                for s in body {
+                    stmt_needs(s, out);
+                }
+                for (_, b) in named_blocks {
+                    for s in b {
+                        stmt_needs(s, out);
+                    }
+                }
+            }
+            // A literal-list array is pure DATA (`a = [1,2,3]`), the same
+            // verdict `setArray`/`setArrayAppend` calls already get: the
+            // elements are expressions, nothing is redirected.
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    expr_needs(e, out);
+                }
+            }
+            // Label/Goto are pure control flow annotations (the structured
+            // restructure pass consumes them; a survivor is a renderer
+            // concern, not a runtime one).
+            IrStmt::Label(_) | IrStmt::Goto(_) => {}
+            // try/except/else/finally: control flow over statement lists.
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    stmt_needs(s, out);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        stmt_needs(s, out);
+                    }
+                }
+                for s in else_body {
+                    stmt_needs(s, out);
+                }
+                for s in finally_body {
+                    stmt_needs(s, out);
+                }
+            }
+            // C-style for: init/cond/step/body are all plain statements
+            // and expressions.
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                for s in init {
+                    stmt_needs(s, out);
+                }
+                expr_needs(cond, out);
+                for s in step {
+                    stmt_needs(s, out);
+                }
+                for s in body {
+                    stmt_needs(s, out);
+                }
+            }
+            // `case`/`select`: a discriminant and clause bodies. (The
+            // patterns are literal/glob text, never an expression.)
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                expr_needs(discriminant, out);
+                for c in clauses {
+                    for s in &c.body {
+                        stmt_needs(s, out);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => expr_needs(e, out),
+            IrStmt::Return(Some(e)) => expr_needs(e, out),
+            IrStmt::Exit(Some(e)) => expr_needs(e, out),
+            IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::Break | IrStmt::Continue => {}
+            // everything below needs the runtime (redirects, captures,
+            // pipelines, shell-outs, subshells/background jobs, RawText,
+            // extension nodes, …)
+            _ => *out = true,
+        }
+    }
+
+    fn expr_needs(e: &IrExpr, out: &mut bool) {
+        if *out {
+            return;
+        }
+        match e {
+            IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Str(..) | IrExpr::Var(..) => {}
+            IrExpr::Index { key, .. } => expr_needs(key, out),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_needs(lhs, out);
+                expr_needs(rhs, out);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_needs(cond, out);
+                expr_needs(then, out);
+                expr_needs(else_, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        expr_needs(x, out);
+                    }
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // `builtin`/`exec` cover echo/printf/arithmetic builtins;
+                // a plain `test`/`arith`/`getVar`/`param`/`arrayLen` is
+                // pure. Anything else (capture, pipeline, source, …) needs
+                // the runtime.
+                //
+                // `setArray`/`setArrayAppend` are pure DATA writes (they
+                // store a value in a variable), so a literal-list
+                // `a = [1,2,3]` does not by itself drag in the runtime —
+                // that verdict gates the runtime-free fast paths (a
+                // straight-line `print`s program can then lower natively).
+                let pure = matches!(
+                    func.as_str(),
+                    "builtin" | "exec" | "test" | "arith" | "getVar" | "param"
+                        | "arrayLen" | "arrayIndex" | "assign" | "return"
+                        | "break" | "continue" | "and"
+                        | "setArray" | "setArrayAppend"
+                );
+                if !pure {
+                    *out = true;
+                }
+                for a in args {
+                    expr_needs(a, out);
+                }
+            }
+            IrExpr::Arith(a) => arith_needs(a, out),
+            // a literal arg array (`echo`'s words) is pure data; its
+            // elements may still be runtime (a capture word)
+            IrExpr::Array(items) => {
+                for it in items {
+                    expr_needs(it, out);
+                }
+            }
+            // capture/regex/range/raw/arrow/arraycomp/lambda/json/
+            // ext/methodcall — all runtime (or unknown) by default
+            _ => *out = true,
+        }
+    }
+
+    fn arith_needs(a: &crate::ir::ArithAst, out: &mut bool) {
+        use crate::ir::ArithAst;
+        if *out {
+            return;
+        }
+        match a {
+            ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) | ArithAst::Sizeof(_) => {}
+            ArithAst::Index { key, .. } => arith_needs(key, out),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                arith_needs(lhs, out);
+                arith_needs(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => arith_needs(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                arith_needs(test, out);
+                arith_needs(then, out);
+                arith_needs(else_, out);
+            }
+            ArithAst::Assign { rhs, .. } => arith_needs(rhs, out),
+            ArithAst::IncDec { .. } => {}
+            ArithAst::Cast { arg, .. } => arith_needs(arg, out),
+            _ => *out = true,
+        }
+    }
+
+    let mut out = false;
+    for s in &prog.stmts {
+        stmt_needs(s, &mut out);
+    }
+    // Subroutine bodies (the A1 `subs` list — the frontend's own
+    // functions, distinct from shell `IrStmt::Function` definitions) are
+    // part of the program: what they contain decides the verdict, and a
+    // redirect-free sub must not by itself mark the program runtime-full.
+    for sub in &prog.subs {
+        for s in &sub.body {
+            stmt_needs(s, &mut out);
+        }
+    }
+    out
+}
+
 /// Loops that are inside an async region (capture producer or pipeline
 /// consumer — cannot be lowered to *Sync because the producer/consumer
 /// binding would be lost).
 pub struct AsyncRegionLoops;
-
 impl super::Analysis for AsyncRegionLoops {
     fn name(&self) -> &'static str {
         "async_region_loops"

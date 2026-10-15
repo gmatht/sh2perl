@@ -54,16 +54,36 @@ fn abbrev_fn_name(fname: &str) -> String {
     }
 }
 
+/// Identifier-sanitize a verbatim fragment: temp names must be valid
+/// identifiers in every backend language (`--flag` short options,
+/// `"a b"`, negative ints all arrive here verbatim and would otherwise
+/// emit `--`/` ` into C). Collisions from the mapping (`a-b` vs `a_b`)
+/// are the backend's job (uniqueness suffix) — this only guarantees the
+/// alphabet.
+fn sanitize_fragment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn abbrev_arg_name(e: &IrExpr) -> String {
     match e {
-        IrExpr::Int(i) => i.to_string(),
+        IrExpr::Int(i) => sanitize_fragment(&i.to_string()),
         // numeric strings are meaningful verbatim (shell values are
         // strings, so `2147483645` arrives as Str); short non-numeric
         // strings too; long opaque strings are hashed.
         IrExpr::Str(s, _) if s.len() <= 8 || s.chars().all(|c| c.is_ascii_digit()) => {
-            s.to_string()
+            sanitize_fragment(s)
         }
-        IrExpr::Var(name, _) | IrExpr::Ident(name) if name.len() <= 8 => name.to_string(),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) if name.len() <= 8 => {
+            sanitize_fragment(name)
+        }
         IrExpr::Arith(a) => abbrev_arith_name(a),
         _ => {
             let s = format!("{:?}", e);
@@ -151,5 +171,30 @@ fn abbrev_arith_operand_name(a: &ArithAst) -> String {
                 digits
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim fragments must stay identifier-safe: short options
+    /// (`--flag`), spaced words, and negative ints all reach the
+    /// verbatim arms and would otherwise emit `--`/spaces into C.
+    #[test]
+    fn verbatim_args_stay_identifiers() {
+        let frag = |e: &IrExpr| {
+            let n = temp_base_name("f", std::slice::from_ref(e));
+            assert!(
+                n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "non-identifier fragment in {n}"
+            );
+            n
+        };
+        assert!(frag(&IrExpr::Str("--flag".into(), crate::ir::StrStyle::DoubleQuoted)).contains("__flag"));
+        assert!(frag(&IrExpr::Int(-5)).contains("_5"));
+        assert!(frag(&IrExpr::Str("a b".into(), crate::ir::StrStyle::DoubleQuoted)).contains("a_b"));
+        // safe names pass through untouched (stability: no rename noise)
+        assert!(frag(&IrExpr::Str("plain".into(), crate::ir::StrStyle::DoubleQuoted)).contains("plain"));
     }
 }
