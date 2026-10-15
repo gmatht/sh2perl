@@ -4105,8 +4105,15 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // `100 / (7 % 2)` rendered as `int(100 / int(7) % 2)`, which
                 // Perl parses as `(100/7) % 2` = 0 while bash yields 100
                 // (063_01_deeply_nested_arithmetic printed 1, not 79).
-                "/" => format!("(int(({}) / ({})))", l, r),
-                "%" => format!("(int(({})) % ({}))", l, r),
+                //
+                // bash ALSO errors on a zero divisor and leaves the
+                // assignment's value EMPTY (`x=$((1/0))` warns "division by
+                // 0" and x stays unset), where Perl's `/` would `die` and
+                // kill the program. Guard through eval so the value is undef
+                // (parse-arithmetic-extra-paren: `x=$(((a+b)/(c+d)))` with
+                // all vars unset must leave x unset, not abort).
+                "/" => format!("(do {{ my $__d = {}; eval {{ int(({}) / ($__d)) }} }})", r, l),
+                "%" => format!("(do {{ my $__d = {}; eval {{ int(({})) % ($__d) }} }})", r, l),
                 // Perl's bitwise ops are STRING ops when an operand is a
                 // string, and shell vars ARE strings (`$a = "78"`): `$a | $b`
                 // string-ORs to "78" and warns "Argument "^E" isn't numeric".
@@ -9853,7 +9860,20 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 )
             }
         }
-        IrExpr::Arith(ast) => format!("int({})", arith_ast_to_perl(ast)),
+        IrExpr::Arith(ast) => {
+            // The trailing `int(...)` truncates, but must NOT swallow the
+            // undef that a guard introduced (a zero divisor, or an
+            // unparseable expression): `int(undef)` is 0, which would turn
+            // bash's "value stays unset" into a spurious 0. Keep undef undef
+            // so `${x:-default}` takes the default like bash
+            // (parse-arithmetic-extra-paren: x must stay unset).
+            let inner = arith_ast_to_perl(ast);
+            if inner.starts_with("(do {") {
+                format!("(do {{ my $__a = {inner}; defined($__a) ? int($__a) : undef }})")
+            } else {
+                format!("int({inner})")
+            }
+        }
         IrExpr::Bool(b) => if *b { "1" } else { "0" }.to_string(),
         IrExpr::Json(v) => {
             let s = v.to_string();
