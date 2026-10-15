@@ -7474,6 +7474,22 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
                         return render_brace_iter(args);
                     }
                 }
+                // `for i in "$*"` — bash's `"$*"` is the positional params
+                // joined by IFS as ONE word, so the loop runs ONCE even with
+                // no arguments (the word is then empty and the body sees an
+                // empty `$i`). Rendering the array itself iterated zero times
+                // and parse-dollars-in-string lost its blank line. Wrap the
+                // join in a one-element list to keep the single iteration.
+                if matches!(func.as_str(), "listVar" | "getVar" | "listVarWords") {
+                    if let IrExpr::Call { args, .. } = &elems[0] {
+                        if args.first().and_then(call_arg_str).as_deref() == Some("*") {
+                            // ONE word: `join` of the params (empty when
+                            // there are none, which still yields a single
+                            // empty iteration).
+                            return "join(' ', @ARGV)".to_string();
+                        }
+                    }
+                }
             }
             ir_expr_to_perl(iter)
         }
