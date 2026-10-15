@@ -4040,7 +4040,47 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
                     out.push_str("\\\\");
                 }
             }
-            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | '[' | ']' => {
+            // A `[...]` character class passes through INTACT — escaping the
+            // brackets turns `[/\\]` (a class matching `/` or `\`) into the
+            // literal-text pattern `\[/\\\]`, which matches nothing, so
+            // `${p##*[/\\]}` stopped stripping and
+            // parse-param-pattern-match printed the whole path instead of
+            // `tool`. The class is copied verbatim up to its closing `]`
+            // (a leading `!`/`^` needs no escaping in Perl).
+            '[' => {
+                out.push('[');
+                if let Some(&neg) = chars.peek() {
+                    if neg == '!' {
+                        out.push('^');
+                        chars.next();
+                    } else if neg == '^' {
+                        out.push('^');
+                        chars.next();
+                    }
+                }
+                if let Some(&first) = chars.peek() {
+                    if first == ']' {
+                        out.push_str("\\]");
+                        chars.next();
+                    }
+                }
+                while let Some(d) = chars.next() {
+                    if d == ']' {
+                        out.push(']');
+                        break;
+                    }
+                    if d == '\\' {
+                        if let Some(&e) = chars.peek() {
+                            out.push('\\');
+                            out.push(e);
+                            chars.next();
+                            continue;
+                        }
+                    }
+                    out.push(d);
+                }
+            }
+            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | ']' => {
                 out.push('\\');
                 out.push(c);
             }
