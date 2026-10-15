@@ -70,6 +70,12 @@ lazy_static::lazy_static! {
     static ref LOWER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
     /// `typeset -u` / `declare -u` names: the uppercase counterpart.
     static ref UPPER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// The first character of `IFS`, as the renderer has seen it assigned.
+    /// bash joins `${arr[*]}` (and `"$*"`) with this separator; fish's
+    /// `string join` needs it spelled out, and defaulting to a space meant a
+    /// file that set `IFS=$'\n'` still joined on spaces — so `sort` saw ONE
+    /// line instead of one per element (064_07 printed the values unsorted).
+    static ref IFS_SEP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 }
 
 /// `set ` or `set -g ` — `-g` while inside a function body, so bash's global
@@ -661,13 +667,27 @@ fn is_plain_name(name: &str) -> bool {
 /// `Array: a Array: b …`), which is not bash's `${arr[*]}` at all. A
 /// substitution yielding a single joined line is one word everywhere.
 fn arr_expand_call_fish(name: &str) -> String {
+    let sep = ifs_join_sep();
     if is_assoc(name) {
-        return format!("({} | string join ' ')", assoc_values_loop_fish(name));
+        return format!("({} | string join {sep})", assoc_values_loop_fish(name));
     }
     if !is_plain_name(name) {
         return format!("(_arr_expand_join {name})");
     }
-    format!("(string join ' ' ${name})")
+    format!("(string join {sep} ${name})")
+}
+
+/// The separator `string join` must use for a `${arr[*]}` / `"$*"` expansion:
+/// bash's first IFS character, or a space when IFS is unset or empty.
+fn ifs_join_sep() -> String {
+    match IFS_SEP.lock().unwrap().as_deref() {
+        Some(s) if !s.is_empty() => {
+            // `\n` in the source is a REAL newline here, which `string join`
+            // accepts as its separator argument.
+            fish_single_quoted(s)
+        }
+        _ => "' '".to_string(),
+    }
 }
 
 /// The ASSOC walk, as a native fish `for` block: the VALUES in key-list order,
@@ -1149,6 +1169,7 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     *NESTED_FN_READS.lock().unwrap() = Default::default();
     FD_DUPS.lock().unwrap().clear();
     LOWER_VARS.lock().unwrap().clear();
+    *IFS_SEP.lock().unwrap() = None;
     UPPER_VARS.lock().unwrap().clear();
     {
         let mut hoisted: Vec<IrStmt> = Vec::new();
@@ -2538,6 +2559,14 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             // global and a callee sees it (dynamic scope); fish's bare `set`
             // is function-local. A name the function declared `local` keeps
             // the local spelling. See FUNC_DEPTH / LOCAL_VARS.
+            // `IFS=<value>` — remember the first character: bash uses it as
+            // the join separator for `${arr[*]}`/`"$*"` and as the field
+            // separator for unquoted expansion.
+            if t.var == "IFS" {
+                let v = word_to_fish(expr).unwrap_or_default();
+                let v = v.trim_matches(['\'', '"']).to_string();
+                *IFS_SEP.lock().unwrap() = Some(v.chars().next().map(|c| c.to_string()).unwrap_or_default());
+            }
             out.push_str(set_prefix_for(&t.var));
             out.push_str(&t.var);
             out.push(' ');
