@@ -168,6 +168,10 @@ pub struct Render {
     need_reduce: bool,
     /// bigint (std.math.big.int.Managed) helpers needed
     need_bigint: bool,
+    /// shellQuote helper needed (printf %q)
+    need_shquote: bool,
+    /// glob matching helper needed (case patterns with wildcards)
+    need_glob: bool,
 }
 
 /// Render an `IrProgram` to Zig source.
@@ -1064,7 +1068,7 @@ impl Render {
                 let a = self.arith(arg);
                 match op.as_str() {
                     "!" => format!("@intFromBool({a} == 0)"),
-                    "~" => format!("(~{a})"),
+                     "~" => format!("(~@as(i64, {a}))"),
                     _ => format!("({op}{a})"),
                 }
             }
@@ -2032,16 +2036,23 @@ impl Render {
         let mut fmt = String::new();
         let mut args: Vec<String> = Vec::new();
         for (spec, e) in parts {
-            fmt.push_str(spec_char(spec));
-            args.push(e);
+            if spec == 'q' {
+                self.need_shquote = true;
+                fmt.push_str(spec_char('s'));
+                args.push(format!("shellQuote({e})"));
+            } else {
+                fmt.push_str(spec_char(spec));
+                args.push(e);
+            }
         }
         if newline {
             fmt.push('\n');
         }
         format!(
-            "try stdout.print({}, .{{{}}});\n    try stdout.flush();",
+            "try stdout.print({}, .{{{}}});\n{}try stdout.flush();",
             Self::zig_str(&fmt),
-            args.join(", ")
+            args.join(", "),
+            "    ".repeat(self.depth)
         )
     }
 
@@ -2685,11 +2696,12 @@ impl Render {
                                                         break;
                                                     }
                                                 }
-                                                let spec = match chars.peek() {
+                                                   let spec = match chars.peek() {
                                                     Some('s') => { chars.next(); 's' }
                                                     Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
                                                     Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
                                                     Some('c') => { chars.next(); 's' }
+                                                    Some('q') => { chars.next(); 'q' }
                                                     Some('\n') => { chars.next(); 's' }
                                                     _ => { parts.push(('s', Self::zig_str("%"))); continue; }
                                                 };
@@ -2706,13 +2718,98 @@ impl Render {
                                                             parts.push(('s', pa[0].1.clone()));
                                                             continue;
                                                         }
+                                                        // %s over a numeric (i64) var:
+                                                        // use {d} so the typed var
+                                                        // compiles and prints its
+                                                        // decimal repr (bash parity)
+                                                        if spec == 's' && pa[0].0 == 'd' {
+                                                            parts.push(('d', pa[0].1.clone()));
+                                                            continue;
+                                                        }
+                                                        // %q shell-quote: wrap the arg
+                                                        // in shellQuote(); for numeric
+                                                        // args, convert to string first
+                                                        if spec == 'q' {
+                                                            if pa[0].0 == 'd' {
+                                                                let n = &pa[0].1;
+                                                                parts.push((
+                                                                    'q',
+                                                                    format!(
+                                                                        "std.fmt.allocPrint(std.heap.page_allocator, \"{{d}}\", .{{{}}}) catch \"\"",
+                                                                        n
+                                                                    ),
+                                                                ));
+                                                            } else {
+                                                                parts.push(('q', pa[0].1.clone()));
+                                                            }
+                                                            continue;
+                                                        }
                                                         parts.push((spec, pa[0].1.clone()));
                                                     } else {
                                                         parts.push(pa[0].clone());
                                                     }
-                                                } else {
-                                                    parts.push((spec, if spec == 'd' { "0".into() } else { "\"\"".into() }));
+                                                 } else {
+                                                    let arg = if spec == 'q' {
+                                                        "\"\"".to_string()
+                                                    } else if spec == 'd' {
+                                                        "0".into()
+                                                    } else {
+                                                        "\"\"".into()
+                                                    };
+                                                    parts.push((spec, arg));
                                                 }
+                                            } else if c == '\\' {
+                                                // bash printf escape sequences in
+                                                // format strings: \n \t \r \\ \a \b \f \v
+                                                // \xHH \NNN
+                                                let esc: String = match chars.peek() {
+                                                    Some('n') => { chars.next(); "\n".to_string() }
+                                                    Some('t') => { chars.next(); "\t".to_string() }
+                                                    Some('r') => { chars.next(); "\r".to_string() }
+                                                    Some('\\') => { chars.next(); "\\".to_string() }
+                                                    Some('a') => { chars.next(); "\u{7}".to_string() }
+                                                    Some('b') => { chars.next(); "\u{8}".to_string() }
+                                                    Some('f') => { chars.next(); "\u{c}".to_string() }
+                                                    Some('v') => { chars.next(); "\u{b}".to_string() }
+                                                    Some('x') => {
+                                                        chars.next();
+                                                        let mut hex = String::new();
+                                                        for _ in 0..2 {
+                                                            if let Some(h) = chars.peek() {
+                                                                if h.is_ascii_hexdigit() {
+                                                                    hex.push(*h);
+                                                                    chars.next();
+                                                                } else { break; }
+                                                            } else { break; }
+                                                        }
+                                                        if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                                                            String::from_utf8_lossy(&[b]).to_string()
+                                                        } else {
+                                                            "\\x".to_string()
+                                                        }
+                                                    }
+                                                    Some(d) if ('0'..='7').contains(d) => {
+                                                        // octal escape \NNN (1-3 digits)
+                                                        let mut oct = String::new();
+                                                        oct.push(*d);
+                                                        chars.next();
+                                                        for _ in 0..2 {
+                                                            if let Some(o) = chars.peek() {
+                                                                if ('0'..='7').contains(o) {
+                                                                    oct.push(*o);
+                                                                    chars.next();
+                                                                } else { break; }
+                                                            } else { break; }
+                                                        }
+                                                        if let Ok(b) = u8::from_str_radix(&oct, 8) {
+                                                            String::from_utf8_lossy(&[b]).to_string()
+                                                        } else {
+                                                            "\\".to_string()
+                                                        }
+                                                    }
+                                                    _ => "\\".to_string(),
+                                                };
+                                                parts.push(('s', Self::zig_str(&esc)));
                                             } else {
                                                 parts.push(('s', Self::zig_str(&c.to_string())));
                                             }
@@ -2959,17 +3056,27 @@ impl Render {
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
-                        .map(|p| format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p)))
+                        .map(|p| {
+                            if p.contains('*') || p.contains('?') || p.contains('[') {
+                                self.need_glob = true;
+                                format!("matchGlob({d}, {})", Self::zig_str(p))
+                            } else {
+                                format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p))
+                            }
+                        })
                         .collect();
                     let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
                     if conds.is_empty() && is_default {
-                        self.emit("else {");
+                        if emitted {
+                            self.emit("} else {");
+                        } else {
+                            self.emit("else {");
+                        }
                         self.depth += 1;
                         for s in &cl.body {
                             self.stmt(s);
                         }
                         self.depth -= 1;
-                        self.emit("}");
                         emitted = true;
                         continue;
                     }
@@ -3349,7 +3456,14 @@ impl Render {
                 }
             }
         }
-        // dead-var guard: Zig rejects declared-but-never-read variables
+        // dead-var guard: Zig rejects declared-but-never-read variables.
+        // `_ = x;` is NOT enough on the 0.16+ target: a variable that was
+        // ASSIGNED (which is what `written` holds) makes the discard itself an
+        // error — "pointless discard of local variable" (verified on 0.16.0 and
+        // 0.17.0). Discarding the ADDRESS (`_ = &x;`) keeps the declaration
+        // live for both cases: it reads the variable AND satisfies
+        // "never mutated" for an unassigned one (taking the address counts as a
+        // potential mutation). Mirrors the core fix in sh2perl/src/zig_backend.rs.
         for v in &written {
             if !self.read.contains(v) && !self.fn_locals.contains(v) {
                 let m = self
@@ -3357,7 +3471,7 @@ impl Render {
                     .get(v)
                     .cloned()
                     .unwrap_or_else(|| self.zig_ident(v));
-                self.emit(&format!("_ = {m};"));
+                self.emit(&format!("_ = &{m};"));
             }
         }
         std::mem::swap(&mut self.out, &mut body_stmts);
@@ -3657,6 +3771,61 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
             self.emit("}");
         }
+        if self.need_glob {
+            self.emit("");
+            self.emit("fn matchGlob(s: []const u8, pat: []const u8) bool {");
+            self.emit("    var si: usize = 0;");
+            self.emit("    var pi: usize = 0;");
+            self.emit("    var ssi: usize = 0;");
+            self.emit("    var spi: usize = 0;");
+            self.emit("    var star = false;");
+            self.emit("    while (si < s.len) {");
+            self.emit("        if (pi < pat.len) {");
+            self.emit("            const pc = pat[pi];");
+            self.emit("            if (pc == '*') {");
+            self.emit("                star = true;");
+            self.emit("                ssi = si;");
+            self.emit("                spi = pi;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("            if (pc == '?' or s[si] == pc) {");
+            self.emit("                si += 1;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("        }");
+            self.emit("        if (star) { si = ssi + 1; ssi = si; pi = spi + 1; } else return false;");
+            self.emit("    }");
+            self.emit("    while (pi < pat.len and pat[pi] == '*') { pi += 1; }");
+            self.emit("    return pi == pat.len;");
+            self.emit("}");
+        }
+        if self.need_shquote {
+            self.emit("");
+            self.emit("fn shellQuote(s: []const u8) []const u8 {");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var needs = false;");
+            self.emit("    for (s) |c| {");
+            self.emit("        if (c == '\\n') { out.appendSlice(std.heap.page_allocator, \"\\\\n\") catch {}; needs = true; }");
+            self.emit("        else if (c == '\\t') { out.appendSlice(std.heap.page_allocator, \"\\\\t\") catch {}; needs = true; }");
+            self.emit("        else if (c == '\\r') { out.appendSlice(std.heap.page_allocator, \"\\\\r\") catch {}; needs = true; }");
+            self.emit("        else if (c == '\\\\') { out.appendSlice(std.heap.page_allocator, \"\\\\\") catch {}; needs = true; }");
+            self.emit("        else if (c == '\\'') { out.appendSlice(std.heap.page_allocator, \"\\\\'\") catch {}; needs = true; }");
+            self.emit("        else if (c < 32 or c == 127) {");
+            self.emit("            out.appendSlice(std.heap.page_allocator, \"\\\\x\") catch {};");
+            self.emit("            const hi: u8 = \"0123456789abcdef\"[@intCast(c >> 4)];");
+            self.emit("            const lo: u8 = \"0123456789abcdef\"[@intCast(c & 0xF)];");
+            self.emit("            out.append(std.heap.page_allocator, hi) catch {}; out.append(std.heap.page_allocator, lo) catch {};");
+            self.emit("            needs = true;");
+            self.emit("        } else { out.append(std.heap.page_allocator, c) catch {}; }");
+            self.emit("    }");
+            self.emit("    if (needs) {");
+            self.emit("        return std.fmt.allocPrint(std.heap.page_allocator, \"$'{s}'\", .{out.items}) catch \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
         // per-callee stubs: compile-able, exit(2) at runtime
         if !self.sh2_calls.is_empty() {
             let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -3763,6 +3932,9 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             );
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
+        }
+        if !self.need_stdout {
+            self.emit("    _ = init;");
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");
