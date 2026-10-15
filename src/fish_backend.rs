@@ -5146,7 +5146,18 @@ fn push_dq_lit(out: &mut String, c: char) {
 /// Single-quote a literal for fish. Inside single quotes fish treats
 /// everything literally, so only `'` and `\` need escaping.
 fn fish_single_quoted(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "'\\''"))
+    // fish's escape INSIDE single quotes is `\'` — NOT bash's
+    // close-quote-backslash-quote-reopen `'\''` idiom. Emitting the bash
+    // spelling into a fish single-quoted word left the characters visible:
+    // single-quote-embed-escape printed `s/'\''/g` instead of `s/'/'\\''/g`.
+    // A backslash before `'` or `\` needs doubling so it survives, which is
+    // exactly what the two replaces do (order matters: backslash first).
+    // fish single quotes: an embedded quote is `\'`, and a literal backslash
+    // must be DOUBLED (`'\\'` prints one backslash — measured). Backslashes
+    // are doubled FIRST, then quotes escaped, so the backslash that the quote
+    // escape introduces is not itself doubled.
+    let doubled = s.replace('\\', "\\\\");
+    format!("'{}'", doubled.replace('\'', "\\'"))
 }
 
 /// Follow the `exec N>&M` dup chain to the fd it ultimately names.
@@ -6817,7 +6828,12 @@ fn interp_to_fish(parts: &[InterpPart]) -> Result<String, String> {
                     match c {
                         '"' => out.push_str("\\\""),
                         '$' => out.push_str("\\$"),
-                        '`' => out.push_str("\\`"),
+                        // A backtick needs NO escape inside fish double quotes
+                        // (measured: `echo "a`b"` prints `a`b`). Escaping it
+                        // produced a VISIBLE backslash — bash drops the
+                        // backslash in `"\`"`, fish does not (echo-with-
+                        // escaped-backtick printed ``\`\'`` where bash printed
+                        // `` `\' ``).
                         '\\' => out.push_str("\\\\"),
                         c => out.push(c),
                     }
@@ -7961,16 +7977,11 @@ fn str_word(s: &str) -> String {
         '$', '"', '\'', '\\', ';', '&', '|', '(', ')', '<', '>', ' ', '\t', '\n', '\r', '=',
     ]) || s.starts_with('#')
     {
-        let mut q = String::from("'");
-        for c in s.chars() {
-            if c == '\'' {
-                q.push_str("'\\''");
-            } else {
-                q.push(c);
-            }
-        }
-        q.push('\'');
-        return q;
+        // DELEGATE to `fish_single_quoted`: this block used to inline bash's
+        // `'\''` close-quote-backslash-quote-reopen idiom, which is not fish
+        // and left the characters visible (single-quote-embed-escape printed
+        // `s/'\''/g` where bash printed `s/'/'\\''/g`).
+        return fish_single_quoted(s);
     }
     // quoted-in-source glob chars (no GLOB_MAGIC) → literal
     if s.contains(['*', '?', '[']) {
