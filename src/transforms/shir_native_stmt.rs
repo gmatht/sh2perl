@@ -3020,6 +3020,18 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     // is refused — the real path isn't known at IR time.
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+        // A `Var`/`Ident` target: which of the two readings is right depends
+        // on the name. A process-substitution temp (`__ps_tmp0`) is a Perl
+        // SCALAR holding the `mktemp` path — the previous statement assigned
+        // it — so the filename is its VALUE. Anything else is a bash-side
+        // name the shell would resolve itself, so the name is the filename.
+        //
+        // Reading `__ps_tmp*` as a literal filename made `sort` write to
+        // a file actually named `__ps_tmp0` while `comm` read the real temp:
+        // 000__04h's process-substitution result was empty.
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+            format!("${n}")
+        }
         IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
@@ -3046,12 +3058,14 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     let Some(file) = file else { return false; };
     // process-substitution temps arrive as Var/Ident (`sort "$__ps_tmp0"`):
     // the NAME is the literal filename.
-    let fname = match file {
-        IrExpr::Str(fname, _) => fname.clone(),
-        IrExpr::Var(n, _) | IrExpr::Ident(n) => n.clone(),
+    // the INPUT side: `__ps_tmp*` names hold the runtime path, so quote the
+    // scalar READ, not the name (same rule as the output target above).
+    let fq = match file {
+        IrExpr::Str(fname, _) => crate::ir::safe_perl_q_string(fname),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => format!("${n}"),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
-    let fq = crate::ir::safe_perl_q_string(&fname);
     let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
