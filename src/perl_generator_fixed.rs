@@ -3822,6 +3822,15 @@ sub __sh_fn_status {
         ? $rv + 0
         : ($? >> 8);
     $st = 1 if !defined $st;
+    # This sub is injected right after the `use` block, BEFORE the shared
+    # renderer's own preamble (`our $CHILD_ERROR = 0;`), so a bare
+    # $CHILD_ERROR here is a `use strict` COMPILE error ("Global symbol
+    # $CHILD_ERROR requires explicit package name") and the whole program
+    # aborts — 051_primes printed NOTHING. Re-declaring the package global
+    # inside the sub is always legal, makes the helper independent of
+    # preamble ordering, and (same package) still writes the caller's
+    # variable.
+    our $CHILD_ERROR;
     $CHILD_ERROR = $st;
     return $st == 0 ? 1 : 0;
 }
