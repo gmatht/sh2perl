@@ -194,12 +194,75 @@ fn restructure_pass(stmts: &mut Vec<IrStmt>, n: &mut usize) -> bool {
                 }
             }
         }
+        // THE BODY-INSIDE-IF SHAPE — the go-sh frontend's own goto loop:
+        //     L:  if (c) { body…; goto L }
+        // The body sits INSIDE the guarded If and the Goto is its LAST
+        // statement (Go's idiomatic goto-loop), which is the mirror of
+        // the `L: body; if (c) goto L;` shape handled above. The test is
+        // the loop CONDITION, so this restructures to `While(c) { body… }`
+        // — no flag variable needed (the jump is the last thing in the
+        // body, so falling off the end re-tests) and the Label drops.
+        if let IrStmt::If { cond, then, elsifs, else_ } = &stmts[i] {
+            if elsifs.is_empty() && else_.is_empty() && then.len() >= 2 {
+                if let IrStmt::Goto(name) = &then[then.len() - 1] {
+                    if let Some((_, lpos)) = labels.iter().find(|(l, _)| l == name) {
+                        // the goto targets an ENCLOSING label; the rest of
+                        // the then-body is the loop and `cond` is the test
+                        if *lpos <= i {
+                            let cond = cond.clone();
+                            let mut body: Vec<IrStmt> =
+                                then[..then.len() - 1].to_vec();
+                            restructure_stmts(&mut body, n);
+                            let while_stmt = IrStmt::While { cond, body };
+                            stmts[*lpos] = IrStmt::Block(vec![while_stmt]);
+                            stmts.remove(i);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         // nested goto targeting this list's label
         if let Some(hit) = find_nested(&stmts[i], i, &labels) {
             return handle_nested(stmts, hit, n);
         }
     }
     false
+}
+
+/// Does this program still carry any `Label`/`Goto` node?
+///
+/// The estree ingress historically skipped the restructure pass on the
+/// theory that "the estree emitter handles goto/cfor natively" — it does
+/// not (shir.rs has no Label/Goto arm, so a surviving jump renders as
+/// `sh2.unsupported("goto <label>")` and dies at runtime). Running the
+/// pass UNCONDITIONALLY there changed the emitted output for
+/// goto/cfor-bearing examples, so gate it on this predicate: a program
+/// with no jumps is byte-identical to before.
+pub fn program_has_goto(prog: &IrProgram) -> bool {
+    fn in_stmts(stmts: &[IrStmt]) -> bool {
+        stmts.iter().any(in_stmt)
+    }
+    fn in_stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Label(_) | IrStmt::Goto(_) => true,
+            IrStmt::If { then, elsifs, else_, .. } => {
+                in_stmts(then) || elsifs.iter().any(|(_, b)| in_stmts(b)) || in_stmts(else_)
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::ForInit { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Redirect { inner: body, .. }
+            | IrStmt::Function { body, .. } => in_stmts(body),
+            IrStmt::Case { clauses, .. } => clauses.iter().any(|c| in_stmts(&c.body)),
+            _ => false,
+        }
+    }
+    in_stmts(&prog.stmts) || prog.subs.iter().any(|sub| in_stmts(&sub.body))
 }
 
 /// A bare top-level `Goto(L)`. Backward -> infinite loop; forward -> the
@@ -1184,6 +1247,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
+
     /// The go-sh `for { switch { … default: goto L } L: … }` shape: the
     /// goto is inside a Case clause and BOTH the goto and its label live
     /// inside the loop's own body list. Pre-fix this left `loop_steps`
@@ -1283,5 +1347,26 @@ mod tests {
         // `end` must be reachable only through the flag guard (an If
         // whose else_ holds the tail), never unconditionally at top level.
         assert!(json.contains("\"If\""), "no guard If: {json}");
+    }
+
+    #[test]
+    fn body_inside_if_goto_loop() {
+        // L: if (c) { body; goto L }
+        let stmts = vec![
+            IrStmt::Label("loop".into()),
+            IrStmt::If {
+                cond: IrExpr::Str("c".into(), StrStyle::DoubleQuoted),
+                then: vec![
+                    IrStmt::Expr(IrExpr::Str("body".into(), StrStyle::DoubleQuoted)),
+                    IrStmt::Goto("loop".into()),
+                ],
+                elsifs: vec![],
+                else_: vec![],
+            },
+        ];
+        let mut prog = program(stmts);
+        RestructureGoto.run(&mut prog, &PassContext::default());
+        let raw = shir_to_shir_json_raw(&prog);
+        println!("RESULT: {raw}");
     }
 }
