@@ -73,7 +73,9 @@ for f in "${corpus[@]}"; do
   fi
 
   bash_out=$(cd "$scratch" && timeout 15 bash "$f" 2>/dev/null); bash_rc=$?
-  fish_out=$(cd "$scratch" && timeout 15 fish "$scratch/_r.fish" 2>/dev/null); fish_rc=$?
+  # SH2_ARGV0 = the exact string `bash "$f"` puts in $0, so the render's
+  # `$0` (fish has none; it uses this or `status filename`) agrees with bash.
+  fish_out=$(cd "$scratch" && SH2_ARGV0="$f" timeout 15 fish "$scratch/_r.fish" 2>/dev/null); fish_rc=$?
   [ -n "$OUTDIR" ] && { printf '%s\n' "$bash_out" > "$OUTDIR/$base.bash"; printf '%s\n' "$fish_out" > "$OUTDIR/$base.fishout"; }
   if [ "$bash_rc" = 124 ] || [ "$fish_rc" = 124 ]; then
     echo -e "TIMEOUT\t$base\tbash=$bash_rc fish=$fish_rc" >> "$tmp/buckets.tsv"; fail=$((fail+1)); continue

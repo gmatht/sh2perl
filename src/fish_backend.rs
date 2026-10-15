@@ -37,6 +37,238 @@ lazy_static::lazy_static! {
     /// drop target must be BARE — dash rejects quoted expansions inside
     /// `$(( ))`).
     static ref NUM_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// Depth of the function body currently being rendered. bash's default
+    /// assignment is GLOBAL and visible to a callee (dynamic scope); fish's
+    /// `set` inside a function is FUNCTION-LOCAL, so an assignment at depth >0
+    /// that is not a `local`/`declare` must be spelled `set -g` or a nested
+    /// (hoisted) function cannot read the enclosing function's variables
+    /// (081_nested_functions, 064_10).
+    static ref FUNC_DEPTH: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+    /// Names declared `local`/`declare`/`typeset` by the CURRENTLY rendered
+    /// function body. bash's `local val` then `val=$(…)` writes the LOCAL;
+    /// the `set -g` spelling used for undeclared function-body writes would
+    /// create a NEW global and leave the local unset, so `$val` read empty
+    /// (087_function_cmd_sub lost its `HELLO`/`WORLD`).
+    static ref LOCAL_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// Variables READ by a hoisted (formerly nested) function. The enclosing
+    /// function must therefore write them GLOBALLY, because the hoisted
+    /// function is not lexically inside it any more.
+    static ref NESTED_FN_READS: std::sync::Mutex<HashSet<String>> = Default::default();
+}
+
+/// `set ` or `set -g ` — `-g` while inside a function body, so bash's global
+/// assignment semantics survive the lowering. See [`FUNC_DEPTH`].
+fn set_prefix() -> &'static str {
+    if *FUNC_DEPTH.lock().unwrap() > 0 { "set -g " } else { "set " }
+}
+
+/// [`set_prefix`] for a SPECIFIC variable: a name the enclosing function
+/// declared `local` keeps the function-local spelling (see [`LOCAL_VARS`]).
+/// Every variable NAME read anywhere in a statement tree. Used to decide which
+/// locals a hoisted nested function needs to be able to see.
+fn body_read_names(st: &IrStmt, out: &mut HashSet<String>) {
+    fn expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Var(n, _) => {
+                out.insert(n.clone());
+            }
+            IrExpr::Ident(n) => {
+                out.insert(n.clone());
+            }
+            IrExpr::Call { func, args } => {
+                if func == "getVar" {
+                    if let Ok(n) = raw_arg(args, 0) {
+                        out.insert(n);
+                    }
+                }
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    expr(i, out);
+                }
+            }
+            IrExpr::Object(fs) => {
+                for (_, v) in fs {
+                    expr(v, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        expr(x, out);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr(lhs, out);
+                expr(rhs, out);
+            }
+            IrExpr::Arrow(body) => {
+                for s in body {
+                    body_read_names(s, out);
+                }
+            }
+            IrExpr::Capture { expr: x, .. } => expr(x, out),
+            IrExpr::Index { key, .. } => expr(key, out),
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr(cond, out);
+                expr(then, out);
+                expr(else_, out);
+            }
+            _ => {}
+        }
+    }
+    match st {
+        IrStmt::Expr(e) | IrStmt::SetChildError(e) | IrStmt::Warn { expr: e, .. } => expr(e, out),
+        IrStmt::Assign { expr: e, .. } => expr(e, out),
+        IrStmt::Declare { init: Some(e), .. } => expr(e, out),
+        IrStmt::DeclareArray { elements, .. } => {
+            for el in elements {
+                expr(el, out);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            expr(cond, out);
+            for b in then.iter().chain(elsifs.iter().flat_map(|(_, b)| b.iter())).chain(else_.iter()) {
+                body_read_names(b, out);
+            }
+        }
+        IrStmt::While { cond, body, .. } => {
+            expr(cond, out);
+            for b in body {
+                body_read_names(b, out);
+            }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for b in body {
+                body_read_names(b, out);
+            }
+            expr(cond, out);
+        }
+        IrStmt::For { iter, body, .. } => {
+            expr(iter, out);
+            for b in body {
+                body_read_names(b, out);
+            }
+        }
+        IrStmt::Case { discriminant, clauses, .. } => {
+            expr(discriminant, out);
+            for c in clauses {
+                for b in &c.body {
+                    body_read_names(b, out);
+                }
+            }
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            for s in b {
+                body_read_names(s, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stg in stages {
+                for b in stg {
+                    body_read_names(b, out);
+                }
+            }
+        }
+        IrStmt::Output { value, .. } | IrStmt::Return(Some(value)) | IrStmt::Exit(Some(value)) => {
+            expr(value, out)
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                body_read_names(b, out);
+            }
+            for r in redirects {
+                expr(&r.target, out);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for b in body.iter().chain(else_body.iter()).chain(finally_body.iter()) {
+                body_read_names(b, out);
+            }
+            for e in excepts {
+                for b in &e.body {
+                    body_read_names(b, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The names a subshell body assigns — used to give the group its own scope
+/// (see the `IrStmt::Subshell` arm).
+fn subshell_assigned_names(body: &[IrStmt]) -> Vec<String> {
+    fn walk(body: &[IrStmt], out: &mut Vec<String>) {
+        for st in body {
+            match st {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            out.push(t.var.clone());
+                        }
+                    }
+                }
+                IrStmt::Declare { vars, .. } => {
+                    for v in vars {
+                        out.push(v.name.clone());
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, out);
+                    for (_, b) in elsifs {
+                        walk(b, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. } | IrStmt::Block(body) => walk(body, out),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, &mut out);
+    out
+}
+
+fn set_prefix_for(name: &str) -> &'static str {
+    // Three cases, and the middle one is why this takes a name:
+    //
+    //   * the name was DECLARED `local` in this body — the declaration already
+    //     made a function-local binding, so a later write is a plain `set`
+    //     (which updates it). `-l` here would make a FRESH local on every
+    //     iteration of a loop and the loop would never observe its own update
+    //     (092_for_arith_func hung).
+    //   * not declared local, inside a function — bash's default assignment is
+    //     global and a callee sees it (dynamic scope), while fish's bare `set`
+    //     is function-local, so the write is `set -g`.
+    //   * file level — `set` is already global.
+    if LOCAL_VARS.lock().unwrap().contains(name) {
+        return "set ";
+    }
+    set_prefix()
+}
+
+/// [`set_prefix_for`] for a DECLARATION site (`local x=…`): always `-l` inside
+/// a function body, and a plain `set` at file level (there is no function scope
+/// to declare in).
+fn decl_prefix_for(name: &str) -> &'static str {
+    if NESTED_FN_READS.lock().unwrap().contains(name) {
+        return "set -g ";
+    }
+    if *FUNC_DEPTH.lock().unwrap() > 0 {
+        return "set -l ";
+    }
+    "set "
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -470,7 +702,7 @@ fn arr_elem_ref(base: &str, idx: &str) -> String {
         // matched, and the whole parser processed nothing.
         return subscript_read_fish(base, if idx.is_empty() { "0" } else { idx });
     }
-    format!("${base}_{idx}")
+    format!("${base}_{}", assoc_key_suffix(idx))
 }
 
 /// [`arr_elem_ref`] with the quoting a WORD position needs: the element is
@@ -528,6 +760,46 @@ fn expr_containers(e: &IrExpr) -> Vec<&IrExpr> {
 /// `_join` caller as also calling the list form.
 fn body_calls(body: &str, name: &str) -> bool {
     body.contains(&format!("{name} ")) || body.contains(&format!("{name})"))
+}
+
+/// Seed the SHELL-IDENTITY variables bash sets at startup and fish does not.
+///
+/// `$BASH_VERSION` / `$BASH_VERSINFO` are set by every bash (they are not
+/// inherited — a fresh `bash` sets them itself), so a faithful translation
+/// must have them non-empty. fish's own `$version` is a DIFFERENT string
+/// ("3.7.0") — renaming would be a silent lie about which shell ran the
+/// script, and would break `[[ ${BASH_VERSION%%.*} -ge 4 ]]`-style version
+/// gates. We only need the variable to EXIST and be non-empty: the corpus
+/// reads it as a presence test (`[ "${BASH_VERSION-}" ]`, 013/bash-version
+/// probes) or prints it (where bash's real value is host-dependent anyway).
+///
+/// `$ZSH_VERSION` is deliberately NOT seeded — bash leaves it unset, and
+/// `param-expand-default-operator.sh` is exactly the zsh/bash discriminator
+/// that depends on it being unset (`if [ "${ZSH_VERSION-}" ]; then zsh;
+/// elif [ "${BASH_VERSION-}" ]; then bash`).
+///
+/// Keyed on the RENDERED BODY, like the array preamble: the variable may be
+/// reached through the opaque `Str` test path (`bash_specials_to_fish`),
+/// where the IR-level `var_bash_env` analyzer (which walks `getVar`/`param`
+/// nodes) cannot see it. Matching the rendered text is exact by
+/// construction.
+fn shell_identity_preamble(body: &str) -> String {
+    // A rendered read is `$BASH_VERSION`; the array/indirect spellings
+    // (`$$name`, `$BASH_VERSION[...]`) are not produced for these names.
+    let mut out = String::new();
+    if body.contains("$BASH_VERSION") {
+        out.push_str("set -g BASH_VERSION 5.2.15\n");
+        // BASH_VERSINFO is the array form (major, minor, patch, …); the
+        // scalar read is `${BASH_VERSINFO[0]}` = the major version.
+        out.push_str("set -g BASH_VERSINFO 5 2 15 1 release x86_64-pc-linux-gnu\n");
+    } else if body.contains("$BASH_VERSINFO") {
+        out.push_str("set -g BASH_VERSINFO 5 2 15 1 release x86_64-pc-linux-gnu\n");
+    }
+    if !out.is_empty() {
+        out.insert_str(0, "# bash shell-identity variables fish does not set itself\n");
+        out.push('\n');
+    }
+    out
 }
 
 /// The array runtime the renderer still cannot spell natively, plus the two
@@ -657,6 +929,81 @@ fn arr_helper_preamble(body: &str) -> String {
 
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
+/// Move every `Function` nested inside another function/block to the TOP
+/// level, replacing it in place with a no-op.
+///
+/// fish rejects a nested `function`, and even where it parses, the inner name
+/// is not visible the way bash's is. Hoisting keeps the definition (and its
+/// call sites) working; the outer function's variables stay readable because
+/// function-body writes are emitted with `set -g`.
+fn hoist_nested_functions(st: &mut IrStmt, out: &mut Vec<IrStmt>) {
+    // Recurse through every container, then lift any Function found NOT at the
+    // top level. `top` is threaded by the entry point below.
+    fn walk(body: &mut Vec<IrStmt>, out: &mut Vec<IrStmt>, top: bool) {
+        for st in body.iter_mut() {
+            match st {
+                IrStmt::Function { name, body: fb, .. } => {
+                    if !top {
+                        // lift a CLONE and neutralise the original position
+                        //
+                        // The hoisted function is now a SIBLING of the function
+                        // that declared its free variables, so every local it
+                        // READS must be global for the read to resolve. Record
+                        // those names before rendering.
+                        {
+                            let mut names = HashSet::new();
+                            for b in fb.iter() {
+                                body_read_names(b, &mut names);
+                            }
+                            let mut nfr = NESTED_FN_READS.lock().unwrap();
+                            for n in names {
+                                nfr.insert(n);
+                            }
+                        }
+                        out.push(IrStmt::Function {
+                            name: name.clone(),
+                            body: fb.clone(),
+                            named_blocks: Vec::new(),
+                        });
+                        *st = IrStmt::RawText(":".into());
+                    }
+                    // the function's OWN body is a new "not top" scope
+                    if let IrStmt::Function { body: fb2, .. } = st {
+                        walk(fb2, out, false);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, out, false);
+                    for (_, b) in elsifs.iter_mut() {
+                        walk(b, out, false);
+                    }
+                    walk(else_, out, false);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. } | IrStmt::Block(body)
+                | IrStmt::Subshell(body) | IrStmt::Background(body) => walk(body, out, false),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses.iter_mut() {
+                        walk(&mut c.body, out, false);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    walk(body, out, false);
+                    for e in excepts.iter_mut() {
+                        walk(&mut e.body, out, false);
+                    }
+                    walk(else_body, out, false);
+                    walk(finally_body, out, false);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut one = vec![std::mem::replace(st, IrStmt::RawText(":".into()))];
+    walk(&mut one, out, true);
+    *st = one.pop().unwrap();
+}
+
 pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // builtin-op fallback arm (shir-builtin-op-20260816): the sh
     // backend has NOT accepted the `builtin` op — render as exec.
@@ -668,6 +1015,28 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // first (the ingest path's CLI-level strip; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // HOIST nested function definitions to the top level.
+    //
+    // fish has NO nested `function` — a definition inside another function's
+    // body is either a parse error or defines the inner name in a scope the
+    // outer body's locals cannot reach, so `081_nested_functions` printed
+    // NOTHING where bash printed `hello` and `064_10` lost `outer_var`
+    // ("Outer: , Inner: inner"). bash allows the nesting and resolves the
+    // outer function's `local`s dynamically, so the inner function must be
+    // reachable at top level; its reads of the outer locals work because the
+    // renderer emits function bodies' variable writes with `set -g`.
+    *NESTED_FN_READS.lock().unwrap() = Default::default();
+    {
+        let mut hoisted: Vec<IrStmt> = Vec::new();
+        for st in &mut stripped.stmts {
+            hoist_nested_functions(st, &mut hoisted);
+        }
+        // PREPEND: a hoisted definition must exist before the call site runs
+        // (fish resolves a function name at call time), and the call site is
+        // inside the function that DEFINED it.
+        hoisted.extend(std::mem::take(&mut stripped.stmts));
+        stripped.stmts = hoisted;
+    }
     let prog = &stripped;
     // collect the array base names (the A1's var_lengths is not carried
     // into IrProgram — the shared core; usage is a sound proxy)
@@ -675,6 +1044,7 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     *NOCASEMATCH.lock().unwrap() = false;
     *INT_VARS.lock().unwrap() = Default::default();
     *ASSOC_VARS.lock().unwrap() = Default::default();
+    *FUNC_DEPTH.lock().unwrap() = 0;
     *NUM_VARS.lock().unwrap() = crate::shir::analyze_var_types(prog)
         .into_iter()
         .filter(|(_, t)| *t == crate::ir::IrType::Int)
@@ -737,12 +1107,17 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     }
     for sub in &prog.subs {
         body.push_str(&format!("\nfunction {}\n", sub.name));
+        let saved_locals = LOCAL_VARS.lock().unwrap().clone();
+        *FUNC_DEPTH.lock().unwrap() += 1;
         for st in &sub.body {
             stmt_to_fish(st, 1, &mut body)?;
         }
+        *FUNC_DEPTH.lock().unwrap() -= 1;
+        *LOCAL_VARS.lock().unwrap() = saved_locals;
         body.push_str("end\n");
     }
     out.push_str(&arr_helper_preamble(&body));
+    out.push_str(&shell_identity_preamble(&body));
     if body.contains("( _num ") || body.contains(" _num ") {
         out.push_str("function _num --argument val\n");
         out.push_str("    # bash coerces non-numeric arith values to 0; fish math errors\n");
@@ -1315,6 +1690,10 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             // convention the call site was rewritten from. Inside such a body
             // `return <v>` lowers to `echo <v>`; a value-less `return` (and a
             // status return in a value-less body) stays a real `return`.
+            // A function body has its OWN set of `local` names; save and
+            // restore around it so an outer body's locals cannot leak in.
+            let saved_locals = LOCAL_VARS.lock().unwrap().clone();
+            *FUNC_DEPTH.lock().unwrap() += 1;
             if fn_body_returns_value(body) {
                 for b in body {
                     valret_body_to_fish(b, d + 1, out)?;
@@ -1324,6 +1703,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     stmt_to_fish(b, d + 1, out)?;
                 }
             }
+            *FUNC_DEPTH.lock().unwrap() -= 1;
+            *LOCAL_VARS.lock().unwrap() = saved_locals;
             indent(out, d);
             out.push_str("end\n");
             Ok(())
@@ -1366,6 +1747,14 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::Subshell(body) => {
             indent(out, d);
             out.push_str("begin\n");
+            // bash's `( … )` runs in a SUBSHELL so its writes are discarded,
+            // but fish has no scope-creating group that reproduces that
+            // without also breaking LOOP-CARRIED state: `set -l x` inside a
+            // `while` body makes a fresh local per iteration and the loop
+            // never terminates (092_for_arith_func hung). The group is
+            // therefore rendered with plain `set`, which is right for every
+            // read-after-write inside the group and only differs from bash
+            // for a write that a LATER sibling statement reads (049_local).
             for b in body {
                 stmt_to_fish(b, d + 1, out)?;
             }
@@ -1384,6 +1773,9 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             }
             indent(out, d);
             out.push_str("begin\n");
+            // A background job is a fork in bash, but the write isolation has
+            // the same loop-carried-state hazard as the subshell group above,
+            // so the body renders with plain `set`.
             for b in body {
                 stmt_to_fish(b, d + 1, out)?;
             }
@@ -1517,10 +1909,31 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         }
         IrStmt::Declare { vars, init, local } => {
             indent(out, d);
-            if *local {
+            // `local x` inside a function body is a declaration; outside one
+            // there is no function scope to declare in, so the write is the
+            // file-level `set`.
+            // A hoisted nested function reads these names but is no longer
+            // lexically inside this body, so a function-local binding would be
+            // invisible to it (081_nested_functions printed nothing). bash
+            // resolves such a read dynamically, so the declaration must be
+            // global.
+            let read_by_hoisted = vars
+                .iter()
+                .any(|v| NESTED_FN_READS.lock().unwrap().contains(&v.name));
+            if *local && read_by_hoisted {
+                out.push_str("set -g ");
+            } else if *local && *FUNC_DEPTH.lock().unwrap() > 0 {
                 out.push_str("set -l ");
             } else {
-                out.push_str("set ");
+                out.push_str(set_prefix());
+            }
+            // Record the declared locals so the LATER writes in this body are
+            // plain `set` (updated binding) rather than `-l` (fresh local).
+            if *local {
+                let mut decls = LOCAL_VARS.lock().unwrap();
+                for v in vars {
+                    decls.insert(v.name.clone());
+                }
             }
             for (i, v) in vars.iter().enumerate() {
                 if i > 0 {
@@ -1593,13 +2006,7 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     return Ok(());
                 }
             }
-            let mut line = String::new();
-            for (i, stg) in stages.iter().enumerate() {
-                if i > 0 {
-                    line.push_str(" | ");
-                }
-                line.push_str(&stmts_inline(stg)?);
-            }
+            let line = pipeline_line(stages)?;
             if let Some(var) = capture {
                 indent(out, d);
                 out.push_str("set ");
@@ -1710,8 +2117,12 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
     }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment — no `name=` prefix.
+    //
+    // Same for the `assign` RHS (`y+=2`): it renders its own `set y …`, so
+    // prefixing it again produced `set y set y (math …)` — a double `set` that
+    // made the whole script fail (051_primes / 055_factorize timeouts).
     if let IrExpr::Call { func, .. } = expr {
-        if func == "setArray" || func == "setArrayAppend" {
+        if func == "setArray" || func == "setArrayAppend" || func == "assign" {
             return cmd_to_fish(expr);
         }
     }
@@ -1763,7 +2174,11 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             continue;
         }
         if t.indices.is_empty() {
-            out.push_str("set ");
+            // `set -g` inside a function body: bash's plain assignment is
+            // global and a callee sees it (dynamic scope); fish's bare `set`
+            // is function-local. A name the function declared `local` keeps
+            // the local spelling. See FUNC_DEPTH / LOCAL_VARS.
+            out.push_str(set_prefix_for(&t.var));
             out.push_str(&t.var);
             out.push(' ');
             out.push_str(&rhs);
@@ -1817,7 +2232,31 @@ fn array_elem_write(base: &str, idx: &str, rhs: &str) -> String {
 
 /// An associative-array element write (`map[key]=v`) — the flat
 /// `{base}_{key}` element plus the `{base}_keys` LIST the readers walk.
+/// Sanitize an associative-array key into the fish identifier suffix.
+///
+/// The flat `{base}_{key}` element layout composes the key into a VARIABLE
+/// NAME, and fish identifiers admit only `[A-Za-z0-9_]`. A literal key with
+/// any other character — `matrix[0,0]` (the `declare -A matrix; matrix[0,0]=`
+/// idiom, 063_hard_to_parse) or `map[a-b]` — made `set matrix_0,0 …` a
+/// run-time "invalid variable name" error, so the write was LOST and every
+/// later read came back empty. Non-identifier characters are replaced by `_`,
+/// which is deterministic and collision-free for the corpus's literal keys
+/// (the same rewrite the dotted-name arms use for `p.x` → `p_x`).
+fn assoc_key_suffix(key: &str) -> String {
+    let s: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // A key that is empty (or all-punctuation) must still name a variable.
+    if s.is_empty() || s.chars().all(|c| c == '_') {
+        "k".to_string()
+    } else {
+        s
+    }
+}
+
 fn assoc_elem_write(base: &str, key: &str, rhs: &str) -> String {
+    let key = assoc_key_suffix(key);
     format!(
         "set {base}_{key} {rhs}; set {base}_len (math --scale 0 \"${base}_len + 1\"); set -a {base}_keys {key}"
     )
@@ -1965,7 +2404,8 @@ fn assign_call_to_fish(args: &[IrExpr]) -> Result<String, String> {
 /// The variable name a `declare`/`local` statement declared — only the `set N`
 /// forms produced above count (a bare word is not a declaration).
 fn declared_name(stmt: &str) -> Option<String> {
-    let rest = stmt.strip_prefix("set ")?;
+    // `set NAME …` at top level, `set -g NAME …` inside a function body.
+    let rest = stmt.strip_prefix("set -g ").or_else(|| stmt.strip_prefix("set "))?;
     let name = rest.split_whitespace().next()?;
     if name.is_empty() || name.contains(['[', '=', '(', '"', '\'']) {
         None
@@ -2063,14 +2503,7 @@ fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
             "captureWords" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, false)),
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
-                let mut line = String::new();
-                for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str(" | ");
-                    }
-                    line.push_str(&stmts_inline(stg)?);
-                }
-                Ok(format!("$({line})"))
+                Ok(format!("$({})", pipeline_line(&stages)?))
             }
 
             "arith" => {
@@ -2583,14 +3016,7 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
-                let mut line = String::new();
-                for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str(" | ");
-                    }
-                    line.push_str(&stmts_inline(stg)?);
-                }
-                Ok(line)
+                pipeline_line(&stages)
             }
             "redirect" => {
                 let inner = arrow_to_fish(args)?;
@@ -3223,6 +3649,92 @@ fn exec_line_to_fish(
         IrExpr::Str(s, _) => Some(s.as_str()),
         _ => None,
     };
+    // `eval "NAME=value"` — bash's assignment-by-string. fish's `eval` exists
+    // but re-parses its argument as FISH, and a `NAME=value` word is the one
+    // thing fish rejects ("Unsupported use of '='. In fish, please use 'set
+    // NAME value'"), so the assignment never happened and every later read was
+    // empty (eval-assign: `y=5+1` vs `y=`).
+    //
+    // When the argument is an interpolation whose FIRST literal part is a plain
+    // `NAME=`, an assignment is certain, and the assignment can be spelled
+    // natively with `set` and the remaining parts as the value. Anything else
+    // (a real command string, a computed prefix) keeps fish's `eval`, whose
+    // behaviour for those is unchanged.
+    if cmd_name == Some("eval") && args.len() == 1 {
+        if let IrExpr::Interpolate(parts) = &args[0] {
+            if let Some(crate::ir::InterpPart::Lit(first)) = parts.first() {
+                if let Some((name, _)) = first.split_once('=') {
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_alphabetic() || c == '_')
+                            == Some(true)
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        // The value is everything after `NAME=`: the rest of
+                        // the first literal plus the remaining parts, spliced
+                        // through the ordinary interpolation renderer so a
+                        // `$x` inside stays an expansion and lands as ONE
+                        // word (`set y "5+1"`).
+                        let rest = &first[name.len() + 1..];
+                        let mut value_parts: Vec<crate::ir::InterpPart> = Vec::new();
+                        if !rest.is_empty() {
+                            value_parts.push(crate::ir::InterpPart::Lit(rest.to_string()));
+                        }
+                        value_parts.extend(parts.iter().skip(1).cloned());
+                        if value_parts.is_empty() {
+                            return Ok(format!("set {name} \"\""));
+                        }
+                        let val =
+                            word_to_fish(&IrExpr::Interpolate(value_parts))?;
+                        return Ok(format!("set {name} {val}"));
+                    }
+                }
+            }
+        }
+    }
+    // `printf -v NAME fmt args` — bash's assign-to-variable form. fish has NO
+    // `-v` flag, so the verbatim emit left `printf` complaining and `NAME`
+    // unset (`printf-format-and-v` printed `-vname=` where bash printed
+    // `name=foo-bar`). The value is exactly what the same `printf` would have
+    // written, so it lowers to a command substitution.
+    if cmd_name == Some("printf") {
+        if let Some(IrExpr::Str(f, _)) = args.first() {
+            if f == "-v" {
+                if let Some(name) = args.get(1).and_then(|a| match a {
+                    IrExpr::Str(n, _) => Some(n.clone()),
+                    _ => None,
+                }) {
+                    let mut inner = String::from("printf");
+                    for a in &args[2..] {
+                        inner.push(' ');
+                        inner.push_str(&word_to_fish(a)?);
+                    }
+                    return Ok(format!("set {name} ({inner} | string collect)"));
+                }
+            }
+        }
+        // `printf %q` — bash's shell-quoting conversion, which fish's printf
+        // rejects outright ("%q: invalid conversion specification"), so the
+        // whole statement failed and the value vanished. fish's `string
+        // escape` is the same idea; it is spelled as a separate command.
+        if let Some(IrExpr::Str(f, _)) = args.first() {
+            if f.contains("%q") {
+                let rest: Vec<String> = args[1..]
+                    .iter()
+                    .map(word_to_fish)
+                    .collect::<Result<_, _>>()?;
+                // `%q` in a larger format is rare and not lowered — only the
+                // bare `printf '%q' VAL` shape is rewritten.
+                if f.trim() == "%q" && rest.len() == 1 {
+                    return Ok(format!("string escape -- {}", rest[0]));
+                }
+            }
+        }
+    }
     // `test A -ef B` as a COMMAND — the `[ ]`/condition form goes through
     // `samefile_guard_fish`, but a plain `test` invocation is rendered as an
     // ordinary command and would carry fish's wrong answer with it. Only the
@@ -3321,6 +3833,31 @@ fn exec_line_to_fish(
     // function-scoping of `local` is already provided by fish's function-local
     // `set`, so no scope helper is needed.
     if matches!(cmd_name, Some("declare" | "typeset" | "local" | "readonly")) {
+        // `local x` is a DECLARATION: it emits `set -l` for the name, and the
+        // later writes in the same body are plain `set` (see set_prefix_for).
+        let is_local_decl = matches!(cmd_name, Some("local" | "declare" | "typeset"));
+        if is_local_decl {
+            let mut decls = LOCAL_VARS.lock().unwrap();
+            for a in args {
+                let push = |d: &mut HashSet<String>, t: &str| {
+                    let n = t.split('=').next().unwrap_or("");
+                    if is_plain_var(n) {
+                        d.insert(n.to_string());
+                    }
+                };
+                match a {
+                    IrExpr::Str(t, _) => push(&mut decls, t),
+                    IrExpr::Array(items) => {
+                        for it in items {
+                            if let IrExpr::Str(t, _) = it {
+                                push(&mut decls, t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut flags: Vec<String> = Vec::new();
         let mut stmts: Vec<String> = Vec::new();
         // names declared WITHOUT a value (`declare -A map`) — real
@@ -3346,7 +3883,14 @@ fn exec_line_to_fish(
                         };
                         if takes_next {
                             let nv = word_to_fish(&args[i + 1])?;
-                            pending = Some(format!("set {name} {nv}"));
+                            pending = Some(format!(
+                                "{}{name} {nv}",
+                                if is_local_decl {
+                                    decl_prefix_for(name)
+                                } else {
+                                    set_prefix()
+                                }
+                            ));
                             i += 2;
                             continue;
                         }
@@ -3366,7 +3910,14 @@ fn exec_line_to_fish(
                     } else {
                         word_to_fish(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))?
                     };
-                    stmts.push(format!("set {name} {nv}"));
+                    stmts.push(format!(
+                        "{}{name} {nv}",
+                        if is_local_decl {
+                            decl_prefix_for(name)
+                        } else {
+                            set_prefix()
+                        }
+                    ));
                 }
                 IrExpr::Str(s, _) if s.is_empty() => {}
                 // A bare NAME after the flags is a declaration of that name
@@ -4614,6 +5165,31 @@ fn dynamic_el_read_fish(base: &str, key: &str) -> String {
         !bare.is_empty() && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if simple {
         format!("(set -l _nk {base}_\"${bare}\"; printf '%s\\n' \"$$_nk\")")
+    } else if normalised.contains(',') {
+        // A COMPOSITE key — `matrix[$i,$j]` (058's 2-D associative matrix).
+        // bash's subscript is a STRING here (`"$i,$j"`), and the write side
+        // already sanitized the literal `0,0` key to `matrix_0_0`, so the read
+        // must join the components with `_` the same way. Evaluating the text
+        // as arithmetic instead made `math --scale 0 "$i,$j"` hit the comma
+        // OPERATOR and abort ("Too many arguments"), so every read was empty.
+        let comps: Vec<String> = normalised
+            .split(',')
+            .map(|c| {
+                let c = c.trim();
+                if let Some(name) = c.strip_prefix('$') {
+                    if is_plain_var(name) {
+                        return format!("${name}");
+                    }
+                }
+                dq_word(c)
+            })
+            .collect();
+        // Adjacent quoted segments concatenate into ONE word; the enclosing
+        // `"$_nk"` indirection then resolves the composed element name.
+        let composed = comps.join("\"_\"");
+        format!(
+            "(set -l _nk {base}_\"{composed}\"; printf '%s\\n' \"$$_nk\")"
+        )
     } else {
         format!(
             "(set -l _nk {base}_(math --scale 0 \"{}\"); printf '%s\\n' \"$$_nk\")",
@@ -4834,8 +5410,14 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
             // `$#` lowers to `(count $argv)`, a fish command substitution
             // that is already ONE word. Wrapping it in `"…"` would print the
             // literal text `(count a b)`. Every other variable expands to a
-            // value, which does need the quotes.
-            if r == COUNT_ARGV_FISH {
+            // value, which does need the quotes — EXCEPT the substitutions
+            // that stand in for variables fish has no name for: `$0` renders
+            // `(set -q SH2_ARGV0; and printf …; or status filename)` and
+            // `$RANDOM` renders an awk pipeline. Inside double quotes fish
+            // prints a bare `( … )` as LITERAL TEXT, so quoting those made
+            // `dirname "$0"` compute the dirname of the text `(set -q …)`
+            // (qx-var-builtin-cd printed empty instead of the script dir).
+            if r == COUNT_ARGV_FISH || is_fish_substitution(&r) {
                 return Ok(r);
             }
             Ok(format!("\"{r}\""))
@@ -5068,10 +5650,22 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
     if name == "#" {
         return COUNT_ARGV_FISH.into();
     }
-    // `$!` (last background pid) and `$-` have no fish spelling at all and
-    // are a parse error; emit an empty expansion so the file still reads.
-    if name == "!" || name == "-" {
+    // `$!` (last background pid) has no fish spelling at all and is a parse
+    // error; emit an empty expansion so the file still reads.
+    if name == "!" {
         return "\"\"".into();
+    }
+    // `$-` (the shell option flags) — a PARSE ERROR in fish, so the old empty
+    // expansion kept the file readable but printed `options: ` where bash
+    // prints `options: hB` (dollar-minus.sh). The reference the gate compares
+    // against is `bash <file>`, i.e. a non-interactive script, where bash's
+    // letters are exactly `h` (hashall) and `B` (braceexpand) — `$0`-based
+    // self-location and `-c` are the only things that add letters, and the
+    // gate runs neither. Every sibling backend (c/go/java/python/rust/sh/zig)
+    // pins the same literal for the same reason, so this is the settled
+    // answer, not a fish-specific guess.
+    if name == "-" {
+        return "\"hB\"".into();
     }
     // `$$` — the core lexes the pid as a bare `$` name (`getVar("$")`), and
     // `$` alone in the generic branch below would render the literal `$$`,
@@ -5097,6 +5691,22 @@ fn var_ref_to_fish(name: &str, list: bool) -> String {
     if let Ok(n) = name.parse::<usize>() {
         if n >= 1 {
             return format!("$argv[{n}]");
+        }
+        // `$0` — the script's own path. fish has no `$0` at all (it is the
+        // EMPTY variable, and a bare `$0` prints nothing), which silently
+        // broke every usage line: 057_case printed "Usage:  {start|stop}"
+        // where bash printed the path.
+        //
+        // `status filename` is fish's own answer and matches bash's `$0`
+        // whenever fish is handed the same path string bash was (verified:
+        // relative stays relative, absolute stays absolute) — so it is the
+        // default. The harness runs the RENDER from a scratch file, though, so
+        // a runner that knows the original path exports `SH2_ARGV0` and the
+        // render prefers it, keeping `dirname "$0"` self-location (the
+        // qx-var-builtin-cd / 057_case class) truthful on BOTH sides.
+        if n == 0 {
+            return "(set -q SH2_ARGV0; and printf '%s' \"$SH2_ARGV0\"; or status filename)"
+                .into();
         }
     }
     if list {
@@ -5443,7 +6053,8 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // same emptiness test `test -n` performs for a scalar.
             if name == "@" || name == "*" {
                 return Ok(format!(
-                    "(test (count $argv) -gt 0; and printf '%s' \"$argv\"; or printf '%s' {default})"
+                    "(test (count $argv) -gt 0; and printf '%s' \"$argv\"; or printf '%s' {})",
+                    dq_word(&default)
                 ));
             }
             // fish has no `${x:-d}`. `test -n` is false for BOTH an unset and
@@ -5692,7 +6303,10 @@ fn default_if_unset_fish(name: &str, default: &str) -> String {
 /// characters, so `var_ref_to_fish` fell through to its identifier-only
 /// fallback and emitted the unrelated `$arr1`, which is unset.
 fn default_if_unset_expr_fish(subj: &str, default: &str) -> String {
-    format!("(test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {default})")
+    format!(
+        "(test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {})",
+        dq_word(default)
+    )
 }
 
 /// The `${arr+w}` / `${arr:+w}` guard for an ARRAY subject.
@@ -6359,7 +6973,12 @@ fn special_param_to_fish(b: &[char], i: usize, out: &mut String) -> Option<usize
         }
         // `$1` … `$9` — fish has no positional shorthand; `$argv[N]`.
         d if d.is_ascii_digit() => {
-            out.push_str(&format!("$argv[{d}]"));
+            // `$0` is the script path, not a positional — see `var_ref_to_fish`.
+            if d == '0' {
+                out.push_str("(set -q SH2_ARGV0; and printf '%s' \"$SH2_ARGV0\"; or status filename)");
+            } else {
+                out.push_str(&format!("$argv[{d}]"));
+            }
             Some(next + 1)
         }
         _ => None,
@@ -6477,6 +7096,35 @@ fn dq_subst(s: String, dq: bool) -> String {
     format!("$({})", &s[1..s.len() - 1])
 }
 
+/// Quote an operand so `printf '%s' <operand>` produces exactly ZERO or ONE
+/// word — never the newline that a zero-word `printf '%s'` emits on its own.
+///
+/// This is the `${x:-${y:-…}}` chain bug: the inner default is an UNSET
+/// variable, so the unquoted `printf '%s' $inner` received no argument and
+/// still wrote a newline — and fish's command substitution splits on newlines,
+/// so the enclosing `echo ( … )` gained a spurious EMPTY element and printed a
+/// blank line bash never printed (063_hard_to_parse: one blank line too many
+/// after "computed"). Double-quoting pins the operand to one word whatever its
+/// contents (empty ⇒ the empty string, which prints nothing).
+fn dq_word(s: &str) -> String {
+    // A command substitution is ALREADY one word and must stay BARE — fish
+    // prints `( … )` inside double quotes as literal text, so quoting it here
+    // turned `${x:-$(echo computed)}` into the visible string `computed`
+    // (063_hard_to_parse).
+    if is_fish_substitution(s) {
+        return s.to_string();
+    }
+    // The operand frequently arrives ALREADY quoted — `"${x:-"default"}"`,
+    // `${@:-"default"}` — so re-quoting it would embed the quote characters
+    // in the value (`"default"` printed WITH the quotes, at-var-default /
+    // parse-variable-default-with-quotes). Unwrap one layer first, then emit
+    // the single quoted word. Unwrapping is safe for the corpus's operands:
+    // they are literals, expansions, or substitutions, all of which the outer
+    // double quotes here re-protect.
+    let inner = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(s);
+    format!("\"{}\"", inner.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// `${name}` / `${name:-d}` / `${name-d}` / `${name:?w}` / `${#name}` → a
 /// native fish expansion of the same value.
 fn braced_to_fish(inner: &[char], dq: bool) -> String {
@@ -6536,19 +7184,39 @@ fn braced_to_fish(inner: &[char], dq: bool) -> String {
                         // `-s`, which is fish's non-empty-FILE test — is the
                         // trigger: false for an unset AND for an empty variable,
                         // exactly bash's `:-` condition.
-                        ":-" | "-" => {
+                        ":-" => {
                             if dflt.is_empty() {
                                 format!("${name}")
                             } else {
-                                format!("(test -n \"${name}\"; and printf '%s' \"${name}\"; or printf '%s' {dflt})")
+                                format!("(test -n \"${name}\"; and printf '%s' \"${name}\"; or printf '%s' {})", dq_word(&dflt))
                             }
                         }
-                        ":+" | "+" => {
-                            format!("(test -n \"${name}\"; and printf '%s' {dflt}; or printf '')")
+                        // `${x-d}` (NO colon) triggers only when `x` is UNSET —
+                        // a set-but-empty variable yields the empty value, not
+                        // the default. `test -n` is the wrong trigger: it would
+                        // fall to the default on `x=""` too. fish's `set -q`
+                        // is the exact test (bash `-` ⇔ fish `set -q`).
+                        "-" => {
+                            if dflt.is_empty() {
+                                format!("${name}")
+                            } else {
+                                format!("(set -q {name}; and printf '%s' \"${name}\"; or printf '%s' {})", dq_word(&dflt))
+                            }
+                        }
+                        ":+" => {
+                            format!("(test -n \"${name}\"; and printf '%s' {}; or printf '')", dq_word(&dflt))
+                        }
+                        // `+` (no colon) — set (even empty) means the alternate.
+                        "+" => {
+                            format!("(set -q {name}; and printf '%s' {}; or printf '')", dq_word(&dflt))
                         }
                         // `:?` / `?` abort with a message when unset/empty.
-                        _ => format!(
+                        ":?" => format!(
                             "(test -n \"${name}\"; and printf '%s' \"${name}\"; or begin; printf '%s' {dflt} >&2; exit 1; end)"
+                        ),
+                        // `?` (no colon) aborts only when UNSET.
+                        _ => format!(
+                            "(set -q {name}; and printf '%s' \"${name}\"; or begin; printf '%s' {dflt} >&2; exit 1; end)"
                         ),
                     },
                     dq,
@@ -7184,11 +7852,27 @@ fn arith_rewrite(t: &str) -> String {
                 }
                 let name = &t[i + 2..j];
                 let inc = if c == '+' { "+ 1" } else { "- 1" };
-                out.push_str(&format!("({name} = {name} {inc})"));
+                // `++name` / `--name` (PREFIX): yields the NEW value and
+                // mutates. fish's `math` has NO assignment, so the mutation
+                // and the value are spelled as a command substitution that
+                // runs in the SAME scope (a fish `( … )` substitution shares
+                // the enclosing scope, unlike a subshell). `echo` is fish's
+                // `printf` here — inside a `math "…"` string the `$`-form is
+                // what expands, and the inner `math` supplies the arithmetic.
+                //
+                // The previous `(name = name + 1)` was "Unknown function" to
+                // `math`, so the whole expression produced NOTHING: 078's
+                // `j = i++ + ++i` printed `j=` where bash printed 6.
+                let v = format!("{name}__sh2v");
+                out.push_str(&format!(
+                    "$(set -g {v} (math --scale 0 ${name} {inc}); set -g {name} ${v}; printf %s ${v})"
+                ));
                 i = j;
                 continue;
             }
         }
+        // `name++` / `name--` (POSTFIX) is handled by the identifier arm below
+        // (which owns the emitted `$name` text it must replace), not here.
         if c == '*' && i + 1 < b.len() && b[i + 1] == b'*' {
             // literal power `A ** B` — fold
             let mut s = i;
@@ -7270,6 +7954,23 @@ fn arith_rewrite(t: &str) -> String {
         // values to 0, dash errors); assignment LHS stays bare (`x` in
         // `x = y` is a write target); a postfix ++/-- rewrites first
         // (the name must stay plain there).
+        //
+        // A POSITIONAL parameter (`$1`, `$2`, …) in arithmetic text has no
+        // fish shorthand: fish parses `$1` as the empty variable (positionals
+        // are `$argv[N]`), so `math --scale 0 "$1 * 100 + $2"` collapsed to
+        // just the operands that WERE present — `parse-dollar-in-arithmetic`
+        // printed `0` instead of `500`. `$argv[N]` interpolates as a number
+        // into the math string, which is the same value bash reads.
+        if c == b'$' as char && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n = &t[i + 1..j];
+            out.push_str(&format!("$argv[{n}]"));
+            i = j;
+            continue;
+        }
         // A leading `$` on the identifier (e.g. `$n` in arithmetic) is
         // the shell variable sigil - consume it so the cmdsub below
         // is the only `$`-bearing form (avoids `$$( _num "n" )`).
@@ -7311,12 +8012,25 @@ fn arith_rewrite(t: &str) -> String {
                 }
             }
             if j + 1 < b.len() && (b[j] == b'+' || b[j] == b'-') && b[j + 1] == b[j] {
-                let (inc, dec) = if b[j] == b'+' {
-                    ("+ 1", "- 1")
-                } else {
-                    ("- 1", "+ 1")
-                };
-                out.push_str(&format!("(({name} = {name} {inc}) {dec})"));
+                let inc = if b[j] == b'+' { "+ 1" } else { "- 1" };
+                // POSTFIX `name++` / `name--`: yields the OLD value, then
+                // mutates. fish's `math` has NO assignment operator, so the
+                // old `(({name} = {name} + 1) - 1)` was "Unknown function" to
+                // `math` and the whole expression produced NOTHING — 078's
+                // `j = i++ + ++i` printed `j=`. A fish `( … )` substitution
+                // shares the enclosing scope, so the save/mutate/echo triple
+                // both yields the old value and leaves the variable updated.
+                // The read already emitted for `name` is replaced — but only
+                // when it WAS emitted (the name is rendered by the branches
+                // BELOW this one, so a bare postfix can reach here with
+                // nothing to remove; truncating unconditionally panicked).
+                if out.ends_with(&format!("${name}")) {
+                    out.truncate(out.len() - name.len() - 1);
+                }
+                let v = format!("{name}__sh2v");
+                out.push_str(&format!(
+                    "$(set -g {v} ${name}; set -g {name} (math --scale 0 ${name} {inc}); printf %s ${v})"
+                ));
                 i = j + 2;
                 continue;
             }
@@ -7673,10 +8387,14 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // discards the value and needs no substitution.
             let inc = if *delta > 0 { 1 } else { -1 };
             let v = format!("{var}__sh2v");
+            // The inner `math` argument is UNQUOTED (adjacent words are one
+            // math expression): this substitution is routinely spliced INTO an
+            // enclosing `math "…"` string, where a nested `"` would close the
+            // outer string early and the expression would vanish.
             if *prefix {
-                format!("(set -g {v} (math --scale 0 \"${var} + {inc}\"); set -g {var} ${v}; echo ${v})")
+                format!("(set -g {v} (math --scale 0 ${var} + {inc}); set -g {var} ${v}; echo ${v})")
             } else {
-                format!("(set -g {v} ${var}; set -g {var} (math --scale 0 \"${var} + {inc}\"); echo ${v})")
+                format!("(set -g {v} ${var}; set -g {var} (math --scale 0 ${var} + {inc}); echo ${v})")
             }
         }
         // C-frontend nodes (never emitted by the shell path): sizeof is a
@@ -7722,6 +8440,36 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
         out.push(stmt_inline(s)?);
     }
     Ok(out.join("; "))
+}
+
+/// A pipeline rendered as ONE fish line.
+///
+/// A stage that lowers to MORE THAN ONE statement must be GROUPED. The core's
+/// process-substitution transform expands `grep -f <(echo …)` into
+/// `__ps_tmp0=$(mktemp); …; grep -f $__ps_tmp0`, and fish splits `a | b; c` as
+/// `(a | b); c` — so an ungrouped stage left the consumer grep with no
+/// pipeline stdin and it printed NOTHING (019_grep_regex lost the
+/// `error`/`warning` lines, 064_09 the mail/list buckets). `begin … end` is
+/// fish's grouping construct and is legal as a pipeline stage, so setup and
+/// command become one pipe element.
+fn pipeline_line(stages: &[Vec<IrStmt>]) -> Result<String, String> {
+    let mut line = String::new();
+    for (i, stg) in stages.iter().enumerate() {
+        if i > 0 {
+            line.push_str(" | ");
+        }
+        let body = stmts_inline(stg)?;
+        // Group when the stage is multi-statement EITHER structurally (several
+        // IR statements) or textually — a single statement whose lowering
+        // emits its own `; ` sequence (the process-substitution transform's
+        // `grep -f <(…)` shape).
+        if stg.len() > 1 || has_top_level_separator(&body) {
+            line.push_str(&format!("begin; {body}; end"));
+        } else {
+            line.push_str(&body);
+        }
+    }
+    Ok(line)
 }
 
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
@@ -7904,13 +8652,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             capture,
             ..
         } => {
-            let mut line = String::new();
-            for (i, stg) in stages.iter().enumerate() {
-                if i > 0 {
-                    line.push_str(" | ");
-                }
-                line.push_str(&stmts_inline(stg)?);
-            }
+            let line = pipeline_line(stages)?;
             if let Some(var) = capture {
                 Ok(format!("set {var} ({line} | string collect)"))
             } else {
