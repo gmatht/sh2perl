@@ -4959,7 +4959,16 @@ fn render_param(args: &[IrExpr]) -> String {
 
 /// Build a bash command string from an exec's (cmd, words) for shell-out.
 fn build_shell_cmd(cmd: &str, words: &[&IrExpr]) -> String {
-    let mut parts: Vec<String> = vec![bash_quote_word(cmd)];
+    // A command NAME that is a shell EXPANSION (`$CMD`, `"$CMD"`, `${C:-d}`)
+    // must reach bash unquoted — single-quoting it made bash run a command
+    // literally named `$CMD` ("${INTERPRETER_UNDER_TEST}: command not
+    // found", heredoc-binary-data). Only a literal name is quoted.
+    let cmd_part = if cmd.contains('$') || cmd.starts_with('"') {
+        cmd.to_string()
+    } else {
+        bash_quote_word(cmd)
+    };
+    let mut parts: Vec<String> = vec![cmd_part];
     for w in words {
         parts.push(bash_word_for(w));
     }
@@ -5394,6 +5403,14 @@ fn bash_word_for(w: &IrExpr) -> String {
                 _ => format!("\"${{{}}}\"", n),
             }
         }
+        // `param("", NAME)` / `param(":-", NAME, D)` — a parameter EXPANSION
+        // whose value bash must resolve itself. `render_word` emits Perl
+        // (`$ENV{NAME}`, `(defined($x) && length($x)) ? …`), and pasting
+        // that into the rebuilt text produced the literal word
+        // `$ENV{INTERPRETER_UNDER_TEST}` — a "command not found" exec
+        // (heredoc-binary-data). Keep the NATIVE shell form; the export
+        // prelude puts the value in the child's environment.
+        IrExpr::Call { func, args } if func == "param" => bash_param_syntax(args),
         IrExpr::Str(s, _) => {
             if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
                 // Shell glob — emit unquoted so bash -c expands it.
@@ -6142,7 +6159,23 @@ pub(crate) fn static_word_text(w: &IrExpr) -> Option<String> {
 }
 
 fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
-    let cmd = call_arg_str(args.first()?)?;
+    // The command NAME is usually a literal, but it can be a parameter
+    // expansion — `"$INTERPRETER" -E -` arrives as
+    // `exec(param("", "INTERPRETER"), ["-E", "-"])`. `call_arg_str` returns
+    // None for a Call, so the whole rebuild failed and the enclosing
+    // Redirect fell through to the "not yet supported (redirect)" die
+    // (heredoc-binary-data printed nothing but that message).
+    let first = args.first()?;
+    let cmd = match call_arg_str(first) {
+        Some(c) => c,
+        // SHELL text, not Perl: the rebuilt command goes to `bash -c` (or
+        // through `__sh_q`), where `$ENV{NAME}` is a literal-word exec
+        // ("$ENV{INTERPRETER_UNDER_TEST}: command not found").
+        None => bash_word_for(first),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
     Some((cmd, exec_word_args(args)))
 }
 
@@ -12340,6 +12373,13 @@ fn is_shell_builtin(cmd: &str) -> bool {
             | "let"
             | "getopts"
             | "hash"
+            // `command` is a builtin: `command -v NAME` LOOKS UP a name in
+            // PATH, it does not execute anything. Sending it to the uu-ffi
+            // argv seam tried to exec a binary literally named `command`
+            // ("Can't exec "command": No such file or directory"), so
+            // heredoc-binary-data's `command -v "${1:-python3}"` produced an
+            // empty capture and the script took its "no interpreter" branch.
+            | "command"
             | "type"
             | "ulimit"
             | "umask"
@@ -12354,7 +12394,46 @@ fn is_shell_builtin(cmd: &str) -> bool {
 /// `__sh_uu_capture` expression. The shell-out lives in the stripped
 /// preamble; the in-process coreutils `.so` handles the supported set.
 /// Word-splitting and glob words keep the shell-text path.
+/// `command -v NAME` as a Perl expression: the first NAME found on `$PATH`
+/// (regular file and executable), or the empty string. Mirrors bash's
+/// builtin, which prints the resolved path, or nothing when it is not found.
+///
+/// The lookup happens at RUNTIME, so a dynamic NAME works — which a
+/// `bash -c` shell-out cannot do, because the child sees none of the
+/// caller's variables or positional parameters.
+fn command_v_capture_expr(e: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let (cmd, words) = exec_call_parts(args)?;
+    if cmd != "command" {
+        return None;
+    }
+    match words.as_slice() {
+        [IrExpr::Str(flag, _), name] if flag == "-v" => {
+            let n = render_word(name);
+            Some(format!(
+                "(do {{ my $__n = {n}; my $__p = ''; for my $__d (split(/:/, ($ENV{{PATH}} // ''))) {{ next if $__d eq ''; my $__c = \"$__d/$__n\"; if (-f $__c && -x $__c) {{ $__p = $__c; last }} }} $__p }})"
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn capture_uu_expr(e: &IrExpr) -> Option<String> {
+    // `command -v NAME` is a PATH LOOKUP that prints NAME's resolution (or
+    // nothing). It is a shell builtin, so the argv seam refuses it — and a
+    // shell-out cannot express it either once NAME is dynamic, because the
+    // `bash -c` child has none of the caller's positional parameters
+    // (`heredoc-binary-data`'s `command -v "${1:-python3}"` reached bash as
+    // the literal `${1:-python3}`, the capture came back empty, and the
+    // script took its "no interpreter" branch). Resolve it in Perl.
+    if let Some(v) = command_v_capture_expr(e) {
+        return Some(v);
+    }
     if !uu_seam_enabled() {
         return None;
     }
