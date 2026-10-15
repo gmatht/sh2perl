@@ -4014,6 +4014,23 @@ fn lower_exec_call(text: &str, at: usize, spawn: bool) -> Option<(String, usize)
 /// through the sink, and pins fd 0 to `inherit()` rather than consulting
 /// `__SH_STDIN`, so its result cannot depend on the enclosing redirect.
 fn lower_capture_call(text: &str, at: usize) -> Option<(String, usize)> {
+    // A literal `$(echo LIT)` is a compile-time constant: the substitution
+    // yields LIT and its status is 0, so no child is spawned. `cmd_argv`
+    // refuses `echo` (a shell builtin), so this fold is checked FIRST.
+    let (args, end0) = scan_paren(text, at)?;
+    // the argument is `&"…"` (the renderer's borrowed-literal form) or
+    // `&format!(…)`; `cmd_template` reads the former only after the `&`
+    let mut a = args.trim();
+    a = a.strip_prefix('&').unwrap_or(a).trim();
+    if let Some((lit, _)) = cmd_template(a) {
+        if let Some(text) = literal_echo_cmdsub(&lit) {
+            // the call's contract is `(String, i32)`
+            return Some((
+                format!("({}, 0)", Render::rust_str_expr(&text)),
+                end0,
+            ));
+        }
+    }
     let (chain, _, end) = cmd_argv(text, at, false)?;
     Some((native_capture_expr(&chain), end))
 }
@@ -5126,58 +5143,110 @@ fn prune_unused_helpers(text: String) -> String {
 /// rest of the file, so no reference can dangle. (Helper bodies are
 /// self-contained and only reach a static by name; user-var statics are
 /// only ever referenced by renderer-emitted reads/writes.)
-/// Drop the `as usize` on a NON-NEGATIVE INTEGER LITERAL index.
+/// Drop a numeric cast on a NON-NEGATIVE INTEGER LITERAL.
 ///
-/// The renderer emits an array/`PIPESTATUS` read and an index-array store with
-/// the key cast unconditionally — `v.borrow().get({key} as usize)` and
-/// `let i: usize = {key} as usize;`. When the key is a compile-time constant
-/// that cast is pure noise: `0`/`1` are integer literals, and every one of
-/// these positions is a `usize` one (`get`'s argument, a `[i]` index, the
-/// `resize` count), so Rust infers the type without the cast — the same output
-/// with the token removed.
+/// Every one of these casts is pure noise: the position already fixes the
+/// type, so Rust infers it from the literal and the token can go.
 ///
-/// Only the two exact shapes the renderer emits are rewritten, and only for a
-/// BARE non-negative literal (`N`, no suffix, no sign, no expression): a
-/// computed index, a `-1`, or any other context keeps its cast. A `usize` that
-/// would be wrong there (a `i64`-typed binding) cannot occur — the binding in
-/// both shapes is the index expression itself.
-fn drop_literal_index_casts(text: &str) -> String {
+///   `v.borrow().get(0 as usize)`      → `get(0)`
+///   `let i = 1 as usize;`             → `let i = 1;`
+///   `std::process::exit((1) as i32)`  → `exit(1)`
+///   `__SH_RC.store((0) as i32, …)`    → `store(0, …)`   (AtomicI32)
+///
+/// The renderer spells a computed value's narrowing cast explicitly (an index
+/// from an `i64` expression, a `char`'s codepoint, a parsed rc); only a
+/// LITERAL is always already the right type. So the rewrite fires on a bare
+/// non-negative integer literal — with or without the parentheses the renderer
+/// puts around an arith leaf — and on nothing else: a sign, a suffix
+/// (`0i64`), a variable, or a computed expression keeps its cast.
+///
+/// A NEGATIVE literal is refused deliberately: `(-1) as usize` is `usize::MAX`
+/// in Rust, and dropping the cast would change the value (and not compile).
+fn drop_literal_num_casts(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let b = text.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
-        // `(` or `= ` immediately before `N as usize` sets the usize context;
-        // we simply look for the literal-cast shape and check what precedes it.
+        // Recognize `N as T` / `(N) as T` for a bare non-negative literal N.
+        // `paren` records whether the digits came wrapped in `(` `)`, and
+        // `call_paren` whether that `(` actually opens a CALL (so the parens
+        // must be preserved).
+        let mut lit_start = 0usize;
+        let mut lit_end = 0usize;
+        let mut paren = false;
+        let mut matched = false;
         if b[i].is_ascii_digit() {
-            // scan the literal
-            let start = i;
             let mut j = i;
             while j < b.len() && b[j].is_ascii_digit() {
                 j += 1;
             }
-            if s_starts_at(text, j, " as usize") {
-                // the char before the literal must not be part of a longer
-                // token (a suffix `0i64 as usize`, an identifier `a0 as usize`,
-                // or a `-` sign) — a bare literal only
-                let prev_ok = start == 0
-                    || !(b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_' || b[start - 1] == b'-');
-                // and the char after the cast must end the token
-                let after = j + " as usize".len();
-                let next_ok = after >= b.len()
-                    || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
-                if prev_ok && next_ok {
-                    out.push_str(&text[start..j]);
-                    i = after;
-                    continue;
-                }
+            lit_start = i;
+            lit_end = j;
+            matched = true;
+        } else if b[i] == b'(' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
             }
-            out.push_str(&text[start..j]);
-            i = j;
+            if b.get(j) == Some(&b')') {
+                lit_start = i + 1;
+                lit_end = j;
+                paren = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            let ch = text[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
             continue;
         }
-        let ch = text[i..].chars().next().unwrap_or('\0');
-        out.push(ch);
-        i += ch.len_utf8();
+        // A preceding `-` makes the literal negative: `(-1) as usize` is
+        // `usize::MAX` and must keep its cast. A preceding identifier char
+        // means this `(` opens a CALL (`unwrap_or(0) as usize`) — its parens
+        // must be preserved or the rewrite fuses them into the callee's name.
+        // For the parenthesised form the `(` is at `lit_start - 1`, so the
+        // character that decides whether these parens are a CALL's lives one
+        // further left again.
+        let before_group = if paren {
+            if lit_start >= 2 { Some(b[lit_start - 2]) } else { None }
+        } else if lit_start > 0 {
+            Some(b[lit_start - 1])
+        } else {
+            None
+        };
+        let neg = text[..lit_start].trim_end().ends_with('-');
+        let call_paren = paren
+            && matches!(before_group,
+                Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b')' || c == b']');
+        let after = if paren { lit_end + 1 } else { lit_end };
+        let mut k = after;
+        while k < b.len() && b[k] == b' ' {
+            k += 1;
+        }
+        let mut dropped = false;
+        for ty in ["usize", "i32", "u32", "i64", "u64"] {
+            if !(s_starts_at(text, k, "as ") && s_starts_at(text, k + 3, ty)) {
+                continue;
+            }
+            let e = k + 3 + ty.len();
+            let tail_ok = e >= b.len() || !(b[e].is_ascii_alphanumeric() || b[e] == b'_');
+            let head_ok = lit_start == 0
+                || !(b[lit_start - 1].is_ascii_alphanumeric() || b[lit_start - 1] == b'_');
+            if tail_ok && head_ok && !neg && !call_paren {
+                out.push_str(&text[lit_start..lit_end]);
+                i = e;
+                dropped = true;
+            }
+            break;
+        }
+        if dropped {
+            continue;
+        }
+        // not our shape — copy the literal (and its parens) and move on
+        let copy_end = if paren { lit_end + 1 } else { lit_end };
+        out.push_str(&text[i..copy_end]);
+        i = copy_end;
     }
     out
 }
@@ -5585,7 +5654,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     let text = drop_dead_trap_calls(&text);
     // A compile-time constant index needs no `as usize` — the position is a
     // usize one, so the literal infers without the cast.
-    let text = drop_literal_index_casts(&text);
+    let text = drop_literal_num_casts(&text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -25401,6 +25470,53 @@ mod tests {
         assert!(super::literal_echo_cmdsub("echo *").is_none());
         assert!(super::literal_echo_cmdsub("echo -e a").is_none());
         assert!(super::literal_echo_cmdsub("printf a").is_none());
+    }
+
+    /// A cast on a bare NON-NEGATIVE integer literal never changes the value:
+    /// the position already fixes the type, so Rust infers it. Regression pin
+    /// (2026-10-15): an earlier form of this pass also matched a CALL's paren
+    /// (`unwrap_or(0) as usize`), which it rewrote to `unwrap_or0` (E0609).
+    #[test]
+    fn literal_casts_are_dropped() {
+        assert_eq!(
+            super::drop_literal_num_casts("std::process::exit((1) as i32)"),
+            "std::process::exit(1)"
+        );
+        assert_eq!(
+            super::drop_literal_num_casts("let i = 0 as usize; if b.len() <= i {}"),
+            "let i = 0; if b.len() <= i {}"
+        );
+        assert_eq!(
+            super::drop_literal_num_casts("__SH_RC.store((2) as i32, Ordering::SeqCst)"),
+            "__SH_RC.store(2, Ordering::SeqCst)"
+        );
+        // A CALL's paren is not a literal's grouping: `x.unwrap_or(0)` is an
+        // EXPRESSION of the callee's type, so its `as usize` is a real
+        // conversion and must stay — an earlier form of this pass matched the
+        // call's paren and rewrote it to `x.unwrap_or0` (E0609).
+        assert_eq!(
+            super::drop_literal_num_casts("x.unwrap_or(0) as usize"),
+            "x.unwrap_or(0) as usize"
+        );
+        assert_eq!(
+            super::drop_literal_num_casts("f(1) as i64"),
+            "f(1) as i64"
+        );
+        // REFUSE > GUESS: a sign, a suffix, a variable, or a computed value
+        // keeps its cast (a negative literal cast to usize is `usize::MAX`)
+        assert_eq!(
+            super::drop_literal_num_casts("(-1) as usize"),
+            "(-1) as usize"
+        );
+        assert_eq!(
+            super::drop_literal_num_casts("0i64 as usize"),
+            "0i64 as usize"
+        );
+        assert_eq!(super::drop_literal_num_casts("n as usize"), "n as usize");
+        assert_eq!(
+            super::drop_literal_num_casts("(a + b) as i32"),
+            "(a + b) as i32"
+        );
     }
 
     fn cat_peephole_shapes() {

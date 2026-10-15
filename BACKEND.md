@@ -26,8 +26,8 @@ renderer; `harness/backend_runtime_metric.sh` sends rust down its default arm
 (`$CLI --target rust`), which links the MAIN tree's `src/rust_backend.rs` and
 therefore reports a **different** renderer — never compare the two.
 
-Measured 2026-10-14 (this worktree, 560 files): **3732 → 3577 tokens**
-(772 → 711 fn definitions), and `as`-casts **327 → 316**. The corpus gate is
+Measured 2026-10-15 (this worktree, 560 files): **3732 → 3562 tokens**
+(772 → 705 fn definitions), and `as`-casts **327 → 283**. The corpus gate is
 **PASS=645 SKIP=7 FAIL=0** — fully green; the one red file it started with
 (`parse-redirect-in-case-pattern.sh`) was a real miscompile and is now fixed
 (see item 4 below).
@@ -66,11 +66,25 @@ Callout classes retired, all in the textual post-pass chain in `shir_to_rust`:
    pattern that is exactly `$(echo LIT)` folds to the constant
    (`literal_echo_cmdsub`), so it spawns nothing.
    Pinned by `case_pattern_expansion_forms` / `literal_echo_cmdsub_folds`.
-5. **Redundant index casts.** `drop_literal_index_casts` removes `as usize`
-   from a BARE non-negative integer-literal index (`get(0 as usize)` →
-   `get(0)`, `let i = 1 as usize` → `let i = 1`). Both positions are `usize`
-   ones, so Rust infers the type; a computed index, a `-1`, or a suffixed
-   literal keeps its cast. 11 sites over 7 files.
+5. **Redundant literal casts.** `drop_literal_num_casts` removes the cast
+   from a BARE non-negative integer literal wherever a cast is only noise:
+   `get(0 as usize)` → `get(0)`, `let i = 1 as usize` → `let i = 1`,
+   `std::process::exit((1) as i32)` → `exit(1)`,
+   `__SH_RC.store((0) as i32, …)` → `store(0, …)` (AtomicI32's `store` takes
+   i32, `exit` takes i32 — every one of these positions already fixes the
+   type). 44 sites over ~37 files.
+   REFUSE > GUESS, and the refusals are load-bearing: a `-` sign
+   (`(-1) as usize` is `usize::MAX`), a suffix (`0i64`), a variable, or a
+   computed expression keeps its cast; and a `(` that opens a **CALL** is not
+   a grouping paren — an earlier form of this pass matched the call's paren in
+   `x.unwrap_or(0) as usize` and rewrote it to `x.unwrap_or0` (E0609), because
+   the call's `(` was consumed while its text was not. `literal_casts_are_dropped`
+   pins both the folding and the refusals, including that E0609 shape.
+6. **A literal `$(echo LIT)` capture.** `lower_capture_call` folds a command
+   substitution whose body is a literal `echo` (and only that) to the constant
+   `(LIT, 0)` — the same fold item 4 applies to `case` patterns, here for
+   every `$( … )` site the statement-level passes cannot reach (a user
+   function body, a `[[ … ]]` condition). 15 sites.
 
 **Latent core bug found while fixing (4), not hit by the corpus:** an
 assignment whose ONLY use is a `$var` `case` pattern is dropped from the ShIR
