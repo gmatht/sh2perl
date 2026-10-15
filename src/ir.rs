@@ -5438,6 +5438,30 @@ fn var_exports_str(cmd: &str) -> String {
                     i += 2;
                     continue;
                 }
+                // `${name}` — the braced form. The bare-name matcher below
+                // cannot see it (`{` is not an identifier char), so a
+                // `"${d}"` operand was never exported and the `bash -c`
+                // child resolved it to the empty string
+                // (000__07_find_path_commands).
+                if chars[i + 1] == '{' {
+                    let rest: String = chars[i + 2..].iter().collect();
+                    if let Some(cap) = name_re.captures(&rest) {
+                        let name = cap[1].to_string();
+                        i += 2 + name.len();
+                        if name != "ENV"
+                            && !name.starts_with("__sh2_")
+                            && !name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_uppercase())
+                                .unwrap_or(false)
+                            && seen.insert(name.clone())
+                        {
+                            out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+                        }
+                        continue;
+                    }
+                }
                 let rest: String = chars[i + 1..].iter().collect();
                 if let Some(cap) = name_re.captures(&rest) {
                     let name = cap[1].to_string();
@@ -5468,7 +5492,20 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
     // run in-process — no `bash -c` (check_qx). The rebuilt text carries the
     // runtime values (`$n` inside the double-quoted words), not the Perl
     // names, so the var-export prelude is unnecessary here.
+    // The export prelude must come FIRST: the rebuilt text can carry a
+    // shell expansion (`"${d}"`) that the pipeline ABI passes through as a
+    // Perl single-quoted literal, so the CHILD resolves `${d}` against its
+    // own environment. Without the export the child sees it unset —
+    // `cd "${d}" && find . -name '*.sh'` ran `find` in the PARENT's cwd and
+    // 000__07_find_path_commands listed the workspace instead of the mktemp
+    // tree.
+    let exports = var_exports_str(cmd);
     if let Some(expr) = pipeline_value_cmd(cmd) {
+        for line in exports.lines() {
+            emit_indent(out, indent);
+            out.push_str(line);
+            out.push('\n');
+        }
         emit_indent(out, indent);
         out.push_str(&format!(
             "$main_exit_code = $CHILD_ERROR = __sh_pipe_run({}, \"pipefail\");\n",
@@ -5476,7 +5513,6 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
         ));
         return;
     }
-    let exports = var_exports_str(cmd);
     for line in exports.lines() {
         emit_indent(out, indent);
         out.push_str(line);
