@@ -1894,6 +1894,30 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     }
                     star_join_reads_ifs(n, out);
                 }
+            } else if matches!(
+                func.as_str(),
+                // The whole-array reductions and the sorted joins: every
+                // one of these READS the store entry for the name in
+                // args[0], spelled as a bare string literal. They were
+                // missing here, so the name looked unread and this pass
+                // dropped its `setArray` as a dead store — after which the
+                // surviving call read an empty store. Measured on the
+                // py-sh-go corpus: t92_max_min_sum.py printed `0` for all
+                // six `print(max/min/sum(...))` lines (and t93, t88 with
+                // it), because `xs = [3,1,4]` was deleted before the call
+                // that consumes it. The element-style reads below already
+                // had this treatment; the reductions were the gap.
+                "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin"
+            ) {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.push(n.clone());
+                    // `#name` is the param-style length spelling — the
+                    // store key is the bare name either way.
+                    let bare = n.trim_start_matches('#');
+                    if bare != n {
+                        out.push(bare.to_string());
+                    }
+                }
             } else if func == "arrayIndex"
                 || func == "addrVar"
                 || func == "derefGet"
