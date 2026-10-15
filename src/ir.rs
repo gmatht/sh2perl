@@ -6657,6 +6657,80 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             ));
             continue;
         }
+        // An `Output` (the native-statement transform's lowering of
+        // `echo LIT`) as a pipeline stage / redirect body: rebuild it as the
+        // shell `echo` it came from. Without this the block recursed into
+        // returned None and the enclosing redirect died
+        // (heredoc-unclosed: `( echo test ) <<EOF 2>&1 >/dev/null`).
+        //
+        // ONLY when a shell-out can preserve the redirect set: if the
+        // enclosing Redirect carries an fd-dup onto a NON-standard fd
+        // (`echo x >&3`), the dup lives in the parent's fd table and a fresh
+        // `bash -c` cannot see it — the shell path would run the command
+        // with fd 3 closed and report a failure the source does not have
+        // (parse-invalid-redirect printed "exit: 1" instead of "exit: 0").
+        // A plain block group `{ a; b; }` rebuilds as the same sequence.
+        // The native-statement transform turns `( echo test )`'s body into
+        // `Block([Output(…), Expr(exec true)])`, which has no shell spelling
+        // of its own unless the block is recursed into — without this the
+        // whole redirect fell through to the "not yet supported (redirect)"
+        // die (heredoc-unclosed).
+        if let IrStmt::Block(body) = s {
+            // A block that is ONLY `Output` statements is the
+            // native-statement transform's lowering of `echo LIT`
+            // (`echo` folds to an `Output` before rendering). It has no
+            // command text of its own, so rebuild it as the `echo` it came
+            // from. This shape is the BODY of a Subshell a heredoc
+            // redirects — `( echo test ) <<EOF` — and without it the
+            // enclosing Redirect fell through to the "not yet supported
+            // (redirect)" die (heredoc-unclosed). Scoped to a body of
+            // Outputs alone so a block that also holds real commands keeps
+            // the shell path unchanged.
+            let is_output_or_noop = |b: &IrStmt| {
+                matches!(b, IrStmt::Output { .. })
+                    || matches!(
+                        b,
+                        IrStmt::Expr(IrExpr::Call { func, args })
+                            if (func == "exec" || func == "builtin")
+                                && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "true" || s == ":")
+                    )
+            };
+            if !body.is_empty() && body.iter().all(|b| is_output_or_noop(b)) {
+                let mut cmds: Vec<String> = Vec::new();
+                for b in body {
+                    if let IrStmt::Output { value, newline, .. } = b {
+                        let word = bash_word_for(value);
+                        cmds.push(if *newline {
+                            format!("echo {word}")
+                        } else {
+                            format!("printf '%s' {word}")
+                        });
+                    }
+                }
+                parts.push(cmds.join("; "));
+                continue;
+            }
+            let inner_cmd = stmts_to_shell_cmd(body)?;
+            parts.push(inner_cmd);
+            continue;
+        }
+        if let IrStmt::Subshell(body) = s {
+            if !body.is_empty() && body.iter().all(|b| matches!(b, IrStmt::Output { .. })) {
+                let mut cmds: Vec<String> = Vec::new();
+                for b in body {
+                    if let IrStmt::Output { value, newline, .. } = b {
+                        let word = bash_word_for(value);
+                        cmds.push(if *newline {
+                            format!("echo {word}")
+                        } else {
+                            format!("printf '%s' {word}")
+                        });
+                    }
+                }
+                parts.push(format!("( {} )", cmds.join("; ")));
+                continue;
+            }
+        }
         if let IrStmt::Subshell(body) = s {
             // `( … )` as a pipeline stage: `(echo a; echo b) | cat` — the
             // subshell rebuilds as a parenthesized group.
