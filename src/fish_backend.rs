@@ -54,6 +54,17 @@ lazy_static::lazy_static! {
     /// function must therefore write them GLOBALLY, because the hoisted
     /// function is not lexically inside it any more.
     static ref NESTED_FN_READS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// `exec N>&M` fd dups — the emulated shell's fd table.
+    ///
+    /// bash's `exec 3>&1` makes fd 3 a PERSISTENT alias for stdout; fish has
+    /// no `exec` builtin, and a redirect on one fish command does not outlive
+    /// it (`echo test >&3 3>&1` works, but `: 3>&1` then `echo test >&3` is
+    /// "Bad file descriptor"). So the dup is recorded and every later `>&N`
+    /// is RESOLVED through the table to the ultimately-aliased fd, which makes
+    /// the dup's effect visible on each command that needs it. Same design as
+    /// the sh backend's fd_dups.
+    static ref FD_DUPS: std::sync::Mutex<std::collections::HashMap<i64, i64>> =
+        Default::default();
 }
 
 /// `set ` or `set -g ` — `-g` while inside a function body, so bash's global
@@ -224,17 +235,51 @@ fn body_read_names(st: &IrStmt, out: &mut HashSet<String>) {
 /// a block-local holding the parent's value (`set -l a $a`). Every later write
 /// inside the group updates that local, which is why this is one declaration
 /// per name rather than `-l` per write.
-fn emit_subshell_shadow(body: &[IrStmt], out: &mut String) {
+fn emit_subshell_shadow(body: &[IrStmt], out: &mut String) -> Vec<String> {
     let mut names = Vec::new();
     for n in subshell_assigned_names(body) {
         if !names.contains(&n) {
             names.push(n);
         }
     }
+    // ONE line per name, three effects, in this order:
+    //   1. save the outer value into `__sh2_sv_NAME` (a block-local, so it
+    //      cannot be disturbed by the group),
+    //   2. ERASE the outer binding so an `unset NAME` inside the group is
+    //      observable and cannot fall through to it,
+    //   3. rebind NAME as a block-local holding the saved value, so ordinary
+    //      writes inside the group update the copy.
+    for n in &names {
+        // The saved value must outlive the block, so it is GLOBAL (`-g`);
+        // a block-local `set -l` is gone by the time the restore runs, which
+        // left `a` unset for the following sibling subshell (049_local).
+        out.push_str(&format!(
+            "    set -g __sh2_sv_{n} ${n}; set -e {n}; set -l {n} $__sh2_sv_{n}\n"
+        ));
+    }
+    names
+}
+
+/// Restore the outer values after a subshell group.
+///
+/// A SHADOW alone is not enough when the group UNSETS a name: `set -l X $X`
+/// then `set -e X` erases the block-local, and the read falls through to the
+/// still-set GLOBAL — so `unset DEBUG` inside `( … )` leaked out of the group
+/// (064_20 printed `DEBUG=1` inside the group that had just unset it, where
+/// bash prints `unset`). Combined with the shadow, the outer binding is
+/// cleared for the group's duration and reinstated afterwards, which is the
+/// observable behaviour of a fork: the group sees a copy, the parent's copy is
+/// untouched.
+fn emit_subshell_restore(names: &[String], out: &mut String, d: usize) {
+    if names.is_empty() {
+        return;
+    }
+    // The restore is written BEFORE the block's `end` (so it runs inside the
+    // group, where the shadowed locals are still in scope) and as a GLOBAL
+    // `set -g`, which is what reinstates the parent's binding.
+    let pad = "    ".repeat(d);
     for n in names {
-        // A no-op when the name is unset (it declares an empty local, which is
-        // what bash's fork would have seen too).
-        out.push_str(&format!("    set -l {n} ${n}\n"));
+        out.push_str(&format!("{pad}set -g {n} $__sh2_sv_{n}; set -e __sh2_sv_{n}\n"));
     }
 }
 
@@ -267,6 +312,25 @@ fn subshell_assigned_names(body: &[IrStmt]) -> Vec<String> {
                 IrStmt::Declare { vars, .. } => {
                     for v in vars {
                         out.push(v.name.clone());
+                    }
+                }
+                // `unset NAME` also MUTATES the name, so a subshell must
+                // shadow it too — otherwise `set -e NAME` inside the group
+                // erases the enclosing shell's variable, which bash's fork
+                // would have protected (064_20: the outer DEBUG became empty).
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                    if let Some(IrExpr::Str(c, _)) = args.first() {
+                        if c == "unset" {
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    if let IrExpr::Str(n, _) = it {
+                                        if !n.starts_with('-') && n != "@" && n != "*" {
+                                            out.push(n.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 IrStmt::If { then, elsifs, else_, .. } => {
@@ -1078,6 +1142,7 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // reachable at top level; its reads of the outer locals work because the
     // renderer emits function bodies' variable writes with `set -g`.
     *NESTED_FN_READS.lock().unwrap() = Default::default();
+    FD_DUPS.lock().unwrap().clear();
     {
         let mut hoisted: Vec<IrStmt> = Vec::new();
         for st in &mut stripped.stmts {
@@ -1814,6 +1879,37 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             if line.trim() == "''" {
                 line = ":".into();
             }
+            // `exec 3>&1` — a redirect-only exec with an EMPTY command. bash
+            // makes the dup PERSISTENT; fish has no `exec` builtin (a bare
+            // `exec` runs fish's own, printing its help), and a redirect on a
+            // single fish command does not outlive it. Record the dup in the
+            // fd table so every later `>&3` resolves to the aliased fd, and
+            // emit a no-op statement.
+            // The COMMAND must be `exec` — the node kind alone is not enough,
+            // because EVERY external command arrives as
+            // `Expr(Call{func:"exec"})`, so matching on `func` swallowed the
+            // whole following `echo test >&3` statement as well.
+            let is_exec_cmd = matches!(inner.as_slice(), [IrStmt::Expr(IrExpr::Call { func, args })]
+                if func == "exec"
+                    && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "exec"));
+            if is_exec_cmd && !plain.is_empty() {
+                let mut any = false;
+                for r in &plain {
+                    if let (Some(fd), IrExpr::Str(t, _)) = (r.fd, &r.target) {
+                        if let Some(rest) = t.strip_prefix('&') {
+                            if rest != "-" {
+                                if let Ok(n) = rest.parse::<i64>() {
+                                    FD_DUPS.lock().unwrap().insert(fd as i64, n);
+                                    any = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if any {
+                    return Ok(());
+                }
+            }
             line = herestring_wrap_fish(&plain, line)?;
             if !ps_ins.is_empty() {
                 line = lower_procsub_stmt_fish(&ps_ins, &line)?;
@@ -1837,10 +1933,11 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             // local — so loop-carried state still works, which per-write `-l`
             // broke (a fresh local per iteration never terminates;
             // 092_for_arith_func hung).
-            emit_subshell_shadow(body, out);
+            let shadowed = emit_subshell_shadow(body, out);
             for b in body {
                 stmt_to_fish(b, d + 1, out)?;
             }
+            emit_subshell_restore(&shadowed, out, d);
             indent(out, d);
             out.push_str("end\n");
             Ok(())
@@ -3762,6 +3859,39 @@ fn exec_line_to_fish(
     args: &[IrExpr],
     env: Option<&[(String, IrExpr)]>,
 ) -> Result<String, String> {
+    // `exec N>&M` — an fd dup with NO command. bash makes it persistent;
+    // fish has no `exec` builtin at all (it would run fish's own `exec`, which
+    // replaces the process), so the dup is recorded in the fd table and a
+    // later `>&N` resolves through it. This is the ONLY reason the statement
+    // needs special handling — a bare `exec` with a command is a real exec.
+    if matches!(cmd, IrExpr::Str(c, _) if c == "exec") {
+        // Redirects are spread across `args` as spec Objects (the `exec`
+        // statement's `redirects` field arrives as a trailing Array/Object).
+        let mut redirs: Vec<IrRedirect> = Vec::new();
+        for a in args {
+            if let Ok(v) = redirect_objs(a) {
+                redirs.extend(v);
+            }
+        }
+        if !redirs.is_empty() {
+            let mut any = false;
+            for r in &redirs {
+                if let (Some(fd), IrExpr::Str(t, _)) = (r.fd, &r.target) {
+                    if let Some(rest) = t.strip_prefix('&') {
+                        if rest != "-" {
+                            if let Ok(n) = rest.parse::<i64>() {
+                                FD_DUPS.lock().unwrap().insert(fd as i64, n);
+                                any = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if any {
+                return Ok(":".into());
+            }
+        }
+    }
     // GNU-only flags: refuse rather than leak an unportable invocation
     if let IrExpr::Str(cn, _) = cmd {
         for a in args {
@@ -4383,6 +4513,43 @@ fn exec_line_to_fish(
     // killed the script, not a parse error). A flattened array also has to
     // drop its len counter, or `${#x[@]}` keeps reporting the old length
     // after the elements are gone.
+    // `export NAME=value` / `export NAME` — bash marks the name for the
+    // environment. The WORD arrives already quoted (`export 'DEBUG=1'`) from
+    // the core's generic word quoting, and fish reads that as a literal string
+    // — so the statement silently did NOTHING and a later `${DEBUG:-unset}`
+    // printed the default (064_20 printed `DEBUG=` where bash printed
+    // `DEBUG=1`). fish's own `export` takes the same `NAME=value` form, so the
+    // fix is to strip the quoting the core added for the ASSIGNMENT word.
+    if cmd_name == Some("export") {
+        let mut words: Vec<String> = vec!["export".into()];
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {}
+                IrExpr::Str(s, _) if s.contains('=') => {
+                    // Unquote exactly one layer, then re-emit BARE so fish sees
+                    // the assignment. A value with spaces is quoted again on
+                    // the right of `=` only.
+                    let (n, v) = s.split_once('=').unwrap();
+                    let v = v
+                        .strip_prefix('\'')
+                        .and_then(|t| t.strip_suffix('\''))
+                        .or_else(|| v.strip_prefix('"').and_then(|t| t.strip_suffix('"')))
+                        .unwrap_or(v);
+                    if n.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                        words.push(word_to_fish(a)?);
+                    } else if v.is_empty() {
+                        words.push(format!("{n}="));
+                    } else if v.chars().any(|c| c.is_whitespace()) {
+                        words.push(format!("{n}={}", dq_word(v)));
+                    } else {
+                        words.push(format!("{n}={v}"));
+                    }
+                }
+                other => words.push(word_to_fish(other)?),
+            }
+        }
+        return Ok(words.join(" "));
+    }
     if cmd_name == Some("unset") {
         let mut words: Vec<String> = Vec::new();
         for a in args {
@@ -4982,6 +5149,19 @@ fn fish_single_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "'\\''"))
 }
 
+/// Follow the `exec N>&M` dup chain to the fd it ultimately names.
+/// Bounded, so a cycle (`exec 3>&4; exec 4>&3`) cannot loop forever.
+fn fd_resolve_fish(fd: i64) -> i64 {
+    let mut f = fd;
+    for _ in 0..8 {
+        match FD_DUPS.lock().unwrap().get(&f) {
+            Some(&n) => f = n,
+            None => break,
+        }
+    }
+    f
+}
+
 fn redirect_to_fish(r: &IrRedirect) -> Result<String, String> {
     let fd = r.fd.unwrap_or(0);
     let op = match r.mode.as_str() {
@@ -5011,9 +5191,24 @@ fn redirect_to_fish(r: &IrRedirect) -> Result<String, String> {
         other => return Err(format!("redirect mode not renderable: {other:?}")),
     };
     let fdpre = fd_prefix(fd);
+    // An INPUT fd is resolved through the dup table too: `exec 3< file` is a
+    // real persistence bash has and fish does not, so a later `read <&3`
+    // resolves to the file redirect that was recorded.
     let target = match &r.target {
-        // `2>&1` dup forms — the target arrives as a literal `&N`
-        IrExpr::Str(s, _) if s.starts_with('&') => s.clone(),
+        // `2>&1` dup forms — the target arrives as a literal `&N`. A `&N` that
+        // names a dup'd fd resolves to the fd it ultimately aliases; `&-`
+        // (close) is left alone, since fish rejects `>&-` and there is nothing
+        // to alias.
+        IrExpr::Str(s, _) if s.starts_with('&') => match s.strip_prefix('&') {
+            Some("") => s.clone(),
+            Some(rest) if rest != "-" => match rest.parse::<i64>() {
+                Ok(n) if FD_DUPS.lock().unwrap().contains_key(&n) => {
+                    format!("&{}", fd_resolve_fish(n))
+                }
+                _ => s.clone(),
+            },
+            _ => s.clone(),
+        },
         other => word_to_fish(other)?,
     };
     Ok(format!(" {fdpre}{op}{target}"))
