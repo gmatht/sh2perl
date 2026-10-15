@@ -4701,6 +4701,25 @@ fn render_param(args: &[IrExpr]) -> String {
                 args.get(2).and_then(call_arg_str).unwrap_or_default(),
             );
             let len_raw = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            // An ARRAY slice (`${arr[@]:off:len}`) is NOT a substr: `@arr`
+            // in scalar context is the element COUNT, so `substr(@arr, 0, 2)`
+            // sliced the number of elements and printed `0` (063_04 line 5
+            // printed `0` where bash prints nothing). Route it through the
+            // same `__sh_slice` helper the statement path uses.
+            if let Some(base) = name.strip_suffix("[@]").or_else(|| name.strip_suffix("[*]")) {
+                let len = if len_raw.trim().is_empty() {
+                    "undef".to_string()
+                } else {
+                    num_or_read(len_raw)
+                };
+                let _ = &off;
+                return format!(
+                    "join(' ', __sh_slice(\\@{}, {}, {}))",
+                    base.replace('.', "_").replace('-', "_"),
+                    num_or_read(args.get(2).and_then(call_arg_str).unwrap_or_default()),
+                    len
+                );
+            }
             if len_raw.trim().is_empty() {
                 format!("substr({}, {})", var, off)
             } else {
@@ -4744,10 +4763,48 @@ fn render_param(args: &[IrExpr]) -> String {
         // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
         // the shIR contract normalizes subscripts).
         "slice" => {
+            // `${!name*[@]:off:len}` / `${!name@[@]:off:len}` — a SLICE of a
+            // key list. bash rejects this outright: "bad substitution",
+            // which aborts the enclosing command list and prints NOTHING for
+            // the command using it. Emitting `keys %prefix` instead made
+            // 063_04 print an extra line bash never produces (bash output is
+            // 2 lines, the translation's 3).
             let raw_off = args
                 .get(2)
                 .and_then(call_arg_str)
                 .unwrap_or_else(|| "0".to_string());
+            // bash rejects `${!name*[@]}` ENTIRELY — the `*` spelling of a
+            // key list is always "bad substitution" (measured: both
+            // `${!p*[@]}` and `${!p*[@]:0:1}` fail, while `${!p[@]}` is
+            // legal). The `*` is the only signal: the shIR encodes the
+            // offset as `"@"` for the sliced and unsliced forms alike, so
+            // the subscript's `*` is what distinguishes them.
+            if name.starts_with('!') && name.contains('*') {
+                // `${!name*[@]:off:len}` — a SLICE of a key list. bash rejects
+                // the syntax: "bad substitution". The diagnostic goes to
+                // stderr and the COMMAND using it is abandoned, but the
+                // script CONTINUES (measured: `echo A; echo "${!p*[@]:0:3}";
+                // echo B` prints A and B). So the expansion emits the
+                // message and then `next`-like skips this command's output —
+                // modelled here as a `die` caught by nothing but with the
+                // status set, which would end the program; use an exception
+                // the enclosing statement catches instead: a plain
+                // `print STDERR` plus `undef` is wrong (echo still prints a
+                // newline), so the value carries a marker the echo path
+                // recognises and suppresses.
+                //
+                // The expansion text is DATA: escape `$` so Perl does not
+                // interpolate it (`${{!prefix*}:@}` compiled to a bareword
+                // `prefix` and aborted the whole FILE).
+                let shown = format!("${{{}}}:{}", name, raw_off).replace('$', "\\$");
+                // `BAD_SUBST_MARKER` prefixes the value so a statement that
+                // renders it can suppress its own output (bash abandons the
+                // command entirely); see `emit_echo`.
+                return format!(
+                    "(do {{ print STDERR \"$0: {shown}: bad substitution\\n\"; \
+\"\x01SH2BADSUBST\x01\" }})"
+                );
+            }
             let raw_len = args.get(3).and_then(call_arg_str).unwrap_or_default();
             // `${@:off:len}` / `${*:off:len}` — a 1-based slice of the
             // positional parameters (a LIST, not a scalar substring).
@@ -8041,6 +8098,16 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         }
     }
     let ok = |out: &mut String| out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+    // A `${!name*[@]:off:len}` argument is a bash SYNTAX ERROR: the
+    // expansion printed its diagnostic and the whole command is abandoned,
+    // so `echo` must emit NOTHING (not even the newline). The renderer marks
+    // that value; skip the statement entirely when it is present.
+    if args.iter().any(|a| {
+        let t = ir_expr_to_perl(a);
+        t.contains("SH2BADSUBST")
+    }) {
+        return;
+    }
     if args.is_empty() {
         emit_indent(out, indent);
         if newline {
@@ -8477,6 +8544,39 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                         && !out.iter().any(|(n, s)| n == &base && *s == sigil)
                     {
                         out.push((base, sigil));
+                    }
+                }
+            }
+            // A `${name OP WORD}` expansion nests further expansions in
+            // WORD (`${array[${index}]:-${default[@]:0:2}}`). Recurse into
+            // them or the inner read is never declared —
+            // `@default` was emitted with only `my $default` in the
+            // preamble, a `use strict` compile error that aborted 063_04.
+            if func == "param" {
+                for a in args.iter().skip(2) {
+                    collect_read_vars_expr(a, out);
+                    // The WORD is frequently RAW shell text carrying a
+                    // nested expansion (`${default[@]:0:2}` arrives as a
+                    // plain Str) — scan it for `name[@]`/`name[*]` reads so
+                    // the base is declared as an array.
+                    if let IrExpr::Str(t, _) = a {
+                        let mut names = std::collections::HashSet::new();
+                        collect_all_subscript_names(t, &mut names);
+                        for n in names {
+                            if !var_is_declarable(&n) {
+                                continue;
+                            }
+                            // ADD an ARRAY entry alongside any scalar one:
+                            // the same name can legitimately be read BOTH
+                            // ways (`${default:-x}` is a scalar read,
+                            // `${default[@]:0:2}` an array read), and Perl
+                            // needs `my $default` and `my @default` for the
+                            // respective spellings. Declaring only one aborts
+                            // the program under `use strict` (063_04).
+                            if !out.iter().any(|(m, s)| m == &n && *s == Sigil::Array) {
+                                out.push((n, Sigil::Array));
+                            }
+                        }
                     }
                 }
             }
@@ -11924,6 +12024,32 @@ fn collect_all_subscript_reads(stmts: &[IrStmt], out: &mut std::collections::Has
         }
     }
     walk(stmts, out);
+}
+
+/// Mark every `name` appearing as `name[@]` / `name[*]` in RAW shell text as
+/// an ARRAY. Complements `collect_all_subscript_reads`, which walks the IR:
+/// a nested expansion inside a `${…}` WORD arrives as plain text
+/// (`\${default[@]:0:2}`), so only a text scan can see it.
+fn collect_all_subscript_names(t: &str, out: &mut std::collections::HashSet<String>) {
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && i + 2 < bytes.len() {
+            if (bytes[i + 1] == b'@' || bytes[i + 1] == b'*') && bytes[i + 2] == b']' {
+                // Walk back over the identifier before the `[`.
+                let mut j = i;
+                while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                    j -= 1;
+                }
+                if j < i {
+                    out.insert(t[j..i].to_string());
+                }
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
