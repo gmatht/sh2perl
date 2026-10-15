@@ -605,7 +605,10 @@ impl Render {
                 self.sh2_calls.insert("arrayIndex".into());
                 "sh2ArrayIndex()".to_string()
             }
-            IrExpr::Capture { .. } => {
+            IrExpr::Capture { expr, .. } => {
+                if let Some(rendered) = self.capture_expr(expr) {
+                    return rendered;
+                }
                 self.sh2_calls.insert("capture".into());
                 "sh2Capture()".to_string()
             }
@@ -784,10 +787,14 @@ impl Render {
                 self.need_truthy = true;
                 format!("sh2Truthy(sh2ArrayIndex())")
             }
-            IrExpr::Capture { .. } => {
-                self.sh2_calls.insert("capture".into());
+            IrExpr::Capture { expr, .. } => {
                 self.need_truthy = true;
-                format!("sh2Truthy(sh2Capture())")
+                if let Some(rendered) = self.capture_expr(expr) {
+                    format!("sh2Truthy({rendered})")
+                } else {
+                    self.sh2_calls.insert("capture".into());
+                    format!("sh2Truthy(sh2Capture())")
+                }
             }
             IrExpr::Regex { .. } => {
                 self.sh2_calls.insert("regex".into());
@@ -2010,6 +2017,46 @@ impl Render {
             }
         }
         argv
+    }
+
+    /// `$(cmd args)` — command substitution.
+    ///
+    /// The lowered shape is `Capture { expr: Arrow([Expr(Call{exec|builtin,
+    /// [cmd, args]})]) }` (the pipeline case nests a `pipeline` call, which
+    /// stays a stub). A capture is exactly `sh2Run` on that argv: `sh2Run`
+    /// already trims the trailing newline the way `$( )` does, so the simple
+    /// single-command form renders NATIVELY with no runtime helper.
+    fn capture_expr(&mut self, expr: &IrExpr) -> Option<String> {
+        let IrExpr::Arrow(stmts) = expr else { return None };
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let cmd = match args.first() {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            _ => return None,
+        };
+        // `echo $(fnValue("f", [args]))` is the echo-return-lift's pass-3
+        // wrapper: the fnValue ALREADY returns the value, so capturing it would
+        // spawn a child that prints what we already have. The discriminator is
+        // the fnValue INSIDE, not `echo` itself — a user's own
+        // `x=`echo hi`` is a genuine capture and must run.
+        if cmd == "echo" {
+            let wraps_fn_value = match args.get(1) {
+                Some(IrExpr::Array(items)) => items.iter().any(|it| {
+                    matches!(it, IrExpr::Call { func, .. } if func == "fnValue")
+                }),
+                _ => false,
+            };
+            if wraps_fn_value {
+                return None;
+            }
+        }
+        let argv = self.build_argv(&cmd, args);
+        self.need_run = true;
+        Some(format!("sh2Run(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
     fn sh2_stub(&mut self, name: &str, note: &str) -> String {
