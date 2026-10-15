@@ -2184,11 +2184,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 ));
                             }
                             "herestring" => {
-                                let target = call_arg_str(&r.target).unwrap_or_default();
-                                cmd.push_str(&format!(
-                                    " <<< '{}'",
-                                    target.replace('\'', "'\\\\''")
-                                ));
+                                // A herestring target is frequently NOT a
+                                // literal: `<<< "$(echo …)"` carries a
+                                // Capture. `call_arg_str` yields None for
+                                // those and the old `.unwrap_or_default()`
+                                // emitted `<<< ''` — the command then read
+                                // NOTHING (063_18 printed an empty line).
+                                // Route through `append_redirect_frag`, which
+                                // renders the real shell word.
+                                if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &r.target) {
+                                    ok = false;
+                                    break;
+                                }
                             }
                             _ => match call_arg_str(&r.target) {
                                 Some(_) => {
@@ -3866,10 +3873,20 @@ fn var_read(name: &str) -> String {
         if idx.chars().all(|c| c.is_ascii_digit()) {
             return format!("${}[{}]", base, idx);
         }
-        if array_var(base) {
-            return format!("${}[${}]", base, idx.trim_matches('"').trim_matches('\''));
+        // `${name[@]}` / `${name[*]}` — the WHOLE array. Never a hash key:
+        // `@`/`*` is the all-elements subscript, and the A1 drops the
+        // `declare -a` that would have put `name` in the census. Reading it
+        // as a hash emitted `$name{'@'}` on a variable declared as a SCALAR
+        // — a `use strict` compile error that aborted the program
+        // (063_04: `${default[@]:0:2}` killed the whole output).
+        let bare = idx.trim_matches('"').trim_matches('\'');
+        if bare == "@" || bare == "*" {
+            return format!("@{}", base);
         }
-        let key = idx.trim_matches('"').trim_matches('\'');
+        if array_var(base) {
+            return format!("${}[${}]", base, bare);
+        }
+        let key = bare;
         // A variable subscript (`${words[$counter]}`) indexes with the
         // variable's value, not the literal name. A BRACED expansion
         // (`${words[${i:-0}]}`) must be recursively lowered — leaving the
@@ -11745,6 +11762,16 @@ pub(crate) fn populate_var_census(prog: &IrProgram) {
     for sub in &prog.subs {
         collect_array_vars(&sub.body, &mut arrays);
     }
+    // A READ of `${name[@]}` / `${name[*]}` also binds `name` as an array:
+    // that subscript means "all elements" and can never be a hash key, even
+    // when the name is otherwise never ASSIGNED as an array (the A1 drops
+    // `declare -a`). Without this the renderer emitted `@name` for the read
+    // but the preamble declared `my $name` — a `use strict` compile error
+    // that aborted the program (063_04).
+    collect_all_subscript_reads(&prog.stmts, &mut arrays);
+    for sub in &prog.subs {
+        collect_all_subscript_reads(&sub.body, &mut arrays);
+    }
     ARRAY_VARS.with(|s| *s.borrow_mut() = arrays);
     let mut hashes = std::collections::HashSet::new();
     collect_hash_vars(&prog.stmts, &mut hashes);
@@ -11752,6 +11779,74 @@ pub(crate) fn populate_var_census(prog: &IrProgram) {
         collect_hash_vars(&sub.body, &mut hashes);
     }
     HASH_VARS.with(|s| *s.borrow_mut() = hashes);
+}
+
+
+/// Mark every `name` read through the all-elements subscript (`${name[@]}`,
+/// `${name[*]}`, and the same inside a `param("slice", …)` call) as an ARRAY.
+fn collect_all_subscript_reads(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    fn walk_expr(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                // `param(op, NAME, …)` — NAME carries the subscript text.
+                if func == "param" {
+                    if let Some(name) = args.get(1).and_then(call_arg_str) {
+                        if let Some(base) = name.strip_suffix("[@]").or_else(|| name.strip_suffix("[*]")) {
+                            if !base.is_empty() {
+                                out.insert(base.to_string());
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, out);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    walk_expr(i, out);
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, out),
+            _ => {}
+        }
+    }
+    fn walk(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e) => walk_expr(e, out),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, out),
+                IrStmt::Output { value, .. } => walk_expr(value, out),
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    walk_expr(cond, out);
+                    walk(then, out);
+                    for (c, b) in elsifs {
+                        walk_expr(c, out);
+                        walk(b, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, out);
+                    walk(body, out);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, out);
+                    walk(body, out);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Function { body: b, .. } => walk(b, out),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, out);
 }
 
 fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
