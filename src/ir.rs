@@ -4413,6 +4413,21 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
         // element its own argument (`printf '%s ' "${lines[@]}"` prints
         // every line). The scalar renderer joined them into one string, so
         // 012/041 printed only the first line.
+        // An UNQUOTED command substitution in a LIST context word-splits on
+        // IFS whitespace, giving one element per field — bash's rule for
+        // `files=(`ls -1 *.sh`)`. `render_word` returns the JOINED scalar
+        // (`join(' ', split(…))`), so using it here produced ONE element and
+        // `${#files[@]}` said 1 where bash said 2, with both names glued into
+        // one entry (000__04h).
+        IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
+            match args.first().and_then(arrow_to_cmd) {
+                Some(cmd) => format!(
+                    "split(/\\s+/, {})",
+                    cmd_str_to_open_perl(&cmd)
+                ),
+                None => render_word(e),
+            }
+        }
         IrExpr::Call { func, args } if func == "param" => {
             let op = args.first().and_then(call_arg_str).unwrap_or_default();
             let name = args.get(1).and_then(call_arg_str).unwrap_or_default();
@@ -8313,9 +8328,16 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
     // warnings on unset positional params. A split word expands to a LIST
     // (triage-perl t62_word_split) and must take the join+grep path even
     // when it is the ONLY word (`echo $x` — join re-inserts the spaces).
-    let has_split = args
-        .iter()
-        .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+    // A word that renders as a LIST takes the join+grep path. That is a
+    // `split` node, or — since `render_word_list` now splits an unquoted
+    // command substitution — any word whose rendered text is a `split(...)`
+    // call. Missing the second case printed `print(split(…))`, which
+    // concatenates the fields with NO separator (008_simple_backup printed
+    // `b.txtsub1sub2`).
+    let has_split = args.iter().enumerate().any(|(i, w)| {
+        matches!(w, IrExpr::Call { func, .. } if func == "split")
+            || parts.get(i).map_or(false, |p| p.starts_with("split(/"))
+    });
     if parts.len() == 1 && !has_split {
         // A single glob word is a LIST in Perl — wrap in join(' ', …) so
         // the expansion space-joins like bash (echo file_*.txt).
