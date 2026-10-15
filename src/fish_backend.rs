@@ -3111,9 +3111,16 @@ fn test_cmp_to_fish(t: &str, dbl: bool) -> Result<String, String> {
         let lhs = lhs.trim_start_matches('!');
         let m = if !dbl || test_rhs_is_quoted(&rhs) {
             // `[ … == … ]` / `test … == …`, or a QUOTED RHS in `[[ … ]]`:
-            // a LITERAL string compare. fish's own `test` is exactly that, so
-            // no case emulation is needed at all.
-            format!("[ {lhs} = {rhs} ]")
+            // a LITERAL string compare. fish's own `test` is exactly that —
+            // EXCEPT under `shopt -s nocasematch`, which makes bash's `==`
+            // fold case even for two quoted literals (`[[ "ABC" == "abc" ]]`
+            // is true with the option set). `string match -qi` compares the
+            // same way when the RHS carries no glob characters.
+            if *NOCASEMATCH.lock().unwrap() && !rhs.contains(['*', '?', '[']) {
+                format!("string match -qi -- {} {lhs}", fish_pattern_lit(&rhs))
+            } else {
+                format!("[ {lhs} = {rhs} ]")
+            }
         } else if let Some((neg, rest)) =
             rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
         {
@@ -3154,6 +3161,36 @@ fn test_cmp_to_fish(t: &str, dbl: bool) -> Result<String, String> {
             "not string match -q -- {} {lhs}",
             fish_pattern_lit(&rhs)
         ))
+    } else if dbl
+        && (split_test_op(t, "<=").is_some()
+            || split_test_op(t, ">=").is_some()
+            || split_test_op(t, "<").is_some()
+            || split_test_op(t, ">").is_some())
+    {
+        // `[[ a < b ]]` — STRING ordering. It cannot go through fish's `test`:
+        // fish parses a bare `<` as a REDIRECT ("Path 'b' does not exist",
+        // status 1) and rejects `\<` outright, so the renderer fell through to
+        // the `[ … ]` literal form and the statement produced the PREVIOUS
+        // command's status (070_gnuisms_thorough printed `lt: 1` where bash
+        // printed `lt: 0`). Ordered by sort: `a < b` iff the first of the two
+        // sorted lines is `a` and they differ.
+        let (op, lhs, rhs) = ["<=", ">=", "<", ">"]
+            .iter()
+            .find_map(|o| split_test_op(t, o).map(|(l, r)| (*o, l, r)))
+            .unwrap();
+        let strict = !op.contains('=');
+        let (a, b) = if op.starts_with('<') { (lhs, rhs) } else { (rhs, lhs) };
+        // A `begin … end` GROUP, not a `( … )`: a bare command substitution is
+        // "command substitutions not allowed here" in statement position, and
+        // this expression IS used in one (`[[ a < b ]]` on its own line).
+        let cmp = format!(
+            "begin; set -l _srt (printf '%s\\n%s\\n' {a} {b} | sort); test \"$_srt[1]\" = {a}; end"
+        );
+        return Ok(if strict {
+            format!("{cmp}; and test {a} != {b}")
+        } else {
+            cmp
+        });
     } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
         // regex match: grep -E ([[ =~ ]] semantics)
         Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
@@ -6325,7 +6362,17 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // array -> the per-element counter helper). A bare `param("",
             // name)` is the QUOTED `"${x}"` expansion (the core wraps
             // unquoted `$x` in split()) — keep it one word.
+            // `PIPESTATUS[i]` — bash's array of the last pipeline's statuses.
+            // fish keeps the same data in `$pipestatus`, 1-BASED and
+            // lowercase, so the index shifts by one. Unmapped, the whole
+            // reference rendered as the literal text `$PIPESTATUS[1]`
+            // (070_gnuisms_thorough printed `ps=,` where bash printed `ps=1,0`).
             if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                if an == "PIPESTATUS" && !idx.contains(['$', '(']) {
+                    if let Ok(n) = idx.parse::<i64>() {
+                        return Ok(format!("$pipestatus[{}]", n + 1));
+                    }
+                }
                 if idx == "@" || idx == "*" {
                     if an.starts_with('!') {
                         return Ok(arr_keys_call_fish(arr_base(&an)));
@@ -7083,6 +7130,20 @@ fn interp_to_fish(parts: &[InterpPart]) -> Result<String, String> {
                 if open {
                     if let Some(inner) = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
                         s = inner.to_string();
+                    } else if is_fish_substitution_prefix(&s) {
+                        // The expansion STARTS with a command substitution
+                        // (`(string upper -- …)(string sub …)` — a `${x^}`
+                        // lowered to two adjacent substitutions). fish prints a
+                        // bare `( … )` inside double quotes as LITERAL text, so
+                        // the template quote must CLOSE before it and reopen
+                        // after. Without this the whole expansion was printed
+                        // verbatim (070_gnuisms_thorough: `firstup=(string
+                        // upper -- …)(string sub …)`).
+                        out.push('"');
+                        out.push_str(&s);
+                        out.push('"');
+                        open = true;
+                        continue;
                     }
                 }
                 out.push_str(&s);
@@ -7098,6 +7159,18 @@ fn interp_to_fish(parts: &[InterpPart]) -> Result<String, String> {
 /// Multi-word or already-quoted interpolate expansions must not be
 /// wrapped in a fresh quote pair (capture already carries `"$(…)"`;
 /// brace / arrayItems / captureWords / whole-array forms are word LISTS).
+/// Does this rendered expansion BEGIN with something fish only expands
+/// OUTSIDE double quotes?
+///
+/// True for a command substitution (`(cmd)`), which fish prints literally
+/// between quotes. The template renderer uses this to close the quote around
+/// such an expansion; a leading `$var` needs no such treatment (it expands
+/// inside quotes quite happily).
+fn is_fish_substitution_prefix(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with('(') || t.starts_with("$(")
+}
+
 fn interp_expr_self_quotes(e: &IrExpr) -> bool {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
