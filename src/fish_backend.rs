@@ -65,6 +65,11 @@ lazy_static::lazy_static! {
     /// the sh backend's fd_dups.
     static ref FD_DUPS: std::sync::Mutex<std::collections::HashMap<i64, i64>> =
         Default::default();
+    /// `typeset -l` / `declare -l` names: bash lowercases the value on every
+    /// assignment.
+    static ref LOWER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// `typeset -u` / `declare -u` names: the uppercase counterpart.
+    static ref UPPER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
 }
 
 /// `set ` or `set -g ` — `-g` while inside a function body, so bash's global
@@ -1143,6 +1148,8 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // renderer emits function bodies' variable writes with `set -g`.
     *NESTED_FN_READS.lock().unwrap() = Default::default();
     FD_DUPS.lock().unwrap().clear();
+    LOWER_VARS.lock().unwrap().clear();
+    UPPER_VARS.lock().unwrap().clear();
     {
         let mut hoisted: Vec<IrStmt> = Vec::new();
         for st in &mut stripped.stmts {
@@ -1263,7 +1270,10 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     }
     out.push_str(&arr_helper_preamble(&body));
     out.push_str(&shell_identity_preamble(&body));
-    if body.contains("( _num ") || body.contains(" _num ") {
+    // A call is `_num "…"` or `$(_num "…")` — the `$(` prefix defeated the
+    // old space-delimited test, so the helper was never emitted and the
+    // integer-coercion call sites were "Unknown command: _num".
+    if body.contains("_num ") || body.contains("_num)") {
         out.push_str("function _num --argument val\n");
         out.push_str("    # bash coerces non-numeric arith values to 0; fish math errors\n");
         out.push_str("    if string match -qr -- '^-?[0-9]+$' $val\n");
@@ -2422,15 +2432,76 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
         }
         let mut rhs = assign_rhs_to_fish(expr)?;
         // `typeset -i` vars assign ARITHMETICALLY (`n=n+1` -> 43)
+        // `typeset -l` / `-u`: case-fold the value on every write.
+        if t.indices.is_empty()
+            && (LOWER_VARS.lock().unwrap().contains(&t.var)
+                || UPPER_VARS.lock().unwrap().contains(&t.var))
+        {
+            let fold = if LOWER_VARS.lock().unwrap().contains(&t.var) {
+                "lower"
+            } else {
+                "upper"
+            };
+            out.push_str(set_prefix_for(&t.var));
+            out.push_str(&t.var);
+            out.push(' ');
+            out.push_str(&format!("(string {fold} -- {})", assign_rhs_to_fish(expr)?));
+            continue;
+        }
         if INT_VARS.lock().unwrap().contains(&t.var) && t.indices.is_empty() {
             let raw = match expr {
                 IrExpr::Str(s, _) => s.clone(),
+                // A pure-literal interpolation (`n="hello"`, `n=5`) is the
+                // same opaque WORD as the Str form — it arrived as
+                // `Interpolate([Lit])` and fell through to the RENDERED rhs
+                // (`"hello"`, quotes included), which `math` rejected.
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+                {
+                    parts
+                        .iter()
+                        .map(|p| match p {
+                            crate::ir::InterpPart::Lit(t) => t.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<String>()
+                }
                 IrExpr::Call { func, args } if func == "getVar" => {
                     raw_arg(args, 0).unwrap_or_default()
                 }
                 _ => rhs.clone(),
             };
-            rhs = format!("(math --scale 0 \"{}\")", raw);
+            // The expression goes through `arith_rewrite`, which gives every
+            // variable read its `$` sigil — fish's `math` parses its argument
+            // as an expression AFTER parameter expansion, so a bare name is
+            // "Unknown function" (`math --scale 0 "n+1"` fails even with `n`
+            // set, while `"$n+1"` gives 43). And bash COERCES a non-numeric
+            // value to 0 in integer arithmetic, where `math` aborts — the
+            // coercion is the `_num` helper the `typeset -i` contract names.
+            // `arith_rewrite` gives the reads their `$` sigil AND wraps an
+            // integer-attribute read in `_num`. An OPAQUE word rhs is
+            // ARITHMETIC in bash — `n="hello"` on a `typeset -i n` stores 0,
+            // and `n=5` stores 5 — so a bare word becomes a variable read and
+            // a non-numeric value coerces to 0 (an empty `math` argument is
+            // an error, not a zero).
+            let rw = arith_rewrite(&raw);
+            let rw = if rw.trim().is_empty() {
+                "0".to_string()
+            } else if let Some(name) = rw.trim().strip_prefix('$') {
+                // A bare word rhs becomes a VARIABLE read (`$hello`), which is
+                // what bash evaluates — and a non-numeric value coerces to 0,
+                // which `_num` supplies (an empty `math` argument is an error,
+                // not a zero). `arith_rewrite` has already added the sigil, so
+                // the test is on what FOLLOWS it.
+                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty() {
+                    format!("$(_num ${name})")
+                } else {
+                    rw
+                }
+            } else {
+                rw
+            };
+            rhs = format!("(math --scale 0 \"{rw}\")");
         }
         // baked element targets (`arr[1]=x` — the A1 folds the subscript
         // into the var name)
@@ -4368,6 +4439,22 @@ fn exec_line_to_fish(
                         };
                         if takes_next {
                             let nv = word_to_fish(&args[i + 1])?;
+                            let nv = if flags.iter().any(|f| {
+                                let l = f.trim_start_matches('-');
+                                l.contains('l') || l.contains('u')
+                            }) {
+                                let fold = if flags
+                                    .iter()
+                                    .any(|f| f.trim_start_matches('-').contains('u'))
+                                {
+                                    "upper"
+                                } else {
+                                    "lower"
+                                };
+                                format!("(string {fold} -- {nv})")
+                            } else {
+                                nv
+                            };
                             pending = Some(format!(
                                 "{}{name} {nv}",
                                 if is_local_decl {
@@ -4394,6 +4481,22 @@ fn exec_line_to_fish(
                         format!("\"{v}\"")
                     } else {
                         word_to_fish(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))?
+                    };
+                    // A `typeset -l`/`-u` declaration also FOLDS its initial
+                    // value (bash applies the attribute at assignment).
+                    let nv = if flags.iter().any(|f| {
+                        let l = f.trim_start_matches('-');
+                        l.contains('l') || l.contains('u')
+                    }) {
+                        let fold = if flags.iter().any(|f| f.trim_start_matches('-').contains('u'))
+                        {
+                            "upper"
+                        } else {
+                            "lower"
+                        };
+                        format!("(string {fold} -- {nv})")
+                    } else {
+                        nv
                     };
                     stmts.push(format!(
                         "{}{name} {nv}",
@@ -4434,6 +4537,31 @@ fn exec_line_to_fish(
         // (arithmetic is rendered in math, assoc elements keep a key list) —
         // record them so the later assignments agree. Only the declared name
         // qualifies, not any bare word that happened to follow.
+        // `-l` / `-u` case attributes. The flag vectors hold the raw `-l`
+        // words, and a combined `-il` sets both.
+        for f in &flags {
+            let letters: String = f.trim_start_matches('-').to_string();
+            if letters.contains('l') {
+                let mut v = LOWER_VARS.lock().unwrap();
+                for s in stmts
+                    .iter()
+                    .filter_map(|s| declared_name(s))
+                    .chain(declared.iter().cloned())
+                {
+                    v.insert(s);
+                }
+            }
+            if letters.contains('u') {
+                let mut v = UPPER_VARS.lock().unwrap();
+                for s in stmts
+                    .iter()
+                    .filter_map(|s| declared_name(s))
+                    .chain(declared.iter().cloned())
+                {
+                    v.insert(s);
+                }
+            }
+        }
         if flags.iter().any(|f| f.contains('i')) {
             let mut ints = INT_VARS.lock().unwrap();
             for s in stmts
@@ -8722,6 +8850,13 @@ fn arith_rewrite(t: &str) -> String {
                 && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
             if is_assign {
                 out.push_str(name);
+            } else if INT_VARS.lock().unwrap().contains(name) {
+                // `typeset -i` / `declare -i`: bash coerces the value to an
+                // integer on every read (a non-numeric string becomes 0).
+                // The coercion wraps the READ alone — `$(_num $n)+1` is
+                // 43 for n=42 and 0 for n=hello — because wrapping the whole
+                // expression would coerce the operator too.
+                out.push_str(&format!("$(_num ${name})"));
             } else if NUM_VARS.lock().unwrap().contains(name) {
                 // A variable READ must carry the `$` sigil. fish's `math`
                 // parses its argument as an EXPRESSION after parameter
