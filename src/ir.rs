@@ -6464,7 +6464,14 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) 
             // expansion is suppressed and the herestring reads nothing. A
             // literal target was already shell-quoted by `bash_word_for`, so
             // only single-quote it when it is not already a quoted word.
-            let rendered = if tstr.contains('$') {
+            // An ALREADY-QUOTED word (bash_word_for wraps an interpolated
+            // literal in `"…"`) must pass through untouched: re-quoting it
+            // made `<<< "hello world"` into the literal `'"hello world"'`,
+            // so the command saw the quotes as data
+            // (000__04h printed `"HELLO WORLD"` with the quotes).
+            let already_quoted = (tstr.starts_with('"') && tstr.ends_with('"') && tstr.len() >= 2)
+                || (tstr.starts_with('\'') && tstr.ends_with('\'') && tstr.len() >= 2);
+            let rendered = if tstr.contains('$') || already_quoted {
                 tstr.clone()
             } else {
                 format!("'{}'", tstr.replace('\'', "'\\\\''"))
