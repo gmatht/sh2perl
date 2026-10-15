@@ -2806,12 +2806,74 @@ fn declared_name(stmt: &str) -> Option<String> {
 ///
 /// A single simple command keeps the direct spelling (`(A | string collect)`)
 /// so the common case is unchanged.
-fn collect_wrap_fish(body: &str) -> String {
-    if has_top_level_separator(body) {
-        format!("begin; {body}; end")
-    } else {
-        body.to_string()
+/// Index of the `)` matching the `(` at byte 0, or None.
+fn matching_paren_close(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut sq = false;
+    let mut dq = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if sq {
+            if c == '\'' {
+                sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if dq {
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => sq = true,
+            '"' => dq = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    None
+}
+
+fn collect_wrap_fish(body: &str) -> String {
+    // A body that already IS a parenthesised group (`(cmd 2>file) | collect`)
+    // is INVALID fish in statement position — fish reads `( … )` as a command
+    // substitution and rejects it ("command substitutions not allowed here").
+    // It must be re-spelled as `begin … end`, which is fish's statement-level
+    // grouping and pipes as a unit.
+    let t = body.trim();
+    if t.starts_with('(') {
+        // Split `(CMD) SUFFIX` into the group's body and whatever trails it
+        // (typically the redirects). fish accepts `begin; CMD; end 2>file`
+        // but NOT `(CMD) 2>file`, so the suffix moves outside the `end`.
+        if let Some(close) = matching_paren_close(t) {
+            let inner = t[1..close].trim();
+            let suffix = t[close + 1..].trim();
+            if suffix.is_empty() {
+                return format!("begin; {inner}; end");
+            }
+            return format!("begin; {inner}; end {suffix}");
+        }
+    }
+    if has_top_level_separator(body) {
+        return format!("begin; {body}; end");
+    }
+    body.to_string()
 }
 
 /// Is there a command SEPARATOR — `;`, `&&` or `||` — at paren depth 0,
