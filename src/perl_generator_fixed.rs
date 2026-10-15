@@ -32,6 +32,15 @@ pub fn generate(prog: &IrProgram) -> String {
     if std::env::var("PG_DUMP_IR").is_ok() {
         eprintln!("PG_DUMP_IR: {prog:#?}");
     }
+    // The array/hash census must be populated BEFORE `fixups`, not only
+    // inside `shir_to_perl`: `fix_array_slice_bounds` consults it (via
+    // `array_var`) to tell a scalar `${s:off:len}` (a SUBSTRING) from an
+    // array slice, and with an empty census it refuses every slice — so
+    // `${primes[@]: -10}` rendered as the WHOLE array
+    // (`@primes[0..$#primes]`) and 051_primes printed all 100 primes after
+    // "Last 10:". `shir_to_perl` re-populates it for its own use; this call
+    // is idempotent.
+    crate::ir::populate_var_census(prog);
     let fixed = fixups(prog);
     let src = shir_to_perl(&fixed);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
