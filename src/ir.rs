@@ -2797,6 +2797,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_indent(out, indent);
                         out.push_str(&s);
                         out.push('\n');
+                    } else if let Some(s) = fn_chain_to_perl(other_expr) {
+                        // `try … || true` — the LHS is a call to a function
+                        // THIS PROGRAM defines. shelling the chain out to
+                        // `bash -c` sent `try` to a child that does not know
+                        // it, so the whole call was lost (realpath-cmdsub
+                        // printed the raw command line instead of its
+                        // results).
+                        emit_indent(out, indent);
+                        out.push_str(&s);
+                        out.push('\n');
                     } else if matches!(other_expr, IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. })
                         && capture_expr_native(other_expr)
                     {
@@ -5173,6 +5183,43 @@ fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>, Option<BinOpK
 /// → `(cond) || next;`, `[[ flat ]] && cmd` → `if (cond) { cmd; }`, and
 /// `(t && c1) || c2` → if/else. Flattened `[[ ]]` tests can't be
 /// reconstructed as spaced `[ … ]` bash syntax, so these lower in Perl.
+/// `FUNC args || OTHER` / `FUNC args && OTHER` where FUNC is a function
+/// this program defines: run the sub call natively and guard OTHER on its
+/// status. A `bash -c` child cannot see a Perl sub, so delegating the whole
+/// chain lost the call entirely (realpath-cmdsub's `try … || true`).
+///
+/// `None` when the LHS is not a program-defined function call — the caller
+/// then keeps whatever rendering it had.
+fn fn_chain_to_perl(e: &IrExpr) -> Option<String> {
+    let IrExpr::BinOp { lhs, op, rhs } = e else {
+        return None;
+    };
+    if !matches!(op, BinOpKind::And | BinOpKind::Or) {
+        return None;
+    }
+    let IrExpr::Call { func, args } = lhs.as_ref() else {
+        return None;
+    };
+    if func != "$fn_call" && func != "fnCall" {
+        return None;
+    }
+    let name = args.first().and_then(call_arg_str)?;
+    let words = exec_word_args(args);
+    let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
+    let mut stmt = String::new();
+    emit_stmt(&mut stmt, &IrStmt::Expr((**rhs).clone()), 1);
+    let cond = if *op == BinOpKind::And {
+        "== 0"
+    } else {
+        "!= 0"
+    };
+    Some(format!(
+        "{name}({args}); if ($CHILD_ERROR {cond}) {{\n{rhs_stmt}}}",
+        args = rest.join(", "),
+        rhs_stmt = stmt
+    ))
+}
+
 fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
     // (test [&&/|| test]* [&& then]) || else → if/else
     if let IrExpr::BinOp {
@@ -9244,6 +9291,14 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                 }
                 s.clone()
             }
+            // Any OTHER expression statement — most importantly an
+            // `&&`/`||` CHAIN whose operand is a program function
+            // (`try … || true`, realpath-cmdsub). Without this arm the
+            // chain was never rewritten, so the function name reached a
+            // `bash -c` child that has no such command and the call was
+            // lost. The shared `rewrite_fn_calls_in_expr` already descends
+            // into both BinOp operands.
+            IrStmt::Expr(e) => IrStmt::Expr(rewrite_fn_calls_in_expr(e, fns)),
             // A call in CONDITION position — `if is_prime $n; then`
             // (examples/051_primes line 50) — is as common as the statement
             // form and was NOT rewritten: the arm cloned `cond` verbatim, so
