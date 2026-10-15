@@ -4406,9 +4406,35 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
         .as_deref()
         {
             Some("@") => "@ARGV".to_string(),
-            Some("*") => "join(' ', @ARGV)".to_string(),
+            Some("*") => ifs_join("@ARGV"),
             _ => render_word(e),
         },
+        // `${arr[@]}` / `${arr[*]}` as a builtin ARGUMENT is a LIST — each
+        // element its own argument (`printf '%s ' "${lines[@]}"` prints
+        // every line). The scalar renderer joined them into one string, so
+        // 012/041 printed only the first line.
+        IrExpr::Call { func, args } if func == "param" => {
+            let op = args.first().and_then(call_arg_str).unwrap_or_default();
+            let name = args.get(1).and_then(call_arg_str).unwrap_or_default();
+            let is_all = op == "slice"
+                && (args.get(2).and_then(call_arg_str).as_deref() == Some("@"))
+                && args.get(3).and_then(call_arg_str).map_or(true, |l| l.is_empty());
+            if is_all {
+                // The name may or may not still carry the subscript: the
+                // parser sometimes encodes `${lines[@]}` as
+                // `param("slice", "lines", "@", "")` — the `@` IS the third
+                // argument there. Strip the suffix when present and accept
+                // the bare name otherwise.
+                let base = name
+                    .strip_suffix("[@]")
+                    .or_else(|| name.strip_suffix("[*]"))
+                    .unwrap_or(&name);
+                if !base.is_empty() && !base.starts_with('!') && !base.starts_with('#') {
+                    return format!("@{base}");
+                }
+            }
+            render_word(e)
+        }
         _ => render_word(e),
     }
 }
@@ -4892,10 +4918,15 @@ fn render_param(args: &[IrExpr]) -> String {
                 // Associative (`declare -A`) → VALUES; otherwise an indexed
                 // array (a name the census never saw is overwhelmingly an
                 // array here, and `@x` is at least declarable).
+                // NOTE: NOT `ifs_join` — this is a FOR ITERAND, where bash
+                // iterates the ELEMENTS. Joining would give one string and a
+                // single iteration (058_advanced_bash_idioms lost its nested
+                // loop bodies). The IFS join belongs only in scalar/string
+                // position.
                 if hash_var(&name) {
-                    return format!("join(' ', values %{})", name);
+                    return format!("values %{name}");
                 }
-                return format!("join(' ', @{})", name);
+                return format!("@{name}");
             }
             let off = raw_off
                 .parse::<i64>()
@@ -5223,6 +5254,22 @@ fn grep_o_regex(pat: &str, flags: &str) -> String {
 }
 
 /// The Perl for a `${…}` inner text (used by the `let`-text lowering).
+/// bash joins `${a[*]}` / `${a[@]}` / `$*` in a SCALAR context with the
+/// FIRST character of IFS (a space when IFS is unset). A hardcoded space is
+/// wrong the moment the script assigns IFS — `IFS=$'\n'
+/// sorted=($(sort <<<"${config[*]}"))` fed `sort` ONE space-joined line
+/// instead of three, so the result was whatever `values %hash` happened to
+/// return (064_07 was nondeterministic across runs).
+///
+/// The separator is read from `$ENV{IFS}` at RUNTIME — the renderer emits
+/// `$ENV{IFS} = …` for an `IFS=…` assignment, so this sees exactly the value
+/// bash would. An unset/empty IFS falls back to the space bash uses.
+pub(crate) fn ifs_join(list: &str) -> String {
+    format!(
+        "join((defined($ENV{{IFS}}) && length($ENV{{IFS}})) ? substr($ENV{{IFS}}, 0, 1) : ' ', {list})"
+    )
+}
+
 fn param_inner_perl(inner: &str) -> String {
     if let Some(rest) = inner.strip_prefix('#') {
         if let Some(arr) = rest.strip_suffix("[@]") {
@@ -7732,9 +7779,23 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 _ => render_word(words[0]),
             };
             let rest: Vec<String> = words[1..].iter().map(|w| render_word_list(w)).collect();
-            let has_split = words[1..]
-                .iter()
-                .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+            // A word that renders as a LIST (a `split` field-split, or an
+            // array expansion `"${lines[@]}"`) contributes MANY arguments,
+            // so the format must be cycled exactly as bash cycles it. Perl's
+            // printf applies the format once and discards the extras
+            // (012/041 printed only the first line).
+            let has_split = words[1..].iter().any(|w| {
+                match w {
+                    IrExpr::Call { func, .. } if func == "split" => true,
+                    IrExpr::Call { func, args } if func == "param" => {
+                        func == "param"
+                            && args.first().and_then(call_arg_str).as_deref() == Some("slice")
+                            && args.get(2).and_then(call_arg_str).as_deref() == Some("@")
+                            && args.get(3).and_then(call_arg_str).map_or(true, |l| l.is_empty())
+                    }
+                    _ => false,
+                }
+            });
             // bash `printf %c` prints the FIRST CHARACTER of the argument
             // (`printf '%c' 65` → `6`, `printf '%c' hello` → `h`); Perl's
             // `%c` NUMIFIES the argument instead (`"hello"` → NUL). When the
@@ -9637,9 +9698,11 @@ pub(crate) fn param_text_to_perl(tok: &str) -> Option<String> {
     let name: String = chars[..i].iter().collect();
     let rest: String = chars[i..].iter().collect();
     if rest.is_empty() {
-        // `"${arr[@]}"` — all elements, joined by spaces in scalar context.
+        // `"${arr[@]}"` — all elements, joined in scalar context with the
+        // first IFS char (`ifs_join`), which is what bash does. A hardcoded
+        // space was wrong whenever the script assigned IFS.
         if let Some(base) = name.strip_suffix("[@]").or_else(|| name.strip_suffix("[*]")) {
-            return Some(format!("join(' ', @{})", base));
+            return Some(ifs_join(&format!("@{base}")));
         }
         return Some(var_read(&name));
     }
@@ -11653,10 +11716,10 @@ fn compound_expansion_expr(inner: &str) -> Option<String> {
             // bash "${arr[@]}" inside double quotes joins on the first IFS
             // char; a space matches the corpus' `IFS=$'\n' sorted=(...)` and
             // `echo "${arr[@]}"` spellings that flow through here.
-            return Some(format!("join(' ', @{{{rest}}})"));
+            return Some(ifs_join(&format!("@{{{rest}}}")));
         }
         // A hash: `${h[@]}` is its VALUES.
-        return Some(format!("join(' ', values %{{{rest}}})"));
+        return Some(ifs_join(&format!("values %{{{rest}}}")));
     }
     // `${name[key]}` — one element. `key` may be a nested expansion; handle
     // only a literal key (a dynamic one cannot be resolved at this point).
