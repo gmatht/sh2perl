@@ -58,6 +58,20 @@ lazy_static::lazy_static! {
 
 /// `set ` or `set -g ` — `-g` while inside a function body, so bash's global
 /// assignment semantics survive the lowering. See [`FUNC_DEPTH`].
+/// The `| sort` suffix the `ls` lowering appends (GNU `ls` sorts; busybox
+/// does not). Kept as a constant because the REDIRECT arm has to splice it
+/// after the redirects and re-assert `ls`'s status.
+const LS_SORT_SUFFIX: &str = " | sort";
+
+/// The status re-assertion that accompanies [`LS_SORT_SUFFIX`]. `sort`
+/// SUCCEEDS on empty input, so the pipe would report sort's status where bash
+/// reports `ls`'s. The corpus source never has its own pipe here — the `| sort`
+/// is entirely ours — so the status must be restored. It is a following
+/// STATEMENT, because `$pipestatus` is only meaningful immediately after the
+/// pipeline, and a `; or test …` suffix would leave the compound at the `or`'s
+/// (zero) status.
+const LS_SORT_STATUS: &str = "; test $pipestatus[1] -eq 0";
+
 fn set_prefix() -> &'static str {
     if *FUNC_DEPTH.lock().unwrap() > 0 { "set -g " } else { "set " }
 }
@@ -201,6 +215,44 @@ fn body_read_names(st: &IrStmt, out: &mut HashSet<String>) {
 
 /// The names a subshell body assigns — used to give the group its own scope
 /// (see the `IrStmt::Subshell` arm).
+/// Emit the shadowing rebinds that give a subshell group its own copy of the
+/// variables it writes.
+///
+/// bash forks: `(a=2)` runs on a copy, so the parent keeps its value
+/// (`049_local` pins the restoration after `(a=2)`). fish's `begin … end`
+/// shares the parent scope, so each name the group WRITES is first rebound to
+/// a block-local holding the parent's value (`set -l a $a`). Every later write
+/// inside the group updates that local, which is why this is one declaration
+/// per name rather than `-l` per write.
+fn emit_subshell_shadow(body: &[IrStmt], out: &mut String) {
+    let mut names = Vec::new();
+    for n in subshell_assigned_names(body) {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    for n in names {
+        // A no-op when the name is unset (it declares an empty local, which is
+        // what bash's fork would have seen too).
+        out.push_str(&format!("    set -l {n} ${n}\n"));
+    }
+}
+
+/// The names a background group READS but does not itself declare — the shell
+/// state a fork would have copied in.
+fn background_read_names(body: &[IrStmt]) -> Vec<String> {
+    let mut read = HashSet::new();
+    for b in body {
+        body_read_names(b, &mut read);
+    }
+    for n in subshell_assigned_names(body) {
+        read.remove(&n);
+    }
+    let mut v: Vec<String> = read.into_iter().filter(|n| is_plain_var(n)).collect();
+    v.sort();
+    v
+}
+
 fn subshell_assigned_names(body: &[IrStmt]) -> Vec<String> {
     fn walk(body: &[IrStmt], out: &mut Vec<String>) {
         for st in body {
@@ -1062,37 +1114,65 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
 
     if needs_grep_p(&prog.stmts) {
         out.push_str("\n");
+        // The polyfill is FISH, not sh: the previous body was bash syntax
+        // (`grep_p() {`, `case … esac`, `[ "$#" -gt 0 ]`) emitted into a fish
+        // file, so any program that actually needed it died with
+        // "Unexpected ')' found, expecting '}'" while reading the file —
+        // killing every statement, not just the grep. It went unnoticed
+        // because the prologue is only emitted when an `-P` pattern is not
+        // ERE-safe, which no corpus file did until the `-Pc` fix made
+        // grep_p.sh reach it.
         out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, pcregrep/pcre2grep, or perl\n");
-        out.push_str("grep_p() {\n");
-        // Leading grep flags (e.g. `-o -i`) pass through before the pattern;
-        // the first non-flag arg is the pattern, the rest are files. The
-        // renderer emits `grep_p FLAGS PATTERN [FILES…]` — without this a
-        // `grep_p -o PAT` call would treat `-o` as the pattern.
-        out.push_str("    _gp_flags=\n");
-        out.push_str("    while [ \"$#\" -gt 0 ]; do\n");
-        out.push_str("        case \"$1\" in\n");
-        out.push_str("            --) shift; break ;;\n");
-        out.push_str("            -*) _gp_flags=\"$_gp_flags $1\"; shift ;;\n");
-        out.push_str("            *) break ;;\n");
-        out.push_str("        esac\n");
-        out.push_str("    done\n");
-        out.push_str("    [ \"$#\" -eq 0 ] && return 1\n");
-        out.push_str("    _gp_pat=\"$1\"; shift\n");
-        out.push_str("    if grep -P $_gp_flags -- \"$_gp_pat\" \"$@\" 2>/dev/null; then return; fi\n");
+        out.push_str("function grep_p\n");
+        out.push_str("    set -l _gp_flags\n");
+        // Leading grep flags (`-o`, `-i`, …) pass through before the pattern;
+        // the first non-flag argument is the pattern and the rest are files.
+        out.push_str("    while count $argv >/dev/null; and test (count $argv) -gt 0\n");
+        out.push_str("        if test $argv[1] = --\n");
+        out.push_str("            set -e argv[1]\n");
+        out.push_str("            break\n");
+        out.push_str("        else if string match -qr '^-' -- $argv[1]\n");
+        out.push_str("            set -a _gp_flags $argv[1]\n");
+        out.push_str("            set -e argv[1]\n");
+        out.push_str("        else\n");
+        out.push_str("            break\n");
+        out.push_str("        end\n");
+        out.push_str("    end\n");
+        out.push_str("    if test (count $argv) -eq 0\n");
+        out.push_str("        return 1\n");
+        out.push_str("    end\n");
+        out.push_str("    set -l _gp_pat $argv[1]\n");
+        out.push_str("    set -e argv[1]\n");
+        out.push_str("    if grep -P $_gp_flags -- $_gp_pat $argv 2>/dev/null\n");
+        out.push_str("        return 0\n");
+        out.push_str("    end\n");
+        out.push_str("    if command -v ggrep >/dev/null 2>&1\n");
+        out.push_str("        ggrep -P $_gp_flags -- $_gp_pat $argv\n");
+        out.push_str("        return $status\n");
+        out.push_str("    end\n");
+        out.push_str("    if command -v pcre2grep >/dev/null 2>&1\n");
+        out.push_str("        pcre2grep $_gp_flags -- $_gp_pat $argv\n");
+        out.push_str("        return $status\n");
+        out.push_str("    end\n");
+        out.push_str("    if command -v pcregrep >/dev/null 2>&1\n");
+        out.push_str("        pcregrep $_gp_flags -- $_gp_pat $argv\n");
+        out.push_str("        return $status\n");
+        out.push_str("    end\n");
+        // Last resort: perl. `-o` needs only the MATCHES, the default has to
+        // print whole lines — two programs, chosen by the flag string.
         out.push_str(
-            "    if command -v ggrep >/dev/null 2>&1; then ggrep -P $_gp_flags -- \"$_gp_pat\" \"$@\"; return; fi\n",
+            "    set -l _gp_perl 'BEGIN{$p=shift @ARGV} print if /$p/'\n",
         );
         out.push_str(
-            "    if command -v pcre2grep >/dev/null 2>&1; then pcre2grep $_gp_flags \"$_gp_pat\" \"$@\"; return; fi\n",
+            "    if string match -q -- '*-o*' -- (string join ' ' -- $_gp_flags)\n",
         );
         out.push_str(
-            "    if command -v pcregrep >/dev/null 2>&1; then pcregrep $_gp_flags \"$_gp_pat\" \"$@\"; return; fi\n",
+            "        set _gp_perl 'BEGIN{$p=shift @ARGV} while (/$p/g) { print \"$&\\n\" }'\n",
         );
-        out.push_str("    case \"$_gp_flags\" in\n");
-        out.push_str("        *-o*) perl -ne 'BEGIN{$p=shift @ARGV} while (/$p/g) { print \"$&\\n\" }' \"$_gp_pat\" \"$@\" ;;\n");
-        out.push_str("        *)    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$_gp_pat\" \"$@\" ;;\n");
-        out.push_str("    esac\n");
-        out.push_str("}\n\n");
+        out.push_str("    end\n");
+        out.push_str("    perl -ne $_gp_perl -- $_gp_pat $argv\n");
+        out.push_str("    return $status\n");
+        out.push_str("end\n\n");
     }
     // The body is rendered FIRST so the runtime preamble can be decided by
     // what it actually REFERENCES. The old code pre-scanned the IR for
@@ -1747,14 +1827,17 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::Subshell(body) => {
             indent(out, d);
             out.push_str("begin\n");
-            // bash's `( … )` runs in a SUBSHELL so its writes are discarded,
-            // but fish has no scope-creating group that reproduces that
-            // without also breaking LOOP-CARRIED state: `set -l x` inside a
-            // `while` body makes a fresh local per iteration and the loop
-            // never terminates (092_for_arith_func hung). The group is
-            // therefore rendered with plain `set`, which is right for every
-            // read-after-write inside the group and only differs from bash
-            // for a write that a LATER sibling statement reads (049_local).
+            // bash's `( … )` runs in a SUBSHELL: every variable it writes is
+            // discarded when it exits (049_local prints `2` for the `(echo $a)`
+            // inside the group and `1` after it).
+            //
+            // The isolation is a SHADOWING DECLARATION at the top of the group,
+            // not `-l` on each write: `set -l x $x` rebinds the name to a
+            // block-local, after which every ordinary write inside updates that
+            // local — so loop-carried state still works, which per-write `-l`
+            // broke (a fresh local per iteration never terminates;
+            // 092_for_arith_func hung).
+            emit_subshell_shadow(body, out);
             for b in body {
                 stmt_to_fish(b, d + 1, out)?;
             }
@@ -1771,16 +1854,31 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     return Ok(());
                 }
             }
-            indent(out, d);
-            out.push_str("begin\n");
-            // A background job is a fork in bash, but the write isolation has
-            // the same loop-carried-state hazard as the subshell group above,
-            // so the body renders with plain `set`.
+            // A background job must both FORK (bash discards its writes —
+            // 105_background_copy_semantics pins `x=1` after `{ x=2; }&`) and
+            // OVERLAP the parent. fish's `begin … end &` does NEITHER: it
+            // BLOCKS until the group finishes (measured — `begin; sleep 1; end
+            // &; echo b` took 1.0s and printed `a` first, where bash prints `b`
+            // first), so 048_subprocess and 063_06 lost their interleaving. A
+            // child `fish -c` is a real process: it overlaps, it inherits the
+            // CWD, and its writes cannot reach the parent. The variables the
+            // group READS are passed through the environment, which is how a
+            // fork's copy of shell state is spelled here.
+            let vars = background_read_names(body);
+            let mut pre = String::new();
+            for v in &vars {
+                pre.push_str(&format!("set -gx {v} ${v}; "));
+            }
+            let mut inner = String::new();
             for b in body {
-                stmt_to_fish(b, d + 1, out)?;
+                stmt_to_fish(b, 0, &mut inner)?;
             }
             indent(out, d);
-            out.push_str("end &\n");
+            out.push_str(&format!(
+                "{}fish -c {} &\n",
+                pre,
+                fish_single_quoted(inner.trim_end())
+            ));
             Ok(())
         }
         IrStmt::Block(body) => {
@@ -3035,6 +3133,20 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
                     out
                 };
                 let mut line = herestring_wrap_fish(&plain, inner)?;
+                // `ls … 2>/dev/null | sort` — the redirect belongs to `ls`.
+                // Appending `| sort` to the rendered command put the redirect
+                // on the SORT side, so a failing `ls` wrote its diagnostic to
+                // the inherited stderr and `|| echo X` never fired
+                // (000__04e/000__03 printed nothing where bash printed
+                // "No test files found"). The splice also re-asserts `ls`'s own
+                // status, which the pipe would otherwise replace with sort's.
+                if let Some(base) = line.strip_suffix(LS_SORT_SUFFIX) {
+                    let mut line = format!("{base}{specs}{LS_SORT_SUFFIX}");
+                    if !ps_ins.is_empty() {
+                        line = lower_procsub_inline_fish(&ps_ins, &line)?;
+                    }
+                    return Ok(format!("{line}{LS_SORT_STATUS}"));
+                }
                 if !ps_ins.is_empty() {
                     line = lower_procsub_inline_fish(&ps_ins, &line)?;
                 }
@@ -3461,8 +3573,26 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                         while i + 1 < words.len() {
                             if let IrExpr::Str(fl, _) = &words[i] {
                                 if fl == "-P" || fl == "--perl-regexp" {
-                                    if let IrExpr::Str(pat, _) = &words[i + 1] {
-                                        if !ere_safe(pat) {
+                                    // The PATTERN is the first non-flag word
+                                    // after `-P`, not necessarily the next one
+                                    // (`grep -Pc PAT` has `-c` in between) —
+                                    // reading a fixed slot checked `-c`,
+                                    // `ere_safe("-c")` is true, and the
+                                    // polyfill prologue was never emitted, so
+                                    // the new `grep_p` call site had no
+                                    // definition at all.
+                                    let pat = words[i + 1..]
+                                        .iter()
+                                        .find_map(|w| match w {
+                                            IrExpr::Str(p, _)
+                                                if !(p.starts_with('-') && p.len() > 1) =>
+                                            {
+                                                Some(p.clone())
+                                            }
+                                            _ => None,
+                                        });
+                                    if let Some(pat) = pat {
+                                        if !ere_safe(&pat) {
                                             return true;
                                         }
                                     }
@@ -4124,7 +4254,25 @@ fn exec_line_to_fish(
             .iter()
             .position(|a| matches!(a, IrExpr::Str(s, _) if s == "-P" || s == "--perl-regexp"))
         {
-            let use_e = matches!(args.get(pidx + 1), Some(IrExpr::Str(p, _)) if ere_safe(p));
+            // The pattern can be the NEXT arg (`grep -P PAT`) or, when the
+            // source combined flags (`grep -Pc PAT`), the arg after the other
+            // flags — so scan forward rather than looking at one fixed slot.
+            // Reading a fixed `pidx + 1` found `-c` here, `ere_safe("-c")` is
+            // true, and a PCRE lookahead pattern was silently lowered to
+            // `grep -E`, where it matches NOTHING (grep_p printed
+            // `fqdn-count=0` where bash printed 1).
+            let pat = args
+                .iter()
+                .skip(pidx + 1)
+                .find_map(|a| match a {
+                    IrExpr::Str(p, _) if !(p.starts_with('-') && p.len() > 1) => Some(p.clone()),
+                    _ => None,
+                })
+                .or_else(|| match args.get(pidx + 1) {
+                    Some(IrExpr::Str(p, _)) => Some(p.clone()),
+                    _ => None,
+                });
+            let use_e = pat.as_deref().map(ere_safe).unwrap_or(true);
             let mut words: Vec<String> = Vec::new();
             words.push(if use_e {
                 "grep -E".into()
@@ -4352,7 +4500,7 @@ fn exec_line_to_fish(
                 out.push(' ');
                 out.push_str(&word_to_fish(w)?);
             }
-            out.push_str(" | sort");
+            out.push_str(LS_SORT_SUFFIX);
             return Ok(out);
         }
     }
@@ -6303,8 +6451,12 @@ fn default_if_unset_fish(name: &str, default: &str) -> String {
 /// characters, so `var_ref_to_fish` fell through to its identifier-only
 /// fallback and emitted the unrelated `$arr1`, which is unset.
 fn default_if_unset_expr_fish(subj: &str, default: &str) -> String {
+    // The WHOLE conditional is piped through `string collect`: fish's command
+    // substitution splits its output on NEWLINES, so a multi-line default
+    // (`${x:-bar\nbaz}`) came back as a list and `"$x"` then joined it with
+    // spaces — `bar baz` where bash prints two lines (param-expand-multiline).
     format!(
-        "(test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {})",
+        "(begin; test -n \"{subj}\"; and printf '%s' \"{subj}\"; or printf '%s' {}; end | string collect)",
         dq_word(default)
     )
 }
