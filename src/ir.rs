@@ -2239,6 +2239,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                         cmd.push_str(&delim);
                     }
+                    // Any body stashed by `append_redirect_frag` (a heredoc
+                    // on a stage of a pipeline inner) belongs at the end of
+                    // this line too.
+                    cmd.push_str(&take_heredoc_tail());
                     if ok {
                         for line in prelude {
                             emit_indent(out, indent);
@@ -3134,7 +3138,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // (verified via `x=$(printf "%s\n" …)` and
                         // `$(echo hi)` — the pre-existing capture bug).
                         let shell_cmd = match inner_expr.as_ref() {
-                            IrExpr::Arrow(stmts) => stmts_to_shell_cmd(stmts),
+                            // A heredoc inside the captured body (`x=$(cat
+                            // <<-EOF …)`) collects its body in the thread-
+                            // local during the rebuild; it belongs at the END
+                            // of the command line, so append it here (the
+                            // outermost call site of the rebuild).
+                            IrExpr::Arrow(stmts) => stmts_to_shell_cmd(stmts)
+                                .map(|c| format!("{c}{}", take_heredoc_tail())),
                             _ => None,
                         };
                         let open_expr = if let Some(cmd) = shell_cmd {
@@ -5987,6 +5997,31 @@ fn var_ref_name(e: &IrExpr) -> Option<String> {
     }
 }
 
+thread_local! {
+    /// Heredoc bodies collected by `append_redirect_frag` while a single
+    /// shell command string is being rebuilt. They are appended AFTER the
+    /// whole line (see `take_heredoc_tail`), because a heredoc body must
+    /// follow every pipeline stage and redirect on that line.
+    static HEREDOC_BODIES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the heredoc bodies collected during one command rebuild and render
+/// the trailing `\n<body>\nDELIM` blocks. Empty string when there were none.
+fn take_heredoc_tail() -> String {
+    let bodies = HEREDOC_BODIES.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let mut tail = String::new();
+    for body in bodies {
+        tail.push('\n');
+        tail.push_str(&body);
+        if !body.ends_with('\n') {
+            tail.push('\n');
+        }
+        tail.push_str("_SH2DOC_");
+    }
+    tail
+}
+
 /// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, ` <<< s`,
 /// ` <<DELIM\nbody\nDELIM`) to cmd. Returns false for unknown modes.
 fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) -> bool {
@@ -6039,14 +6074,32 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) 
             return true;
         }
         "heredoc" | "heredoc-tabs" => {
-            let body = &tstr;
-            cmd.push_str(" <<'_SH2DOC_'");
-            cmd.push('\n');
-            cmd.push_str(body);
-            if !body.ends_with('\n') {
-                cmd.push('\n');
-            }
-            cmd.push_str("_SH2DOC_");
+            // The heredoc BODY must not be inlined here. This function
+            // appends to ONE STAGE of a pipeline, and stages are joined
+            // with ` | `: inlining put the body and its terminator BEFORE
+            // the remaining stages, so `cat <<EOF | grep -v '^#' | sed s/^/  /`
+            // became
+            //     cat <<'_SH2DOC_'
+            //     <body>
+            //     _SH2DOC_ | grep -v '^#' | sed 's/^/  /'
+            // and bash read `_SH2DOC_ | grep …` as a CONTINUATION of the
+            // body (warning "here-document delimited by end-of-file") and
+            // printed the raw body (063_05, heredoc-binary-data,
+            // heredoc-unclosed, 063_hard_to_parse).
+            //
+            // Emit just the operator now and stash the body in a
+            // thread-local; the caller appends every stashed body after
+            // the complete command line (HEREDOC_TAIL).
+            //
+            // `<<-` (heredoc-tabs) keeps its dash: bash strips leading TABS
+            // from both the body and the terminator, and the delimiter must
+            // still be found after that stripping. The tab-stripping is a
+            // property of `<<-` itself, so the body goes out verbatim and
+            // bash does the stripping (parse-heredoc-tab: stripping it here
+            // would double-apply on a body that legitimately keeps tabs).
+            let op = if mode == "heredoc-tabs" { " <<-" } else { " <<" };
+            cmd.push_str(&format!("{op}'_SH2DOC_'"));
+            HEREDOC_BODIES.with(|b| b.borrow_mut().push(tstr.clone()));
             return true;
         }
         // Process substitution (core-request perl-shir-20260806-1930):
@@ -6487,6 +6540,16 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
     if parts.is_empty() {
         None
     } else {
+        // NOTE: no `take_heredoc_tail()` here. This function is called both
+        // at the top level AND for a single STAGE of a pipeline (via
+        // `arrow_to_cmd`), and a stage must not carry the body: the body
+        // belongs after the whole line. Draining here put
+        //     cat <<'_SH2DOC_'
+        //     <body>
+        //     _SH2DOC_ | grep …
+        // inside the stage text (063_05). The outermost caller
+        // (`stages_to_shell_cmd`, or the Redirect arm for a standalone
+        // command) appends the tail once, after every stage and redirect.
         Some(parts.join("; "))
     }
 }
@@ -6499,12 +6562,16 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
 fn stages_to_shell_cmd(stages: &[&IrExpr]) -> Option<String> {
     let mut out: Vec<String> = Vec::with_capacity(stages.len());
     for s in stages {
-        out.push(arrow_to_cmd(s)?);
+        let c = arrow_to_cmd(s)?;
+        out.push(c);
     }
     if out.is_empty() {
         None
     } else {
-        Some(out.join(" | "))
+        // A heredoc body collected from any stage belongs at the END of the
+        // complete pipeline line, never inside a stage (see
+        // `append_redirect_frag`'s heredoc arm).
+        Some(format!("{}{}", out.join(" | "), take_heredoc_tail()))
     }
 }
 
@@ -7011,7 +7078,10 @@ fn capture_call_to_cmd(call: &IrExpr) -> Option<String> {
         if func == "capture" || func == "captureWords" {
             for a in args {
                 if let Some(cmd) = arrow_to_cmd(a) {
-                    return Some(cmd);
+                    // A heredoc in the captured body (`$(cat <<-EOF …)`) puts
+                    // its body at the end of the command line, not inside the
+                    // arrow's own text (see `append_redirect_frag`).
+                    return Some(format!("{cmd}{}", take_heredoc_tail()));
                 }
             }
         }
@@ -9535,6 +9605,12 @@ fn pipeline_leaf_capture(e: &IrExpr) -> Option<String> {
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Capture { expr, native } => {
+            // A heredoc in the captured body (`x=$(cat <<-EOF …)`) supplies
+            // its body at the END of the command line, so it travels with
+            // whatever this arm returns (see `append_redirect_frag`). Drain
+            // once, here: a heredoc-free body drains nothing and the tail is
+            // the empty string.
+            let hd_tail = take_heredoc_tail();
             // Prefer the REBUILT SHELL TEXT for Arrow bodies: the old
             // fallback rendered the Arrow as a Perl anonymous sub
             // (`sub { … }`) and fed it to bash -c — which is not shell.
@@ -9702,7 +9778,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             } else {
                 // Shell backtick result — use open() based code instead of qx{...}
                 // to avoid check_qx violations.
-                cmd_str_to_open_perl(&inner)
+                //
+                // A heredoc body collected from the captured command goes at
+                // the END of the command line, after every stage/redirect.
+                cmd_str_to_open_perl(&format!("{inner}{hd_tail}"))
             }
         }
 
