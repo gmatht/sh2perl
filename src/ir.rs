@@ -7862,9 +7862,16 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         "set" => {
             // `set -- a b c` replaces the positional parameters.
             if words.first().and_then(|w| call_arg_str(w)).as_deref() == Some("--") {
-                let items: Vec<String> = words[1..].iter().map(|w| render_word(w)).collect();
+                let items: Vec<String> = words[1..].iter().map(|w| set_arg_item(w)).collect();
                 emit_indent(out, indent);
                 out.push_str(&format!("@ARGV = ({});\n", items.join(", ")));
+                // Keep the file-scope COUNT in step: `$#` reads and the
+                // `__sh_pos` helper consult `$__sh_args_n`, and a `set --`
+                // that did not refresh it left them looking at the OLD
+                // list (parse-at-slice-param printed no space where bash
+                // printed one).
+                emit_indent(out, indent);
+                out.push_str("$__sh_args_n = scalar(@ARGV);\n");
             }
             // Other `set` forms are option toggles — no runtime effect.
             emit_indent(out, indent);
@@ -8074,6 +8081,46 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
 }
 
 /// `echo` lowering — join args with single spaces, newline unless `-n`.
+/// One word of a `set -- …` argument list, as Perl source.
+///
+/// A positional SLICE (`"${@:3}"` / `"$*"`) is special: bash's `@` form
+/// SPLICES its elements as separate words even when quoted, so the slice
+/// must reach the list as a LIST, not as a joined string. The renderer emits
+/// `join(' ', __sh_pos(N))` for the scalar reading; strip the join so the
+/// elements land individually (parse-at-slice-param: `set -- "$1" "$tmp"
+/// "${@:3}"` with no arguments is TWO empty parameters in bash, and the
+/// following `echo "${@:1}"` prints a single space).
+fn set_arg_item(w: &IrExpr) -> String {
+    let r = render_word(w);
+    // The renderer's own spelling of a positional slice, before the
+    // post-pass rewrites it (`join(' ', @ARGV[2..$#ARGV])`), and the
+    // post-pass's own output (`join(' ', __sh_pos(3))`).
+    for prefix in ["join(' ', @ARGV[", "join(' ', __sh_pos("] {
+        if let Some(inner) = r.strip_prefix(prefix) {
+            let inner = inner.strip_suffix(')').unwrap_or(inner);
+            if prefix.ends_with('[') {
+                // `@ARGV[2..$#ARGV]` — the trailing `]` is still on `inner`
+                // (the prefix stops at the bracket), so re-emit the list
+                // slice from the two bounds and drop the spare bracket.
+                if let Some((lo, hi)) = inner.split_once("..") {
+                    // Guard the descending range: `@a[2..0]` counts DOWN and
+                    // fabricates elements (Perl), where bash's slice is
+                    // empty. The helper form is empty-safe, so defer to it
+                    // when the bound is not a plain upper limit.
+                    let lo = lo.trim().to_string();
+                    let hi = hi.trim_end_matches(']').trim().to_string();
+                    return format!(
+                        "(do {{ my $__e = {hi}; $__e < {lo} ? () : @ARGV[{lo}..$__e] }})"
+                    );
+                }
+            } else {
+                return format!("__sh_pos({inner})");
+            }
+        }
+    }
+    r
+}
+
 fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
     let mut args = words;
     let mut newline = true;

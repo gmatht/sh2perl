@@ -127,7 +127,15 @@ fn bind_toplevel_positional_params(src: &str) -> String {
     // renderer produces for `$1` / `${@:…}`. The slice fix above already
     // rewrote `@ARGV[lo..hi]` slices, so what is left here is a bare
     // element read.
-    if !src.contains("$ARGV[") && !src.contains("$#ARGV") {
+    // `@__sh_args` / `$__sh_args_n` already in the body (a `set --` writes
+    // them, and `__sh_pos` reads them) still need the DECLARATIONS and the
+    // file-scope binding — without them `$__sh_args_n` is an undeclared
+    // global and the program dies under `use strict`.
+    if !src.contains("$ARGV[")
+        && !src.contains("$#ARGV")
+        && !src.contains("@__sh_args")
+        && !src.contains("$__sh_args_n")
+    {
         return src.to_string();
     }
     let out = replace_all_outside_strings(src, "$ARGV[", "$__sh_args[");
@@ -3998,14 +4006,27 @@ sub __sh_pos {
     # list contributes zero fields to the enclosing join, and a non-empty
     # one contributes exactly its elements. The offset is 1-based, as bash
     # counts it; a non-positive or past-the-end offset is empty.
+    # This sub is injected right after the `use` block, BEFORE the
+    # file-scope `our @__sh_args; our $__sh_args_n;` declarations, so a bare
+    # read here is a `use strict` COMPILE error and the whole program
+    # aborts. Re-declaring the package globals inside the sub is always
+    # legal and independent of preamble ordering (same package, so it still
+    # sees the caller's values).
+    our (@__sh_args, $__sh_args_n);
     my $__off = shift();
     my $__len = shift();
     return () if $__off < 1;
-    return () if $__off > $#ARGV + 1;
-    my $__end = defined($__len) ? $__off + $__len - 1 : $#ARGV;
-    $__end = $#ARGV if $__end > $#ARGV;
+    return () if $__off > $__sh_args_n;
+    # `@__sh_args` / `$__sh_args_n`, NOT `@ARGV` / `$#ARGV`: this helper is
+    # injected AFTER `post_pass`, which is what rebinds the file-scope
+    # positional reads to `@__sh_args` (a `set --` writes there, and `do
+    # FILE` runs with `@ARGV` already emptied). Reading `@ARGV` here saw a
+    # different (empty) list than the statements around it, so
+    # parse-at-slice-param printed no space where bash printed one.
+    my $__end = defined($__len) ? $__off + $__len - 1 : $__sh_args_n - 1;
+    $__end = $__sh_args_n - 1 if $__end > $__sh_args_n - 1;
     return () if $__end < $__off - 1;
-    return @ARGV[$__off - 1 .. $__end];
+    return @__sh_args[$__off - 1 .. $__end];
 }
 "#;
 /// {@link SLICE_PREAMBLE}, continued: the array-slice helper of Fix 16.
