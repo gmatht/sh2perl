@@ -20,13 +20,21 @@
 //!     (`If { cond: c, then: [], else_: skip }`)
 //!   - goto out of nested loops                          -> flag var + `break`
 //!     (`__g<label>_<n>`), each outer loop body ends with `if (flag) break`
+//!   - forward goto to a label in the SAME statement list -> the skipped
+//!     statements are dead-coded (`If { cond: false }`); no flag is needed.
+//!     This is the Go idiom `for { switch { … default: goto L } L: rest }`
+//!     (posix-sh-go main.go:2072, zig-sh-go main.go:1302, and go-sh's own
+//!     `goto matched` format-spec scan) — the jump skips the tail of the
+//!     switch and continues at the label, WITHOUT leaving the loop.
 //! Anything else is left in place and the renderers refuse loudly
 //! (their `Label`/`Goto` arms emit the Unsupported marker), keeping the
 //! failure-driven loops in charge.
 //!
 //! Pinned by frontends/c-sh-go/testdata/t27_goto.c (backward -> DoWhile),
 //! t30_goto_nested.c (multi-level exit -> flag), t31_goto_forward.c
-//! (forward cleanup -> inverted If).
+//! (forward cleanup -> inverted If), plus tests/goto_c_frontend_pins.rs
+//! and tests/goto_restructure_e2e.rs (the Go frontend's own gotos, against
+//! native `go run`).
 
 use crate::ir::*;
 use crate::shir_passes::{PassContext, Transform};
@@ -289,7 +297,7 @@ fn handle_guarded_goto(
 
 /// Descent-path step: which sub-list of the stmt at the given index to
 /// enter next.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Branch {
     Body,
     Then,
@@ -332,7 +340,7 @@ fn find_nested(root: &IrStmt, top_idx: usize, labels: &[(String, usize)]) -> Opt
     descend_from(
         root,
         top_idx,
-        0,
+        None,
         labels,
         &mut path,
         &mut loop_steps,
@@ -341,11 +349,35 @@ fn find_nested(root: &IrStmt, top_idx: usize, labels: &[(String, usize)]) -> Opt
     out
 }
 
+/// `s` is a statement that IS a loop (its `body` may carry a meaningful
+/// `break`). Blocks/Subshells/Functions have a `body` too, but a `break`
+/// inside them targets an enclosing loop of the SOURCE, not the node —
+/// so they must never be recorded as loop steps or receive a guard.
+fn is_loop_stmt(s: &IrStmt) -> bool {
+    matches!(
+        s,
+        IrStmt::While { .. }
+            | IrStmt::DoWhile { .. }
+            | IrStmt::For { .. }
+            | IrStmt::ForInit { .. }
+    )
+}
+
 /// Record the path steps into `s`'s nested statement lists (tree order).
+///
+/// `loop_step` is the path index of the nearest enclosing LOOP body (the
+/// loop currently being descended into), or `None` at the top level. It is
+/// pushed onto `loop_steps` when the goto is found so that gotos reached
+/// through a NON-body branch (a `Case` clause, an `If` arm, a pipeline
+/// stage) still know how many loops enclose them. Without it the descent
+/// through `CaseClause`/`Then`/`Else`/`Stage` silently DROPPED the loop
+/// (a `default: goto L` in a switch inside a `for` recorded zero loop
+/// steps), so `handle_nested` had no loop to guard and the tail after the
+/// statement was left to run with the flag set.
 fn descend_from(
     s: &IrStmt,
     idx: usize,
-    lc: usize,
+    loop_step: Option<usize>,
     labels: &[(String, usize)],
     path: &mut Vec<(usize, Branch)>,
     loop_steps: &mut Vec<usize>,
@@ -361,33 +393,30 @@ fn descend_from(
             else_,
             ..
         } => {
-            push_and_walk(then, idx, Branch::Then, lc, labels, path, loop_steps, out);
+            push_and_walk(then, idx, Branch::Then, loop_step, labels, path, loop_steps, out);
             for (k, (_, b)) in elsifs.iter().enumerate() {
-                push_and_walk(b, idx, Branch::Elsif(k), lc, labels, path, loop_steps, out);
+                push_and_walk(b, idx, Branch::Elsif(k), loop_step, labels, path, loop_steps, out);
             }
-            push_and_walk(else_, idx, Branch::Else, lc, labels, path, loop_steps, out);
+            push_and_walk(else_, idx, Branch::Else, loop_step, labels, path, loop_steps, out);
         }
         IrStmt::While { body, .. }
         | IrStmt::DoWhile { body, .. }
         | IrStmt::For { body, .. }
         | IrStmt::ForInit { body, .. } => {
-            push_and_walk(
-                body,
-                idx,
-                Branch::Body,
-                lc + 1,
-                labels,
-                path,
-                loop_steps,
-                out,
-            );
+            // this node IS a loop: the body list it opens gets path index
+            // `path.len()`, which becomes the enclosing-loop step for
+            // everything below it.
+            let step = Some(path.len());
+            push_and_walk(body, idx, Branch::Body, step, labels, path, loop_steps, out);
         }
         IrStmt::Block(body)
         | IrStmt::Subshell(body)
         | IrStmt::Background(body)
         | IrStmt::Redirect { inner: body, .. }
         | IrStmt::Function { body, .. } => {
-            push_and_walk(body, idx, Branch::Body, lc, labels, path, loop_steps, out);
+            // transparent for loop nesting: a non-loop body must inherit
+            // the enclosing loop step, not clear it.
+            push_and_walk(body, idx, Branch::Body, loop_step, labels, path, loop_steps, out);
         }
         IrStmt::Case { clauses, .. } => {
             for (k, c) in clauses.iter().enumerate() {
@@ -395,7 +424,7 @@ fn descend_from(
                     &c.body,
                     idx,
                     Branch::CaseClause(k),
-                    lc,
+                    loop_step,
                     labels,
                     path,
                     loop_steps,
@@ -409,7 +438,7 @@ fn descend_from(
                     stg,
                     idx,
                     Branch::Stage(k),
-                    lc,
+                    loop_step,
                     labels,
                     path,
                     loop_steps,
@@ -426,7 +455,7 @@ fn push_and_walk(
     list: &[IrStmt],
     idx: usize,
     br: Branch,
-    lc: usize,
+    loop_step: Option<usize>,
     labels: &[(String, usize)],
     path: &mut Vec<(usize, Branch)>,
     loop_steps: &mut Vec<usize>,
@@ -436,7 +465,12 @@ fn push_and_walk(
         return;
     }
     path.push((idx, br));
-    if br == Branch::Body {
+    // `loop_step` is the step of the loop this list is the body OF (None
+    // for a Block/If arm/pipeline stage that is not a loop body), so it is
+    // recorded only when it names THIS step — a goto reached through a
+    // non-body branch still inherits the enclosing loop from the caller.
+    let recorded = loop_step == Some(path.len() - 1);
+    if recorded {
         loop_steps.push(path.len() - 1);
     }
     for (j, st) in list.iter().enumerate() {
@@ -453,24 +487,77 @@ fn push_and_walk(
                 return;
             }
         }
-        descend_from(st, j, lc, labels, path, loop_steps, out);
+        descend_from(st, j, loop_step, labels, path, loop_steps, out);
         if out.is_some() {
             path.pop();
             return;
         }
     }
-    if br == Branch::Body {
+    if recorded {
         loop_steps.pop();
     }
     path.pop();
 }
 
-/// A goto nested inside K loops, targeting a top-level label after the
-/// loop chain: flag + break. The innermost loop is exited by the break;
-/// every outer loop body gets `if (flag) break` appended.
+/// Eliminate a goto whose target label is NOT a top-level sibling after the
+/// goto's enclosing loop. Three topologies reach here and they need
+/// different lowerings; what they share is that the jump's destination is
+/// the label, reachable by UNWINDING `hit.path` outward until a list that
+/// actually contains the label.
+///
+/// * **residual (a), cross-list** — the label is a top-level sibling after
+///   the ancestor: the jump leaves the loop chain. `flag = 1; break` exits
+///   the innermost loop, each outer loop body gets `if (flag) break`, and
+///   the tail between the ancestor and the label is guarded by the flag.
+/// * **ancestor-list** — the goto sits inside a NESTED list (a `Case`
+///   clause, an `If` arm) and the label is a later statement of one of the
+///   enclosing lists (the go-sh `for { switch { … default: goto L } L: rest }`
+///   shape at posix-sh-go main.go:2072 and zig-sh-go main.go:1302). The
+///   jump must abandon the inner list and continue at the label WITHOUT
+///   leaving the loop, so `break` is wrong. Both the skipped region (after
+///   the goto, out to the label's list) and the label's own tail stay put;
+///   only the skipped statements are dead-coded away.
+/// * **same-list** — a special case of the above where the goto's own list
+///   already holds the label.
 fn handle_nested(stmts: &mut Vec<IrStmt>, hit: Hit, n: &mut usize) -> bool {
     if hit.lpos <= hit.path.first().map(|(i, _)| *i).unwrap_or(usize::MAX) {
         return false; // label before/inside the loop chain — refuse
+    }
+    // A forward jump that never leaves a loop is lowered by dead-coding the
+    // skipped statements; only a jump that DOES leave a loop needs the
+    // flag+break machinery below.
+    if let Some(sites) = forward_skip_site(stmts, &hit.path, hit.goto_index, &hit.label) {
+        // Apply the ranges deepest-first: draining a deeper range does not
+        // move anything in an outer list, but a shallower drain would
+        // invalidate the deeper paths' indices.
+        let mut sites = sites;
+        sites.sort_by_key(|(p, _, _)| std::cmp::Reverse(p.len()));
+        for (prefix, from, to) in sites {
+            let list = descend_mut(stmts, &prefix);
+            let to = to.min(list.len());
+            if from >= to {
+                continue;
+            }
+            let mut skipped: Vec<IrStmt> = list.drain(from..to).collect();
+            // The dead region may still CONTAIN a goto (when the jump's
+            // ancestor had successors between the goto and this level).
+            // Leaving one there would make `restructure_pass` re-find it on
+            // the next iteration and never converge — and it is unreachable
+            // by construction, so a jump inside it can never be taken.
+            strip_jumps(&mut skipped);
+            if !skipped.is_empty() {
+                list.insert(
+                    from,
+                    IrStmt::If {
+                        cond: IrExpr::Str("false".to_string(), StrStyle::DoubleQuoted),
+                        then: vec![],
+                        elsifs: vec![],
+                        else_: skipped,
+                    },
+                );
+            }
+        }
+        return true;
     }
     let flag = fresh_flag(&hit.label, n);
     // 1. replace the goto with `flag = 1; break`
@@ -499,70 +586,284 @@ fn handle_nested(stmts: &mut Vec<IrStmt>, hit: Hit, n: &mut usize) -> bool {
             else_: vec![],
         });
     }
-    // 2b. GUARD THE TAIL between the goto's top-level ancestor and the
-    //     label. After the innermost `break` unwinds, every statement
-    //     in THIS list between them would otherwise run UNGUARDED (the
+    // 2b. GUARD THE TAIL between the goto and its label. After the
+    //     innermost `break` unwinds, every statement that sits between
+    //     them would otherwise run UNGUARDED with the flag set (the
     //     observed zig-sh-go spin: `no-match` printed forever because
     //     `i` never advanced — the flag was set but nothing read it).
     //     Skip the tail under the flag, and CLEAR the flag at the label
-    //     position so subsequent iterations start clean. Applies
-    //     generally: even with outer-loop guards, the unwind lands here.
+    //     position so subsequent iterations start clean.
+    //
+    //     By this point the jump is known to LEAVE a loop (a forward jump
+    //     that stays inside one returned above), so the label is either a
+    //     top-level sibling AFTER the ancestor — the c-sh-go / go-sh
+    //     `for { … goto L }; L: rest` shape — or, when the ancestor is the
+    //     loop itself and the label is its immediate sibling, there is no
+    //     tail and the guard degenerates to reading the flag once (which
+    //     is what an immediate exit needs: the loop body already broke
+    //     out, and the flag must be consumed exactly once).
     let anc_idx = hit.path.first().map(|(i, _)| *i);
-    if std::env::var("RSDBG").is_ok() {
-        eprintln!("RSDBG handle_nested label={} lpos={} path_len={} loops={:?} anc={:?}", hit.label, hit.lpos, hit.path.len(), hit.loop_steps, anc_idx);
-    }
-    if let Some(aidx) = anc_idx {
-        // recompute the label position (outer guards above may have
-        // spliced bodies deeper — the top level is untouched by them)
-        let lpos_now = stmts
-            .iter()
-            .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label))
-            .unwrap_or(hit.lpos);
-        if aidx + 1 < lpos_now {
-            let tail: Vec<IrStmt> = stmts.drain(aidx + 1..lpos_now).collect();
-            let guarded = IrStmt::If {
-                cond: var(&flag),
-                then: vec![],
-                elsifs: vec![],
-                else_: tail,
-            };
-            stmts.insert(aidx + 1, guarded);
-        }
-        // clear the flag where the label was (fall-through entry point)
-        let lpos_after = stmts
-            .iter()
-            .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label));
-        if let Some(lp) = lpos_after {
-            stmts[lp] = assign_stmt(&flag, st("0"));
-        } else {
-            // label not found (drained as part of the tail?) — append
-            // the clear at the insertion boundary instead
-            stmts.insert(aidx + 1, assign_stmt(&flag, st("0")));
-        }
+    let Some(aidx) = anc_idx else {
+        // the goto is itself at the top level of a list whose label is a
+        // sibling — no enclosing loop, so no unwind to wait for
+        stmts.remove(hit.lpos);
         return true;
+    };
+    let anc_is_loop = is_loop_stmt_at_root(stmts, aidx);
+    if !anc_is_loop && hit.lpos <= aidx {
+        return false; // label before/inside a non-loop ancestor — refuse
     }
-    // 3. remove the (now fall-through) label
-    stmts.remove(hit.lpos);
+    // recompute the label position (outer guards above may have
+    // spliced bodies deeper — the top level is untouched by them)
+    let lpos_now = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label))
+        .unwrap_or(hit.lpos);
+    if anc_is_loop && lpos_now > aidx {
+        // case (a): guard the region between the loop and its label. The
+        // `else_` holds the tail; when the label is immediately adjacent
+        // the `else_` is empty and the If degenerates to reading the flag
+        // (which is exactly what an immediate exit needs — the loop body
+        // already broke out, and the flag must be consumed once).
+        let tail: Vec<IrStmt> = stmts.drain(aidx + 1..lpos_now).collect();
+        let guarded = IrStmt::If {
+            cond: var(&flag),
+            then: vec![],
+            elsifs: vec![],
+            else_: tail,
+        };
+        stmts.insert(aidx + 1, guarded);
+    }
+    // clear the flag where the label was (fall-through entry point)
+    let lpos_after = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label));
+    if let Some(lp) = lpos_after {
+        stmts[lp] = assign_stmt(&flag, st("0"));
+    }
     true
 }
 
-/// True when the stmt at the given path step is a real loop (the only
-/// stmt kind whose `body` is a loop body). A `Block` at the same
-/// position would also be a `Body` step (Block's body is its child list)
-/// but is NOT a loop — appending `if (flag) break` there escapes the
-/// program. Used by `handle_nested` to skip non-loop steps.
+/// Decide how to eliminate a goto that is NOT a plain top-level sibling
+/// jump. The jump's destination — the `Label` — is found by walking OUTWARD
+/// from the goto's own statement list:
+///
+/// * the label is in the goto's own list, later in the list → pure forward
+///   jump *within* that list; nothing is left, no loop is crossed;
+/// * the label is in an ENCLOSING list reached only through `Block`/`If`/
+///   `Case`/`Pipeline` steps → a forward jump out of a nested list; the
+///   statements skipped are those after the goto out to (but not including)
+///   the label, and again no loop is crossed;
+/// * the label is outside a LOOP body (or the goto is at the top level and
+///   the label is a sibling after the enclosing loop) → the jump leaves a
+///   loop, and only that case needs the flag+break machinery.
+///
+/// `Some(skip_sites)` for the first two (a list of `(path_prefix, from, to)`
+/// ranges to dead-code, innermost first), `None` for the third.
+///
+/// The ranges matter: the jump's destination is the label, so what becomes
+/// unreachable is only what lies AFTER the jump's ancestor at each level —
+/// never the ancestor itself, which may hold statements that run before the
+/// jump (the go-sh `default: print; goto L` arm: the print must still
+/// execute, only the jump's successors are dead).
+fn forward_skip_site(
+    stmts: &[IrStmt],
+    path: &[(usize, Branch)],
+    goto_index: usize,
+    label: &str,
+) -> Option<Vec<(Vec<(usize, Branch)>, usize, usize)>> {
+    // Try every prefix from the deepest (the goto's own list) outward.
+    for depth in (0..=path.len()).rev() {
+        let prefix: Vec<(usize, Branch)> = path[..depth].to_vec();
+        let Some(list) = list_at(stmts, &prefix) else {
+            continue;
+        };
+        let Some(lpos) = list
+            .iter()
+            .position(|s| matches!(s, IrStmt::Label(nm) if nm == label))
+        else {
+            continue;
+        };
+        // Where does the dead region start in THIS list?
+        let skip_from = if depth == path.len() {
+            // the goto is a statement of this list
+            if lpos <= goto_index {
+                continue; // backward — not a forward jump
+            }
+            goto_index + 1
+        } else {
+            // the goto is inside a nested list of the statement at
+            // `path[depth].0`; the jump escapes that statement, so the
+            // statement's SUCCESSORS in this list are dead
+            let Some((idx, _)) = path.get(depth) else {
+                continue;
+            };
+            if lpos <= *idx {
+                continue;
+            }
+            *idx + 1
+        };
+        // Crossing a LOOP body on the way out is not a forward jump. Only
+        // the steps BELOW the label's list are traversed by the jump, so
+        // scan `depth..path.len()` — scanning the prefix would look at lists
+        // the goto is above, and miss the loop it is actually inside.
+        if (depth..path.len()).any(|k| {
+            let (_, br) = path[k];
+            if br != Branch::Body {
+                return false;
+            }
+            let Some(ls) = list_at(stmts, &path[..k]) else {
+                return false;
+            };
+            ls.get(path[k].0).map(is_loop_stmt).unwrap_or(false)
+        }) {
+            return None;
+        }
+        // The dead ranges, innermost first. Inside the goto's own list the
+        // region is (goto+1 .. label); at every level outward it is the
+        // successors of the statement the jump escaped, up to the label's
+        // position in that list.
+        let mut sites: Vec<(Vec<(usize, Branch)>, usize, usize)> = Vec::new();
+        if depth < path.len() {
+            // Innermost: the goto's own list — drop the goto itself and
+            // everything after it (all of it is skipped by the jump).
+            sites.push((path.to_vec(), goto_index, usize::MAX));
+            for d in (depth..path.len()).rev() {
+                let Some((idx, _)) = path.get(d) else { continue };
+                let outer_prefix = path[..d].to_vec();
+                let outer_list = list_at(stmts, &outer_prefix)?;
+                let from = idx + 1;
+                let to = if d == depth { lpos } else { outer_list.len() };
+                sites.push((outer_prefix, from, to));
+            }
+        } else {
+            sites.push((prefix.clone(), goto_index + 1, lpos));
+        }
+        return Some(sites);
+    }
+    None
+}
+
+/// The statement list at the end of `path` (immutable).
+fn list_at<'a>(stmts: &'a [IrStmt], path: &[(usize, Branch)]) -> Option<&'a [IrStmt]> {
+    let mut list: &[IrStmt] = stmts;
+    for (idx, br) in path {
+        let s = list.get(*idx)?;
+        list = match br {
+            Branch::Body => body_list_ref(s),
+            Branch::Then => match s {
+                IrStmt::If { then, .. } => then,
+                _ => return None,
+            },
+            Branch::Else => match s {
+                IrStmt::If { else_, .. } => else_,
+                _ => return None,
+            },
+            Branch::Elsif(k) => match s {
+                IrStmt::If { elsifs, .. } => &elsifs[*k].1,
+                _ => return None,
+            },
+            Branch::CaseClause(k) => match s {
+                IrStmt::Case { clauses, .. } => &clauses[*k].body,
+                _ => return None,
+            },
+            Branch::Stage(k) => match s {
+                IrStmt::Pipeline { stages, .. } => &stages[*k],
+                _ => return None,
+            },
+        };
+    }
+    Some(list)
+}
+
+/// Immutable twin of [`body_list_mut`]: the child statement list of a node
+/// whose `body` is a statement list.
+fn body_list_ref(s: &IrStmt) -> &[IrStmt] {
+    match s {
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body)
+        | IrStmt::Redirect { inner: body, .. }
+        | IrStmt::Function { body, .. } => body,
+        _ => &[],
+    }
+}
+
+
+/// Remove `Label`/`Goto` nodes from a region that has been made unreachable.
+///
+/// Used when a forward jump's skipped region is dead-coded: the region is
+/// unreachable, so a jump inside it can never be taken, but a surviving
+/// `Goto` would be re-discovered by [`restructure_pass`] on the next
+/// iteration and the pass would never converge.
+fn strip_jumps(stmts: &mut Vec<IrStmt>) {
+    stmts.retain(|s| !matches!(s, IrStmt::Label(_) | IrStmt::Goto(_)));
+    for s in stmts.iter_mut() {
+        strip_jumps_children(s);
+    }
+}
+
+fn strip_jumps_children(s: &mut IrStmt) {
+    match s {
+        IrStmt::If { then, elsifs, else_, .. } => {
+            strip_jumps(then);
+            for (_, b) in elsifs.iter_mut() {
+                strip_jumps(b);
+            }
+            strip_jumps(else_);
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body)
+        | IrStmt::Redirect { inner: body, .. }
+        | IrStmt::Function { body, .. } => strip_jumps(body),
+        IrStmt::Case { clauses, .. } => {
+            for c in clauses.iter_mut() {
+                strip_jumps(&mut c.body);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages.iter_mut() {
+                strip_jumps(stage);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            strip_jumps(body);
+            for e in excepts.iter_mut() {
+                strip_jumps(&mut e.body);
+            }
+            strip_jumps(else_body);
+            strip_jumps(finally_body);
+        }
+        _ => {}
+    }
+}
+
+/// Is the top-level statement at `idx` a loop (a node whose `body` is a
+/// loop body, so a `break` inside it targets THIS list)?
+fn is_loop_stmt_at_root(stmts: &[IrStmt], idx: usize) -> bool {
+    stmts.get(idx).map(is_loop_stmt).unwrap_or(false)
+}
+
+/// True when the stmt at the given path step is a real loop. See
+/// [`is_loop_stmt`]: a `Block` at the same position is also a `Body` step
+/// (Block's body is its child list) but is NOT a loop — appending
+/// `if (flag) break` there escapes the program. Used by `handle_nested`
+/// to skip non-loop steps.
 fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -> bool {
     let mut list = stmts;
     for (k, (idx, _br)) in path.iter().enumerate() {
         let s = &list[*idx];
         if k == step {
-            return matches!(
-                s,
-                IrStmt::While { .. }
-                    | IrStmt::For { .. }
-                    | IrStmt::DoWhile { .. }
-                    | IrStmt::ForInit { .. }
-            );
+            return is_loop_stmt(s);
         }
         list = match s {
             IrStmt::If { then, .. } => then,
@@ -881,5 +1182,106 @@ mod tests {
     fn empty_list_noop() {
         let out = run(vec![]);
         assert!(out.is_empty());
+    }
+
+    /// The go-sh `for { switch { … default: goto L } L: … }` shape: the
+    /// goto is inside a Case clause and BOTH the goto and its label live
+    /// inside the loop's own body list. Pre-fix this left `loop_steps`
+    /// EMPTY (the descent through `CaseClause` dropped the enclosing
+    /// loop) and `handle_nested` bailed out at `lpos <= anc_idx`, so the
+    /// statements after the label ran with the flag still set and the
+    /// jump never took effect.
+    ///
+    /// Pinned by frontends/posix-sh-go/main.go:2072 (`default: goto
+    /// fiDone`) and :2857 (`goto additionalArgs`), and by
+    /// frontends/zig-sh-go/main.go:1302.
+    #[test]
+    fn goto_inside_a_switch_inside_the_loop_body_reaches_its_tail() {
+        // while true { switch { case a: output("kw"); break
+        //                       default: output("dflt"); goto tail }
+        //              tail: output("args") }
+        let case_body = vec![IrStmt::Break];
+        let default_body = vec![output("dflt"), goto("tail")];
+        let switch_stmt = IrStmt::Case {
+            discriminant: st("kw"),
+            clauses: vec![
+                IrCaseClause {
+                    patterns: vec!["if".to_string()],
+                    body: case_body,
+                },
+                IrCaseClause {
+                    patterns: vec![],
+                    body: default_body,
+                },
+            ],
+        };
+        let out = run(vec![while_loop(
+            truthy(),
+            vec![
+                switch_stmt,
+                label("tail"),
+                output("args"),
+                IrStmt::Break,
+            ],
+        )]);
+        let json = shir_to_shir_json_raw(&program(out.clone()));
+        assert!(!json.contains("\"Goto\""), "goto survived: {json}");
+        // The jump is a forward jump that never leaves the loop: the `goto`
+        // is simply dropped (the label is right there in the enclosing
+        // list), so no flag variable and no dead region are needed. Pre-fix
+        // the descent through `CaseClause` dropped the enclosing loop from
+        // `loop_steps` and `handle_nested` bailed out at `lpos <= anc_idx`,
+        // rewriting NOTHING: the `default` arm set a flag nothing read, the
+        // `break` unwound the loop, and the label's tail never ran.
+        assert_eq!(
+            json.matches("\"__gtail\"").count(),
+            0,
+            "no flag variable should be needed for a forward jump: {json}"
+        );
+        // The `default` arm's own statements must SURVIVE (they run before
+        // the jump) — "dflt" is the print that precedes the goto.
+        assert!(
+            json.contains("\"dflt\""),
+            "the statements before the goto were dropped: {json}"
+        );
+        // `args` (the label's tail) must remain reachable.
+        assert!(
+            json.contains("\"args\""),
+            "the label's tail was swallowed: {json}"
+        );
+    }
+
+    /// The sibling shape: the goto's top-level ancestor IS the loop and
+    /// the label is a top-level sibling AFTER it (`for { … goto L }; L:`).
+    /// Pre-fix `handle_nested` returned early whenever the target label
+    /// sat at or before the ancestor's index, so nothing guarded the tail
+    /// and the loop simply ran to completion with the flag set.
+    #[test]
+    fn goto_out_of_a_top_level_loop_guards_the_tail() {
+        let loop_body = vec![
+            if_cond(vec![goto("done")]),
+            output("no"),
+        ];
+        let out = run(vec![
+            IrStmt::ForInit {
+                init: vec![],
+                cond: st("c"),
+                step: vec![],
+                body: loop_body,
+            },
+            label("done"),
+            output("end"),
+        ]);
+        let json = shir_to_shir_json_raw(&program(out.clone()));
+        assert!(!json.contains("\"Goto\""), "goto survived: {json}");
+        assert!(!json.contains("\"Label\""), "label survived: {json}");
+        assert_eq!(
+            json.matches("__gdone").count(),
+            3,
+            "expected flag set + guard read + tail clear: {json}"
+        );
+        // `end` must be reachable only through the flag guard (an If
+        // whose else_ holds the tail), never unconditionally at top level.
+        assert!(json.contains("\"If\""), "no guard If: {json}");
     }
 }
