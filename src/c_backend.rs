@@ -2434,6 +2434,16 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     // value int-ness: an expression that always evaluates to a canonical
     // integer whenever it produces a value. Arith counts WITH div/mod (a
     // zero divisor aborts the expansion — no value is produced at all).
+    // A positional (`$1`..`$9`, `${10}`…) always evaluates to the
+    // caller's argv string, whatever it is. Converting it once with
+    // `atoll` observes exactly what every per-use `atoll` observes,
+    // so positionals are int-valued sources (the `$0` program name is
+    // the one positional that is NOT numeric and stays refused).
+    // Seeds additionally require int-use-only downstream, and demote
+    // re-validates, so a text-observed positional can never mistype.
+    fn is_positional(n: &str) -> bool {
+        !n.is_empty() && n != "0" && n.bytes().all(|b| b.is_ascii_digit())
+    }
     // Var/getVar recurse through assigns_numeric (cycle-guarded).
     // arrayIndex/min/max/sum count when the array is structurally sound
     // (its slots hold integers; an OOB read yields "" which every int
@@ -2469,12 +2479,18 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                 if matches!(n.as_str(), "?" | "#" | "!" | "$") {
                     return true;
                 }
+                if is_positional(n) {
+                    return true;
+                }
                 assigns_numeric(n, assigns, sound, big, visiting)
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 match Render::str_arg(args, 0).as_deref() {
                     Some(n) => {
                         if matches!(n, "?" | "#" | "!" | "$") {
+                            return true;
+                        }
+                        if is_positional(n) {
                             return true;
                         }
                         assigns_numeric(n, assigns, sound, big, visiting)
@@ -2503,6 +2519,11 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
         }
         if visiting.contains(&v.to_string()) {
             return false;
+        }
+        // Positionals have no assigns entry (the caller owns the
+        // value) and are int-valued per is_positional above.
+        if is_positional(v) {
+            return true;
         }
         let Some(a) = assigns.get(v) else { return false };
         if a.rhs.is_empty() {
@@ -3257,6 +3278,18 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
             sound.insert(arr.clone());
             continue;
         }
+        // Class F (full-cover fixed arrays): a `$var` dynamic key needs
+        // no guard/nonneg proof. Soundness: the literal cover fills
+        // every slot so no holes can form; fixed-array stores render
+        // the exact `_sh_arr_set` guard in both representations
+        // (negative stores nothing, past-cap exits 127 — see
+        // emit_fixed_index_write), and reads render the len guard per
+        // context (`""` for string observers, `0` for numeric ones —
+        // identical to bash in both). Seeds additionally require
+        // int-use-only, so a runtime `""` still never reaches a text
+        // observer as `"0"`. The guard calls below stay so
+        // SH2_DEBUG_INT_ELEM=6 keeps reporting what the old rule
+        // would have rejected.
         let mut ok = true;
         for k in &w.dyn_keys {
             if let Some(rest) = k.strip_prefix('#') {
@@ -3270,18 +3303,12 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                 ok = false;
                 break;
             }
-            if !stores_guarded(prog, arr, k, n as i64, &globals)
-                || !proven_nonneg(k, &assigns)
-            {
-                if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("6") {
-                    eprintln!(
-                        "INT_ELEM guardfail {arr}[{k}] n={n} guarded={} nonneg={}",
-                        stores_guarded(prog, arr, k, n as i64, &globals),
-                        proven_nonneg(k, &assigns)
-                    );
+            if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("6") {
+                if !stores_guarded(prog, arr, k, n as i64, &globals)
+                    || !proven_nonneg(k, &assigns)
+                {
+                    eprintln!("INT_ELEM guardfail-accepted {arr}[{k}] n={n}");
                 }
-                ok = false;
-                break;
             }
         }
         if ok {
