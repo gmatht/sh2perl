@@ -2174,6 +2174,94 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
             _ => {}
         }
     }
+    // Redirect-target text marking: scalar reads always mark `str_use`,
+    // element reads mark a whole-array `str_read`. Everything observed
+    // through a redirect target is text, so positions that are
+    // transparent in value walks (getVar, Index value) mark here.
+    fn mark_redirect_text(e: &IrExpr, u: &mut Uses, arrs: &HashSet<String>) {
+        match e {
+            IrExpr::Arith(_) | IrExpr::Int(_) => {}
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                u.str_use.insert(n.clone());
+            }
+            IrExpr::Index { key, .. } => {
+                walk_u_expr(key, true, u, arrs);
+            }
+            IrExpr::Call { func, args } => {
+                if func == "arrayIndex" || func == "arrayItems" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        u.str_read.insert(name.clone());
+                    }
+                    for a in args.iter().skip(1) {
+                        walk_u_expr(a, true, u, arrs);
+                    }
+                    return;
+                }
+                if matches!(func.as_str(), "min" | "max" | "sum") {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        u.str_read.insert(name.clone());
+                    }
+                    return;
+                }
+                if func == "arrayLen" {
+                    return;
+                }
+                if func == "getVar" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if arrs.contains(name) {
+                            u.str_read.insert(name.clone());
+                        } else {
+                            u.str_use.insert(name.clone());
+                        }
+                    }
+                    return;
+                }
+                if func == "test" {
+                    if let Some(IrExpr::Str(t, _)) = args.first() {
+                        let (refs, has_str) = test_refs(t);
+                        for r in &refs {
+                            if has_str {
+                                u.str_use.insert(r.clone());
+                            } else {
+                                u.int_use.insert(r.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+                for a in args {
+                    if let IrExpr::Str(nm, _) = a {
+                        if func == "slice" || func == "arrayItems" || func == "listVar" {
+                            u.str_read.insert(nm.clone());
+                        }
+                        if func == "sortedBigintJoin" {
+                            u.str_read.insert(nm.clone());
+                        }
+                    }
+                    mark_redirect_text(a, u, arrs);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    mark_redirect_text(it, u, arrs);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        mark_redirect_text(x, u, arrs);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                mark_redirect_text(lhs, u, arrs);
+                mark_redirect_text(rhs, u, arrs);
+            }
+            IrExpr::Arrow(stmts) => walk_u_list(stmts, u, arrs),
+            IrExpr::Capture { expr, .. } => mark_redirect_text(expr, u, arrs),
+            _ => {}
+        }
+    }
     fn walk_u_arith(a: &ArithAst, u: &mut Uses, arrs: &HashSet<String>) {
         match a {
             ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
@@ -2285,7 +2373,16 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
             IrStmt::Subshell(body)
             | IrStmt::Background(body)
             | IrStmt::Block(body) => walk_u_list(body, u, arrs),
-            IrStmt::Redirect { inner, .. } => walk_u_list(inner, u, arrs),
+            IrStmt::Redirect { inner, redirects } => {
+                walk_u_list(inner, u, arrs);
+                // Redirect targets are genuine text observations: `> $p`
+                // with `p="007"` vs `p=7` are different files, so even
+                // a `getVar` marks here (unlike value position, where
+                // it is transparent).
+                for r in redirects {
+                    mark_redirect_text(&r.target, u, arrs);
+                }
+            }
             IrStmt::Pipeline { stages, .. } => {
                 for st in stages {
                     walk_u_list(st, u, arrs);
@@ -2517,8 +2614,15 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
         if big.contains(v) {
             return false;
         }
+        // Coinductive cycle reading: a revisit assumes int. Sound
+        // because seeding is gated (str_use exclusion above), the
+        // fixpoint is removal-only, and demote re-validates every
+        // seed afterward — a text-observed cycle member is dropped
+        // by the gate, and a genuinely-stringy one by demote. This
+        // resolves benign copy cycles (`x1=$x2`, `x2=$t`, `t=$x1`)
+        // that a least fixpoint deadlocks on.
         if visiting.contains(&v.to_string()) {
-            return false;
+            return true;
         }
         // Positionals have no assigns entry (the caller owns the
         // value) and are int-valued per is_positional above.
