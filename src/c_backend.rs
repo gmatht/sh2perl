@@ -487,6 +487,12 @@ pub struct Render {
     /// system() call — a native mapfile reading a FIFO must run once the
     /// child (which spawns the FIFO writer) has started, not before it
     pending_native_stmts: Vec<IrStmt>,
+    /// void calling-convention lifts: shell fn name → arity. A void fn
+    /// is ONLY ever called as a bare statement (rc+globals are its only
+    /// channels) — it takes real C params and returns void, so bare
+    /// call sites are plain C calls (no argv swap). `return N` and
+    /// stdout writers are allowed in the body (see scan_void_lifts).
+    void_fns: BTreeMap<String, usize>,
     /// emitted shell-out site helper bodies (`static int _sh_site_N(void) {...}`)
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
@@ -9155,6 +9161,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.lifted_fns = scan_fn_lifts(&prog.stmts);
+    r.void_fns = scan_void_lifts(&prog.stmts);
     r.native_num_fns = analyze_native_num_fns(&prog);
     r.bigint_param_fns = analyze_bigint_param_fns(&prog);
     r.array_return_arrays = analyze_array_return_fns(&prog);
@@ -9261,7 +9268,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         let mut for_vars = BTreeSet::new();
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         let shadowed = vars.contains("argc") || vars.contains("argv");
-        r.pos_const = scan_pos_const(&prog.stmts, &r.lifted_fns, shadowed);
+        // void-lifted callees read _pN, never _sh_argv — the same proof
+        // as lifted fns, so they join the defs map for this scan.
+        let mut pos_defs = r.lifted_fns.clone();
+        pos_defs.extend(r.void_fns.iter().map(|(k, v)| (k.clone(), *v)));
+        r.pos_const = scan_pos_const(&prog.stmts, &pos_defs, shadowed);
     }
     // Range-loop re-fold: the frontend lowers `for i in range(...)` to
     // `i = lo; while (i < hi) { body; i++ }` (the While form keeps the
@@ -14742,7 +14753,35 @@ impl Render {
                 .unwrap_or_else(|| format!("_p{i}"))
         };
         match self.lifted_fns.get(name) {
-            None => format!("static void {fname}(void)"),
+            None => match self.void_fns.get(name) {
+                // VOID lift: real C params (long long when numeric,
+                // mpz_t when bigint — the same selection as value
+                // lifts), void return.
+                None => format!("static void {fname}(void)"),
+                Some(&0) => format!("static void {fname}(void)"),
+                Some(&n) => {
+                    let native = self.native_num_fns.contains(name);
+                    let big = self.bigint_param_fns.contains(name);
+                    format!(
+                        "static void {fname}({})",
+                        (1..=n)
+                            .map(|i| {
+                                if native {
+                                    format!(
+                                        "long long {}",
+                                        alias.get(&i).cloned().unwrap_or_else(|| format!("_p{i}"))
+                                    )
+                                } else if big {
+                                    format!("mpz_t _p{i}")
+                                } else {
+                                    format!("char *_p{i}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            },
             Some(&0) => format!("static char *{fname}(void)"),
             Some(&n) => {
                 if self.array_return_fns.contains(name) {
@@ -14781,6 +14820,33 @@ impl Render {
         }
     }
 
+    /// The positional index a bare `$N` read denotes, in any of its three
+    /// IR shapes (`Var("N")`, `Arith(Var("N"))`, `getVar("N")` — the last
+    /// is the frontend's string-position shape, e.g. `n=$1`). None for
+    /// anything else (including `$@`/`$#`, which are never bare reads).
+    fn positional_digit(expr: &IrExpr) -> Option<usize> {
+        let v = match expr {
+            IrExpr::Var(d, _) => d.clone(),
+            IrExpr::Arith(a) => match &**a {
+                ArithAst::Var(d) => d.clone(),
+                _ => return None,
+            },
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(d, _)) => d.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let i: usize = v.parse().ok()?;
+        if i == 0 {
+            return None;
+        }
+        Some(i)
+    }
+
     /// Param-copy aliasing (t86 `n = (_p1)` → `all_factors(long long n)`):
     /// for a lifted native-numeric fn, a positional param copied into a
     /// same-typed local can lend the C parameter its name — iff the copy
@@ -14811,21 +14877,11 @@ fn param_copy_alias(
                     | "getVar"
             )
         }
-        // a bare positional read: `Var("3")` or `Arith(Var("3"))`.
+        // a bare positional read in any of its three IR shapes (see
+        // `positional_digit`), range-checked against the arity.
         fn copy_digit(expr: &IrExpr, arity: usize) -> Option<usize> {
-            let v = match expr {
-                IrExpr::Var(d, _) => d.clone(),
-                IrExpr::Arith(a) => match &**a {
-                    ArithAst::Var(d) => d.clone(),
-                    _ => return None,
-                },
-                _ => return None,
-            };
-            if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            let i: usize = v.parse().ok()?;
-            if i == 0 || i > arity {
+            let i = Render::positional_digit(expr)?;
+            if i > arity {
                 return None;
             }
             Some(i)
@@ -16355,10 +16411,15 @@ fn param_copy_alias(
         // (the parameter IS their declaration) and their self-copies
         // + single Declares are skipped during the body render.
         let lifted_arity_top = self.lifted_fns.get(name).copied();
-        let (param_alias, param_skip) = if lifted_arity_top.is_some()
+        let void_arity_top = self.void_fns.get(name).copied();
+        let (param_alias, param_skip) = if (lifted_arity_top.is_some() || void_arity_top.is_some())
             && self.native_num_fns.contains(name)
         {
-            Self::param_copy_alias(&self.var_types, body, lifted_arity_top.unwrap_or(0))
+            Self::param_copy_alias(
+                &self.var_types,
+                body,
+                lifted_arity_top.or(void_arity_top).unwrap_or(0),
+            )
         } else {
             (HashMap::new(), HashSet::new())
         };
@@ -16438,14 +16499,17 @@ fn param_copy_alias(
         // single trailing `echo V` becomes the return value (the caller
         // consumed it as the $(fn) capture's text)
         let lifted_arity = self.lifted_fns.get(name).copied();
+        let void_arity = self.void_fns.get(name).copied();
         let saved_params = std::mem::take(&mut self.cur_params);
         let saved_native = self.cur_native_num;
         let saved_big = self.cur_bigint_param;
         let saved_arr = self.cur_array_return_arr.take();
-        self.cur_native_num = lifted_arity.is_some() && self.native_num_fns.contains(name);
-        self.cur_bigint_param = lifted_arity.is_some() && self.bigint_param_fns.contains(name);
+        self.cur_native_num =
+            (lifted_arity.is_some() || void_arity.is_some()) && self.native_num_fns.contains(name);
+        self.cur_bigint_param =
+            (lifted_arity.is_some() || void_arity.is_some()) && self.bigint_param_fns.contains(name);
         self.cur_array_return_arr = self.array_return_arrays.get(name).cloned();
-        if let Some(arity) = lifted_arity {
+        if let Some(arity) = lifted_arity.or(void_arity) {
             self.cur_params = (1..=arity)
                 .map(|i| {
                     param_alias
@@ -21586,6 +21650,38 @@ fn param_copy_alias(
                                 }
                             }
                             None => "0".into(),
+                        };
+                        a.push(v);
+                    }
+                    format!("({}({}), _sh_rc == 0)", self.c_ident(&cmd), a.join(", "))
+                } else if let Some(&arity) = self.void_fns.get(&cmd) {
+                    // VOID fn: plain C call with the args as params — no
+                    // argv swap (the body reads _pN), no stdout capture.
+                    // Missing args pad ""/0 (unset positionals). Native
+                    // args convert like value-lift params (value_ll),
+                    // bigint args via a temp mpz_t (value_mpz).
+                    self.need_sh = true;
+                    let native = self.native_num_fns.contains(&cmd);
+                    let big = self.bigint_param_fns.contains(&cmd);
+                    let mut a: Vec<String> = Vec::new();
+                    for i in 0..arity {
+                        let v = match words.get(i) {
+                            Some(w) => {
+                                if native {
+                                    self.value_ll(w)
+                                } else if big {
+                                    self.value_mpz(w)
+                                } else {
+                                    self.value_c(w)
+                                }
+                            }
+                            None => {
+                                if native || big {
+                                    "0".into()
+                                } else {
+                                    "\"\"".into()
+                                }
+                            }
                         };
                         a.push(v);
                     }
@@ -33660,15 +33756,28 @@ struct LiftScan {
     bad: bool,
     self_call: bool,
     writers: usize,
+    /// Set while scanning a body the renderer hoists into a SEPARATE C
+    /// function (`_cap_N`/`_sh_site_N`) that builds child-bash command
+    /// text. `$N` there must be interpolated by text the child can see,
+    /// but the hoisted builder has no `_pN` in scope — measured two ways:
+    /// `v=$(echo "$1")` rendered `_sh_export(..., _p1)` inside `_cap_0`
+    /// (‘_p1’ undeclared), and `echo $(($1+1)) | tr` compiled but the
+    /// child saw an empty `$1` and printed 1 where bash prints 6. A
+    /// positional read under `child` therefore vetoes the lift.
+    child: bool,
 }
 
 fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
     match e {
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-                let n: usize = name.parse().unwrap_or(0);
-                if n > st.max_pos {
-                    st.max_pos = n;
+                if st.child {
+                    st.bad = true;
+                } else {
+                    let n: usize = name.parse().unwrap_or(0);
+                    if n > st.max_pos {
+                        st.max_pos = n;
+                    }
                 }
             } else if matches!(name.as_str(), "@" | "*" | "#" | "0") {
                 st.bad = true;
@@ -33678,14 +33787,31 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
             // `$1` inside RAW text: an arith text is fine (arith_subst/
             // mathfunc read the lifted param); any other raw text would
             // reach a child bash that does not see the fn's params —
-            // refuse rather than guess.
-            if !spawn && s.contains('$') {
+            // refuse rather than guess. Under `child` the text IS handed
+            // to a child bash by the hoisted builder, so the positional
+            // forms must refuse there too (a plain `$var` is fine: the
+            // builder exports it by name).
+            if s.contains('$') {
                 let b: Vec<char> = s.chars().collect();
                 let mut i = 0;
                 while i < b.len() {
                     if b[i] == '$' {
                         let d = b.get(i + 1);
-                        if d.map_or(false, |c| c.is_ascii_digit() || *c == '{' || *c == '@') {
+                        let pos = |c: &char| c.is_ascii_digit() || *c == '{' || *c == '@';
+                        if st.child {
+                            // positional/special forms only — `${var}` and
+                            // `$var` are exported by name and stay legal.
+                            let after_brace = d == Some(&'{')
+                                && b.get(i + 2)
+                                    .map_or(false, |c| c.is_ascii_digit() || *c == '@');
+                            if d.map_or(false, |c| {
+                                c.is_ascii_digit() || matches!(*c, '@' | '*' | '#')
+                            }) || after_brace
+                            {
+                                st.bad = true;
+                                break;
+                            }
+                        } else if !spawn && d.map_or(false, pos) {
                             st.bad = true;
                             break;
                         }
@@ -33700,9 +33826,13 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                 // Str arg (same hole the pos-const scan had)
                 if let Some(c) = lift_str_arg(args, 0) {
                     if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
-                        let n: usize = c.parse().unwrap_or(0);
-                        if n > st.max_pos {
-                            st.max_pos = n;
+                        if st.child {
+                            st.bad = true;
+                        } else {
+                            let n: usize = c.parse().unwrap_or(0);
+                            if n > st.max_pos {
+                                st.max_pos = n;
+                            }
                         }
                     } else if matches!(c.as_str(), "@" | "*" | "#" | "0") {
                         st.bad = true;
@@ -33710,16 +33840,21 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                 }
             }
             "capture" | "captureWords" => {
+                let saved_child = st.child;
+                st.child = true;
                 for a in args {
                     if let IrExpr::Arrow(stmts) = a {
                         lift_scan_stmts(stmts, true, fname, st);
                     }
                 }
+                st.child = saved_child;
             }
             "pipeline" => {
                 if !spawn {
                     st.writers += 1;
                 }
+                let saved_child = st.child;
+                st.child = true;
                 if let Some(IrExpr::Array(items)) = args.first() {
                     for it in items {
                         if let IrExpr::Arrow(stmts) = it {
@@ -33727,6 +33862,7 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                         }
                     }
                 }
+                st.child = saved_child;
             }
             "exec" | "builtin" => {
                 let cmd = lift_str_arg(args, 0);
@@ -33747,9 +33883,13 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                 // the slice form: param("slice", "@", off, len)
                 if let Some(c) = lift_str_arg(args, 1) {
                     if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
-                        let n: usize = c.parse().unwrap_or(0);
-                        if n > st.max_pos {
-                            st.max_pos = n;
+                        if st.child {
+                            st.bad = true;
+                        } else {
+                            let n: usize = c.parse().unwrap_or(0);
+                            if n > st.max_pos {
+                                st.max_pos = n;
+                            }
                         }
                     } else if matches!(c.as_str(), "@" | "*" | "#" | "0") || c.starts_with('@') {
                         st.bad = true;
@@ -33783,7 +33923,12 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
                 }
             }
         }
-        IrExpr::Arrow(stmts) => lift_scan_stmts(stmts, true, fname, st),
+        IrExpr::Arrow(stmts) => {
+            let saved_child = st.child;
+            st.child = true;
+            lift_scan_stmts(stmts, true, fname, st);
+            st.child = saved_child;
+        }
         IrExpr::Array(items) => {
             for x in items {
                 lift_scan_expr(x, spawn, fname, st);
@@ -33815,7 +33960,12 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
             lift_scan_expr(expr, spawn, fname, st);
             lift_scan_expr(default, spawn, fname, st);
         }
-        IrExpr::Capture { expr, .. } => lift_scan_expr(expr, true, fname, st),
+        IrExpr::Capture { expr, .. } => {
+            let saved_child = st.child;
+            st.child = true;
+            lift_scan_expr(expr, true, fname, st);
+            st.child = saved_child;
+        }
         IrExpr::ArrayComp { iter, elem, cond, .. } => {
             lift_scan_expr(iter, spawn, fname, st);
             lift_scan_expr(elem, spawn, fname, st);
@@ -33835,9 +33985,16 @@ fn lift_scan_arith(a: &ArithAst, st: &mut LiftScan) {
     match a {
         ArithAst::Var(n) | ArithAst::Ident(n) => {
             if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
-                let i: usize = n.parse().unwrap_or(0);
-                if i > st.max_pos {
-                    st.max_pos = i;
+                if st.child {
+                    // `$(($1+1))` inside a hoisted child-bash builder: the
+                    // value is interpolated as text the child re-evaluates
+                    // with EMPTY positionals (measured: printed 1, not 6).
+                    st.bad = true;
+                } else {
+                    let i: usize = n.parse().unwrap_or(0);
+                    if i > st.max_pos {
+                        st.max_pos = i;
+                    }
                 }
             }
         }
@@ -33899,9 +34056,12 @@ fn lift_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
             if !spawn {
                 st.writers += 1;
             }
+            let saved_child = st.child;
+            st.child = true;
             for stage in stages {
                 lift_scan_stmts(stage, true, fname, st);
             }
+            st.child = saved_child;
         }
         IrStmt::Output { .. } => {
             if !spawn {
@@ -34558,11 +34718,392 @@ fn scan_fn_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
     out
 }
 
+/// ── void calling-convention lift analysis ──
+///
+/// The dual of `scan_fn_lifts`: a shell function qualifies when it is
+/// ONLY ever called as a bare statement (`f args` as the whole
+/// statement — its only observable channels are `_sh_rc` and globals),
+/// its body reads only `$1..$9` (no `$@`/`$*`/`$#`/`$0`, no
+/// `shift`/`set --`), and it has no nested function defs of unknown
+/// shape and does not call itself (file-scope locals would alias).
+/// Unlike the value lift, `return N` is allowed (it lowers to
+/// `_sh_rc = N; return;`, valid in a void C function) and stdout
+/// writers are allowed (no caller captures, so body stdout IS process
+/// stdout either way — the render is byte-identical). Arity 0 lifts
+/// (a zero-arg bare call pays the argv swap today too).
+/// Such a fn takes real C params (`char *_pN`, `long long _pN` when
+/// numeric) and returns void — bare call sites are plain C calls.
+/// Refuse > guess: anything unanalyzed keeps the argv transport.
+fn scan_void_lifts(stmts: &[IrStmt]) -> BTreeMap<String, usize> {
+    let mut names = BTreeSet::new();
+    let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    collect_fn_defs(stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    let (bare_uses, tainted, bad) = scan_void_uses(stmts, &defmap);
+    if bad {
+        return BTreeMap::new();
+    }
+    let mut out = BTreeMap::new();
+    for (name, body) in &defmap {
+        if tainted.contains(name) {
+            continue;
+        }
+        if bare_uses.get(name).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let mut st = LiftScan::default();
+        void_scan_stmts(body, false, name, &mut st);
+        if st.bad || st.self_call || st.max_pos > 9 {
+            continue;
+        }
+        out.insert(name.clone(), st.max_pos);
+    }
+    out
+}
+
+/// The void body scan: `lift_scan_stmt` except `return` is legal (its
+/// arg is scanned for positional reads; the renderer's `_sh_rc = N;
+/// return;` is valid in a void C function) and stdout writers are
+/// legal (Redirect/Pipeline/Output never reach a capturing caller —
+/// the use-scan above proved every call is a bare statement).
+fn void_scan_stmts(stmts: &[IrStmt], spawn: bool, fname: &str, st: &mut LiftScan) {
+    for s in stmts {
+        void_scan_stmt(s, spawn, fname, st);
+    }
+}
+
+fn void_scan_stmt(s: &IrStmt, spawn: bool, fname: &str, st: &mut LiftScan) {
+    // Control flow recurses with the VOID scan (a `return` nested in an
+    // if/loop/case body is legal here — delegating to lift_scan_stmt
+    // would reject it). Leaf statements delegate to lift_scan_stmt.
+    match s {
+        IrStmt::Return(opt) => {
+            if let Some(e) = opt {
+                lift_scan_expr(e, spawn, fname, st);
+            }
+        }
+        IrStmt::Redirect { inner, .. } => void_scan_stmts(inner, true, fname, st),
+        IrStmt::Pipeline { stages, .. } => {
+            let saved_child = st.child;
+            st.child = true;
+            for stage in stages {
+                void_scan_stmts(stage, true, fname, st);
+            }
+            st.child = saved_child;
+        }
+        IrStmt::Output { value, .. } => lift_scan_expr(value, spawn, fname, st),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            lift_scan_expr(cond, spawn, fname, st);
+            void_scan_stmts(then, spawn, fname, st);
+            for (c, b) in elsifs {
+                lift_scan_expr(c, spawn, fname, st);
+                void_scan_stmts(b, spawn, fname, st);
+            }
+            void_scan_stmts(else_, spawn, fname, st);
+        }
+        IrStmt::While { cond, body } => {
+            lift_scan_expr(cond, spawn, fname, st);
+            void_scan_stmts(body, spawn, fname, st);
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            void_scan_stmts(body, spawn, fname, st);
+            lift_scan_expr(cond, spawn, fname, st);
+        }
+        IrStmt::For { iter, body, .. } => {
+            lift_scan_expr(iter, spawn, fname, st);
+            void_scan_stmts(body, spawn, fname, st);
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            void_scan_stmts(init, spawn, fname, st);
+            lift_scan_expr(cond, spawn, fname, st);
+            void_scan_stmts(step, spawn, fname, st);
+            void_scan_stmts(body, spawn, fname, st);
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            lift_scan_expr(discriminant, spawn, fname, st);
+            for cl in clauses {
+                void_scan_stmts(&cl.body, spawn, fname, st);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            void_scan_stmts(body, spawn, fname, st);
+            for ex in excepts {
+                if let Some(m) = &ex.match_expr {
+                    lift_scan_expr(m, spawn, fname, st);
+                }
+                void_scan_stmts(&ex.body, spawn, fname, st);
+            }
+            void_scan_stmts(else_body, spawn, fname, st);
+            void_scan_stmts(finally_body, spawn, fname, st);
+        }
+        IrStmt::Block(b) => void_scan_stmts(b, spawn, fname, st),
+        IrStmt::Subshell(b) => void_scan_stmts(b, spawn, fname, st),
+        IrStmt::Background(b) => void_scan_stmts(b, true, fname, st),
+        _ => lift_scan_stmt(s, spawn, fname, st),
+    }
+}
+
+/// Bare-statement uses per defined fn (name → count), the tainted set
+/// (any capture/condition/chain/arg/redirect/spawn/fnValue mention —
+/// every channel except a bare `_sh_rc`+globals call), and a global bad
+/// flag (an opaque shape may hide a use — refuse everything).
+/// No wildcard arms: the compiler enforces coverage of every IrStmt /
+/// IrExpr variant, so a future variant is a build error, not a hole.
+fn scan_void_uses(
+    top: &[IrStmt],
+    defs: &BTreeMap<String, Vec<IrStmt>>,
+) -> (BTreeMap<String, usize>, BTreeSet<String>, bool) {
+    struct St<'a> {
+        defs: &'a BTreeMap<String, Vec<IrStmt>>,
+        bare: BTreeMap<String, usize>,
+        tainted: BTreeSet<String>,
+        bad: bool,
+    }
+    fn walk_stmts(stmts: &[IrStmt], spawn: bool, st: &mut St) {
+        for s in stmts {
+            walk_stmt(s, spawn, st);
+        }
+    }
+    fn walk_stmt(s: &IrStmt, spawn: bool, st: &mut St) {
+        match s {
+            // the ONLY bare position: the whole statement is the call.
+            // (`f a && g` is a BinOp, `if f` a cond, `f > x` a Redirect
+            // — all taint via the arms below.)
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if !spawn && (func == "exec" || func == "builtin") =>
+            {
+                if let Some(cmd) = lift_str_arg(args, 0) {
+                    if st.defs.contains_key(cmd.as_str()) {
+                        *st.bare.entry(cmd.clone()).or_insert(0) += 1;
+                    }
+                }
+                // the ARGS are value position (`f $(g)` captures g)
+                for a in args {
+                    taint_expr(a, st);
+                }
+            }
+            IrStmt::Expr(e) => taint_expr(e, st),
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    for ix in &t.indices {
+                        taint_expr(ix, st);
+                    }
+                }
+                taint_expr(expr, st);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    taint_expr(e, st);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    taint_expr(e, st);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                taint_expr(cond, st);
+                walk_stmts(then, spawn, st);
+                for (c, b) in elsifs {
+                    taint_expr(c, st);
+                    walk_stmts(b, spawn, st);
+                }
+                walk_stmts(else_, spawn, st);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                walk_stmts(body, spawn, st);
+                for ex in excepts {
+                    if let Some(m) = &ex.match_expr {
+                        taint_expr(m, st);
+                    }
+                    walk_stmts(&ex.body, spawn, st);
+                }
+                walk_stmts(else_body, spawn, st);
+                walk_stmts(finally_body, spawn, st);
+            }
+            IrStmt::For { iter, body, .. } => {
+                taint_expr(iter, st);
+                walk_stmts(body, spawn, st);
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                walk_stmts(init, spawn, st);
+                taint_expr(cond, st);
+                walk_stmts(step, spawn, st);
+                walk_stmts(body, spawn, st);
+            }
+            IrStmt::While { cond, body } => {
+                taint_expr(cond, st);
+                walk_stmts(body, spawn, st);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                walk_stmts(body, spawn, st);
+                taint_expr(cond, st);
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => taint_expr(expr, st),
+            IrStmt::Exec { cmd, args, capture: _, redirects, env } => {
+                // not the bare Call shape — a name match taints
+                if let IrExpr::Str(cmd_s, _) = cmd {
+                    if st.defs.contains_key(cmd_s.as_str()) {
+                        st.tainted.insert(cmd_s.clone());
+                    }
+                }
+                taint_expr(cmd, st);
+                for a in args {
+                    taint_expr(a, st);
+                }
+                for r in redirects {
+                    taint_expr(r, st);
+                }
+                for (_, v) in env {
+                    taint_expr(v, st);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    walk_stmts(stage, true, st);
+                }
+            }
+            IrStmt::Return(opt) | IrStmt::Exit(opt) => {
+                if let Some(e) = opt {
+                    taint_expr(e, st);
+                }
+            }
+            IrStmt::SetChildError(e) => taint_expr(e, st),
+            IrStmt::Case { discriminant, clauses } => {
+                taint_expr(discriminant, st);
+                for cl in clauses {
+                    walk_stmts(&cl.body, spawn, st);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                walk_stmts(inner, true, st);
+                for r in redirects {
+                    taint_expr(&r.target, st);
+                }
+            }
+            IrStmt::Function { name, body, named_blocks, .. } => {
+                if st.defs.contains_key(name) {
+                    walk_stmts(body, false, st);
+                    for (_, b) in named_blocks {
+                        walk_stmts(b, false, st);
+                    }
+                }
+            }
+            IrStmt::Subshell(body) => walk_stmts(body, spawn, st),
+            IrStmt::Background(body) => walk_stmts(body, true, st),
+            IrStmt::Select { clauses } => {
+                for cl in clauses {
+                    if let Some(ch) = &cl.ch {
+                        taint_expr(ch, st);
+                    }
+                    if let Some(v) = &cl.value {
+                        taint_expr(v, st);
+                    }
+                    walk_stmts(&cl.body, spawn, st);
+                }
+            }
+            IrStmt::Asm { outputs, inputs, .. } => {
+                for (_, o) in outputs {
+                    taint_expr(o, st);
+                }
+                for (_, i) in inputs {
+                    taint_expr(i, st);
+                }
+            }
+            IrStmt::Block(body) => walk_stmts(body, spawn, st),
+            IrStmt::Output { value, .. } => taint_expr(value, st),
+            IrStmt::WriteFile { path, content, .. } => {
+                taint_expr(path, st);
+                taint_expr(content, st);
+            }
+            IrStmt::Shaderize { body, .. } => walk_stmts(body, true, st),
+            IrStmt::Ext(_) | IrStmt::RawText(_) => st.bad = true,
+            IrStmt::Continue
+            | IrStmt::Break
+            | IrStmt::Require(_)
+            | IrStmt::Label(_)
+            | IrStmt::Goto(_) => {}
+        }
+    }
+    fn taint_expr(e: &IrExpr, st: &mut St) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "exec" || func == "builtin" || func == "fnValue" {
+                    if let Some(cmd) = lift_str_arg(args, 0) {
+                        if st.defs.contains_key(cmd.as_str()) {
+                            st.tainted.insert(cmd);
+                        }
+                    }
+                }
+                for a in args {
+                    if let IrExpr::Arrow(body) = a {
+                        walk_stmts(body, true, st);
+                    } else {
+                        taint_expr(a, st);
+                    }
+                }
+            }
+            IrExpr::Var(_, _) | IrExpr::Ident(_) | IrExpr::Str(_, _) | IrExpr::Int(_)
+            | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. } | IrExpr::Range { .. } => {}
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        taint_expr(x, st);
+                    }
+                }
+            }
+            IrExpr::Arrow(body) => walk_stmts(body, true, st),
+            IrExpr::Array(items) => {
+                for x in items {
+                    taint_expr(x, st);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                taint_expr(lhs, st);
+                taint_expr(rhs, st);
+            }
+            IrExpr::Index { key, .. } => taint_expr(key, st),
+            IrExpr::Arith(_) => {}
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    taint_expr(v, st);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                taint_expr(obj, st);
+                for a in args {
+                    taint_expr(a, st);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                taint_expr(cond, st);
+                taint_expr(then, st);
+                taint_expr(else_, st);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                taint_expr(expr, st);
+                taint_expr(default, st);
+            }
+            IrExpr::Capture { expr, .. } => taint_expr(expr, st),
+            IrExpr::ArrayComp { .. } | IrExpr::Splice(_) | IrExpr::RawExpr(_)
+            | IrExpr::Ext(_) | IrExpr::Lambda { .. } => st.bad = true,
+        }
+    }
+    let mut st = St { defs, bare: BTreeMap::new(), tainted: BTreeSet::new(), bad: false };
+    // top-level statements are bare context; every fn body is walked
+    // through its Function node (nested defs included).
+    walk_stmts(top, false, &mut st);
+    (st.bare, st.tainted, st.bad)
+}
+
 /// Lifted functions whose params are all provably-numeric (Int-typed,
 /// not bigint) AND every call site passes a provably-small (non-bigint)
 /// arg — eligible for a native `long long _pN` signature.
 fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
-    let lifted = scan_fn_lifts(&prog.stmts);
+    // value- AND void-lifted fns both take real C params (see
+    // scan_void_lifts) — the numeric selection covers both.
+    let mut lifted = scan_fn_lifts(&prog.stmts);
+    lifted.extend(scan_void_lifts(&prog.stmts));
     let bigint = crate::shir::analyze_bigint_vars(prog);
     let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let mut names = BTreeSet::new();
@@ -34581,6 +35122,10 @@ fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
                         if arith_refs_positional(a) {
                             param_vars.insert(t.var.clone());
                         }
+                    } else if Render::positional_digit(expr).is_some() {
+                        // `n = $N` in string position (the frontend's
+                        // getVar shape): the same positional copy.
+                        param_vars.insert(t.var.clone());
                     }
                 }
             }
@@ -34756,7 +35301,10 @@ fn walk_expr_bigint(e: &IrExpr, bigint: &BTreeSet<String>, found: &mut bool) {
 /// Lifted functions whose params are all bigint (used in bigint arith) —
 /// eligible for a native `mpz_t _pN` signature.
 fn analyze_bigint_param_fns(prog: &IrProgram) -> BTreeSet<String> {
-    let lifted = scan_fn_lifts(&prog.stmts);
+    // value- AND void-lifted fns both take real C params (see
+    // scan_void_lifts) — the bigint selection covers both.
+    let mut lifted = scan_fn_lifts(&prog.stmts);
+    lifted.extend(scan_void_lifts(&prog.stmts));
     let bigint = crate::shir::analyze_bigint_vars(prog);
     let mut names = BTreeSet::new();
     let mut defs = Vec::new();
@@ -34773,6 +35321,10 @@ fn analyze_bigint_param_fns(prog: &IrProgram) -> BTreeSet<String> {
                         if arith_refs_positional(a) {
                             param_vars.insert(t.var.clone());
                         }
+                    } else if Render::positional_digit(expr).is_some() {
+                        // `n = $N` in string position (the frontend's
+                        // getVar shape): the same positional copy.
+                        param_vars.insert(t.var.clone());
                     }
                 }
             }
@@ -43087,6 +43639,353 @@ mod tests {
             .count();
         assert_eq!(protos, 1, "forward reference keeps one prototype:\n{out2}");
         let _ = out;
+    }
+
+    // ── void-lift scan tests ──
+    fn void_bare_call(name: &str, args: Vec<IrExpr>) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(args),
+            ],
+        })
+    }
+    fn void_fn_def(name: &str, body: Vec<IrStmt>) -> IrStmt {
+        IrStmt::Function {
+            name: name.to_string(),
+            params: vec![],
+            body,
+            named_blocks: vec![],
+        }
+    }
+    fn void_assign(var: &str, expr: IrExpr) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr,
+            asm: None,
+        }
+    }
+    fn void_var(name: &str) -> IrExpr {
+        IrExpr::Var(name.to_string(), None)
+    }
+    fn void_str(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), crate::ir::StrStyle::DoubleQuoted)
+    }
+
+    #[test]
+    fn void_lift_bare_only_fn() {
+        // $1 read + return, called bare once → lifts with arity 1.
+        let body = vec![
+            void_assign("x", void_var("1")),
+            IrStmt::Return(Some(IrExpr::Int(1))),
+        ];
+        let stmts = vec![
+            void_fn_def("vf", body),
+            void_bare_call("vf", vec![void_str("a")]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert_eq!(got.get("vf"), Some(&1), "bare-only fn lifts: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_nested_return() {
+        // `return` nested in an if body is legal for a void lift (the
+        // value lift rejects it — its C function must return a value).
+        let body = vec![IrStmt::If {
+            cond: void_var("x"),
+            then: vec![IrStmt::Return(Some(IrExpr::Int(0)))],
+            elsifs: vec![],
+            else_: vec![],
+        }];
+        let stmts = vec![
+            void_fn_def("vn2", body),
+            void_bare_call("vn2", vec![]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert_eq!(got.get("vn2"), Some(&0), "nested return lifts: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_zero_arity() {
+        // no positionals, bare-called → lifts with arity 0 (a zero-arg
+        // bare call pays the argv swap today too).
+        let stmts = vec![
+            void_fn_def("vz", vec![IrStmt::Return(None)]),
+            void_bare_call("vz", vec![]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert_eq!(got.get("vz"), Some(&0), "zero-arity fn lifts: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_allows_echo() {
+        // stdout writers are legal: no caller captures, so body stdout
+        // IS process stdout either way.
+        let body = vec![void_bare_call("echo", vec![void_var("1")])];
+        let stmts = vec![
+            void_fn_def("ve", body),
+            void_bare_call("ve", vec![void_str("hi")]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert_eq!(got.get("ve"), Some(&1), "echo body lifts: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_refuses_capture() {
+        // x=$(vf) captures stdout → tainted, no lift.
+        let cap = IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: "x".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "capture".to_string(),
+                args: vec![IrExpr::Arrow(vec![void_bare_call("vf", vec![])])],
+            },
+            asm: None,
+        };
+        let stmts = vec![
+            void_fn_def("vf", vec![void_assign("x", void_var("1"))]),
+            cap,
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(!got.contains_key("vf"), "captured fn must not lift: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_refuses_capture_positional() {
+        // `v=$(echo "$1")` hoists into `_cap_N`, whose child-bash builder
+        // has no `_pN` in scope — measured as ‘_p1’ undeclared. Veto.
+        let body = vec![void_assign(
+            "x",
+            IrExpr::Capture {
+                expr: Box::new(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![void_str("echo"), IrExpr::Array(vec![void_var("1")])],
+                }),
+                native: false,
+            },
+        )];
+        let stmts = vec![
+            void_fn_def("vc", body),
+            void_bare_call("vc", vec![void_str("hi")]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(
+            !got.contains_key("vc"),
+            "capture+positional must not lift: {got:?}"
+        );
+    }
+
+    #[test]
+    fn void_lift_refuses_capture_arith_positional() {
+        // `v=$(($1+1))` COMPILES but the child re-evaluates the text with
+        // empty positionals (measured: printed 1 where bash prints 6).
+        let body = vec![void_assign(
+            "x",
+            IrExpr::Capture {
+                expr: Box::new(IrExpr::Arith(Box::new(ArithAst::Var(
+                    "1".to_string(),
+                )))),
+                native: false,
+            },
+        )];
+        let stmts = vec![
+            void_fn_def("va2", body),
+            void_bare_call("va2", vec![void_str("5")]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(
+            !got.contains_key("va2"),
+            "capture+arith-positional must not lift: {got:?}"
+        );
+    }
+
+    #[test]
+    fn void_lift_refuses_pipeline_positional() {
+        // `echo "$1" | tr …` lowers to a child-bash command string built
+        // in a hoisted `_sh_site_N` — the same missing-`_p1` problem.
+        let stage = vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![void_str("echo"), IrExpr::Array(vec![void_var("1")])],
+        })];
+        let body = vec![IrStmt::Pipeline {
+            stages: vec![stage.clone(), stage],
+            last_output: None,
+            capture: None,
+            cmd_str: None,
+        }];
+        let stmts = vec![
+            void_fn_def("vp", body),
+            void_bare_call("vp", vec![void_str("hi")]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(
+            !got.contains_key("vp"),
+            "pipeline+positional must not lift: {got:?}"
+        );
+    }
+
+    #[test]
+    fn void_lift_allows_pipeline_without_positional() {
+        // The veto is about positionals in child-bash text, not about
+        // pipelines as such: a constant pipeline still lifts.
+        let stage = vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![void_str("echo"), IrExpr::Array(vec![void_str("hi")])],
+        })];
+        let body = vec![IrStmt::Pipeline {
+            stages: vec![stage.clone(), stage],
+            last_output: None,
+            capture: None,
+            cmd_str: None,
+        }];
+        let stmts = vec![
+            void_fn_def("vq", body),
+            void_bare_call("vq", vec![]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert_eq!(got.get("vq"), Some(&0), "constant pipeline lifts: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_refuses_condition_and_chain() {
+        // `if vf` reads stdout via the capture-fn path; `vf && g` reads
+        // the verdict — neither is a bare rc+globals call.
+        let cond = IrStmt::If {
+            cond: IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![void_str("vf"), IrExpr::Array(vec![])],
+            },
+            then: vec![],
+            elsifs: vec![],
+            else_: vec![],
+        };
+        let chain = IrStmt::Expr(IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![void_str("vg"), IrExpr::Array(vec![])],
+            }),
+            op: crate::ir::BinOpKind::And,
+            rhs: Box::new(void_var("x")),
+        });
+        let stmts = vec![
+            void_fn_def("vf", vec![IrStmt::Return(None)]),
+            void_fn_def("vg", vec![IrStmt::Return(None)]),
+            cond,
+            chain,
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(!got.contains_key("vf"), "condition use must not lift: {got:?}");
+        assert!(!got.contains_key("vg"), "chain use must not lift: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_refuses_at_and_set_and_self() {
+        // $@, `set --`, and self-recursion each disqualify.
+        let stmts = vec![
+            void_fn_def("va", vec![void_assign("x", void_var("@"))]),
+            void_bare_call("va", vec![]),
+            void_fn_def(
+                "vs",
+                vec![void_bare_call("set", vec![void_str("--")])],
+            ),
+            void_bare_call("vs", vec![]),
+            void_fn_def("vr", vec![void_bare_call("vr", vec![])]),
+            void_bare_call("vr", vec![]),
+        ];
+        let got = scan_void_lifts(&stmts);
+        assert!(!got.contains_key("va"), "$@ body must not lift: {got:?}");
+        assert!(!got.contains_key("vs"), "set body must not lift: {got:?}");
+        assert!(!got.contains_key("vr"), "self-call must not lift: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_needs_a_bare_use() {
+        // defined but never called → nothing to lift.
+        let stmts = vec![void_fn_def("vn", vec![IrStmt::Return(None)])];
+        let got = scan_void_lifts(&stmts);
+        assert!(!got.contains_key("vn"), "uncalled fn must not lift: {got:?}");
+    }
+
+    #[test]
+    fn void_lift_native_numeric_param() {
+        // end to end phase 2: `n = Arith($1)` (numeric provenance → the
+        // recomputed var_types mark n Int) + a small call site →
+        // `long long` param with param-copy aliasing (`n` names the C
+        // parameter, the copy drops, no atoll).
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                void_fn_def(
+                    "vn",
+                    vec![
+                        void_assign(
+                            "n",
+                            IrExpr::Arith(Box::new(crate::ir::ArithAst::Var("1".to_string()))),
+                        ),
+                        void_bare_call("echo", vec![void_var("n")]),
+                    ],
+                ),
+                void_bare_call("vn", vec![void_str("3")]),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static void vn(long long n)"),
+            "native void signature missing:\n{out}"
+        );
+        assert!(out.contains("vn(3)"), "direct numeric call missing:\n{out}");
+        // the param-copy alias absorbed the copy: no _pN survives, so no
+        // atoll can remain on this path (a bare "atoll" assert would
+        // trip on unrelated runtime boilerplate).
+        assert!(!out.contains("_p1"), "unaliased param survived:\n{out}");
+    }
+
+    #[test]
+    fn void_lift_renders_plain_call() {
+        // end to end: `static void vf(char *_p1)` + a bare `vf("a");`
+        // with no argv-swap array.
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                void_fn_def("vf", vec![void_assign("x", void_var("1"))]),
+                void_bare_call("vf", vec![void_str("a")]),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static void vf(char *_p1)"),
+            "void signature missing:\n{out}"
+        );
+        assert!(out.contains("vf(\"a\")"), "plain call missing:\n{out}");
+        assert!(!out.contains("_sh_av"), "argv swap leaked:\n{out}");
     }
 
     // Prototype-gating counters: static decl (`...);`) vs definition
