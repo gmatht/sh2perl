@@ -9182,11 +9182,24 @@ fn arith_to_fish(a: &ArithAst) -> String {
             // "math: Error: Unknown function"), so the previous inline guard
             // could not have worked even when it did parse.
             //
-            // The variable is read bare. A var whose value is NOT numeric
-            // makes `math` abort rather than coerce to 0 the way bash does —
-            // that is a limitation of the fish lowering, recorded here so the
-            // next reader does not re-add the guard that cannot parse.
-            format!("${name}")
+            // The variable is read bare — UNLESS it is not proven numeric, in
+            // which case bash's coercion to 0 must be reproduced or `math`
+            // aborts ("Unknown function") and the whole expression yields
+            // nothing (064_10 printed `Result: ` where bash prints `Result: 0`
+            // for `((result = outer_var + inner_var))` on string values).
+            //
+            // The coercion is a COMMAND SUBSTITUTION around the read. The old
+            // comment here claimed no spelling could parse — that was true of
+            // an inline REGEX (its `$'` terminates the enclosing `math "…"`),
+            // but `$(_num $x)` contains no quote of its own and `math` expands
+            // a `$( )` inside its argument happily (measured).
+            if NUM_VARS.lock().unwrap().contains(&name)
+                || name.chars().all(|c| c.is_ascii_digit())
+            {
+                format!("${name}")
+            } else {
+                format!("$(_num ${name})")
+            }
         }
         // An INDEXED array is a native fish LIST (`set a 10 20 30`), so the
         // subscript reads the list itself. fish's own `$a[n]` is 1-based, so a
