@@ -138,6 +138,7 @@ pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
 pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)
 pub mod fbdev_gpu_calls; // GpuOp → the fb_* call it names (C target only)
 pub mod slice_identity;
+pub mod array_len_fold;
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -230,6 +231,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         //   c worker's in-flight work continues. Flip this line when done.
         //   (Module declared in shir_passes/mod.rs; compiles inert.)
 ("slice-identity", slice_identity::transform),
+("array-len-fold", array_len_fold::transform),
     ]
 }
 
