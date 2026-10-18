@@ -137,6 +137,7 @@ pub mod fbdev_gpu; // device write → GPU op (the §4.2 stage ② "gpu-prep" pa
 pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
 pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)
 pub mod fbdev_gpu_calls; // GpuOp → the fb_* call it names (C target only)
+pub mod slice_identity;
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -228,6 +229,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         //   ir::tests::embed_injects_carp_for_emulations regresses); the
         //   c worker's in-flight work continues. Flip this line when done.
         //   (Module declared in shir_passes/mod.rs; compiles inert.)
+("slice-identity", slice_identity::transform),
     ]
 }
 
