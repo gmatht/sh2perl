@@ -45,7 +45,7 @@
 //! every analysis already keys; estree's var tracker records
 //! `arrayLen` as a read exactly as it recorded the slice).
 
-use crate::ir::{InterpPart, IrExpr, IrStmt, StrStyle};
+use crate::ir::{InterpPart, IrExpr, IrStmt};
 
 /// Apply the transform. Returns whether anything changed.
 /// Signature matches `transforms::TransformFn` (`fn(&mut Vec<IrStmt>)`).
@@ -260,6 +260,7 @@ fn fold(e: &mut IrExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::StrStyle;
 
     fn s(v: &str) -> IrExpr {
         IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)
