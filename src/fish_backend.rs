@@ -70,6 +70,10 @@ lazy_static::lazy_static! {
     static ref LOWER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
     /// `typeset -u` / `declare -u` names: the uppercase counterpart.
     static ref UPPER_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// `typeset -x` / `declare -x` names: bash exports these to the
+    /// environment, so a child sees them (`env | grep '^name='`). fish's
+    /// `set -x` is the same attribute.
+    static ref EXPORT_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
     /// The first character of `IFS`, as the renderer has seen it assigned.
     /// bash joins `${arr[*]}` (and `"$*"`) with this separator; fish's
     /// `string join` needs it spelled out, and defaulting to a space meant a
@@ -1171,6 +1175,7 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     LOWER_VARS.lock().unwrap().clear();
     *IFS_SEP.lock().unwrap() = None;
     UPPER_VARS.lock().unwrap().clear();
+    EXPORT_VARS.lock().unwrap().clear();
     {
         let mut hoisted: Vec<IrStmt> = Vec::new();
         for st in &mut stripped.stmts {
@@ -2463,10 +2468,21 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             } else {
                 "upper"
             };
-            out.push_str(set_prefix_for(&t.var));
+            // An EXPORTED name also carries `-x` (fish's own attribute for
+            // "put me in the environment"), so `typeset -lx n=…` emits both.
+            let exported = EXPORT_VARS.lock().unwrap().contains(&t.var);
+            out.push_str(if exported { "set -gx " } else { set_prefix_for(&t.var) });
             out.push_str(&t.var);
             out.push(' ');
             out.push_str(&format!("(string {fold} -- {})", assign_rhs_to_fish(expr)?));
+            continue;
+        }
+        // An exported name whose value is a plain assignment.
+        if t.indices.is_empty() && EXPORT_VARS.lock().unwrap().contains(&t.var) {
+            out.push_str("set -gx ");
+            out.push_str(&t.var);
+            out.push(' ');
+            out.push_str(&assign_rhs_to_fish(expr)?);
             continue;
         }
         if INT_VARS.lock().unwrap().contains(&t.var) && t.indices.is_empty() {
@@ -4628,6 +4644,22 @@ fn exec_line_to_fish(
         // (arithmetic is rendered in math, assoc elements keep a key list) —
         // record them so the later assignments agree. Only the declared name
         // qualifies, not any bare word that happened to follow.
+        // `-x` — the EXPORT attribute. bash puts the name in the environment
+        // so a child sees it (`env | grep '^name='`); fish spells that `set
+        // -x`. Registered here like the other attributes, then applied by the
+        // assignment path.
+        for f in &flags {
+            if f.trim_start_matches('-').contains('x') {
+                let mut v = EXPORT_VARS.lock().unwrap();
+                for s in stmts
+                    .iter()
+                    .filter_map(|s| declared_name(s))
+                    .chain(declared.iter().cloned())
+                {
+                    v.insert(s);
+                }
+            }
+        }
         // `-l` / `-u` case attributes. The flag vectors hold the raw `-l`
         // words, and a combined `-il` sets both.
         for f in &flags {
@@ -4683,7 +4715,28 @@ fn exec_line_to_fish(
             // per-element lowering self-initializes, so a no-op still parses.
             out.push(':');
         } else {
-            out.push_str(&stmts.join("; "));
+            // An EXPORTED name gets fish's `-x`: the statements here are
+            // emitted verbatim (`stmts.join`), so the assignment path never
+            // sees them and the attribute has to be applied at this level
+            // (typeset-cmdsub's `typeset -x myexport=…` rendered a plain `set`
+            // and `env` never listed the name).
+            let exported: Vec<String> = stmts
+                .iter()
+                .filter_map(|st| {
+                    let n = declared_name(st)?;
+                    EXPORT_VARS.lock().unwrap().contains(&n).then_some(n)
+                })
+                .collect();
+            let rendered: Vec<String> = stmts
+                .iter()
+                .map(|st| match declared_name(st) {
+                    Some(n) if exported.contains(&n) => {
+                        st.replacen("set ", "set -gx ", 1)
+                    }
+                    _ => st.clone(),
+                })
+                .collect();
+            out.push_str(&rendered.join("; "));
         }
         return Ok(out);
     }
@@ -6289,6 +6342,38 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
                 var_ref_to_fish(&raw_arg(args, 0)?, false)
             )),
             IrExpr::Call { func, args } if func == "param" => param_to_fish(args, false),
+            // split() of a PURE-LITERAL interpolation (`arr=($x)` with
+            // `x="a b"` constant-folded to split("a b")): the value is
+            // already known — field-split it at RENDER into bare words
+            // (fish splits only unquoted expansions, so an Interp
+            // rendered through word_to_fish would arrive single-quoted
+            // as ONE element: t63 `set arr 'a b'` gave n=1 not n=2).
+            // Mixed literal+expr parts keep the runtime split below.
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+            {
+                let mut s = String::new();
+                for p in parts {
+                    if let crate::ir::InterpPart::Lit(t) = p {
+                        s.push_str(t);
+                    }
+                }
+                // quote each field for fish (a field with spaces would
+                // re-split) — the SPLIT already happened here.
+                Ok(s.split(|c: char| c == ' ' || c == '\t' || c == '\n')
+                    .filter(|w| !w.is_empty())
+                    .map(|w| {
+                        if w.contains(['\'', '"', '$', '`', '\\', '(', ')', ';', '&', '|', '*', '?', '#', '~'])
+                            || w.is_empty()
+                        {
+                            format!("'{}'", w.replace('\'', "\\'"))
+                        } else {
+                            w.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "))
+            }
             other => word_to_fish(other),
         },
         "param" => param_to_fish(args, false),
