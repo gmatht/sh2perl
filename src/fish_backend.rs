@@ -4815,6 +4815,46 @@ fn exec_line_to_fish(
                 // load-bearing: without it a word starting with `-` is read
                 // as an OPTION (`echo --x="$X"` died with `string join:
                 // --x=test: unknown option`, parse-longoption-with-dollar.sh).
+                //
+                // A SINGLE interpolation word (`echo "prefix$(…)"`) joins
+                // its PARTS with `''`, not the words with `' '`: a command
+                // substitution with no output contributes ZERO elements to
+                // a space-join (the whole word vanished — 058 printed EMPTY
+                // for the `%%`-strip of an unset var), while `string join
+                // ''` keeps the surviving parts glued (bash concatenation).
+                // Parts render separately: `"lit"$(subst)""` glued still
+                // vanishes when the subst is empty (cart-product). Multi-word
+                // joins keep the `' '` form (echo joins its args with spaces;
+                // the join reproduces exactly that).
+                if words.len() == 1 {
+                    // NOTE: in exec_line_to_fish, `args` are the WORDS
+                    // (the call site passes the Array items, cmd separately)
+                    // — args[0] is the single Interp word itself.
+                    if let Some(IrExpr::Interpolate(parts)) = args.first() {
+                        let mut pj = Vec::new();
+                        for p in parts {
+                            match p {
+                                crate::ir::InterpPart::Lit(t) => {
+                                    if t.is_empty() {
+                                        continue;
+                                    }
+                                    pj.push(format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")));
+                                }
+                                crate::ir::InterpPart::Expr(x) => {
+                                    pj.push(word_to_fish(x)?);
+                                }
+                            }
+                        }
+                        if pj.len() >= 2 {
+                            return Ok(format!("printf '%s\\n' (string join '' -- {})", pj.join(" ")));
+                        }
+                    }
+                    let w = &words[0];
+                    if w.contains('(') && w.contains(')') {
+                        return Ok(format!("printf '%s\\n' (string join '' -- {w})"));
+                    }
+                    return Ok(format!("printf '%s\\n' {w}"));
+                }
                 return Ok(format!("printf '%s\\n' (string join ' ' -- {joined})"));
             }
         }
