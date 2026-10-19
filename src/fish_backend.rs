@@ -3901,7 +3901,38 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
 fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Arith(a) => Ok(arith_cond_ast_fish(a)),
+        // Native comparison BinOps in CONDITION position (the core now
+        // emits If-conds as structured `BinOp(Gt/Lt/…, Arith, Arith)`
+        // instead of test-string Calls): render as `[ lhs flag rhs ]`
+        // directly — routing through cmd_to_fish hits its catch-all
+        // ("command expression not renderable") since that path only
+        // knows And/Or/Not/Arith/Var.
+        IrExpr::BinOp { op, lhs, rhs } => {
+            let flag = match op {
+                BinOpKind::Eq => "-eq",
+                BinOpKind::Ne => "-ne",
+                BinOpKind::Lt => "-lt",
+                BinOpKind::Gt => "-gt",
+                BinOpKind::Le => "-le",
+                BinOpKind::Ge => "-ge",
+                _ => return cmd_to_fish(e),
+            };
+            Ok(format!(
+                "[ {} {flag} {} ]",
+                cond_operand_fish(lhs)?,
+                cond_operand_fish(rhs)?
+            ))
+        }
         IrExpr::BinOp { .. } => cmd_to_fish(e),
+        other => cmd_to_fish(other),
+    }
+}
+
+/// A comparison operand in CONDITION position: an `Arith` subtree renders
+/// as its math expression, anything else through the value renderer.
+fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
+    match e {
+        IrExpr::Arith(a) => Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a))),
         other => cmd_to_fish(other),
     }
 }
@@ -4852,6 +4883,29 @@ fn exec_line_to_fish(
                     // (the call site passes the Array items, cmd separately)
                     // — args[0] is the single Interp word itself.
                     if let Some(IrExpr::Interpolate(parts)) = args.first() {
+                        // Render each part for CONCATENATION (bash word
+                        // semantics — no added spaces). Literals stay QUOTED
+                        // (a bare multi-word literal would split); vars stay
+                        // bare; nested literal-only interpolations inline as
+                        // their text. Do NOT route through
+                        // word_to_fish/interp_to_fish here: those QUOTE the
+                        // parts for standalone-word use, and the quotes
+                        // would become literal (t04 printed
+                        // `"words: 'hello world'"` with visible quotes).
+                        fn flat_interp(e: &IrExpr) -> Option<String> {
+                            if let IrExpr::Interpolate(ps) = e {
+                                if ps.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) {
+                                    let mut s = String::new();
+                                    for p in ps {
+                                        if let crate::ir::InterpPart::Lit(t) = p {
+                                            s.push_str(t);
+                                        }
+                                    }
+                                    return Some(s);
+                                }
+                            }
+                            None
+                        }
                         let mut pj = Vec::new();
                         let mut has_subst = false;
                         for p in parts {
@@ -4860,14 +4914,27 @@ fn exec_line_to_fish(
                                     if t.is_empty() {
                                         continue;
                                     }
+                                    // QUOTED (multi-word literals must not split).
                                     pj.push(format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")));
                                 }
                                 crate::ir::InterpPart::Expr(x) => {
+                                    if let Some(flat) = flat_interp(x) {
+                                        pj.push(flat.replace('\\', "\\\\").replace('"', "\\\""));
+                                        continue;
+                                    }
                                     let w = word_to_fish(x)?;
                                     if w.contains('(') {
                                         has_subst = true;
                                     }
-                                    pj.push(w);
+                                    // Strip ONE layer of double quotes the
+                                    // word renderer added for standalone
+                                    // use: inside this concatenation the
+                                    // quotes are literal text.
+                                    if w.starts_with('"') && w.ends_with('"') && w.len() >= 2 {
+                                        pj.push(w[1..w.len() - 1].to_string());
+                                    } else {
+                                        pj.push(w);
+                                    }
                                 }
                             }
                         }
@@ -4876,31 +4943,19 @@ fn exec_line_to_fish(
                         }
                         if pj.len() >= 2 {
                             // Scalar interpolation concatenates (bash word
-                            // semantics — no added spaces): `"a"$x"b"`.
-                            // Only a VANISHING part (command substitution
-                            // with no output — cart-product kills the word)
-                            // needs the join, and that took the `''` path
-                            // above. A bare list var splats natively in
-                            // fish (`"Config: "$sorted` is one word per
-                            // element) — joining is wrong too. So: plain
-                            // concatenate, with one exception: a part that
-                            // renders a command substitution `(…)` cannot
-                            // concatenate (zero elements kill the word) —
-                            // but has_subst already routed those.
+                            // semantics): strip the quotes the part renderer
+                            // added for standalone use, then glue into ONE
+                            // double-quoted word. (Only a vanishing command
+                            // substitution needs a join, and that took the
+                            // `''` path above.)
                             let mut cat = String::new();
                             for part in &pj {
-                                // strip the quotes the part renderer added:
-                                // a `"lit"` becomes lit, a bare `$v`/subst
-                                // stays bare — concatenation position.
                                 if part.starts_with('"') && part.ends_with('"') && part.len() >= 2 {
                                     cat.push_str(&part[1..part.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"));
                                 } else {
                                     cat.push_str(part);
                                 }
                             }
-                            // Re-quote as ONE double-quoted word (fish `$`
-                            // still expands inside; escaped `\"`/`\\`
-                            // survive verbatim).
                             let esc = cat.replace('\\', "\\\\").replace('"', "\\\"");
                             return Ok(format!("printf '%s\\n' \"{esc}\""));
                         }
@@ -7848,8 +7903,11 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
             }
         }
         // A nested interpolation as an expression part (`"hello $("world")" —
-        // the posix frontend nests single-word Interps): flatten to the
-        // inner word (a pure-literal nest renders as its literal text).
+        // the posix frontend nests single-word Interps). A pure-literal
+        // nest is JUST text: return it as a PLAIN STRING (not a quoted
+        // word) so the caller's concatenation does not double-quote it
+        // (t04: `"words: $y"` with folded `y="hello world"` printed
+        // `"words: 'hello world'"` with literal quotes).
         IrExpr::Interpolate(inner) => {
             if inner.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) {
                 let mut s = String::new();
@@ -7858,7 +7916,7 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
                         s.push_str(t);
                     }
                 }
-                return interp_to_fish(&[crate::ir::InterpPart::Lit(s)]);
+                return Ok(bash_specials_to_fish(&s));
             }
             interp_to_fish(inner)
         }
