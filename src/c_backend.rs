@@ -7918,6 +7918,7 @@ fn array_fixed_caps(
                         let info = map.entry(name.clone()).or_default();
                         info.defined = true;
                         info.unbounded = true;
+                        info.escaped = true;
                     }
                 }
                 for a in args {
