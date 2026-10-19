@@ -7847,7 +7847,23 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
                 ))
             }
         }
+        // A nested interpolation as an expression part (`"hello $("world")" —
+        // the posix frontend nests single-word Interps): flatten to the
+        // inner word (a pure-literal nest renders as its literal text).
+        IrExpr::Interpolate(inner) => {
+            if inner.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) {
+                let mut s = String::new();
+                for p in inner {
+                    if let crate::ir::InterpPart::Lit(t) = p {
+                        s.push_str(t);
+                    }
+                }
+                return interp_to_fish(&[crate::ir::InterpPart::Lit(s)]);
+            }
+            interp_to_fish(inner)
+        }
         other => Err(format!("interp expr not renderable: {other:?}")),
+
     }
 }
 
