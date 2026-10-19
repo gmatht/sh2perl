@@ -2814,6 +2814,13 @@ fn assign_call_to_fish(args: &[IrExpr]) -> Result<String, String> {
     if op.is_empty() || op == "=" {
         return Ok(format!("set {name} {value}"));
     }
+    // `arr+=(...)` / `z+=slice` on an ARRAY target is an APPEND, not
+    // arithmetic: route through set_array_to_fish (051: `z+=(a b)` then
+    // `z+=${primes[@]:0:1}` rendered as `math` on the whole list and
+    // failed). The ARRAY_NAMES census marks every setArray target.
+    if op == "+=" && ARRAY_NAMES.lock().unwrap().contains(arr_base(&name)) {
+        return Ok(set_array_to_fish(&name, &value, true));
+    }
     // `x+=y` — the accumulating form. `math` gives the fish-native numeric
     // semantics the rest of the backend already relies on.
     let binop = match op {
