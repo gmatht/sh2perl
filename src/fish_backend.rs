@@ -8762,6 +8762,17 @@ fn arith_cmd_fish(raw: &str) -> String {
 /// to a `-ne 0` nonzero test — bash's `(( expr ))` truthiness — which is what
 /// the nonzero branch above already does.
 fn arith_cond_fish(raw: &str) -> String {
+    // Top-level `&&` / `||` chain FIRST (before the relational split): fish's
+    // `math` has no boolean operators, so `((a>b)&&(b<c)||(a%2==0))` must
+    // become `[ A ] && [ B ] || [ C ]` (each side recurses — a relational
+    // splits to a test, a bare value to nonzero). Depth-0 split only;
+    // parens-grouped sides strip one outer layer.
+    if let Some((op, lhs, rhs)) = split_bool_top(raw) {
+        let l = arith_cond_fish(strip_one_paren(lhs.trim()));
+        let r = arith_cond_fish(strip_one_paren(rhs.trim()));
+        let joiner = if op == "&&" { " && " } else { " || " };
+        return format!("{l}{joiner}{r}");
+    }
     // Split BEFORE the `$`-rewrite, and only at a relational that sits at
     // paren-depth 0. Rewriting first would move `$var` → `var`, and the `>`
     // INSIDE the variable name would then be mistaken for the comparison
@@ -8775,6 +8786,73 @@ fn arith_cond_fish(raw: &str) -> String {
         );
     }
     format!("[ (math --scale 0 \"{}\") -ne 0 ]", arith_rewrite(raw))
+}
+
+/// The first paren-depth-0 `&&` / `||` in an arithmetic condition, as
+/// `(op, lhs, rhs)`. `None` when the expression has no top-level boolean
+/// (a relational or bare value — the caller's other arms). Depth tracking
+/// plus the `$`-name skip mirror `split_relational` (a `&&` inside parens
+/// or a var name is not a split point).
+fn split_bool_top(raw: &str) -> Option<(&str, &str, &str)> {
+    let b = raw.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'$' => {
+                let mut j = i + 1;
+                while j < b.len()
+                    && (b[j].is_ascii_alphanumeric() || b[j] == b'_')
+                {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            _ if depth == 0 => {
+                for op in ["&&", "||"] {
+                    if raw[i..].starts_with(op) {
+                        let lhs = raw[..i].trim();
+                        let rhs = raw[i + op.len()..].trim();
+                        if !lhs.is_empty() && !rhs.is_empty() {
+                            return Some((op, lhs, rhs));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip one outer paren layer (`((a) && b)` → `(a) && b`) so a grouped
+/// boolean side recurses into the `&&`/`||` arm instead of falling to the
+/// relational arm with parens intact.
+fn strip_one_paren(s: &str) -> &str {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('(') && t.ends_with(')') {
+        // verify balance: the first `(` must close at the very end
+        let mut depth = 0i32;
+        let b = t.as_bytes();
+        for (i, &c) in b.iter().enumerate() {
+            if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+                if depth == 0 && i != b.len() - 1 {
+                    return s;
+                }
+            }
+        }
+        if depth == 0 {
+            return &t[1..t.len() - 1];
+        }
+    }
+    s
 }
 
 /// The first paren-depth-0 relational in an arithmetic expression, as
