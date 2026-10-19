@@ -6697,6 +6697,13 @@ fn array_fixed_caps(
         defined: bool,
         indexed_write: bool,
         unbounded: bool,
+        // The array's name escapes to an UNKNOWN call (it may be indexed
+        // through a nameref, past any cap we could emit). Never route
+        // such an array to vec: the callee sees a `char**` it did not
+        // grow, and `arr[i]=v` past the grown region would write out of
+        // bounds. Distinct from `unbounded` (a split/mapfile fill whose
+        // count is only known at runtime but which WE alone write).
+        escaped: bool,
         // max over LITERAL index writes (arr[1]=x needs cap >= 2).
         // Dynamic indices keep indexed_write (poison); literal ones only
         // raise this bound (item 41) — same slot rewritten in a loop
@@ -7845,6 +7852,12 @@ fn array_fixed_caps(
         match args.get(1) {
             Some(IrExpr::Array(items)) => {
                 if items.iter().any(is_multi) {
+                    // A runtime-unknown element count: unboundable, but
+                    // this IS a definition of the array (it gets storage
+                    // routed to vec below) — leaving `defined` false made
+                    // the vec route skip it and fall back to the blanket
+                    // ARR_CAP table.
+                    info.defined = true;
                     info.unbounded = true;
                     return;
                 }
@@ -8181,6 +8194,26 @@ fn array_fixed_caps(
     }
     let mut out = HashMap::new();
     for (name, info) in &map {
+        // An UNBOUNDED fill (a `split` / `mapfile` / `read` whose element
+        // count is only known at runtime) can never be sized from proofs,
+        // so it takes the same route as a failed proof: vec. This must be
+        // decided BEFORE the `unbounded` skip below — otherwise it falls
+        // through to the blanket `array_cap()` → ARR_CAP table at the
+        // decl site, while the split/mapfile store sites consult
+        // `vec_arrays` and emit the fixed guard (measured: `c=( $(...) )`
+        // still emitted `char *c[1024]`). `defined` is required: a name
+        // seen only as a read has no storage of its own.
+        //
+        // NOT extended to `indexed_write` (a dynamic index write): those
+        // arrays keep the fixed ARR_CAP backstop deliberately. A sparse
+        // dynamic fill only ever touches low indices, so a fixed table
+        // works up to the cap and exits 127 past it — never garbage —
+        // whereas routing it changes that documented backstop (see the
+        // counter_forinit_*_keeps_fixed tests). Doing it properly needs
+        // the dense-coverage proof that `routed` above already collects.
+        if info.unbounded && info.defined && !info.escaped && !exclude.contains(name) {
+            routed.insert(name.clone());
+        }
         if info.indexed_write || info.unbounded || !info.defined {
             continue;
         }
@@ -8202,6 +8235,27 @@ fn array_fixed_caps(
         // runtime guard still exits 127 on any miscount: fail-closed).
         if info.counter_index_max > 0 || need < ARR_CAP as u64 {
             out.insert(name.clone(), need.max(1) as usize);
+        } else {
+            // SIZING FAILED: no proven cap. Route to vec instead of the
+            // `ARR_CAP` fallback. The fallback was strictly worse than a
+            // vec — it reserved 1024 pointers of .bss (8 KiB) for an
+            // array whose extent was NOT proven, while still
+            // `_sh_xstrdup`-ing every element, so it saved no allocation
+            // at all: it only over-allocated the pointer table (measured
+            // on MIMEcroft_fb: RFB_ROWS reserved 1024 slots for 240 rows,
+            // lgi 1024 for <=12 — 16 KiB of the 18.4 KiB the fixed
+            // tables cost). A vec starts at 0 bytes and grows to need,
+            // and every use site renders identically through the pointer
+            // (`x[k]` / `x_len` / `x_cap`), so the only difference is
+            // HOW overflow is handled: `_sh_grow_str` instead of the
+            // exit-127 guard. That also collapses the fixed/vec split to
+            // "proven cap = fixed, everything else = vec", which is what
+            // makes a single reset path possible.
+            //
+            // Not routed when the array is an assoc (its `_k`/`_v` stores
+            // are removed from vec_arrays at render time) or a
+            // fn-return/bigint array (excluded above).
+            routed.insert(name.clone());
         }
     }
     (out, routed)
@@ -9339,7 +9393,20 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         r.vec_arrays.extend(routed.iter().cloned());
         // Routed arrays are exactly clean + dense0 + dynamic: the
         // bulk-len eligibility base (per-loop checks add the rest).
+        // Read this BEFORE the extension below: bulk-len needs the
+        // dense-counter proof, not merely "is a vec".
         r.counter_dense = routed;
+        // Every string array WITHOUT a proven cap is a vec too (see the
+        // decl site): the blanket ARR_CAP table was worse than a vec.
+        // `arrays` is not known yet (it is discovered from the IR during
+        // render), so this is applied again at the decl site for
+        // IR-visible arrays; this pass covers the ones `array_fixed_caps`
+        // sized (map population) so the grow helpers get registered.
+        for a in r.arrays.iter() {
+            if !r.array_caps.contains_key(a) {
+                r.vec_arrays.insert(a.clone());
+            }
+        }
     }
     // Inline take-field fusion (adjacent grab+strip pairs → TakeField
     // nodes). LAST pre-pass before render, on purpose: the node hides
@@ -29983,8 +30050,22 @@ fn param_copy_alias(
                         let id = self.c_ident(&name);
                         let t = self.value_c(target);
                         let strip = if striptail { "1" } else { "0" };
+                        // Grow (vec) / refuse (fixed) — the SAME split
+                        // every other store site makes. This site used to
+                        // hardcode the ARR_CAP guard, so an array routed
+                        // to vec storage wrote past the end of a NULL
+                        // pointer (segfault: 012_process_substitution).
+                        let guard = if self.vec_arrays.contains(&name) {
+                            format!(
+                                "while ({id}_len + 1 > {id}_cap) _sh_grow_str(&{id}, &{id}_cap);"
+                            )
+                        } else {
+                            format!(
+                                "if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                            )
+                        };
                         self.emit(&format!(
-                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} if ({id}_len >= {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[{id}_len++] = _sh_xstrdup(_mfl.p); }} fclose(_mf); }} }}"
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static _sh_vbuf _mfl = {{0, 0}}; while (_sh_fgets_line(_mf, &_mfl)) {{ size_t _mn = strlen(_mfl.p); if ({strip}) {{ while (_mn && (_mfl.p[_mn-1]=='\\n'||_mfl.p[_mn-1]=='\\r')) _mfl.p[--_mn]=0; }} {guard} {id}[{id}_len++] = _sh_xstrdup(_mfl.p); }} fclose(_mf); }} }}"
                         ));
                         return;
                     }
@@ -33206,10 +33287,37 @@ fn param_copy_alias(
                     self.prealloc.push((id.clone(), "char*".to_string(), cap));
                 }
             } else {
-                // exact proven capacity (sizing from proofs) or ARR_CAP
-                let cap = self.array_cap(a);
-                self.emit(&format!("static char *{id}[{cap}] = {{0}};"));
-                self.emit(&format!("static size_t {id}_len = 0;"));
+                // Exact proven capacity (sizing from proofs). An array
+                // with NO proven cap routes to vec instead of the blanket
+                // `ARR_CAP` table, because that fallback was strictly
+                // worse than a vec: it reserved ARR_CAP pointers of .bss
+                // (8 KiB) for an array whose extent was NOT proven, while
+                // still `_sh_xstrdup`-ing every element — so it saved no
+                // allocation at all, only over-allocated the pointer
+                // table. Measured on MIMEcroft_fb: RFB_ROWS reserved 1024
+                // slots for 240 rows and lgi 1024 for <=12, i.e. 16 of
+                // the 18.4 KiB its fixed tables cost. A vec starts at 0
+                // bytes and grows to need, and every use site renders
+                // identically through the pointer (`x[k]` / `x_len` /
+                // `x_cap`); the only difference is how overflow is
+                // handled (`_sh_grow_str` instead of the exit-127 guard).
+                // This also collapses the fixed/vec split to "proven cap =
+                // fixed, everything else = vec", which is what lets a
+                // single reset path serve both.
+                if self.vec_arrays.contains(a) {
+                    self.emit(&format!("static char **{id} = NULL;"));
+                    self.emit(&format!("static size_t {id}_len = 0, {id}_cap = 0;"));
+                    if let Some(cap) = self.prof_in.as_ref().and_then(|p| p.cap_for(a)) {
+                        self.prealloc.push((id.clone(), "char*".to_string(), cap));
+                    }
+                } else {
+                    // PROVEN cap: a fixed table of exactly that size
+                    // (`array_caps` never holds ARR_CAP for a proven
+                    // array — the unproven ones are vecs above).
+                    let cap = self.array_cap(a);
+                    self.emit(&format!("static char *{id}[{cap}] = {{0}};"));
+                    self.emit(&format!("static size_t {id}_len = 0;"));
+                }
             }
         }
         if !self.arrays.is_empty() {
@@ -49082,7 +49190,20 @@ mod tests {
             ),
             echo_len("c"),
         ]));
-        assert!(out.contains("char *c[1024]"), "split fill shrunk:\n{out}");
+        // split fill (runtime-unknown count) → VEC, not the blanket
+        // `char *c[1024]` table. That fallback reserved 1024 pointers
+        // (8 KiB of .bss) for an array whose extent was never proven,
+        // while still strdup-ing every element — so it saved no
+        // allocation, only over-allocated the table. Vec starts at 0
+        // bytes and grows to need.
+        assert!(
+            out.contains("char **c = NULL"),
+            "split fill not routed to vec:\n{out}"
+        );
+        assert!(
+            !out.contains("char *c[1024]"),
+            "blanket cap survived for an unproven array:\n{out}"
+        );
     }
 
     #[test]
