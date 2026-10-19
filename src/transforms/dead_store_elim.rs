@@ -575,6 +575,18 @@ fn census_expr(
                         }
                     }
                 }
+                // `param("slice"/"len"/"join", name, ...)` joins array
+                // elements at RUNTIME — the join separator is IFS. Without
+                // this the IFS store is culled whenever the join goes
+                // through param rather than a literal `[*]` word (064_07's
+                // assoc path: sort saw one space-joined line).
+                if matches!(func.as_str(), "param") {
+                    if let Some(IrExpr::Str(op, _)) = args.first() {
+                        if matches!(op.as_str(), "slice" | "len" | "join") {
+                            reads.insert("IFS".to_string());
+                        }
+                    }
+                }
             }
             // the json* writers write the resolved var (the receiver
             // name arg) — the store must stay live.

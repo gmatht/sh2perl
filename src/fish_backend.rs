@@ -683,12 +683,19 @@ fn arr_expand_call_fish(name: &str) -> String {
 
 /// The separator `string join` must use for a `${arr[*]}` / `"$*"` expansion:
 /// bash's first IFS character, or a space when IFS is unset or empty.
+///
+/// INDIRECTED through the runtime `$IFS` variable (never inlined): a
+/// literal newline separator inside `(string join '…' …)` is a fish
+/// command separator, so the join broke at render (064_07 printed one
+/// glued word); `$'\n'` is not decoded by fish in either quote form.
+/// The backend emits `set IFS <char>` at the assignment, so by the time
+/// any join runs, `$IFS` carries exactly what bash would join with.
+/// When the program never assigns IFS, `$IFS` is unset and the `or`
+/// supplies the space bash defaults to.
 fn ifs_join_sep() -> String {
     match IFS_SEP.lock().unwrap().as_deref() {
         Some(s) if !s.is_empty() => {
-            // `\n` in the source is a REAL newline here, which `string join`
-            // accepts as its separator argument.
-            fish_single_quoted(s)
+            "(set -q IFS; and printf '%s' $IFS; or printf '%s' ' ')".to_string()
         }
         _ => "' '".to_string(),
     }
@@ -4833,12 +4840,20 @@ fn exec_line_to_fish(
                 // vanishes when the subst is empty (cart-product). Multi-word
                 // joins keep the `' '` form (echo joins its args with spaces;
                 // the join reproduces exactly that).
+                //
+                // LIST exception: a bare list variable (`"Config: $sorted"`)
+                // is NOT a zero-element risk — fish splats it natively —
+                // and `''`-joining it CONCATENATES (064_07 glued), where
+                // bash's `"${sorted[@]}"` joins with spaces. Only command
+                // substitutions (and other parens-forms) take the `''`
+                // path; plain vars keep the space join.
                 if words.len() == 1 {
                     // NOTE: in exec_line_to_fish, `args` are the WORDS
                     // (the call site passes the Array items, cmd separately)
                     // — args[0] is the single Interp word itself.
                     if let Some(IrExpr::Interpolate(parts)) = args.first() {
                         let mut pj = Vec::new();
+                        let mut has_subst = false;
                         for p in parts {
                             match p {
                                 crate::ir::InterpPart::Lit(t) => {
@@ -4848,12 +4863,46 @@ fn exec_line_to_fish(
                                     pj.push(format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")));
                                 }
                                 crate::ir::InterpPart::Expr(x) => {
-                                    pj.push(word_to_fish(x)?);
+                                    let w = word_to_fish(x)?;
+                                    if w.contains('(') {
+                                        has_subst = true;
+                                    }
+                                    pj.push(w);
                                 }
                             }
                         }
-                        if pj.len() >= 2 {
+                        if has_subst && pj.len() >= 2 {
                             return Ok(format!("printf '%s\\n' (string join '' -- {})", pj.join(" ")));
+                        }
+                        if pj.len() >= 2 {
+                            // Scalar interpolation concatenates (bash word
+                            // semantics — no added spaces): `"a"$x"b"`.
+                            // Only a VANISHING part (command substitution
+                            // with no output — cart-product kills the word)
+                            // needs the join, and that took the `''` path
+                            // above. A bare list var splats natively in
+                            // fish (`"Config: "$sorted` is one word per
+                            // element) — joining is wrong too. So: plain
+                            // concatenate, with one exception: a part that
+                            // renders a command substitution `(…)` cannot
+                            // concatenate (zero elements kill the word) —
+                            // but has_subst already routed those.
+                            let mut cat = String::new();
+                            for part in &pj {
+                                // strip the quotes the part renderer added:
+                                // a `"lit"` becomes lit, a bare `$v`/subst
+                                // stays bare — concatenation position.
+                                if part.starts_with('"') && part.ends_with('"') && part.len() >= 2 {
+                                    cat.push_str(&part[1..part.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"));
+                                } else {
+                                    cat.push_str(part);
+                                }
+                            }
+                            // Re-quote as ONE double-quoted word (fish `$`
+                            // still expands inside; escaped `\"`/`\\`
+                            // survive verbatim).
+                            let esc = cat.replace('\\', "\\\\").replace('"', "\\\"");
+                            return Ok(format!("printf '%s\\n' \"{esc}\""));
                         }
                     }
                     let w = &words[0];
@@ -5471,7 +5520,18 @@ fn lower_procsub_inline_fish(ps: &[IrRedirect], cmd: &str) -> Result<String, Str
 fn herestring_wrap_fish(redirects: &[IrRedirect], cmd: String) -> Result<String, String> {
     for r in redirects {
         if r.mode == "herestring" {
-            let t = word_to_fish(&r.target)?;
+            // A herestring feeds LINES to the command's stdin (`sort`,
+            // `read`, `wc -l`), not one joined word: render the target in
+            // LIST form (elements as separate words — the assoc loop one
+            // value per line, `$arr` bare) so the pipe carries lines.
+            // Scalar words are unaffected (one word is one line either
+            // way).
+            let t = match &r.target {
+                IrExpr::Call { func, args } if func.as_str() == "param" => {
+                    param_to_fish(args, true)?
+                }
+                other => word_to_fish(other)?,
+            };
             return Ok(format!("printf '%s\\n' {t} | {cmd}"));
         }
         if r.mode == "heredoc" || r.mode == "heredoc-tabs" {
@@ -6762,6 +6822,12 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                     if an.starts_with('!') {
                         return Ok(arr_keys_call_fish(arr_base(&an)));
                     }
+                    // LIST context (a herestring feeding a line-tool):
+                    // elements as separate words — the assoc walk one
+                    // value per line. Otherwise the joined WORD form.
+                    if list {
+                        return Ok(arr_expand_call_fish_list(arr_base(&an)));
+                    }
                     return Ok(arr_expand_call_fish(arr_base(&an)));
                 }
                 if idx.contains(['$', '(']) {
@@ -6837,6 +6903,13 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
                 // `${!map[@]}` — the `!` marker means KEYS, not values
                 if name.starts_with('!') {
                     return Ok(arr_keys_call_fish(arr_base(&name)));
+                }
+                // LIST context (a herestring feeding a line-tool): the
+                // elements as separate words — one per line down the pipe.
+                // The assoc walk already emits one value per line; a plain
+                // list splats natively. Otherwise the joined WORD form.
+                if list {
+                    return Ok(arr_expand_call_fish_list(arr_base(&name)));
                 }
                 return Ok(arr_expand_call_fish(arr_base(&name)));
             }
