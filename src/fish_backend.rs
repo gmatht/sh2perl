@@ -5081,8 +5081,20 @@ fn exec_line_to_fish(
                         }
                     }
                     let w = &words[0];
+                    // A FIELD-SPLIT expansion (`echo $t` with t="a b" — the
+                    // core hands it over as split(getVar t), which renders as a
+                    // `(string match -ar …)` LIST) joins with a SPACE: it is
+                    // bash's default-IFS word list, and echo prints its fields
+                    // separated. `''` is for a single command substitution whose
+                    // zero-element case would otherwise VANISH the word — not
+                    // for a split (t08_chain printed `ab` for bash's `a b`).
+                    let is_split = matches!(
+                        args.first(),
+                        Some(IrExpr::Call { func, .. }) if func == "split"
+                    );
                     if w.contains('(') && w.contains(')') {
-                        return Ok(format!("printf '%s\\n' (string join '' -- {w})"));
+                        let sep = if is_split { "' '" } else { "''" };
+                        return Ok(format!("printf '%s\\n' (string join {sep} -- {w})"));
                     }
                     return Ok(format!("printf '%s\\n' {w}"));
                 }
