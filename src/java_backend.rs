@@ -284,7 +284,7 @@ impl JavaRender {
         // removes the whole missing-symbol failure class.
         let _ = std::mem::take(&mut self.helpers);
         let all_helpers = [
-            "env","len","num","arg","shift","cd","run","runrc","capture","printf",
+            "env","len","num","arg","shift","cd","run","runrc","capture","fncap","printf",
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
@@ -481,9 +481,28 @@ impl JavaRender {
                 self.pipeline(stages, capture.as_deref(), cmd_str.as_deref()),
             IrStmt::Function { .. } => Ok(()), // emitted at top level
             IrStmt::Return(v) => {
+                // The echo-return-lift turns trailing `echo ...` into
+                // `return "<string>"` — the function's VALUE is its stdout.
+                // String values print (bash-faithful: statement-position
+                // calls show output, fnValue captures it); numeric values
+                // set the exit status (real `return N` — the core keeps
+                // those as Int/Arith, a numeric Str, or a variable read).
                 match v {
-                    Some(e) => { let x = self.expr_num(e)?; self.emit(&format!("__SH_RC = {x};")); }
                     None => {}
+                    Some(e) => {
+                        let is_status = matches!(e, IrExpr::Int(_) | IrExpr::Arith(_)
+                            | IrExpr::Var(_, _) | IrExpr::Ident(_))
+                            || matches!(e, IrExpr::Str(s, _) if s.trim().parse::<i64>().is_ok())
+                            || matches!(e, IrExpr::Call { func, .. } if func == "getVar");
+                        if is_status {
+                            let x = self.expr_num(e)?;
+                            self.emit(&format!("__SH_RC = {x};"));
+                        } else {
+                            let s = self.expr_str(e)?;
+                            self.emit(&format!("System.out.println({s});"));
+                            self.emit("__SH_RC = 0;");
+                        }
+                    }
                 }
                 if self.in_fn > 0 {
                     self.emit("return __SH_RC == 0;");
@@ -492,8 +511,8 @@ impl JavaRender {
                 }
                 Ok(())
             }
-            IrStmt::Break => { self.emit("break;"); Ok(()) }
-            IrStmt::Continue => { self.emit("continue;"); Ok(()) }
+            IrStmt::Break => { self.emit("__SH_RC = 0; break;"); Ok(()) }
+            IrStmt::Continue => { self.emit("__SH_RC = 0; continue;"); Ok(()) }
             IrStmt::Exit(code) => {
                 match code {
                     Some(e) => { let c = self.expr_num(e)?; self.emit(&format!("System.exit((int) {c});")); }
@@ -627,7 +646,7 @@ impl JavaRender {
         let mut opened: Vec<String> = Vec::new();
         for r in redirects {
             match (r.fd, r.mode.as_str()) {
-                (None, "w") | (Some(1), "w") => {
+                (None, "w") | (None, "wc") | (Some(1), "w") | (Some(1), "wc") => {
                     let t = self.expr_str(&r.target)?;
                     self.redir_seq += 1;
                     let v = format!("__oldOut{}", self.redir_seq);
@@ -812,12 +831,18 @@ impl JavaRender {
                 self.command(args)
             }
             IrExpr::Call { func, args, .. } if func == "assign" => {
-                // assign("name", value) or assign("name", "=", value)
+                // assign("name", value), assign("name", "=", value),
+                // or assign("name", "+=", value) — string append
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
-                let vi = if str_arg(args, 1) == Some("=") { 2 } else { 1 };
+                let is_append = str_arg(args, 1) == Some("+=");
+                let vi = if str_arg(args, 1) == Some("=") || is_append { 2 } else { 1 };
                 let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
                 self.ensure_field(name);
-                self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
+                if is_append {
+                    self.emit(&format!("__v_{} = __v_{} + {v}; __SH_RC = 0;", sanitize(name), sanitize(name)));
+                } else {
+                    self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
+                }
                 Ok(())
             }
             IrExpr::Call { func, args, .. } if func == "setVar" => {
@@ -929,8 +954,8 @@ impl JavaRender {
                 self.emit("__SH_RC = 0;");
                 Ok(())
             }
-            IrExpr::Call { func, .. } if func == "continue" => { self.emit("continue;"); Ok(()) }
-            IrExpr::Call { func, .. } if func == "break" => { self.emit("break;"); Ok(()) }
+            IrExpr::Call { func, .. } if func == "continue" => { self.emit("__SH_RC = 0; continue;"); Ok(()) }
+            IrExpr::Call { func, .. } if func == "break" => { self.emit("__SH_RC = 0; break;"); Ok(()) }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
                 if matches!(*op, BinOpKind::And | BinOpKind::Or) =>
             {
@@ -1166,7 +1191,14 @@ impl JavaRender {
                                         let (n0, v0) = (&t[..eq], &t[eq + 1..]);
                                         self.ensure_field(n0);
                                         if !v0.is_empty() {
-                                            self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0)));
+                                            if v0.contains('$') && self.dollar_expand_ok(v0) {
+                                                match self.expand_dollars(v0) {
+                                                    Ok(e) => self.emit(&format!("__v_{} = {e};", sanitize(n0))),
+                                                    Err(_) => self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0))),
+                                                }
+                                            } else {
+                                                self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0)));
+                                            }
                                         } else {
                                             nm = Some(n0.to_string());
                                         }
@@ -1187,7 +1219,18 @@ impl JavaRender {
                     if let IrExpr::Str(s2, _) = w {
                         if let Some(eq) = s2.find('=') {
                             self.ensure_field(&s2[..eq]);
-                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(&s2[eq + 1..])));
+                            let rhs = &s2[eq + 1..];
+                            // the value may carry $ forms the frontend kept
+                            // opaque in one string (local n=$1): expand them
+                            // natively; plain literals stay literals.
+                            if rhs.contains('$') && self.dollar_expand_ok(rhs) {
+                                match self.expand_dollars(rhs) {
+                                    Ok(e) => self.emit(&format!("__v_{} = {e};", sanitize(&s2[..eq]))),
+                                    Err(_) => self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(rhs))),
+                                }
+                            } else {
+                                self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(rhs)));
+                            }
                         }
                     }
                 }
@@ -1297,14 +1340,25 @@ impl JavaRender {
             IrExpr::Array(items) => {
                 let mut parts = Vec::new();
                 for it in items {
-                    if let IrExpr::Call { func, .. } = it {
+                    if let IrExpr::Call { func, args, .. } = it {
                         // "$@" / "$*" iterables stay runtime lists
                         if func == "listVar" {
                             parts.push("__SH_ARGV".to_string());
                             continue;
                         }
-                    }
-                    if let IrExpr::Call { func, args, .. } = it {
+                        // getVar("@")/$* in a for-context: word-split at runtime
+                        if func == "getVar" {
+                            let name = str_arg(args, 0).ok_or("for: getVar without name")?;
+                            self.helper("split");
+                            if name == "@" || name == "*" {
+                                parts.push("shSplit(String.join(\" \", __SH_ARGV))".to_string());
+                            } else {
+                                let base = read_field(sanitize(name))
+                                    .ok_or_else(|| format!("for over undeclared var {name}"))?;
+                                parts.push(format!("shSplit({base})"));
+                            }
+                            continue;
+                        }
                         if func == "brace" {
                             for x in brace_expand(args)? {
                                 parts.push(jstr(&x));
@@ -1380,6 +1434,21 @@ impl JavaRender {
                 Ok(format!("({} && {})", self.cond_bool(lhs)?, self.cond_bool(rhs)?)),
             IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs, .. } =>
                 Ok(format!("({} || {})", self.cond_bool(lhs)?, self.cond_bool(rhs)?)),
+            IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } =>
+                Ok(format!("(!{})", self.cond_bool(lhs)?)),
+            IrExpr::BinOp { op, lhs, rhs, .. } if is_cmp(op) => {
+                // numeric/string comparison in condition position: a real
+                // Java boolean — NOT the String.valueOf wrapper the value
+                // context needs (wrapping it in .isEmpty() is always true,
+                // which turned every [ $i -lt $n ] while loop into an
+                // infinite loop).
+                self.binop_bool(op, lhs, rhs)
+            },
+            IrExpr::Call { func, .. } if func == "redirect" => {
+                self.helper("run");
+                self.helper("quote");
+                Ok(format!("(shRun({}) == 0)", self.side_text(cond)?))
+            }
             IrExpr::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
             other => {
                 let v = self.expr_str(other)?;
@@ -1416,10 +1485,24 @@ impl JavaRender {
             "false" => Ok("false".into()),
             other if self.funcs.contains(other) => {
                 let flat = flatten_words(rest);
-                if !flat.is_empty() {
-                    return Err("function call with args not supported in condition position".into());
+                if flat.is_empty() {
+                    Ok(format!("{}()", fn_name(other)))
+                } else {
+                    // function call WITH args in condition position: the
+                    // callee reads positionals from __SH_ARGV, so bind them
+                    // inline — a Java assignment IS an expression, and the
+                    // function's own try/finally restores the caller's argv.
+                    let mut arg_exprs = Vec::new();
+                    for w in flat.iter() {
+                        let e = self.expr_str(w)?;
+                        if e.starts_with("shSplit(") || e.starts_with("String.join(\" \", shSplit(") {
+                            return Err("function call with word-splitting args not supported in condition position".into());
+                        }
+                        arg_exprs.push(e);
+                    }
+                    Ok(format!("((__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}}))) != null && {}())",
+                               arg_exprs.join(", "), fn_name(other)))
                 }
-                Ok(format!("{}()", fn_name(other)))
             }
             _ => {
                 let words = self.words_to_args(rest)?;
@@ -1532,7 +1615,27 @@ impl JavaRender {
                     if !ok { return false; }
                     i = j + 1;
                 }
-                '(' => return false, // command substitution needs the child path
+                '(' => {
+                    // $((arith)) is fine when natively parseable (the
+                    // expand path renders it inline); $(cmd) needs the
+                    // child path, so refuse.
+                    if i + 2 >= ch.len() || ch[i + 2] != '(' { return false; }
+                    let mut depth = 0usize;
+                    let mut j = i + 2;
+                    while j < ch.len() {
+                        if ch[j] == '(' { depth += 1; }
+                        if ch[j] == ')' {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        j += 1;
+                    }
+                    if depth != 0 { return false; }
+                    let inner_full: String = ch[i + 2..=j].iter().collect();
+                    let inner = inner_full.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(inner_full.trim());
+                    if crate::shir::parse_arith_native(inner).is_none() { return false; }
+                    i = j + 2;
+                }
                 c if c.is_ascii_digit() || matches!(c, '?' | '#' | '@' | '*' | '!' | '$') => i += 1,
                 c if c.is_ascii_alphabetic() || c == '_' => {
                     i += 1;
@@ -1577,6 +1680,38 @@ impl JavaRender {
                     }
                     i = j + 1;
                 } else if ch[i + 1] == '(' {
+                    // $((arith)) arithmetic vs $(cmd) command substitution
+                    if i + 2 < ch.len() && ch[i + 2] == '(' {
+                        // arithmetic: find the matching close paren pair
+                        let mut depth = 0usize;
+                        let mut j = i + 2;
+                        while j < ch.len() {
+                            if ch[j] == '(' { depth += 1; }
+                            if ch[j] == ')' {
+                                depth -= 1;
+                                if depth == 0 { break; }
+                            }
+                            j += 1;
+                        }
+                        if depth != 0 {
+                            return Err("unbalanced $((...)) in test text".into());
+                        }
+                        // inner is "(expr)": strip ONE paren pair for the
+                        // arith parser (it takes bare `n % i`, not `(n % i)`)
+                        let inner_full: String = ch[i + 2..=j].iter().collect();
+                        let inner = inner_full.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(inner_full.trim());
+                        match crate::shir::parse_arith_native(inner) {
+                            Some(ast) => {
+                                out += &format!("String.valueOf({})", self.arith(&ast)?);
+                            }
+                            None => {
+                                return Err(format!("arith in test text not parseable natively: {inner:?}"));
+                            }
+                        }
+                        // skip past BOTH close parens of the $((...)) form
+                        i = j + 2;
+                        continue;
+                    }
                     // $(cmd) command substitution inside test text
                     let mut depth = 1;
                     let mut j = i + 2;
@@ -1733,13 +1868,17 @@ impl JavaRender {
                 return match op.as_str() {
                     "-n" => Ok(format!("(({}).isEmpty() == false)", o)),
                     "-z" => Ok(format!("(({}).isEmpty())", o)),
-                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-h" | "-p" | "-b" | "-c" | "-S" => {
+                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-h" | "-p" | "-b" | "-c" | "-S"
+                    | "-g" | "-k" | "-u" | "-O" | "-G" | "-N" => {
                         self.helper("ftype");
                         let k = match op.as_str() {
                             "-f" => "\"f\"", "-d" => "\"d\"", "-e" => "\"e\"", "-s" => "\"s\"",
                             "-r" => "\"r\"", "-w" => "\"w\"", "-x" => "\"x\"",
-                            "-L" | "-h" => "\"L\"", 
-                            "-p" => "\"p\"", "-b" => "\"b\"", "-c" => "\"c\"", _ => "\"S\"",
+                            "-L" | "-h" => "\"L\"",
+                            "-p" => "\"p\"", "-b" => "\"b\"", "-c" => "\"c\"",
+                            "-g" => "\"g\"", "-k" => "\"k\"", "-u" => "\"u\"",
+                            "-O" => "\"O\"", "-G" => "\"G\"", "-N" => "\"N\"",
+                            _ => "\"S\"",
                         };
                         Ok(format!("(shFtype({k}, {o}))"))
                     }
@@ -1791,8 +1930,15 @@ impl JavaRender {
             }
             IrExpr::Call { func, args, .. } if func == "assign" => {
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
-                let v = self.expr_str(args.get(2).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
-                self.emit(&format!("__v_{} = {v};", sanitize(name)));
+                let is_append = str_arg(args, 1) == Some("+=");
+                let vi = if str_arg(args, 1) == Some("=") || is_append { 2 } else { 1 };
+                let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                if is_append {
+                    self.ensure_field(name);
+                    self.emit(&format!("__v_{0} = __v_{0} + {v};", sanitize(name)));
+                } else {
+                    self.emit(&format!("__v_{} = {v};", sanitize(name)));
+                }
                 self.emit("__SH_RC = 0;");
                 return Ok(format!("__v_{}", sanitize(name)));
             }
@@ -1955,6 +2101,11 @@ impl JavaRender {
                 self.helper("capture");
                 return Ok(format!("shCapture({t})"));
             }
+            IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => {
+                // ! cmd in value position: stdout is identical to cmd's
+                // (the ! only negates exit status, not output)
+                self.expr_str(lhs)
+            }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
                 if matches!(*op, BinOpKind::And | BinOpKind::Or)
                     || matches!(lhs.as_ref(), IrExpr::Call { func, .. } if matches!(func.as_str(), "redirect" | "exec" | "builtin" | "capture"))
@@ -1969,6 +2120,36 @@ impl JavaRender {
             }
             IrExpr::Capture { expr, .. } => self.capture_expr(expr),
             IrExpr::Call { func, args, .. } if func == "capture" => self.capture_text(args),
+            IrExpr::Call { func, args, .. } if func == "fnValue" || func == "fnCall" => {
+                // user-function call in value position: run the transpiled
+                // function in-process and capture what it printed (bash
+                // functions return stdout, not a value). The capture swaps
+                // System.out for the duration of the call — argv is bound
+                // by the same inline assignment the condition position uses
+                // (the function's try/finally restores the caller's argv).
+                let name = str_arg(args, 0).unwrap_or_default();
+                if !self.funcs.contains(name) {
+                    return Err(format!("fnValue of unknown function {name}"));
+                }
+                let call_args: Vec<String> = match args.get(1) {
+                    Some(IrExpr::Array(elems)) => {
+                        let mut v = Vec::new();
+                        for e in elems { v.push(self.expr_str(e)?); }
+                        v
+                    }
+                    _ => Vec::new(),
+                };
+                self.helper("fncap");
+                let bind = if call_args.is_empty() {
+                    String::new()
+                } else {
+                    format!("__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}})); ",
+                            call_args.join(", "))
+                };
+                // BooleanSupplier lambda defers the call into the helper;
+                // trailing newline stripping matches shCapture semantics.
+                Ok(format!("shFncap(() -> {{ {bind}return {}(); }})", fn_name(name)))
+            },
             IrExpr::Call { func, args, .. } if func == "captureWords" => {
                 let c = self.capture_text(args)?;
                 self.helper("split");
@@ -2264,8 +2445,12 @@ impl JavaRender {
                         None => "0L".to_string(),
                     };
                     let len = match args.get(li) {
-                        Some(e) => self.expr_num(e)?,
+                        // absent OR empty length means "to the end" (-1);
+                        // routing "" through expr_num would give shNum("") = 0
+                        // (empty slice) instead of the full tail.
                         None => "-1L".to_string(),
+                        Some(IrExpr::Str(s, _)) if s.trim().is_empty() => "-1L".to_string(),
+                        Some(e) => self.expr_num(e)?,
                     };
                     self.helper("aslice");
                     return Ok(format!("shAslice(__a_{}, {off}, {len})", sanitize(&name)));
@@ -2476,7 +2661,6 @@ impl JavaRender {
                             sub.push(self.expr_str(a)?);
                         }
                     }
-                    eprintln!("DBG and-join sub={:?} sep={sep}", sub);
                     parts.push(sub.join(&format!(" + \"{sep}\" + ")));
                 }
                 IrStmt::Expr(IrExpr::BinOp { op, lhs, rhs, .. }) => {
@@ -2497,17 +2681,24 @@ impl JavaRender {
         if let IrExpr::Object(props) = r {
             let mut mode = String::new();
             let mut target: Option<&IrExpr> = None;
+            let mut fd: Option<i64> = None;
             for (k, v) in props {
                 match k.as_str() {
                     "mode" => { if let IrExpr::Str(m, _) = v { mode = m.clone(); } }
                     "target" => target = Some(v),
+                    "fd" => { if let IrExpr::Int(n) = v { fd = Some(*n); } }
                     _ => {}
                 }
             }
             if let Some(t) = target {
                 let t = self.expr_str(t)?;
+                // fd 2 with a write/append mode is stderr (2> / 2>>);
+                // anything else keeps the stdout/stdin operator.
+                let redir2 = fd == Some(2) && (mode == "w" || mode == "wc" || mode == "a");
                 return Ok(match mode.as_str() {
-                    "w" => format!(" + \" > \" + shQuote({t})"),
+                    "w" | "wc" if redir2 => format!(" + \" 2> \" + shQuote({t})"),
+                    "a" if redir2 => format!(" + \" 2>> \" + shQuote({t})"),
+                    "w" | "wc" => format!(" + \" > \" + shQuote({t})"),
                     "a" => format!(" + \" >> \" + shQuote({t})"),
                     "r" => format!(" + \" < \" + shQuote({t})"),
                     "herestring" => format!(" + \" <<< \" + shQuote({t})"),
@@ -2524,17 +2715,17 @@ impl JavaRender {
                 let mode = match items.get(1) { Some(IrExpr::Str(m, _)) => m.clone(), _ => String::new() };
                 let t = self.expr_str(&items[2])?;
                 return Ok(match mode.as_str() {
-                    "w" => format!(" + \" > \" + shQuote({t})"),
-                    "a" => format!(" + \" >> \" + shQuote({t})"),
-                    _ => String::new(),
-                });
+                     "w" | "wc" => format!(" + \" > \" + shQuote({t})"),
+                     "a" => format!(" + \" >> \" + shQuote({t})"),
+                     _ => String::new(),
+                 });
             }
             if items.len() == 2 {
                 // maybe [mode, target]
                 if let Some(IrExpr::Str(m, _)) = items.first() {
                     let t = self.expr_str(&items[1])?;
                     return Ok(match m.as_str() {
-                        "w" => format!(" + \" > \" + shQuote({t})"),
+                        "w" | "wc" => format!(" + \" > \" + shQuote({t})"),
                         "a" => format!(" + \" >> \" + shQuote({t})"),
                         _ => String::new(),
                     });
@@ -2566,8 +2757,8 @@ impl JavaRender {
                     .filter(|t| !matches!(t, TestTok::S(x) if matches!(x.as_str(), "[" | "]" | "[[" | "]]")))
                     .collect();
                 let b = self.test_tokens(&toks)?;
-                self.helper("num");
-                Ok(format!("[ (({{ __SH_RC = ({b}) ? 0 : 1; }}) == 0) ]"))
+                self.helper("testrc");
+                Ok(format!("(shTestRc({b}) ? \"true\" : \"false\")"))
             }
             IrExpr::Call { func, args, .. } if func == "exec" || func == "builtin" => {
                 self.cmd_line_expr(args)
@@ -2590,7 +2781,7 @@ impl JavaRender {
                 let sep = if matches!(*op, BinOpKind::And) { " && " } else { " || " };
                 let l = self.side_text(lhs)?;
                 let r = self.side_text(rhs)?;
-                Ok(format!("({l}){sep}({r})"))
+                Ok(format!("({l} + \"{sep}\" + {r})"))
             }
             IrExpr::Call { func, args, .. } if func == "pipeline" => {
                 let mut parts2 = Vec::new();
@@ -3179,6 +3370,28 @@ fn helper_src(name: &str) -> Option<&'static str> {
         }
     }
 "#,
+        "fncap" => r#"    interface ShFn { boolean run() throws Exception; }
+    static String shFncap(ShFn fn) {
+        // capture a transpiled shell function's stdout: swap System.out
+        // for a buffer, run in-process, restore, strip trailing newlines
+        // (bash command substitution semantics, same as shCapture).
+        PrintStream old = System.out;
+        old.flush();
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(buf));
+        try {
+            fn.run();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            System.out.flush();
+            System.setOut(old);
+        }
+        String s = new String(buf.toByteArray(), StandardCharsets.UTF_8);
+        while (s.endsWith("\n") || s.endsWith("\r")) s = s.substring(0, s.length() - 1);
+        return s;
+    }
+"#,
         "printf" => r#"    static String shPrintf(String fmt, String[] args) {
         StringBuilder sb = new StringBuilder();
         // unescape backslash sequences in the literal first
@@ -3478,6 +3691,48 @@ fn helper_src(name: &str) -> Option<&'static str> {
             case "x": return f.canExecute();
             case "L": try { return !f.getCanonicalPath().equals(f.getAbsolutePath()); }
                       catch (Exception e) { return false; }
+            case "p": case "b": case "c": case "S":
+                try {
+                    String ft = (String) java.nio.file.Files.getAttribute(
+                        java.nio.file.Paths.get(shAbs(path)), "unix:type",
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (kind.equals("p")) return "fifo".equals(ft);
+                    if (kind.equals("b")) return "block".equals(ft);
+                    if (kind.equals("c")) return "character".equals(ft);
+                    if (kind.equals("S")) return "socket".equals(ft);
+                    return false;
+                } catch (Exception e) { return false; }
+            case "g": case "k": case "u":
+                try {
+                    Integer m = (Integer) java.nio.file.Files.readAttributes(
+                        java.nio.file.Paths.get(shAbs(path)), "unix:mode").get("mode");
+                    int bit = (kind.equals("g")) ? 02000 : (kind.equals("k") ? 01000 : 04000);
+                    return (m != null && (m & bit) != 0);
+                } catch (Exception e) { return false; }
+            case "O":
+                try {
+                    return java.nio.file.Files.getOwner(
+                        java.nio.file.Paths.get(shAbs(path))).getName()
+                        .equals(System.getProperty("user.name"));
+                } catch (Exception e) { return false; }
+            case "G":
+                try {
+                    return ((java.nio.file.attribute.PosixFileAttributes)
+                        java.nio.file.Files.readAttributes(
+                            java.nio.file.Paths.get(shAbs(path)),
+                            java.nio.file.attribute.PosixFileAttributes.class))
+                        .group().getName().equals(System.getProperty("user.name"));
+                } catch (Exception e) { return false; }
+            case "N":
+                try {
+                    long mt = ((java.nio.file.attribute.FileTime)
+                        java.nio.file.Files.getAttribute(
+                            java.nio.file.Paths.get(shAbs(path)), "lastModifiedTime")).toMillis();
+                    long at = ((java.nio.file.attribute.FileTime)
+                        java.nio.file.Files.getAttribute(
+                            java.nio.file.Paths.get(shAbs(path)), "lastAccessTime")).toMillis();
+                    return mt > at;
+                } catch (Exception e) { return false; }
             default: return false;
         }
     }
