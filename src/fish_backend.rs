@@ -3932,13 +3932,26 @@ fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
         // ("command expression not renderable") since that path only
         // knows And/Or/Not/Arith/Var.
         IrExpr::BinOp { op, lhs, rhs } => {
-            let flag = match op {
-                BinOpKind::Eq => "-eq",
-                BinOpKind::Ne => "-ne",
-                BinOpKind::Lt => "-lt",
-                BinOpKind::Gt => "-gt",
-                BinOpKind::Le => "-le",
-                BinOpKind::Ge => "-ge",
+            // Numeric vs STRING comparison. `-eq`/`-ne`/… are `test`'s
+            // NUMERIC operators: given two non-number strings they die with
+            // "integer expression expected" (whose non-zero status fish
+            // reads as "match" — test-double-bracket printed "yes" where bash
+            // printed "yes" only because its `-n` was folded to a Str first;
+            // the folded `Str Ne Str` then compared numerics). bash's `==`
+            // over non-arithmetic operands is a STRING compare, so the flag
+            // follows the operand SHAPE: arithmetic subtree on both sides →
+            // numeric; anything else → `=` / `!=`.
+            let numeric =
+                matches!(&**lhs, IrExpr::Arith(_)) || matches!(&**rhs, IrExpr::Arith(_));
+            let flag = match (op, numeric) {
+                (BinOpKind::Eq, true) => "-eq",
+                (BinOpKind::Ne, true) => "-ne",
+                (BinOpKind::Eq, false) => "=",
+                (BinOpKind::Ne, false) => "!=",
+                (BinOpKind::Lt, _) => "-lt",
+                (BinOpKind::Gt, _) => "-gt",
+                (BinOpKind::Le, _) => "-le",
+                (BinOpKind::Ge, _) => "-ge",
                 _ => return cmd_to_fish(e),
             };
             Ok(format!(
@@ -3961,6 +3974,14 @@ fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
         // normalisation leaves the RHS a Str) is a VALUE, not a command —
         // the `_` arm of `cmd_to_fish` refuses it. Quote it for `[ ]`.
         IrExpr::Str(s, _) => Ok(format!("\"{}\"", bash_specials_to_fish(s))),
+        // A bare variable operand (`[[ "$var" == value ]]` arrives as
+        // BinOp{Ne, Var, Str}) is a VALUE too. `cmd_to_fish` renders a
+        // command-position Var as a `[ -n … ]` truthiness test, which spliced
+        // INTO the enclosing `[ … ]` produced `[ [ -n "$var" ] -ne "true" ]`
+        // — a parse error fish reads as "false", so every such `if` silently
+        // never fired (test-expr-true, double-equals-in-test, and the
+        // x=hello arm of test-literal-string-compare).
+        IrExpr::Var(name, _) => Ok(format!("\"{}\"", var_ref_to_fish(name, false))),
         other => cmd_to_fish(other),
     }
 }
