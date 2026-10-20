@@ -4950,6 +4950,21 @@ fn exec_line_to_fish(
                                         pj.push(flat.replace('\\', "\\\\").replace('"', "\\\""));
                                         continue;
                                     }
+                                    // A literal Str part is TEXT, not a word:
+                                    // routing it through word_to_fish runs
+                                    // `str_word`, which SINGLE-QUOTES a value
+                                    // containing spaces for standalone use —
+                                    // here the quotes would be literal, so
+                                    // `a=`echo "x   y" z`` + `echo "[$a]"`
+                                    // printed `['x   y z']` where bash printed
+                                    // `[x   y z]` (zz_probe_p1/edge, ce1).
+                                    if let IrExpr::Str(sval, _) = &**x {
+                                        pj.push(
+                                            sval.replace('\\', "\\\\")
+                                                .replace('"', "\\\""),
+                                        );
+                                        continue;
+                                    }
                                     let w = word_to_fish(x)?;
                                     if w.contains('(') {
                                         has_subst = true;
