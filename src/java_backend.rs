@@ -32,6 +32,7 @@ struct JavaRender {
     funcs: BTreeSet<String>,
     fnvalues: BTreeSet<String>,    // functions ever called via fnValue (echo-return-lifted: their Return is a VALUE, not a status)
     exit_traps: Vec<String>,       // EXIT-trap bodies to run before normal end-of-main exit
+    temp_setup_done: BTreeSet<String>, // __ps_* temp assigns already pre-run natively
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
     redir_seq: usize,
@@ -74,7 +75,7 @@ const JAVA_RESERVED: &[&str] = &[
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), assoc: BTreeSet::new(), funcs: BTreeSet::new(),
-                     fnvalues: BTreeSet::new(), exit_traps: Vec::new(),
+                     fnvalues: BTreeSet::new(), exit_traps: Vec::new(), temp_setup_done: BTreeSet::new(),
                      helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
                      out: Vec::new(), depth: 2 }
     }
@@ -3159,9 +3160,89 @@ impl JavaRender {
         }
     }
 
+    /// Whether an Arrow body needs NATIVE execution (cannot be bash
+    /// text): loops over java-side state (For over __a_ arrays, While,
+    /// whileLoop), function-value calls, or subshells. Everything else
+    /// (plain commands, pipelines, and/or chains, redirects, blocks of
+    /// those) renders as bash text — which is REQUIRED for file fills:
+    /// a native helper's fork/exec children bypass java-side output
+    /// swaps (inheritIO) and would leak to the terminal instead of the
+    /// file.
+    fn body_needs_native(stmts: &[IrStmt]) -> bool {
+        for st in stmts {
+            match st {
+                IrStmt::For { .. } | IrStmt::While { .. } | IrStmt::DoWhile { .. } => return true,
+                IrStmt::Block(b) | IrStmt::Subshell(b) => {
+                    if Self::body_needs_native(b) { return true; }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    if Self::body_needs_native(inner) { return true; }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for s in stages {
+                        if Self::body_needs_native(s) { return true; }
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => {
+                    if Self::expr_needs_native(e) { return true; }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn expr_needs_native(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args, .. }
+                if matches!(func.as_str(), "fnValue" | "fnCall" | "subshell" | "whileLoop") =>
+            {
+                true
+            }
+            IrExpr::Call { func, args, .. }
+                if matches!(func.as_str(), "and" | "or" | "pipeline" | "redirect" | "block" | "capture" | "captureWords") =>
+            {
+                args.iter().any(|a| match a {
+                    IrExpr::Arrow(b) => Self::body_needs_native(b),
+                    x => Self::expr_needs_native(x),
+                })
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::expr_needs_native(lhs) || Self::expr_needs_native(rhs)
+            }
+            IrExpr::Arrow(b) => Self::body_needs_native(b),
+            IrExpr::Array(items) => items.iter().any(Self::expr_needs_native),
+            IrExpr::Capture { expr, .. } => Self::expr_needs_native(expr),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => Self::expr_needs_native(x),
+                _ => false,
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::expr_needs_native(cond) || Self::expr_needs_native(then) || Self::expr_needs_native(else_)
+            }
+            _ => false,
+        }
+    }
+
     /// The bash command line of an Arrow body when it's a simple
     /// command / pipeline / redirected command, as a Java expression.
     fn arrow_expr(&mut self, stmts: &[IrStmt]) -> Result<String, String> {
+        // Pre-run renderer-temp setup assigns (`__ps_tmpN = $(mktemp)`
+        // for process substitution): the text renderer below SKIPS
+        // assigns, but these temps' VALUES feed java-side redirect
+        // targets and native stage helpers — without running them the
+        // java field stays "" and fills fail. Run once each (a done-set;
+        // the value is consumed within the same command).
+        for st in stmts {
+            if let IrStmt::Assign { targets, .. } = st {
+                if let Some(t) = targets.first() {
+                    if t.var.starts_with("__ps_") && !self.temp_setup_done.contains(&t.var) {
+                        self.temp_setup_done.insert(t.var.clone());
+                        self.stmt(st)?;
+                    }
+                }
+            }
+        }
         let mut parts = Vec::new();
         for st in stmts {
             match st {
@@ -3176,13 +3257,11 @@ impl JavaRender {
                     parts.push(sp.join(" + \" | \" + "));
                 }
                 IrStmt::Redirect { inner, redirects } => {
-                    // Simple bodies stay text; loop bodies go native as a
-                    // whole (a text `< file` on the printf shim would feed
-                    // the wrong command — see the redirect-call arm).
-                    let simple = inner.iter().all(|st| matches!(st,
-                        IrStmt::Expr(IrExpr::Call { func, .. })
-                            if func == "exec" || func == "builtin" || func == "test"));
-                    if !simple {
+                    // Bodies needing java state go native as a whole (a
+                    // text `< file` on the printf shim would feed the wrong
+                    // command); plain bodies stay text (REQUIRED for file
+                    // fills — native helpers' children bypass swaps).
+                    if Self::body_needs_native(inner) {
                         let wrapped = IrStmt::Redirect { inner: inner.clone(), redirects: redirects.clone() };
                         parts.push(self.stage_expr(std::slice::from_ref(&wrapped))?);
                         continue;
@@ -3262,11 +3341,10 @@ impl JavaRender {
                 }
                 IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "redirect" => {
                     // redirect(Arrow(body), redirects...) inside a capture.
-                    // If the body is simple text, append redirect operators;
-                    // if it needs NATIVE execution (loops), run the whole
-                    // redirect natively — a text `< file` on the printf shim
-                    // would redirect the WRONG command's stdin (the loop
-                    // reads java-side, never seeing the file).
+                    // Plain bodies stay text; java-state bodies run the
+                    // whole redirect natively (a text `< file` on the printf
+                    // shim would redirect the WRONG command — the loop reads
+                    // java-side, never seeing the file).
                     let body: &[IrStmt] = match args.first() {
                         Some(IrExpr::Arrow(b)) => b,
                         _ => return Err("redirect without Arrow body in capture text".into()),
@@ -3275,16 +3353,7 @@ impl JavaRender {
                         Some(IrExpr::Array(rs)) => rs.clone(),
                         _ => Vec::new(),
                     };
-                    // probe: is the body plain text?
-                    let mut text_ok = true;
-                    for st in body {
-                        if !matches!(st, IrStmt::Expr(IrExpr::Call { func, .. })
-                            if func == "exec" || func == "builtin" || func == "test") {
-                            text_ok = false;
-                            break;
-                        }
-                    }
-                    if text_ok {
+                    if !Self::body_needs_native(body) {
                         let mut t = self.arrow_expr(body)?;
                         for rr in rs.iter() { t += &self.redirect_text(rr)?; }
                         parts.push(t);
