@@ -344,7 +344,7 @@ impl JavaRender {
         let all_helpers = [
             "env","len","num","arg","shift","cd","run","runrc","capture","printf",
             "escapes","substr","fnmatch","strip","replace","case","basename",
-            "dirname","div","pow","ftype","readln","readsplit","split","aset","aget",
+            "dirname","div","pow","ftype","readln","readsplit","sourcefile","split","aset","aget",
             "asetkey","agetkey",
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
@@ -1719,6 +1719,23 @@ impl JavaRender {
                 self.emit("__SH_RC = 0;");
                 Ok(())
             }
+            "." | "source" => {
+                // `.`/`source` shares state with the caller (the sourced
+                // file's assignments persist). Static inlining is impossible
+                // when the file is created at runtime — instead round-trip
+                // through a child bash: serialize java state in, source the
+                // file, `declare -p` the changes back out.
+                let f = self.join_words(rest, " ")?;
+                self.helper("sourcefile");
+                // pass every tracked scalar + array (prefixed by kind) so
+                // the child sees them; new vars come back via __dyn.
+                let mut names: Vec<String> = Vec::new();
+                for fld in self.fields.iter() { names.push(format!("s:{fld}")); }
+                for arr in self.arrays.iter() { names.push(format!("a:{arr}")); }
+                let nl = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+                self.emit(&format!("__SH_RC = shSourceFile({f}, new String[]{{{nl}}});"));
+                Ok(())
+            }
             other => {
                 if self.funcs.contains(other) {
                     // positional args replace __SH_ARGV for the call.
@@ -2886,6 +2903,10 @@ impl JavaRender {
                     format!("__v_{}", sanitize(n))
                 } else if self.arrays.contains(&sanitize(n)) {
                     format!("String.join(\" \", __a_{})", sanitize(n))
+                } else if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    // sourced-file vars with no static field land in the
+                    // __dyn overflow map (or "" when never sourced)
+                    format!("__dyn.getOrDefault(\"{n}\", shEnv(\"{n}\"))", n = n)
                 } else {
                     self.helper("env");
                     format!("shEnv({})", jstr(n))
@@ -4794,6 +4815,97 @@ fn helper_src(name: &str) -> Option<&'static str> {
         return out;
     }
 "#,
+        "sourcefile" => r#"    static java.util.Map<String, String> __dyn = new java.util.LinkedHashMap<>();
+    static long shSourceFile(String file, String[] names) {
+        // `.`/`source` shares state: serialize java scalars/arrays into a
+        // child bash, source the file there, read the changes back.
+        // Protocol: base64 lines (no quoting pain), scalars SH2V, indexed
+        // array elements SH2A. Assoc arrays are out of scope.
+        try {
+            StringBuilder setup = new StringBuilder();
+            for (String n : names) {
+                if (n.startsWith("a:")) {
+                    String v = n.substring(2);
+                    java.lang.reflect.Field fv = Sh2Program.class.getDeclaredField("__a_" + v);
+                    @SuppressWarnings("unchecked")
+                    java.util.List<String> a = (java.util.List<String>) fv.get(null);
+                    setup.append(v).append("=(); ");
+                    for (String e : a) {
+                        setup.append(v).append("+=(").append(shQuoteBash(e)).append(") ");
+                    }
+                } else {
+                    String v = n.startsWith("s:") ? n.substring(2) : n;
+                    java.lang.reflect.Field f = Sh2Program.class.getDeclaredField("__v_" + v);
+                    String val = (String) f.get(null);
+                    setup.append(v).append("=").append(shQuoteBash(val)).append(" ");
+                }
+            }
+            String names_arg = "";
+            for (String n : names) {
+                String v = n.startsWith("a:") ? n.substring(2) : (n.startsWith("s:") ? n.substring(2) : n);
+                names_arg += v + " ";
+            }
+            String script = setup.toString()
+                + "__before=$(compgen -v | sort); "
+                + "source " + shQuoteBash(file) + "; __rc=$?; "
+                + "__after=$(compgen -v | sort); "
+                + "__new=$(comm -13 <(echo \"$__before\") <(echo \"$__after\") | grep -v '^__'); "
+                + "for __v in " + names_arg + " $__new; do "
+                + "if declare -p $__v 2>/dev/null | grep -q 'declare -a'; then "
+                + "eval 'for __i in \"${!$__v[@]}\"; do __ref=$__v[$__i]; printf \"SH2A\\037%s\\037%s\\037%s\\n\" \"$__v\" \"$__i\" \"$(printf %s \"${!__ref}\" | base64 -w 0)\"; done'; "
+                + "else printf 'SH2V\\037%s\\037%s\\n' \"$__v\" \"$(printf %s \"${!__v}\" | base64 -w 0)\"; fi; done; "
+                + "exit $__rc";
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", script);
+            pb.directory(new File(shCwd()));
+            pb.environment().putAll(__SH_EXPORTS);
+            pb.redirectErrorStream(false);
+            Process p = pb.start();
+            byte[] out = p.getInputStream().readAllBytes();
+            p.getErrorStream().readAllBytes();
+            int rc = p.waitFor();
+            String s = new String(out, java.nio.charset.StandardCharsets.UTF_8);
+            for (String line : s.split("\n")) {
+                String[] f = line.split("\037", -1);
+                if (f.length == 3 && f[0].equals("SH2V")) {
+                    String val = new String(java.util.Base64.getDecoder().decode(f[2]),
+                                            java.nio.charset.StandardCharsets.UTF_8);
+                    setShVar(f[1], val);
+                } else if (f.length == 4 && f[0].equals("SH2A")) {
+                    String val = new String(java.util.Base64.getDecoder().decode(f[3]),
+                                            java.nio.charset.StandardCharsets.UTF_8);
+                    setShArr(f[1], Integer.parseInt(f[2]), val);
+                }
+            }
+            __SH_RC = rc;
+            return rc;
+        } catch (Exception e) {
+            __SH_RC = 127;
+            return 127L;
+        }
+    }
+    static String shQuoteBash(String w) {
+        return "'" + w.replace("'", "'\\''") + "'";
+    }
+    static void setShVar(String n, String v) {
+        try {
+            java.lang.reflect.Field f = Sh2Program.class.getDeclaredField("__v_" + n);
+            f.set(null, v);
+        } catch (Exception e) {
+            __dyn.put(n, v);
+        }
+    }
+    static void setShArr(String n, int i, String v) {
+        try {
+            java.lang.reflect.Field fa = Sh2Program.class.getDeclaredField("__a_" + n);
+            @SuppressWarnings("unchecked")
+            java.util.List<String> a = (java.util.List<String>) fa.get(null);
+            while (a.size() <= i) a.add("");
+            a.set(i, v);
+        } catch (Exception e) {
+            __dyn.put(n + "[" + i + "]", v);
+        }
+    }
+"#,
         "split" => r#"    static List<String> shSplit(long v) { return shSplit(String.valueOf(v)); }
     static List<String> shSplit(String s) {
         if (s.isEmpty()) return new ArrayList<>();
@@ -4911,7 +5023,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Tokenize a string-form test expression (`-f "my file"`) on whitespace
+/// Tokenize a string-form test expression on whitespace,
 /// respecting double/single quotes.
 fn split_test_text(t: &str) -> Vec<String> {
     let mut out = Vec::new();
