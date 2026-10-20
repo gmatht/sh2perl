@@ -4834,22 +4834,184 @@ impl Render {
                 ));
             }
             IrStmt::Redirect { inner, redirects } => {
-                // render the inner commands; apply a simple fd-1 write
-                // redirect (`> file` / `>> file`) by writing the captured
-                // output to the file (the common echo-to-file case).
+                // fd juggling through libc dup/dup2 (the gate links it):
+                // each spec opens its target and swaps it onto the fd IN
+                // SOURCE ORDER (bash `>f 2>&1` dups the already-redirected
+                // stdout), the inner commands run (prints AND forked
+                // children observe the swapped fds), then the saved fds
+                // restore in reverse. Buffered stdout is flushed across
+                // both transitions (bytes buffered before the swap belong
+                // to the old destination). A failed open skips the inner
+                // commands with status 1 (bash). Custom fds (3+) persist
+                // past `exec N>f` (empty inner); writes/reads through them
+                // stay stubs. Without libc there is no dup — stub loudly.
+                // Specs are VALIDATED before anything emits, so a refused
+                // redirect leaves no partial juggling behind.
+                if !Self::uu_ffi_enabled() {
+                    self.sh2_calls.insert("redirect".into());
+                    self.mark_todo("redirect → sh2.redirect (no libc for dup)");
+                    return;
+                }
+                // pre-validate: every spec must be a modeled shape
+                let mut valid = true;
+                for r in redirects {
+                    let fd = r.fd.unwrap_or(1);
+                    let dup_target = match &r.target {
+                        IrExpr::Str(s, _) => {
+                            s.len() == 2
+                                && s.starts_with('&')
+                                && s[1..].chars().all(|c| c.is_ascii_digit())
+                        }
+                        _ => false,
+                    };
+                    match r.mode.as_str() {
+                        "w" | "a" | "wc" => {
+                            if !dup_target && fd != 0 && fd != 1 && fd != 2 && !inner.is_empty() {
+                                valid = false;
+                            }
+                        }
+                        "r" | "r+" => {
+                            if fd != 0 && !inner.is_empty() {
+                                valid = false;
+                            }
+                        }
+                        "heredoc" | "heredoc-tabs" | "herestring" => {
+                            if fd != 0 {
+                                valid = false;
+                            }
+                        }
+                        _ => {
+                            valid = false;
+                        }
+                    }
+                }
+                if !valid {
+                    self.sh2_calls.insert("redirect".into());
+                    self.mark_todo("redirect → sh2.redirect (unmodeled spec)");
+                    return;
+                }
+                self.need_writefile = true; // forces sh_io publication
+                let blk = self.fresh_tmp("sh_rd");
+                // the ok-flag is only mutable when a fallible spec (path
+                // open / pipe) exists; pure dup-swaps use a const
+                let mut fallible = false;
+                for r in redirects {
+                    match r.mode.as_str() {
+                        "w" | "a" | "wc" => {
+                            let is_dup = match &r.target {
+                                IrExpr::Str(t, _) => {
+                                    t.len() == 2
+                                        && t.starts_with('&')
+                                        && t[1..].chars().all(|c| c.is_ascii_digit())
+                                }
+                                _ => false,
+                            };
+                            if !is_dup {
+                                fallible = true;
+                            }
+                        }
+                        _ => {
+                            fallible = true;
+                        }
+                    }
+                }
+                self.emit("{");
+                self.depth += 1;
+                self.emit("stdout.flush() catch {};");
+                if fallible {
+                    self.emit(&format!("var {blk}_ok = true;"));
+                } else {
+                    self.emit(&format!("const {blk}_ok = true;"));
+                }
+                let mut saves: Vec<(i32, String)> = Vec::new();
+                for r in redirects {
+                    let fd = r.fd.unwrap_or(1);
+                    let sv = self.fresh_tmp("sh_rd_sv");
+                    match r.mode.as_str() {
+                        "w" | "a" | "wc" => {
+                            let is_dup = match &r.target {
+                                IrExpr::Str(s, _) => {
+                                    s.len() == 2
+                                        && s.starts_with('&')
+                                        && s[1..].chars().all(|c| c.is_ascii_digit())
+                                }
+                                _ => false,
+                            };
+                            if is_dup {
+                                if let IrExpr::Str(s, _) = &r.target {
+                                    let m: i32 = s[1..].parse().unwrap_or(1);
+                                    self.emit(&format!("const {sv}: c_int = std.c.dup({fd});"));
+                                    self.emit(&format!("_ = std.c.dup2({m}, {fd});"));
+                                    saves.push((fd, sv));
+                                }
+                                continue;
+                            }
+                            let p = self.expr_str(&r.target);
+                            let pv = self.fresh_tmp("sh_rd_p");
+                            let flags = if r.mode == "a" {
+                                ".{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }"
+                            } else {
+                                ".{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }"
+                            };
+                            self.emit(&format!("const {pv}_z = std.heap.page_allocator.dupeSentinel(u8, {p}, 0) catch \"\";"));
+                            self.emit(&format!("const {pv}: c_int = if ({pv}_z.len == 0) -1 else std.c.open({pv}_z.ptr, {flags}, @as(c_uint, 0o666));"));
+                            self.emit(&format!("var {sv}: c_int = -1;"));
+                            self.emit(&format!("if ({pv} < 0) {{ {blk}_ok = false; }} else {{ {sv} = std.c.dup({fd}); _ = std.c.dup2({pv}, {fd}); _ = std.c.close({pv}); }}"));
+                            if inner.is_empty() {
+                                // `exec N>f`: persistent, no restore — keep
+                                // the saved fd referenced (address-discard:
+                                // a plain `_ = sv` on an assigned var is a
+                                // pointless-discard error)
+                                self.emit(&format!("_ = &{sv};"));
+                            } else {
+                                saves.push((fd, sv));
+                            }
+                        }
+                        "r" | "r+" => {
+                            let p = self.expr_str(&r.target);
+                            self.emit(&format!("var {sv}: c_int = -1;"));
+                            self.emit(&format!("if (std.Io.Dir.cwd().openFile(sh_io orelse unreachable, {p}, .{{}}) catch null) |__f| {{ {sv} = std.c.dup({fd}); _ = std.c.dup2(__f.handle, {fd}); __f.close(sh_io orelse unreachable); }} else {{ {blk}_ok = false; }}"));
+                            if !inner.is_empty() {
+                                saves.push((fd, sv));
+                            } else {
+                                self.emit(&format!("_ = &{sv};"));
+                            }
+                        }
+                        "heredoc" | "heredoc-tabs" | "herestring" => {
+                            let text = self.expr_str(&r.target);
+                            self.emit(&format!("var {sv}: c_int = -1;"));
+                            self.emit(&format!("var {blk}_p_{sv}: [2]std.c.fd_t = undefined;"));
+                            self.emit(&format!("if (std.c.pipe(&{blk}_p_{sv}) != 0) {{ {blk}_ok = false; }} else {{"));
+                            self.depth += 1;
+                            self.emit(&format!("const __wf = std.Io.File{{ .handle = {blk}_p_{sv}[1], .flags = .{{ .nonblocking = false }} }};"));
+                            self.emit(&format!("__wf.writeStreamingAll(sh_io orelse unreachable, {text}) catch {{ {blk}_ok = false; }};"));
+                            self.emit("__wf.close(sh_io orelse unreachable);");
+                            self.emit(&format!("{sv} = std.c.dup(0); _ = std.c.dup2({blk}_p_{sv}[0], 0); _ = std.c.close({blk}_p_{sv}[0]);"));
+                            self.depth -= 1;
+                            self.emit("}");
+                            if !inner.is_empty() {
+                                saves.push((fd, sv));
+                            } else {
+                                self.emit(&format!("_ = &{sv};"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.emit(&format!("if ({blk}_ok) {{"));
+                self.depth += 1;
                 for s in inner {
                     self.stmt(s);
                 }
-                for r in redirects {
-                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
-                        let p = self.expr_str(&r.target);
-                        self.need_writefile = true;
-                        self.emit(&format!(
-                            "shWriteFile({p}, \"\", {});",
-                            if r.mode == "a" { "true" } else { "false" }
-                        ));
-                    }
+                self.emit("stdout.flush() catch {};");
+                self.depth -= 1;
+                self.emit("} else { sh_rc = 1; }");
+                // restore in reverse (only swapped ones)
+                for (fd, sv) in saves.iter().rev() {
+                    self.emit(&format!("if ({sv} >= 0) {{ _ = std.c.dup2({sv}, {fd}); _ = std.c.close({sv}); }}"));
                 }
+                self.depth -= 1;
+                self.emit("}");
             }
             IrStmt::Die { .. }
             | IrStmt::Warn { .. }
@@ -4956,7 +5118,7 @@ impl Render {
                     locals.retain(|v| must_local.contains(v) || !self.top_written.contains(v));
                 }
                 self.fn_locals.extend(locals.iter().cloned());
-                let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
+                let uses_stdout = saved.iter().any(|l| l.contains("stdout.print") || l.contains("stdout.flush"));
                 let uses_args = saved.iter().any(|l| l.contains("__args"));
                 // a body with `try` (bigint Managed ops, file IO) must
                 // return an error union
