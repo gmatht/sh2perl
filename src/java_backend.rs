@@ -293,9 +293,15 @@ impl JavaRender {
                 self.depth = saved_depth;
                 for l in &body_lines { fn_buf.push_str(l); fn_buf.push('\n'); }
                 fn_buf.push_str("        } finally { __SH_ARGV = __saved; }\n");
+                // A body ending in a jump never falls through — appending
+                // code after it is a Java unreachable-statement error.
                 let ends_with_return = body_lines.iter().rev()
                     .find(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().starts_with("return "))
+                    .map(|l| {
+                        let t = l.trim();
+                        t.starts_with("return ") || t.ends_with("break;")
+                            || t.ends_with("continue;") || t.contains("System.exit(")
+                    })
                     .unwrap_or(false);
                 if !ends_with_return {
                     fn_buf.push_str("        return \"\";\n");
@@ -462,7 +468,17 @@ impl JavaRender {
                 self.emit(&format!("boolean {cv} = {c};"));
                 self.emit(&format!("if (!{cv}) {{ __SH_RC = {lb}; break; }}"));
                 for b in body { self.stmt(b)?; }
-                self.emit(&format!("{lb} = __SH_RC;"));
+                // a body ending in a jump (break/continue/return/exit) never
+                // falls through — emitting the shadow update after it is a
+                // Java unreachable-statement error.
+                let diverged = self.out.last().map(|l| {
+                    let t = l.trim();
+                    t.ends_with("break;") || t.ends_with("continue;")
+                        || t.starts_with("return ") || t.contains("System.exit(")
+                }).unwrap_or(false);
+                if !diverged {
+                    self.emit(&format!("{lb} = __SH_RC;"));
+                }
                 self.block_close();
                 Ok(())
             }
@@ -716,6 +732,24 @@ impl JavaRender {
         Ok(())
     }
 
+    /// Heredoc/herestring body as a Java string expression. Unquoted
+    /// delimiters (`interpolate: true`) expand `$` forms at render time
+    /// (the delimiter stays quoted — the content arrives pre-expanded);
+    /// quoted delimiters stay literal.
+    fn heredoc_content(&mut self, r: &IrRedirect) -> Result<String, String> {
+        if r.interpolate {
+            if let IrExpr::Str(s, _) = &r.target {
+                if self.dollar_expand_ok(s) {
+                    match self.expand_dollars(s) {
+                        Ok(e) => return Ok(e),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        self.expr_str(&r.target)
+    }
+
     fn redirect(&mut self, inner: &[IrStmt], redirects: &[IrRedirect]) -> Result<(), String> {
         // Generic stdout/stderr/stdin swaps around the body; each swap gets
         // a unique variable so nested redirects don't collide.
@@ -799,14 +833,38 @@ impl JavaRender {
                         }
                     }
                     if cmds.is_empty() { return Err("empty heredoc body".into()); }
-                    let t = self.expr_str(&r.target)?;
+                    let t = self.heredoc_content(r)?;
                     self.helper("quote");
                     self.helper("run");
                     let q = if r.mode == "herestring" { "" } else { "'" };
-                    // heredoc bodies already end with \n; herestrings need one
-                    let tail = if r.mode == "herestring" { "\"\\nSH2EOF\"" } else { "\"SH2EOF\"" };
+                    // heredoc bodies already end with \n; herestrings need one.
+                    // The terminator needs a trailing newline of its own.
+                    let tail = if r.mode == "herestring" { "\"\\nSH2EOF\\n\"" } else { "\"SH2EOF\\n\"" };
                     let joined = cmds.join(" + \" ; \" + ");
-                    self.emit(&format!("__SH_RC = shRun({joined} + \" <<{q}SH2EOF{q}\\n\" + {t} + {tail});"));
+                    // sibling file redirects (`cat <<EOF > file`) go on the
+                    // COMMAND line (before the heredoc body) — bash treats
+                    // a `> file` after the SH2EOF line as a new command.
+                    let mut suffix = String::new();
+                    for r2 in redirects {
+                        if r2.fd == Some(0) { continue; }
+                        match (r2.fd, r2.mode.as_str()) {
+                            (None, "w") | (None, "wc") | (Some(1), "w") | (Some(1), "wc") => {
+                                let t2 = self.expr_str(&r2.target)?;
+                                suffix += &format!(" + \" > \" + shQuote({t2})");
+                            }
+                            (None, "a") | (Some(1), "a") => {
+                                let t2 = self.expr_str(&r2.target)?;
+                                suffix += &format!(" + \" >> \" + shQuote({t2})");
+                            }
+                            (Some(2), "w") | (Some(2), "a") => {
+                                let t2 = self.expr_str(&r2.target)?;
+                                let op = if r2.mode == "a" { " >>" } else { " >" };
+                                suffix += &format!(" + \" 2{op} \" + shQuote({t2})");
+                            }
+                            _ => return Err(format!("redirect {:?} with heredoc not supported", (&r2.fd, &r2.mode))),
+                        }
+                    }
+                    self.emit(&format!("__SH_RC = shRun({joined}{suffix} + \" <<{q}SH2EOF{q}\\n\" + {t} + {tail});"));
                     return Ok(());
                 }
                 #[allow(unreachable_patterns)]
@@ -814,7 +872,7 @@ impl JavaRender {
                     // the body feeds an EXTERNAL command: native Scanner
                     // swaps don't reach a bash -c child — embed the
                     // content as a real heredoc in the command text
-                    let t = self.expr_str(&r.target)?;
+                    let t = self.heredoc_content(r)?;
                     self.helper("quote");
                     self.helper("run");
                     let mut inner_t = String::from("\"\"");
@@ -833,7 +891,7 @@ impl JavaRender {
                     self.emit(&format!("__SH_RC = shRun({inner_t} + \" <<{q}SH2EOF\\n\" + {t} + \"\\nSH2EOF\");"));
                 }
                 (Some(0), "heredoc") | (Some(0), "herestring") => {
-                    let t = self.expr_str(&r.target)?;
+                    let t = self.heredoc_content(r)?;
                     let content = if r.mode == "herestring" { t } else { format!("{t} + \"\\n\"") };
                     self.redir_seq += 1;
                     let v = format!("__oldIn{}", self.redir_seq);
@@ -1177,8 +1235,60 @@ impl JavaRender {
             {
                 // short-circuit chains as nested ifs:
                 // - test/native-builtin lhs -> native cond
+                // - break/continue on either side -> native jump (a child
+                //   `break` would error outside the java loop AND bind the
+                //   wrong loop; `break || X` / `break && X` both just break)
+                // - assignment lhs -> run natively (state must persist;
+                //   a child `result=...` would be lost)
+                // - COMPOUND (BinOp) lhs -> recurse natively: the inner
+                //   chain may itself contain assignments that must persist
+                //   (a single-child `grep && result=...` would lose them)
                 // - otherwise a real child run (stdout passes through)
                 let is_or = matches!(*op, BinOpKind::Or);
+                if matches!(lhs.as_ref(), IrExpr::Call { func, .. } if func == "break") {
+                    self.emit("__SH_RC = 0; break;");
+                    return Ok(());
+                }
+                if matches!(lhs.as_ref(), IrExpr::Call { func, .. } if func == "continue") {
+                    self.emit("__SH_RC = 0; continue;");
+                    return Ok(());
+                }
+                if matches!(rhs.as_ref(), IrExpr::Call { func, .. } if func == "break") {
+                    // X || break / X && break: run X, break on the
+                    // short-circuit polarity (expr_stmt runs tests and
+                    // assignments natively, children otherwise)
+                    let gate = if is_or { "__SH_RC != 0" } else { "__SH_RC == 0" };
+                    self.expr_stmt(lhs)?;
+                    self.emit(&format!("if ({gate}) {{ __SH_RC = 0; break; }}"));
+                    return Ok(());
+                }
+                if matches!(rhs.as_ref(), IrExpr::Call { func, .. } if func == "continue") {
+                    let gate = if is_or { "__SH_RC != 0" } else { "__SH_RC == 0" };
+                    self.expr_stmt(lhs)?;
+                    self.emit(&format!("if ({gate}) {{ __SH_RC = 0; continue; }}"));
+                    return Ok(());
+                }
+                if matches!(lhs.as_ref(), IrExpr::Call { func, .. }
+                    if matches!(func.as_str(), "assign" | "setVar" | "setArray" | "setArrayAppend" | "block")) {
+                    // state-changing lhs runs natively; gate on its status
+                    self.expr_stmt(lhs)?;
+                    let head = if is_or { "if (__SH_RC != 0) {".to_string() } else { "if (__SH_RC == 0) {".to_string() };
+                    self.block_open(&head);
+                    self.expr_stmt(rhs)?;
+                    self.block_close();
+                    return Ok(());
+                }
+                if matches!(lhs.as_ref(), IrExpr::BinOp { op, .. }
+                    if matches!(op, BinOpKind::And | BinOpKind::Or)) {
+                    // compound lhs: lower it natively (inner assignments
+                    // persist), then gate the rhs on the recorded status
+                    self.expr_stmt(lhs)?;
+                    let head = if is_or { "if (__SH_RC != 0) {".to_string() } else { "if (__SH_RC == 0) {".to_string() };
+                    self.block_open(&head);
+                    self.expr_stmt(rhs)?;
+                    self.block_close();
+                    return Ok(());
+                }
                 let cond = if matches!(lhs.as_ref(), IrExpr::Call { func, .. } if func == "test")
                     || matches!(lhs.as_ref(), IrExpr::Str(..))
                     || matches!(lhs.as_ref(),
@@ -2568,9 +2678,9 @@ impl JavaRender {
             return Ok(format!("String.valueOf(shLen({inner}))"));
         }
         Ok(match name {
-            "?" => "__SH_RC".to_string(),
-            "#" => "__SH_ARGV.size()".to_string(),
-            "$" => "ProcessHandle.current().pid()".to_string(),
+            "?" => "String.valueOf(__SH_RC)".to_string(),
+            "#" => "String.valueOf(__SH_ARGV.size())".to_string(),
+            "$" => "String.valueOf(ProcessHandle.current().pid())".to_string(),
             "0" => "System.getProperty(\"sh2.argv0\", \"prog.sh\")".to_string(),
             "@" | "*" => "String.join(\" \", __SH_ARGV)".to_string(),
             "!" => "\"\"".to_string(),
@@ -2999,6 +3109,26 @@ impl JavaRender {
                     let mut inner_text = self.arrow_expr(inner)?;
                     for r in redirects {
                         let t = self.expr_str(&r.target)?;
+                        // >&N / <&N / >&- (any fd): descriptor dups are
+                        // never quoted (shQuote("&4") would create a file).
+                        if matches!(r.mode.as_str(), "w" | "wc" | "a" | "r" | "r+")
+                            && (t == "\"&0\"" || t == "\"&1\"" || t == "\"&2\""
+                                || t == "\"&3\"" || t == "\"&4\"" || t == "\"&5\""
+                                || t == "\"&6\"" || t == "\"&7\"" || t == "\"&8\""
+                                || t == "\"&9\"" || t == "\"&-\"") {
+                            let bare = &t[1..t.len() - 1];
+                            let op = match r.mode.as_str() {
+                                "a" => ">>",
+                                "r" | "r+" => "<",
+                                _ => ">",
+                            };
+                            let fds = match r.fd {
+                                Some(f) => format!("{f}"),
+                                None => String::new(),
+                            };
+                            inner_text += &format!(" + \" {fds}{op}{bare} \"");
+                            continue;
+                        }
                         match (r.fd, r.mode.as_str()) {
                             (None, "w") | (Some(1), "w") => inner_text += &format!(" + \" > \" + shQuote({t})"),
                             (None, "a") | (Some(1), "a") => inner_text += &format!(" + \" >> \" + shQuote({t})"),
@@ -3008,6 +3138,17 @@ impl JavaRender {
                             (Some(0), "herestring") => inner_text += &format!(" + \" <<< \" + shQuote({t})"),
                             (Some(0), "heredoc") | (Some(0), "heredoc-tabs") =>
                                 inner_text += &format!(" + \" <<'SH2EOF\\n\" + {t} + \"\\nSH2EOF\""),
+                            (Some(fd @ 3..=9), _) => {
+                                // fd slots pass through as bash text (the
+                                // child owns a real fd table) — reuse the
+                                // object-form renderer via a synthetic node.
+                                let node = IrExpr::Object(vec![
+                                    ("fd".to_string(), IrExpr::Int(fd as i64)),
+                                    ("mode".to_string(), IrExpr::Str(r.mode.clone(), StrStyle::DoubleQuoted)),
+                                    ("target".to_string(), r.target.clone()),
+                                ]);
+                                inner_text += &self.redirect_text(&node)?;
+                            }
                             _ => return Err(format!("redirect {:?}/{} not in capture text", r.fd, r.mode)),
                         }
                     }
@@ -3153,9 +3294,29 @@ impl JavaRender {
             }
             if let Some(t) = target {
                 let t = self.expr_str(t)?;
-                // fd 3+: pass the operator through as bash text — the
-                // child shell owns a real fd table and handles dup/close
-                // (`4>&-`, `>&4`, `3>&-`, `5<&0`) natively.
+                // >&N / <&N / >&- (ANY fd): dup/close operators — the
+                // target is a file DESCRIPTOR, never a filename, so it must
+                // not be quoted (shQuote("&4") would create a file named
+                // `&4`). The child shell owns a real fd table and handles
+                // these natively.
+                if matches!(mode.as_str(), "w" | "wc" | "a" | "r" | "r+")
+                    && (t == "\"&0\"" || t == "\"&1\"" || t == "\"&2\""
+                        || t == "\"&3\"" || t == "\"&4\"" || t == "\"&5\""
+                        || t == "\"&6\"" || t == "\"&7\"" || t == "\"&8\""
+                        || t == "\"&9\"" || t == "\"&-\"") {
+                    let bare = &t[1..t.len() - 1];
+                    let op = match mode.as_str() {
+                        "a" => ">>",
+                        "r" | "r+" => "<",
+                        _ => ">",
+                    };
+                    let fds = match fd {
+                        Some(f) => format!("{f}"),
+                        None => String::new(),
+                    };
+                    return Ok(format!(" + \" {fds}{op}{bare} \""));
+                }
+                // fd 3+ file targets pass through as bash text.
                 if let Some(fdn) = fd {
                     if (3..=9).contains(&fdn) {
                         let op = match mode.as_str() {
@@ -3163,14 +3324,6 @@ impl JavaRender {
                             "r" | "r+" => "<",
                             _ => ">",
                         };
-                        // &N / &- targets are fds, not files — unquoted
-                        if t == "\"&0\"" || t == "\"&1\"" || t == "\"&2\""
-                            || t == "\"&3\"" || t == "\"&4\"" || t == "\"&5\""
-                            || t == "\"&6\"" || t == "\"&7\"" || t == "\"&8\""
-                            || t == "\"&9\"" || t == "\"&-\"" {
-                            let bare = &t[1..t.len() - 1];
-                            return Ok(format!(" + \" {fdn}{op}{bare} \""));
-                        }
                         return Ok(format!(" + \" {fdn}{op} \" + shQuote({t})"));
                     }
                 }
@@ -3299,6 +3452,30 @@ impl JavaRender {
                     }
                 }
                 Ok(format!("({})", parts.join(&format!("){sep}("))))
+            }
+            // chain operands in TEXT (child-subshell) position: assignments
+            // run in the child (state is the child's — bash-subshell
+            // semantics), jumps pass through as text.
+            IrExpr::Call { func, args, .. } if func == "assign" => {
+                let name = str_arg(args, 0).ok_or("assign: no name")?;
+                let vi = if str_arg(args, 1) == Some("=") || str_arg(args, 1) == Some("+=") { 2 } else { 1 };
+                let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                self.helper("quote");
+                Ok(format!("({} + shQuote({v}))", jstr(&format!("{name}="))))
+            }
+            IrExpr::Call { func, .. } if func == "break" || func == "continue" => {
+                Ok(format!("\"{func} \""))
+            }
+            IrExpr::Call { func, args, .. } if func == "block" => {
+                let mut sub = Vec::new();
+                for a in args.iter() {
+                    if let IrExpr::Arrow(body) = a {
+                        sub.push(self.arrow_expr(body)?);
+                    } else {
+                        sub.push(self.expr_str(a)?);
+                    }
+                }
+                Ok(format!("( \"{{ \" + {} + \" ; }}\" )", sub.join(" + \" ; \" + ")))
             }
             other => Err(format!("command-chain side not representable: {other:?}")),
         }
