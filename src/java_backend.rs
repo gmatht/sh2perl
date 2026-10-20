@@ -25,9 +25,11 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
 
 struct JavaRender {
     in_fn: usize,                  // >0 while rendering a function body
+    cur_fn: String,                // name of the function being rendered ("" at top level)
     fields: BTreeSet<String>,      // scalar vars (sanitized names kept separate)
     arrays: BTreeSet<String>,
     funcs: BTreeSet<String>,
+    fnvalues: BTreeSet<String>,    // functions ever called via fnValue (echo-return-lifted: their Return is a VALUE, not a status)
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
     redir_seq: usize,
@@ -69,7 +71,8 @@ const JAVA_RESERVED: &[&str] = &[
 
 impl JavaRender {
     fn new() -> Self {
-        JavaRender { in_fn: 0, fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
+        JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
+                     fnvalues: BTreeSet::new(),
                      helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
                      out: Vec::new(), depth: 2 }
     }
@@ -126,6 +129,13 @@ impl JavaRender {
                 if matches!(func.as_str(), "setArray" | "setArrayAppend") {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         self.arrays.insert(sanitize(name));
+                    }
+                }
+                // the echo-return-lift's value convention: these functions'
+                // Return nodes are VALUES (print them), not statuses
+                if matches!(func.as_str(), "fnValue" | "fnCall") {
+                    if let Some(n) = str_arg(&args, 0) {
+                        self.fnvalues.insert(n.to_string());
                     }
                 }
                 for a in args { self.scan_expr(a)?; }
@@ -235,14 +245,16 @@ impl JavaRender {
         let mut fn_buf = String::new();
         for (name, body) in fn_list.iter() {
                 let fname = fn_name(name);
-                fn_buf.push_str(&format!("    static boolean {fname}() throws Exception {{\n"));
+                fn_buf.push_str(&format!("    static String {fname}() throws Exception {{\n"));
                 fn_buf.push_str("        List<String> __saved = new ArrayList<>(__SH_ARGV);\n");
                 fn_buf.push_str("        try {\n");
                 let saved_depth = self.depth;
                 self.out.clear();
                 self.depth = 2;
                 self.in_fn += 1;
+                let saved_fn = std::mem::replace(&mut self.cur_fn, name.clone());
                 for b in body { self.stmt(b)?; }
+                self.cur_fn = saved_fn;
                 self.in_fn -= 1;
                 let body_lines = std::mem::take(&mut self.out);
                 self.depth = saved_depth;
@@ -253,7 +265,7 @@ impl JavaRender {
                     .map(|l| l.trim().starts_with("return "))
                     .unwrap_or(false);
                 if !ends_with_return {
-                    fn_buf.push_str("        return __SH_RC == 0;\n");
+                    fn_buf.push_str("        return \"\";\n");
                 }
                 fn_buf.push_str("    }\n\n");
         }
@@ -284,7 +296,7 @@ impl JavaRender {
         // removes the whole missing-symbol failure class.
         let _ = std::mem::take(&mut self.helpers);
         let all_helpers = [
-            "env","len","num","arg","shift","cd","run","runrc","capture","fncap","printf",
+            "env","len","num","arg","shift","cd","run","runrc","capture","printf",
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
@@ -481,33 +493,45 @@ impl JavaRender {
                 self.pipeline(stages, capture.as_deref(), cmd_str.as_deref()),
             IrStmt::Function { .. } => Ok(()), // emitted at top level
             IrStmt::Return(v) => {
-                // The echo-return-lift turns trailing `echo ...` into
-                // `return "<string>"` — the function's VALUE is its stdout.
-                // String values print (bash-faithful: statement-position
-                // calls show output, fnValue captures it); numeric values
-                // set the exit status (real `return N` — the core keeps
-                // those as Int/Arith, a numeric Str, or a variable read).
+                // Value convention (see the echo_return lift contract): a
+                // function ever called via fnValue is VALUE-returning — its
+                // Return nodes are echoed values (status 0, the value flows
+                // back as the Java return). Any other function is
+                // STATUS-returning — its Return sets __SH_RC and yields "".
+                let is_value_fn = !self.cur_fn.is_empty() && self.fnvalues.contains(&self.cur_fn);
                 match v {
-                    None => {}
-                    Some(e) => {
-                        let is_status = matches!(e, IrExpr::Int(_) | IrExpr::Arith(_)
-                            | IrExpr::Var(_, _) | IrExpr::Ident(_))
-                            || matches!(e, IrExpr::Str(s, _) if s.trim().parse::<i64>().is_ok())
-                            || matches!(e, IrExpr::Call { func, .. } if func == "getVar");
-                        if is_status {
-                            let x = self.expr_num(e)?;
-                            self.emit(&format!("__SH_RC = {x};"));
+                    None => {
+                        if self.in_fn > 0 {
+                            self.emit("return \"\";");
                         } else {
-                            let s = self.expr_str(e)?;
-                            self.emit(&format!("System.out.println({s});"));
-                            self.emit("__SH_RC = 0;");
+                            self.emit(&format!("System.exit((int) __SH_RC);"));
                         }
                     }
-                }
-                if self.in_fn > 0 {
-                    self.emit("return __SH_RC == 0;");
-                } else {
-                    self.emit(&format!("System.exit((int) __SH_RC);"));
+                    Some(e) => {
+                        if is_value_fn {
+                            let s = self.expr_str(e)?;
+                            self.emit("__SH_RC = 0;");
+                            self.emit(&format!("return {s};"));
+                        } else {
+                            let is_status = matches!(e, IrExpr::Int(_) | IrExpr::Arith(_)
+                                | IrExpr::Var(_, _) | IrExpr::Ident(_))
+                                || matches!(e, IrExpr::Str(s, _) if s.trim().parse::<i64>().is_ok())
+                                || matches!(e, IrExpr::Call { func, .. } if func == "getVar");
+                            if is_status {
+                                let x = self.expr_num(e)?;
+                                self.emit(&format!("__SH_RC = {x};"));
+                            } else {
+                                let s = self.expr_str(e)?;
+                                self.emit(&format!("System.out.println({s});"));
+                                self.emit("__SH_RC = 0;");
+                            }
+                            if self.in_fn > 0 {
+                                self.emit("return \"\";");
+                            } else {
+                                self.emit(&format!("System.exit((int) __SH_RC);"));
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -617,7 +641,10 @@ impl JavaRender {
         for cl in clauses {
             let mut conds = Vec::new();
             for p in &cl.patterns {
-                conds.push(format!("shFnmatch({}, {d})", jstr(p)));
+                // ShIR case patterns keep their source quotes (`"add"`);
+                // bash compares the quote-removed value — strip one
+                // wrapping quote pair (globs like `*` have none).
+                conds.push(format!("shFnmatch({}, {d})", jstr(&strip_wrapping_quotes(p))));
             }
             let cond = conds.join(" || ");
             {
@@ -1270,7 +1297,13 @@ impl JavaRender {
             }
             other => {
                 if self.funcs.contains(other) {
-                    // positional args replace __SH_ARGV for the call
+                    // positional args replace __SH_ARGV for the call.
+                    // Functions return their value as a String (the
+                    // echo-return-lift convention); a direct statement call
+                    // prints it when non-empty (eligible functions have no
+                    // direct calls post-lift, but a missed rewrite must
+                    // still show output). __SH_RC survives: the print below
+                    // never touches it.
                     let flat = flatten_words(rest);
                     if !flat.is_empty() {
                         self.emit("{");
@@ -1286,7 +1319,12 @@ impl JavaRender {
                         self.emit("__SH_ARGV = __callArgv;");
                         self.emit("}");
                     }
-                    self.emit(&format!("{}();", fn_name(other)));
+                    self.tmp_seq += 1;
+                    let rv = format!("__fnrv{}", self.tmp_seq);
+                    self.emit(&format!("String {rv} = {f}();", f = fn_name(other)));
+                    self.block_open(&format!("if (!{rv}.isEmpty()) {{"));
+                    self.emit(&format!("System.out.println({rv});"));
+                    self.block_close();
                     return Ok(());
                 }
                 let mut pieces: Vec<(String, bool)> = Vec::new();
@@ -1484,9 +1522,12 @@ impl JavaRender {
             "true" => Ok("true".into()),
             "false" => Ok("false".into()),
             other if self.funcs.contains(other) => {
+                // Functions return String; the condition is the STATUS the
+                // call leaves in __SH_RC. Sequence the call as a boolean
+                // via a null-check on its (never-null) value.
                 let flat = flatten_words(rest);
                 if flat.is_empty() {
-                    Ok(format!("{}()", fn_name(other)))
+                    Ok(format!("(({f}() != null) && __SH_RC == 0)", f = fn_name(other)))
                 } else {
                     // function call WITH args in condition position: the
                     // callee reads positionals from __SH_ARGV, so bind them
@@ -1500,8 +1541,8 @@ impl JavaRender {
                         }
                         arg_exprs.push(e);
                     }
-                    Ok(format!("((__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}}))) != null && {}())",
-                               arg_exprs.join(", "), fn_name(other)))
+                    Ok(format!("((__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}}))) != null && ({f}() != null) && __SH_RC == 0)",
+                               arg_exprs.join(", "), f = fn_name(other)))
                 }
             }
             _ => {
@@ -2121,12 +2162,11 @@ impl JavaRender {
             IrExpr::Capture { expr, .. } => self.capture_expr(expr),
             IrExpr::Call { func, args, .. } if func == "capture" => self.capture_text(args),
             IrExpr::Call { func, args, .. } if func == "fnValue" || func == "fnCall" => {
-                // user-function call in value position: run the transpiled
-                // function in-process and capture what it printed (bash
-                // functions return stdout, not a value). The capture swaps
-                // System.out for the duration of the call — argv is bound
-                // by the same inline assignment the condition position uses
-                // (the function's try/finally restores the caller's argv).
+                // User-function call in value position: the transpiled
+                // function RETURNS its value as a String (the
+                // echo-return-lift convention) — no stdout capture needed.
+                // Argv is bound inline (the function's try/finally restores
+                // the caller's argv). fnCall discards the value ("").
                 let name = str_arg(args, 0).unwrap_or_default();
                 if !self.funcs.contains(name) {
                     return Err(format!("fnValue of unknown function {name}"));
@@ -2139,16 +2179,17 @@ impl JavaRender {
                     }
                     _ => Vec::new(),
                 };
-                self.helper("fncap");
-                let bind = if call_args.is_empty() {
-                    String::new()
+                let call = if call_args.is_empty() {
+                    format!("{}()", fn_name(name))
                 } else {
-                    format!("__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}})); ",
-                            call_args.join(", "))
+                    format!("((__SH_ARGV = new ArrayList<>(List.of(new String[]{{{}}}))) != null ? {}() : \"\")",
+                            call_args.join(", "), fn_name(name))
                 };
-                // BooleanSupplier lambda defers the call into the helper;
-                // trailing newline stripping matches shCapture semantics.
-                Ok(format!("shFncap(() -> {{ {bind}return {}(); }})", fn_name(name)))
+                if func == "fnCall" {
+                    Ok("\"\"".to_string())
+                } else {
+                    Ok(call)
+                }
             },
             IrExpr::Call { func, args, .. } if func == "captureWords" => {
                 let c = self.capture_text(args)?;
@@ -2365,6 +2406,23 @@ impl JavaRender {
     }
 
     // ── parameter expansion ──────────────────────────────────────────
+    /// Bash quote-removal for a literal ${var//pat/rep} pattern or
+    /// replacement: inside the original double quotes, `\"` `\$` `\\`
+    /// (and backslash + newline) collapse to the literal char. The core
+    /// keeps the raw text in the ShIR, so the renderer applies it.
+    fn replace_pat(&mut self, e: &IrExpr) -> Result<String, String> {
+        match e {
+            IrExpr::Str(s, _) => Ok(jstr(&bash_dquote_unescape(s))),
+            other => self.expr_str(other),
+        }
+    }
+
+    fn replace_rep(&mut self, e: &IrExpr) -> Result<String, String> {
+        match e {
+            IrExpr::Str(s, _) => Ok(jstr(&bash_dquote_unescape(s))),
+            other => self.expr_str(other),
+        }
+    }
     fn param(&mut self, args: &[IrExpr]) -> Result<String, String> {
         let op = str_arg(args, 0).unwrap_or_default();
         let name = str_arg(args, 1).ok_or("param: no variable name")?;
@@ -2495,14 +2553,14 @@ impl JavaRender {
                 Ok(format!("shStripShortestSuffix({}, {pat})", self.getvar_str(&name)?))
             }
             "//" => {
-                let pat = self.expr_str(args.get(2).ok_or("//: no pattern")?)?;
-                let rep = self.expr_str(args.get(3).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                let pat = self.replace_pat(args.get(2).ok_or("//: no pattern")?)?;
+                let rep = self.replace_rep(args.get(3).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
                 self.helper("replace");
                 Ok(format!("shReplaceAll({}, {pat}, {rep})", self.getvar_str(&name)?))
             }
             "/" => {
-                let pat = self.expr_str(args.get(2).ok_or("/: no pattern")?)?;
-                let rep = self.expr_str(args.get(3).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                let pat = self.replace_pat(args.get(2).ok_or("/: no pattern")?)?;
+                let rep = self.replace_rep(args.get(3).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
                 self.helper("replace");
                 Ok(format!("shReplaceFirst({}, {pat}, {rep})", self.getvar_str(&name)?))
             }
@@ -3044,6 +3102,44 @@ fn str_arg<'a>(args: &'a [IrExpr], i: usize) -> Option<&'a str> {
         Some(IrExpr::Str(s, _)) => Some(s),
         _ => None,
     }
+}
+
+/// Bash double-quote removal: inside "...", a backslash preserves its
+/// literal meaning except when followed by `$`, `` ` ``, `"`, `\`, or a
+/// newline (those collapse to the char itself / nothing). The frontend
+/// keeps the raw text in ShIR Str nodes, so renderers that need the real
+/// value (e.g. ${var//pat/rep} patterns) apply this.
+fn bash_dquote_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some('$') | Some('`') | Some('"') | Some('\\') => out.push(it.next().unwrap()),
+                Some('\n') => { it.next(); }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Strip one wrapping quote pair (`"add"` → `add`) for case patterns:
+/// the ShIR keeps source quotes, bash matches the removed value.
+/// Only fires when the SAME quote wraps both ends.
+fn strip_wrapping_quotes(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 {
+        let b = t.as_bytes();
+        if (b[0] == b'"' && b[t.len() - 1] == b'"')
+            || (b[0] == b'\'' && b[t.len() - 1] == b'\'')
+        {
+            return t[1..t.len() - 1].to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// A Java string literal (same rules as java_str_lit).
