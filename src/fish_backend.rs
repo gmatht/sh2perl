@@ -1796,7 +1796,7 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 // everything after it silently never runs
                 // (090_nested_if_else.sh lost its `farewell` line).
                 out.push_str("else if ");
-                out.push_str(&cmd_to_fish(econd)?);
+                out.push_str(&cond_to_fish(econd)?);
                 out.push_str("\n");
                 if ebody.is_empty() {
                     indent(out, d + 1);
