@@ -39,7 +39,15 @@ for f in "${corpus[@]}"; do
     [ "$VERBOSE" = 1 ] && echo "  STUB($s) $base"; continue
   fi
   printf '%s' "$out" > "$tmp/r.fish"
-  bo=$(cd "$tmp" && timeout -k 2 15 bash "$f" 2>/dev/null); brc=$?
+  # BASH_ENV is deliberately cleared for the bash side: this agent's shell
+  # exports one carrying `grep`/`find` WRAPPER FUNCTIONS (pir's shell
+  # integration). Those wrappers exist only in bash — fish runs the real
+  # binaries — so an inherited BASH_ENV makes the two sides differ for reasons
+  # that have nothing to do with the renderer (015_grep_advanced's
+  # `--color=always` emitted 01;31/m/K under real GNU grep vs 0m;1;31 under
+  # the wrapper; 016_grep_basic gained a spurious line). The canonical gate
+  # runs from systemd, which has no BASH_ENV at all.
+  bo=$(cd "$tmp" && env -u BASH_ENV timeout -k 2 15 bash "$f" 2>/dev/null); brc=$?
   fo=$(cd "$tmp" && SH2_ARGV0="$f" timeout -k 2 15 fish "$tmp/r.fish" 2>/dev/null); frc=$?
   if [ "$frc" = 124 ] || [ "$brc" = 124 ] || [ "$frc" != "$brc" ] || [ "$bo" != "$fo" ]; then
     fail=$((fail+1)); eqfail=$((eqfail+1)); fails="$f $fails"
