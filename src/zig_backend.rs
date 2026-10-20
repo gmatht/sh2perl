@@ -1833,6 +1833,22 @@ impl Render {
                     None => self.sh2_stub("split", "split"),
                 }
             }
+            "param" => {
+                if let Some(rendered) = self.render_param(args) {
+                    return rendered;
+                }
+                self.sh2_stub("param", "param")
+            }
+            "join" => {
+                // `join(slice…)` wraps scalar AND array slices: scalar
+                // slices already render as plain strings (identity); array
+                // slices bail upstream in render_param, so this is reached
+                // only for values that are already joined text
+                match args.first() {
+                    Some(arg) => self.expr_str(arg),
+                    None => self.sh2_stub("join", "join"),
+                }
+            }
             "setArray" | "setArrayAppend" => {
                 // array assignment `arr=(a b c)` — render as a bracketed
                 // string (the common indexed-array form).
@@ -2973,6 +2989,384 @@ impl Render {
                 self.mark_todo(&format!("chain side {e:?}"));
             }
         }
+    }
+
+    /// `${…}` parameter expansion (the `param` call): `args` =
+    /// `[op, name, extra…]` all Str. Returns None for shapes outside the
+    /// modeled subset (arrays, indirect, exotic) → the caller stubs.
+    fn render_param(&mut self, args: &[IrExpr]) -> Option<String> {
+        self.render_param_depth(args, 0)
+    }
+
+    fn render_param_depth(&mut self, args: &[IrExpr], depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        let op = match args.first() {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            _ => return None,
+        };
+        let name = match args.get(1) {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            _ => return None,
+        };
+        let extra = match args.get(2) {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            None => String::new(),
+            _ => return None,
+        };
+        // array element / slice subjects (`arr[i]`, `arr`, `@`) go through
+        // the array homes (not yet modeled) — except `len`, which counts.
+        // Single `,`/`^` suffix: the core only splits the DOUBLED forms, so
+        // `${n,}` arrives as op="" name="n," — apply first-char case-mod
+        // here rather than misreading it as an array index.
+        if name == "@" || name == "*" || name.starts_with('!') {
+            return None;
+        }
+        if op.is_empty() && !name.contains('[') {
+            if let Some(base) = name.strip_suffix(',') {
+                let v = self.param_var_str(base)?;
+                self.need_ext = true;
+                return Some(format!("shCaseOne({v}, false)"));
+            }
+            if let Some(base) = name.strip_suffix('^') {
+                let v = self.param_var_str(base)?;
+                self.need_ext = true;
+                return Some(format!("shCaseOne({v}, true)"));
+            }
+        }
+        if name.contains('[') {
+            return None;
+        }
+        match op.as_str() {
+            ":-" => {
+                // `${s:off:len}` with a NEGATIVE len lexes as `:-` with a
+                // `s:off` name (the core keeps the slice split only for
+                // non-negative lens) — a `:` can never occur in a real var
+                // name, so re-split to a slice unambiguously (perl renders
+                // this shape literally and prints the default: wrong)
+                if let Some(ci) = name.find(':') {
+                    let (base, off_text) = (&name[..ci], name[ci + 1..].to_string());
+                    if !base.is_empty()
+                        && !base.contains('[')
+                        && base.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
+                        let v = self.param_var_str(base)?;
+                        let off_s = IrExpr::Str(off_text, crate::ir::StrStyle::DoubleQuoted);
+                        let off = self.param_int(&off_s)?;
+                        let len_s = IrExpr::Str(extra.clone(), crate::ir::StrStyle::DoubleQuoted);
+                        let len = self.param_int(&len_s)?;
+                        self.need_ext = true;
+                        return Some(format!("shSub({v}, {off}, {len})"));
+                    }
+                }
+                let v = self.param_var_str(&name)?;
+                let d = self.render_param_default(&extra, depth)?;
+                Some(format!("(if ({v}.len == 0) {d} else {v})"))
+            }
+            ":=" => {
+                // assign-back needs a DECLARED home (mid-render decls are
+                // impossible); env-only names stay stubs
+                if !self.declared(&name) {
+                    return None;
+                }
+                let m = self.zig_ident(&name);
+                self.mark_read(&name);
+                let d = self.render_param_default(&extra, depth)?;
+                let cur = if self.is_num(&name) {
+                    self.need_intstr = true;
+                    format!("shIntStr({m})")
+                } else {
+                    m.clone()
+                };
+                let assign = if self.is_num(&name) {
+                    self.need_toint = true;
+                    format!("{m} = shToInt({d});")
+                } else {
+                    format!("{m} = {d};")
+                };
+                Some(format!(
+                    "blk: {{ if ({cur}.len == 0) {{ {assign} }} break :blk {m}; }}"
+                ))
+            }
+            ":?" => {
+                let v = self.param_var_str(&name)?;
+                let msg = if extra.is_empty() {
+                    format!("\"{name}: parameter null or not set\"")
+                } else {
+                    match self.render_param_default(&extra, depth) {
+                        Some(d) => d,
+                        None => return None,
+                    }
+                };
+                Some(format!(
+                    "blk: {{ if ({v}.len == 0) {{ std.debug.print(\"{{s}}\\n\", .{{{msg}}}); std.process.exit(1); }} break :blk {v}; }}"
+                ))
+            }
+            ":+" => {
+                // alternate value (the core conflates bare `+` here too —
+                // same shape, same semantics)
+                let v = self.param_var_str(&name)?;
+                let d = self.render_param_default(&extra, depth)?;
+                Some(format!("(if ({v}.len == 0) \"\" else {d})"))
+            }
+            "len" => {
+                let v = self.param_var_str(&name)?;
+                self.need_intstr = true;
+                Some(format!("shIntStr(@as(i64, @intCast({v}.len)))"))
+            }
+            "slice" => {
+                let v = self.param_var_str(&name)?;
+                let off = self.param_int(&args.get(2).cloned().unwrap_or(IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)))?;
+                // omitted length = "to the end": pass through as a huge
+                // length (clamped inside shSub) — NOT -1, which bash reads
+                // as end-counting (`${s:1:-1}` chops the last char)
+                let len = match args.get(3) {
+                    None => "9223372036854775807".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.trim().is_empty() => {
+                        "9223372036854775807".to_string()
+                    }
+                    Some(e) => self.param_int(e)?,
+                };
+                self.need_ext = true;
+                Some(format!("shSub({v}, {off}, {len})"))
+            }
+            "#" | "##" => {
+                let v = self.param_var_str(&name)?;
+                let pat = self.param_pattern(&extra)?;
+                self.need_ext = true;
+                let longest = op == "##";
+                Some(format!("shStripPre({v}, {pat}, {})", longest))
+            }
+            "%" | "%%" => {
+                let v = self.param_var_str(&name)?;
+                let pat = self.param_pattern(&extra)?;
+                self.need_ext = true;
+                let longest = op == "%%";
+                Some(format!("shStripSuf({v}, {pat}, {})", longest))
+            }
+            "/" | "//" => {
+                let v = self.param_var_str(&name)?;
+                let (pat, repl) = (self.param_pattern(&extra)?, self.param_repl(args)?);
+                self.need_ext = true;
+                let all = op == "//";
+                Some(format!("shReplace({v}, {pat}, {repl}, {})", all))
+            }
+            "^" | "^^" => {
+                let v = self.param_var_str(&name)?;
+                self.need_ext = true;
+                if op == "^^" {
+                    Some(format!("shCase({v}, true)"))
+                } else {
+                    Some(format!("shCaseOne({v}, true)"))
+                }
+            }
+            "," | ",," => {
+                let v = self.param_var_str(&name)?;
+                self.need_ext = true;
+                if op == ",," {
+                    Some(format!("shCase({v}, false)"))
+                } else {
+                    Some(format!("shCaseOne({v}, false)"))
+                }
+            }
+            "basename" => {
+                let v = self.param_var_str(&name)?;
+                self.need_ext = true;
+                Some(format!("shBasename({v})"))
+            }
+            "dirname" => {
+                let v = self.param_var_str(&name)?;
+                self.need_ext = true;
+                Some(format!("shDirname({v})"))
+            }
+            _ => None,
+        }
+    }
+
+    /// A `param` subject as a string expression: specials, positionals,
+    /// declared homes (typed), env fallback. None for array subjects.
+    fn param_var_str(&mut self, name: &str) -> Option<String> {
+        if name == "?" {
+            self.need_intstr = true;
+            return Some("shIntStr(sh_rc)".to_string());
+        }
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+            if self.in_function {
+                let idx: usize = name.parse().unwrap_or(1);
+                return Some(format!("(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"));
+            }
+            return Some("\"\"".to_string());
+        }
+        if name == "#" {
+            return Some("\"0\"".to_string());
+        }
+        if name == "@" || name == "*" {
+            return Some("\"\"".to_string());
+        }
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            if self.is_num(name) {
+                self.need_intstr = true;
+                return Some(format!("shIntStr({m})"));
+            }
+            return Some(m);
+        }
+        self.need_env = true;
+        Some(format!("shEnv({})", Self::zig_str(name)))
+    }
+
+    /// A `param` slice offset/length as an i64 expression: literal ints
+    /// (whitespace-tolerated, negatives allowed) or `$`-refs thereof.
+    fn param_int(&mut self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) => {
+                let t = s.trim();
+                if t.parse::<i64>().is_ok() {
+                    return Some(t.to_string());
+                }
+                // `$i` / `${i}` / `-$i`? — resolve the ref, coerce numeric
+                let neg = t.starts_with('-');
+                let body = if neg { t[1..].trim() } else { t };
+                let r = self.declare_value_expr(body)?;
+                self.need_toint = true;
+                let c = format!("shToInt({r})");
+                if neg {
+                    Some(format!("-{c}"))
+                } else {
+                    Some(c)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A `${…#pat}`-family pattern as a string expression (Str literal or
+    /// a `$`-ref resolving to one).
+    fn param_pattern(&mut self, pat: &str) -> Option<String> {
+        if !pat.contains('$') {
+            return Some(Self::zig_str(pat));
+        }
+        self.declare_value_expr(pat.trim())
+    }
+
+    /// The replacement of a `${…/pat/repl}`: args[3] as Str (may be empty).
+    fn param_repl(&mut self, args: &[IrExpr]) -> Option<String> {
+        match args.get(3) {
+            None => Some("\"\"".to_string()),
+            Some(IrExpr::Str(s, _)) => {
+                if s.contains('$') {
+                    self.declare_value_expr(s.trim())
+                } else {
+                    Some(Self::zig_str(s))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A `:-`-family default word: plain/quoted literal, `$(…)` capture
+    /// text, nested `${…}` (recursed), `$`-refs. None → caller stubs.
+    fn render_param_default(&mut self, text: &str, depth: usize) -> Option<String> {
+        let t = text.trim();
+        // `$(cmd args)` / backticks: naive word-split (quotes respected);
+        // anything shell-active beyond words bails
+        if let Some(inner) = t
+            .strip_prefix("$(")
+            .and_then(|r| r.strip_suffix(')'))
+            .or_else(|| {
+                (t.len() >= 2 && t.starts_with('`') && t.ends_with('`'))
+                    .then(|| &t[1..t.len() - 1])
+            })
+        {
+            return self.param_default_capture(inner.trim());
+        }
+        // nested `${…}`: re-split op/name/arg, recurse
+        if let Some(body) = t.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+            if let Some((op2, name2, arg2)) = split_param_body(body) {
+                let s = |x: &str| IrExpr::Str(x.to_string(), crate::ir::StrStyle::DoubleQuoted);
+                return self.render_param_depth(
+                    &[s(op2), s(name2), s(arg2), s("")],
+                    depth + 1,
+                );
+            }
+            if !body.is_empty()
+                && body.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            {
+                return self.param_var_str(body);
+            }
+            return None;
+        }
+        // quoted literal: the quotes are delimiters, not content
+        if t.len() >= 2
+            && ((t.starts_with('"') && t.ends_with('"'))
+                || (t.starts_with('\'') && t.ends_with('\'')))
+        {
+            return Some(Self::zig_str(&t[1..t.len() - 1]));
+        }
+        // `$`-refs resolve; anything else shell-active bails
+        if t.contains('$') || t.contains('`') {
+            return self.declare_value_expr(t);
+        }
+        Some(Self::zig_str(t))
+    }
+
+    /// Words of a `$(…)` default body into a capture call. Refuses (None)
+    /// on anything beyond plain words: pipes, redirects, globs, `~`.
+    fn param_default_capture(&mut self, body: &str) -> Option<String> {
+        let mut words: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote = '\0';
+        let mut in_word = false;
+        for c in body.chars() {
+            if quote != '\0' {
+                if c == quote {
+                    quote = '\0';
+                } else {
+                    cur.push(c);
+                }
+                continue;
+            }
+            match c {
+                '"' | '\'' => {
+                    quote = c;
+                    in_word = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_word {
+                        words.push(cur.clone());
+                        cur.clear();
+                        in_word = false;
+                    }
+                }
+                '$' | '`' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '['
+                | ']' | '{' | '}' | '!' | '#' | '\n' | '\\' => return None,
+                _ => {
+                    cur.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        if quote != '\0' {
+            return None;
+        }
+        if in_word {
+            words.push(cur);
+        }
+        if words.is_empty() {
+            return None;
+        }
+        let argv: Vec<String> = words.iter().map(|w| Self::zig_str(w)).collect();
+        self.need_run = true;
+        self.rc_dirty = true;
+        let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(&words[0]) {
+            self.need_uu_run = true;
+            "shUuRun"
+        } else {
+            "shRun"
+        };
+        Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
     fn stmt(&mut self, s: &IrStmt) {
@@ -4286,10 +4680,80 @@ impl Render {
             self.emit("    return std.mem.indexOf(u8, hay, needle) != null;");
             self.emit("}");
             self.emit("fn shSub(t: []const u8, off: i64, len: i64) []const u8 {");
-            self.emit("    const o: usize = @intCast(@max(0, @min(off, @as(i64, @intCast(t.len)))));");
-            self.emit("    if (len < 0) return t[o..];");
-            self.emit("    const e: usize = o + @as(usize, @intCast(len));");
-            self.emit("    return t[o..@min(e, t.len)];");
+            self.emit("    const n: i64 = @intCast(t.len);");
+            self.emit("    var o = if (off < 0) n + off else off;");
+            self.emit("    o = @max(0, @min(o, n));");
+            self.emit("    const ou: usize = @intCast(o);");
+            self.emit("    if (len < 0) {");
+            self.emit("        var e = n + len;");
+            self.emit("        e = @max(o, @min(e, n));");
+            self.emit("        return t[ou..@as(usize, @intCast(e))];");
+            self.emit("    }");
+            self.emit("    const e: usize = @min(ou +| @as(usize, @intCast(len)), t.len);");
+            self.emit("    return t[ou..e];");
+            self.emit("}");
+            self.emit("fn shStripPre(t: []const u8, pat: []const u8, longest: bool) []const u8 {");
+            self.emit("    // shortest/longest PREFIX of t matching the glob pat is removed");
+            self.emit("    if (pat.len == 0) return t;");
+            self.emit("    var best: ?usize = null;");
+            self.emit("    var k: usize = 0;");
+            self.emit("    while (k <= t.len) : (k += 1) {");
+            self.emit("        if (shGlobName(pat, t[0..k])) {");
+            self.emit("            if (!longest) return t[k..];");
+            self.emit("            best = k;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    if (best) |b| return t[b..];");
+            self.emit("    return t;");
+            self.emit("}");
+            self.emit("fn shStripSuf(t: []const u8, pat: []const u8, longest: bool) []const u8 {");
+            self.emit("    // shortest/longest SUFFIX of t matching the glob pat is removed");
+            self.emit("    if (pat.len == 0) return t;");
+            self.emit("    var best: ?usize = null;");
+            self.emit("    var k: usize = 0;");
+            self.emit("    while (k <= t.len) : (k += 1) {");
+            self.emit("        if (shGlobName(pat, t[t.len - k ..])) {");
+            self.emit("            if (!longest) return t[0 .. t.len - k];");
+            self.emit("            best = k;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    if (best) |b| return t[0 .. t.len - b];");
+            self.emit("    return t;");
+            self.emit("}");
+            self.emit("fn shReplace(t: []const u8, pat: []const u8, repl: []const u8, all: bool) []const u8 {");
+            self.emit("    // glob-pattern replace (first or all, left-to-right, non-overlapping)");
+            self.emit("    if (pat.len == 0) return t;");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var j: usize = 0;");
+            self.emit("    var done = false;");
+            self.emit("    while (j <= t.len) {");
+            self.emit("        var hit: usize = 0;");
+            self.emit("        if (!done) {");
+            self.emit("            var k: usize = 1;");
+            self.emit("            while (j + k <= t.len) : (k += 1) {");
+            self.emit("                if (shGlobName(pat, t[j .. j + k])) hit = k;");
+            self.emit("            }");
+            self.emit("        }");
+            self.emit("        if (hit > 0) {");
+            self.emit("            out.appendSlice(std.heap.page_allocator, repl) catch return \"\";");
+            self.emit("            j += hit;");
+            self.emit("            if (!all) done = true;");
+            self.emit("        } else {");
+            self.emit("            if (j == t.len) break;");
+            self.emit("            out.append(std.heap.page_allocator, t[j]) catch return \"\";");
+            self.emit("            j += 1;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+            self.emit("fn shCaseOne(t: []const u8, upper: bool) []const u8 {");
+            self.emit("    // `^`/`,`: convert only the FIRST byte (bash operates on the");
+            self.emit("    // first character; byte-wise is exact for ASCII)");
+            self.emit("    if (t.len == 0) return t;");
+            self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
+            self.emit("    @memcpy(b, t);");
+            self.emit("    b[0] = if (upper) std.ascii.toUpper(t[0]) else std.ascii.toLower(t[0]);");
+            self.emit("    return b;");
             self.emit("}");
             self.emit("fn shCase(t: []const u8, upper: bool) []const u8 {");
             self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
@@ -5163,6 +5627,27 @@ fn collect_captured(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             _ => {}
         }
     }
+}
+
+/// Split a nested `${name<op>arg}` body into (op, name, arg) — mirrors the
+/// perl backend's split_param_body (same op list, longest-first) for the
+/// `:-`-default re-parse path.
+fn split_param_body(body: &str) -> Option<(&str, &str, &str)> {
+    let name_end = body
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(body.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &body[..name_end];
+    let rest = &body[name_end..];
+    let (op, arg) = [
+        "##", "%%", ":-", ":=", ":+", ":?", "//", "^^", ",,", "#", "%", "-", "+", "^", ",",
+        "/",
+    ]
+    .iter()
+    .find_map(|o| rest.strip_prefix(o).map(|a| (*o, a)))?;
+    Some((op, name, arg))
 }
 
 /// CamelCase a sh2.* callee name for the stub function name.
