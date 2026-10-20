@@ -100,6 +100,23 @@ const ZIG_RESERVED: &[&str] = &[
     "shB2S",
 ];
 
+/// Runtime-helper INTERNAL identifiers (locals, params, loop bindings in
+/// the emitted `sh*` helpers and the main prologue). A file-scope
+/// (capture-promoted) user var with one of these names makes the helper's
+/// local a shadowing error (`local constant shadows declaration`), so
+/// capture-promoted globals mangle away from all of them (they gain a `_`
+/// suffix). Function/main locals are separate scopes and keep clean names.
+const HELPER_INTERNALS: &[&str] = &[
+    "result", "term", "child", "io", "st", "f", "s", "t", "m", "b", "out", "ix", "j",
+    "w", "n", "k", "hit", "done", "best", "e", "o", "ou", "lo", "hi", "c", "a", "i",
+    "v", "argv", "argc", "zargs", "util_z", "hay", "needle", "upper", "lead", "trail",
+    "off", "len", "pat", "name", "data", "p", "flag", "append", "repl", "all",
+    "longest", "first", "suppress", "d", "ids", "si", "pi", "ssi", "spi", "star",
+    "negate", "body", "close", "bi", "lines", "s0", "e0", "num", "full", "nm", "bn",
+    "fh", "buf", "rd", "line", "needs", "total", "stdout_buffer", "stdout_file_writer",
+    "sh_io", "sh_environ", "init", "__args",
+];
+
 /// sh2.* callee names that collide with a real runtime helper (or the
 /// generic sh2TODO) — their per-callee stub gets a `Stub` suffix so the
 /// call site and the definition agree.
@@ -196,7 +213,13 @@ pub struct Render {
     /// vars read by a nested function from an enclosing function scope
     /// (bash dynamic scoping): promoted to main-level globals; enclosing
     /// fns must not shadow them with locals
-    captured: BTreeSet<String>,
+    globals: BTreeSet<String>,
+    /// vars written by TOP-level statements (function bodies excluded by
+    /// the walker): a function that assigns one of these writes the shared
+    /// global (bash has no `local` unless declared) — the Function arm
+    /// must not redeclare it as an fn-local shadow, except for names the
+    /// fn itself declares `local` (Declare{local} / builtin `local`)
+    top_written: BTreeSet<String>,
     /// user functions whose trailing `echo [-n] V` became the return value
     /// (name → trailing newline?): a STATEMENT-position call must print
     /// that value (bash executes the echo as a side effect);
@@ -227,58 +250,10 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_storage = prog.var_storage.iter().cloned().collect();
-    // nested-function names count as defined (a call inside the enclosing
-    // fn is a direct call, never an external)
-    fn collect_fns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-        for s in stmts {
-            match s {
-                IrStmt::Function { name, body, named_blocks, .. } => {
-                    out.insert(name.clone());
-                    collect_fns(body, out);
-                    for (_, b) in named_blocks {
-                        collect_fns(b, out);
-                    }
-                }
-                IrStmt::If { then, elsifs, else_, .. } => {
-                    collect_fns(then, out);
-                    for (_, b) in elsifs {
-                        collect_fns(b, out);
-                    }
-                    collect_fns(else_, out);
-                }
-                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
-                    collect_fns(body, out);
-                }
-                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
-                    collect_fns(body, out);
-                }
-                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
-                    collect_fns(b, out);
-                }
-                IrStmt::Redirect { inner, .. } => collect_fns(inner, out),
-                IrStmt::Pipeline { stages, .. } => {
-                    for st in stages {
-                        collect_fns(st, out);
-                    }
-                }
-                IrStmt::Case { clauses, .. } => {
-                    for c in clauses {
-                        collect_fns(&c.body, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
     collect_fns(&prog.stmts, &mut r.user_fns);
     for sub in &prog.subs {
         r.user_fns.insert(sub.name.clone());
         collect_fns(&sub.body, &mut r.user_fns);
-    }
-    // dynamic-scoping promotion (nested fn reads of enclosing locals)
-    collect_captured(&prog.stmts, &mut r.captured);
-    for sub in &prog.subs {
-        collect_captured(&sub.body, &mut r.captured);
     }
     if std::env::var("ZIG_DBG").is_ok() {
         eprintln!("DBG var_types: {:?}", r.var_types);
@@ -367,6 +342,23 @@ impl Render {
     /// Sanitize a shell var name to a valid Zig identifier and mangle
     /// reserved names (A6-consistent). De-duplicates collisions.
     fn zig_ident(&mut self, name: &str) -> String {
+        if let Some(m) = self.mangle.get(name) {
+            return m.clone();
+        }
+        let mut m = String::new();
+        for (_i, c) in name.chars().enumerate() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                m.push(c);
+            } else {
+                m.push('_');
+            }
+        }
+        if m.is_empty() || m.chars().next().unwrap().is_ascii_digit() {
+            m.insert_str(0, "v_");
+        }
+        if ZIG_RESERVED.contains(&m.as_str()) {
+            m.push('_');
+        }
         if let Some(m) = self.mangle.get(name) {
             return m.clone();
         }
@@ -2029,7 +2021,9 @@ impl Render {
     }
 
     /// A numeric operand for a `let` condition: a declared numeric var
-    /// → its ident; a number literal → the literal.
+    /// → its ident; a declared STRING-homed var → shToInt coercion (bash
+    /// compares values, and a `$1`-fed local is string-homed); a number
+    /// literal → the literal.
     fn num_operand(&mut self, t: &str) -> Option<String> {
         let t = t.trim();
         if let Ok(n) = t.parse::<i64>() {
@@ -2043,7 +2037,11 @@ impl Render {
         if self.declared(name) {
             let m = self.zig_ident(name);
             self.mark_read(name);
-            return Some(m);
+            if self.is_num(name) {
+                return Some(m);
+            }
+            self.need_toint = true;
+            return Some(format!("shToInt({m})"));
         }
         None
     }
@@ -2822,12 +2820,35 @@ impl Render {
             if glued_only {
                 if let IrExpr::Str(s, _) = val[0] {
                     let rest = &s[s.find('=').unwrap() + 1..];
-                    match self.declare_value_expr(rest) {
-                        Some(rhs) => {
+                    if self.is_num(&name) {
+                        // numeric home: literals parse, `$`-refs resolve
+                        // then coerce (a literal `$3` here would numify to 0)
+                        if rest.trim().starts_with('$') {
+                            match self.declare_value_expr(rest.trim()) {
+                                Some(v) => {
+                                    self.need_toint = true;
+                                    self.emit(&format!("{m} = shToInt({v});"));
+                                }
+                                None => {
+                                    self.emit(&format!("// {cmd} {m} (unresolvable value)"));
+                                }
+                            }
+                        } else {
+                            let lit = IrExpr::Str(
+                                rest.to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            );
+                            let rhs = self.expr_num(&lit);
                             self.emit(&format!("{m} = {rhs};"));
                         }
-                        None => {
-                            self.emit(&format!("// {cmd} {m} (unresolvable value)"));
+                    } else {
+                        match self.declare_value_expr(rest) {
+                            Some(rhs) => {
+                                self.emit(&format!("{m} = {rhs};"));
+                            }
+                            None => {
+                                self.emit(&format!("// {cmd} {m} (unresolvable value)"));
+                            }
                         }
                     }
                     continue;
@@ -4428,7 +4449,33 @@ impl Render {
                 // capture-promoted vars stay global (bash dynamic scoping):
                 // a fn-local shadow here would hide the global the nested
                 // fn reads
-                locals.retain(|v| !self.captured.contains(v));
+                locals.retain(|v| !self.globals.contains(v));
+                // vars written at TOP level are shared globals (bash writes
+                // global unless `local`): keep them global here too, EXCEPT
+                // names this fn itself declares `local` (Declare{local} or
+                // a builtin `local` word — those genuinely shadow)
+                {
+                    let mut must_local: BTreeSet<String> = BTreeSet::new();
+                    for st in body {
+                        if let IrStmt::Declare { vars, local: true, .. } = st {
+                            for d in vars {
+                                must_local.insert(d.name.clone());
+                            }
+                        }
+                        if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+                            if func == "builtin" {
+                                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                    if cmd == "local" {
+                                        for n in builtin_declare_names(cmd, args) {
+                                            must_local.insert(n);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    locals.retain(|v| must_local.contains(v) || !self.top_written.contains(v));
+                }
                 self.fn_locals.extend(locals.iter().cloned());
                 let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
                 let uses_args = saved.iter().any(|l| l.contains("__args"));
@@ -4444,7 +4491,7 @@ impl Render {
                 );
                 if uses_stdout {
                     fntext.push_str("    var stdout_buffer: [4096]u8 = undefined;\n");
-                    fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);\n");
+                    fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);\n");
                     fntext.push_str("    const stdout = &stdout_file_writer.interface;\n");
                 } else {
                     // a pure value-return fn never touches init
@@ -4518,18 +4565,73 @@ impl Render {
     }
 
     fn program(&mut self, prog: &IrProgram) {
+        // Pass 0: global promotion. A var written at top level AND touched
+        // (read or written) inside any function is ONE shared global (bash
+        // has no `local` unless declared) — main-locals and fn-locals would
+        // both be invisible to the other side. Nested-fn reads of enclosing
+        // locals promote the same way (dynamic scoping). Promoted globals
+        // get file-scope-safe manglings (no helper-internal collisions).
+        {
+            let mut top = BTreeSet::new();
+            collect_written(&prog.stmts, &mut top);
+            self.top_written = top.clone();
+            let mut touched = BTreeSet::new();
+            let mut bodies: Vec<&[IrStmt]> = Vec::new();
+            all_fn_bodies(&prog.stmts, &mut bodies);
+            for b in bodies {
+                reads_stmts(b, &mut touched);
+                collect_targets(b, &mut touched);
+            }
+            collect_captured(&prog.stmts, &mut self.globals);
+            for v in top {
+                if touched.contains(&v) {
+                    self.globals.insert(v);
+                }
+            }
+            let names: Vec<String> = self.globals.iter().cloned().collect();
+            for v in names {
+                let mut m = String::new();
+                for c in v.chars() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        m.push(c);
+                    } else {
+                        m.push('_');
+                    }
+                }
+                if m.is_empty() || m.chars().next().unwrap().is_ascii_digit() {
+                    m.insert_str(0, "v_");
+                }
+                if ZIG_RESERVED.contains(&m.as_str())
+                    || HELPER_INTERNALS.contains(&m.as_str())
+                {
+                    m.push('_');
+                }
+                if m == "_" {
+                    m = "underscore".to_string();
+                }
+                let base = m.clone();
+                let mut n = 1;
+                while self.mangle.values().any(|x| x == &m) {
+                    m = format!("{base}{n}");
+                    n += 1;
+                }
+                self.mangle.insert(v, m);
+            }
+        }
         // Pass 1: collect written vars so declarations are hoisted.
         let mut written: BTreeSet<String> = BTreeSet::new();
         collect_written(&prog.stmts, &mut written);
+        // top-level writes (function bodies are excluded by the walker):
+        // functions assigning these names write the shared global
         for (n, _) in &prog.var_types {
             written.insert(n.clone());
         }
         // `declared()` consults this during rendering (a var reference
         // before its assignment in source order still lowers natively).
-        // Capture-promoted vars (nested-fn reads of enclosing locals) are
-        // main-level globals even though no top-level statement writes them
-        // (function bodies are excluded from the walk below).
-        written.extend(self.captured.iter().cloned());
+        // Promoted globals (Pass 0) are main-level even though no top-level
+        // statement may write them (function bodies are excluded from the
+        // walk below).
+        written.extend(self.globals.iter().cloned());
         self.written = written.clone();
 
         // set-typed arrays (setArray/setArrayAppend) — lowered to a
@@ -5126,14 +5228,14 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
                 pat.iter().any(|p| l.contains(p.as_str()))
             // capture-promoted vars are assigned inside functions (their
             // stores never appear in main's body text) — always mutable
-            }) || self.captured.contains(v);
+            }) || self.globals.contains(v);
             let kw = if mutated || self.bigint_vars.contains(v) || self.set_arrays.contains(v) {
                 "var"
             } else {
                 "const"
             };
             // file-scope when promoted (and not bigint-homed)
-            let file_scope = self.captured.contains(v) && !self.bigint_vars.contains(v);
+            let file_scope = self.globals.contains(v) && !self.bigint_vars.contains(v);
             let ind = if file_scope { "" } else { "    " };
             if self.bigint_vars.contains(v) {
                 decls.push(format!(
@@ -5207,7 +5309,7 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
             self.out.push(
-                "    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);"
+                "    var stdout_file_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);"
                     .to_string(),
             );
             self.out
@@ -5329,177 +5431,10 @@ fn function_locals(body: &[IrStmt]) -> BTreeSet<String> {
 /// boundary (nested Function bodies are their own scope). Used to tell a
 /// nested function's self-contained writes apart from its reads of outer
 /// locals (which must promote to globals — dynamic scoping).
-fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-    for s in stmts {
-        match s {
-            IrStmt::Assign { targets, .. } => {
-                for t in targets {
-                    out.insert(t.var.clone());
-                }
-            }
-            IrStmt::Declare { vars, .. } => {
-                for d in vars {
-                    out.insert(d.name.clone());
-                }
-            }
-            IrStmt::For { var, body, .. } => {
-                out.insert(var.clone());
-                collect_targets(body, out);
-            }
-            IrStmt::Expr(IrExpr::Call { func, args })
-                if func == "exec" || func == "builtin" =>
-            {
-                if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                    for n in builtin_declare_names(cmd, args) {
-                        out.insert(n);
-                    }
-                }
-            }
-            IrStmt::If { then, elsifs, else_, .. } => {
-                collect_targets(then, out);
-                for (_, b) in elsifs {
-                    collect_targets(b, out);
-                }
-                collect_targets(else_, out);
-            }
-            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
-                collect_targets(body, out);
-            }
-            IrStmt::ForInit { body, .. } => collect_targets(body, out),
-            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
-                collect_targets(b, out);
-            }
-            IrStmt::Redirect { inner, .. } => collect_targets(inner, out),
-            IrStmt::Pipeline { stages, .. } => {
-                for st in stages {
-                    collect_targets(st, out);
-                }
-            }
-            IrStmt::Case { clauses, .. } => {
-                for c in clauses {
-                    collect_targets(&c.body, out);
-                }
-            }
-            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                collect_targets(body, out);
-                for e in excepts {
-                    collect_targets(&e.body, out);
-                }
-                collect_targets(else_body, out);
-                collect_targets(finally_body, out);
-            }
-            IrStmt::Function { .. } => {}
-            _ => {}
-        }
-    }
-}
-
-/// Names a nested function reads from an enclosing function scope:
-/// (mentions in the nested body) − (the nested body's own targets).
-/// Those promote to main-level globals (bash dynamic scoping); the
-/// enclosing fn must not shadow them with locals.
+// nested-function names count as defined (a call inside the enclosing
+// fn is a direct call, never an external)
 fn collect_captured(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-    /// reads under one expression (Var/Ident/getVar("name") — the names
-    /// collect_written_expr cannot see: it only walks values, and a
-    /// getVar name is a Str, not a Var)
-    fn reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
-        match e {
-            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
-                out.insert(name.clone());
-            }
-            IrExpr::Call { func, args } => {
-                if func == "getVar" {
-                    if let Some(IrExpr::Str(name, _)) = args.first() {
-                        out.insert(name.clone());
-                    }
-                }
-                for a in args {
-                    reads_expr(a, out);
-                }
-            }
-            IrExpr::MethodCall { obj, args, .. } => {
-                reads_expr(obj, out);
-                for a in args {
-                    reads_expr(a, out);
-                }
-            }
-            IrExpr::BinOp { lhs, rhs, .. } => {
-                reads_expr(lhs, out);
-                reads_expr(rhs, out);
-            }
-            IrExpr::Ternary { cond, then, else_, .. } => {
-                reads_expr(cond, out);
-                reads_expr(then, out);
-                reads_expr(else_, out);
-            }
-            IrExpr::DefinedOr { expr, default, .. } => {
-                reads_expr(expr, out);
-                reads_expr(default, out);
-            }
-            IrExpr::Interpolate(parts) => {
-                for p in parts {
-                    if let InterpPart::Expr(x) = p {
-                        reads_expr(x, out);
-                    }
-                }
-            }
-            IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => reads_expr(expr, out),
-            IrExpr::Arrow(stmts) => reads_stmts(stmts, out),
-            IrExpr::Lambda { body, .. } => reads_stmts(body, out),
-            IrExpr::Index { var, key } => {
-                out.insert(var.clone());
-                reads_expr(key, out);
-            }
-            IrExpr::Array(items) => {
-                for i in items {
-                    reads_expr(i, out);
-                }
-            }
-            IrExpr::ArrayComp { iter, elem, cond, .. } => {
-                reads_expr(iter, out);
-                reads_expr(elem, out);
-                if let Some(c) = cond {
-                    reads_expr(c, out);
-                }
-            }
-            IrExpr::Object(fields) => {
-                for (_, v) in fields {
-                    reads_expr(v, out);
-                }
-            }
-            IrExpr::Arith(a) => reads_arith(a, out),
-            _ => {}
-        }
-    }
-    /// reads under arithmetic (variable leaves)
-    fn reads_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
-        match a {
-            ArithAst::Var(name) | ArithAst::Ident(name) => {
-                out.insert(name.clone());
-            }
-            ArithAst::Bin { lhs, rhs, .. } => {
-                reads_arith(lhs, out);
-                reads_arith(rhs, out);
-            }
-            ArithAst::Un { arg, .. } => reads_arith(arg, out),
-            ArithAst::Cond { test, then, else_, .. } => {
-                reads_arith(test, out);
-                reads_arith(then, out);
-                reads_arith(else_, out);
-            }
-            ArithAst::Assign { rhs, .. } => reads_arith(rhs, out),
-            ArithAst::Index { var, key } => {
-                out.insert(var.clone());
-                reads_arith(key, out);
-            }
-            ArithAst::Cast { arg, .. } => reads_arith(arg, out),
-            _ => {}
-        }
-    }
-    /// reads under statements (expression positions only — targets are
-    /// writes, handled by collect_targets; nested Functions recurse)
-    fn reads_stmts(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-        for s in stmts {
+    for s in stmts {
             match s {
                 IrStmt::Expr(e)
                 | IrStmt::Output { value: e, .. }
@@ -5573,6 +5508,263 @@ fn collect_captured(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
         }
     }
+fn collect_fns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Function { name, body, named_blocks, .. } => {
+                out.insert(name.clone());
+                collect_fns(body, out);
+                for (_, b) in named_blocks {
+                    collect_fns(b, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_fns(then, out);
+                for (_, b) in elsifs {
+                    collect_fns(b, out);
+                }
+                collect_fns(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_fns(body, out);
+            }
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                collect_fns(body, out);
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                collect_fns(b, out);
+            }
+            IrStmt::Redirect { inner, .. } => collect_fns(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_fns(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_fns(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every Function body in the tree (any depth, incl. named blocks):
+/// feeds the touched-names union for global promotion.
+/// Bodies of subs are included by the caller separately.
+fn all_fn_bodies<'a>(stmts: &'a [IrStmt], out: &mut Vec<&'a [IrStmt]>) {
+    for s in stmts {
+        match s {
+            IrStmt::Function { body, named_blocks, .. } => {
+                out.push(body);
+                all_fn_bodies(body, out);
+                for (_, b) in named_blocks {
+                    all_fn_bodies(b, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                all_fn_bodies(then, out);
+                for (_, b) in elsifs {
+                    all_fn_bodies(b, out);
+                }
+                all_fn_bodies(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                all_fn_bodies(body, out);
+            }
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                all_fn_bodies(body, out);
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                all_fn_bodies(b, out);
+            }
+            IrStmt::Redirect { inner, .. } => all_fn_bodies(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    all_fn_bodies(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    all_fn_bodies(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    out.insert(t.var.clone());
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_targets(body, out);
+            }
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "exec" || func == "builtin" =>
+            {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    for n in builtin_declare_names(cmd, args) {
+                        out.insert(n);
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_targets(then, out);
+                for (_, b) in elsifs {
+                    collect_targets(b, out);
+                }
+                collect_targets(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_targets(body, out);
+            }
+            IrStmt::ForInit { body, .. } => collect_targets(body, out),
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                collect_targets(b, out);
+            }
+            IrStmt::Redirect { inner, .. } => collect_targets(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_targets(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_targets(&c.body, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_targets(body, out);
+                for e in excepts {
+                    collect_targets(&e.body, out);
+                }
+                collect_targets(else_body, out);
+                collect_targets(finally_body, out);
+            }
+            IrStmt::Function { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+/// Names a nested function reads from an enclosing function scope:
+/// (mentions in the nested body) − (the nested body's own targets).
+/// Those promote to main-level globals (bash dynamic scoping); the
+/// enclosing fn must not shadow them with locals.
+/// Reads under one expression (Var/Ident/getVar("name") — the names
+/// collect_written_expr cannot see: it only walks values, and a
+/// getVar name is a Str, not a Var)
+fn reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            out.insert(name.clone());
+        }
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
+                }
+            }
+            for a in args {
+                reads_expr(a, out);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            reads_expr(obj, out);
+            for a in args {
+                reads_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            reads_expr(lhs, out);
+            reads_expr(rhs, out);
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            reads_expr(cond, out);
+            reads_expr(then, out);
+            reads_expr(else_, out);
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            reads_expr(expr, out);
+            reads_expr(default, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    reads_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => reads_expr(expr, out),
+        IrExpr::Arrow(stmts) => reads_stmts(stmts, out),
+        IrExpr::Lambda { body, .. } => reads_stmts(body, out),
+        IrExpr::Index { var, key } => {
+            out.insert(var.clone());
+            reads_expr(key, out);
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                reads_expr(i, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            reads_expr(iter, out);
+            reads_expr(elem, out);
+            if let Some(c) = cond {
+                reads_expr(c, out);
+            }
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                reads_expr(v, out);
+            }
+        }
+        IrExpr::Arith(a) => reads_arith(a, out),
+        _ => {}
+    }
+}
+/// reads under arithmetic (variable leaves)
+fn reads_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
+    match a {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
+            out.insert(name.clone());
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            reads_arith(lhs, out);
+            reads_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => reads_arith(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            reads_arith(test, out);
+            reads_arith(then, out);
+            reads_arith(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => reads_arith(rhs, out),
+        ArithAst::Index { var, key } => {
+            out.insert(var.clone());
+            reads_arith(key, out);
+        }
+        ArithAst::Cast { arg, .. } => reads_arith(arg, out),
+        _ => {}
+    }
+}
+/// reads under statements (expression positions only — targets are
+/// writes, handled by collect_targets; nested Functions recurse)
+fn reads_stmts(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    
     for s in stmts {
         match s {
             IrStmt::Function { body, named_blocks, .. } => {
