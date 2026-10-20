@@ -367,6 +367,51 @@ impl JavaRender {
     }
 
     // ── statements ───────────────────────────────────────────────────
+    /// Whether evaluating `e` records a meaningful status in __SH_RC
+    /// (captures, pipelines, command substitutions, fnValues). Plain
+    /// assignments RESET the status to 0 — unless the value carries one
+    /// of these, in which case bash keeps the substitution's status
+    /// (`x=$(false)` → rc 1, not 0) and resetting would lose it.
+    fn expr_has_capture(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Capture { .. } => true,
+            IrExpr::Arrow(_) => true,
+            IrExpr::Call { func, args, .. }
+                if matches!(func.as_str(), "capture" | "captureWords" | "pipeline"
+                    | "fnValue" | "fnCall" | "redirect" | "commandSubst") =>
+            {
+                true
+            }
+            IrExpr::Call { func, args, .. } => {
+                args.iter().any(Self::expr_has_capture)
+                    && !matches!(func.as_str(), "and" | "or")
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::expr_has_capture(lhs) || Self::expr_has_capture(rhs)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => Self::expr_has_capture(x),
+                _ => false,
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::expr_has_capture(cond) || Self::expr_has_capture(then) || Self::expr_has_capture(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                Self::expr_has_capture(expr) || Self::expr_has_capture(default)
+            }
+            IrExpr::Array(items) => items.iter().any(Self::expr_has_capture),
+            _ => false,
+        }
+    }
+
+    /// Emit the assignment-status epilogue: `__SH_RC = 0` for pure values,
+    /// nothing for capture-carrying values (their status stands).
+    fn emit_assign_rc(&mut self, expr: &IrExpr) {
+        if !Self::expr_has_capture(expr) {
+            self.emit("__SH_RC = 0;");
+        }
+    }
+
     fn stmt(&mut self, st: &IrStmt) -> Result<(), String> {
         match st {
             IrStmt::Expr(e) => self.expr_stmt(e),
@@ -422,11 +467,12 @@ impl JavaRender {
                     let val = self.expr_str(expr)?;
                     self.helper("aset");
                     self.emit(&format!("shAset(__a_{}, {}, {});", sanitize(&t.var), idx, val));
+                    self.emit_assign_rc(expr);
                     return Ok(());
                 }
                 let v = self.expr_str(expr)?;
                 self.emit(&format!("__v_{} = {v};", sanitize(&t.var)));
-                self.emit("__SH_RC = 0;");
+                self.emit_assign_rc(expr);
                 Ok(())
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
@@ -661,8 +707,19 @@ impl JavaRender {
             IrStmt::Exec { cmd, args, capture: None, .. } => {
                 let mut words = Vec::new();
                 let cmd_e = self.expr_str(cmd)?;
-                words.push(format!("shQuote({cmd_e})"));
-                for a in args.iter() { words.push(format!("shQuote({})", self.expr_str(a)?)); }
+                if Self::is_multi_word(cmd) {
+                    words.push(cmd_e);
+                } else {
+                    words.push(format!("shQuote({cmd_e})"));
+                }
+                for a in args.iter() {
+                    let e = self.expr_str(a)?;
+                    if Self::is_multi_word(a) {
+                        words.push(e);
+                    } else {
+                        words.push(format!("shQuote({e})"));
+                    }
+                }
                 let line = words.join(" + \" \" + ");
                 self.helper("quote");
                 self.helper("run");
@@ -1113,19 +1170,25 @@ impl JavaRender {
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
                 let is_append = str_arg(args, 1) == Some("+=");
                 let vi = if str_arg(args, 1) == Some("=") || is_append { 2 } else { 1 };
-                let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                let empty = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
+                let ve = args.get(vi).unwrap_or(&empty);
+                let v = self.expr_str(ve)?;
                 self.ensure_field(name);
                 if is_append {
-                    self.emit(&format!("__v_{} = __v_{} + {v}; __SH_RC = 0;", sanitize(name), sanitize(name)));
+                    self.emit(&format!("__v_{} = __v_{} + {v};", sanitize(name), sanitize(name)));
                 } else {
-                    self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
+                    self.emit(&format!("__v_{} = {v};", sanitize(name)));
                 }
+                self.emit_assign_rc(ve);
                 Ok(())
             }
             IrExpr::Call { func, args, .. } if func == "setVar" => {
                 let name = str_arg(args, 0).ok_or("setVar: no name")?;
-                let v = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
-                self.emit(&format!("__v_{} = {v}; __SH_RC = 0;", sanitize(name)));
+                let empty = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
+                let ve = args.get(1).unwrap_or(&empty);
+                let v = self.expr_str(ve)?;
+                self.emit(&format!("__v_{} = {v};", sanitize(name)));
+                self.emit_assign_rc(ve);
                 Ok(())
             }
             IrExpr::Call { func, args, .. } if func == "capture" => {
@@ -1349,7 +1412,11 @@ impl JavaRender {
                     || matches!(lhs.as_ref(),
                         IrExpr::Call { func, args, .. }
                         if (func == "exec" || func == "builtin")
-                            && str_arg(args, 0).map(|c| matches!(c, "cd" | "export" | "read" | "shift")).unwrap_or(false)) {
+                            && str_arg(args, 0).map(|c| matches!(c, "cd" | "export" | "read" | "shift")).unwrap_or(false))
+                    || matches!(lhs.as_ref(),
+                        IrExpr::Call { func, args, .. }
+                        if (func == "exec" || func == "builtin")
+                            && str_arg(args, 0).map(|c| self.funcs.contains(c)).unwrap_or(false)) {
                     Some(self.cond_bool(lhs)?)
                 } else {
                     let t = self.side_text(lhs)?;
@@ -1556,6 +1623,17 @@ impl JavaRender {
                 Ok(())
             }
             "local" | "typeset" | "declare" => {
+                // `local x=$(false)` keeps the substitution's status (like
+                // plain assignment); only reset when no value captures.
+                // (Computed upfront: values embed in strings/arrays below.)
+                let saw_capture = rest.iter().any(|w| match w {
+                    IrExpr::Array(items) => items.iter().any(|it| match it {
+                        IrExpr::Str(t, _) => t.contains("$(") || t.contains('`'),
+                        other => Self::expr_has_capture(other),
+                    }),
+                    IrExpr::Str(t, _) => t.contains("$(") || t.contains('`'),
+                    other => Self::expr_has_capture(other),
+                });
                 for w in rest.iter() {
                     if matches!(w, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
                         // declare arr=(elems): nested setArray call
@@ -1629,7 +1707,9 @@ impl JavaRender {
                         }
                     }
                 }
-                self.emit("__SH_RC = 0;");
+                if !saw_capture {
+                    self.emit("__SH_RC = 0;");
+                }
                 Ok(())
             }
             "read" => {
@@ -2244,9 +2324,14 @@ impl JavaRender {
         let mut i = 0;
         while i < ch.len() {
             if ch[i] == '$' && i + 1 < ch.len() {
-                if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
-                out += " + ";
+                // NOTE: the ` + ` separator is emitted by each expansion
+                // branch, NOT unconditionally here — a literal `$`
+                // (e.g. `$'` ANSI-C quotes) appends nothing to `out` and
+                // an unconditional separator would leave a dangling `+`
+                // (`"*" +  + "$'...'"` — javac rejects the empty operand).
                 if ch[i + 1] == '{' {
+                    if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                    out += " + ";
                     let mut j = i + 2;
                     while j < ch.len() && ch[j] != '}' { j += 1; }
                     let inner: String = ch[i + 2..j.min(ch.len())].iter().collect();
@@ -2267,6 +2352,8 @@ impl JavaRender {
                     }
                     i = j + 1;
                 } else if ch[i + 1] == '(' {
+                    if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                    out += " + ";
                     // $((arith)) arithmetic vs $(cmd) command substitution
                     if i + 2 < ch.len() && ch[i + 2] == '(' {
                         // arithmetic: find the matching close paren pair
@@ -2315,20 +2402,41 @@ impl JavaRender {
                     i = j;
                 } else if ch[i + 1] == '#' || ch[i + 1] == '?' || ch[i + 1] == '@'
                        || ch[i + 1] == '*' || ch[i + 1] == '$' || ch[i + 1] == '!' {
+                    if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                    out += " + ";
                     out += &self.getvar_str(&ch[i + 1].to_string())?;
                     i += 2;
                 } else if ch[i + 1].is_ascii_digit() {
+                    if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                    out += " + ";
                     let mut j = i + 1;
                     while j < ch.len() && ch[j].is_ascii_digit() { j += 1; }
                     let n: String = ch[i + 1..j].iter().collect();
                     out += &self.getvar_str(&n)?;
                     i = j;
                 } else if ch[i + 1].is_ascii_alphabetic() || ch[i + 1] == '_' {
+                    if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                    out += " + ";
                     let mut j = i + 1;
                     while j < ch.len() && (ch[j].is_ascii_alphanumeric() || ch[j] == '_') { j += 1; }
                     let n: String = ch[i + 1..j].iter().collect();
                     out += &self.getvar_str(&n)?;
                     i = j;
+                } else if ch[i + 1] == '\'' {
+                    // ANSI-C quote $'...': interpret backslash escapes
+                    // natively ($'\x00' is a real NUL, not 7 chars).
+                    let mut j = i + 2;
+                    while j < ch.len() && ch[j] != '\'' { j += 1; }
+                    if j >= ch.len() {
+                        lit.push('$');
+                        i += 1;
+                    } else {
+                        let body: String = ch[i + 2..j].iter().collect();
+                        if !lit.is_empty() { out += &format!(" + {}", jstr(&lit)); lit.clear(); }
+                        out += " + ";
+                        out += &jstr(&unescape_ansi_c(&body));
+                        i = j + 1;
+                    }
                 } else {
                     lit.push('$');
                     i += 1;
@@ -2519,14 +2627,16 @@ impl JavaRender {
                 let name = str_arg(args, 0).ok_or("assign: no name")?;
                 let is_append = str_arg(args, 1) == Some("+=");
                 let vi = if str_arg(args, 1) == Some("=") || is_append { 2 } else { 1 };
-                let v = self.expr_str(args.get(vi).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                let empty = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
+                let ve = args.get(vi).unwrap_or(&empty);
+                let v = self.expr_str(ve)?;
                 if is_append {
                     self.ensure_field(name);
                     self.emit(&format!("__v_{0} = __v_{0} + {v};", sanitize(name)));
                 } else {
                     self.emit(&format!("__v_{} = {v};", sanitize(name)));
                 }
-                self.emit("__SH_RC = 0;");
+                self.emit_assign_rc(ve);
                 return Ok(format!("__v_{}", sanitize(name)));
             }
             IrExpr::Call { func, args, .. } if func == "setArrayAppend" => {
@@ -3814,18 +3924,41 @@ impl JavaRender {
     }
 
     /// builtin/exec args → Java expression of the quoted command line.
+    /// Whether an expression yields MULTIPLE words in bash-text position
+    /// (`"${arr[@]}"` slices, word-splits, `"$@"` — these must NOT be
+    /// shQuote'd into a single word; bash re-splits the unquoted join).
+    fn is_multi_word(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args, .. } if func == "split" => true,
+            IrExpr::Call { func, .. } if func == "listVar" => true,
+            IrExpr::Call { func, args, .. } if func == "param" => {
+                // slice-@ (all elements) is multi; anything with a
+                // non-empty offset/length is a (single) substring
+                matches!(args.get(2).and_then(|a| str_arg(std::slice::from_ref(a), 0)), Some("@"))
+            }
+            IrExpr::Call { func, args, .. } if func == "getVar" => {
+                matches!(str_arg(args, 0), Some("@" | "*"))
+            }
+            _ => false,
+        }
+    }
+
     fn cmd_line_expr(&mut self, args: &[IrExpr]) -> Result<String, String> {
         self.helper("quote");
         let mut pieces: Vec<(String, bool)> = Vec::new();
         match args.first() {
             Some(IrExpr::Str(c, _)) => pieces.push((
                 jstr(&c.replace("\u{1}SH2GLOB\u{1}", "")), c.contains("\u{1}SH2GLOB\u{1}"))),
-            Some(other) => pieces.push((self.expr_str(other)?, true)),
+            Some(other) => pieces.push((self.expr_str(other)?, !Self::is_multi_word(other))),
             None => return Err("command: no command word".into()),
         }
         for w in args.iter().skip(1) {
             for x in flatten_words(std::slice::from_ref(w)) {
-                pieces.extend(self.word_pieces(x)?);
+                let mut ps = self.word_pieces(x)?;
+                if Self::is_multi_word(x) {
+                    for p in ps.iter_mut() { p.1 = false; }
+                }
+                pieces.extend(ps);
             }
         }
         Ok(self.pieces_join(&pieces))
@@ -4049,6 +4182,73 @@ fn fd_slot_target(rendered: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// bash ANSI-C `$'...'` unescaping: `\\` `\'` `\"` `\n` `\t` `\r` `\b`
+/// `\f` `\v` `\a` `\e` `\0ooo` `\xHH` `\uHHHH`, plus `\cX` controls.
+/// NUL (`\x00`, `\0`, `\u0000`) maps to EMPTY — bash strings cannot hold
+/// NUL bytes, so `$'\x00'` is the empty string (and a `*\0*` glob
+/// collapses to `**`, matching everything). Java COULD hold NUL, which
+/// would diverge, so drop it here to stay bash-faithful.
+/// Unknown escapes keep char-after-backslash (bash drops the backslash
+/// for the common set; pass the rest through with it intact... actually
+/// bash drops the backslash for ANY `\c`? No — bash keeps unknown like
+/// `\?` as `\?`. Match: known set above, else backslash intact).
+fn unescape_ansi_c(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let ch: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] != '\\' || i + 1 >= ch.len() { out.push(ch[i]); i += 1; continue; }
+        match ch[i + 1] {
+            '\\' => { out.push('\\'); i += 2; }
+            '\'' => { out.push('\''); i += 2; }
+            '"' => { out.push('"'); i += 2; }
+            'n' => { out.push('\n'); i += 2; }
+            't' => { out.push('\t'); i += 2; }
+            'r' => { out.push('\r'); i += 2; }
+            'b' => { out.push('\u{8}'); i += 2; }
+            'f' => { out.push('\u{c}'); i += 2; }
+            'v' => { out.push('\u{b}'); i += 2; }
+            'a' => { out.push('\u{7}'); i += 2; }
+            'e' | 'E' => { out.push('\u{1b}'); i += 2; }
+            'x' => {
+                let h: String = ch[i + 2..].iter().take_while(|c| c.is_ascii_hexdigit()).take(2).collect();
+                if h.is_empty() { out.push('\\'); out.push('x'); i += 2; }
+                else if let Ok(v) = u32::from_str_radix(&h, 16) {
+                    // NUL is unrepresentable in bash strings: drop it
+                    if v != 0 { out.push(char::from_u32(v).unwrap_or('\u{fffd}')); }
+                    i += 2 + h.len();
+                } else { out.push('\\'); out.push('x'); i += 2; }
+            }
+            'u' | 'U' => {
+                let n = if ch[i + 1] == 'u' { 4 } else { 8 };
+                let h: String = ch[i + 2..].iter().take_while(|c| c.is_ascii_hexdigit()).take(n).collect();
+                if let Ok(v) = u32::from_str_radix(&h, 16) {
+                    if let Some(c) = char::from_u32(v) {
+                        // NUL is unrepresentable in bash strings: drop it
+                        if v != 0 { out.push(c); }
+                        i += 2 + h.len(); continue;
+                    }
+                }
+                out.push('\\'); out.push(ch[i + 1]); i += 2;
+            }
+            '0'..='7' => {
+                let o: String = ch[i + 1..].iter().take_while(|c| matches!(c, '0'..='7')).take(3).collect();
+                if let Ok(v) = u32::from_str_radix(&o, 8) {
+                    // NUL is unrepresentable in bash strings: drop it
+                    if v != 0 { out.push(char::from_u32(v).unwrap_or('\u{fffd}')); }
+                    i += 1 + o.len();
+                } else { out.push('\\'); i += 1; }
+            }
+            'c' if i + 2 < ch.len() => {
+                let c = ch[i + 2].to_ascii_uppercase() as u32;
+                out.push(char::from_u32(c & 0x1f).unwrap_or('\u{fffd}')); i += 3;
+            }
+            _ => { out.push('\\'); out.push(ch[i + 1]); i += 2; }
+        }
+    }
+    out
 }
 
 /// Strip one wrapping quote pair (`"add"` → `add`) for case patterns:
