@@ -372,6 +372,20 @@ impl JavaRender {
             IrStmt::Expr(e) => self.expr_stmt(e),
             IrStmt::Assign { targets, expr, .. } => {
                 let t = targets.first().ok_or("assign: no target")?;
+                // `((i++))` / `((++i))` arrive as Assign{i, Arith(IncDec)}
+                // (the estree contract: a NATIVE postfix update, not a
+                // value assignment). Rendering the value back (`__v_i =
+                // old`) would clobber the side effect — run for effect.
+                if let IrExpr::Arith(a) = expr {
+                    if let ArithAst::IncDec { var, .. } = &**a {
+                        if sanitize(var) == sanitize(&t.var) {
+                            let code = self.arith(a)?;
+                            self.emit(&format!("{code};"));
+                            self.emit("__SH_RC = 0;");
+                            return Ok(());
+                        }
+                    }
+                }
                 if t.indices.is_empty() && !t.var.contains('[') {
                     self.ensure_field(&t.var);
                 }
