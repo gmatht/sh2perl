@@ -295,12 +295,14 @@ impl JavaRender {
                 fn_buf.push_str("        } finally { __SH_ARGV = __saved; }\n");
                 // A body ending in a jump never falls through — appending
                 // code after it is a Java unreachable-statement error.
+                // (System.exit does NOT count: javac models it as a normal
+                // call, so a trailing return is still REQUIRED after it.)
                 let ends_with_return = body_lines.iter().rev()
                     .find(|l| !l.trim().is_empty())
                     .map(|l| {
                         let t = l.trim();
                         t.starts_with("return ") || t.ends_with("break;")
-                            || t.ends_with("continue;") || t.contains("System.exit(")
+                            || t.ends_with("continue;")
                     })
                     .unwrap_or(false);
                 if !ends_with_return {
@@ -758,6 +760,27 @@ impl JavaRender {
             match (r.fd, r.mode.as_str()) {
                 (None, "w") | (None, "wc") | (Some(1), "w") | (Some(1), "wc") => {
                     let t = self.expr_str(&r.target)?;
+                    // >&2 / >&1 / >&- on stdout: descriptor dups, not files
+                    if t == "\"&2\"" {
+                        self.redir_seq += 1;
+                        let v = format!("__oldErr{}", self.redir_seq);
+                        self.helper("errswap");
+                        self.emit(&format!("PrintStream {v} = shSwapErr(System.err);"));
+                        opened.push(v);
+                        continue;
+                    }
+                    if t == "\"&1\"" {
+                        // stdout to stdout: no-op
+                        continue;
+                    }
+                    if t == "\"&-\"" {
+                        self.redir_seq += 1;
+                        let v = format!("__oldOut{}", self.redir_seq);
+                        self.helper("outswap");
+                        self.emit(&format!("PrintStream {v} = shSwapOut(shNullStream());"));
+                        opened.push(v);
+                        continue;
+                    }
                     // >&N (N=3..9): duplicate-write into the N slot
                     if let Some(slot) = fd_slot_target(&t) {
                         // echo/printf to an fd slot: print via the slot
