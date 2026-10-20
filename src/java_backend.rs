@@ -651,7 +651,24 @@ impl JavaRender {
                 let line = words.join(" + \" \" + ");
                 self.helper("quote");
                 self.helper("run");
-                self.emit(&format!("__SH_RC = shRun({line});"));
+                // renderer-temp cleanup (`rm -f __ps_tmp*`): preserve the
+                // recorded status (same rule as the command() fallback).
+                let is_rm = matches!(cmd, IrExpr::Str(c, _) if c == "rm");
+                let all_temp = args.iter().flat_map(|w| flatten_words(std::slice::from_ref(w))).all(|w| match w {
+                    IrExpr::Str(s, _) => s.starts_with('-') || s.contains("__ps_tmp"),
+                    IrExpr::Var(n, _) | IrExpr::Ident(n) => n.contains("__ps_tmp"),
+                    IrExpr::Call { func, args, .. } if func == "getVar" => {
+                        str_arg(args, 0).map(|n| n.contains("__ps_tmp")).unwrap_or(false)
+                    }
+                    _ => false,
+                });
+                if is_rm && all_temp {
+                    self.tmp_seq += 1;
+                    let sv = format!("__rcsv{}", self.tmp_seq);
+                    self.emit(&format!("long {sv} = __SH_RC; __SH_RC = shRun({line}); __SH_RC = {sv};"));
+                } else {
+                    self.emit(&format!("__SH_RC = shRun({line});"));
+                }
                 Ok(())
             }
             IrStmt::Exec { capture: Some(_), .. } =>
@@ -1694,7 +1711,25 @@ impl JavaRender {
                 let line = self.pieces_join(&pieces);
                 self.helper("quote");
                 self.helper("run");
-                self.emit(&format!("__SH_RC = shRun({line});"));
+                // renderer-temp cleanup (`rm -f __ps_tmp*` after process
+                // substitution) must not clobber the recorded status: in
+                // bash the temp removal is not a command and `$?` still
+                // reads the real previous status.
+                let all_temp = rest.iter().flat_map(|w| flatten_words(std::slice::from_ref(w))).all(|w| match w {
+                    IrExpr::Str(s, _) => s.starts_with('-') || s.contains("__ps_tmp"),
+                    IrExpr::Var(n, _) | IrExpr::Ident(n) => n.contains("__ps_tmp"),
+                    IrExpr::Call { func, args, .. } if func == "getVar" => {
+                        str_arg(args, 0).map(|n| n.contains("__ps_tmp")).unwrap_or(false)
+                    }
+                    _ => false,
+                });
+                if other == "rm" && all_temp {
+                    self.tmp_seq += 1;
+                    let sv = format!("__rcsv{}", self.tmp_seq);
+                    self.emit(&format!("long {sv} = __SH_RC; __SH_RC = shRun({line}); __SH_RC = {sv};"));
+                } else {
+                    self.emit(&format!("__SH_RC = shRun({line});"));
+                }
                 Ok(())
             }
         }
