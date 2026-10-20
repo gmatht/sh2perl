@@ -314,6 +314,17 @@ fn spec_char(spec: char) -> &'static str {
     }
 }
 
+/// One pipeline stage: either a forked argv or an in-process string
+/// feed (echo/printf, whose output must match the renderer's own print
+/// semantics exactly — forking /bin/echo would diverge on backslash
+/// escapes).
+#[derive(Clone)]
+enum PipeStage {
+    Fork(Vec<String>),
+    Feed(String),
+}
+
+
 impl Render {
     fn emit(&mut self, s: &str) {
         if s.is_empty() {
@@ -702,6 +713,10 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if name == "?" {
+                        self.need_intstr = true;
+                        return "shIntStr(sh_rc)".to_string();
+                    }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
@@ -1094,6 +1109,12 @@ impl Render {
             // A2 verdict so numeric vars keep the {d} specifier.
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // `$?` first (see call_str/expr_str: "?" can land in
+                    // the written set and would mangle to `underscore`)
+                    if name == "?" {
+                        self.need_intstr = true;
+                        return ('s', "shIntStr(sh_rc)".to_string());
+                    }
                     self.mark_read(name);
                     if self.bigint_vars.contains(name) {
                         self.need_bigint = true;
@@ -1752,7 +1773,15 @@ impl Render {
                 // body is a single `exec fn [args]`. An `exec` of anything
                 // else is an EXTERNAL command — render the native capture
                 // (shRun), never a call to an undeclared Zig fn.
+                // `$(a | b)` (single-Expr pipeline body): collect the pipe.
                 if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    if let [IrStmt::Expr(IrExpr::Call { func: pfunc, args: pargs })] = stmts.as_slice() {
+                        if pfunc == "pipeline" {
+                            if let Some(rendered) = self.render_pipeline(pargs, true) {
+                                return rendered;
+                            }
+                        }
+                    }
                     if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
                         if func == "exec" {
                             if let Some(IrExpr::Str(fname, _)) = cargs.first() {
@@ -1790,6 +1819,13 @@ impl Render {
             }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // `$?` FIRST — a synthesized Var("?")/read can land "?"
+                    // in the written set, and the declared arm below would
+                    // emit it as a bare (nonexistent, mangled) identifier
+                    if name == "?" {
+                        self.need_intstr = true;
+                        return "shIntStr(sh_rc)".to_string();
+                    }
                     // inside a user function: getVar("N") is the POSITIONAL
                     // PARAMETER read ($1 convention — the C frontend's
                     // outparam/param channel), not an env lookup
@@ -1803,12 +1839,6 @@ impl Render {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
                         return m;
-                    }
-                    // `$?` — the last recorded exit status (C backend's
-                    // _sh_rc convention)
-                    if name == "?" {
-                        self.need_intstr = true;
-                        return "shIntStr(sh_rc)".to_string();
                     }
                     // undeclared (env) var: read the process environment
                     self.need_env = true;
@@ -1828,6 +1858,15 @@ impl Render {
                     Some(arg) => self.expr_str(arg),
                     None => self.sh2_stub("split", "split"),
                 }
+            }
+            "pipeline" => {
+                // value position (`x=$(a | b)`, nested words): collect the
+                // last stage's output; statement/condition positions have
+                // their own arms
+                if let Some(rendered) = self.render_pipeline(args, true) {
+                    return rendered;
+                }
+                self.sh2_stub("pipeline", "pipeline")
             }
             "param" => {
                 if let Some(rendered) = self.render_param(args) {
@@ -2018,6 +2057,21 @@ impl Render {
             "getVar" => {
                 self.need_truthy = true;
                 format!("shTruthy({})", self.call_str(func, args))
+            }
+            "pipeline" => {
+                // `if a | b` / `while a | b` — the LAST stage's status
+                // decides (the pass-through run prints side effects like
+                // bash, then sh_rc is read)
+                match self.render_pipeline(args, false) {
+                    Some(run) => {
+                        self.rc_dirty = true;
+                        format!("blk: {{ _ = {run}; break :blk sh_rc == 0; }}")
+                    }
+                    None => {
+                        self.sh2_calls.insert("pipeline".into());
+                        "shTruthy(sh2Pipeline())".to_string()
+                    }
+                }
             }
             "exec" => {
                 // builtin true/false used as a condition
@@ -2287,6 +2341,203 @@ impl Render {
         Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
+    /// One stage of either pipeline form as a fork/feed unit. None for
+    /// compound stages or stateful builtins (cd/export/exit/… — their side
+    /// effects must not leak from the pipe into our process).
+    fn stage_call(&mut self, func: &str, cargs: &[IrExpr]) -> Option<PipeStage> {
+        // commands that must NEVER fork-or-feed as a stage: their effects
+        // belong to our own process (or terminate it)
+        const DENY: &[&str] = &[
+            "cd", "local", "declare", "export", "readonly", "typeset", "exit", "set", "shopt",
+            "eval", "source", ".", "exec", "return", "break", "continue", "trap", "unset",
+            "shift", "read",
+        ];
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let Some(IrExpr::Str(cmd, _)) = cargs.first() else {
+            return None;
+        };
+        if DENY.contains(&cmd.as_str()) {
+            return None;
+        }
+        if cmd == "echo" {
+            if let Some((parts, newline)) = self.echo_parts(cargs) {
+                return Some(PipeStage::Feed(self.parts_value(parts, newline)));
+            }
+            return None;
+        }
+        if cmd == "printf" {
+            if let Some(v) = self.printf_value(cargs) {
+                return Some(PipeStage::Feed(v));
+            }
+            return None;
+        }
+        Some(PipeStage::Fork(self.build_argv(cmd, cargs)))
+    }
+
+    /// Stage list of a `pipeline` call (each arg = Arrow of a single
+    /// single-command stage). None for empty pipelines.
+    fn pipeline_stages(&mut self, args: &[IrExpr]) -> Option<Vec<PipeStage>> {
+        if args.is_empty() {
+            return None;
+        }
+        let mut stages = Vec::new();
+        for a in args {
+            let IrExpr::Arrow(stmts) = a else {
+                return None;
+            };
+            let [IrStmt::Expr(IrExpr::Call { func, args: cargs })] = stmts.as_slice() else {
+                return None;
+            };
+            stages.push(self.stage_call(func, cargs)?);
+        }
+        Some(stages)
+    }
+
+    /// A `printf` stage's output as a heap value (mirrors the statement
+    /// printf arm's format decoding; None when the format is dynamic).
+    fn printf_value(&mut self, args: &[IrExpr]) -> Option<String> {
+        let items = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        let fmt = match items.first() {
+            Some(IrExpr::Str(f, _)) => f.clone(),
+            _ => return None,
+        };
+        // decode exactly like the statement arm: reuse it by rendering a
+        // synthetic printf call's parts through a shared helper is
+        // complex; instead only static formats with %s/%d/%q are fed
+        let mut parts: Vec<(char, String)> = Vec::new();
+        let rest = &items[1..];
+        let mut argi = 0;
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                if chars.peek() == Some(&'%') {
+                    chars.next();
+                    parts.push(('s', Self::zig_str("%")));
+                    continue;
+                }
+                while let Some(&f) = chars.peek() {
+                    if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
+                        || f.is_ascii_digit()
+                        || matches!(f, '-' | '+' | ' ' | '#')
+                    {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let spec = match chars.peek() {
+                    Some('s') => {
+                        chars.next();
+                        's'
+                    }
+                    Some('d') | Some('i') | Some('u') => {
+                        chars.next();
+                        'd'
+                    }
+                    Some('x') | Some('X') | Some('o') => {
+                        chars.next();
+                        'd'
+                    }
+                    Some('c') => {
+                        chars.next();
+                        's'
+                    }
+                    Some('q') => {
+                        chars.next();
+                        'q'
+                    }
+                    _ => return None,
+                };
+                let a = rest.get(argi)?;
+                argi += 1;
+                let pa = self.parts_of(a);
+                if pa.len() != 1 {
+                    return None;
+                }
+                if spec == 'd' && pa[0].0 == 's' {
+                    parts.push(('s', pa[0].1.clone()));
+                } else if spec == 's' && pa[0].0 == 'd' {
+                    parts.push(('d', pa[0].1.clone()));
+                } else {
+                    parts.push((spec, pa[0].1.clone()));
+                }
+                continue;
+            }
+            if c == '\\' {
+                // printf escapes: only the trivial ones are fed; anything
+                // richer bails to the stub (the statement arm interprets
+                // \a\b\f\v\xHH\NNN — duplicating that here would drift)
+                let esc: String = match chars.peek() {
+                    Some('n') => {
+                        chars.next();
+                        "\n".to_string()
+                    }
+                    Some('t') => {
+                        chars.next();
+                        "\t".to_string()
+                    }
+                    Some('r') => {
+                        chars.next();
+                        "\r".to_string()
+                    }
+                    Some('\\') => {
+                        chars.next();
+                        "\\".to_string()
+                    }
+                    _ => return None,
+                };
+                parts.push(('s', Self::zig_str(&esc)));
+                continue;
+            }
+            parts.push(('s', Self::zig_str(&c.to_string())));
+        }
+        if argi != rest.len() {
+            return None;
+        }
+        Some(self.parts_value(parts, false))
+    }
+
+    /// Emit a `pipeline` call: `capture` selects pass-through (statement:
+    /// the last stage inherits our stdout) vs collect-and-return.
+    fn render_pipeline(&mut self, args: &[IrExpr], capture: bool) -> Option<String> {
+        let stages = self.pipeline_stages(args)?;
+        self.emit_pipeline(&stages, capture)
+    }
+
+    /// The shPipe call for converted stages.
+    fn emit_pipeline(&mut self, stages: &[PipeStage], capture: bool) -> Option<String> {
+        if stages.is_empty() {
+            return None;
+        }
+        let mut argv_list: Vec<String> = Vec::new();
+        let mut feed_list: Vec<String> = Vec::new();
+        for st in stages {
+            match st {
+                PipeStage::Fork(argv) => {
+                    argv_list.push(format!("&[_][]const u8{{{}}}", argv.join(", ")));
+                    feed_list.push("null".to_string());
+                }
+                PipeStage::Feed(s) => {
+                    argv_list.push("&[_][]const u8{}".to_string());
+                    feed_list.push(format!("{s}"));
+                }
+            }
+        }
+        self.need_run = true;
+        self.rc_dirty = true;
+        Some(format!(
+            "shPipe(&[_][]const []const u8{{{}}}, &[_]?[]const u8{{{}}}, {})",
+            argv_list.join(", "),
+            feed_list.join(", "),
+            capture
+        ))
+    }
+
     fn sh2_stub(&mut self, name: &str, note: &str) -> String {
         self.sh2_calls.insert(name.to_string());
         self.mark_todo(&format!("{note} → sh2.{name}"));
@@ -2306,6 +2557,64 @@ impl Render {
     }
 
     /// Parts → one `try stdout.print("fmt", .{args});` statement.
+    /// The `echo` words as print parts + trailing newline (the flag
+    /// stripping shared by the statement echo arm and pipeline feeds).
+    /// None when the words are not an Array.
+    fn echo_parts(&mut self, args: &[IrExpr]) -> Option<(Vec<(char, String)>, bool)> {
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            // leading -n/-e/-E flags (incl. combined -ne): -n suppresses
+            // the newline; -e/-E are accepted and ignored (no backslash
+            // escapes in word-split values to expand)
+            let mut newline = true;
+            let mut rest = items.as_slice();
+            while let Some(IrExpr::Str(flag, _)) = rest.first() {
+                let t = flag.trim();
+                if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
+                    if t.contains('n') {
+                        newline = false;
+                    }
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            let mut parts = Vec::new();
+            for (i, item) in rest.iter().enumerate() {
+                if i > 0 {
+                    parts.push(('s', "\" \"".to_string()));
+                }
+                parts.extend(self.parts_of(item));
+            }
+            return Some((parts, newline));
+        }
+        None
+    }
+
+    /// Print parts as a heap-allocated VALUE (pipeline feeds, `$(…)` of
+    /// print-only stages): the same fmt/args print_from_parts would print.
+    fn parts_value(&mut self, parts: Vec<(char, String)>, newline: bool) -> String {
+        let mut fmt = String::new();
+        let mut fargs: Vec<String> = Vec::new();
+        for (spec, e) in parts {
+            if spec == 'q' {
+                self.need_shquote = true;
+                fmt.push_str(spec_char('s'));
+                fargs.push(format!("shellQuote({e})"));
+            } else {
+                fmt.push_str(spec_char(spec));
+                fargs.push(e);
+            }
+        }
+        if newline {
+            fmt.push('\n');
+        }
+        format!(
+            "std.fmt.allocPrint(std.heap.page_allocator, {}, .{{{}}}) catch \"\"",
+            Self::zig_str(&fmt),
+            fargs.join(", ")
+        )
+    }
+
     fn print_from_parts(&mut self, parts: Vec<(char, String)>, newline: bool) -> String {
         self.need_stdout = true;
         if !self.in_function {
@@ -3613,31 +3922,7 @@ impl Render {
             return;
         }
         if cmd == "echo" {
-            let mut parts = Vec::new();
-            if let Some(IrExpr::Array(items)) = args.get(1) {
-                // leading -n/-e/-E flags (incl. combined
-                // -ne): -n suppresses the newline; -e/-E
-                // are accepted and ignored (no backslash
-                // escapes in word-split values to expand)
-                let mut newline = true;
-                let mut rest = items.as_slice();
-                while let Some(IrExpr::Str(flag, _)) = rest.first() {
-                    let t = flag.trim();
-                    if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
-                        if t.contains('n') {
-                            newline = false;
-                        }
-                        rest = &rest[1..];
-                    } else {
-                        break;
-                    }
-                }
-                for (i, item) in rest.iter().enumerate() {
-                    if i > 0 {
-                        parts.push(('s', "\" \"".to_string()));
-                    }
-                    parts.extend(self.parts_of(item));
-                }
+            if let Some((parts, newline)) = self.echo_parts(args) {
                 let call = self.print_from_parts(parts, newline);
                 self.emit(&call);
                 return;
@@ -4073,7 +4358,9 @@ impl Render {
                 // `A && B` / `A || B` chains: status-driven control flow.
                 // Each side runs as a statement (managing sh_rc through
                 // the same arms as top level); the connective branches on
-                // the recorded status. `!A` inverts it.
+                // the recorded status. `!A` inverts it. A bare `a | b`
+                // pipeline in statement position passes through (the last
+                // stage inherits our stdout).
                 if let IrExpr::BinOp { lhs, op, rhs } = e {
                     if matches!(
                         op,
@@ -4081,6 +4368,14 @@ impl Render {
                     ) {
                         self.chain_stmt(lhs, op, rhs);
                         return;
+                    }
+                }
+                if let IrExpr::Call { func, args } = e {
+                    if func == "pipeline" {
+                        if let Some(rendered) = self.render_pipeline(args, false) {
+                            self.emit(&format!("_ = {rendered};"));
+                            return;
+                        }
                     }
                 }
                 let x = self.expr_any(e);
@@ -4458,12 +4753,38 @@ impl Render {
                 self.emit("_ = sh2Exec();");
             }
             IrStmt::Pipeline { stages, .. } => {
-                // render each stage's statements in sequence (the native
-                // in-process approximation for the v1 subset).
+                // structured pipeline stages: same shPipe lowering as the
+                // `pipeline` call form (single-command stages; anything
+                // else keeps the honest stub, never silent sequencing)
+                let mut converted: Vec<PipeStage> = Vec::new();
+                let mut ok = true;
                 for st in stages {
-                    for s in st {
-                        self.stmt(s);
+                    let [IrStmt::Expr(IrExpr::Call { func, args })] = st.as_slice() else {
+                        ok = false;
+                        break;
+                    };
+                    if func != "exec" && func != "builtin" {
+                        ok = false;
+                        break;
                     }
+                    match self.stage_call(func, args) {
+                        Some(stage) => converted.push(stage),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    if let Some(rendered) = self.emit_pipeline(&converted, false) {
+                        self.emit(&format!("_ = {rendered};"));
+                    } else {
+                        self.sh2_calls.insert("pipeline".into());
+                        self.mark_todo("pipeline → sh2.pipeline");
+                    }
+                } else {
+                    self.sh2_calls.insert("pipeline".into());
+                    self.mark_todo("pipeline → sh2.pipeline");
                 }
             }
             IrStmt::Subshell(body) => {
@@ -5291,6 +5612,77 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("    var child = std.process.spawn(io, .{ .argv = argv }) catch { sh_rc = 127; return; };");
             self.emit("    const term = child.wait(io) catch { sh_rc = 1; return; };");
             self.emit("    sh_rc = switch (term) { .exited => |c| @as(i64, c), else => 1 };");
+            self.emit("}");
+            self.emit("");
+            // multi-stage pipelines (`a | b | c…`): fork every argv stage
+            // chained by pipes; string-feed stages (echo/printf, whose
+            // output must match our own print semantics) are written into
+            // a libc pipe (no pipe() in the 0.17 Io surface). The last
+            // stage inherits our stdout in statement position, or is
+            // collected (1 MiB cap, trailing newlines trimmed like shRun)
+            // in capture position. sh_rc = the last FORK stage's status
+            // (a feed-last pipeline is 0 — feeds always succeed).
+            self.emit("fn shPipe(stages: []const []const []const u8, feeds: []const ?[]const u8, capture: bool) []const u8 {");
+            self.emit("    const io = sh_io orelse return \"\";");
+            self.emit("    var prev: ?std.Io.File = null;");
+            self.emit("    var childs: [64]std.process.Child = undefined;");
+            self.emit("    var nchild: usize = 0;");
+            self.emit("    var last_fork: ?usize = null;");
+            self.emit("    var si: usize = 0;");
+            self.emit("    for (stages, feeds) |argv, feed| {");
+            self.emit("        const last = si == stages.len - 1;");
+            self.emit("        si += 1;");
+            self.emit("        if (feed) |text| {");
+            self.emit("            // string stage: drain any piped input (echo/printf");
+            self.emit("            // never read stdin), then feed our text onward");
+            self.emit("            if (prev) |pf| {");
+            self.emit("                var dbuf: [8192]u8 = undefined;");
+            self.emit("                var drdr = pf.reader(io, &dbuf);");
+            self.emit("                while (true) {");
+            self.emit("                    const dn = drdr.interface.readSliceShort(&dbuf) catch break;");
+            self.emit("                    if (dn == 0) break;");
+            self.emit("                }");
+            self.emit("            }");
+            self.emit("            var fds: [2]std.c.fd_t = undefined;");
+            self.emit("            if (std.c.pipe(&fds) != 0) { sh_rc = 1; return \"\"; }");
+            self.emit("            const wf = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };");
+            self.emit("            wf.writeStreamingAll(io, text) catch { sh_rc = 1; return \"\"; };");
+            self.emit("            wf.close(io);");
+            self.emit("            prev = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };");
+            self.emit("            continue;");
+            self.emit("        }");
+            self.emit("        var opts = std.process.SpawnOptions{ .argv = argv };");
+            self.emit("        if (prev) |pf| opts.stdin = .{ .file = pf };");
+            self.emit("        if (!last or capture) opts.stdout = .pipe;");
+            self.emit("        const child = std.process.spawn(io, opts) catch { sh_rc = 127; return \"\"; };");
+            self.emit("        if (!last or capture) prev = child.stdout;");
+            self.emit("        if (nchild < 64) { childs[nchild] = child; nchild += 1; last_fork = nchild - 1; }");
+            self.emit("    }");
+            self.emit("    var collected: []const u8 = \"\";");
+            self.emit("    if (capture) {");
+            self.emit("        if (prev) |pf| {");
+            self.emit("            var cbuf: [8192]u8 = undefined;");
+            self.emit("            var crdr = pf.reader(io, &cbuf);");
+            self.emit("            var cacc: std.ArrayList(u8) = .empty;");
+            self.emit("            while (true) {");
+            self.emit("                const cn = crdr.interface.readSliceShort(&cbuf) catch break;");
+            self.emit("                if (cn == 0) break;");
+            self.emit("                if (cacc.items.len + cn > 1 << 20) break;");
+            self.emit("                cacc.appendSlice(std.heap.page_allocator, cbuf[0..cn]) catch break;");
+            self.emit("            }");
+            self.emit("            collected = std.mem.trimEnd(u8, cacc.items, \"\\n\");");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    var last_rc: i64 = 0;");
+            self.emit("    var ci: usize = 0;");
+            self.emit("    while (ci < nchild) : (ci += 1) {");
+            self.emit("        const term = childs[ci].wait(io) catch { if (last_fork != null and ci == last_fork.?) last_rc = 1; continue; };");
+            self.emit("        if (last_fork != null and ci == last_fork.?) {");
+            self.emit("            last_rc = switch (term) { .exited => |cc| @as(i64, cc), else => 1 };");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    sh_rc = last_rc;");
+            self.emit("    return collected;");
             self.emit("}");
         }
         if self.need_uu_run {
