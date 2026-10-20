@@ -3969,6 +3969,92 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         true
     }
 
+    /// Expand `$name`/`${name}`/specials inside raw shell TEXT (unquoted
+    /// heredoc bodies arrive as one Str with `interpolate: true` — the
+    /// core does not lower the refs). Returns a string expression;
+    /// unknown `$` forms stay literal (bash keeps `$` before a
+    /// non-name char literally, except the documented specials).
+    fn expand_heredoc(&mut self, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut lits = String::new();
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        let flush_lit = |lits: &mut String, parts: &mut Vec<String>| {
+            if !lits.is_empty() {
+                parts.push(Self::zig_str(lits));
+                lits.clear();
+            }
+        };
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                lits.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+            // `${name}` form
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if let Some(end) = text[i..].find('}') {
+                    let inner = &text[i + 2..i + end];
+                    let user = !inner.is_empty()
+                        && (inner.as_bytes()[0].is_ascii_alphabetic() || inner.as_bytes()[0] == b'_')
+                        && inner.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+                    let special = matches!(inner, "@" | "*" | "#" | "?" | "!" | "-")
+                        || (inner.len() == 1 && inner.as_bytes()[0].is_ascii_digit());
+                    if user || special {
+                        flush_lit(&mut lits, &mut parts);
+                        parts.push(self.declare_name_read(inner));
+                        i += end + 1;
+                        continue;
+                    }
+                }
+                lits.push('$');
+                i += 1;
+                continue;
+            }
+            // `$name` / special single char
+            let mut j = i + 1;
+            if j < bytes.len()
+                && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_')
+            {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                flush_lit(&mut lits, &mut parts);
+                parts.push(self.declare_name_read(&text[i + 1..j]));
+                i = j;
+                continue;
+            }
+            if j < bytes.len() {
+                let c = bytes[j] as char;
+                let special = matches!(c, '@' | '*' | '#' | '?' | '!' | '-' | '$')
+                    || bytes[j].is_ascii_digit();
+                if special {
+                    flush_lit(&mut lits, &mut parts);
+                    parts.push(self.declare_name_read(&text[i + 1..j + 1]));
+                    i = j + 1;
+                    continue;
+                }
+            }
+            lits.push('$');
+            i += 1;
+        }
+        flush_lit(&mut lits, &mut parts);
+        if parts.is_empty() {
+            return Self::zig_str("");
+        }
+        if parts.len() == 1 {
+            return parts.into_iter().next().unwrap();
+        }
+        // fold with shStrCat (left-assoc)
+        let mut it = parts.into_iter();
+        let mut acc = it.next().unwrap();
+        self.need_cat = true;
+        for p in it {
+            acc = format!("shStrCat({acc}, {p})");
+        }
+        acc
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // `$?` regime: every simple command updates the status. Helpers
         // that record a real code (shRun/shRunStmt/shUuRun, `false`,
@@ -5017,6 +5103,13 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     return;
                 }
                 self.need_writefile = true; // forces sh_io publication
+                // the flush lines reference `stdout`: make sure the
+                // prologue exists in this scope (main: flags; functions:
+                // the textual uses_stdout scan sees the flush lines)
+                self.need_stdout = true;
+                if !self.in_function {
+                    self.need_main_stdout = true;
+                }
                 let blk = self.fresh_tmp("sh_rd");
                 // the ok-flag is only mutable when a fallible spec (path
                 // open / pipe) exists; pure dup-swaps use a const
@@ -5104,7 +5197,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             }
                         }
                         "heredoc" | "heredoc-tabs" | "herestring" => {
-                            let text = self.expr_str(&r.target);
+                            // unquoted heredocs/herestrings interpolate
+                            // (`interpolate: true`): the target arrives as
+                            // raw text with `$`-refs intact — expand them;
+                            // quoted bodies stay literal
+                            let text = match &r.target {
+                                IrExpr::Str(s, _) if r.interpolate => self.expand_heredoc(s),
+                                _ => self.expr_str(&r.target),
+                            };
                             self.emit(&format!("var {sv}: c_int = -1;"));
                             self.emit(&format!("var {blk}_p_{sv}: [2]std.c.fd_t = undefined;"));
                             self.emit(&format!("if (std.c.pipe(&{blk}_p_{sv}) != 0) {{ {blk}_ok = false; }} else {{"));
