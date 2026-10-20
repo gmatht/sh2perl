@@ -175,6 +175,10 @@ pub struct Render {
     /// set/list arrays with bigint elements — lowered to a fixed
     /// std.math.big.int.Managed array + length counter
     bigint_arrays: BTreeSet<String>,
+    /// string-element arrays (`arr=(a b c)`) — lowered to a fixed
+    /// `[]const u8` array + length counter (bash arrays are strings; the
+    /// i64 set home only fits all-numeric element lists)
+    str_arrays: BTreeSet<String>,
     /// bigint vars (arith beyond i64) — lowered to std.math.big.int.Managed
     bigint_vars: BTreeSet<String>,
     /// user functions whose body uses `try` (bigint/file IO) — they
@@ -1841,6 +1845,46 @@ impl Render {
                     None => self.sh2_stub("join", "join"),
                 }
             }
+            "arrayLen" => {
+                // `${#arr[@]}` — the live element count of any array home
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.set_arrays.contains(name)
+                        || self.str_arrays.contains(name)
+                        || self.bigint_arrays.contains(name)
+                    {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_intstr = true;
+                        return format!(
+                            "shIntStr(@as(i64, @intCast({m}_len)))"
+                        );
+                    }
+                }
+                self.sh2_stub("arrayLen", "arrayLen")
+            }
+            "arrayIndex" => {
+                let (name, idx) = match args {
+                    [IrExpr::Str(name, _), IrExpr::Str(idx, _)] => (name.clone(), idx.clone()),
+                    _ => return self.sh2_stub("arrayIndex", "arrayIndex"),
+                };
+                if let Some(rendered) = self.render_array_index(&name, &idx) {
+                    return rendered;
+                }
+                self.sh2_stub("arrayIndex", "arrayIndex")
+            }
+            "listVar" => {
+                // `$@` — positional params: joined with spaces in string
+                // context (empty at top level; the gate passes no argv)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if name == "@" || name == "*" {
+                        if self.in_function {
+                            return "std.mem.join(std.heap.page_allocator, \" \", __args) catch \"\"".to_string();
+                        }
+                        return "\"\"".to_string();
+                    }
+                }
+                self.sh2_stub("listVar", "listVar")
+            }
             "setArray" | "setArrayAppend" => {
                 // array assignment `arr=(a b c)` — render as a bracketed
                 // string (the common indexed-array form).
@@ -3012,6 +3056,78 @@ impl Render {
         }
     }
 
+    /// `${arr[i]}` element read for the i64/str array homes: negative
+    /// indices count from the end (bash), out-of-range yields "".
+    /// A labeled block binds the normalized index once (the index text may
+    /// be dynamic); int homes convert through shIntStr.
+    fn render_array_index(&mut self, name: &str, idx: &str) -> Option<String> {
+        let is_int = self.set_arrays.contains(name);
+        let is_str = self.str_arrays.contains(name);
+        if !is_int && !is_str {
+            return None;
+        }
+        let m = self.zig_ident(name);
+        self.mark_read(name);
+        let t = self.fresh_tmp("sh_arridx");
+        let idx_e = self.param_int(&IrExpr::Str(
+            idx.to_string(),
+            crate::ir::StrStyle::DoubleQuoted,
+        ))?;
+        let val = if is_int {
+            self.need_intstr = true;
+            format!("shIntStr({m}[@as(usize, @intCast({t}_i))])")
+        } else {
+            format!("{m}[@as(usize, @intCast({t}_i))]")
+        };
+        Some(format!(
+            "blk: {{ const {t}: i64 = {idx_e}; const {t}_n: i64 = @intCast({m}_len); const {t}_i = if ({t} < 0) {t}_n + {t} else {t}; break :blk if ({t}_i < 0 or {t}_i >= {t}_n) \"\" else {val}; }}"
+        ))
+    }
+
+    /// `${arr[@]:off:len}` — space-joined window over an array home.
+    /// Arg shapes: `[slice, arr, @, off, len?]` or `[slice, arr, off, len?]`
+    /// (the core omits the `@` for some subjects); offsets/lengths resolve
+    /// like scalar slice operands (literals, negatives, `$`-refs).
+    fn render_array_slice(&mut self, name: &str, args: &[IrExpr]) -> Option<String> {
+        let m = self.zig_ident(name);
+        self.mark_read(name);
+        let is_int = self.set_arrays.contains(name);
+        let (off_e, len_e) = match args.get(2) {
+            Some(IrExpr::Str(s, _)) if s == "@" || s == "*" => (
+                self.param_int(&args.get(3).cloned().unwrap_or(IrExpr::Str(
+                    String::new(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )))?,
+                match args.get(4) {
+                    None => "9223372036854775807".to_string(),
+                    Some(IrExpr::Str(t, _)) if t.trim().is_empty() => {
+                        "9223372036854775807".to_string()
+                    }
+                    Some(e) => self.param_int(e)?,
+                },
+            ),
+            off => (
+                self.param_int(&off.cloned().unwrap_or(IrExpr::Str(
+                    String::new(),
+                    crate::ir::StrStyle::DoubleQuoted,
+                )))?,
+                match args.get(3) {
+                    None => "9223372036854775807".to_string(),
+                    Some(IrExpr::Str(t, _)) if t.trim().is_empty() => {
+                        "9223372036854775807".to_string()
+                    }
+                    Some(e) => self.param_int(e)?,
+                },
+            ),
+        };
+        self.need_ext = true;
+        if is_int {
+            Some(format!("shIntArrSlice(&{m}, {m}_len, {off_e}, {len_e})"))
+        } else {
+            Some(format!("shStrArrSlice(&{m}, {m}_len, {off_e}, {len_e})"))
+        }
+    }
+
     /// `${…}` parameter expansion (the `param` call): `args` =
     /// `[op, name, extra…]` all Str. Returns None for shapes outside the
     /// modeled subset (arrays, indirect, exotic) → the caller stubs.
@@ -3054,6 +3170,29 @@ impl Render {
                 let v = self.param_var_str(base)?;
                 self.need_ext = true;
                 return Some(format!("shCaseOne({v}, true)"));
+            }
+        }
+        // `${arr[i]}` / `${arr[@]}` / `${arr[*]}` — array reads through
+        // the i64/str homes (assoc `map[k]` stays a stub: no home models it)
+        if op.is_empty() {
+            if name.ends_with("[@]") || name.ends_with("[*]") {
+                let base = name[..name.len() - 3].to_string();
+                if self.set_arrays.contains(&base) || self.str_arrays.contains(&base) {
+                    let m = self.zig_ident(&base);
+                    self.mark_read(&base);
+                    self.need_ext = true;
+                    if self.set_arrays.contains(&base) {
+                        return Some(format!("shIntArrSlice(&{m}, {m}_len, 0, 9223372036854775807)"));
+                    }
+                    return Some(format!("shStrArrSlice(&{m}, {m}_len, 0, 9223372036854775807)"));
+                }
+                return None;
+            }
+            if let Some(bi) = name.find('[') {
+                if let Some(idx) = name[bi + 1..].strip_suffix(']') {
+                    let base = &name[..bi];
+                    return self.render_array_index(base, idx.trim());
+                }
             }
         }
         if name.contains('[') {
@@ -3137,6 +3276,12 @@ impl Render {
                 Some(format!("shIntStr(@as(i64, @intCast({v}.len)))"))
             }
             "slice" => {
+                // array slice (`${arr[@]:off:len}` / `${arr:off:len}` — the
+                // latter when the core omits the `@`) joins the window with
+                // spaces; scalar subjects use shSub
+                if self.set_arrays.contains(&name) || self.str_arrays.contains(&name) {
+                    return self.render_array_slice(&name, args);
+                }
                 let v = self.param_var_str(&name)?;
                 let off = self.param_int(&args.get(2).cloned().unwrap_or(IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)))?;
                 // omitted length = "to the end": pass through as a huge
@@ -3239,11 +3384,17 @@ impl Render {
     }
 
     /// A `param` slice offset/length as an i64 expression: literal ints
-    /// (whitespace-tolerated, negatives allowed) or `$`-refs thereof.
+    /// (whitespace-tolerated, negatives allowed), empty (offset 0), or
+    /// `$`-refs thereof.
     fn param_int(&mut self, e: &IrExpr) -> Option<String> {
         match e {
             IrExpr::Str(s, _) => {
                 let t = s.trim();
+                if t.is_empty() {
+                    // omitted offset — bash starts at 0 (an omitted LENGTH
+                    // is handled by the caller with the huge sentinel)
+                    return Some("0".to_string());
+                }
                 if t.parse::<i64>().is_ok() {
                     return Some(t.to_string());
                 }
@@ -3954,10 +4105,14 @@ impl Render {
                     return;
                 }
                 // set-array writes: `factors = set()` resets the length;
-                // `factors.add(x)` appends (dedup happens at sortedIntJoin)
+                // `factors.add(x)` appends (dedup happens at sortedIntJoin).
+                // String-element arrays (`arr=(a b c)`) fill the []const u8
+                // home element-wise; bigint homes init Managed slots.
                 if let IrExpr::Call { func, args } = expr {
                     if matches!(func.as_str(), "setArray" | "setArrayAppend")
-                        && (self.set_arrays.contains(&t.var) || self.bigint_arrays.contains(&t.var))
+                        && (self.set_arrays.contains(&t.var)
+                            || self.bigint_arrays.contains(&t.var)
+                            || self.str_arrays.contains(&t.var))
                     {
                         if func == "setArray" {
                             self.emit(&format!("{m}_len = 0;"));
@@ -3975,6 +4130,9 @@ impl Render {
                                             self.emit(&format!("try {m}[{m}_len].setString(10, {v});"));
                                         }
                                     }
+                                } else if self.str_arrays.contains(&t.var) {
+                                    let v = self.expr_str(it);
+                                    self.emit(&format!("{m}[{m}_len] = {v};"));
                                 } else {
                                     let v = self.expr_num(it);
                                     self.emit(&format!("{m}[{m}_len] = {v};"));
@@ -4512,6 +4670,10 @@ impl Render {
                         // set → fixed i64 array + length counter
                         fntext.push_str(&format!("    var {m}: [1024]i64 = undefined;\n"));
                         fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
+                    } else if self.str_arrays.contains(v) {
+                        // string list → fixed []const u8 array + length counter
+                        fntext.push_str(&format!("    var {m}: [1024][]const u8 = undefined;\n"));
+                        fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
                     } else if self.bigint_vars.contains(v) {
                         fntext.push_str(&format!("    var {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);\n"));
                         fntext.push_str(&format!("    defer {m}.deinit();\n"));
@@ -4638,7 +4800,13 @@ impl Render {
         // fixed i64 array + length counter
         let mut set_arrays = BTreeSet::new();
         collect_set_arrays(&prog.stmts, &mut set_arrays);
+        // string-element arrays keep the []const u8 home (and leave the
+        // i64 set when every element is numeric)
+        let mut str_arrays = BTreeSet::new();
+        collect_str_arrays(&prog.stmts, &mut str_arrays);
+        set_arrays.retain(|v| !str_arrays.contains(v));
         self.set_arrays = set_arrays;
+        self.str_arrays = str_arrays;
 
         // bigint-element arrays — lowered to a Managed array
         let mut bigint_arrays = BTreeSet::new();
@@ -4856,6 +5024,40 @@ impl Render {
             self.emit("    @memcpy(b, t);");
             self.emit("    b[0] = if (upper) std.ascii.toUpper(t[0]) else std.ascii.toLower(t[0]);");
             self.emit("    return b;");
+            self.emit("}");
+            self.emit("fn shStrArrSlice(a: []const []const u8, n: usize, off: i64, len: i64) []const u8 {");
+            self.emit("    // `${arr[@]:off:len}` over a string home: space-joined window,");
+            self.emit("    // negative offsets count from the end (bash)");
+            self.emit("    const nn: i64 = @intCast(n);");
+            self.emit("    var o = if (off < 0) nn + off else off;");
+            self.emit("    o = @max(0, @min(o, nn));");
+            self.emit("    var e: i64 = if (len < 0) nn + len else o + len;");
+            self.emit("    e = @max(o, @min(e, nn));");
+            self.emit("    const ou: usize = @intCast(o);");
+            self.emit("    const eu: usize = @intCast(e);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    for (a[ou..eu], 0..) |s, k| {");
+            self.emit("        if (k != 0) out.append(std.heap.page_allocator, ' ') catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, s) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+            self.emit("fn shIntArrSlice(a: []const i64, n: usize, off: i64, len: i64) []const u8 {");
+            self.emit("    // `${arr[@]:off:len}` over an int home: space-joined window");
+            self.emit("    const nn: i64 = @intCast(n);");
+            self.emit("    var o = if (off < 0) nn + off else off;");
+            self.emit("    o = @max(0, @min(o, nn));");
+            self.emit("    var e: i64 = if (len < 0) nn + len else o + len;");
+            self.emit("    e = @max(o, @min(e, nn));");
+            self.emit("    const ou: usize = @intCast(o);");
+            self.emit("    const eu: usize = @intCast(e);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    for (a[ou..eu], 0..) |v, k| {");
+            self.emit("        if (k != 0) out.append(std.heap.page_allocator, ' ') catch return \"\";");
+            self.emit("        const num = std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{v}) catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, num) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
             self.emit("}");
             self.emit("fn shCase(t: []const u8, upper: bool) []const u8 {");
             self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
@@ -5229,7 +5431,11 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             // capture-promoted vars are assigned inside functions (their
             // stores never appear in main's body text) — always mutable
             }) || self.globals.contains(v);
-            let kw = if mutated || self.bigint_vars.contains(v) || self.set_arrays.contains(v) {
+            let kw = if mutated
+                || self.bigint_vars.contains(v)
+                || self.set_arrays.contains(v)
+                || self.str_arrays.contains(v)
+            {
                 "var"
             } else {
                 "const"
@@ -5253,6 +5459,15 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
                     fdecls.push(format!("var {m}_len: usize = 0;"));
                 } else {
                     decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
+                    decls.push(format!("    var {m}_len: usize = 0;"));
+                }
+            } else if self.str_arrays.contains(v) {
+                // string list → fixed []const u8 array + length counter
+                if file_scope {
+                    fdecls.push(format!("var {m}: [1024][]const u8 = undefined;"));
+                    fdecls.push(format!("var {m}_len: usize = 0;"));
+                } else {
+                    decls.push(format!("    var {m}: [1024][]const u8 = undefined;"));
                     decls.push(format!("    var {m}_len: usize = 0;"));
                 }
             } else if self.is_num(v) {
@@ -5916,6 +6131,74 @@ fn collect_bigint_arrays(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTr
         }
     }
     walk(stmts, big, out);
+}
+
+/// String-element arrays: any setArray/setArrayAppend target with a
+/// non-numeric element (bash arrays are strings; all-numeric lists keep
+/// the i64 set home for the max/min/sum/sorted reductions).
+fn collect_str_arrays(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    fn numeric_element(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
+            IrExpr::Arith(_) => true,
+            _ => false,
+        }
+    }
+    fn walk(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { expr, .. } => {
+                    if let IrExpr::Call { func, args } = expr {
+                        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                            if let Some(IrExpr::Str(name, _)) = args.first() {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if items.iter().any(|it| !numeric_element(it)) {
+                                        out.insert(name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, out);
+                    for (_, b) in elsifs {
+                        walk(b, out);
+                    }
+                    walk(else_, out);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                    walk(body, out);
+                }
+                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                    walk(body, out);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    walk(b, out);
+                }
+                IrStmt::Redirect { inner, .. } => walk(inner, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk(st, out);
+                    }
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body, out);
+                    for (_, b) in named_blocks {
+                        walk(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, out);
 }
 
 fn collect_set_arrays(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
