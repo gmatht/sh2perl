@@ -30,6 +30,7 @@ struct JavaRender {
     arrays: BTreeSet<String>,
     funcs: BTreeSet<String>,
     fnvalues: BTreeSet<String>,    // functions ever called via fnValue (echo-return-lifted: their Return is a VALUE, not a status)
+    exit_traps: Vec<String>,       // EXIT-trap bodies to run before normal end-of-main exit
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
     redir_seq: usize,
@@ -72,7 +73,7 @@ const JAVA_RESERVED: &[&str] = &[
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
-                     fnvalues: BTreeSet::new(),
+                     fnvalues: BTreeSet::new(), exit_traps: Vec::new(),
                      helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
                      out: Vec::new(), depth: 2 }
     }
@@ -223,6 +224,16 @@ impl JavaRender {
         for st in &prog.stmts {
             if matches!(st, IrStmt::Function { .. }) { continue; }
             self.stmt(st)?;
+        }
+        // EXIT traps run before normal end-of-main exit (bash semantics;
+        // explicit `exit N` / return paths bypass them — same limitation
+        // as the no-op trap arms they replace, but the common case works)
+        if !self.exit_traps.is_empty() {
+            self.helper("runrc");
+            let bodies: Vec<String> = std::mem::take(&mut self.exit_traps);
+            for b in bodies {
+                self.emit(&format!("__SH_RC = shRunEval({});", jstr(&b)));
+            }
         }
         self.emit("System.exit((int) __SH_RC);");
         self.block_close();
@@ -808,6 +819,12 @@ impl JavaRender {
 
     /// A Java string expression holding the bash text of one pipeline stage
     /// (only simple exec/builtin/test stages are representable).
+    /// A pipeline stage as a Java string expression of bash text. Stages
+    /// that are simple commands render directly; stages containing loops
+    /// (For/While/whileLoop — e.g. `for...done | sort`) run NATIVELY in a
+    /// per-site helper whose stdout is captured, then fed to the rest of
+    /// the pipeline via `printf '%s'`. The capture is byte-exact (no
+    /// trailing-newline stripping — pipes carry raw bytes).
     fn stage_expr(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         self.helper("quote");
         match stage {
@@ -816,7 +833,32 @@ impl JavaRender {
             {
                 self.cmd_line_expr(args)
             }
-            other => Err(format!("pipeline stage not representable as process text: {other:?}")),
+            other => {
+                // native fallback: run the stage's statements in-process,
+                // capture what they print
+                self.tmp_seq += 1;
+                let name = format!("__stage{}", self.tmp_seq);
+                let saved_depth = self.depth;
+                let saved_out = std::mem::take(&mut self.out);
+                self.depth = 2;
+                let mut err: Option<String> = None;
+                for st in other {
+                    if let Err(e) = self.stmt(st) { err = Some(e); break; }
+                }
+                let lines = std::mem::take(&mut self.out);
+                self.out = saved_out;
+                self.depth = saved_depth;
+                if let Some(e) = err {
+                    return Err(format!("native pipeline stage failed: {e}"));
+                }
+                let mut body = String::new();
+                for l in &lines { body.push_str(l); body.push('\n'); }
+                self.java_helpers.push(format!(
+                    "    static String {name}() throws Exception {{\n        ByteArrayOutputStream __b = new ByteArrayOutputStream();\n        PrintStream __o = System.out;\n        System.out.flush();\n        System.setOut(new PrintStream(__b));\n        try {{\n{body}        }} finally {{ System.out.flush(); System.setOut(__o); }}\n        return new String(__b.toByteArray(), StandardCharsets.UTF_8);\n    }}\n"
+                ));
+                // feed the captured bytes to the remaining pipeline stages
+                Ok(format!("(shQuote(\"printf\") + \" \" + shQuote(\"%s\") + \" \" + shQuote({name}()))"))
+            }
         }
     }
 
@@ -983,6 +1025,58 @@ impl JavaRender {
             }
             IrExpr::Call { func, .. } if func == "continue" => { self.emit("__SH_RC = 0; continue;"); Ok(()) }
             IrExpr::Call { func, .. } if func == "break" => { self.emit("__SH_RC = 0; break;"); Ok(()) }
+            IrExpr::Call { func, args, .. } if func == "whileLoop" => {
+                // `while CMD; do BODY; done` where the condition is a
+                // command (read/...) — the core keeps it as a call with
+                // cond/body arrows. The condition runs as bash text (its
+                // status drives the loop); the body runs NATIVELY so
+                // state changes (count, mapfile arrays) persist.
+                // bash: the loop's status is the last BODY command's.
+                let (cond_arrow, body_arrow) = match (args.first(), args.get(1)) {
+                    (Some(IrExpr::Arrow(c)), Some(IrExpr::Arrow(b))) => (c, b),
+                    _ => return Err("whileLoop without cond/body arrows".into()),
+                };
+                // A single read/test cond runs NATIVELY (java-side vars
+                // update and swapped stdin is honored); anything else runs
+                // as bash text and only its status drives the loop.
+                let native_cond: Option<String> = match &cond_arrow[..] {
+                    [IrStmt::Expr(IrExpr::Call { func, args, .. })]
+                        if (func == "exec" || func == "builtin")
+                            && str_arg(args, 0).map(|c| c == "read").unwrap_or(false) =>
+                    {
+                        Some(self.command_cond(args)?)
+                    }
+                    [IrStmt::Expr(IrExpr::Call { func, args, .. })] if func == "test" => {
+                        let b = self.test_bool(args)?;
+                        self.helper("testrc");
+                        Some(format!("shTestRc({b})"))
+                    }
+                    _ => None,
+                };
+                self.tmp_seq += 1;
+                let lb = format!("__lastBody{}", self.tmp_seq);
+                self.emit(&format!("long {lb} = __SH_RC;"));
+                self.block_open("while (true) {");
+                match native_cond {
+                    Some(c) => {
+                        self.tmp_seq += 1;
+                        let cv = format!("__c{}", self.tmp_seq);
+                        self.emit(&format!("boolean {cv} = {c};"));
+                        self.emit(&format!("if (!{cv}) {{ __SH_RC = {lb}; break; }}"));
+                    }
+                    None => {
+                        let cond_text = self.arrow_expr(cond_arrow)?;
+                        self.helper("quote");
+                        self.helper("run");
+                        self.emit(&format!("__SH_RC = shRun({cond_text});"));
+                        self.emit(&format!("if (__SH_RC != 0) {{ __SH_RC = {lb}; break; }}"));
+                    }
+                }
+                for b in body_arrow { self.stmt(b)?; }
+                self.emit(&format!("{lb} = __SH_RC;"));
+                self.block_close();
+                Ok(())
+            }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
                 if matches!(*op, BinOpKind::And | BinOpKind::Or) =>
             {
@@ -1293,8 +1387,27 @@ impl JavaRender {
                 self.emit(&format!("__SH_RC = shRunEval({t});"));
                 Ok(())
             }
-            "wait" | "trap" | "umask" | "ulimit" | "shopt" | "set" | "hash" | "enable"
+            "wait" | "umask" | "ulimit" | "shopt" | "set" | "hash" | "enable"
             | "suspend" | "times" | "bind" | "help" | "type" | "command_noop" => {
+                self.emit("__SH_RC = 0;");
+                Ok(())
+            }
+            "trap" => {
+                // trap BODY SIGNAL: only EXIT with a plain-string body is
+                // honored — run it before normal end-of-main exit (error
+                // traps and dynamic bodies stay no-ops). The body text is
+                // re-parsed by bash at exit time via shRunEval.
+                let flat = flatten_words(rest);
+                let strs: Vec<String> = flat.iter().filter_map(|e| match e {
+                    IrExpr::Str(s, _) => Some(s.clone()),
+                    _ => None,
+                }).collect();
+                if strs.len() >= 2 && strs.last().map(|s| s == "EXIT").unwrap_or(false) {
+                    let body = strs[..strs.len() - 1].join(" ");
+                    if !body.contains("$(") && !body.contains('`') {
+                        self.exit_traps.push(body);
+                    }
+                }
                 self.emit("__SH_RC = 0;");
                 Ok(())
             }
@@ -2095,9 +2208,12 @@ impl JavaRender {
                 if let Some(ast) = crate::shir::parse_arith_native(&t) {
                     Ok(format!("String.valueOf({})", self.arith(&ast)?))
                 } else {
-                    // last resort: let bash evaluate the expression text
+                    // last resort: let bash evaluate the original $((...))
+                    // text — a failed evaluation prints an error to stderr
+                    // (discarded) and yields EMPTY (bash: `result=$((echo
+                    // "test"))` gives "", not 0), which shCapture reproduces.
                     self.helper("capture");
-                    Ok(format!("shCapture(\"echo $(({}))\")", t.replace('"', "\"")))
+                    Ok(format!("shCapture({})", jstr(&format!("echo $(({t}))"))))
                 }
             }
             IrExpr::Arith(a) => Ok(format!("String.valueOf({})", self.arith(a)?)),
@@ -2216,10 +2332,10 @@ impl JavaRender {
             }
             IrExpr::Call { func, args, .. } if func == "arrayIndex" => {
                 let name = str_arg(args, 0).ok_or("arrayIndex: no name")?;
-                let key = self.expr_str(args.get(1).unwrap_or(&IrExpr::Int(0)))?;
+                let key = self.array_idx_num(args.get(1).unwrap_or(&IrExpr::Int(0)))?;
                 self.helper("aget");
                 self.arrays.insert(sanitize(name));
-                Ok(format!("shAget(__a_{}, shNum({key}))", sanitize(name)))
+                Ok(format!("shAget(__a_{}, {key})", sanitize(name)))
             }
             IrExpr::Call { func, args, .. } if func == "arrayLen" => {
                 let name = str_arg(args, 0).ok_or("arrayLen: no name")?;
@@ -2420,6 +2536,29 @@ impl JavaRender {
     }
 
     // ── parameter expansion ──────────────────────────────────────────
+    /// An array index expression as a Java long. Handles literals,
+    /// `$`-bearing arith texts (`(2*$i)-1` — bare the refs for the arith
+    /// parser, which resolves them via getvar_num), and general exprs.
+    fn array_idx_num(&mut self, e: &IrExpr) -> Result<String, String> {
+        if let IrExpr::Str(t, _) = e {
+            let idx = t.trim();
+            if let Ok(k) = idx.parse::<i64>() {
+                return Ok(format!("{k}L"));
+            }
+            if idx.contains('$') {
+                let bare = bare_arith_refs(idx);
+                if let Some(ast) = crate::shir::parse_arith_native(&bare) {
+                    return Ok(self.arith(&ast)?);
+                }
+            }
+        }
+        if let IrExpr::Int(i) = e {
+            return Ok(i.to_string());
+        }
+        let s = self.expr_str(e)?;
+        self.helper("num");
+        Ok(format!("shNum({s})"))
+    }
     /// Bash quote-removal for a literal ${var//pat/rep} pattern or
     /// replacement: inside the original double quotes, `\"` `\$` `\\`
     /// (and backslash + newline) collapse to the literal char. The core
@@ -2450,6 +2589,15 @@ impl JavaRender {
                         self.arrays.insert(sanitize(arr));
                         self.helper("aget");
                         return Ok(format!("shAget(__a_{}, {k}L)", sanitize(arr)));
+                    }
+                    // dynamic index with $vars (${a[(2*$i)-1]}, ${a[$i]}):
+                    // array_idx_num bares the refs for the arith parser and
+                    // lowers natively (the old assoc-approx was silently 0).
+                    if idx.contains('$') {
+                        let key = self.array_idx_num(&IrExpr::Str(idx.to_string(), StrStyle::DoubleQuoted))?;
+                        self.arrays.insert(sanitize(arr));
+                        self.helper("aget");
+                        return Ok(format!("shAget(__a_{}, {key})", sanitize(arr)));
                     }
                     self.arrays.insert(sanitize(arr));
                     self.helper("num");
@@ -2494,6 +2642,11 @@ impl JavaRender {
                 // and a `#`-prefixed name: length semantics. (The `@` offset
                 // is NOT length — ${arr[@]} is the all-elements slice and
                 // ${#arr[@]} arrives as a separate arrayLen node.)
+                //
+                // Assoc-key listing arrives as `!name` (`${!map[@]}`) — the
+                // `!` is a marker, not part of the name; strip it (and any
+                // `#` length marker) before field resolution.
+                let aname = name.trim_start_matches('!').trim_start_matches('#').to_string();
                 let off_s = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
                 let len_s = args.get(3).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
                 if name.starts_with('#') && off_s.is_empty() && len_s.is_empty() {
@@ -2509,7 +2662,7 @@ impl JavaRender {
                 // The core drops the @ marker when the var is a known array,
                 // so array-ness alone selects this path.
                 if args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)) == Some("@")
-                    || (self.arrays.contains(&sanitize(&name))
+                    || (self.arrays.contains(&sanitize(&aname))
                         && !args.get(2).map(|e| str_arg(std::slice::from_ref(e), 0).unwrap_or_default().is_empty()).unwrap_or(true))
                 {
                     let has_at = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)) == Some("@");
@@ -2527,7 +2680,7 @@ impl JavaRender {
                         Some(e) => self.expr_num(e)?,
                     };
                     self.helper("aslice");
-                    return Ok(format!("shAslice(__a_{}, {off}, {len})", sanitize(&name)));
+                    return Ok(format!("shAslice(__a_{}, {off}, {len})", sanitize(&aname)));
                 }
                 // offsets may arrive as raw "$i" text — expand natively
                 let num_of = |r: &mut Self, e: Option<&IrExpr>| -> Result<String, String> {
@@ -2652,6 +2805,17 @@ impl JavaRender {
                     parts.push(sp.join(" + \" | \" + "));
                 }
                 IrStmt::Redirect { inner, redirects } => {
+                    // Simple bodies stay text; loop bodies go native as a
+                    // whole (a text `< file` on the printf shim would feed
+                    // the wrong command — see the redirect-call arm).
+                    let simple = inner.iter().all(|st| matches!(st,
+                        IrStmt::Expr(IrExpr::Call { func, .. })
+                            if func == "exec" || func == "builtin" || func == "test"));
+                    if !simple {
+                        let wrapped = IrStmt::Redirect { inner: inner.clone(), redirects: redirects.clone() };
+                        parts.push(self.stage_expr(std::slice::from_ref(&wrapped))?);
+                        continue;
+                    }
                     let mut inner_text = self.arrow_expr(inner)?;
                     for r in redirects {
                         let t = self.expr_str(&r.target)?;
@@ -2695,32 +2859,69 @@ impl JavaRender {
                     parts.push(sp.join(" + \" | \" + "));
                 }
                 IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "redirect" => {
-                    // redirect(Arrow(body), redirects...) inside a capture
-                    let mut t = String::from("\"\"");
-                    if let Some(IrExpr::Arrow(b)) = args.first() {
-                        t = self.arrow_expr(b)?;
-                    }
-                    if let Some(IrExpr::Array(rs)) = args.get(1) {
-                        for rr in rs.iter() { t += &self.redirect_text(rr)?; }
-                    }
-                    parts.push(t);
-                }
-                IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "redirect" => {
-                    // redirect(Arrow, redirects...) — append redirect text
-                    let mut t = String::from("\"\"");
-                    if let Some(IrExpr::Arrow(b)) = args.first() {
-                        t = self.arrow_expr(b)?;
-                    }
-                    if let Some(IrExpr::Array(rs)) = args.get(1) {
-                        for r in rs.iter() {
-                            match self.redirect_text(r) {
-                                Ok(x) => t += &x,
-                                Err(e) => return Err(e),
-                            }
+                    // redirect(Arrow(body), redirects...) inside a capture.
+                    // If the body is simple text, append redirect operators;
+                    // if it needs NATIVE execution (loops), run the whole
+                    // redirect natively — a text `< file` on the printf shim
+                    // would redirect the WRONG command's stdin (the loop
+                    // reads java-side, never seeing the file).
+                    let body: &[IrStmt] = match args.first() {
+                        Some(IrExpr::Arrow(b)) => b,
+                        _ => return Err("redirect without Arrow body in capture text".into()),
+                    };
+                    let rs: Vec<IrExpr> = match args.get(1) {
+                        Some(IrExpr::Array(rs)) => rs.clone(),
+                        _ => Vec::new(),
+                    };
+                    // probe: is the body plain text?
+                    let mut text_ok = true;
+                    for st in body {
+                        if !matches!(st, IrStmt::Expr(IrExpr::Call { func, .. })
+                            if func == "exec" || func == "builtin" || func == "test") {
+                            text_ok = false;
+                            break;
                         }
                     }
-                    parts.push(t);
-                }
+                    if text_ok {
+                        let mut t = self.arrow_expr(body)?;
+                        for rr in rs.iter() { t += &self.redirect_text(rr)?; }
+                        parts.push(t);
+                    } else {
+                        // native: build an IrStmt::Redirect and capture it
+                        let mut redirects = Vec::new();
+                        for rr in rs.iter() {
+                            match rr {
+                                IrExpr::Object(props) => {
+                                    let mut fd = None;
+                                    let mut mode = String::new();
+                                    let mut target = None;
+                                    for (k, v) in props {
+                                        match k.as_str() {
+                                            "fd" => if let IrExpr::Int(n) = v { fd = Some(*n as i32); },
+                                            "mode" => if let IrExpr::Str(m, _) = v { mode = m.clone(); },
+                                            "target" => target = Some(v.clone()),
+                                            _ => {}
+                                        }
+                                    }
+                                    if let Some(t) = target {
+                                        redirects.push(IrStmt::Redirect {
+                                            inner: vec![],
+                                            redirects: vec![crate::ir::IrRedirect { fd, mode, target: t, interpolate: false }],
+                                        });
+                                    }
+                                }
+                                _ => return Err(format!("redirect shape not in the java subset: {rr:?}")),
+                            }
+                        }
+                        // flatten: one Redirect stmt wrapping the body
+                        let inner_redirects: Vec<crate::ir::IrRedirect> = redirects.into_iter().flat_map(|s| match s {
+                            IrStmt::Redirect { redirects, .. } => redirects,
+                            _ => vec![],
+                        }).collect();
+                        let wrapped = IrStmt::Redirect { inner: body.to_vec(), redirects: inner_redirects };
+                        parts.push(self.stage_expr(std::slice::from_ref(&wrapped))?);
+                    }
+                },
                 IrStmt::Assign { .. } => {
                     // renderer-temp assignments inside captured bodies carry
                     // no process-visible effect — skip them in command text
@@ -2743,7 +2944,13 @@ impl JavaRender {
                     let sep = if matches!(*op, BinOpKind::And) { " && " } else { " || " };
                     parts.push(format!("{l} + \"{sep}\" + {r}"));
                 }
-                other => return Err(format!("arrow statement not representable as text: {other:?}")),
+                other => {
+                    // loops (For/While/whileLoop) inside a captured body:
+                    // run natively in a per-site capture helper (same as a
+                    // pipeline stage), then feed the bytes as the command.
+                    // Wrap in a single-element stage slice for the helper.
+                    parts.push(self.stage_expr(std::slice::from_ref(other))?);
+                }
             }
         }
         Ok(parts.join(" + \" ; \" + "))
@@ -3140,6 +3347,35 @@ fn bash_dquote_unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Bare `$name` / `${name}` references for the arith parser (`$i` → `i`,
+/// mirroring the core's arith_text_dollar_strip for the plain-name case;
+/// exotic shapes are left intact and fail parsing loudly downstream).
+fn bare_arith_refs(s: &str) -> String {
+    let mut bare = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '$' {
+            if it.peek() == Some(&'{') {
+                it.next();
+                for c2 in it.by_ref() {
+                    if c2 == '}' { break; }
+                    bare.push(c2);
+                }
+            } else {
+                let mut nm = String::new();
+                while let Some(&d) = it.peek() {
+                    if d.is_ascii_alphanumeric() || d == '_' { nm.push(d); it.next(); }
+                    else { break; }
+                }
+                bare.push_str(&nm);
+            }
+        } else {
+            bare.push(c);
+        }
+    }
+    bare
 }
 
 /// Strip one wrapping quote pair (`"add"` → `add`) for case patterns:
