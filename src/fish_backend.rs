@@ -4449,8 +4449,32 @@ fn exec_line_to_fish(
                     .collect::<Result<_, _>>()?;
                 // `%q` in a larger format is rare and not lowered — only the
                 // bare `printf '%q' VAL` shape is rewritten.
+                // A LITERAL operand needs no runtime shim: bash's `%q` is a
+                // pure function, so compute its exact spelling here. This is
+                // the common shape (`printf '%q' "$IFS"` after the core folds
+                // IFS to its literal value, parse-dollar-single-quote).
                 if f.trim() == "%q" && rest.len() == 1 {
-                    return Ok(format!("string escape -- {}", rest[0]));
+                    if let Some(IrExpr::Str(v, _)) = args.get(1) {
+                        // `printf '%q'` PRINTS the quoted text (it is a
+                        // conversion, not a command). fish has NO `$'…'`
+                        // ANSI-C quoting ("Expected a variable name after
+                        // this $"), so bash's spelling cannot be emitted as a
+                        // fish word — emit a fish-native `printf` that prints
+                        // those exact BYTES instead.
+                        return Ok(format!("printf '%s' {}", bash_quote_printf_fish(v)));
+                    }
+                }
+                if f.trim() == "%q" && rest.len() == 1 {
+                    // bash spells a value holding CONTROL characters as
+                    // `$'\n\t'`; fish's `string escape` instead prints the
+                    // bare escapes (and `''` for an empty string), so the two
+                    // disagree exactly where `%q` is normally used
+                    // (parse-dollar-single-quote printed `\n\t` for bash's
+                    // `$'\n\t'`). Reproduce bash's form for the control case
+                    // inline; every other value keeps fish's own escaping
+                    // (valid shell quoting, just a different spelling).
+                    let shim = r#"begin; set -l __v (printf '%s' VVV | string collect); set -l __o ''; set -l __e 0; for __i in (seq (string length -- "$__v")); set -l __c (string sub -s $__i -l 1 -- "$__v"); if string match -q -- (printf '\n') $__c; set __o "$__o\n"; set __e 1; else if string match -q -- (printf '\t') $__c; set __o "$__o\t"; set __e 1; else if string match -q -- (printf '\r') $__c; set __o "$__o\r"; set __e 1; else; set __o "$__o$__c"; end; end; if test $__e = 1; printf "\$'%s'" "$__o"; else; string escape -- "$__v"; end; end | string collect"#;
+                    return Ok(format!("({})", shim.replace("VVV", &rest[0])));
                 }
             }
         }
@@ -10940,4 +10964,63 @@ mod tests {
         );
         assert!(!sh.contains("set options["), "no bracketed set: {sh}");
     }
+}
+
+/// bash's `printf %q` for a KNOWN value, rendered as a fish word.
+///
+/// bash quotes in one of two ways: a value made only of "safe" characters
+/// (alnum plus a few punctuation) is emitted bare with backslash escapes
+/// (`hello\ world`, `a\'b`, `''` for empty), and a value containing CONTROL
+/// characters is emitted as an ANSI-C string `$'…'` with `\n`/`\t`/`\r`
+/// spelled out. fish parses both forms exactly as bash does, so the computed
+/// spelling can be emitted verbatim (parse-dollar-single-quote: bash printed
+/// `$'\n\t'` where fish's `string escape` printed `\n\t`).
+fn bash_quote_printf_fish(v: &str) -> String {
+    // fish prints the bash `%q` spelling byte-for-byte from a format string;
+    // `%` itself is the only character with a meaning there.
+    // Inside fish's single quotes a literal backslash and `%` are the only
+    // characters with any meaning to `printf`'s format.
+    let f = bash_quote_fish(v)
+        .replace('\\', "\\\\")
+        .replace('%', "%%")
+        .replace('\'', "'\\''");
+    format!("'{f}'")
+}
+
+/// bash's `%q` spelling as TEXT (not necessarily a valid fish word:
+/// `$'\n\t'` is bash-only syntax).
+fn bash_quote_fish(v: &str) -> String {
+    if v.is_empty() {
+        return "''".into();
+    }
+    if v.chars().any(|c| c.is_control()) {
+        let mut out = String::from("$'");
+        for c in v.chars() {
+            match c {
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                c if c.is_control() => out.push_str(&format!("\\{:03o}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        return out;
+    }
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:=,+@%^".contains(c);
+    if v.chars().all(safe) {
+        return v.to_string();
+    }
+    let mut out = String::new();
+    for c in v.chars() {
+        if safe(c) {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
 }
