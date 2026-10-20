@@ -1741,6 +1741,67 @@ impl Render {
         "shToInt(sh2GetVar())".to_string()
     }
 
+/// Raw `$(…)`/backtick capture value (user-fn direct call,
+/// pipeline collect, or external shRun). None → caller stubs.
+fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
+            // `$(fn args…)` of a user function DEFINED in this
+            // program: call it and use its return value. The capture
+            // body is a single `exec fn [args]`. An `exec` of anything
+            // else is an EXTERNAL command — render the native capture
+            // (shRun), never a call to an undeclared Zig fn.
+            // `$(a | b)` (single-Expr pipeline body): collect the pipe.
+            if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                // structured `IrStmt::Pipeline` body (backtick/`$()`
+                // of a pipeline lowers here, not to a `pipeline` call)
+                if let [IrStmt::Pipeline { stages, .. }] = stmts.as_slice() {
+                    if let Some(rendered) = self.render_pipeline_structured(stages, true) {
+                        return Some(rendered);
+                    }
+                }
+                if let [IrStmt::Expr(IrExpr::Call { func: pfunc, args: pargs })] = stmts.as_slice() {
+                    if pfunc == "pipeline" {
+                        if let Some(rendered) = self.render_pipeline(pargs, true) {
+                            return Some(rendered);
+                        }
+                    }
+                }
+                if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
+                    if func == "exec" {
+                        if let Some(IrExpr::Str(fname, _)) = cargs.first() {
+                            if self.user_fns.contains(fname) {
+                                let m = self.zig_ident(fname);
+                                let call_args: Vec<String> = cargs
+                                    .get(1)
+                                    .and_then(|a| match a {
+                                        IrExpr::Array(items) => Some(
+                                            items.iter().map(|e| self.expr_str(e)).collect(),
+                                        ),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                let catch = if self.error_fns.contains(fname) {
+                                    " catch \"\""
+                                } else {
+                                    ""
+                                };
+                                return Some(format!(
+                                    "{m}(init, &[_][]const u8{{ {} }}){catch}",
+                                    call_args.join(", ")
+                                ));
+                            }
+                            if let Some(arrow) = args.first() {
+                                if let Some(rendered) = self.capture_expr(arrow) {
+                                    return Some(rendered);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            None
+        }
+
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
             "fnValue" | "fnCall" => {
@@ -1767,56 +1828,22 @@ impl Render {
                 let catch = if self.error_fns.contains(&orig) { " catch \"\"" } else { "" };
                 format!("{name}(init, &[_][]const u8{{ {} }}){catch}", call_args.join(", "))
             }
-            "capture" | "captureWords" => {
-                // `$(fn args…)` of a user function DEFINED in this
-                // program: call it and use its return value. The capture
-                // body is a single `exec fn [args]`. An `exec` of anything
-                // else is an EXTERNAL command — render the native capture
-                // (shRun), never a call to an undeclared Zig fn.
-                // `$(a | b)` (single-Expr pipeline body): collect the pipe.
-                if let Some(IrExpr::Arrow(stmts)) = args.first() {
-                    if let [IrStmt::Expr(IrExpr::Call { func: pfunc, args: pargs })] = stmts.as_slice() {
-                        if pfunc == "pipeline" {
-                            if let Some(rendered) = self.render_pipeline(pargs, true) {
-                                return rendered;
-                            }
-                        }
-                    }
-                    if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
-                        if func == "exec" {
-                            if let Some(IrExpr::Str(fname, _)) = cargs.first() {
-                                if self.user_fns.contains(fname) {
-                                    let m = self.zig_ident(fname);
-                                    let call_args: Vec<String> = cargs
-                                        .get(1)
-                                        .and_then(|a| match a {
-                                            IrExpr::Array(items) => Some(
-                                                items.iter().map(|e| self.expr_str(e)).collect(),
-                                            ),
-                                            _ => None,
-                                        })
-                                        .unwrap_or_default();
-                                    let catch = if self.error_fns.contains(fname) {
-                                        " catch \"\""
-                                    } else {
-                                        ""
-                                    };
-                                    return format!(
-                                        "{m}(init, &[_][]const u8{{ {} }}){catch}",
-                                        call_args.join(", ")
-                                    );
-                                }
-                                if let Some(arrow) = args.first() {
-                                    if let Some(rendered) = self.capture_expr(arrow) {
-                                        return rendered;
-                                    }
-                                }
-                            }
-                        }
-                    }
+            "capture" => {
+                if let Some(rendered) = self.capture_raw(args) {
+                    return rendered;
                 }
                 self.sh2_stub("capture", "capture")
             }
+            "captureWords" => {
+                // unquoted backticks: word-split the captured text (bash
+                // splits unquoted substitutions; echo joins with spaces)
+                if let Some(rendered) = self.capture_raw(args) {
+                    self.need_ext = true;
+                    return format!("shJoinWs({rendered})");
+                }
+                self.sh2_stub("capture", "capture")
+            }
+
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     // `$?` FIRST — a synthesized Var("?")/read can land "?"
@@ -1852,10 +1879,15 @@ impl Render {
                 format!("shB2S({})", self.call_bool(func, args))
             }
             "split" => {
-                // word splitting: a single value with default IFS (no
-                // whitespace) is just the value; render the inner arg.
+                // word splitting (unquoted `$x` / `$@` in word position):
+                // split on IFS whitespace, drop empties, rejoin with
+                // single spaces (bash; echo joins argv with spaces). On
+                // whitespace-free values this is the identity.
                 match args.first() {
-                    Some(arg) => self.expr_str(arg),
+                    Some(arg) => {
+                        self.need_ext = true;
+                        format!("shJoinWs({})", self.expr_str(arg))
+                    }
                     None => self.sh2_stub("split", "split"),
                 }
             }
@@ -2298,6 +2330,10 @@ impl Render {
     /// single-command form renders NATIVELY with no runtime helper.
     fn capture_expr(&mut self, expr: &IrExpr) -> Option<String> {
         let IrExpr::Arrow(stmts) = expr else { return None };
+        // `$(a | b)`: structured pipeline body — collect the pipe
+        if let [IrStmt::Pipeline { stages, .. }] = stmts.as_slice() {
+            return self.render_pipeline_structured(stages, true);
+        }
         let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
             return None;
         };
@@ -2507,6 +2543,23 @@ impl Render {
     fn render_pipeline(&mut self, args: &[IrExpr], capture: bool) -> Option<String> {
         let stages = self.pipeline_stages(args)?;
         self.emit_pipeline(&stages, capture)
+    }
+
+    /// Structured `IrStmt::Pipeline` stages rendered through shPipe
+    /// (shared by the Pipeline-stmt arm and capture-of-pipeline).
+    fn render_pipeline_structured(
+        &mut self,
+        stages: &[Vec<IrStmt>],
+        capture: bool,
+    ) -> Option<String> {
+        let mut converted: Vec<PipeStage> = Vec::new();
+        for st in stages {
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = st.as_slice() else {
+                return None;
+            };
+            converted.push(self.stage_call(func, args)?);
+        }
+        self.emit_pipeline(&converted, capture)
     }
 
     /// The shPipe call for converted stages.
@@ -4756,35 +4809,14 @@ impl Render {
                 // structured pipeline stages: same shPipe lowering as the
                 // `pipeline` call form (single-command stages; anything
                 // else keeps the honest stub, never silent sequencing)
-                let mut converted: Vec<PipeStage> = Vec::new();
-                let mut ok = true;
-                for st in stages {
-                    let [IrStmt::Expr(IrExpr::Call { func, args })] = st.as_slice() else {
-                        ok = false;
-                        break;
-                    };
-                    if func != "exec" && func != "builtin" {
-                        ok = false;
-                        break;
-                    }
-                    match self.stage_call(func, args) {
-                        Some(stage) => converted.push(stage),
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok {
-                    if let Some(rendered) = self.emit_pipeline(&converted, false) {
+                match self.render_pipeline_structured(stages, false) {
+                    Some(rendered) => {
                         self.emit(&format!("_ = {rendered};"));
-                    } else {
+                    }
+                    None => {
                         self.sh2_calls.insert("pipeline".into());
                         self.mark_todo("pipeline → sh2.pipeline");
                     }
-                } else {
-                    self.sh2_calls.insert("pipeline".into());
-                    self.mark_todo("pipeline → sh2.pipeline");
                 }
             }
             IrStmt::Subshell(body) => {
@@ -5507,6 +5539,19 @@ impl Render {
             self.emit("    @memcpy(b, t);");
             self.emit("    b[0] = if (upper) std.ascii.toUpper(t[0]) else std.ascii.toLower(t[0]);");
             self.emit("    return b;");
+            self.emit("}");
+            self.emit("fn shJoinWs(t: []const u8) []const u8 {");
+            self.emit("    // word-split on IFS whitespace, drop empties, rejoin with");
+            self.emit("    // single spaces (bash unquoted-substitution semantics)");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var it = std.mem.tokenizeAny(u8, t, \" \\t\\n\\r\");");
+            self.emit("    var first = true;");
+            self.emit("    while (it.next()) |w| {");
+            self.emit("        if (!first) out.append(std.heap.page_allocator, ' ') catch return \"\";");
+            self.emit("        first = false;");
+            self.emit("        out.appendSlice(std.heap.page_allocator, w) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
             self.emit("}");
             self.emit("fn shStrArrSlice(a: []const []const u8, n: usize, off: i64, len: i64) []const u8 {");
             self.emit("    // `${arr[@]:off:len}` over a string home: space-joined window,");
