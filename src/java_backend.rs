@@ -1988,6 +1988,19 @@ impl JavaRender {
         // a merged operand like `~="$HOME"` hides a comparison operator —
         // split on top-level = / == / != first
         for piece in split_eq_ops(t) {
+            // leading-tilde expansion (unquoted `~` / `~/...` in test
+            // position expands to $HOME; quoted forms never reach here as
+            // bare pieces — string contexts keep `~` literal)
+            if piece == "~" {
+                let home = self.getvar_str("HOME").unwrap_or_else(|_| "\"\"".to_string());
+                w.push(TestTok::E(home, false));
+                continue;
+            }
+            if piece.starts_with("~/") {
+                let home = self.getvar_str("HOME").unwrap_or_else(|_| "\"\"".to_string());
+                w.push(TestTok::E(format!("({home} + {})", jstr(&piece[1..])), false));
+                continue;
+            }
             if piece == "=" || piece == "==" || piece == "!=" {
                 w.push(TestTok::S(piece));
             } else if piece.starts_with('~') {
