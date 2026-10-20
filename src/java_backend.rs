@@ -1212,6 +1212,20 @@ impl JavaRender {
                     if let IrExpr::Array(items) = w {
                         let mut nm: Option<String> = None;
                         for it in items.iter() {
+                            // nested setArray (declare -a arr=(...)): run it
+                            // for effect, never as a value for `nm`
+                            if matches!(it, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
+                                self.expr_stmt(it)?;
+                                continue;
+                            }
+                            // flags (-a/-A/-r/...) are never names: pending
+                            // nm must not capture them (declare -a arr=...
+                            // would otherwise assign the value to `-a`)
+                            if let IrExpr::Str(t, _) = it {
+                                if t.starts_with('-') && !t.contains('=') {
+                                    continue;
+                                }
+                            }
                             match it {
                                 IrExpr::Str(t, _) => {
                                     if let Some(eq) = t.find('=') {
@@ -2476,11 +2490,13 @@ impl JavaRender {
                 Ok(format!("({base}.isEmpty() ? \"\" : {a})"))
             }
             "slice" => {
-                // ${#arr} / ${#arr[@]} arrive as slice-with-empty offset or
-                // "@"-offset + empty len: length semantics
+                // ${#arr} arrives as slice-with-empty offset + empty len
+                // and a `#`-prefixed name: length semantics. (The `@` offset
+                // is NOT length — ${arr[@]} is the all-elements slice and
+                // ${#arr[@]} arrives as a separate arrayLen node.)
                 let off_s = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
                 let len_s = args.get(3).and_then(|e| str_arg(std::slice::from_ref(e), 0)).unwrap_or_default().to_string();
-                if (off_s == "@" || off_s.is_empty()) && len_s.is_empty() {
+                if name.starts_with('#') && off_s.is_empty() && len_s.is_empty() {
                     let bare = name.trim_start_matches('#').to_string();
                     if self.arrays.contains(&sanitize(&bare)) {
                         return Ok(format!("String.valueOf(__a_{}.size())", sanitize(&bare)));
