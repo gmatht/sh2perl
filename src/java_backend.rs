@@ -507,13 +507,24 @@ impl JavaRender {
                     }
                     self.depth += 1;
                     for b in else_ { self.stmt(b)?; }
-                }
-                self.depth -= 1;
-                {
-                    let mut l = String::new();
-                    for _ in 0..self.depth { l.push_str("    "); }
-                    l.push('}');
-                    self.out.push(l);
+                    self.depth -= 1;
+                    {
+                        let mut l = String::new();
+                        for _ in 0..self.depth { l.push_str("    "); }
+                        l.push('}');
+                        self.out.push(l);
+                    }
+                } else {
+                    // bash: an `if` with no taken branch and no else
+                    // exits 0 (the condition's nonzero status does NOT
+                    // leak — `if false; then x; fi; echo $?` prints 0).
+                    self.depth -= 1;
+                    {
+                        let mut l = String::new();
+                        for _ in 0..self.depth { l.push_str("    "); }
+                        l.push_str("} else { __SH_RC = 0; }");
+                        self.out.push(l);
+                    }
                 }
                 Ok(())
             }
