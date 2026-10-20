@@ -10209,6 +10209,32 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
 
 fn for_items_to_fish(iter: &IrExpr) -> Result<String, String> {
     match iter {
+        // `for x in "$*"` iterates ONCE over the space-joined positionals.
+        // Both `$*` and `$@` lower to `$argv` in SCALAR position, but here the
+        // difference IS the loop count: fish's `$argv` is always a LIST, so
+        // `$*` must be joined explicitly (parse-dollars-in-string ran the body
+        // twice for bash's single pass). Only `getVar("*")` is narrowed to --
+        // `listVar` is also what the frontends emit for `"$@"`, and rewriting
+        // that broke 005_args/positional-dollar-at-params.
+        IrExpr::Array(items) if items.len() == 1 => {
+            if let IrExpr::Call { func, args } = &items[0] {
+                if func == "getVar" && matches!(args.first(), Some(IrExpr::Str(k, _)) if k == "*") {
+                    // `string join` of an EMPTY list yields zero elements (the
+                    // word vanishes), while bash's "$*" with no arguments is
+                    // ONE empty word and runs the body once
+                    // (parse-dollars-in-string's blank line).
+                    return Ok(
+                        "(if count $argv >/dev/null; string join ' ' -- $argv; else; echo ''; end | string collect)"
+                            .into(),
+                    );
+                }
+            }
+            let mut out = Vec::new();
+            for it in items {
+                out.push(for_item_to_fish(it)?);
+            }
+            Ok(out.join(" "))
+        }
         IrExpr::Array(items) => {
             if items.is_empty() {
                 // `for x; do` — iterate the positional parameters.
