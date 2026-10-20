@@ -3901,6 +3901,30 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
 fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Arith(a) => Ok(arith_cond_ast_fish(a)),
+        // Boolean STRUCTURE in condition position. These arms are what keep
+        // a cond from bouncing back into `cmd_to_fish`: that path's Not arm
+        // re-enters `cond_to_fish`, and its operand — a `Str`/`Array` test
+        // atom such as the `"$X" = "1"` a negated test arrives as — is not a
+        // command, so it ended at "command expression not renderable"
+        // (t16_if_cond: `if ! [ "$X" = "1" ]`).
+        //
+        // `not` is rendered as a negated TEST rather than `! (…)` so fish
+        // keeps `[ ]` (its `!` prefix form) and never needs a subshell.
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => Ok(format!("! {}", cond_to_fish(lhs)?)),
+        IrExpr::BinOp {
+            op: BinOpKind::And,
+            lhs,
+            rhs,
+        } => Ok(format!("{} && {}", cond_to_fish(lhs)?, cond_to_fish(rhs)?)),
+        IrExpr::BinOp {
+            op: BinOpKind::Or,
+            lhs,
+            rhs,
+        } => Ok(format!("{} || {}", cond_to_fish(lhs)?, cond_to_fish(rhs)?)),
         // Native comparison BinOps in CONDITION position (the core now
         // emits If-conds as structured `BinOp(Gt/Lt/…, Arith, Arith)`
         // instead of test-string Calls): render as `[ lhs flag rhs ]`
@@ -3933,6 +3957,10 @@ fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
 fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Arith(a) => Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a))),
+        // A bare string atom (`[ "$X" = "1" ]` after the core's compare
+        // normalisation leaves the RHS a Str) is a VALUE, not a command —
+        // the `_` arm of `cmd_to_fish` refuses it. Quote it for `[ ]`.
+        IrExpr::Str(s, _) => Ok(format!("\"{}\"", bash_specials_to_fish(s))),
         other => cmd_to_fish(other),
     }
 }
