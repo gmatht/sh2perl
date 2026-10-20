@@ -4963,8 +4963,18 @@ fn exec_line_to_fish(
                                     if t.is_empty() {
                                         continue;
                                     }
-                                    // QUOTED (multi-word literals must not split).
-                                    pj.push(format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")));
+                                    // QUOTED so a multi-word literal cannot split.
+                                    // `$` is escaped HERE, where "this is literal
+                                    // TEXT" is known: the concatenation below
+                                    // splices the parts into ONE double-quoted
+                                    // word, and an unescaped `$` there starts an
+                                    // expansion -- bash's `"id: \$$n"` prints
+                                    // `id: $42`, but the render emitted
+                                    // `"id: $42"` and fish read a variable named
+                                    // `42` (dollar-escape-in-interpolate). Only
+                                    // the LITERAL part may carry it; a `$` that
+                                    // begins a real expansion is in an Expr part.
+                                    pj.push(format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$")));
                                 }
                                 crate::ir::InterpPart::Expr(x) => {
                                     if let Some(flat) = flat_interp(x) {
@@ -5012,16 +5022,23 @@ fn exec_line_to_fish(
                             // double-quoted word. (Only a vanishing command
                             // substitution needs a join, and that took the
                             // `''` path above.)
+                            // The parts are already in FINAL form for the one
+                            // surrounding double-quoted word: a literal part
+                            // carries its own `$`/`"\`/backslash escapes (see its
+                            // arm above), and an expansion part is verbatim fish
+                            // (`$i`, `(math …)`), which must NOT be escaped or it
+                            // stops expanding (`"Number: \$i"` printed a literal
+                            // `$i` in every loop). So glue and emit -- no second
+                            // escaping pass.
                             let mut cat = String::new();
                             for part in &pj {
                                 if part.starts_with('"') && part.ends_with('"') && part.len() >= 2 {
-                                    cat.push_str(&part[1..part.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"));
+                                    cat.push_str(&part[1..part.len() - 1]);
                                 } else {
                                     cat.push_str(part);
                                 }
                             }
-                            let esc = cat.replace('\\', "\\\\").replace('"', "\\\"");
-                            return Ok(format!("printf '%s\\n' \"{esc}\""));
+                            return Ok(format!("printf '%s\\n' \"{cat}\""));
                         }
                     }
                     let w = &words[0];
