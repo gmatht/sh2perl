@@ -3087,6 +3087,32 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 self.rc_dirty = true;
                 true
             }
+            "eval" => {
+                // `eval payload`: re-parse and run through `sh -c` (a real
+                // shell re-execution, not a fallback — the payload is shell
+                // source by definition). State changes inside the payload
+                // do not feed back (known limitation, documented).
+                let words: Vec<String> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => {
+                        items.iter().map(|w| self.expr_str(w)).collect()
+                    }
+                    _ => vec![],
+                };
+                self.need_run = true;
+                self.rc_dirty = true;
+                self.need_ext = true;
+                if words.is_empty() {
+                    self.emit("sh_rc = 0;");
+                } else {
+                    self.emit(&format!(
+                        "shRunStmt(&[_][]const u8{{{}, {}, shJoinSp(&[_][]const u8{{{}}})}});",
+                        Self::zig_str("sh"),
+                        Self::zig_str("-c"),
+                        words.join(", ")
+                    ));
+                }
+                true
+            }
             "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
             _ => false,
         }
@@ -5747,6 +5773,15 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    }");
             self.emit("    return out.items;");
             self.emit("}");
+            self.emit("fn shJoinSp(a: []const []const u8) []const u8 {");
+            self.emit("    // join argv words verbatim with single spaces (eval payloads)");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    for (a, 0..) |w, k| {");
+            self.emit("        if (k != 0) out.append(std.heap.page_allocator, ' ') catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, w) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
             self.emit("fn shArrAppendStr(a: [][]const u8, n: *usize, text: []const u8) void {");
             self.emit("    // array `+=` of a joined string: append each word (bash appends");
             self.emit("    // ELEMENTS, so a multi-word append grows the array by each word)");
@@ -5763,7 +5798,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    const nn: i64 = @intCast(n);");
             self.emit("    var o = if (off < 0) nn + off else off;");
             self.emit("    o = @max(0, @min(o, nn));");
-            self.emit("    var e: i64 = if (len < 0) nn + len else o + len;");
+            self.emit("    var e: i64 = if (len < 0) nn +| len else o +| len;");
             self.emit("    e = @max(o, @min(e, nn));");
             self.emit("    const ou: usize = @intCast(o);");
             self.emit("    const eu: usize = @intCast(e);");
@@ -5779,7 +5814,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    const nn: i64 = @intCast(n);");
             self.emit("    var o = if (off < 0) nn + off else off;");
             self.emit("    o = @max(0, @min(o, nn));");
-            self.emit("    var e: i64 = if (len < 0) nn + len else o + len;");
+            self.emit("    var e: i64 = if (len < 0) nn +| len else o +| len;");
             self.emit("    e = @max(o, @min(e, nn));");
             self.emit("    const ou: usize = @intCast(o);");
             self.emit("    const eu: usize = @intCast(e);");
