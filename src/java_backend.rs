@@ -2108,9 +2108,19 @@ impl JavaRender {
     }
 
     fn expand_dollars(&mut self, raw: &str) -> Result<String, String> {
-        // strip shell-quote artifacts around the operand
+        // strip shell-quote artifacts around the operand: remove exactly
+        // one wrapping `"` pair when present, preserving everything inside
+        // byte-for-byte (heredoc bodies carry a significant trailing
+        // newline that trim() would eat, gluing `content` to a following
+        // SH2EOF terminator). Unquoted text passes through untouched.
         let t = raw.trim();
-        let s = if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 { &t[1..t.len()-1] } else { t };
+        let s = if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+            // locate the pair in the ORIGINAL (not the trimmed view)
+            match (raw.find('"'), raw.rfind('"')) {
+                (Some(a), Some(b)) if b > a => &raw[a + 1..b],
+                _ => raw,
+            }
+        } else { raw };
         let mut out = String::from("\"\"");
         let mut lit = String::new();
         let ch: Vec<char> = s.chars().collect();
