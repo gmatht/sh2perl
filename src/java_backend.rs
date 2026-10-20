@@ -28,6 +28,7 @@ struct JavaRender {
     cur_fn: String,                // name of the function being rendered ("" at top level)
     fields: BTreeSet<String>,      // scalar vars (sanitized names kept separate)
     arrays: BTreeSet<String>,
+    assoc: BTreeSet<String>,       // `declare -A` maps: parallel __k_<name> key list
     funcs: BTreeSet<String>,
     fnvalues: BTreeSet<String>,    // functions ever called via fnValue (echo-return-lifted: their Return is a VALUE, not a status)
     exit_traps: Vec<String>,       // EXIT-trap bodies to run before normal end-of-main exit
@@ -72,7 +73,7 @@ const JAVA_RESERVED: &[&str] = &[
 
 impl JavaRender {
     fn new() -> Self {
-        JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
+        JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), assoc: BTreeSet::new(), funcs: BTreeSet::new(),
                      fnvalues: BTreeSet::new(), exit_traps: Vec::new(),
                      helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
                      out: Vec::new(), depth: 2 }
@@ -91,9 +92,30 @@ impl JavaRender {
                 IrStmt::Declare { vars, .. } => {
                     for Decl { name, .. } in vars { self.fields.insert(sanitize(&name)); }
                 }
-                IrStmt::DeclareArray { var, elements, .. } => {
+            IrStmt::DeclareArray { var, elements, .. } => {
                     self.arrays.insert(sanitize(&var));
                     for e in elements { self.scan_expr(e)?; }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                    if (func == "exec" || func == "builtin") && str_arg(&args, 0) == Some("declare") =>
+                {
+                    // `declare -A map`: assoc-map marker (parallel key list)
+                    let rest: Vec<IrExpr> = args.iter().skip(1).cloned().collect();
+                    let flat = flatten_words(&rest);
+                    let mut is_assoc = false;
+                    for w in flat {
+                        if let IrExpr::Str(s, _) = w {
+                            if s == "-A" { is_assoc = true; }
+                            else if !s.starts_with('-') {
+                                let nm = s.split('=').next().unwrap_or(s);
+                                self.arrays.insert(sanitize(nm));
+                                if is_assoc { self.assoc.insert(sanitize(nm)); }
+                                self.scan_expr((*w).clone())?;
+                            }
+                        } else {
+                            self.scan_expr((*w).clone())?;
+                        }
+                    }
                 }
                 IrStmt::Function { name, body, .. } => {
                     self.funcs.insert(name);
@@ -294,6 +316,9 @@ impl JavaRender {
         for a in &self.arrays {
             header.push_str(&format!("    static List<String> __a_{a} = new ArrayList<>();\n"));
         }
+        for a in &self.assoc {
+            header.push_str(&format!("    static List<String> __k_{a} = new ArrayList<>();\n"));
+        }
         header.push('\n');
         // splice header right after the class opening line
         if let Some(pos) = o.find("{\n") {
@@ -310,6 +335,7 @@ impl JavaRender {
             "env","len","num","arg","shift","cd","run","runrc","capture","printf",
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","split","aset","aget",
+            "asetkey","agetkey",
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
         "aslice",
@@ -345,13 +371,24 @@ impl JavaRender {
                     let base = &t.var[..lb];
                     let idx = &t.var[lb + 1..t.var.len() - 1];
                     let val = self.expr_str(expr)?;
-                    if let Ok(k) = idx.trim().parse::<i64>() {
+                    let base_s = sanitize(base);
+                    if self.assoc.contains(&base_s) {
+                        // assoc map: string-keyed set (insertion-ordered)
+                        let key = self.assoc_key(idx)?;
+                        self.arrays.insert(base_s.clone());
+                        self.emit(&format!("shAsetKey(__a_{base_s}, __k_{base_s}, {key}, {val});"));
+                    } else if let Ok(k) = idx.trim().parse::<i64>() {
                         self.helper("aset");
                         self.emit(&format!("shAset(__a_{}, {k}L, {val});", sanitize(base)));
-                    } else {
-                        // assoc-style key: hash by key into the list (approx)
+                    } else if idx.contains('$') {
+                        // dynamic numeric index — lower natively
+                        let key = self.array_idx_num(&IrExpr::Str(idx.to_string(), StrStyle::DoubleQuoted))?;
                         self.helper("aset");
-                        self.emit(&format!("shAset(__a_{}, shNum({}), {val});", sanitize(base), jstr(idx.trim())));
+                        self.emit(&format!("shAset(__a_{}, {key}, {val});", sanitize(base)));
+                    } else {
+                        // unknown string key on a non-assoc array: refuse
+                        // rather than aliasing everything onto index 0
+                        return Err(format!("string index {idx:?} on non-assoc array {base}"));
                     }
                     return Ok(());
                 }
@@ -1538,10 +1575,27 @@ impl JavaRender {
                             parts.push(format!("shSplit({inner})"));
                             continue;
                         }
+                        if func == "param" {
+                            // `${!map[@]}` keys iteration: the key list
+                            // directly (marked with the \u{1} join so the
+                            // runtime-list path addAlls it)
+                            if let Some(n) = str_arg(args, 1) {
+                                if let Some(bare) = n.strip_prefix('!') {
+                                    let ks = sanitize(bare);
+                                    self.assoc.insert(ks.clone());
+                                    self.arrays.insert(ks.clone());
+                                    parts.push(format!("__k_{ks}\u{1}"));
+                                    continue;
+                                }
+                            }
+                            let slice = self.param(args)?;
+                            parts.push(slice);
+                            continue;
+                        }
                     }
                     parts.push(self.expr_str(it)?);
                 }
-                let has_list = parts.iter().any(|p| p.contains("shSplit("));
+                let has_list = parts.iter().any(|p| p.contains("shSplit(") || p.contains('\u{1}'));
                 Ok(parts.join(if has_list { "\u{1}" } else { ", " }))
             }
             IrExpr::Range { start, end } => {
@@ -2332,15 +2386,25 @@ impl JavaRender {
             }
             IrExpr::Call { func, args, .. } if func == "arrayIndex" => {
                 let name = str_arg(args, 0).ok_or("arrayIndex: no name")?;
-                let key = self.array_idx_num(args.get(1).unwrap_or(&IrExpr::Int(0)))?;
+                let name_s = sanitize(name);
+                let key_e = args.get(1).unwrap_or(&IrExpr::Int(0));
+                if self.assoc.contains(&name_s) {
+                    // assoc read with a general key expression
+                    let key = self.expr_str(key_e)?;
+                    self.arrays.insert(name_s.clone());
+                    return Ok(format!("shAgetKey(__a_{name_s}, __k_{name_s}, {key})"));
+                }
+                let key = self.array_idx_num(key_e)?;
                 self.helper("aget");
-                self.arrays.insert(sanitize(name));
-                Ok(format!("shAget(__a_{}, {key})", sanitize(name)))
+                self.arrays.insert(name_s.clone());
+                Ok(format!("shAget(__a_{name_s}, {key})"))
             }
             IrExpr::Call { func, args, .. } if func == "arrayLen" => {
                 let name = str_arg(args, 0).ok_or("arrayLen: no name")?;
-                self.arrays.insert(sanitize(name));
-                Ok(format!("String.valueOf(__a_{}.size())", sanitize(name)))
+                // `${#map[@]}` / `${#!map[@]}`: strip the key-listing `!`
+                let bare = name.trim_start_matches('!').trim_start_matches('#');
+                self.arrays.insert(sanitize(bare));
+                Ok(format!("String.valueOf(__a_{}.size())", sanitize(bare)))
             }
             IrExpr::Index { var, key } => {
                 let k = self.expr_num(key)?;
@@ -2493,8 +2557,9 @@ impl JavaRender {
             }
             IrExpr::Call { func, args, .. } if func == "arrayLen" => {
                 let name = str_arg(args, 0).ok_or("arrayLen: no name")?;
-                self.arrays.insert(sanitize(name));
-                Ok(format!("__a_{}.size()", sanitize(name)))
+                let bare = name.trim_start_matches('!').trim_start_matches('#');
+                self.arrays.insert(sanitize(bare));
+                Ok(format!("__a_{}.size()", sanitize(bare)))
             }
             other => {
                 let s = self.expr_str(other)?;
@@ -2533,6 +2598,19 @@ impl JavaRender {
                 }
             }
         })
+    }
+
+    /// An assoc-map key as a Java string expression: literals stay
+    /// literal, `$`-bearing keys expand natively via expand_dollars.
+    fn assoc_key(&mut self, idx: &str) -> Result<String, String> {
+        let t = idx.trim();
+        if !t.contains('$') {
+            return Ok(jstr(t));
+        }
+        if self.dollar_expand_ok(t) {
+            return self.expand_dollars(t);
+        }
+        Err(format!("assoc key not expandable natively: {t:?}"))
     }
 
     // ── parameter expansion ──────────────────────────────────────────
@@ -2585,6 +2663,13 @@ impl JavaRender {
                     // ${arr[idx]} arrives as param("", "arr[idx]")
                     let arr = &name[..lb];
                     let idx = &name[lb + 1..name.len() - 1];
+                    let arr_s = sanitize(arr);
+                    if self.assoc.contains(&arr_s) {
+                        // assoc read: string-keyed lookup
+                        let key = self.assoc_key(idx)?;
+                        self.arrays.insert(arr_s.clone());
+                        return Ok(format!("shAgetKey(__a_{arr_s}, __k_{arr_s}, {key})"));
+                    }
                     if let Ok(k) = idx.trim().parse::<i64>() {
                         self.arrays.insert(sanitize(arr));
                         self.helper("aget");
@@ -2657,6 +2742,14 @@ impl JavaRender {
                     self.helper("len");
                     let bare2 = name.trim_start_matches('#').to_string();
                     return Ok(format!("String.valueOf(shLen({}))", self.getvar_str(&bare2)?));
+                }
+                // `${!map[@]}` in VALUE context: the KEY join (insertion
+                // order). Offsets on keys are vanishingly rare — full join.
+                if name.starts_with('!') {
+                    let ks = sanitize(&aname);
+                    self.assoc.insert(ks.clone());
+                    self.arrays.insert(ks.clone());
+                    return Ok(format!("String.join(\" \", __k_{ks})"));
                 }
                 // ARRAY slice: ${arr[@]:off:len} — element join, not string.
                 // The core drops the @ marker when the var is a known array,
@@ -4116,6 +4209,20 @@ fn helper_src(name: &str) -> Option<&'static str> {
         long i = idx < 0 ? a.size() + idx : idx;
         if (i < 0 || i >= a.size()) return "";
         return a.get((int) i);
+    }
+"#,
+        // Assoc-map storage: __a_<name> holds values, __k_<name> holds keys
+        // in insertion order. Numeric operations never touch the key list.
+        "asetkey" => r#"    static void shAsetKey(List<String> a, List<String> k, String key, String val) {
+        int i = k.indexOf(key);
+        if (i < 0) { k.add(key); a.add(val); }
+        else a.set(i, val);
+    }
+"#,
+        "agetkey" => r#"    static String shAgetKey(List<String> a, List<String> k, String key) {
+        int i = k.indexOf(key);
+        if (i < 0 || i >= a.size()) return "";
+        return a.get(i);
     }
 "#,
         "writefile" => r#"    static void shWriteFile(String path, String content, boolean append) throws IOException {
