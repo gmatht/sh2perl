@@ -319,6 +319,7 @@ impl JavaRender {
         for a in &self.assoc {
             header.push_str(&format!("    static List<String> __k_{a} = new ArrayList<>();\n"));
         }
+        header.push_str("    static PrintStream __fd3 = null;\n    static PrintStream __fd4 = null;\n    static PrintStream __fd5 = null;\n    static PrintStream __fd6 = null;\n    static PrintStream __fd7 = null;\n    static PrintStream __fd8 = null;\n    static PrintStream __fd9 = null;\n");
         header.push('\n');
         // splice header right after the class opening line
         if let Some(pos) = o.find("{\n") {
@@ -723,6 +724,25 @@ impl JavaRender {
             match (r.fd, r.mode.as_str()) {
                 (None, "w") | (None, "wc") | (Some(1), "w") | (Some(1), "wc") => {
                     let t = self.expr_str(&r.target)?;
+                    // >&N (N=3..9): duplicate-write into the N slot
+                    if let Some(slot) = fd_slot_target(&t) {
+                        // echo/printf to an fd slot: print via the slot
+                        // (null slot = closed fd — bash reports rc 1; the
+                        // write itself goes nowhere).
+                        self.tmp_seq += 1;
+                        let sv = format!("__fdv{}", self.tmp_seq);
+                        self.emit(&format!("PrintStream {sv} = {slot};"));
+                        // mark for restore-skipping: slots persist
+                        opened.push(format!("__FDSLOT:{sv}"));
+                        // stash the slot var for the inner emitter: the
+                        // statements below must print to it. Simplest
+                        // sound approach for echo/printf bodies: swap
+                        // System.out for the duration.
+                        self.helper("outswap");
+                        self.emit(&format!("PrintStream __oldFd{sv} = shSwapOut({sv} == null ? shNullStream() : {sv});"));
+                        opened.push(format!("__oldFd{sv}"));
+                        continue;
+                    }
                     self.redir_seq += 1;
                     let v = format!("__oldOut{}", self.redir_seq);
                     self.helper("outswap");
@@ -744,6 +764,9 @@ impl JavaRender {
                     self.helper("errswap");
                     if t == "\"/dev/null\"" {
                         self.emit(&format!("PrintStream {v} = shSwapErr(shNullStream());"));
+                    } else if t == "\"&1\"" {
+                        // 2>&1: stderr follows the CURRENT stdout
+                        self.emit(&format!("PrintStream {v} = shSwapErr(System.out);"));
                     } else {
                         let app = r.mode == "a";
                         self.emit(&format!("PrintStream {v} = shSwapErr(new PrintStream(new FileOutputStream({t}, {app})));"));
@@ -818,14 +841,49 @@ impl JavaRender {
                     self.emit(&format!("Scanner {v} = shSwapIn(new Scanner(new StringReader({content})));"));
                     opened.push(v);
                 }
+                (Some(fd @ 3..=9), m) if m == "w" || m == "wc" || m == "a" => {
+                    // fd N>target / N>>target: open a file (or dup &M) into
+                    // the N slot. `exec 3>file` persists (empty inner), so
+                    // the slot assignment is never restored — matching the
+                    // shell fd table for the common shapes.
+                    let t = self.expr_str(&r.target)?;
+                    let app = m == "a";
+                    if t == "\"&1\"" {
+                        self.emit(&format!("__fd{fd} = System.out;"));
+                    } else if t == "\"&2\"" {
+                        self.emit(&format!("__fd{fd} = System.err;"));
+                    } else if t == "\"&-\"" {
+                        self.emit(&format!("__fd{fd} = null;"));
+                    } else {
+                        self.emit(&format!("__fd{fd} = new PrintStream(new FileOutputStream(shAbs({t}), {app}));"));
+                    }
+                }
+                (Some(fd @ 3..=9), m) if m == "r" || m == "r+" => {
+                    // `N<&0`: fd N aliases stdin — nothing to model (stdin
+                    // IS stdin); accept silently. Real file inputs need a
+                    // modeled fd table — refuse loudly.
+                    let t = self.expr_str(&r.target)?;
+                    if t == "\"&0\"" {
+                        // no-op
+                    } else {
+                        return Err(format!("fd {fd} input redirect not supported by the java renderer"));
+                    }
+                }
                 other => return Err(format!("redirect {:?} not supported by the java renderer", other)),
             }
         }
         for b in inner { self.stmt(b)?; }
         for v in opened.iter().rev() {
-            if v.starts_with("__oldOut") { self.emit(&format!("shRestoreOut({v});")); }
+            if v.starts_with("__FDSLOT:") { continue; }
+            else if v.starts_with("__oldOut") || v.starts_with("__oldFd") { self.emit(&format!("shRestoreOut({v});")); }
             else if v.starts_with("__oldErr") { self.emit(&format!("shRestoreErr({v});")); }
             else { self.emit(&format!("shRestoreIn({v});")); }
+        }
+        // closed-fd writes report rc 1 (bash write-error semantics)
+        for v in opened.iter() {
+            if let Some(sv) = v.strip_prefix("__FDSLOT:") {
+                self.emit(&format!("if ({sv} == null) {{ __SH_RC = 1; }}"));
+            }
         }
         Ok(())
     }
@@ -1801,6 +1859,18 @@ impl JavaRender {
 
     fn push_test_str(&mut self, w: &mut Vec<TestTok>, s: &str) {
         let mut toks = if s.chars().any(|c| c.is_whitespace()) { split_test_text(s) } else { vec![s.to_string()] };
+        // the core sometimes fuses `!` with the operator (`!-e file`
+        // arrives as one string): split a leading `!` before tokenizing
+        let mut split: Vec<String> = Vec::new();
+        for t in toks {
+            if t.len() > 1 && t.starts_with('!') && t[1..].starts_with('-') {
+                split.push("!".to_string());
+                split.push(t[1..].to_string());
+            } else {
+                split.push(t);
+            }
+        }
+        let toks = split;
         // merge an unclosed $( across subsequent tokens (the frontend splits
         // `[[ $(uname -r) == x ]]` into several string args)
         while let Some(last) = toks.last() {
@@ -2345,6 +2415,23 @@ impl JavaRender {
             }
             IrExpr::Capture { expr, .. } => self.capture_expr(expr),
             IrExpr::Call { func, args, .. } if func == "capture" => self.capture_text(args),
+            IrExpr::Call { func, args, .. } if func == "subshell" => {
+                // subshell in value position: snapshot scalars+argv, run
+                // the body for effect, restore — the value is empty
+                // (a subshell produces no value; its stdout belongs to an
+                // enclosing capture, which the caller handles).
+                self.helper("snapshot");
+                self.tmp_seq += 1;
+                let k = self.tmp_seq;
+                self.emit(&format!("String __snap{k} = shSnapshot(); List<String> __snapArgv{k} = new ArrayList<>(__SH_ARGV); long __snapRc{k} = __SH_RC;"));
+                for a in args.iter() {
+                    if let IrExpr::Arrow(stmts) = a {
+                        for st in stmts.iter() { self.stmt(st)?; }
+                    }
+                }
+                self.emit(&format!("shRestore(__snap{k}); __SH_ARGV = __snapArgv{k}; __SH_RC = __snapRc{k};"));
+                Ok("\"\"".to_string())
+            },
             IrExpr::Call { func, args, .. } if func == "fnValue" || func == "fnCall" => {
                 // User-function call in value position: the transpiled
                 // function RETURNS its value as a String (the
@@ -3066,6 +3153,27 @@ impl JavaRender {
             }
             if let Some(t) = target {
                 let t = self.expr_str(t)?;
+                // fd 3+: pass the operator through as bash text — the
+                // child shell owns a real fd table and handles dup/close
+                // (`4>&-`, `>&4`, `3>&-`, `5<&0`) natively.
+                if let Some(fdn) = fd {
+                    if (3..=9).contains(&fdn) {
+                        let op = match mode.as_str() {
+                            "a" => ">>",
+                            "r" | "r+" => "<",
+                            _ => ">",
+                        };
+                        // &N / &- targets are fds, not files — unquoted
+                        if t == "\"&0\"" || t == "\"&1\"" || t == "\"&2\""
+                            || t == "\"&3\"" || t == "\"&4\"" || t == "\"&5\""
+                            || t == "\"&6\"" || t == "\"&7\"" || t == "\"&8\""
+                            || t == "\"&9\"" || t == "\"&-\"" {
+                            let bare = &t[1..t.len() - 1];
+                            return Ok(format!(" + \" {fdn}{op}{bare} \""));
+                        }
+                        return Ok(format!(" + \" {fdn}{op} \" + shQuote({t})"));
+                    }
+                }
                 // fd 2 with a write/append mode is stderr (2> / 2>>);
                 // anything else keeps the stdout/stdin operator.
                 let redir2 = fd == Some(2) && (mode == "w" || mode == "wc" || mode == "a");
@@ -3469,6 +3577,23 @@ fn bare_arith_refs(s: &str) -> String {
         }
     }
     bare
+}
+
+/// A `>&N` / `N>&M` target already rendered as a Java string literal:
+/// return the fd-slot field (`__fdN`) for N=3..9, else None. Matches the
+/// exact jstr output for `"&3"`..`"&9"` — dynamic targets never match.
+fn fd_slot_target(rendered: &str) -> Option<String> {
+    if rendered.len() == 4 && rendered.starts_with('"') && rendered.ends_with('"') {
+        let inner = &rendered[1..3];
+        if inner.len() == 2 && inner.starts_with('&') {
+            if let Some(d) = inner[1..].chars().next() {
+                if ('3'..='9').contains(&d) {
+                    return Some(format!("__fd{d}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Strip one wrapping quote pair (`"add"` → `add`) for case patterns:
