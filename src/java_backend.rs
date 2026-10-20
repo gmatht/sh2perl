@@ -344,7 +344,7 @@ impl JavaRender {
         let all_helpers = [
             "env","len","num","arg","shift","cd","run","runrc","capture","printf",
             "escapes","substr","fnmatch","strip","replace","case","basename",
-            "dirname","div","pow","ftype","readln","split","aset","aget",
+            "dirname","div","pow","ftype","readln","readsplit","split","aset","aget",
             "asetkey","agetkey",
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
@@ -1619,12 +1619,49 @@ impl JavaRender {
                 Ok(())
             }
             "read" => {
-                let target = rest.first()
-                    .and_then(|e| str_arg(std::slice::from_ref(e), 0))
-                    .ok_or("read: no target var")?;
+                // `read [-r] [-d delim] [-n N] [-t sec] [-p prompt] [-a arr]
+                // [-s] [-u fd] [name...]` with optional VAR=value env
+                // prefixes (notably `IFS=:` — split the line on the IFS
+                // delimiter instead of taking it whole).
+                let flat: Vec<&IrExpr> = rest.iter().flat_map(|w| flatten_words(std::slice::from_ref(w))).collect();
+                let mut ifs: Option<String> = None;
+                let mut names: Vec<String> = Vec::new();
+                for w in flat.iter() {
+                    match w {
+                        IrExpr::Object(props) => {
+                            for (k, v) in props.iter() {
+                                if k == "IFS" {
+                                    if let IrExpr::Str(s, _) = v { ifs = Some(s.clone()); }
+                                }
+                            }
+                        }
+                        IrExpr::Str(t, _) if t.starts_with('-') => {}
+                        IrExpr::Str(t, _) => names.push(t.clone()),
+                        IrExpr::Call { func, args, .. } if func == "getVar" => {
+                            if let Some(n) = str_arg(args, 0) { names.push(n.to_string()); }
+                        }
+                        _ => {}
+                    }
+                }
+                let target = names.first().cloned().ok_or("read: no target var")?;
                 self.helper("readln");
-                self.emit(&format!("__v_{} = shReadln(); __SH_RC = (__v_{} == null) ? 1 : 0;",
-                                   sanitize(target), sanitize(target)));
+                for n in names.iter() { self.ensure_field(n); }
+                if names.len() == 1 && ifs.is_none() {
+                    self.emit(&format!("__v_{} = shReadln(); __SH_RC = (__v_{} == null) ? 1 : 0;",
+                                       sanitize(&target), sanitize(&target)));
+                } else {
+                    // multi-var and/or IFS-split read
+                    self.helper("readsplit");
+                    let dl = jstr(ifs.as_deref().unwrap_or(""));
+                    self.emit("{");
+                    self.emit(&format!("    String __line = shReadln();"));
+                    self.emit(&format!("    String[] __flds = shReadSplit(__line, {dl}, {});", names.len()));
+                    for (i, n) in names.iter().enumerate() {
+                        self.emit(&format!("    __v_{} = __flds[{i}];", sanitize(n)));
+                    }
+                    self.emit(&format!("    __SH_RC = (__line == null) ? 1 : 0;"));
+                    self.emit("}");
+                }
                 Ok(())
             }
             "eval" => {
@@ -1913,19 +1950,54 @@ impl JavaRender {
                 Ok(format!("(shCd({d}) == 0)"))
             }
             "read" => {
-                let target = rest.iter()
-                    .flat_map(|e| match e {
-                        IrExpr::Array(xs) => xs.iter().collect::<Vec<_>>(),
-                        other => vec![other],
-                    })
-                    .find_map(|x| match x {
-                        IrExpr::Str(t, _) if !t.starts_with('-') => Some(t.clone()),
-                        _ => None,
-                    })
-                    .ok_or("read cond: no target")?;
+                // `read ... name...` in condition position also honors
+                // VAR=value prefixes (IFS=:) and multi-var splitting. A
+                // multi-target read needs STATEMENTS (split + assign), so
+                // it goes in a per-site boolean helper (statements are
+                // legal there; the call site stays a pure boolean expr).
+                let flat: Vec<&IrExpr> = rest.iter().flat_map(|e| match e {
+                    IrExpr::Array(xs) => xs.iter().collect::<Vec<_>>(),
+                    other => vec![other],
+                }).collect();
+                let mut ifs: Option<String> = None;
+                let mut names: Vec<String> = Vec::new();
+                for x in flat.iter() {
+                    match x {
+                        IrExpr::Object(props) => {
+                            for (k, v) in props.iter() {
+                                if k == "IFS" {
+                                    if let IrExpr::Str(s, _) = v { ifs = Some(s.clone()); }
+                                }
+                            }
+                        }
+                        IrExpr::Str(t, _) if !t.starts_with('-') => names.push(t.clone()),
+                        IrExpr::Call { func, args, .. } if func == "getVar" => {
+                            if let Some(n) = str_arg(args, 0) { names.push(n.to_string()); }
+                        }
+                        _ => {}
+                    }
+                }
+                let target = names.first().cloned().ok_or("read cond: no target")?;
                 self.helper("readln");
-                self.ensure_field(&target);
-                Ok(format!("((__v_{t} = shReadln()) != null)", t = sanitize(&target)))
+                for n in names.iter() { self.ensure_field(n); }
+                if names.len() == 1 && ifs.is_none() {
+                    Ok(format!("((__v_{t} = shReadln()) != null)", t = sanitize(&target)))
+                } else {
+                    self.helper("readsplit");
+                    self.tmp_seq += 1;
+                    let hn = format!("__readc{}", self.tmp_seq);
+                    let dl = jstr(ifs.as_deref().unwrap_or(""));
+                    let mut body = String::new();
+                    body.push_str("        String __line = shReadln();\n");
+                    body.push_str("        if (__line == null) return false;\n");
+                    body.push_str(&format!("        String[] __flds = shReadSplit(__line, {dl}, {});\n", names.len()));
+                    for (i, n) in names.iter().enumerate() {
+                        body.push_str(&format!("        __v_{} = __flds[{i}];\n", sanitize(n)));
+                    }
+                    body.push_str("        return true;\n");
+                    self.java_helpers.push(format!("    static boolean {hn}() throws Exception {{\n{body}    }}\n"));
+                    Ok(format!("{hn}()"))
+                }
             }
             "true" => Ok("true".into()),
             "false" => Ok("false".into()),
@@ -2523,6 +2595,27 @@ impl JavaRender {
                 let t = str_arg(args, 0).unwrap_or_default();
                 if let Some(ast) = crate::shir::parse_arith_native(&t) {
                     Ok(format!("String.valueOf({})", self.arith(&ast)?))
+                } else if t.contains("++") || t.contains("--") {
+                    // ++/-- texts: the core's native parser gates them out,
+                    // but the FULL parser reads them and this renderer's
+                    // arith() lowers IncDec exactly (postfix yields old
+                    // value + stores back; prefix stores + yields new;
+                    // Java evaluates left-to-right like bash). The child
+                    // fallback would be WRONG here — it cannot see
+                    // java-side vars (078: `((j = i++ + ++i))` reads i=2).
+                    match crate::shir::parse_arith(&t) {
+                        Some(ast) => match self.arith(&ast) {
+                            Ok(code) => Ok(format!("String.valueOf({code})")),
+                            Err(_) => {
+                                self.helper("capture");
+                                Ok(format!("shCapture({})", jstr(&format!("echo $(({t}))"))))
+                            }
+                        },
+                        None => {
+                            self.helper("capture");
+                            Ok(format!("shCapture({})", jstr(&format!("echo $(({t}))"))))
+                        }
+                    }
                 } else {
                     // last resort: let bash evaluate the original $((...))
                     // text — a failed evaluation prints an error to stderr
@@ -4640,6 +4733,51 @@ fn helper_src(name: &str) -> Option<&'static str> {
             if (!__SH_IN.hasNextLine()) return null;
             return __SH_IN.nextLine();
         } catch (Exception e) { return null; }
+    }
+"#,
+        "readsplit" => r#"    static String[] shReadSplit(String line, String ifs, int n) {
+        // `read` field splitting: null line (EOF) -> all empty; no names
+        // edge (n==0) -> empty. With an IFS delimiter: split on any of its
+        // chars (non-whitespace IFS) or runs of whitespace (default/blank
+        // IFS); excess fields merge into the LAST var (bash semantics).
+        String[] out = new String[Math.max(n, 0)];
+        java.util.Arrays.fill(out, "");
+        if (line == null || n <= 0) return out;
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        if (ifs.isEmpty()) {
+            for (String p : line.trim().split("\\s+")) {
+                if (!p.isEmpty()) parts.add(p);
+            }
+        } else {
+            boolean ifsWs = false;
+            for (int i = 0; i < ifs.length(); i++) {
+                if (Character.isWhitespace(ifs.charAt(i))) { ifsWs = true; break; }
+            }
+            if (ifsWs) {
+                for (String p : line.trim().split("\\s+")) {
+                    if (!p.isEmpty()) parts.add(p);
+                }
+            } else {
+                StringBuilder cur = new StringBuilder();
+                for (int i = 0; i < line.length(); i++) {
+                    char c = line.charAt(i);
+                    if (ifs.indexOf(c) >= 0) { parts.add(cur.toString()); cur.setLength(0); }
+                    else cur.append(c);
+                }
+                parts.add(cur.toString());
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (i < parts.size()) {
+                if (i == n - 1) {
+                    // last var absorbs the remainder with single spaces
+                    StringBuilder b = new StringBuilder(parts.get(i));
+                    for (int j = i + 1; j < parts.size(); j++) b.append(' ').append(parts.get(j));
+                    out[i] = b.toString();
+                } else out[i] = parts.get(i);
+            }
+        }
+        return out;
     }
 "#,
         "split" => r#"    static List<String> shSplit(long v) { return shSplit(String.valueOf(v)); }
