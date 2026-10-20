@@ -2643,6 +2643,24 @@ impl Render {
                 self.rc_dirty = true;
                 true
             }
+            "cd" => {
+                // real chdir (relative paths, `cd ..`, capture-chains like
+                // `DIR=$(cd /x && pwd)` all observe it). Bare `cd` → HOME.
+                let target = match args.get(1) {
+                    Some(IrExpr::Array(items)) if !items.is_empty() => {
+                        self.expr_str(&items[0])
+                    }
+                    _ => {
+                        self.need_env = true;
+                        "shEnv(\"HOME\")".to_string()
+                    }
+                };
+                self.emit(&format!(
+                    "std.Io.Threaded.chdir({target}) catch {{ sh_rc = 1; }};"
+                ));
+                self.rc_dirty = true;
+                true
+            }
             "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
             _ => false,
         }
@@ -2865,6 +2883,98 @@ impl Render {
         self.rc_dirty = true;
     }
 
+    /// A `&&`/`||`/`!` chain in STATEMENT position: sides run as
+    /// statements (sh_rc records each side's status through the normal
+    /// arms); the connective branches on it. A side that is itself a
+    /// chain recurses. Non-command sides (tests, captures) evaluate for
+    /// effect and set sh_rc from their value.
+    fn chain_stmt(&mut self, lhs: &IrExpr, op: &BinOpKind, rhs: &IrExpr) {
+        if *op == BinOpKind::Not {
+            self.side_stmt(lhs);
+            self.emit("sh_rc = if (sh_rc != 0) 0 else 1;");
+            self.rc_dirty = true;
+            return;
+        }
+        self.side_stmt(lhs);
+        let cond = if *op == BinOpKind::And {
+            "sh_rc == 0"
+        } else {
+            "sh_rc != 0"
+        };
+        self.emit(&format!("if ({cond}) {{"));
+        self.depth += 1;
+        self.side_stmt(rhs);
+        self.depth -= 1;
+        self.emit("}");
+    }
+
+    /// One chain side as a statement: commands run through the shared
+    /// exec arm (user-fns direct, builtins native, externals spawned);
+    /// a nested chain recurses; a test records its real 0/1 status; a
+    /// capture runs for effect (shRun records the child's code); anything
+    /// else is an honest stub.
+    fn side_stmt(&mut self, e: &IrExpr) {
+        match e {
+            IrExpr::BinOp { lhs, op, rhs }
+                if matches!(op, BinOpKind::And | BinOpKind::Or | BinOpKind::Not) =>
+            {
+                self.chain_stmt(lhs, op, rhs);
+            }
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    if self.stmt_builtin(cmd, args) {
+                        return;
+                    }
+                    self.exec_stmt_cmd(cmd, args);
+                    return;
+                }
+                self.mark_todo("chain side without command word");
+            }
+            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let call_args: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(items) => {
+                                Some(items.iter().map(|w| self.expr_str(w)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.need_run = true;
+                    self.emit_fn_call_stmt(name, &call_args);
+                    return;
+                }
+                self.mark_todo("chain side fnCall without name");
+            }
+            IrExpr::Call { func, args } if func == "test" => {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if let Some(c) = self.test_render(s) {
+                        self.emit(&format!("sh_rc = if ({c}) 0 else 1;"));
+                        self.rc_dirty = true;
+                        return;
+                    }
+                }
+                self.sh2_calls.insert("test".into());
+                self.emit("sh_rc = if (sh2Test()) 0 else 1;");
+                self.rc_dirty = true;
+            }
+            IrExpr::Capture { expr, .. } => {
+                if let Some(rendered) = self.capture_expr(expr) {
+                    self.emit(&format!("_ = {rendered};"));
+                    self.rc_dirty = true;
+                    return;
+                }
+                self.sh2_calls.insert("capture".into());
+                self.emit("_ = sh2Capture();");
+                self.rc_dirty = true;
+            }
+            _ => {
+                self.mark_todo(&format!("chain side {e:?}"));
+            }
+        }
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // `$?` regime: every simple command updates the status. Helpers
         // that record a real code (shRun/shRunStmt/shUuRun, `false`,
@@ -2886,6 +2996,258 @@ impl Render {
         if !self.rc_dirty && !diverges {
             self.emit("sh_rc = 0;");
         }
+    }
+
+    /// A single `exec cmd [args]` in STATEMENT position (extracted from
+    /// the Expr-stmt arm so `&&`/`||` chain sides reuse it): builtins with
+    /// native lowering (exit/echo/cd/…) render inline, anything else spawns.
+    fn exec_stmt_cmd(&mut self, cmd: &str, args: &[IrExpr]) {
+        // a user-function call: direct call, not a
+        // process spawn (the capture path already gates
+        // this way; the stmt path called `g` as an
+        // external and failed to compile)
+        if self.user_fns.contains(cmd) {
+            let call_args: Vec<String> = args
+                .get(1)
+                .and_then(|a| match a {
+                    IrExpr::Array(items) => Some(
+                        items.iter().map(|w| self.expr_str(w)).collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            // main must take `init` to forward it (the
+            // need_run gate covers the signature rewrite)
+            self.need_run = true;
+            self.emit_fn_call_stmt(cmd, &call_args);
+            return;
+        }
+        if cmd == "exit" {
+            // bash `exit N` → exit(N); bare `exit` →
+            // the current status (bash `false; exit` → 1)
+            let code = match args.get(1) {
+                Some(IrExpr::Array(items)) if !items.is_empty() => {
+                    self.expr_num(&items[0])
+                }
+                _ => "sh_rc".to_string(),
+            };
+            self.emit(&format!("std.process.exit(@intCast({code}));"));
+            return;
+        }
+        if cmd == "true" {
+            // status 0 no-op
+            self.emit("sh_rc = 0;");
+            return;
+        }
+        if cmd == "false" {
+            // status 1, but the program CONTINUES (bash
+            // `false; echo hi` prints hi and exits 0)
+            self.emit("sh_rc = 1;");
+            self.rc_dirty = true;
+            return;
+        }
+        if cmd == "echo" {
+            let mut parts = Vec::new();
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                // leading -n/-e/-E flags (incl. combined
+                // -ne): -n suppresses the newline; -e/-E
+                // are accepted and ignored (no backslash
+                // escapes in word-split values to expand)
+                let mut newline = true;
+                let mut rest = items.as_slice();
+                while let Some(IrExpr::Str(flag, _)) = rest.first() {
+                    let t = flag.trim();
+                    if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
+                        if t.contains('n') {
+                            newline = false;
+                        }
+                        rest = &rest[1..];
+                    } else {
+                        break;
+                    }
+                }
+                for (i, item) in rest.iter().enumerate() {
+                    if i > 0 {
+                        parts.push(('s', "\" \"".to_string()));
+                    }
+                    parts.extend(self.parts_of(item));
+                }
+                let call = self.print_from_parts(parts, newline);
+                self.emit(&call);
+                return;
+            }
+        }
+        if cmd == "printf" {
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                    let mut parts = Vec::new();
+                    // translate the format's % conversions into
+                    // print_from_parts specs over the arg list
+                    let rest = &items[1..];
+                    let mut argi = 0;
+                    let mut chars = fmt.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '%' {
+                            if chars.peek() == Some(&'%') {
+                                chars.next();
+                                parts.push(('s', Self::zig_str("%")));
+                                continue;
+                            }
+                            // consume flags/width/length
+                            // modifiers (`%lld`, `%u`,
+                            // `%5d`): the value model is
+                            // int-as-string or i64
+                            while let Some(&f) = chars.peek() {
+                                if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
+                                    || f.is_ascii_digit()
+                                    || matches!(f, '-' | '+' | ' ' | '#')
+                                {
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                               let spec = match chars.peek() {
+                                Some('s') => { chars.next(); 's' }
+                                Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
+                                Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
+                                Some('c') => { chars.next(); 's' }
+                                Some('q') => { chars.next(); 'q' }
+                                Some('\n') => { chars.next(); 's' }
+                                _ => { parts.push(('s', Self::zig_str("%"))); continue; }
+                            };
+                            if let Some(a) = rest.get(argi) {
+                                argi += 1;
+                                let pa = self.parts_of(a);
+                                if pa.len() == 1 {
+                                    // a %d over a
+                                    // string-model value
+                                    // (the user-fn
+                                    // convention) prints
+                                    // identically with {s}
+                                    if spec == 'd' && pa[0].0 == 's' {
+                                        parts.push(('s', pa[0].1.clone()));
+                                        continue;
+                                    }
+                                    // %s over a numeric (i64) var:
+                                    // use {d} so the typed var
+                                    // compiles and prints its
+                                    // decimal repr (bash parity)
+                                    if spec == 's' && pa[0].0 == 'd' {
+                                        parts.push(('d', pa[0].1.clone()));
+                                        continue;
+                                    }
+                                    // %q shell-quote: wrap the arg
+                                    // in shellQuote(); for numeric
+                                    // args, convert to string first
+                                    if spec == 'q' {
+                                        if pa[0].0 == 'd' {
+                                            let n = &pa[0].1;
+                                            parts.push((
+                                                'q',
+                                                format!(
+                                                    "std.fmt.allocPrint(std.heap.page_allocator, \"{{d}}\", .{{{}}}) catch \"\"",
+                                                    n
+                                                ),
+                                            ));
+                                        } else {
+                                            parts.push(('q', pa[0].1.clone()));
+                                        }
+                                        continue;
+                                    }
+                                    parts.push((spec, pa[0].1.clone()));
+                                } else {
+                                    parts.push(pa[0].clone());
+                                }
+                             } else {
+                                let arg = if spec == 'q' {
+                                    "\"\"".to_string()
+                                } else if spec == 'd' {
+                                    "0".into()
+                                } else {
+                                    "\"\"".into()
+                                };
+                                parts.push((spec, arg));
+                            }
+                        } else if c == '\\' {
+                            // bash printf escape sequences in
+                            // format strings: \n \t \r \\ \a \b \f \v
+                            // \xHH \NNN
+                            let esc: String = match chars.peek() {
+                                Some('n') => { chars.next(); "\n".to_string() }
+                                Some('t') => { chars.next(); "\t".to_string() }
+                                Some('r') => { chars.next(); "\r".to_string() }
+                                Some('\\') => { chars.next(); "\\".to_string() }
+                                Some('a') => { chars.next(); "\u{7}".to_string() }
+                                Some('b') => { chars.next(); "\u{8}".to_string() }
+                                Some('f') => { chars.next(); "\u{c}".to_string() }
+                                Some('v') => { chars.next(); "\u{b}".to_string() }
+                                Some('x') => {
+                                    chars.next();
+                                    let mut hex = String::new();
+                                    for _ in 0..2 {
+                                        if let Some(h) = chars.peek() {
+                                            if h.is_ascii_hexdigit() {
+                                                hex.push(*h);
+                                                chars.next();
+                                            } else { break; }
+                                        } else { break; }
+                                    }
+                                    if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                                        String::from_utf8_lossy(&[b]).to_string()
+                                    } else {
+                                        "\\x".to_string()
+                                    }
+                                }
+                                Some(d) if ('0'..='7').contains(d) => {
+                                    // octal escape \NNN (1-3 digits)
+                                    let mut oct = String::new();
+                                    oct.push(*d);
+                                    chars.next();
+                                    for _ in 0..2 {
+                                        if let Some(o) = chars.peek() {
+                                            if ('0'..='7').contains(o) {
+                                                oct.push(*o);
+                                                chars.next();
+                                            } else { break; }
+                                        } else { break; }
+                                    }
+                                    if let Ok(b) = u8::from_str_radix(&oct, 8) {
+                                        String::from_utf8_lossy(&[b]).to_string()
+                                    } else {
+                                        "\\".to_string()
+                                    }
+                                }
+                                _ => "\\".to_string(),
+                            };
+                            parts.push(('s', Self::zig_str(&esc)));
+                        } else {
+                            parts.push(('s', Self::zig_str(&c.to_string())));
+                        }
+                    }
+                    let call = self.print_from_parts(parts, false);
+                    self.emit(&call);
+                    return;
+                }
+            }
+        }
+        // external command: in-process uutils when the
+        // library provides it, else fork/exec.
+        // STATEMENT position: the command's stdout must
+        // reach OUR stdout (bash runs it in the
+        // foreground with inherited fds). shRun captures
+        // (for `$(…)`); shRunStmt inherits stdio.
+        // shUuRun writes to fd 1 in-process either way.
+        let argv = self.build_argv(cmd, args);
+        self.need_run = true;
+        self.rc_dirty = true;
+        if Self::uu_ffi_enabled() && Self::uu_cmd_ok(cmd) {
+            self.need_uu_run = true;
+            self.emit(&format!("_ = shUuRun(&[_][]const u8{{{}}});", argv.join(", ")));
+        } else {
+            self.emit(&format!("shRunStmt(&[_][]const u8{{{}}});", argv.join(", ")));
+        }
+        return;
     }
 
     fn stmt_inner(&mut self, s: &IrStmt) {
@@ -3116,251 +3478,7 @@ impl Render {
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                            // a user-function call: direct call, not a
-                            // process spawn (the capture path already gates
-                            // this way; the stmt path called `g` as an
-                            // external and failed to compile)
-                            if self.user_fns.contains(cmd) {
-                                let call_args: Vec<String> = args
-                                    .get(1)
-                                    .and_then(|a| match a {
-                                        IrExpr::Array(items) => Some(
-                                            items.iter().map(|w| self.expr_str(w)).collect(),
-                                        ),
-                                        _ => None,
-                                    })
-                                    .unwrap_or_default();
-                                // main must take `init` to forward it (the
-                                // need_run gate covers the signature rewrite)
-                                self.need_run = true;
-                                self.emit_fn_call_stmt(cmd, &call_args);
-                                return;
-                            }
-                            if cmd == "exit" {
-                                // bash `exit N` → exit(N); bare `exit` →
-                                // the current status (bash `false; exit` → 1)
-                                let code = match args.get(1) {
-                                    Some(IrExpr::Array(items)) if !items.is_empty() => {
-                                        self.expr_num(&items[0])
-                                    }
-                                    _ => "sh_rc".to_string(),
-                                };
-                                self.emit(&format!("std.process.exit(@intCast({code}));"));
-                                return;
-                            }
-                            if cmd == "true" {
-                                // status 0 no-op
-                                self.emit("sh_rc = 0;");
-                                return;
-                            }
-                            if cmd == "false" {
-                                // status 1, but the program CONTINUES (bash
-                                // `false; echo hi` prints hi and exits 0)
-                                self.emit("sh_rc = 1;");
-                                self.rc_dirty = true;
-                                return;
-                            }
-                            if cmd == "echo" {
-                                let mut parts = Vec::new();
-                                if let Some(IrExpr::Array(items)) = args.get(1) {
-                                    // leading -n/-e/-E flags (incl. combined
-                                    // -ne): -n suppresses the newline; -e/-E
-                                    // are accepted and ignored (no backslash
-                                    // escapes in word-split values to expand)
-                                    let mut newline = true;
-                                    let mut rest = items.as_slice();
-                                    while let Some(IrExpr::Str(flag, _)) = rest.first() {
-                                        let t = flag.trim();
-                                        if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
-                                            if t.contains('n') {
-                                                newline = false;
-                                            }
-                                            rest = &rest[1..];
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    for (i, item) in rest.iter().enumerate() {
-                                        if i > 0 {
-                                            parts.push(('s', "\" \"".to_string()));
-                                        }
-                                        parts.extend(self.parts_of(item));
-                                    }
-                                    let call = self.print_from_parts(parts, newline);
-                                    self.emit(&call);
-                                    return;
-                                }
-                            }
-                            if cmd == "printf" {
-                                if let Some(IrExpr::Array(items)) = args.get(1) {
-                                    if let Some(IrExpr::Str(fmt, _)) = items.first() {
-                                        let mut parts = Vec::new();
-                                        // translate the format's % conversions into
-                                        // print_from_parts specs over the arg list
-                                        let rest = &items[1..];
-                                        let mut argi = 0;
-                                        let mut chars = fmt.chars().peekable();
-                                        while let Some(c) = chars.next() {
-                                            if c == '%' {
-                                                if chars.peek() == Some(&'%') {
-                                                    chars.next();
-                                                    parts.push(('s', Self::zig_str("%")));
-                                                    continue;
-                                                }
-                                                // consume flags/width/length
-                                                // modifiers (`%lld`, `%u`,
-                                                // `%5d`): the value model is
-                                                // int-as-string or i64
-                                                while let Some(&f) = chars.peek() {
-                                                    if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
-                                                        || f.is_ascii_digit()
-                                                        || matches!(f, '-' | '+' | ' ' | '#')
-                                                    {
-                                                        chars.next();
-                                                    } else {
-                                                        break;
-                                                    }
-                                                }
-                                                   let spec = match chars.peek() {
-                                                    Some('s') => { chars.next(); 's' }
-                                                    Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
-                                                    Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
-                                                    Some('c') => { chars.next(); 's' }
-                                                    Some('q') => { chars.next(); 'q' }
-                                                    Some('\n') => { chars.next(); 's' }
-                                                    _ => { parts.push(('s', Self::zig_str("%"))); continue; }
-                                                };
-                                                if let Some(a) = rest.get(argi) {
-                                                    argi += 1;
-                                                    let pa = self.parts_of(a);
-                                                    if pa.len() == 1 {
-                                                        // a %d over a
-                                                        // string-model value
-                                                        // (the user-fn
-                                                        // convention) prints
-                                                        // identically with {s}
-                                                        if spec == 'd' && pa[0].0 == 's' {
-                                                            parts.push(('s', pa[0].1.clone()));
-                                                            continue;
-                                                        }
-                                                        // %s over a numeric (i64) var:
-                                                        // use {d} so the typed var
-                                                        // compiles and prints its
-                                                        // decimal repr (bash parity)
-                                                        if spec == 's' && pa[0].0 == 'd' {
-                                                            parts.push(('d', pa[0].1.clone()));
-                                                            continue;
-                                                        }
-                                                        // %q shell-quote: wrap the arg
-                                                        // in shellQuote(); for numeric
-                                                        // args, convert to string first
-                                                        if spec == 'q' {
-                                                            if pa[0].0 == 'd' {
-                                                                let n = &pa[0].1;
-                                                                parts.push((
-                                                                    'q',
-                                                                    format!(
-                                                                        "std.fmt.allocPrint(std.heap.page_allocator, \"{{d}}\", .{{{}}}) catch \"\"",
-                                                                        n
-                                                                    ),
-                                                                ));
-                                                            } else {
-                                                                parts.push(('q', pa[0].1.clone()));
-                                                            }
-                                                            continue;
-                                                        }
-                                                        parts.push((spec, pa[0].1.clone()));
-                                                    } else {
-                                                        parts.push(pa[0].clone());
-                                                    }
-                                                 } else {
-                                                    let arg = if spec == 'q' {
-                                                        "\"\"".to_string()
-                                                    } else if spec == 'd' {
-                                                        "0".into()
-                                                    } else {
-                                                        "\"\"".into()
-                                                    };
-                                                    parts.push((spec, arg));
-                                                }
-                                            } else if c == '\\' {
-                                                // bash printf escape sequences in
-                                                // format strings: \n \t \r \\ \a \b \f \v
-                                                // \xHH \NNN
-                                                let esc: String = match chars.peek() {
-                                                    Some('n') => { chars.next(); "\n".to_string() }
-                                                    Some('t') => { chars.next(); "\t".to_string() }
-                                                    Some('r') => { chars.next(); "\r".to_string() }
-                                                    Some('\\') => { chars.next(); "\\".to_string() }
-                                                    Some('a') => { chars.next(); "\u{7}".to_string() }
-                                                    Some('b') => { chars.next(); "\u{8}".to_string() }
-                                                    Some('f') => { chars.next(); "\u{c}".to_string() }
-                                                    Some('v') => { chars.next(); "\u{b}".to_string() }
-                                                    Some('x') => {
-                                                        chars.next();
-                                                        let mut hex = String::new();
-                                                        for _ in 0..2 {
-                                                            if let Some(h) = chars.peek() {
-                                                                if h.is_ascii_hexdigit() {
-                                                                    hex.push(*h);
-                                                                    chars.next();
-                                                                } else { break; }
-                                                            } else { break; }
-                                                        }
-                                                        if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                                                            String::from_utf8_lossy(&[b]).to_string()
-                                                        } else {
-                                                            "\\x".to_string()
-                                                        }
-                                                    }
-                                                    Some(d) if ('0'..='7').contains(d) => {
-                                                        // octal escape \NNN (1-3 digits)
-                                                        let mut oct = String::new();
-                                                        oct.push(*d);
-                                                        chars.next();
-                                                        for _ in 0..2 {
-                                                            if let Some(o) = chars.peek() {
-                                                                if ('0'..='7').contains(o) {
-                                                                    oct.push(*o);
-                                                                    chars.next();
-                                                                } else { break; }
-                                                            } else { break; }
-                                                        }
-                                                        if let Ok(b) = u8::from_str_radix(&oct, 8) {
-                                                            String::from_utf8_lossy(&[b]).to_string()
-                                                        } else {
-                                                            "\\".to_string()
-                                                        }
-                                                    }
-                                                    _ => "\\".to_string(),
-                                                };
-                                                parts.push(('s', Self::zig_str(&esc)));
-                                            } else {
-                                                parts.push(('s', Self::zig_str(&c.to_string())));
-                                            }
-                                        }
-                                        let call = self.print_from_parts(parts, false);
-                                        self.emit(&call);
-                                        return;
-                                    }
-                                }
-                            }
-                            // external command: in-process uutils when the
-                            // library provides it, else fork/exec.
-                            // STATEMENT position: the command's stdout must
-                            // reach OUR stdout (bash runs it in the
-                            // foreground with inherited fds). shRun captures
-                            // (for `$(…)`); shRunStmt inherits stdio.
-                            // shUuRun writes to fd 1 in-process either way.
-                            let argv = self.build_argv(cmd, args);
-                            self.need_run = true;
-                            self.rc_dirty = true;
-                            if Self::uu_ffi_enabled() && Self::uu_cmd_ok(cmd) {
-                                self.need_uu_run = true;
-                                self.emit(&format!("_ = shUuRun(&[_][]const u8{{{}}});", argv.join(", ")));
-                            } else {
-                                self.emit(&format!("shRunStmt(&[_][]const u8{{{}}});", argv.join(", ")));
-                            }
+                            self.exec_stmt_cmd(cmd, args);
                             return;
                         }
                     }
@@ -3383,6 +3501,19 @@ impl Render {
                             }
                         }
                         self.mark_todo("cstyleFor args");
+                        return;
+                    }
+                }
+                // `A && B` / `A || B` chains: status-driven control flow.
+                // Each side runs as a statement (managing sh_rc through
+                // the same arms as top level); the connective branches on
+                // the recorded status. `!A` inverts it.
+                if let IrExpr::BinOp { lhs, op, rhs } = e {
+                    if matches!(
+                        op,
+                        BinOpKind::And | BinOpKind::Or | BinOpKind::Not
+                    ) {
+                        self.chain_stmt(lhs, op, rhs);
                         return;
                     }
                 }
