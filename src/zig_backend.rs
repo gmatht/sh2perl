@@ -14,14 +14,14 @@
 //!
 //! Zig has no `any` type: every value is statically `i64`, `[]const u8`
 //! or `bool`, and the renderer picks per node — the A2 verdicts decide at
-//! the variable boundaries, and `sh2ToInt`/`sh2IntStr`/`sh2Truthy`
+//! the variable boundaries, and `shToInt`/`shIntStr`/`shTruthy`
 //! convert at the type boundaries. Native arithmetic renders to real Zig
 //! operators (integer division truncates toward zero like bash); `**`
 //! lowers to `std.math.pow`, arith `&&`/`||`/`!` to `@intFromBool`, string
 //! comparisons to `std.mem.eql`/`std.mem.order`.
 
 use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Zig keywords + identifiers the generated program relies on (the `std`
 /// import, the builtin scalar types, the helper/stub names). Everything
@@ -91,12 +91,13 @@ const ZIG_RESERVED: &[&str] = &[
     "undefined",
     "main",
     "stdout",
+    "sh_rc",
     "sh2TODO",
-    "sh2ToInt",
-    "sh2IntStr",
-    "sh2Truthy",
-    "sh2StrCat",
-    "sh2B2S",
+    "shToInt",
+    "shIntStr",
+    "shTruthy",
+    "shStrCat",
+    "shB2S",
 ];
 
 /// sh2.* callee names that collide with a real runtime helper (or the
@@ -104,11 +105,11 @@ const ZIG_RESERVED: &[&str] = &[
 /// call site and the definition agree.
 const RESERVED_STUB: &[&str] = &[
     "sh2TODO",
-    "sh2ToInt",
-    "sh2IntStr",
-    "sh2Truthy",
-    "sh2StrCat",
-    "sh2B2S",
+    "shToInt",
+    "shIntStr",
+    "shTruthy",
+    "shStrCat",
+    "shB2S",
     "sh2Test",
     "sh2Arith",
 ];
@@ -164,10 +165,15 @@ pub struct Render {
     error_fns: BTreeSet<String>,
     /// counter for generated temp names (for-loop item bindings)
     tmp_counter: usize,
-    /// text-ops primitive helpers (sh2Contains/sh2Sub/…) needed
+    /// text-ops primitive helpers (shContains/shSub/…) needed
     need_ext: bool,
     /// sortedIntJoin helper (set-array sort+dedup+join) needed
     need_sorted: bool,
+    /// a `try stdout.print` was emitted at MAIN level (not inside a
+    /// hoisted user fn): main's own stdout prologue is only emitted then
+    /// (a fn-level print uses the fn's private buffer, leaving main's
+    /// `const stdout` unused — a compile error)
+    need_main_stdout: bool,
     /// max/min/sum reduction helpers needed
     need_reduce: bool,
     /// bigint (std.math.big.int.Managed) helpers needed
@@ -176,6 +182,26 @@ pub struct Render {
     need_shquote: bool,
     /// glob matching helper needed (case patterns with wildcards)
     need_glob: bool,
+    /// set when the current statement already assigned sh_rc (external
+    /// run, capture, `false`, real-status test): the stmt() wrapper skips
+    /// the default `sh_rc = 0` reset. Cleared at each stmt() entry so
+    /// nested body statements resolve independently and compounds keep
+    /// last-leaf-wins by construction.
+    rc_dirty: bool,
+    /// user-function names defined in this program (top-level Function
+    /// stmts + subs): a `$(fname …)` capture of one of these is a direct
+    /// call; any other `exec` inside a capture is an EXTERNAL command
+    /// (shRun), never a call to an undeclared Zig fn
+    user_fns: BTreeSet<String>,
+    /// vars read by a nested function from an enclosing function scope
+    /// (bash dynamic scoping): promoted to main-level globals; enclosing
+    /// fns must not shadow them with locals
+    captured: BTreeSet<String>,
+    /// user functions whose trailing `echo [-n] V` became the return value
+    /// (name → trailing newline?): a STATEMENT-position call must print
+    /// that value (bash executes the echo as a side effect);
+    /// capture-position calls consume it silently
+    value_fns: BTreeMap<String, bool>,
 }
 
 /// Render an `IrProgram` to Zig source.
@@ -201,6 +227,59 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_storage = prog.var_storage.iter().cloned().collect();
+    // nested-function names count as defined (a call inside the enclosing
+    // fn is a direct call, never an external)
+    fn collect_fns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Function { name, body, named_blocks, .. } => {
+                    out.insert(name.clone());
+                    collect_fns(body, out);
+                    for (_, b) in named_blocks {
+                        collect_fns(b, out);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_fns(then, out);
+                    for (_, b) in elsifs {
+                        collect_fns(b, out);
+                    }
+                    collect_fns(else_, out);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                    collect_fns(body, out);
+                }
+                IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                    collect_fns(body, out);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    collect_fns(b, out);
+                }
+                IrStmt::Redirect { inner, .. } => collect_fns(inner, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_fns(st, out);
+                    }
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_fns(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_fns(&prog.stmts, &mut r.user_fns);
+    for sub in &prog.subs {
+        r.user_fns.insert(sub.name.clone());
+        collect_fns(&sub.body, &mut r.user_fns);
+    }
+    // dynamic-scoping promotion (nested fn reads of enclosing locals)
+    collect_captured(&prog.stmts, &mut r.captured);
+    for sub in &prog.subs {
+        collect_captured(&sub.body, &mut r.captured);
+    }
     if std::env::var("ZIG_DBG").is_ok() {
         eprintln!("DBG var_types: {:?}", r.var_types);
     }
@@ -215,16 +294,30 @@ fn is_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The single value of a trailing `echo V` statement (the function-return
-/// convention), or None for any other shape.
-fn trailing_echo_value(s: &IrStmt) -> Option<IrExpr> {
+/// The single value of a trailing `echo [-n] V` statement (the
+/// function-return convention), plus whether it ends with a newline.
+/// None for any other shape.
+fn trailing_echo_value(s: &IrStmt) -> Option<(IrExpr, bool)> {
     if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
         if func == "exec" {
             if let Some(IrExpr::Str(cmd, _)) = args.first() {
                 if cmd == "echo" {
                     if let Some(IrExpr::Array(items)) = args.get(1) {
-                        if items.len() == 1 {
-                            return items.first().cloned();
+                        let mut rest = items.as_slice();
+                        let mut newline = true;
+                        while let Some(IrExpr::Str(flag, _)) = rest.first() {
+                            let t = flag.trim();
+                            if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
+                                if t.contains('n') {
+                                    newline = false;
+                                }
+                                rest = &rest[1..];
+                            } else {
+                                break;
+                            }
+                        }
+                        if rest.len() == 1 {
+                            return rest.first().cloned().map(|v| (v, newline));
                         }
                     }
                 }
@@ -429,14 +522,17 @@ impl Render {
                     n.to_string()
                 } else {
                     self.need_toint = true;
-                    format!("sh2ToInt({})", Self::zig_str(s))
+                    format!("shToInt({})", Self::zig_str(s))
                 }
             }
             IrExpr::Var(name, _) => {
+                if name == "?" {
+                    return "sh_rc".to_string();
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
-                    return "sh2ToInt(sh2GetVar())".to_string();
+                    return "shToInt(sh2GetVar())".to_string();
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
@@ -444,14 +540,17 @@ impl Render {
                     m
                 } else {
                     self.need_toint = true;
-                    format!("sh2ToInt({m})")
+                    format!("shToInt({m})")
                 }
             }
             IrExpr::Ident(name) => {
+                if name == "?" {
+                    return "sh_rc".to_string();
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
-                    return "sh2ToInt(sh2GetVar())".to_string();
+                    return "shToInt(sh2GetVar())".to_string();
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
@@ -459,7 +558,7 @@ impl Render {
                     m
                 } else {
                     self.need_toint = true;
-                    format!("sh2ToInt({m})")
+                    format!("shToInt({m})")
                 }
             }
             IrExpr::Arith(a) => {
@@ -489,7 +588,7 @@ impl Render {
             }
             IrExpr::BinOp { lhs: _, op, rhs: _ } if *op == BinOpKind::Concat => {
                 self.need_toint = true;
-                format!("sh2ToInt({})", self.expr_str(e))
+                format!("shToInt({})", self.expr_str(e))
             }
             IrExpr::BinOp { lhs, op, rhs } if *op == BinOpKind::Pow => {
                 let (l, r) = (self.expr_num(lhs), self.expr_num(rhs));
@@ -515,11 +614,11 @@ impl Render {
                             return m;
                         }
                         self.need_toint = true;
-                        return format!("sh2ToInt({m})");
+                        return format!("shToInt({m})");
                     }
                 }
                 self.need_toint = true;
-                format!("sh2ToInt({})", self.call_str("getVar", args))
+                format!("shToInt({})", self.call_str("getVar", args))
             }
             IrExpr::Call { func, args } => self.call_num(func, args),
             IrExpr::Ternary { cond, then, else_ } => format!(
@@ -530,7 +629,7 @@ impl Render {
             ),
             other => {
                 self.need_toint = true;
-                format!("sh2ToInt({})", self.expr_str(other))
+                format!("shToInt({})", self.expr_str(other))
             }
         }
     }
@@ -550,7 +649,7 @@ impl Render {
                 if self.is_num(name) {
                     // an INT-homed var read in string context converts
                     self.need_intstr = true;
-                    return format!("sh2IntStr({m})");
+                    return format!("shIntStr({m})");
                 }
                 m
             }
@@ -568,10 +667,10 @@ impl Render {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
-                    return format!("sh2BigIntStr({t})");
+                    return format!("shBigIntStr({t})");
                 }
                 self.need_intstr = true;
-                format!("sh2IntStr({})", self.arith(a))
+                format!("shIntStr({})", self.arith(a))
             }
             IrExpr::Bool(b) => {
                 if *b {
@@ -595,26 +694,30 @@ impl Render {
                 ) =>
             {
                 self.need_b2s = true;
-                format!("sh2B2S({})", self.expr_bool(e))
+                format!("shB2S({})", self.expr_bool(e))
             }
             IrExpr::BinOp { lhs, op, rhs } if *op == BinOpKind::Concat => {
                 self.need_cat = true;
-                format!("sh2StrCat({}, {})", self.expr_str(lhs), self.expr_str(rhs))
+                format!("shStrCat({}, {})", self.expr_str(lhs), self.expr_str(rhs))
             }
             IrExpr::BinOp { .. } => {
                 self.need_intstr = true;
-                format!("sh2IntStr({})", self.expr_num(e))
+                format!("shIntStr({})", self.expr_num(e))
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.declared(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
-                        if self.is_str(name) {
-                            return m;
+                        // mirror the var's HOME (is_num), not the verdict:
+                        // an un-verdictable var (no A2 entry) is string-homed
+                        // — the old is_str test wrapped those in shIntStr
+                        // and broke compilation (t41_local_var)
+                        if self.is_num(name) {
+                            self.need_intstr = true;
+                            return format!("shIntStr({m})");
                         }
-                        self.need_intstr = true;
-                        return format!("sh2IntStr({m})");
+                        return m;
                     }
                 }
                 self.call_str("getVar", args)
@@ -738,7 +841,7 @@ impl Render {
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_truthy = true;
-                    return "sh2Truthy(sh2GetVar())".to_string();
+                    return "shTruthy(sh2GetVar())".to_string();
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
@@ -752,7 +855,7 @@ impl Render {
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_truthy = true;
-                    return "sh2Truthy(sh2GetVar())".to_string();
+                    return "shTruthy(sh2GetVar())".to_string();
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
@@ -812,7 +915,7 @@ impl Render {
                     }
                 }
                 self.need_truthy = true;
-                format!("sh2Truthy({})", self.call_str("getVar", args))
+                format!("shTruthy({})", self.call_str("getVar", args))
             }
             IrExpr::Call { func, args } => self.call_bool(func, args),
             IrExpr::Ternary { cond, then, else_ } => format!(
@@ -825,31 +928,31 @@ impl Render {
             IrExpr::Index { .. } => {
                 self.sh2_calls.insert("arrayIndex".into());
                 self.need_truthy = true;
-                format!("sh2Truthy(sh2ArrayIndex())")
+                format!("shTruthy(sh2ArrayIndex())")
             }
             IrExpr::Capture { expr, .. } => {
                 self.need_truthy = true;
                 if let Some(rendered) = self.capture_expr(expr) {
-                    format!("sh2Truthy({rendered})")
+                    format!("shTruthy({rendered})")
                 } else {
                     self.sh2_calls.insert("capture".into());
-                    format!("sh2Truthy(sh2Capture())")
+                    format!("shTruthy(sh2Capture())")
                 }
             }
             IrExpr::Regex { .. } => {
                 self.sh2_calls.insert("regex".into());
                 self.need_truthy = true;
-                format!("sh2Truthy(sh2Regex())")
+                format!("shTruthy(sh2Regex())")
             }
             IrExpr::DefinedOr { .. } => {
                 self.sh2_calls.insert("definedOr".into());
                 self.need_truthy = true;
-                format!("sh2Truthy(sh2DefinedOr())")
+                format!("shTruthy(sh2DefinedOr())")
             }
             IrExpr::MethodCall { .. } => {
                 self.sh2_calls.insert("methodCall".into());
                 self.need_truthy = true;
-                format!("sh2Truthy(sh2MethodCall())")
+                format!("shTruthy(sh2MethodCall())")
             }
             IrExpr::Json(v) => match v {
                 serde_json::Value::String(s) => format!("({} .len != 0)", Self::zig_str(s)),
@@ -951,7 +1054,7 @@ impl Render {
             IrExpr::Bool(_) => ('b', self.expr_bool(e)),
             // a user-function call returns the STRING model — print it
             // with {s} (a %d of int 42 and {s} of "42" produce the same
-            // stdout); a numeric context would coerce via sh2ToInt
+            // stdout); a numeric context would coerce via shToInt
             IrExpr::Call { func, .. } if func == "fnValue" || func == "fnCall" => {
                 ('s', self.expr_str(e))
             }
@@ -999,14 +1102,14 @@ impl Render {
                     if self.bigint_vars.contains(name) {
                         self.need_bigint = true;
                         let m = self.zig_ident(name);
-                        return ('s', format!("sh2BigIntStr({m})"));
+                        return ('s', format!("shBigIntStr({m})"));
                     }
                     if self.is_num(name) {
                         self.mark_read(name);
                         return ('d', self.expr_num(e));
                     }
                     // a DECLARED non-num var homes as a string — print it
-                    // raw (sh2IntStr would wrap a []const u8 in an i64
+                    // raw (shIntStr would wrap a []const u8 in an i64
                     // conversion and fail to compile)
                     if self.declared(name) {
                         // NB: mark_read — skipping it emits a spurious
@@ -1072,13 +1175,13 @@ impl Render {
                     let idx: usize = name.parse().unwrap_or(1);
                     self.need_toint = true;
                     return format!(
-                        "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                        "shToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
                     );
                 }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
-                    return "sh2ToInt(sh2GetVar())".to_string();
+                    return "shToInt(sh2GetVar())".to_string();
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
@@ -1086,7 +1189,7 @@ impl Render {
                     m
                 } else {
                     self.need_toint = true;
-                    format!("sh2ToInt({m})")
+                    format!("shToInt({m})")
                 }
             }
             ArithAst::Index { var, .. } => {
@@ -1600,12 +1703,12 @@ impl Render {
                 let idx: usize = name.parse().unwrap_or(1);
                 self.need_toint = true;
                 return format!(
-                    "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                    "shToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
                 );
             }
             self.sh2_calls.insert("getVar".into());
             self.need_toint = true;
-            return "sh2ToInt(sh2GetVar())".to_string();
+            return "shToInt(sh2GetVar())".to_string();
         }
         if self.declared(name) {
             let m = self.zig_ident(name);
@@ -1614,11 +1717,11 @@ impl Render {
                 return m;
             }
             self.need_toint = true;
-            return format!("sh2ToInt({m})");
+            return format!("shToInt({m})");
         }
         self.sh2_calls.insert("getVar".into());
         self.need_toint = true;
-        "sh2ToInt(sh2GetVar())".to_string()
+        "shToInt(sh2GetVar())".to_string()
     }
 
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
@@ -1626,7 +1729,7 @@ impl Render {
             "fnValue" | "fnCall" => {
                 // a user-function call: name(args...) — values flow as
                 // strings (the positional-param convention); a numeric
-                // context coerces via sh2ToInt at the read site
+                // context coerces via shToInt at the read site
                 let orig = args
                     .first()
                     .and_then(|a| match a {
@@ -1650,30 +1753,39 @@ impl Render {
             "capture" | "captureWords" => {
                 // `$(fn args…)` of a user function DEFINED in this
                 // program: call it and use its return value. The capture
-                // body is a single `exec fn [args]`.
+                // body is a single `exec fn [args]`. An `exec` of anything
+                // else is an EXTERNAL command — render the native capture
+                // (shRun), never a call to an undeclared Zig fn.
                 if let Some(IrExpr::Arrow(stmts)) = args.first() {
                     if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
                         if func == "exec" {
                             if let Some(IrExpr::Str(fname, _)) = cargs.first() {
-                                let m = self.zig_ident(fname);
-                                let call_args: Vec<String> = cargs
-                                    .get(1)
-                                    .and_then(|a| match a {
-                                        IrExpr::Array(items) => Some(
-                                            items.iter().map(|e| self.expr_str(e)).collect(),
-                                        ),
-                                        _ => None,
-                                    })
-                                    .unwrap_or_default();
-                                let catch = if self.error_fns.contains(fname) {
-                                    " catch \"\""
-                                } else {
-                                    ""
-                                };
-                                return format!(
-                                    "{m}(init, &[_][]const u8{{ {} }}){catch}",
-                                    call_args.join(", ")
-                                );
+                                if self.user_fns.contains(fname) {
+                                    let m = self.zig_ident(fname);
+                                    let call_args: Vec<String> = cargs
+                                        .get(1)
+                                        .and_then(|a| match a {
+                                            IrExpr::Array(items) => Some(
+                                                items.iter().map(|e| self.expr_str(e)).collect(),
+                                            ),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    let catch = if self.error_fns.contains(fname) {
+                                        " catch \"\""
+                                    } else {
+                                        ""
+                                    };
+                                    return format!(
+                                        "{m}(init, &[_][]const u8{{ {} }}){catch}",
+                                        call_args.join(", ")
+                                    );
+                                }
+                                if let Some(arrow) = args.first() {
+                                    if let Some(rendered) = self.capture_expr(arrow) {
+                                        return rendered;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1696,16 +1808,22 @@ impl Render {
                         self.mark_read(name);
                         return m;
                     }
+                    // `$?` — the last recorded exit status (C backend's
+                    // _sh_rc convention)
+                    if name == "?" {
+                        self.need_intstr = true;
+                        return "shIntStr(sh_rc)".to_string();
+                    }
                     // undeclared (env) var: read the process environment
                     self.need_env = true;
-                    return format!("sh2Env({})", Self::zig_str(name));
+                    return format!("shEnv({})", Self::zig_str(name));
                 }
                 self.sh2_stub("getVar", "getVar")
             }
             "test" => {
                 // a [ ... ] result in string context (rare; e.g. `x=$( [ .. ] )`)
                 self.need_b2s = true;
-                format!("sh2B2S({})", self.call_bool(func, args))
+                format!("shB2S({})", self.call_bool(func, args))
             }
             "split" => {
                 // word splitting: a single value with default IFS (no
@@ -1733,7 +1851,7 @@ impl Render {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
                         self.need_sorted = true;
-                        return format!("sh2SortedIntJoin(&{m}, {m}_len)");
+                        return format!("shSortedIntJoin(&{m}, {m}_len)");
                     }
                 }
                 self.sh2_stub("sortedIntJoin", "sortedIntJoin")
@@ -1745,7 +1863,7 @@ impl Render {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
                         self.need_sorted = true;
-                        return format!("sh2SortedBigintJoin(&{m}, {m}_len)");
+                        return format!("shSortedBigintJoin(&{m}, {m}_len)");
                     }
                 }
                 self.sh2_stub("sortedBigintJoin", "sortedBigintJoin")
@@ -1772,12 +1890,12 @@ impl Render {
                 if let Some(IrExpr::Str(sv, _)) = args.first() {
                     if let Some(x) = self.arith_text(sv) {
                         self.need_intstr = true;
-                        return format!("sh2IntStr({x})");
+                        return format!("shIntStr({x})");
                     }
                 }
                 self.need_intstr = true;
                 self.sh2_calls.insert("arith".into());
-                format!("sh2IntStr(sh2ArithStub())")
+                format!("shIntStr(sh2ArithStub())")
             }
             _ => self.sh2_stub(func, func),
         }
@@ -1808,7 +1926,7 @@ impl Render {
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
                 self.need_toint = true;
-                format!("sh2ToInt({})", self.call_str(func, args))
+                format!("shToInt({})", self.call_str(func, args))
             }
         }
     }
@@ -1847,7 +1965,7 @@ impl Render {
             }
             "getVar" => {
                 self.need_truthy = true;
-                format!("sh2Truthy({})", self.call_str(func, args))
+                format!("shTruthy({})", self.call_str(func, args))
             }
             "exec" => {
                 // builtin true/false used as a condition
@@ -1869,11 +1987,11 @@ impl Render {
                     }
                 }
                 self.need_truthy = true;
-                format!("sh2Truthy({})", self.call_str(func, args))
+                format!("shTruthy({})", self.call_str(func, args))
             }
             _ => {
                 self.need_truthy = true;
-                format!("sh2Truthy({})", self.call_str(func, args))
+                format!("shTruthy({})", self.call_str(func, args))
             }
         }
     }
@@ -2012,7 +2130,7 @@ impl Render {
                 }
                 // a string-homed var in an arith cond — coerce
                 self.need_toint = true;
-                return format!("sh2ToInt({m})");
+                return format!("shToInt({m})");
             }
             return "0".into();
         }
@@ -2063,7 +2181,7 @@ impl Render {
     ///
     /// The lowered shape is `Capture { expr: Arrow([Expr(Call{exec|builtin,
     /// [cmd, args]})]) }` (the pipeline case nests a `pipeline` call, which
-    /// stays a stub). A capture is exactly `sh2Run` on that argv: `sh2Run`
+    /// stays a stub). A capture is exactly `shRun` on that argv: `shRun`
     /// already trims the trailing newline the way `$( )` does, so the simple
     /// single-command form renders NATIVELY with no runtime helper.
     fn capture_expr(&mut self, expr: &IrExpr) -> Option<String> {
@@ -2096,14 +2214,17 @@ impl Render {
         }
         let argv = self.build_argv(&cmd, args);
         self.need_run = true;
+        // a capture records the child's real status in sh_rc (bash:
+        // `x=$(false); echo $?` → 1), so the stmt wrapper must not reset it
+        self.rc_dirty = true;
         // Route through the in-process uutils arm only for a command the
         // linked library actually provides (uu_run returns 127 and prints
         // NOTHING otherwise, which would silently drop the output).
         let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(&cmd) {
             self.need_uu_run = true;
-            "sh2UuRun"
+            "shUuRun"
         } else {
-            "sh2Run"
+            "shRun"
         };
         Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
     }
@@ -2129,6 +2250,9 @@ impl Render {
     /// Parts → one `try stdout.print("fmt", .{args});` statement.
     fn print_from_parts(&mut self, parts: Vec<(char, String)>, newline: bool) -> String {
         self.need_stdout = true;
+        if !self.in_function {
+            self.need_main_stdout = true;
+        }
         let mut fmt = String::new();
         let mut args: Vec<String> = Vec::new();
         for (spec, e) in parts {
@@ -2166,7 +2290,7 @@ impl Render {
                 self.mark_read(name);
                 if self.bigint_vars.contains(name) {
                     self.need_bigint = true;
-                    vec![('s', format!("sh2BigIntStr({m})"))]
+                    vec![('s', format!("shBigIntStr({m})"))]
                 } else if self.is_num(name) {
                     vec![('d', m)]
                 } else {
@@ -2182,7 +2306,7 @@ impl Render {
                 self.mark_read(name);
                 if self.bigint_vars.contains(name) {
                     self.need_bigint = true;
-                    vec![('s', format!("sh2BigIntStr({m})"))]
+                    vec![('s', format!("shBigIntStr({m})"))]
                 } else if self.is_num(name) {
                     vec![('d', m)]
                 } else {
@@ -2217,7 +2341,7 @@ impl Render {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
-                    vec![('s', format!("sh2BigIntStr({t})"))]
+                    vec![('s', format!("shBigIntStr({t})"))]
                 } else {
                     vec![('d', self.arith(a))]
                 }
@@ -2284,13 +2408,13 @@ impl Render {
                         va
                     } else {
                         self.need_toint = true;
-                        format!("sh2ToInt({va})")
+                        format!("shToInt({va})")
                     };
                     let vb = if nb {
                         vb
                     } else {
                         self.need_toint = true;
-                        format!("sh2ToInt({vb})")
+                        format!("shToInt({vb})")
                     };
                     Some(format!("({va} {o} {vb})"))
                 } else if let Some(o) = str_op {
@@ -2298,13 +2422,13 @@ impl Render {
                     let (vb, nb) = self.test_operand(b);
                     let va = if na {
                         self.need_intstr = true;
-                        format!("sh2IntStr({va})")
+                        format!("shIntStr({va})")
                     } else {
                         va
                     };
                     let vb = if nb {
                         self.need_intstr = true;
-                        format!("sh2IntStr({vb})")
+                        format!("shIntStr({vb})")
                     } else {
                         vb
                     };
@@ -2321,7 +2445,7 @@ impl Render {
                 let (vv, nv) = self.test_operand(v);
                 let vv = if nv {
                     self.need_intstr = true;
-                    format!("sh2IntStr({vv})")
+                    format!("shIntStr({vv})")
                 } else {
                     vv
                 };
@@ -2331,7 +2455,7 @@ impl Render {
                 let (vv, nv) = self.test_operand(v);
                 let vv = if nv {
                     self.need_intstr = true;
-                    format!("sh2IntStr({vv})")
+                    format!("shIntStr({vv})")
                 } else {
                     vv
                 };
@@ -2341,7 +2465,7 @@ impl Render {
                 let (vv, nv) = self.test_operand(v);
                 let vv = if nv {
                     self.need_intstr = true;
-                    format!("sh2IntStr({vv})")
+                    format!("shIntStr({vv})")
                 } else {
                     vv
                 };
@@ -2352,12 +2476,12 @@ impl Render {
                 let (vv, nv) = self.test_operand(v);
                 let vv = if nv {
                     self.need_intstr = true;
-                    format!("sh2IntStr({vv})")
+                    format!("shIntStr({vv})")
                 } else {
                     vv
                 };
                 self.need_fexist = true;
-                Some(format!("sh2FileTest({}, {vv})", Self::zig_str(*flag)))
+                Some(format!("shFileTest({}, {vv})", Self::zig_str(*flag)))
             }
             _ => None,
         }
@@ -2405,27 +2529,27 @@ impl Render {
             "ReadLine" => {
                 self.need_ext = true;
                 // rendered INSIDE main → init.io is in scope at the call
-                Some("sh2ReadLine(init.io)".to_string())
+                Some("shReadLine(init.io)".to_string())
             }
             "StrLen" => {
                 self.need_intstr = true;
-                Some(format!("sh2IntStr(@intCast(({}).len))", child(self, 0)?))
+                Some(format!("shIntStr(@intCast(({}).len))", child(self, 0)?))
             }
             "CaseTransform" => {
                 let n = node.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()?;
                 self.need_ext = true;
-                Some(format!("sh2Case({}, {})", child(self, 0)?, if n.upper { "true" } else { "false" }))
+                Some(format!("shCase({}, {})", child(self, 0)?, if n.upper { "true" } else { "false" }))
             }
             "SubStrExtract" => {
                 self.need_ext = true;
                 let off = child(self, 1)?;
                 let len = ch.get(2).map(|e| self.expr_num(e)).unwrap_or_else(|| "-1".into());
-                Some(format!("sh2Sub({}, {}, {})", child(self, 0)?, off, len))
+                Some(format!("shSub({}, {}, {})", child(self, 0)?, off, len))
             }
             "StringContains" => {
                 self.need_ext = true;
-                let b = format!("sh2Contains({}, {})", child(self, 0)?, child(self, 1)?);
-                if bool_ctx { Some(b) } else { self.need_b2s = true; Some(format!("sh2B2S({})", b)) }
+                let b = format!("shContains({}, {})", child(self, 0)?, child(self, 1)?);
+                if bool_ctx { Some(b) } else { self.need_b2s = true; Some(format!("shB2S({})", b)) }
             }
             "RegSub" => {
                 // pattern must be a LITERAL (no regex metachars) — zig has
@@ -2435,13 +2559,13 @@ impl Render {
                 // only) is a NAMED primitive here: trim trailing newlines
                 if !n.global && n.pattern == "\n+$" {
                     self.need_ext = true;
-                    return Some(format!("sh2TrimRightNl({})", child(self, 0)?));
+                    return Some(format!("shTrimRightNl({})", child(self, 0)?));
                 }
                 if n.pattern.chars().any(|c| ".*+?[](){}|^$\\\\".contains(c) || c == '"') {
                     return None;
                 }
                 self.need_ext = true;
-                Some(format!("sh2ReplaceLit({}, {}, {}, {})",
+                Some(format!("shReplaceLit({}, {}, {}, {})",
                     child(self, 0)?,
                     Self::zig_str(&n.pattern),
                     Self::zig_str(&n.replacement),
@@ -2468,7 +2592,7 @@ impl Render {
                 self.need_ext = true;
                 let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
                 let arr = format!("&[_]usize{{ {} }}", list);
-                Some(format!("sh2Fields(std.heap.page_allocator, {}, {}, {}, {})",
+                Some(format!("shFields(std.heap.page_allocator, {}, {}, {}, {})",
                     child(self, 0)?,
                     Self::zig_str(&n.delimiter),
                     arr,
@@ -2484,30 +2608,287 @@ impl Render {
                 if n.bytes {
                     let t = child(self, 0)?;
                     return Some(if n.from_end {
-                        format!("sh2Sub({}, if ({t}.len > {}) {t}.len - {} else 0)", t, cnt, cnt)
+                        format!("shSub({}, if ({t}.len > {}) {t}.len - {} else 0)", t, cnt, cnt)
                     } else {
-                        format!("sh2Sub({}, 0, {})", t, cnt)
+                        format!("shSub({}, 0, {})", t, cnt)
                     });
                 }
-                Some(format!("sh2TakeLines({}, {}, {})", child(self, 0)?, cnt, if n.from_end { "true" } else { "false" }))
+                Some(format!("shTakeLines({}, {}, {})", child(self, 0)?, cnt, if n.from_end { "true" } else { "false" }))
             }
             "PathName" => {
                 let n = node.as_any().downcast_ref::<crate::shir_nodes::PathName>()?;
                 self.need_ext = true;
-                let f = if n.which == "dirname" { "sh2Dirname" } else { "sh2Basename" };
+                let f = if n.which == "dirname" { "shDirname" } else { "shBasename" };
                 Some(format!("{}({})", f, child(self, 0)?))
             }
             "StringTrim" => {
                 let n = node.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
                 self.need_ext = true;
-                Some(format!("sh2TrimSides({}, {}, {})",
+                Some(format!("shTrimSides({}, {}, {})",
                     child(self, 0)?, if n.leading { "true" } else { "false" }, if n.trailing { "true" } else { "false" }))
             }
             _ => None,
         }
     }
 
+    /// Statement-position shell builtins that the core leaves as
+    /// `exec`/`builtin` calls but that must NOT spawn a process:
+    /// `local`/`declare`/`export`/`readonly` (declaration + assignment),
+    /// `:` (no-op). Returns true when handled (the caller returns).
+    /// Anything unrecognized returns false → the external path.
+    fn stmt_builtin(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
+        match cmd {
+            ":" => {
+                self.emit("sh_rc = 0;");
+                self.rc_dirty = true;
+                true
+            }
+            "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
+            _ => false,
+        }
+    }
+
+    /// A `$name`/`${name}`/literal word inside a `local`-family value
+    /// (mirrors the perl backend's declare_value_expr): bare `$3` arrives
+    /// UNEXPANDED in glued `NAME=value` words, so the backend resolves it.
+    /// None → declare the name bare (perl's behavior), never guess.
+    fn declare_value_expr(&mut self, value: &str) -> Option<String> {
+        if value.is_empty() {
+            return None;
+        }
+        let user = |n: &str| {
+            !n.is_empty()
+                && (n.as_bytes()[0].is_ascii_alphabetic() || n.as_bytes()[0] == b'_')
+                && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        };
+        let special = |n: &str| {
+            matches!(n, "@" | "*" | "#" | "?" | "!" | "-")
+                || (n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+        };
+        if let Some(n) = value.strip_prefix('$') {
+            if user(n) || special(n) {
+                return Some(self.declare_name_read(n));
+            }
+            return None;
+        }
+        if let Some(inner) = value
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+        {
+            if user(inner) || special(inner) {
+                return Some(self.declare_name_read(inner));
+            }
+            return None;
+        }
+        if value.contains(['$', '`', '\\', '"', '\'']) {
+            return None;
+        }
+        Some(Self::zig_str(value))
+    }
+
+    /// A shared-var read in string position for declare values (the getVar
+    /// string behavior: positional params, `$?`, typed homes, env fallback).
+    fn declare_name_read(&mut self, name: &str) -> String {
+        if self.in_function && !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+            let idx: usize = name.parse().unwrap_or(1);
+            return format!("(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")");
+        }
+        if name == "?" {
+            self.need_intstr = true;
+            return "shIntStr(sh_rc)".to_string();
+        }
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            if self.is_num(name) {
+                self.need_intstr = true;
+                return format!("shIntStr({m})");
+            }
+            return m;
+        }
+        self.need_env = true;
+        format!("shEnv({})", Self::zig_str(name))
+    }
+
+    /// `local`/`declare`/`export`/`readonly` with static `NAME[=value]`
+    /// words: declare (hoisted like Declare) + assign. Words are glued
+    /// (`NAME=` + value parts may arrive split); leading flags skipped.
+    /// Unparseable shapes return false (external fallback).
+    fn stmt_declare(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
+        let items = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return cmd == "readonly",
+        };
+        // flatten one level (a quoted word may arrive as a nested Array)
+        let mut words: Vec<&IrExpr> = Vec::new();
+        for it in items {
+            if let IrExpr::Array(inner) = it {
+                words.extend(inner.iter());
+            } else {
+                words.push(it);
+            }
+        }
+        // (name, value-items) per word; unparseable → external fallback
+        let mut decls: Vec<(String, Vec<&IrExpr>)> = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            match words[i] {
+                IrExpr::Str(s, _) => {
+                    if s.starts_with('-') && !s.contains('=') {
+                        i += 1; // flags (-a, -r, -p, …)
+                        continue;
+                    }
+                    match s.find('=') {
+                        Some(eq) => {
+                            let name = s[..eq].to_string();
+                            if name.is_empty() || !is_ident(&name) {
+                                return false;
+                            }
+                            let mut val: Vec<&IrExpr> = Vec::new();
+                            if !s[eq + 1..].is_empty() {
+                                val.push(words[i]);
+                            }
+                            i += 1;
+                            while i < words.len() {
+                                match words[i] {
+                                    IrExpr::Str(t, _) if t.contains('=') => break,
+                                    _ => {
+                                        val.push(words[i]);
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            decls.push((name, val));
+                        }
+                        None => {
+                            if !is_ident(s) {
+                                return false;
+                            }
+                            decls.push((s.clone(), Vec::new()));
+                            i += 1;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        for (name, val) in decls {
+            self.mark_written(&name);
+            let m = self.zig_ident(&name);
+            if val.is_empty() {
+                self.emit(&format!("// {cmd} {m}"));
+                continue;
+            }
+            // rebuild the value expr: a glued `NAME=rest` first word
+            // contributes only its post-`=` slice as a literal — unless it
+            // is the ONLY value part, in which case `$`-refs resolve
+            // (bare `$3` arrives unexpanded in glued words)
+            let glued_only = val.len() == 1
+                && matches!(val[0], IrExpr::Str(s, _) if s.contains('='));
+            if glued_only {
+                if let IrExpr::Str(s, _) = val[0] {
+                    let rest = &s[s.find('=').unwrap() + 1..];
+                    match self.declare_value_expr(rest) {
+                        Some(rhs) => {
+                            self.emit(&format!("{m} = {rhs};"));
+                        }
+                        None => {
+                            self.emit(&format!("// {cmd} {m} (unresolvable value)"));
+                        }
+                    }
+                    continue;
+                }
+            }
+            let mut parts: Vec<InterpPart> = Vec::new();
+            for (vi, v) in val.iter().enumerate() {
+                match v {
+                    IrExpr::Str(s, _) if vi == 0 && s.contains('=') => {
+                        let rest = &s[s.find('=').unwrap() + 1..];
+                        if !rest.is_empty() {
+                            parts.push(InterpPart::Lit(rest.to_string()));
+                        }
+                    }
+                    IrExpr::Str(s, _) => parts.push(InterpPart::Lit(s.clone())),
+                    other => parts.push(InterpPart::Expr(Box::new((*other).clone()))),
+                }
+            }
+            let vexpr = if parts.len() == 1 {
+                if val.len() == 1 {
+                    // single literal word — keep the original node so
+                    // numeric literals stay numeric (expr_num parses)
+                    (*val[0]).clone()
+                } else {
+                    IrExpr::Interpolate(parts)
+                }
+            } else {
+                IrExpr::Interpolate(parts)
+            };
+            let rhs = if self.is_num(&name) {
+                self.expr_num(&vexpr)
+            } else {
+                self.expr_str(&vexpr)
+            };
+            self.emit(&format!("{m} = {rhs};"));
+        }
+        true
+    }
+
+    /// A user-function call in STATEMENT position: the call runs for its
+    /// side effects, and when the fn is a value-fn (its trailing echo
+    /// became the return value) that echo is a side-effect print in bash —
+    /// so print the returned value. Capture-position callers consume the
+    /// value silently instead. `catch {}` (not `try`): this line must also
+    /// compile inside non-error-union user functions.
+    fn emit_fn_call_stmt(&mut self, name: &str, call_args: &[String]) {
+        let m = self.zig_ident(name);
+        let catch = if self.error_fns.contains(name) {
+            " catch \"\""
+        } else {
+            ""
+        };
+        let call = format!(
+            "{m}(init, &[_][]const u8{{ {} }}){catch}",
+            call_args.join(", ")
+        );
+        if let Some(newline) = self.value_fns.get(name).copied() {
+            if !self.in_function {
+                self.need_main_stdout = true;
+            }
+            let fmt = if newline { "{s}\\n" } else { "{s}" };
+            self.emit(&format!("stdout.print(\"{fmt}\", .{{{call}}}) catch {{}};"));
+            self.emit("stdout.flush() catch {};");
+        } else {
+            self.emit(&format!("_ = {call};"));
+        }
+        // the body runs at runtime and manages sh_rc through its own
+        // leaves — keep, don't reset
+        self.rc_dirty = true;
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
+        // `$?` regime: every simple command updates the status. Helpers
+        // that record a real code (shRun/shRunStmt/shUuRun, `false`,
+        // real-status tests) set rc_dirty; anything else falls through to
+        // the native-success reset. Compounds (if/loops/case/subshells)
+        // need no handling: their bodies render through stmt(), so the
+        // last executed leaf wins exactly like bash. Flow-diverting
+        // statements (break/continue/return/exit) take no reset — it
+        // would be unreachable code, which zig rejects.
+        self.rc_dirty = false;
+        self.stmt_inner(s);
+        // a diverging `return` (inside a user function) takes no reset —
+        // it would be unreachable code, which zig rejects. A top-level
+        // return is a status-2 no-op (bash keeps running), so it resets
+        // normally (usually already dirty).
+        let diverges =
+            matches!(s, IrStmt::Break | IrStmt::Continue | IrStmt::Exit(_))
+                || (matches!(s, IrStmt::Return(_)) && self.in_function);
+        if !self.rc_dirty && !diverges {
+            self.emit("sh_rc = 0;");
+        }
+    }
+
+    fn stmt_inner(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
                 // STREAMING line iteration (docs/shir-primitives.md
@@ -2531,7 +2912,7 @@ impl Render {
                 self.mark_written(&fl.var);
                 self.mark_read(&fl.var); // bound by the loop — never a dead var
                 // a read line is ALWAYS a string — pin the A2 verdict so
-                // body reads render as strings, not sh2ToInt coerctions
+                // body reads render as strings, not shToInt coerctions
                 self.var_types.insert(fl.var.clone(), IrType::Str);
                 self.emit(&format!("var {} = std.Io.Dir.cwd().openFile(init.io, {}, .{{}}) catch {{", fh, src));
                 self.emit("    std.process.exit(2);");
@@ -2585,7 +2966,7 @@ impl Render {
                     Some(x) => Self::zig_str(x),
                     None => "\"\"".to_string(),
                 };
-                self.need_ext = true; // sh2GlobName fn
+                self.need_ext = true; // shGlobName fn
                 self.mark_written(&wd.var);
                 self.mark_read(&wd.var);
                 self.var_types.insert(wd.var.clone(), IrType::Str);
@@ -2596,7 +2977,7 @@ impl Render {
                 self.emit("            // -name GLOB on the BASE NAME (independent of -type)");
                 self.emit("            if (nm.len != 0) {");
                 self.emit("                const bn = if (std.mem.lastIndexOfScalar(u8, full, '/')) |ix| full[ix + 1 ..] else full;");
-                self.emit("                if (!sh2GlobName(nm, bn)) return false;");
+                self.emit("                if (!shGlobName(nm, bn)) return false;");
                 self.emit("            }");
                 self.emit("            if (t.len != 0) {");
                 self.emit("                if (std.mem.eql(u8, t, \"d\") != isdir) return false;");
@@ -2645,6 +3026,21 @@ impl Render {
                 // a typed assignment to the var's zig home (dotted struct
                 // names sanitize consistently for reads)
                 if let IrExpr::Call { func, args } = e {
+                    if func == "exec" || func == "builtin" {
+                        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            if self.stmt_builtin(cmd, args) {
+                                return;
+                            }
+                            // a `local`-family builtin the native path
+                            // refused is a STUB (never an external: there is
+                            // no `local` binary — spawning it can only fail)
+                            if matches!(cmd.as_str(), "local" | "declare" | "export" | "readonly" | "typeset") {
+                                self.sh2_calls.insert("declare".into());
+                                self.mark_todo(&format!("{cmd} declaration"));
+                                return;
+                            }
+                        }
+                    }
                     if func == "setVar" {
                         if let (Some(IrExpr::Str(name, _)), Some(value)) =
                             (args.first(), args.get(1))
@@ -2662,7 +3058,6 @@ impl Render {
                     }
                     if func == "fnCall" || func == "fnValue" {
                         if let Some(IrExpr::Str(name, _)) = args.first() {
-                            let m = self.zig_ident(name);
                             self.mark_read(name);
                             let call_args: Vec<String> = args
                                 .get(1)
@@ -2673,15 +3068,8 @@ impl Render {
                                     _ => None,
                                 })
                                 .unwrap_or_default();
-                            let catch = if self.error_fns.contains(name) {
-                                " catch \"\""
-                            } else {
-                                ""
-                            };
-                            self.emit(&format!(
-                                "_ = {m}(&[_][]const u8{{ {} }}){catch};",
-                                call_args.join(", ")
-                            ));
+                            self.need_run = true;
+                            self.emit_fn_call_stmt(name, &call_args);
                             return;
                         }
                     }
@@ -2695,7 +3083,7 @@ impl Render {
                         self.mark_read(var);
                         let d = delta.unsigned_abs();
                         // a STRING-homed var (the C frontend's value model
-                        // for untyped locals) coerces via sh2ToInt
+                        // for untyped locals) coerces via shToInt
                         if self.is_num(var) {
                             let zop = if *delta >= 0 { "+" } else { "-" };
                             self.emit(&format!("{v} {zop}= {d};"));
@@ -2704,7 +3092,7 @@ impl Render {
                             self.need_intstr = true;
                             let op = if *delta >= 0 { "+" } else { "-" };
                             self.emit(&format!(
-                                "{v} = sh2IntStr(sh2ToInt({v}) {op} {d});"
+                                "{v} = shIntStr(shToInt({v}) {op} {d});"
                             ));
                         }
                         return;
@@ -2728,36 +3116,77 @@ impl Render {
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            // a user-function call: direct call, not a
+                            // process spawn (the capture path already gates
+                            // this way; the stmt path called `g` as an
+                            // external and failed to compile)
+                            if self.user_fns.contains(cmd) {
+                                let call_args: Vec<String> = args
+                                    .get(1)
+                                    .and_then(|a| match a {
+                                        IrExpr::Array(items) => Some(
+                                            items.iter().map(|w| self.expr_str(w)).collect(),
+                                        ),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                // main must take `init` to forward it (the
+                                // need_run gate covers the signature rewrite)
+                                self.need_run = true;
+                                self.emit_fn_call_stmt(cmd, &call_args);
+                                return;
+                            }
                             if cmd == "exit" {
-                                // bash `exit N` / bare `exit` → std.process.exit
+                                // bash `exit N` → exit(N); bare `exit` →
+                                // the current status (bash `false; exit` → 1)
                                 let code = match args.get(1) {
                                     Some(IrExpr::Array(items)) if !items.is_empty() => {
                                         self.expr_num(&items[0])
                                     }
-                                    _ => "0".to_string(),
+                                    _ => "sh_rc".to_string(),
                                 };
                                 self.emit(&format!("std.process.exit(@intCast({code}));"));
                                 return;
                             }
                             if cmd == "true" {
                                 // status 0 no-op
+                                self.emit("sh_rc = 0;");
                                 return;
                             }
                             if cmd == "false" {
-                                // status 1: exit nonzero
-                                self.emit("std.process.exit(1);");
+                                // status 1, but the program CONTINUES (bash
+                                // `false; echo hi` prints hi and exits 0)
+                                self.emit("sh_rc = 1;");
+                                self.rc_dirty = true;
                                 return;
                             }
                             if cmd == "echo" {
                                 let mut parts = Vec::new();
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
-                                    for (i, item) in items.iter().enumerate() {
+                                    // leading -n/-e/-E flags (incl. combined
+                                    // -ne): -n suppresses the newline; -e/-E
+                                    // are accepted and ignored (no backslash
+                                    // escapes in word-split values to expand)
+                                    let mut newline = true;
+                                    let mut rest = items.as_slice();
+                                    while let Some(IrExpr::Str(flag, _)) = rest.first() {
+                                        let t = flag.trim();
+                                        if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E') {
+                                            if t.contains('n') {
+                                                newline = false;
+                                            }
+                                            rest = &rest[1..];
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    for (i, item) in rest.iter().enumerate() {
                                         if i > 0 {
                                             parts.push(('s', "\" \"".to_string()));
                                         }
                                         parts.extend(self.parts_of(item));
                                     }
-                                    let call = self.print_from_parts(parts, true);
+                                    let call = self.print_from_parts(parts, newline);
                                     self.emit(&call);
                                     return;
                                 }
@@ -2917,16 +3346,21 @@ impl Render {
                                 }
                             }
                             // external command: in-process uutils when the
-                            // library provides it, else fork/exec
+                            // library provides it, else fork/exec.
+                            // STATEMENT position: the command's stdout must
+                            // reach OUR stdout (bash runs it in the
+                            // foreground with inherited fds). shRun captures
+                            // (for `$(…)`); shRunStmt inherits stdio.
+                            // shUuRun writes to fd 1 in-process either way.
                             let argv = self.build_argv(cmd, args);
                             self.need_run = true;
-                            let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(cmd) {
+                            self.rc_dirty = true;
+                            if Self::uu_ffi_enabled() && Self::uu_cmd_ok(cmd) {
                                 self.need_uu_run = true;
-                                "sh2UuRun"
+                                self.emit(&format!("_ = shUuRun(&[_][]const u8{{{}}});", argv.join(", ")));
                             } else {
-                                "sh2Run"
-                            };
-                            self.emit(&format!("_ = {entry}(&[_][]const u8{{{}}});", argv.join(", ")));
+                                self.emit(&format!("shRunStmt(&[_][]const u8{{{}}});", argv.join(", ")));
+                            }
                             return;
                         }
                     }
@@ -3111,7 +3545,7 @@ impl Render {
                 let p = self.expr_str(path);
                 let c = self.expr_str(content);
                 self.emit(&format!(
-                    "try std.fs.cwd().writeFile(.{{ .sub_path = {p}, .data = {c} }});"
+                    "std.Io.Dir.cwd().writeFile(sh_io orelse return, .{{ .sub_path = {p}, .data = {c} }}) catch return;"
                 ));
             }
             IrStmt::If {
@@ -3160,11 +3594,34 @@ impl Render {
                         .iter()
                         .filter(|p| p.as_str() != "*")
                         .map(|p| {
-                            if p.contains('*') || p.contains('?') || p.contains('[') {
+                            // source quotes are not part of the value: a
+                            // QUOTED pattern is a literal (even `"*"` —
+                            // bash matches only a literal `*`); only an
+                            // UNQUOTED pattern with wildcards is a glob
+                            let (text, quoted) = match p.as_str() {
+                                q if q.len() >= 2
+                                    && q.starts_with('"')
+                                    && q.ends_with('"') =>
+                                {
+                                    (q[1..q.len() - 1].to_string(), true)
+                                }
+                                q if q.len() >= 2
+                                    && q.starts_with('\'')
+                                    && q.ends_with('\'') =>
+                                {
+                                    (q[1..q.len() - 1].to_string(), true)
+                                }
+                                q => (q.to_string(), false),
+                            };
+                            if !quoted
+                                && (text.contains('*')
+                                    || text.contains('?')
+                                    || text.contains('['))
+                            {
                                 self.need_glob = true;
-                                format!("matchGlob({d}, {})", Self::zig_str(p))
+                                format!("matchGlob({d}, {})", Self::zig_str(&text))
                             } else {
-                                format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p))
+                                format!("std.mem.eql(u8, {d}, {})", Self::zig_str(&text))
                             }
                         })
                         .collect();
@@ -3240,8 +3697,8 @@ impl Render {
                         } else {
                             ("[]const u8", elems.join(", "))
                         };
-                        let items_tmp = self.fresh_tmp("sh2_items");
-                        let v_tmp = self.fresh_tmp("sh2_v");
+                        let items_tmp = self.fresh_tmp("sh_items");
+                        let v_tmp = self.fresh_tmp("sh_v");
                         self.emit(&format!("{{"));
                         self.depth += 1;
                         self.emit(&format!("const {items_tmp} = [_]{t}{{{inner}}};"));
@@ -3282,7 +3739,7 @@ impl Render {
                 let code = e
                     .as_ref()
                     .map(|x| self.expr_num(x))
-                    .unwrap_or_else(|| "0".into());
+                    .unwrap_or_else(|| "sh_rc".to_string());
                 self.emit(&format!("std.process.exit(@intCast({code}));"));
             }
             IrStmt::Block(b) => {
@@ -3305,7 +3762,35 @@ impl Render {
                     }
                 }
             }
-            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            IrStmt::Subshell(body) => {
+                // bash subshells are copy-at-fork: assignments inside never
+                // reach the parent. Save every var the body writes, render
+                // inline, restore after (mirrors the perl backend).
+                let mut ws = BTreeSet::new();
+                collect_written(body, &mut ws);
+                let mut saves: Vec<(String, String)> = Vec::new();
+                for w in &ws {
+                    let m = self.zig_ident(w);
+                    let tmp = self.fresh_tmp("sh_subsave");
+                    self.emit(&format!("const {tmp} = {m};"));
+                    saves.push((m, tmp));
+                }
+                for s in body {
+                    self.stmt(s);
+                }
+                for (m, tmp) in saves {
+                    self.emit(&format!("{m} = {tmp};"));
+                }
+            }
+            IrStmt::Background(body) => {
+                for s in body {
+                    self.stmt(s);
+                }
+                // bash `cmd &` reports the LAUNCH status (0), never the
+                // job's — the inline body above already ran, so reset
+                self.emit("sh_rc = 0;");
+            }
+            IrStmt::Block(body) => {
                 for s in body {
                     self.stmt(s);
                 }
@@ -3335,7 +3820,7 @@ impl Render {
                         let p = self.expr_str(&r.target);
                         self.need_writefile = true;
                         self.emit(&format!(
-                            "sh2WriteFile({p}, \"\", {});",
+                            "shWriteFile({p}, \"\", {});",
                             if r.mode == "a" { "true" } else { "false" }
                         ));
                     }
@@ -3356,18 +3841,24 @@ impl Render {
             IrStmt::Return(v) => {
                 if self.in_function {
                     // user-function value return: strings are the value
-                    // model (numeric contexts coerce at the read site)
+                    // model (numeric contexts coerce at the read site).
+                    // A numeric literal also sets the status (bash `f;
+                    // echo $?` sees return N — non-numeric values leave it).
                     let r = v.as_ref().map(|e| self.expr_str(e)).unwrap_or_default();
+                    if let Some(e) = v {
+                        if let IrExpr::Int(n) = e {
+                            self.emit(&format!("sh_rc = {n};"));
+                        }
+                    }
                     self.emit(&format!("return {r};"));
                     return;
                 }
-                match v {
-                    Some(e) => {
-                        let code = self.expr_num(e);
-                        self.emit(&format!("return @intCast({code});"));
-                    }
-                    None => self.emit("return;"),
-                }
+                // top-level `return`: bash errors (stderr, ignored by the
+                // gate) and CONTINUES with $? = 2 (probed) — never a Zig
+                // return from main (type error) nor process exit (bash
+                // keeps running)
+                self.emit("sh_rc = 2;");
+                self.rc_dirty = true;
             }
             IrStmt::Function { name, body, .. } => {
                 // Render as a hoisted Zig fn taking POSITIONAL params:
@@ -3382,51 +3873,37 @@ impl Render {
                 self.in_function = true;
                 let mut saved = std::mem::take(&mut self.out);
                 let n_body = body.len();
+                // did the body already return (trailing echo-value or an
+                // explicit Return)? A value-returning fn that falls off
+                // the end is a compile error — append `return "";`.
+                let mut body_returns = false;
                 for (bi, s) in body.iter().enumerate() {
                     // the single trailing `echo V` becomes the return
                     // value (the caller consumed it as the $(fn) capture)
                     if bi == n_body - 1 {
-                        if let Some(v) = trailing_echo_value(s) {
+                        if let Some((v, nl)) = trailing_echo_value(s) {
                             let r = self.expr_str(&v);
                             self.emit(&format!("return {r};"));
+                            body_returns = true;
+                            self.value_fns.insert(name.clone(), nl);
                             continue;
+                        }
+                        if matches!(s, IrStmt::Return(_)) {
+                            body_returns = true;
                         }
                     }
                     self.stmt(s);
                 }
+                if !body_returns {
+                    self.emit("return \"\";");
+                }
                 std::mem::swap(&mut saved, &mut self.out);
                 self.in_function = prev_in_fn;
-                let mut locals: BTreeSet<String> = BTreeSet::new();
-                for st in body {
-                    if let IrStmt::Assign { targets, .. } = st {
-                        for t in targets {
-                            locals.insert(t.var.clone());
-                        }
-                    }
-                    if let IrStmt::Declare { vars, .. } = st {
-                        for d in vars {
-                            locals.insert(d.name.clone());
-                        }
-                    }
-                    if let IrStmt::For { var, .. } = st {
-                        locals.insert(var.clone());
-                    }
-                    if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
-                        if func == "cstyleFor" {
-                            if let Some(IrExpr::Str(spec, _)) = args.first() {
-                                for part in spec.split(';') {
-                                    let part = part.trim();
-                                    if let Some(eq) = part.find('=') {
-                                        let v = part[..eq].trim();
-                                        if is_ident(v) {
-                                            locals.insert(v.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let mut locals = function_locals(body);
+                // capture-promoted vars stay global (bash dynamic scoping):
+                // a fn-local shadow here would hide the global the nested
+                // fn reads
+                locals.retain(|v| !self.captured.contains(v));
                 self.fn_locals.extend(locals.iter().cloned());
                 let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
                 let uses_args = saved.iter().any(|l| l.contains("__args"));
@@ -3446,12 +3923,12 @@ impl Render {
                     fntext.push_str("    const stdout = &stdout_file_writer.interface;\n");
                 } else {
                     // a pure value-return fn never touches init
-                    fntext.push_str("    _ = init;\n");
+                    fntext.push_str("    _ = &init;\n");
                 }
                 // mark __args used only when the body never reads a param
                 // (Zig rejects an unused function parameter)
                 if !uses_args {
-                    fntext.push_str("    _ = __args;\n");
+                    fntext.push_str("    _ = &__args;\n");
                 }
                 for v in &locals {
                     let m = self.zig_ident(v);
@@ -3476,6 +3953,9 @@ impl Render {
                 fntext.push('\n');
                 fntext.push_str("}\n");
                 self.pending_fns.push(fntext);
+                // defining a function executes nothing (bash: status 0) —
+                // the hoisted body's leaves must not count as executed here
+                self.rc_dirty = false;
             }
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
@@ -3521,6 +4001,10 @@ impl Render {
         }
         // `declared()` consults this during rendering (a var reference
         // before its assignment in source order still lowers natively).
+        // Capture-promoted vars (nested-fn reads of enclosing locals) are
+        // main-level globals even though no top-level statement writes them
+        // (function bodies are excluded from the walk below).
+        written.extend(self.captured.iter().cloned());
         self.written = written.clone();
 
         // set-typed arrays (setArray/setArrayAppend) — lowered to a
@@ -3582,6 +4066,12 @@ impl Render {
 
         // ── preamble: import, helpers, stubs, then main ──
         self.emit("const std = @import(\"std\");");
+        // last-command status (`$?`, the C backend's _sh_rc): recorded by
+        // shRun/shRunStmt/shUuRun and `false`, read by getVar("?"), and the
+        // program's final exit code. Always emitted (file-scope; no
+        // unused-var error) so every read site typechecks.
+        self.emit("");
+        self.emit("var sh_rc: i64 = 0;");
         if !self.sh2_calls.is_empty() {
             self.emit("");
             self.emit("// sh2.* runtime helpers — TODO: implement (harness/sh2-namespace.json)");
@@ -3592,13 +4082,13 @@ impl Render {
         }
         if self.need_toint {
             self.emit("");
-            self.emit("fn sh2ToInt(s: []const u8) i64 {");
+            self.emit("fn shToInt(s: []const u8) i64 {");
             self.emit("    return std.fmt.parseInt(i64, std.mem.trim(u8, s, \" \\t\\n\\r\"), 10) catch 0;");
             self.emit("}");
         }
         if self.need_intstr {
             self.emit("");
-            self.emit("fn sh2IntStr(n: i64) []const u8 {");
+            self.emit("fn shIntStr(n: i64) []const u8 {");
             self.emit(
                 "    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{n}) catch \"\";",
             );
@@ -3606,42 +4096,43 @@ impl Render {
         }
         if self.need_truthy {
             self.emit("");
-            self.emit("fn sh2Truthy(s: []const u8) bool {");
+            self.emit("fn shTruthy(s: []const u8) bool {");
             self.emit("    return s.len != 0;");
             self.emit("}");
         }
         if self.need_cat {
             self.emit("");
-            self.emit("fn sh2StrCat(a: []const u8, b: []const u8) []const u8 {");
+            self.emit("fn shStrCat(a: []const u8, b: []const u8) []const u8 {");
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}\", .{ a, b }) catch \"\";");
             self.emit("}");
         }
         if self.need_b2s {
             self.emit("");
-            self.emit("fn sh2B2S(b: bool) []const u8 {");
+            self.emit("fn shB2S(b: bool) []const u8 {");
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
-        if self.need_env || self.need_run {
+        if self.need_env || self.need_run || self.need_fexist || self.need_writefile {
             // Process handle for the runtime helpers. `Init` is only available
             // inside the emitted `main`, and zig has no way to thread it into a
             // free helper without changing every call site, so the emitted main
-            // publishes it here (see the `sh2_io = init.io;` injection).
+            // publishes it here (see the `sh_io = init.io;` injection).
             self.emit("");
-            self.emit("var sh2_io: ?std.Io = null;");
+            self.emit("var sh_io: ?std.Io = null;");
         }
         if self.need_env {
-            self.emit("var sh2_environ: ?*std.process.Environ.Map = null;");
+            self.emit("var sh_environ: ?*std.process.Environ.Map = null;");
             self.emit("");
-            self.emit("fn sh2Env(name: []const u8) []const u8 {");
-            self.emit("    const m = sh2_environ orelse return \"\";");
+            self.emit("fn shEnv(name: []const u8) []const u8 {");
+            self.emit("    const m = sh_environ orelse return \"\";");
             self.emit("    return m.get(name) orelse \"\";");
             self.emit("}");
         }
         if self.need_fexist {
             self.emit("");
-            self.emit("fn sh2FileTest(flag: []const u8, p: []const u8) bool {");
-            self.emit("    const st = std.fs.cwd().statFile(p) catch return false;");
+            self.emit("fn shFileTest(flag: []const u8, p: []const u8) bool {");
+            self.emit("    const io = sh_io orelse return false;");
+            self.emit("    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return false;");
             self.emit("    if (std.mem.eql(u8, flag, \"-f\")) return st.kind == .file;");
             self.emit("    if (std.mem.eql(u8, flag, \"-d\")) return st.kind == .directory;");
             self.emit("    if (std.mem.eql(u8, flag, \"-e\")) return true;");
@@ -3651,29 +4142,30 @@ impl Render {
         }
         if self.need_writefile {
             self.emit("");
-            self.emit("fn sh2WriteFile(p: []const u8, data: []const u8, append: bool) void {");
-            self.emit("    const f = std.fs.cwd().createFile(p, .{ .truncate = !append }) catch return;");
-            self.emit("    defer f.close();");
-            self.emit("    f.writeAll(data) catch {};");
+            self.emit("fn shWriteFile(p: []const u8, data: []const u8, append: bool) void {");
+            self.emit("    const io = sh_io orelse return;");
+            self.emit("    const f = std.Io.Dir.cwd().createFile(io, p, .{ .truncate = !append }) catch return;");
+            self.emit("    defer f.close(io);");
+            self.emit("    f.writeStreamingAll(io, data) catch {};");
             self.emit("}");
         }
         if self.need_ext {
             self.emit("");
-            self.emit("fn sh2Contains(hay: []const u8, needle: []const u8) bool {");
+            self.emit("fn shContains(hay: []const u8, needle: []const u8) bool {");
             self.emit("    return std.mem.indexOf(u8, hay, needle) != null;");
             self.emit("}");
-            self.emit("fn sh2Sub(t: []const u8, off: i64, len: i64) []const u8 {");
+            self.emit("fn shSub(t: []const u8, off: i64, len: i64) []const u8 {");
             self.emit("    const o: usize = @intCast(@max(0, @min(off, @as(i64, @intCast(t.len)))));");
             self.emit("    if (len < 0) return t[o..];");
             self.emit("    const e: usize = o + @as(usize, @intCast(len));");
             self.emit("    return t[o..@min(e, t.len)];");
             self.emit("}");
-            self.emit("fn sh2Case(t: []const u8, upper: bool) []const u8 {");
+            self.emit("fn shCase(t: []const u8, upper: bool) []const u8 {");
             self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
             self.emit("    for (t, 0..) |c, i| b[i] = if (upper) std.ascii.toUpper(c) else std.ascii.toLower(c);");
             self.emit("    return b;");
             self.emit("}");
-            self.emit("fn sh2ReplaceLit(t: []const u8, pat: []const u8, repl: []const u8, all: bool) []const u8 {");
+            self.emit("fn shReplaceLit(t: []const u8, pat: []const u8, repl: []const u8, all: bool) []const u8 {");
             self.emit("    const i = std.mem.indexOf(u8, t, pat) orelse return t;");
             self.emit("    if (!all) {");
             self.emit("        return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}{s}\", .{ t[0..i], repl, t[i + pat.len ..] }) catch \"\";");
@@ -3696,8 +4188,8 @@ impl Render {
             self.emit("    }");
             self.emit("    return out[0..w];");
             self.emit("}");
-            self.emit("fn sh2Fields(allocator: std.mem.Allocator, t: []const u8, d: []const u8, ids: []const usize, suppress: bool) []const u8 {");
-            self.emit("    if (!sh2Contains(t, d)) return if (suppress) \"\" else t;");
+            self.emit("fn shFields(allocator: std.mem.Allocator, t: []const u8, d: []const u8, ids: []const usize, suppress: bool) []const u8 {");
+            self.emit("    if (!shContains(t, d)) return if (suppress) \"\" else t;");
             self.emit("    const p = std.heap.page_allocator.alloc([]const u8, std.mem.count(u8, t, d) + 1) catch return \"\";");
             self.emit("    var it = std.mem.splitScalar(u8, t, d[0]);");
             self.emit("    var np: usize = 0;");
@@ -3713,7 +4205,7 @@ impl Render {
             self.emit("    }");
             self.emit("    return out.items;");
             self.emit("}");
-            self.emit("fn sh2TakeLines(t: []const u8, k: usize, fromEnd: bool) []const u8 {");
+            self.emit("fn shTakeLines(t: []const u8, k: usize, fromEnd: bool) []const u8 {");
             self.emit("    var lines = std.ArrayList([]const u8).init(std.heap.page_allocator);");
             self.emit("    var it = std.mem.splitScalar(u8, t, '\\n');");
             self.emit("    while (it.next()) |part| lines.append(part) catch return \"\";");
@@ -3722,11 +4214,11 @@ impl Render {
             self.emit("    const e0 = if (fromEnd) n else @min(k, n);");
             self.emit("    return std.mem.join(std.heap.page_allocator, \"\\n\", lines.items[s0..e0]) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2Basename(t: []const u8) []const u8 {");
+            self.emit("fn shBasename(t: []const u8) []const u8 {");
             self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return t;");
             self.emit("    return t[i + 1 ..];");
             self.emit("}");
-            self.emit("fn sh2Dirname(t: []const u8) []const u8 {");
+            self.emit("fn shDirname(t: []const u8) []const u8 {");
             self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return \".\";");
             self.emit("    if (i == 0) return \"/\";");
             self.emit("    return t[0..i];");
@@ -3735,7 +4227,7 @@ impl Render {
             self.emit("var __rl_buf: [4096]u8 = undefined;");
             self.emit("var __rl_rdr: std.Io.File.Reader = undefined;");
             self.emit("var __rl_init: bool = false;");
-            self.emit("fn sh2ReadLine(io: std.Io) []const u8 {");
+            self.emit("fn shReadLine(io: std.Io) []const u8 {");
             self.emit("    if (!__rl_init) {");
             self.emit("        __rl_file = std.Io.File.stdin();");
             self.emit("        __rl_rdr = __rl_file.reader(io, &__rl_buf);");
@@ -3744,23 +4236,23 @@ impl Render {
             self.emit("    const line = __rl_rdr.interface.takeDelimiter('\\n') catch return \"\";");
             self.emit("    return line orelse \"\";");
             self.emit("}");
-self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
+self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("    var s = t;");
             self.emit("    while (s.len > 0 and s[s.len - 1] == '\\n') s = s[0 .. s.len - 1];");
             self.emit("    return s;");
             self.emit("}");
-            self.emit("fn sh2GlobName(pat: []const u8, name: []const u8) bool {");
+            self.emit("fn shGlobName(pat: []const u8, name: []const u8) bool {");
             self.emit("    // fnmatch-style: * ? [cls] — recursive matcher, no regex");
             self.emit("    if (pat.len == 0) return name.len == 0;");
             self.emit("    if (pat[0] == '*') {");
             self.emit("        var k: usize = 0;");
             self.emit("        while (k <= name.len) : (k += 1) {");
-            self.emit("            if (sh2GlobName(pat[1..], name[k..])) return true;");
+            self.emit("            if (shGlobName(pat[1..], name[k..])) return true;");
             self.emit("        }");
             self.emit("        return false;");
             self.emit("    }");
             self.emit("    if (name.len == 0) return false;");
-            self.emit("    if (pat[0] == '?') return sh2GlobName(pat[1..], name[1..]);");
+            self.emit("    if (pat[0] == '?') return shGlobName(pat[1..], name[1..]);");
             self.emit("    if (pat[0] == '[') {");
             self.emit("        const close = std.mem.indexOfScalar(u8, pat, ']') orelse return false;");
             self.emit("        if (close < 2) return false;");
@@ -3775,12 +4267,12 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("                bi += 2;");
             self.emit("            } else if (body[bi] == name[0]) hit = true;");
             self.emit("        }");
-            self.emit("        if (hit != negate) return sh2GlobName(pat[close + 1 ..], name[1..]);");
+            self.emit("        if (hit != negate) return shGlobName(pat[close + 1 ..], name[1..]);");
             self.emit("        return false;");
             self.emit("    }");
-            self.emit("    return pat[0] == name[0] and sh2GlobName(pat[1..], name[1..]);");
+            self.emit("    return pat[0] == name[0] and shGlobName(pat[1..], name[1..]);");
             self.emit("}");
-            self.emit("fn sh2TrimSides(t: []const u8, lead: bool, trail: bool) []const u8 {");
+            self.emit("fn shTrimSides(t: []const u8, lead: bool, trail: bool) []const u8 {");
             self.emit("    var s = t;");
             self.emit("    if (lead) s = std.mem.trimLeft(u8, s, \" \\t\\n\\r\");");
             self.emit("    if (trail) s = std.mem.trimRight(u8, s, \" \\t\\n\\r\");");
@@ -3789,13 +4281,13 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         }
         if self.need_bigint {
             self.emit("");
-            self.emit("fn sh2BigIntStr(v: std.math.big.int.Managed) []const u8 {");
+            self.emit("fn shBigIntStr(v: std.math.big.int.Managed) []const u8 {");
             self.emit("    return v.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
             self.emit("}");
         }
         if self.need_sorted {
             self.emit("");
-            self.emit("fn sh2SortedIntJoin(a: []const i64, n: usize) []const u8 {");
+            self.emit("fn shSortedIntJoin(a: []const i64, n: usize) []const u8 {");
             self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
             self.emit("    for (0..n) |i| ix[i] = i;");
             self.emit("    std.mem.sort(usize, ix, a, struct {");
@@ -3814,7 +4306,7 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    }");
             self.emit("    return out.items;");
             self.emit("}");
-            self.emit("fn sh2SortedBigintJoin(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("fn shSortedBigintJoin(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
             self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
             self.emit("    for (0..n) |i| ix[i] = i;");
             self.emit("    std.mem.sort(usize, ix, a, struct {");
@@ -3836,36 +4328,36 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         }
         if self.need_reduce {
             self.emit("");
-            self.emit("fn sh2Max(a: []const i64, n: usize) []const u8 {");
+            self.emit("fn shMax(a: []const i64, n: usize) []const u8 {");
             self.emit("    if (n == 0) return \"0\";");
             self.emit("    var best = a[0];");
             self.emit("    for (a[1..n]) |v| { if (v > best) best = v; }");
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2Min(a: []const i64, n: usize) []const u8 {");
+            self.emit("fn shMin(a: []const i64, n: usize) []const u8 {");
             self.emit("    if (n == 0) return \"0\";");
             self.emit("    var best = a[0];");
             self.emit("    for (a[1..n]) |v| { if (v < best) best = v; }");
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2Sum(a: []const i64, n: usize) []const u8 {");
+            self.emit("fn shSum(a: []const i64, n: usize) []const u8 {");
             self.emit("    var total: i64 = 0;");
             self.emit("    for (a[0..n]) |v| total += v;");
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{total}) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2MaxBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("fn shMaxBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
             self.emit("    if (n == 0) return \"0\";");
             self.emit("    var best = a[0];");
             self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .gt) best = v; }");
             self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2MinBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("fn shMinBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
             self.emit("    if (n == 0) return \"0\";");
             self.emit("    var best = a[0];");
             self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .lt) best = v; }");
             self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
             self.emit("}");
-            self.emit("fn sh2SumBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("fn shSumBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
             self.emit("    var total = std.math.big.int.Managed.initSet(std.heap.page_allocator, 0) catch return \"\";");
             self.emit("    defer total.deinit();");
             self.emit("    for (a[0..n]) |v| {");
@@ -3882,13 +4374,24 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             // fork/exec arm — always emitted: it is the fallback for any
             // command the FFI library does not provide, and the only arm
             // when SH2_UU_FFI is off.
-            self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
-            self.emit("    const io = sh2_io orelse return \"\";");
+            self.emit("fn shRun(argv: []const []const u8) []const u8 {");
+            self.emit("    const io = sh_io orelse return \"\";");
             self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
             self.emit("        .argv = argv,");
             self.emit("        .stdout_limit = .limited(1 << 20),");
             self.emit("    }) catch return \"\";");
+            self.emit("    sh_rc = switch (result.term) { .exited => |c| @as(i64, c), else => 1 };");
             self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
+            self.emit("}");
+            self.emit("");
+            // statement-position twin: same spawn, but the child INHERITS
+            // our stdio (bash foreground semantics) instead of capturing.
+            // Used by statement-level externals; `$(…)` keeps shRun.
+            self.emit("fn shRunStmt(argv: []const []const u8) void {");
+            self.emit("    const io = sh_io orelse return;");
+            self.emit("    var child = std.process.spawn(io, .{ .argv = argv }) catch { sh_rc = 127; return; };");
+            self.emit("    const term = child.wait(io) catch { sh_rc = 1; return; };");
+            self.emit("    sh_rc = switch (term) { .exited => |c| @as(i64, c), else => 1 };");
             self.emit("}");
         }
         if self.need_uu_run {
@@ -3902,14 +4405,14 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("");
             self.emit("extern fn uu_run(util: [*:0]const u8, argc: c_int, argv: [*]const [*:0]const u8) c_int;");
             self.emit("");
-            self.emit("fn sh2UuRun(argv: []const []const u8) []const u8 {");
+            self.emit("fn shUuRun(argv: []const []const u8) []const u8 {");
             self.emit("    if (argv.len == 0) return \"\";");
             self.emit("    const util_z = std.heap.page_allocator.dupeSentinel(u8, argv[0], 0) catch return \"\";");
             self.emit("    const zargs = std.heap.page_allocator.alloc([*:0]const u8, argv.len) catch return \"\";");
             self.emit("    for (argv, 0..) |a, i| {");
             self.emit("        zargs[i] = std.heap.page_allocator.dupeSentinel(u8, a, 0) catch return \"\";");
             self.emit("    }");
-            self.emit("    _ = uu_run(util_z, @intCast(argv.len), zargs.ptr);");
+            self.emit("    sh_rc = uu_run(util_z, @intCast(argv.len), zargs.ptr);");
             self.emit("    return \"\";");
             self.emit("}");
         }
@@ -4009,6 +4512,11 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         // zig 0.16 errors on a `var` that is never mutated — emit `const`
         // unless the rendered body assigns the name somewhere
         let mut decls: Vec<String> = Vec::new();
+        // capture-promoted vars live at FILE scope (visible to every hoisted
+        // fn); everything else is a main local. File-scope bigint homes are
+        // unsupported (Managed needs `try init`) — those stay main-local as
+        // a known gap.
+        let mut fdecls: Vec<String> = Vec::new();
         // self.written (not the pass-1 local): setVar arms discovered
         // during body rendering add their names here
         let written_now: Vec<String> = self.written.iter().cloned().collect();
@@ -4021,12 +4529,17 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             let mutated = body_stmts.iter().any(|l| {
                 let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
                 pat.iter().any(|p| l.contains(p.as_str()))
-            });
+            // capture-promoted vars are assigned inside functions (their
+            // stores never appear in main's body text) — always mutable
+            }) || self.captured.contains(v);
             let kw = if mutated || self.bigint_vars.contains(v) || self.set_arrays.contains(v) {
                 "var"
             } else {
                 "const"
             };
+            // file-scope when promoted (and not bigint-homed)
+            let file_scope = self.captured.contains(v) && !self.bigint_vars.contains(v);
+            let ind = if file_scope { "" } else { "    " };
             if self.bigint_vars.contains(v) {
                 decls.push(format!(
                     "    {kw} {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);"
@@ -4038,12 +4551,36 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 decls.push(format!("    var {m}_len: usize = 0;"));
             } else if self.set_arrays.contains(v) {
                 // set/list → fixed i64 array + length counter
-                decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
-                decls.push(format!("    var {m}_len: usize = 0;"));
+                if file_scope {
+                    fdecls.push(format!("var {m}: [1024]i64 = undefined;"));
+                    fdecls.push(format!("var {m}_len: usize = 0;"));
+                } else {
+                    decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
+                    decls.push(format!("    var {m}_len: usize = 0;"));
+                }
             } else if self.is_num(v) {
-                decls.push(format!("    {kw} {m}: i64 = 0;"));
+                if file_scope {
+                    fdecls.push(format!("var {m}: i64 = 0;"));
+                } else {
+                    decls.push(format!("    {kw} {m}: i64 = 0;"));
+                }
+            } else if file_scope {
+                fdecls.push(format!("var {m}: []const u8 = \"\";"));
             } else {
                 decls.push(format!("    {kw} {m}: []const u8 = \"\";"));
+            }
+        }
+        if !fdecls.is_empty() {
+            // splice before the `pub fn main` line (file scope)
+            if let Some(pos) = self.out.iter().position(|l| l.starts_with("pub fn main")) {
+                for (j, d) in fdecls.iter().enumerate() {
+                    self.out.insert(pos + j, d.clone());
+                }
+                self.out.insert(pos + fdecls.len(), String::new());
+            } else {
+                for d in &fdecls {
+                    self.emit(d);
+                }
             }
         }
         if !decls.is_empty() {
@@ -4070,7 +4607,7 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 }
             }
         }
-        if self.need_stdout {
+        if self.need_main_stdout {
             self.emit("");
             self.out
                 .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
@@ -4081,18 +4618,18 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
         }
-        if self.need_env || self.need_run {
+        if self.need_env || self.need_run || self.need_fexist || self.need_writefile {
             self.out
-                .push("    sh2_io = init.io;".to_string());
+                .push("    sh_io = init.io;".to_string());
         }
         if self.need_env {
             self.out
-                .push("    sh2_environ = init.environ_map;".to_string());
+                .push("    sh_environ = init.environ_map;".to_string());
         }
-        if !self.need_stdout && !self.need_env && !self.need_run {
+        if !self.need_main_stdout && !self.need_env && !self.need_run && !self.need_fexist && !self.need_writefile {
             // `main` always takes `init`; if nothing consumed the handle the
             // parameter is unused and zig rejects it.
-            self.emit("    _ = init;");
+            self.emit("    _ = &init;");
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");
@@ -4100,12 +4637,399 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
         for line in &body_stmts {
             self.emit(line);
         }
+        // the program's exit code is the last recorded status (bash: the
+        // last command's code). Explicit `exit N` never reaches here.
+        self.emit("    std.process.exit(@intCast(sh_rc));");
         self.emit("}");
         if self.todo > 0 {
             self.emit(&format!(
                 "// {} construct(s) lowered to TODO markers",
                 self.todo
             ));
+        }
+    }
+}
+
+/// Names declared by a statement-position `local`/`declare`/`export`/
+/// `readonly` builtin call (the words the stmt_declare renderer consumes).
+/// Static (Pass-1 usable): only `NAME[=…]` Str words count.
+fn builtin_declare_names(cmd: &str, args: &[IrExpr]) -> Vec<String> {
+    if !matches!(
+        cmd,
+        "local" | "declare" | "export" | "readonly" | "typeset"
+    ) {
+        return Vec::new();
+    }
+    let items = match args.get(1) {
+        Some(IrExpr::Array(items)) => items,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for it in items {
+        let subs: Vec<&IrExpr> = match it {
+            IrExpr::Array(inner) => inner.iter().collect(),
+            other => vec![other],
+        };
+        for w in subs {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && !s.contains('=') {
+                    continue;
+                }
+                let name = s.split('=').next().unwrap_or("");
+                if !name.is_empty() && is_ident(name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Direct-level write targets of a function body (Assign/Declare/for-loop
+/// vars/cstyleFor/builtin `local` — the locals scan). Shared by the
+/// Function arm and the capture-promotion pre-pass.
+fn function_locals(body: &[IrStmt]) -> BTreeSet<String> {
+    let mut locals: BTreeSet<String> = BTreeSet::new();
+    for st in body {
+        if let IrStmt::Assign { targets, .. } = st {
+            for t in targets {
+                locals.insert(t.var.clone());
+            }
+        }
+        if let IrStmt::Declare { vars, .. } = st {
+            for d in vars {
+                locals.insert(d.name.clone());
+            }
+        }
+        if let IrStmt::For { var, .. } = st {
+            locals.insert(var.clone());
+        }
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+            if func == "exec" || func == "builtin" {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    for n in builtin_declare_names(cmd, args) {
+                        locals.insert(n);
+                    }
+                }
+            }
+            if func == "cstyleFor" {
+                if let Some(IrExpr::Str(spec, _)) = args.first() {
+                    for part in spec.split(';') {
+                        let part = part.trim();
+                        if let Some(eq) = part.find('=') {
+                            let v = part[..eq].trim();
+                            if is_ident(v) {
+                                locals.insert(v.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    locals
+}
+
+/// Targets written anywhere under stmts WITHOUT crossing a function
+/// boundary (nested Function bodies are their own scope). Used to tell a
+/// nested function's self-contained writes apart from its reads of outer
+/// locals (which must promote to globals — dynamic scoping).
+fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    out.insert(t.var.clone());
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_targets(body, out);
+            }
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "exec" || func == "builtin" =>
+            {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    for n in builtin_declare_names(cmd, args) {
+                        out.insert(n);
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_targets(then, out);
+                for (_, b) in elsifs {
+                    collect_targets(b, out);
+                }
+                collect_targets(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_targets(body, out);
+            }
+            IrStmt::ForInit { body, .. } => collect_targets(body, out),
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                collect_targets(b, out);
+            }
+            IrStmt::Redirect { inner, .. } => collect_targets(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_targets(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_targets(&c.body, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_targets(body, out);
+                for e in excepts {
+                    collect_targets(&e.body, out);
+                }
+                collect_targets(else_body, out);
+                collect_targets(finally_body, out);
+            }
+            IrStmt::Function { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+/// Names a nested function reads from an enclosing function scope:
+/// (mentions in the nested body) − (the nested body's own targets).
+/// Those promote to main-level globals (bash dynamic scoping); the
+/// enclosing fn must not shadow them with locals.
+fn collect_captured(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    /// reads under one expression (Var/Ident/getVar("name") — the names
+    /// collect_written_expr cannot see: it only walks values, and a
+    /// getVar name is a Str, not a Var)
+    fn reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                out.insert(name.clone());
+            }
+            IrExpr::Call { func, args } => {
+                if func == "getVar" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        out.insert(name.clone());
+                    }
+                }
+                for a in args {
+                    reads_expr(a, out);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                reads_expr(obj, out);
+                for a in args {
+                    reads_expr(a, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                reads_expr(lhs, out);
+                reads_expr(rhs, out);
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                reads_expr(cond, out);
+                reads_expr(then, out);
+                reads_expr(else_, out);
+            }
+            IrExpr::DefinedOr { expr, default, .. } => {
+                reads_expr(expr, out);
+                reads_expr(default, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        reads_expr(x, out);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => reads_expr(expr, out),
+            IrExpr::Arrow(stmts) => reads_stmts(stmts, out),
+            IrExpr::Lambda { body, .. } => reads_stmts(body, out),
+            IrExpr::Index { var, key } => {
+                out.insert(var.clone());
+                reads_expr(key, out);
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    reads_expr(i, out);
+                }
+            }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                reads_expr(iter, out);
+                reads_expr(elem, out);
+                if let Some(c) = cond {
+                    reads_expr(c, out);
+                }
+            }
+            IrExpr::Object(fields) => {
+                for (_, v) in fields {
+                    reads_expr(v, out);
+                }
+            }
+            IrExpr::Arith(a) => reads_arith(a, out),
+            _ => {}
+        }
+    }
+    /// reads under arithmetic (variable leaves)
+    fn reads_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                out.insert(name.clone());
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                reads_arith(lhs, out);
+                reads_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => reads_arith(arg, out),
+            ArithAst::Cond { test, then, else_, .. } => {
+                reads_arith(test, out);
+                reads_arith(then, out);
+                reads_arith(else_, out);
+            }
+            ArithAst::Assign { rhs, .. } => reads_arith(rhs, out),
+            ArithAst::Index { var, key } => {
+                out.insert(var.clone());
+                reads_arith(key, out);
+            }
+            ArithAst::Cast { arg, .. } => reads_arith(arg, out),
+            _ => {}
+        }
+    }
+    /// reads under statements (expression positions only — targets are
+    /// writes, handled by collect_targets; nested Functions recurse)
+    fn reads_stmts(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e)
+                | IrStmt::Output { value: e, .. }
+                | IrStmt::Return(Some(e))
+                | IrStmt::Exit(Some(e))
+                | IrStmt::SetChildError(e) => reads_expr(e, out),
+                IrStmt::Assign { expr, .. } => reads_expr(expr, out),
+                IrStmt::Declare { init: Some(e), .. } => reads_expr(e, out),
+                IrStmt::WriteFile { path, content, .. } => {
+                    reads_expr(path, out);
+                    reads_expr(content, out);
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    reads_expr(cond, out);
+                    reads_stmts(then, out);
+                    for (c, b) in elsifs {
+                        reads_expr(c, out);
+                        reads_stmts(b, out);
+                    }
+                    reads_stmts(else_, out);
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    reads_expr(cond, out);
+                    reads_stmts(body, out);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    reads_expr(iter, out);
+                    reads_stmts(body, out);
+                }
+                IrStmt::ForInit { init, cond, step, body, .. } => {
+                    reads_stmts(init, out);
+                    reads_expr(cond, out);
+                    reads_stmts(step, out);
+                    reads_stmts(body, out);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    reads_stmts(b, out);
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    reads_stmts(inner, out);
+                    for r in redirects {
+                        reads_expr(&r.target, out);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        reads_stmts(st, out);
+                    }
+                }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    reads_expr(discriminant, out);
+                    for c in clauses {
+                        reads_stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    reads_stmts(body, out);
+                    for e in excepts {
+                        reads_stmts(&e.body, out);
+                    }
+                    reads_stmts(else_body, out);
+                    reads_stmts(finally_body, out);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    reads_stmts(body, out);
+                    for (_, b) in named_blocks {
+                        reads_stmts(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for s in stmts {
+        match s {
+            IrStmt::Function { body, named_blocks, .. } => {
+                let mut mentions = BTreeSet::new();
+                reads_stmts(body, &mut mentions);
+                let mut writes = BTreeSet::new();
+                collect_targets(body, &mut writes);
+                for m in mentions.difference(&writes) {
+                    out.insert(m.clone());
+                }
+                // deeper nesting promotes through every level
+                collect_captured(body, out);
+                for (_, b) in named_blocks {
+                    collect_captured(b, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_captured(then, out);
+                for (_, b) in elsifs {
+                    collect_captured(b, out);
+                }
+                collect_captured(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_captured(body, out);
+            }
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => {
+                collect_captured(body, out);
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                collect_captured(b, out);
+            }
+            IrStmt::Redirect { inner, .. } => collect_captured(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_captured(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_captured(&c.body, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                collect_captured(body, out);
+                for e in excepts {
+                    collect_captured(&e.body, out);
+                }
+                collect_captured(else_body, out);
+                collect_captured(finally_body, out);
+            }
+            _ => {}
         }
     }
 }
@@ -4356,7 +5280,17 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 collect_written_expr(i, out);
             }
         }
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args } => {
+            // a `local`/`declare`/`export`/`readonly` builtin call declares
+            // its NAME words (hoisted like Declare) — the values may read
+            // other vars, so still walk the args
+            if func == "exec" || func == "builtin" {
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    for n in builtin_declare_names(cmd, args) {
+                        out.insert(n);
+                    }
+                }
+            }
             for a in args {
                 collect_written_expr(a, out);
             }
@@ -4448,11 +5382,12 @@ mod tests {
     #[test]
     fn untyped_var_uses_runtime_store() {
         let out = render("y=$(ls)\necho \"$y\"\n");
-        // capture assigns are A2-typed Str by the core; the sh2Capture
-        // stub returns []const u8 so the string var assignment compiles
+        // capture assigns are A2-typed Str by the core; a bare `$(cmd)`
+        // renders natively via shRun (the sh2Capture stub is only the
+        // fallback for shapes capture_expr refuses)
         assert!(out.contains("var y: []const u8 = \"\";"), "{out}");
-        assert!(out.contains("y = sh2Capture();"), "{out}");
-        assert!(out.contains("fn sh2Capture() []const u8 {"), "{out}");
+        assert!(out.contains("y = shRun(&[_][]const u8{\"ls\"});"), "{out}");
+        assert!(!out.contains("sh2Capture()"), "{out}");
     }
 
     #[test]
