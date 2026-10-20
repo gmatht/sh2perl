@@ -5030,12 +5030,51 @@ fn exec_line_to_fish(
                             // stops expanding (`"Number: \$i"` printed a literal
                             // `$i` in every loop). So glue and emit -- no second
                             // escaping pass.
+                            // A `$name` expansion that the next literal would
+                            // BIND to (`${var}s` — fish has no `${}`, and inside
+                            // one double-quoted word `$vars` is a different
+                            // variable) must keep the boundary by CLOSING and
+                            // REOPENING the quote: fish concatenates adjacent
+                            // quoted segments ("C: ""$var""s" is `C: xs`), while
+                            // `"{$var}s"` prints the braces. zz-hs-probe printed
+                            // "C: " for `echo "C: ${var}s"`.
+                            let brace_at: Vec<bool> = (0..pj.len())
+                                .map(|i| {
+                                    if i + 1 >= pj.len() {
+                                        return false;
+                                    }
+                                    let inner = pj[i].trim_matches('"');
+                                    let is_bare_var = inner
+                                        .strip_prefix('$')
+                                        .map(|n| {
+                                            !n.is_empty()
+                                                && n.chars().all(|c| {
+                                                    c.is_ascii_alphanumeric() || c == '_'
+                                                })
+                                        })
+                                        .unwrap_or(false);
+                                    let lit = &pj[i + 1];
+                                    let next_ident = lit
+                                        .trim_start_matches('"')
+                                        .chars()
+                                        .next()
+                                        .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        .unwrap_or(false);
+                                    is_bare_var && next_ident
+                                })
+                                .collect();
                             let mut cat = String::new();
-                            for part in &pj {
-                                if part.starts_with('"') && part.ends_with('"') && part.len() >= 2 {
+                            for (i, part) in pj.iter().enumerate() {
+                                let quoted = part.starts_with('"')
+                                    && part.ends_with('"')
+                                    && part.len() >= 2;
+                                if quoted {
                                     cat.push_str(&part[1..part.len() - 1]);
                                 } else {
                                     cat.push_str(part);
+                                }
+                                if brace_at[i] {
+                                    cat.push_str("\"\"");
                                 }
                             }
                             return Ok(format!("printf '%s\\n' \"{cat}\""));
