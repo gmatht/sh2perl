@@ -1891,6 +1891,12 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     None => self.sh2_stub("split", "split"),
                 }
             }
+            "shopt" => {
+                // shell options (`nullglob`, `nocasematch`, `extglob`, …):
+                // known runtime limitation — statement position has its
+                // own arm (records status); value position is "0"
+                "0".to_string()
+            }
             "pipeline" => {
                 // value position (`x=$(a | b)`, nested words): collect the
                 // last stage's output; statement/condition positions have
@@ -3903,6 +3909,66 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
+    /// `y+=2` / `r=$(cmd)` / `x=$y` as an `assign` CALL (the core leaves
+    /// compound assignment as a call, not an Assign node): same homes as
+    /// Assign. Array-homed `+=` appends word-wise (bash appends ELEMENTS).
+    /// None for unmodeled shapes → caller stubs.
+    fn assign_call(&mut self, args: &[IrExpr]) -> bool {
+        let name = match args.first() {
+            Some(IrExpr::Str(n, _)) => n.clone(),
+            _ => return false,
+        };
+        let op = match args.get(1) {
+            Some(IrExpr::Str(o, _)) => o.clone(),
+            _ => return false,
+        };
+        let value = match args.get(2) {
+            Some(v) => v,
+            None => return false,
+        };
+        if !is_ident(&name) {
+            return false;
+        }
+        self.mark_written(&name);
+        let m = self.zig_ident(&name);
+        // array-homed `+=`: append each word (bash element semantics)
+        if op == "+="
+            && (self.set_arrays.contains(&name)
+                || self.str_arrays.contains(&name)
+                || self.bigint_arrays.contains(&name))
+        {
+            if self.bigint_arrays.contains(&name) {
+                return false;
+            }
+            let v = self.expr_str(value);
+            self.emit(&format!("shArrAppendStr(&{m}, &{m}_len, {v});"));
+            self.rc_dirty = true;
+            self.need_ext = true;
+            return true;
+        }
+        let rhs = if self.is_num(&name) {
+            self.expr_num(value)
+        } else {
+            self.expr_str(value)
+        };
+        match op.as_str() {
+            "=" => {
+                self.emit(&format!("{m} = {rhs};"));
+            }
+            "+=" => {
+                if self.is_num(&name) {
+                    self.emit(&format!("{m} += {rhs};"));
+                } else {
+                    self.need_cat = true;
+                    self.emit(&format!("{m} = shStrCat({m}, {rhs});"));
+                }
+            }
+            _ => return false,
+        }
+        self.rc_dirty = true;
+        true
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // `$?` regime: every simple command updates the status. Helpers
         // that record a real code (shRun/shRunStmt/shUuRun, `false`,
@@ -4424,11 +4490,27 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     }
                 }
                 if let IrExpr::Call { func, args } = e {
+                    if func == "assign" {
+                        if self.assign_call(args) {
+                            return;
+                        }
+                        self.sh2_calls.insert("assign".into());
+                        self.mark_todo("assign → sh2.assign");
+                        return;
+                    }
                     if func == "pipeline" {
                         if let Some(rendered) = self.render_pipeline(args, false) {
                             self.emit(&format!("_ = {rendered};"));
                             return;
                         }
+                    }
+                    // `shopt -s opt` — known runtime limitation: accept as
+                    // a successful no-op (status 0); files depending on the
+                    // option fail equivalence honestly
+                    if func == "shopt" {
+                        self.emit("sh_rc = 0;");
+                        self.rc_dirty = true;
+                        return;
                     }
                 }
                 let x = self.expr_any(e);
@@ -4451,6 +4533,18 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 if !t.indices.is_empty() {
                     self.mark_todo("array-index assign");
                     return;
+                }
+                // compound assignment as a call (`y+=2`, `r=$(cmd)`): the
+                // call carries its own target name (== the Assign target)
+                if let IrExpr::Call { func, args } = expr {
+                    if func == "assign" {
+                        if self.assign_call(args) {
+                            return;
+                        }
+                        self.sh2_calls.insert("assign".into());
+                        self.mark_todo("assign → sh2.assign");
+                        return;
+                    }
                 }
                 // set-array writes: `factors = set()` resets the length;
                 // `factors.add(x)` appends (dedup happens at sortedIntJoin).
@@ -5553,6 +5647,16 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    }");
             self.emit("    return out.items;");
             self.emit("}");
+            self.emit("fn shArrAppendStr(a: [][]const u8, n: *usize, text: []const u8) void {");
+            self.emit("    // array `+=` of a joined string: append each word (bash appends");
+            self.emit("    // ELEMENTS, so a multi-word append grows the array by each word)");
+            self.emit("    var it = std.mem.tokenizeAny(u8, text, \" \\t\\n\\r\");");
+            self.emit("    while (it.next()) |w| {");
+            self.emit("        if (n.* >= 1024) return;");
+            self.emit("        a[n.*] = w;");
+            self.emit("        n.* += 1;");
+            self.emit("    }");
+            self.emit("}");
             self.emit("fn shStrArrSlice(a: []const []const u8, n: usize, off: i64, len: i64) []const u8 {");
             self.emit("    // `${arr[@]:off:len}` over a string home: space-joined window,");
             self.emit("    // negative offsets count from the end (bash)");
@@ -6207,6 +6311,13 @@ fn function_locals(body: &[IrStmt]) -> BTreeSet<String> {
                 locals.insert(t.var.clone());
             }
         }
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+            if func == "assign" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    locals.insert(name.clone());
+                }
+            }
+        }
         if let IrStmt::Declare { vars, .. } = st {
             for d in vars {
                 locals.insert(d.name.clone());
@@ -6415,6 +6526,11 @@ fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             IrStmt::Assign { targets, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "assign" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
                 }
             }
             IrStmt::Declare { vars, .. } => {
@@ -6979,6 +7095,12 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                     for n in builtin_declare_names(cmd, args) {
                         out.insert(n);
                     }
+                }
+            }
+            // an `assign` call writes its name (`y+=2`, `r=$(cmd)`)
+            if func == "assign" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
                 }
             }
             for a in args {
