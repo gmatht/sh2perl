@@ -19574,10 +19574,12 @@ mod tests {
     /// `-Og` ones this rule is about, then restore it.
     #[test]
     fn literal_literal_ops_are_widened() {
-        // NOTE: `-Os` is a process-global other tests flip, and the
-        // literal-only subtree below FOLDS under it. Both accepted shapes
-        // therefore carry the suffix — the invariant pinned is that a
-        // literal-only operation never loses its widening either way.
+        // NOTE: `-Os` (the literal-arith fold) is flag state other tests
+        // flip, and the literal-only subtree below FOLDS under it. Pin
+        // the level this test's shapes are asserted at (-Og) rather than
+        // trusting the thread's ambient value, which under pooled test
+        // threads can be a previous test's leftover `-Os`.
+        crate::shir::set_size_opt(false);
         let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
         assert!(
             out.contains("2000000000i64 + 2000000000i64") || out.contains("4000000000i64"),
@@ -19596,6 +19598,7 @@ mod tests {
         assert!(mixed.contains("let x = 1;"), "{mixed}");
         assert!(mixed.contains("x << 2"), "{mixed}");
         assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
+        crate::shir::set_size_opt(false); // restore the default for the thread
     }
 
     #[test]

@@ -106,25 +106,39 @@ pub fn shaderize_enabled() -> bool {
 /// literal arithmetic fold (`shir_passes::optimize::fold_arith_literals`:
 /// `1 + 2` → `3`). Off at `-Og` (the default), whose contract is that the
 /// output resembles the input — a human should see `1 + 2` there.
-static SIZE_OPT: AtomicBool = AtomicBool::new(false);
+///
+/// THREAD-LOCAL, not a process-global `AtomicBool` (2026-10-21). cargo
+/// runs tests on parallel threads and this flag is flip-during-render
+/// state: a test that flips it while ANOTHER test renders made that
+/// render assert the wrong level. Measured on the clean core worktree:
+/// three `cargo test --lib` runs of the SAME commit yielded 21/20/19
+/// failures, the extras being `literal_literal_ops_are_widened` and
+/// `const_string_test_folds_only_with_size_opt` racing each other — the
+/// flake that flapped the core worker's gate RED on a clean tree. The
+/// production CLI sets the flag in `main()` and renders on that same
+/// thread, so thread-local is behaviourally identical there; in tests
+/// each thread gets its own flag, so a flip is invisible to parallel
+/// renders.
+std::thread_local! {
+    static SIZE_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Enable/disable `-Os` size-oriented lowering (default off).
+/// Enable/disable `-Os` size-oriented lowering (default off, per thread).
 pub fn set_size_opt(on: bool) {
-    SIZE_OPT.store(on, std::sync::atomic::Ordering::SeqCst);
+    SIZE_OPT.with(|f| f.set(on));
 }
 
 pub fn size_opt_enabled() -> bool {
-    SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
+    SIZE_OPT.with(|f| f.get())
 }
 
 /// Serializes every test that flips [`SIZE_OPT`].
 ///
-/// `SIZE_OPT` is a process-global, and cargo runs tests on parallel
-/// threads: a test that calls [`set_size_opt`] while ANOTHER test is
-/// rendering observes the wrong level. This is the same hazard the
-/// dual-loop tests already serialize (see `dual_loop_tests`), and it is
-/// a real flake, not a theoretical one — `literal_literal_ops_are_widened`
-/// failed on ~2 runs in 5 purely from scheduling, with no source change.
+/// No longer load-bearing for correctness (the flag is thread-local as of
+/// 2026-10-21), but kept for the tests that already take it: it also
+/// pins the set→render→reset sequence against POOLED-THREAD reuse, where
+/// a test that flips the flag and forgets to restore it would leak `-Os`
+/// into the next test that happens to land on the same worker thread.
 ///
 /// Hold this for the whole set/render/reset sequence. The guard is
 /// re-entrant across the module so several `set_size_opt` tests can each
@@ -6362,7 +6376,14 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // write could tear them mid-emission (the determinism unit tests
     // compile concurrently). Never re-entered: shir_to_estree does not
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    //
+    // Poison-tolerant (2026-10-21): a panic while holding the lock must
+    // not cascade into every later compile in the process. In the test
+    // suite one panicking test under the poisoned mutex produced 178
+    // extra failures — unrelated tests red on `PoisonError`, which hides
+    // the real failing set from any gate. In production a panic unwinds
+    // the CLI out of the process anyway, so no state needs protecting.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let after_optimize = stmts.clone();
     crate::transforms::apply(&mut stmts);
     // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
@@ -31352,7 +31373,9 @@ fn array_migrate_program(program: &mut Program, module_bound: &HashSet<String>) 
 }
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // Poison-tolerant — see the same note at the ast_to_ir lock site
+    // (2026-10-21): one panicking test must not redden the rest.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
     // lowering now emits the rich A1 ForInit node — the shell-flavored
     // renderers never see an unstripped ForInit (REFUSE > GUESS), so
