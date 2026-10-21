@@ -2331,6 +2331,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 out.push_str(var);
                 out.push_str(" (");
                 out.push_str(&line);
+                // (a lone command can still print several lines, so the
+                // collect stays — see the note in assign_rhs_to_fish)
                 out.push_str(" | string collect)\n");
             } else {
                 indent(out, d);
@@ -3022,6 +3024,13 @@ fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
                 return Ok(lift);
             }
             let body = arrow_to_fish(std::slice::from_ref(inner.as_ref()))?;
+            // NOTE: `string collect` is NOT removable for a "single" command.
+            // A lone command can still print MANY lines (`sha256sum a b`,
+            // `ls`), and bash's `$(…)` keeps them as one newline-joined
+            // string while fish's substitution splits them into a list.
+            // Dropping the wrap on the "one command => one line" assumption
+            // regressed 5 files (000__04b/04c/06, readonly-cmdsub,
+            // test_system_builtin).
             Ok(format!("({} | string collect)", collect_wrap_fish(&body)))
         }
         IrExpr::Call { func, args } => match func.as_str() {
