@@ -189,6 +189,10 @@ pub struct Render {
     need_pad: bool,
     /// emit shArgv0 ($0)
     need_argv0: bool,
+    /// `trap 'payload' EXIT` — run at the end of main
+    exit_trap: Option<String>,
+    /// at least one `&` job was forked (reap them before exiting)
+    saw_background: bool,
     /// names that are only ever READ (never a store target)
     read_only_names: BTreeSet<String>,
     /// shopt -s nocasematch in effect (case-insensitive [[ == ]])
@@ -3698,6 +3702,28 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
                 false
             }
+            "trap" => {
+                // `trap 'payload' EXIT` runs the payload when the shell
+                // exits. Capture the payload for the end-of-main hook (other
+                // signals are not modelled — they record status 0).
+                let mut payload: Option<String> = None;
+                let mut sig = String::new();
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if let Some(IrExpr::Str(p, _)) = items.first() {
+                        payload = Some(p.clone());
+                    }
+                    if let Some(IrExpr::Str(sg, _)) = items.get(1) {
+                        sig = sg.clone();
+                    }
+                }
+                if let (Some(p), true) = (payload, sig == "EXIT" || sig == "0") {
+                    self.need_run = true;
+                    self.exit_trap = Some(p);
+                }
+                self.emit("sh_rc = 0;");
+                self.rc_dirty = true;
+                true
+            }
             "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
             _ => false,
         }
@@ -5971,11 +5997,28 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
             }
             IrStmt::Background(body) => {
+                // bash runs the job CONCURRENTLY on a copy of the shell
+                // state (`(sleep 1; echo a) & echo b` prints b first). Fork:
+                // the child flushes our buffered stdout, runs the body
+                // against its own copy (the fork IS the copy), then
+                // _exits; the parent resets the launch status to 0.
+                self.need_run = true;
+                self.need_stdout = true;
+                self.need_main_stdout = true;
+                self.saw_background = true;
+                if !self.in_function {
+                    self.emit("stdout.flush() catch {};");
+                }
+                let pid = self.fresh_tmp("sh_bgpid");
+                self.emit(&format!("const {pid} = std.c.fork();"));
+                self.emit(&format!("if ({pid} == 0) {{"));
+                self.depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
-                // bash `cmd &` reports the LAUNCH status (0), never the
-                // job's — the inline body above already ran, so reset
+                self.emit("std.c._exit(0);");
+                self.depth -= 1;
+                self.emit("}");
                 self.emit("sh_rc = 0;");
             }
             IrStmt::Block(body) => {
@@ -6753,6 +6796,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("fn shB2S(b: bool) []const u8 {");
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
+        }
+        if self.saw_background {
+            self.emit("");
+            self.emit("extern fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;");
         }
         if self.need_env || self.need_run || self.need_fexist || self.need_writefile || self.need_globpat || self.need_source {
             // Process handle for the runtime helpers. `Init` is only available
@@ -7689,6 +7736,27 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
         }
         // the program's exit code is the last recorded status (bash: the
         // last command's code). Explicit `exit N` never reaches here.
+        // an EXIT trap runs on the way out (before the final exit)
+        if let Some(payload) = self.exit_trap.clone() {
+            if !payload.is_empty() {
+                self.need_run = true;
+                self.emit(&format!(
+                    "shRunStmt(&[_][]const u8{{\"sh\", \"-c\", {}}});",
+                    Self::zig_str(&payload)
+                ));
+                self.emit("stdout.flush() catch {};");
+            }
+        }
+        // a script END waits for its background jobs (bash reaps them
+        // before exiting, so their output still reaches stdout)
+        if self.saw_background {
+            // `#include <sys/wait.h>` equivalent: libc's waitpid
+            self.emit("    while (true) {");
+            self.emit("        var __st: c_int = 0;");
+            self.emit("        const __r = waitpid(-1, &__st, 0);");
+            self.emit("        if (__r <= 0) break;");
+            self.emit("    }");
+        }
         self.emit("    std.process.exit(@intCast(sh_rc));");
         self.emit("}");
         if self.todo > 0 {
