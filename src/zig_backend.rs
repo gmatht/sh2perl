@@ -522,9 +522,26 @@ impl Render {
     /// A Zig string literal. Escaped byte-wise so arbitrary (non-UTF-8)
     /// payloads from the shell corpus stay valid Zig and byte-exact.
     fn zig_str(s: &str) -> String {
+        // BYTES, not chars: the markers above stand for individual source
+        // bytes, and every non-ASCII byte is escaped anyway
+        let bytes: Vec<u8> = if s.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32))) {
+            let mut v: Vec<u8> = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                let u = c as u32;
+                if (0xF800..=0xF8FF).contains(&u) {
+                    v.push((u - 0xF800) as u8);
+                } else {
+                    let mut buf = [0u8; 4];
+                    v.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            v
+        } else {
+            s.as_bytes().to_vec()
+        };
         let mut out = String::new();
         out.push('"');
-        for &b in s.as_bytes() {
+        for &b in &bytes {
             match b {
                 b'\\' => out.push_str("\\\\"),
                 b'"' => out.push_str("\\\""),
@@ -7778,6 +7795,9 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("        const __r = waitpid(-1, &__st, 0);");
             self.emit("        if (__r <= 0) break;");
             self.emit("    }");
+            // the child wrote through the same fd; flush after reaping so its
+            // bytes are not lost behind our exit
+            self.emit("    stdout.flush() catch {};");
         }
         self.emit("    std.process.exit(@intCast(sh_rc));");
         self.emit("}");
@@ -8072,7 +8092,22 @@ fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     for n in builtin_declare_names(cmd, args) {
-                        out.insert(n);
+                        out.insert(n.clone());
+                    }
+                    // `unset NAME` MUTATES the name: an enclosing subshell
+                    // must save and restore it (064_20's inner
+                    // `( unset DEBUG )` otherwise leaked into the outer
+                    // scope and printed DEBUG= instead of DEBUG=1)
+                    if cmd == "unset" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(n, _) = w {
+                                    if is_ident(n) {
+                                        out.insert(n.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -8619,7 +8654,26 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_written_expr(&fl.source, out);
                 }
             }
-            IrStmt::Expr(e) => collect_written_expr(e, out),
+            IrStmt::Expr(e) => {
+                // `unset NAME` mutates NAME (nothing else in the expr walker
+                // sees it) — an enclosing subshell must save/restore it
+                if let IrExpr::Call { func, args } = e {
+                    if (func == "exec" || func == "builtin")
+                        && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "unset")
+                    {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(n, _) = w {
+                                    if is_ident(n) {
+                                        out.insert(n.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_written_expr(e, out)
+            }
             IrStmt::Output { value, .. } => collect_written_expr(value, out),
             IrStmt::WriteFile { path, content, .. } => {
                 collect_written_expr(path, out);
