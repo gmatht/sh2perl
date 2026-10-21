@@ -3974,6 +3974,14 @@ fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
         // process to compute a constant that is already on the page.
         IrExpr::Arith(a) => match &**a {
             ArithAst::Num(n) => Ok(n.to_string()),
+            // A PLAIN VARIABLE needs no substitution either: fish's `test`
+            // coerces its operands numerically, with the SAME edge results as
+            // bash's `[ ]` (measured: empty -> rc 2, unset -> rc 2,
+            // non-numeric -> rc 2, on both shells). `(math --scale 0 "$i")`
+            // bought nothing but a process per comparison.
+            ArithAst::Var(n) | ArithAst::Ident(n) if var_ref_needs_no_math(n) => {
+                Ok(format!("\"{}\"", var_ref_to_fish(&n.replace('.', "_"), false)))
+            }
             _ => Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a))),
         },
         // A bare string atom (`[ "$X" = "1" ]` after the core's compare
@@ -11066,4 +11074,43 @@ fn split_literal_fish(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// May this variable be handed to `test` DIRECTLY, instead of through
+/// `(math --scale 0 "$x")`?
+///
+/// `test` coerces numerically and fails rc 2 on a non-numeric value exactly as
+/// bash's `[ ]` does, so a plain read is equivalent. Two kinds of name must
+/// still go through `math`:
+///   * the core's self-describing placeholders (`${#name[@]}` arrives as a
+///     name the arith-length decoder recognises) — those are COMMANDS, not
+///     variables;
+///   * fish's own special names (`$status`, `$argv`, …) are fine, but the
+///     bash-special renames (`?` -> `$status`, `$` -> `$fish_pid`) are only
+///     produced by var_ref_to_fish, so anything the decoder would rewrite
+///     stays on the math path.
+fn var_ref_needs_no_math(name: &str) -> bool {
+    if arith_len_placeholder_fish(name).is_some() {
+        return false;
+    }
+    let mut ok = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        // names var_ref_to_fish rewrites into something that is NOT a plain
+        // variable read (bash specials, placeholders) stay on the math path
+        let rendered = var_ref_to_fish(name, false);
+        ok = rendered.starts_with('$')
+            && !rendered.contains(['(', ' ', '\'', '"', '['])
+            && rendered[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    }
+    ok
 }
