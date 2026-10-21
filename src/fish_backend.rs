@@ -3969,7 +3969,13 @@ fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
 /// as its math expression, anything else through the value renderer.
 fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
     match e {
-        IrExpr::Arith(a) => Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a))),
+        // A NUMERIC LITERAL needs no substitution at all: `[ 10 -lt 2 ]` is
+        // what fish would write, and `(math --scale 0 "10")` is a needless
+        // process to compute a constant that is already on the page.
+        IrExpr::Arith(a) => match &**a {
+            ArithAst::Num(n) => Ok(n.to_string()),
+            _ => Ok(format!("(math --scale 0 \"{}\")", arith_to_fish(a))),
+        },
         // A bare string atom (`[ "$X" = "1" ]` after the core's compare
         // normalisation leaves the RHS a Str) is a VALUE, not a command —
         // the `_` arm of `cmd_to_fish` refuses it. Quote it for `[ ]`.
