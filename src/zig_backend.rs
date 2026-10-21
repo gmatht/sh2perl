@@ -189,6 +189,8 @@ pub struct Render {
     need_pad: bool,
     /// emit shArgv0 ($0)
     need_argv0: bool,
+    /// the `test` being rendered is a `[[ ]]` (pattern RHS allowed)
+    current_is_dbracket: bool,
     /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
     need_globpat: bool,
     /// emit shBEscape (printf %b backslash expansion)
@@ -985,7 +987,10 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
-                    if let Some(c) = self.test_render(s) {
+                    self.current_is_dbracket = matches!(args.get(1), Some(IrExpr::Str(t, _)) if t == "[[");
+                    let r = self.test_render(s);
+                    self.current_is_dbracket = false;
+                    if let Some(c) = r {
                         return c;
                     }
                 }
@@ -3078,6 +3083,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         // literal it printed "SH2GLOB*.txt" (064_19, 011_brace_expansion).
         if let Some(pat) = glob_marked_str(e) {
             self.need_globpat = true;
+            self.need_run = true; // sh_io is declared by the run arm
             return vec![('s', format!("shGlobExpand({}, ' ')", Self::zig_str(&pat)))];
         }
         match e {
@@ -3245,7 +3251,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     // literal: `[[ $x = @(foo|bar) ]]` matched nothing
                     // before (at-in-test.sh). A plain literal keeps the
                     // exact-equality fast path.
-                    let is_pat = Self::lit_is_pattern(b);
+                    // a PATTERN only in `[[ ]]`, and only when the RHS is
+                    // UNQUOTED: in `[ ]` the RHS is always a literal string,
+                    // and in `[[ ]]` a quoted RHS is literal too
+                    let is_pat = self.current_is_dbracket && !b.trim_start().starts_with('"') && !b.trim_start().starts_with('\'') && Self::lit_is_pattern(b);
                     if is_pat {
                         self.need_globpat = true;
                         if o == "==" {
@@ -3970,7 +3979,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             }
             IrExpr::Call { func, args } if func == "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
-                    if let Some(c) = self.test_render(s) {
+                    self.current_is_dbracket = matches!(args.get(1), Some(IrExpr::Str(t, _)) if t == "[[");
+                    let r = self.test_render(s);
+                    self.current_is_dbracket = false;
+                    if let Some(c) = r {
                         self.emit(&format!("sh_rc = if ({c}) 0 else 1;"));
                         self.rc_dirty = true;
                         return;
@@ -4798,6 +4810,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 for it in items {
                     if let Some(pat) = glob_marked_str(it) {
                         self.need_globpat = true;
+                        self.need_run = true;
                         text.push(' ');
                         text.push_str(&pat);
                     } else if let IrExpr::Str(w, _) = it {
@@ -5257,12 +5270,27 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     // the sh2Arith stub)
                     match expr {
                         IrExpr::Arith(a) => match &**a {
-                            ArithAst::IncDec { var, delta, .. } => {
+                            ArithAst::IncDec { var, delta, prefix } => {
                                 let v = self.zig_ident(var);
                                 self.mark_read(var);
                                 let d = delta.unsigned_abs();
                                 let s = if *delta >= 0 { "+" } else { "-" };
-                                self.emit(&format!("{v} {s}= {d};"));
+                                // the STATEMENT form sets $? from the
+                                // expression VALUE: old for postfix, new for
+                                // prefix; 0 -> status 1 (arith-postfix-status)
+                                if *prefix {
+                                    self.emit(&format!("{v} {s}= {d};"));
+                                    self.emit(&format!("sh_rc = if ({v} != 0) 0 else 1;"));
+                                } else {
+                                    // braced: two postfix statements in one
+                                    // scope would redeclare the temp
+                                    self.emit("{");
+                                    self.emit(&format!("    const __sh_old = {v};"));
+                                    self.emit(&format!("    {v} {s}= {d};"));
+                                    self.emit("    sh_rc = if (__sh_old != 0) 0 else 1;");
+                                    self.emit("}");
+                                }
+                                self.rc_dirty = true;
                                 return;
                             }
                             ArithAst::Assign { var, op, rhs } => {
@@ -5572,6 +5600,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             match glob_marked_str(it) {
                                 Some(p) => {
                                     self.need_globpat = true;
+                                    self.need_run = true;
                                     // a pattern may expand to MANY names —
                                     // expand at run time and re-split on 0x1f
                                     pats.push(format!(
@@ -6450,7 +6479,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
-        if self.need_env || self.need_run || self.need_fexist || self.need_writefile {
+        if self.need_env || self.need_run || self.need_fexist || self.need_writefile || self.need_globpat || self.need_source {
             // Process handle for the runtime helpers. `Init` is only available
             // inside the emitted `main`, and zig has no way to thread it into a
             // free helper without changing every call site, so the emitted main
