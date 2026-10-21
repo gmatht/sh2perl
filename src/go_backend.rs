@@ -47,6 +47,8 @@ pub struct Render {
     var_types: HashMap<String, IrType>,
     /// vars used as arrays (declare as []any)
     arrays: BTreeSet<String>,
+    /// vars used as associative arrays (declare as map[string]any)
+    assoc: BTreeSet<String>,
     /// vars written anywhere (declared at the top of main)
     written: BTreeSet<String>,
     /// vars actually read (skip the `_ = x` dead-var guard)
@@ -65,6 +67,9 @@ pub struct Render {
     st_read: bool,
     /// vars written via arithmetic (cstyleFor/let/arith) — declare int64
     arith_ints: BTreeSet<String>,
+    /// background-body var saves pending a `wait` restore (fork isolation):
+    /// (go ident, temp holding the pre-spawn value), oldest first.
+    bg_saves: Vec<(String, String)>,
     /// `shopt -s nocasematch` seen — [[ == ]] compares case-insensitively
     nocase: bool,
     /// vars map + write-sync emissions needed (param-expansion ops)
@@ -129,8 +134,10 @@ const GO_RESERVED: &[&str] = &[
     "bufio",
     "regexp",
     "filepath",
+    "path",
     "strings",
     "strconv",
+    "sync",
     "utf8",
     "syscall",
     "error",
@@ -138,6 +145,27 @@ const GO_RESERVED: &[&str] = &[
     "st",
     "vars",
     "fArgs",
+    "__wgd",
+    "__wgds",
+    "splitTop",
+    "hasExtglob",
+    "arrKeys",
+    "assocIdx",
+    "ifsJoin",
+    "appendStrings",
+    "splitLines",
+    "shArgOff",
+    "doShiftF",
+    "doShiftS",
+    "shArgs",
+    "shStdIn",
+    "shStdErr",
+    "origStdin",
+    "origStdout",
+    "origStderr",
+    "isDigits",
+    "atoi",
+    "pSliceIdx",
     "s2s",
     "s2i",
     "truthy",
@@ -436,6 +464,26 @@ impl Render {
         out
     }
 
+    /// Undo shell backslash-quoting in a pattern word (`\"` → `"`,
+    /// `\\` → `\`): inside `${…}` a backslash quotes the next char, but
+    /// the runtime matchers would read the backslash literally.
+    fn unescape_pat(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                } else {
+                    out.push('\\');
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     fn is_num(&self, name: &str) -> bool {
         self.var_types.get(name).copied() == Some(IrType::Int)
     }
@@ -446,6 +494,11 @@ impl Render {
 
     fn is_arr(&self, name: &str) -> bool {
         self.arrays.contains(name)
+    }
+
+    /// True when the var is an associative array (map storage).
+    fn is_assoc(&self, name: &str) -> bool {
+        self.assoc.contains(name)
     }
 
     /// True when `decl_lines` will hoist `v` as Go `string` — the one case
@@ -487,6 +540,12 @@ impl Render {
 
     fn mark_arr(&mut self, name: &str) {
         self.arrays.insert(name.to_string());
+        self.mark_written(name);
+    }
+
+    /// Mark a var as assoc-written (declared map[string]any).
+    fn mark_assoc(&mut self, name: &str) {
+        self.assoc.insert(name.to_string());
         self.mark_written(name);
     }
 
@@ -848,6 +907,36 @@ impl Render {
             IrExpr::Call { func, args }
                 if func == "exec" || func == "pipeline" || func == "redirect" =>
             {
+                // A user FUNCTION here (`if func …`, `while func …`) calls
+                // the closure and tests the shared `st` — same contract as
+                // the chain_operand arm above.
+                if func == "exec" {
+                    if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                        if self.functions.contains(cmd) {
+                            let m = self.go_ident(cmd);
+                            self.mark_read(cmd);
+                            self.need_fargs = true;
+                            self.need_st = true;
+                            let vals: Vec<String> = match args.get(1) {
+                                Some(IrExpr::Array(items)) => {
+                                    items.iter().map(|i| self.expr_str(i)).collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            if vals.is_empty() {
+                                self.sides.push(format!("{m}();"));
+                            } else {
+                                self.sides.push(format!(
+                                    "fArgs = []string{{{}}};",
+                                    vals.join(", ")
+                                ));
+                                self.sides.push(format!("{m}();"));
+                                self.sides.push("fArgs = nil;".to_string());
+                            }
+                            return "(st == 0)".to_string();
+                        }
+                    }
+                }
                 // a command is TRUE when it succeeds (status 0) — the
                 // && / || short-circuit then runs the rhs exactly like bash
                 let v = self.call(func, args);
@@ -1276,6 +1365,38 @@ impl Render {
             {
                 return None;
             }
+            // A stage `echo`/`printf` whose argv contains a lone `%` (as in
+            // `echo "7 % 3" | bc`) must run the EXTERNAL coreutils binary —
+            // the builtin policy above admits it only when the external
+            // counterpart agrees, and for `%`-formats only printf's
+            // no-`%q` rule was checked. Rather than reasoning about echo's
+            // `%`-handling here, refuse the stage: the pipeline falls back
+            // to the `bash -c` weld whose argv is exactly bash's. Plain
+            // literals arrive either bare or wrapped in an all-literal
+            // Interpolate; anything dynamic keeps the native path (its
+            // value is computed, not re-parsed).
+            if (cmd == "echo" || cmd == "printf")
+                && argv_items.iter().any(|a| match a {
+                    IrExpr::Str(s, _) => s.contains('%'),
+                    IrExpr::Interpolate(parts) => {
+                        !parts.is_empty()
+                            && parts.iter().all(|p| match p {
+                                InterpPart::Lit(t) => !t.contains('$'),
+                                _ => false,
+                            }) && parts
+                                .iter()
+                                .map(|p| match p {
+                                    InterpPart::Lit(t) => t.as_str(),
+                                    _ => "",
+                                })
+                                .collect::<String>()
+                                .contains('%')
+                    }
+                    _ => false,
+                })
+            {
+                return None;
+            }
             let cmd = Self::go_str(cmd);
             let argv = match args.get(1) {
                 Some(IrExpr::Array(items)) => self.argv_strings(items)?,
@@ -1694,7 +1815,8 @@ impl Render {
              __hs{id}_c.Stdin = strings.NewReader({text}); \
              __hs{id}_c.Stderr = io.Discard; \
              __hs{id}_o, __hs{id}_e := __hs{id}_c.Output(); \
-             if __hs{id}_e != nil {{ return \"\" }}; \
+             _ = __hs{id}_e; \
+             if len(__hs{id}_o) == 0 {{ return \"\" }}; \
              return strings.TrimRight(string(__hs{id}_o), \"\\n\") }}()"
         ))
     }
@@ -1760,7 +1882,7 @@ impl Render {
              __hs{id}_c.Stdin = strings.NewReader({text}); \
              __hs{id}_c.Stderr = io.Discard; \
              __hs{id}_o, __hs{id}_e := __hs{id}_c.Output(); \
-             if __hs{id}_e != nil {{ return \"\" }}; \
+             if __hs{id}_e != nil && len(__hs{id}_o) == 0 {{ return \"\" }}; \
              return strings.TrimRight(string(__hs{id}_o), \"\\n\") }}();{sync}"
         ));
         true
@@ -2676,6 +2798,17 @@ impl Render {
                     _ => return self.sh2_stub("arrayIndex"),
                 };
                 let m = self.ident_of(&name);
+                // An assoc read (`matrix[$i,$j]`, `map[$k]`) keys the map
+                // by the key's STRING value — never an arrIdx into []any.
+                if self.is_assoc(&name) {
+                    let key = match args.get(1) {
+                        Some(IrExpr::Int(i)) => Self::go_str(&i.to_string()),
+                        Some(IrExpr::Str(s, _)) => self.expand_str(s),
+                        Some(other) => self.expr_str(other),
+                        None => return self.sh2_stub("arrayIndex"),
+                    };
+                    return format!("s2s(assocIdx({m}, {key}))");
+                }
                 self.mark_arr(&name);
                 let key = match args.get(1) {
                     Some(IrExpr::Int(i)) => i.to_string(),
@@ -2897,6 +3030,15 @@ impl Render {
             }
             if let IrExpr::Str(s, _) = it {
                 let s = strip_sh2glob(s);
+                // The shell expands the WORD as written, quotes and all
+                // (`grep -l pat "*.txt"` expands; bash only suppresses
+                // expansion for a WHOLE-word quote in the SOURCE, which the
+                // frontend has already unquoted). The decision therefore
+                // uses the value as it arrives, and the ARGUMENT keeps its
+                // text untouched -- the escape sequence `\n` inside a
+                // quoted word survives expansion, so stripping quotes here
+                // would eat the backslash and turn echo's `-e` newlines
+                // into literal `n`s.
                 if has_glob(&s) {
                     // A glob splices its matches into the argv, as a spread
                     // element. Go allows a `…` spread only in FINAL position
@@ -3056,7 +3198,17 @@ impl Render {
                 break;
             }
             if !texts.is_empty() {
-                let text = texts.join(" | ");
+                // Hoist heredoc bodies past the whole pipeline (a body
+                // inline in a stage breaks at the following ` | `).
+                let mut heads = Vec::new();
+                let mut tails = String::new();
+                for p in texts {
+                    let (h, b) = split_heredoc_tail(&p);
+                    heads.push(h);
+                    tails.push_str(&b);
+                }
+                let joined = heads.join(" | ");
+                let text = format!("{joined}{tails}");
                 let env = self.env_lit_for(Some(&text));
                 return format!("redirRun({}, {env})", Self::go_str(&text));
             }
@@ -3133,14 +3285,20 @@ impl Render {
         }
         if let Some(text) = self.cmd_text_stmts(body) {
             let mut with_redirs = format!("( {text} )");
+            let mut bodies = String::new();
             for r in redirs {
                 if let Some(rt) = self.redirect_text(r) {
                     with_redirs.push(' ');
                     with_redirs.push_str(&rt);
+                    // A heredoc body must trail the COMPLETE command.
+                    if let Some(b) = heredoc_body_spec_text(r) {
+                        bodies.push_str(&b);
+                    }
                 } else {
                     return self.sh2_stub("redirect");
                 }
             }
+            with_redirs.push_str(&bodies);
             let env = self.env_lit_for(Some(&with_redirs));
             return format!("redirRun({}, {env})", Self::go_str(&with_redirs));
         }
@@ -3461,12 +3619,203 @@ impl Render {
                 }
             }
         }
+        lines.push(format!("shStdIn({cvar});"));
         lines.push(format!(
             "if {okvar} {{ st = runCmd({cvar}) }} else {{ st = 1 }}"
         ));
         lines.extend(closes);
         self.need_st = true;
         lines
+    }
+
+    /// A user FUNCTION call with welded stdio redirects (`f < in`, `f >
+    /// out`, `f 2>err`, `f 2>&1`, `f <<< s`): run the closure with the
+    /// process-wide os.Stdin/Stdout/Stderr temporarily swapped. Children the
+    /// closure spawns inherit the swapped descriptors (they are set before
+    /// the call); Go-level prints (`fmt.Println`) write through the same
+    /// vars. Only the redirect shapes `native_redirect_spec` accepts, with
+    /// the same `2>&1`-after-stdout rule; anything else (or an unopenable
+    /// file, which is status 1 with the call skipped — exactly like bash)
+    /// refuses and the caller keeps the fallback. Returns the Go lines, or
+    /// `None`. The render state is rolled back on refusal.
+    fn function_redirect_lines(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<Vec<String>> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let (Some(IrExpr::Str(head, _)), Some(IrExpr::Array(_))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        if !self.functions.contains(head) {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let fail = |r: &mut Render| {
+            r.sides.truncate(sides);
+            r.tmp = tmp;
+            r.todo = todo;
+            None
+        };
+        let mut plan: Vec<NativeRedir> = Vec::with_capacity(redirects.len());
+        let mut stdout_attached = false;
+        for r in redirects {
+            let Some(nr) = self.native_redirect_spec(r) else {
+                return fail(self);
+            };
+            if self.todo != todo {
+                return fail(self);
+            }
+            match &nr {
+                NativeRedir::File { fd: 1, .. } => stdout_attached = true,
+                NativeRedir::DupStdoutToStderr if !stdout_attached => {
+                    return fail(self);
+                }
+                _ => {}
+            }
+            plan.push(nr);
+        }
+        let args = args.clone();
+        let head = head.clone();
+        let id = self.new_tmp();
+        let okvar = format!("__rfok{id}");
+        let mut lines = vec![format!("{okvar} := true;")];
+        let mut swapped = [false, false, false];
+        let mut closes: Vec<String> = Vec::new();
+        for (i, nr) in plan.iter().enumerate() {
+            match nr {
+                NativeRedir::File {
+                    fd,
+                    path,
+                    read,
+                    append,
+                } => {
+                    let fv = format!("__rff{id}_{i}");
+                    let ev = format!("__rfe{id}_{i}");
+                    let (slot, old) = match fd {
+                        0 => ("Stdin", format!("__rfoi{id}")),
+                        2 => ("Stderr", format!("__rfoe{id}")),
+                        _ => ("Stdout", format!("__rfoo{id}")),
+                    };
+                    if !swapped[*fd as usize] {
+                        lines.push(format!("{old} := os.{slot};"));
+                        swapped[*fd as usize] = true;
+                    }
+                    lines.push(if *read {
+                        format!("{fv}, {ev} := os.Open({path});")
+                    } else {
+                        let flags = if *append {
+                            "os.O_WRONLY|os.O_CREATE|os.O_APPEND"
+                        } else {
+                            "os.O_WRONLY|os.O_CREATE|os.O_TRUNC"
+                        };
+                        format!("{fv}, {ev} := os.OpenFile({path}, {flags}, 0644);")
+                    });
+                    lines.push(format!(
+                        "if {ev} == nil {{ os.{slot} = {fv} }} else {{ {okvar} = false }}"
+                    ));
+                    closes.push(format!("if {ev} == nil {{ {fv}.Close() }}"));
+                }
+                NativeRedir::DupStdoutToStderr => {
+                    if !swapped[2] {
+                        lines.push(format!("__rfoe{id} := os.Stderr;"));
+                        swapped[2] = true;
+                    }
+                    lines.push("os.Stderr = os.Stdout;".to_string());
+                }
+                NativeRedir::StdinStr(text) => {
+                    if !swapped[0] {
+                        lines.push(format!("__rfoi{id} := os.Stdin;"));
+                        swapped[0] = true;
+                    }
+                    lines.push(format!("os.Stdin = strings.NewReader({text});"));
+                }
+            }
+        }
+        // The closure call itself: fArgs + call + restore, under the
+        // open-ok guard. `call_function` emits directly (not into sides),
+        // so snapshot the line count and splice the call between the
+        // swap-in and the restore.
+        let call_at = self.out.len();
+        self.call_function(&head, &args);
+        if self.todo != todo {
+            self.out.truncate(call_at);
+            return fail(self);
+        }
+        let call_lines: Vec<String> = self.out.drain(call_at..).collect();
+        lines.push(format!("if {okvar} {{"));
+        lines.extend(call_lines.iter().map(|l| format!("    {l}")));
+        lines.push("} else {".to_string());
+        lines.push("    st = 1;".to_string());
+        lines.push("}".to_string());
+        if swapped[0] {
+            lines.push(format!("os.Stdin = __rfoi{id};"));
+        }
+        if swapped[1] {
+            lines.push(format!("os.Stdout = __rfoo{id};"));
+        }
+        if swapped[2] {
+            lines.push(format!("os.Stderr = __rfoe{id};"));
+        }
+        lines.extend(closes);
+        self.need_st = true;
+        Some(lines)
+    }
+
+    /// `cat > f <<EOF … EOF` / `cat >> f <<EOF … EOF` → a native file
+    /// write of the heredoc content. The content interpolates exactly when
+    /// the heredoc is unquoted (`interpolate`), via the runtime `expand`.
+    /// `None` keeps the fallback. Only the heredoc plus one fd-1 plain
+    /// file write/append; the render state is rolled back on refusal.
+    fn heredoc_to_file(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<String> {
+        if !is_single_cat(inner) {
+            return None;
+        }
+        if redirects.len() != 2 {
+            return None;
+        }
+        let heredoc = redirects
+            .iter()
+            .find(|r| r.mode == "heredoc" && r.fd.unwrap_or(0) == 0)?;
+        let target = match &heredoc.target {
+            IrExpr::Str(text, _) => {
+                if heredoc.interpolate {
+                    format!("expand({})", Self::go_str(text))
+                } else {
+                    Self::go_str(text)
+                }
+            }
+            _ => return None,
+        };
+        let file = redirects.iter().find(|r| {
+            (r.mode == "w" || r.mode == "a") && r.fd.unwrap_or(1) == 1
+        })?;
+        let append = file.mode == "a";
+        let path = self.expr_str(&file.target.clone());
+        let id = self.new_tmp();
+        let op = if append {
+            format!(
+                "if __hwf{id}, __hwe{id} := os.OpenFile({path}, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); \
+                 __hwe{id} == nil {{ __hwf{id}.WriteString({target}); __hwf{id}.Close(); st = 0 }} else {{ st = 1 }}"
+            )
+        } else {
+            format!(
+                "if __hwe{id} := os.WriteFile({path}, []byte({target}), 0644); __hwe{id} == nil {{ st = 0 }} else {{ st = 1 }}"
+            )
+        };
+        self.need_st = true;
+        Some(op)
     }
 
     /// One pipeline stage → (argv parts, stdio plan). Accepts the bare
@@ -4001,8 +4350,14 @@ impl Render {
         // Start all but the last, Run the last, Wait the rest — runPipe's
         // own sequence, so the status is the last stage's. A start failure
         // skips the run (status 1), exactly like runPipe's early return.
+        // The parent's copies of the inter-stage pipes close after the
+        // last stage is reaped (same deadlock runPipe documents: an
+        // early-exiting downstream stage must retire the producers).
         lines.push(format!("if {okvar} {{"));
         lines.push(format!("{stvar} = func() int64 {{"));
+        lines.push(format!(
+            "if __pq{id}_0.Stdin == nil {{ __pq{id}_0.Stdin = os.Stdin }}"
+        ));
         for i in 0..n.saturating_sub(1) {
             lines.push(format!(
                 "if __e := __pq{id}_{i}.Start(); __e != nil {{ return 1 }}"
@@ -4013,6 +4368,9 @@ impl Render {
              if __ee, __ok := __e.(*exec.ExitError); __ok {{ return int64(__ee.ExitCode()) }}; \
              return 1 }}"
         ));
+        for j in 0..n.saturating_sub(1) {
+            lines.push(format!("__pq{id}_p{j}.Close();"));
+        }
         for i in 0..n.saturating_sub(1) {
             lines.push(format!("__pq{id}_{i}.Wait();"));
         }
@@ -4291,6 +4649,255 @@ impl Render {
         self.builtin_fs_speculative(&call_args)
     }
 
+    /// `eval "name=value …"` where every word is a plain assignment:
+    /// lower each natively (see the `eval` arm). The words arrive as
+    /// Interpolate pieces; a word counts iff it is exactly `lit(name=)` +
+    /// value-parts with NO spaces, quotes, or substitutions beyond plain
+    /// var reads and arithmetic (those need the shell). Returns the Go
+    /// lines, or `None` to keep the `bash -c` fallback.
+    fn eval_assign_native(&mut self, code: &IrExpr) -> Option<Vec<String>> {
+        let words: Vec<&IrExpr> = match code {
+            IrExpr::Array(items) => items.iter().collect(),
+            single => vec![single],
+        };
+        if words.is_empty() {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let fail = |r: &mut Render| {
+            r.sides.truncate(sides);
+            r.tmp = tmp;
+            r.todo = todo;
+            None
+        };
+        let mut lines = Vec::new();
+        for w in words {
+            let (name, val) = match w {
+                IrExpr::Interpolate(parts) => {
+                    let Some(InterpPart::Lit(first)) = parts.first() else {
+                        return fail(self);
+                    };
+                    let Some(eq) = first.find('=') else {
+                        return fail(self);
+                    };
+                    let nm = &first[..eq];
+                    if nm.is_empty()
+                        || !nm
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        || nm.chars().next().map_or(true, |c| c.is_ascii_digit())
+                    {
+                        return fail(self);
+                    }
+                    if first[eq + 1..].chars().any(|c| {
+                        c.is_whitespace()
+                            || matches!(
+                                c,
+                                '\'' | '"' | '`' | ';' | '|' | '&' | '(' | ')' | '<' | '>'
+                            )
+                    }) {
+                        return fail(self);
+                    }
+                    let mut rest = vec![InterpPart::Lit(first[eq + 1..].to_string())];
+                    rest.extend(parts[1..].iter().cloned());
+                    (nm.to_string(), IrExpr::Interpolate(rest))
+                }
+                _ => return fail(self),
+            };
+            let mut ok = true;
+            if let IrExpr::Interpolate(parts) = &val {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        let plain = match x.as_ref() {
+                            IrExpr::Call { func, .. } => {
+                                func == "getVar"
+                                    || func == "param"
+                                    || func == "arith"
+                                    || func == "arithEval"
+                            }
+                            IrExpr::Arith(_) => true,
+                            IrExpr::Var(_, _)
+                            | IrExpr::Ident(_)
+                            | IrExpr::Str(_, _)
+                            | IrExpr::Int(_) => true,
+                            _ => false,
+                        };
+                        if !plain {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                return fail(self);
+            }
+            self.mark_written(&name);
+            let m = self.go_ident(&name);
+            let rhs = if self.is_num(&name) {
+                self.expr_num(&val)
+            } else {
+                self.expr_str(&val)
+            };
+            if self.todo != todo {
+                return fail(self);
+            }
+            let sync = self.sync_inline(&name);
+            lines.push(format!("{m} = {rhs};{sync}"));
+        }
+        self.flush_sides();
+        Some(lines)
+    }
+
+    /// True when an assignment RHS is pure (no child, no capture, no
+    /// external command): arithmetic, literals, var reads, parameter
+    /// expansion, and string concatenations thereof. Such a RHS writes no
+    /// stderr, so stderr-discard redirects on the assignment are no-ops.
+    fn is_pure_assign_rhs(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Bool(_)
+            | IrExpr::Var(_, _)
+            | IrExpr::Ident(_)
+            | IrExpr::Arith(_) => true,
+            IrExpr::Call { func, args } => {
+                (func == "getVar" || func == "param" || func == "arith" || func == "arithEval")
+                    && args.iter().all(Self::is_pure_assign_rhs)
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::is_pure_assign_rhs(lhs) && Self::is_pure_assign_rhs(rhs)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(_) => true,
+                InterpPart::Expr(x) => Self::is_pure_assign_rhs(x),
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                Self::is_pure_assign_rhs(cond)
+                    && Self::is_pure_assign_rhs(then)
+                    && Self::is_pure_assign_rhs(else_)
+            }
+            _ => false,
+        }
+    }
+
+    /// `mapfile [-t] [-d delim] [array] < file` / `readarray …` — read the
+    /// file's lines into the array with NO subprocess. Only one stdin-file
+    /// redirect (a plain path or var); no bare-stdin form (it would read
+    /// the terminal). REFUSE > GUESS: `-u` (another fd), `-O`/`-C`/`-s`/`-n`
+    /// (origin/callback/skip/count), or anything the shape does not cover —
+    /// the caller keeps the fallback.
+    fn mapfile_redirect_lines(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> Option<Vec<String>> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        if cmd != "mapfile" && cmd != "readarray" {
+            return None;
+        }
+        if redirects.len() != 1 {
+            return None;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let r = &redirects[0];
+        let from_stdin_string: Option<String> =
+            if r.mode == "r" && matches!(r.fd, None | Some(0)) {
+                None
+            } else if r.mode == "herestring" && matches!(r.fd, None | Some(0)) {
+                // `mapfile <<< text`: the text plus the one newline a
+                // herestring always feeds (even `<<< ""` feeds `"\n"`).
+                let text = self.expr_str(&r.target.clone());
+                if self.todo != todo {
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                    return None;
+                }
+                Some(format!("({text} + \"\\n\")"))
+            } else if r.mode == "heredoc" && matches!(r.fd, None | Some(0)) {
+                // A heredoc body is static text; it interpolates exactly
+                // when unquoted.
+                match &r.target {
+                    IrExpr::Str(text, _) => {
+                        if r.interpolate {
+                            Some(format!("expand({})", Self::go_str(text)))
+                        } else {
+                            Some(Self::go_str(text))
+                        }
+                    }
+                    _ => return None,
+                }
+            } else {
+                return None;
+            };
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let fail = |rr: &mut Render| {
+            rr.sides.truncate(sides);
+            rr.tmp = tmp;
+            rr.todo = todo;
+            None
+        };
+        let mut chomp = false;
+        let mut delim = String::from("\n");
+        let mut array: Option<String> = None;
+        let mut it = argv.iter().peekable();
+        while let Some(a) = it.next() {
+            let IrExpr::Str(s, _) = a else {
+                return fail(self);
+            };
+            if s == "-t" {
+                chomp = true;
+            } else if s == "-d" {
+                match it.next() {
+                    Some(IrExpr::Str(d, _)) => delim = d.clone(),
+                    _ => return fail(self),
+                }
+            } else if let Some(d) = s.strip_prefix("-d") {
+                delim = d.to_string();
+            } else if s.starts_with('-') {
+                return fail(self);
+            } else if array.is_none() {
+                array = Some(s.clone());
+            } else {
+                return fail(self);
+            }
+        }
+        let var = array.unwrap_or_else(|| "MAPFILE".to_string());
+        self.mark_arr(&var);
+        let m = self.go_ident(&var);
+        let sync = self.sync_inline(&var);
+        self.flush_sides();
+        self.need_st = true;
+        let id = self.new_tmp();
+        // A herestring/heredoc feeds literal text; a file is read.
+        if let Some(text) = from_stdin_string {
+            return Some(vec![format!(
+                "{m} = splitLines({text}, {}, {chomp});{sync} st = 0;",
+                Self::go_str(&delim)
+            )]);
+        }
+        let path = self.expr_str(&r.target.clone());
+        if self.todo != todo {
+            return fail(self);
+        }
+        Some(vec![format!(
+            "if __mfd{id}, __mfe{id} := os.ReadFile({path}); __mfe{id} == nil {{ \
+             {m} = splitLines(string(__mfd{id}), {}, {chomp});{sync} st = 0 }} else {{ st = 1 }}",
+            Self::go_str(&delim)
+        )])
+    }
+
     /// `redirect(Arrow(body), [redirs])` in statement position, lowered
     /// natively when the body is exactly one external exec. Speculative:
     /// the render state is rolled back when it refuses.
@@ -4411,7 +5018,30 @@ impl Render {
         else {
             return self.sh2_stub("param");
         };
-        let extra: Vec<String> = args[2..].iter().map(|a| self.expr_str(a)).collect();
+        // `${!name…}` sliced is a bad substitution in bash (indirect
+        // expansion admits no offset/length) — the shell aborts the script
+        // with status 1, printing nothing for the enclosing command. Emit
+        // the same abort (stderr is discarded by the gate; stdout and the
+        // exit code are what must match).
+        if op == "slice" && name.starts_with('!') {
+            return "func() string { fmt.Fprintln(os.Stderr, \"bad substitution\"); os.Exit(1); return \"\" }()".to_string();
+        }
+        // Shell quoting inside the expansion: a backslash quotes the next
+        // char (`${x//\"/\\\"}` matches `"` and substitutes `\"`). The
+        // runtime matchers treat backslashes literally, so unescape here.
+        // Only for the pattern-shaped ops (`#`/`%` patterns, `/` pattern
+        // and replacement) and only for literal words — dynamic defaults
+        // (`${x:-$y}`) expand at runtime through `expand`.
+        let mut extra: Vec<String> = args[2..].iter().map(|a| self.expr_str(a)).collect();
+        if matches!(op.as_str(), "#" | "##" | "%" | "%%" | "/" | "//") {
+            for (i, a) in args[2..].iter().enumerate() {
+                if let IrExpr::Str(s, _) = a {
+                    if s.contains('\\') {
+                        extra[i] = Self::go_str(&Self::unescape_pat(s));
+                    }
+                }
+            }
+        }
         self.need_vars = true;
         match op.as_str() {
             "@" | "*" => "strings.Join(argsList(), \" \")".to_string(),
@@ -4452,11 +5082,27 @@ impl Render {
                     (args.first(), args.get(1))
                 {
                     self.need_vars = true;
-                    let extra: Vec<String> = args[2..].iter().map(|a| self.expr_str(a)).collect();
+                    // `${arr[@]...}` — the `@` arrives as the first extra
+                    // arg; pList joins on the `[@]`-suffixed name exactly
+                    // like param_call does, so the join sees every element
+                    // instead of element zero.
+                    let (name, extra): (String, Vec<String>) =
+                        if matches!(args.get(2), Some(IrExpr::Str(a, _)) if a == "@" || a == "*")
+                        {
+                            (
+                                format!("{name}[@]"),
+                                args[3..].iter().map(|a| self.expr_str(a)).collect(),
+                            )
+                        } else {
+                            (
+                                name.clone(),
+                                args[2..].iter().map(|a| self.expr_str(a)).collect(),
+                            )
+                        };
                     return format!(
                         "strings.Join(pList({}, {}{}), {sep})",
                         Self::go_str(op),
-                        Self::go_str(name),
+                        Self::go_str(&name),
                         join_args(&extra)
                     );
                 }
@@ -4614,6 +5260,19 @@ impl Render {
     /// Render-time expansion of `$var`/`${var}`/`$1`/`$(…)` inside a
     /// literal string → a Go string expression.
     fn expand_str(&mut self, s: &str) -> String {
+        // Outer quotes are syntax, not data (`"$HOME/x"` expands the
+        // inside; the quotes themselves vanish).
+        let s = {
+            let t = s.trim();
+            if t.len() >= 2
+                && ((t.starts_with('"') && t.ends_with('"'))
+                    || (t.starts_with('\'') && t.ends_with('\'')))
+            {
+                &t[1..t.len() - 1]
+            } else {
+                t
+            }
+        };
         let mut parts: Vec<String> = Vec::new();
         let b: Vec<char> = s.chars().collect();
         let mut i = 0;
@@ -4708,9 +5367,19 @@ impl Render {
 
     fn cmd_text_stmts(&mut self, stmts: &[IrStmt]) -> Option<String> {
         let mut parts = Vec::new();
+        let mut tails = String::new();
         for s in stmts {
             match self.cmd_text_stmt(s) {
-                Some(t) => parts.push(t),
+                Some(t) => {
+                    // A statement's text may still end in a heredoc BODY
+                    // (the `redirect` CALL form appends it inline). Hold it
+                    // aside: `;`-joining is fine, but a caller that welds a
+                    // pipeline may put ` | …` right after this text, and a
+                    // body must never precede that. Re-appended below.
+                    let (h, b) = split_heredoc_tail(&t);
+                    parts.push(h);
+                    tails.push_str(&b);
+                }
                 None => {
                     if std::env::var_os("SH2_GO_DEBUG").is_some() {
                         eprintln!("SH2DEBUG cmd_text_stmt refuse: {}", debug_stmt(s));
@@ -4719,7 +5388,12 @@ impl Render {
                 }
             }
         }
-        Some(parts.join("; "))
+        let joined = parts.join("; ");
+        if tails.is_empty() {
+            Some(joined)
+        } else {
+            Some(format!("{joined}{tails}"))
+        }
     }
 
     fn cmd_text_stmt(&mut self, s: &IrStmt) -> Option<String> {
@@ -4870,11 +5544,18 @@ impl Render {
                 let text = match cmd_str {
                     Some(c) => c.clone(),
                     None => {
-                        let mut parts = Vec::new();
+                        let mut heads = Vec::new();
+                        let mut tails = String::new();
                         for st in stages {
-                            parts.push(self.cmd_text_stmts(st)?);
+                            // A stage's text keeps its own heredoc bodies
+                            // trailing (NUL-marked) — hoist them past the
+                            // ` | ` that will follow this stage.
+                            let t = self.cmd_text_stmts(st)?;
+                            let (h, b) = split_heredoc_tail(&t);
+                            heads.push(h);
+                            tails.push_str(&b);
                         }
-                        parts.join(" | ")
+                        format!("{}{tails}", heads.join(" | "))
                     }
                 };
                 match capture {
@@ -4885,11 +5566,22 @@ impl Render {
             IrStmt::Redirect { inner, redirects } => {
                 let t = self.cmd_text_stmts(inner)?;
                 let mut with = format!("( {t} )");
+                let mut bodies = String::new();
                 for r in redirects {
                     with.push(' ');
                     with.push_str(&self.redirect_spec_text(r)?);
+                    if let Some(b) = heredoc_body_text(r) {
+                        bodies.push_str(&b);
+                    }
                 }
-                Some(with)
+                // Bodies trail the complete statement text; a NUL marker
+                // keeps them apart so `split_heredoc_tail` can hoist them
+                // past a ` | ` a welding caller appends.
+                if bodies.is_empty() {
+                    Some(with)
+                } else {
+                    Some(format!("{with}\u{0}{bodies}"))
+                }
             }
             IrStmt::Background(b) => {
                 let t = self.cmd_text_stmts(b)?;
@@ -5319,21 +6011,45 @@ impl Render {
                 };
                 let text = self.cmd_text_stmts(body)?;
                 let mut out = format!("( {text} )");
+                let mut bodies = String::new();
                 for r in redirs {
                     let rt = self.redirect_text(r)?;
                     out.push(' ');
                     out.push_str(&rt);
+                    // Heredoc bodies follow the complete command (never
+                    // inline — a closing paren or a pipe would break them).
+                    if let IrExpr::Object(props) = r {
+                        let mode = props
+                            .iter()
+                            .find(|(k, _)| k == "mode")
+                            .and_then(|(_, v)| match v {
+                                IrExpr::Str(s, _) => Some(s.as_str()),
+                                _ => None,
+                            });
+                        let target = props
+                            .iter()
+                            .find(|(k, _)| k == "target")
+                            .map(|(_, v)| v);
+                        if matches!(mode, Some("heredoc") | Some("heredoc-tabs")) {
+                            if let Some(IrExpr::Str(s, _)) = target {
+                                bodies.push_str(&format!("\n{s}\nEOF"));
+                            }
+                        }
+                    }
                 }
+                out.push_str(&bodies);
                 Some(out)
             }
             IrExpr::Call { func, args } if func == "subshell" || func == "block" => {
                 // `( body )` / `{ body }` groups in an `and`/`or`/capture
-                // operand — reconstruct as a subshell group.
+                // operand — reconstruct as a subshell group. A heredoc body
+                // inside must stay outside the closing paren.
                 let Some(IrExpr::Arrow(body)) = args.first() else {
                     return None;
                 };
-                let text = self.cmd_text_stmts(body)?;
-                Some(format!("( {text} )"))
+                let t = self.cmd_text_stmts(body)?;
+                let (h, b) = split_heredoc_tail(&t);
+                Some(format!("( {h} ){b}"))
             }
             IrExpr::Call { func, args } if func == "assign" => {
                 let name = match args.first() {
@@ -5391,6 +6107,28 @@ impl Render {
                     .iter()
                     .map(|a| self.cmd_text_expr(a))
                     .collect::<Option<Vec<_>>>()?;
+                // `param(slice, NAME, …)` is the core's array/string slice
+                // spelling: `${NAME[@]}` / `${NAME:off:len}`, never the
+                // juxtaposed `NAMEslice…` the generic path below builds.
+                // Array-ness decides the form (`${a[@]:1}` vs `${s:1}`) —
+                // the core uses one encoding for both.
+                if op == "slice" {
+                    if matches!(extra.first().map(String::as_str), Some("@") | Some("*")) {
+                        let sigil = &extra[0];
+                        let rest = extra[1..].join("");
+                        if rest.is_empty() {
+                            return Some(format!("${{{name}[{sigil}]}}"));
+                        }
+                        return Some(format!("${{{name}[{sigil}]:{rest}}}"));
+                    }
+                    if !extra.is_empty() {
+                        if self.is_arr(name) {
+                            return Some(format!("${{{name}[@]:{}}}", extra.join(":")));
+                        }
+                        return Some(format!("${{{name}:{}}}", extra.join(":")));
+                    }
+                    return Some(format!("${{{name}}}"));
+                }
                 let mut inner = name.clone();
                 if !extra.is_empty() {
                     inner.push_str(op);
@@ -5732,6 +6470,22 @@ impl Render {
         });
         let quoted = t.starts_with('"') || t.starts_with('\'');
         let inner = t.trim_matches('"').trim_matches('\'');
+        // `$(( … ))` is arithmetic, not command substitution: lower it
+        // through the arith renderer instead of exec'ing `(…)` (which the
+        // shell reads as a subshell and fails).
+        if let Some(rest) = inner.strip_prefix("$((") {
+            if let Some(close) = rest.rfind("))") {
+                let arith_text = rest[..close].to_string();
+                if let Some((sides, v)) = self.arith_str(&arith_text) {
+                    for s in sides {
+                        self.sides.push(s);
+                    }
+                    return Some((v, Opnd::Num));
+                }
+                return None;
+            }
+            return None;
+        }
         if let Some(rest) = inner.strip_prefix("$(") {
             if let Some(close) = rest.rfind(')') {
                 let cmd = rest[..close].to_string();
@@ -5745,6 +6499,20 @@ impl Render {
             let inner2 = &t[2..t.len() - 1];
             self.need_vars = true;
             return Some((self.expand_braced(inner2), Opnd::Str));
+        }
+        // A leading `~` (bare or `~/…`) expands to $HOME — but only
+        // unquoted; `"~"` is a literal tilde. `~user` (another user's
+        // home) has no native form and refuses below.
+        if !quoted {
+            if t == "~" {
+                return Some(("os.Getenv(\"HOME\")".to_string(), Opnd::Str));
+            }
+            if let Some(rest) = t.strip_prefix("~/") {
+                return Some((
+                    format!("(os.Getenv(\"HOME\") + {})", Self::go_str(&format!("/{rest}"))),
+                    Opnd::Str,
+                ));
+            }
         }
         let inner = inner.strip_prefix('$').unwrap_or(inner);
         let inner = inner
@@ -5793,7 +6561,15 @@ impl Render {
                 } else if let Ok(n) = inner.parse::<i64>() {
                     Some((n.to_string(), Opnd::Num))
                 } else if has_dollar {
-                    Some((format!("os.Getenv({})", Self::go_str(inner)), Opnd::Str))
+                    // A word mixing literal text with expansions
+                    // (`$HOME/Documents`, `pre$d`, `$a$b`): expand it
+                    // through the general expander instead of a single
+                    // getenv of the whole word.
+                    if inner.chars().any(|c| c != '$' && !c.is_ascii_alphanumeric() && c != '_' && c != '{' && c != '}') {
+                        Some((self.expand_str(t), Opnd::Str))
+                    } else {
+                        Some((format!("os.Getenv({})", Self::go_str(inner)), Opnd::Str))
+                    }
                 } else {
                     Some((Self::go_str(inner), Opnd::Str))
                 }
@@ -5940,10 +6716,24 @@ impl Render {
                         self.stmt(s);
                     }
                     self.depth -= 1;
+                } else {
+                    // No else taken and no condition true: bash sets $?
+                    // to 0 (a stale failure before the `if` must not leak
+                    // through; the gate compares exit codes).
+                    self.emit("} else {");
+                    self.depth += 1;
+                    self.emit("st = 0;");
+                    self.need_st = true;
+                    self.depth -= 1;
                 }
                 self.emit("}");
             }
             IrStmt::While { cond, body } => {
+                // A loop that never runs leaves $? at 0 in bash — track
+                // iterations so a stale failure before the loop cannot leak
+                // through (the gate compares exit codes).
+                let runflag = format!("__run{}", self.new_tmp());
+                self.emit(&format!("{runflag} := false;"));
                 // multi-command condition: `while cmd1; cmd2; do …` — run
                 // the cond commands each iteration, loop on the LAST status.
                 if let IrExpr::Call { func, args } = cond {
@@ -5957,12 +6747,15 @@ impl Render {
                             }
                             self.emit("if st != 0 { break; }");
                             self.need_st = true;
+                            self.emit(&format!("{runflag} = true;"));
                             for s in body {
                                 self.stmt(s);
                             }
                             self.depth -= 1;
                             self.loop_depth -= 1;
                             self.emit("}");
+                            self.emit(&format!("if !{runflag} {{ st = 0; }}"));
+                            self.need_st = true;
                             return;
                         }
                     }
@@ -5972,12 +6765,15 @@ impl Render {
                 self.emit(&format!("for {c} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.emit(&format!("{runflag} = true;"));
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
+                self.emit(&format!("if !{runflag} {{ st = 0; }}"));
+                self.need_st = true;
             }
             IrStmt::DoWhile { body, cond, until } => {
                 self.emit("for {");
@@ -6070,17 +6866,122 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::Redirect { inner, redirects } => {
-                // heredoc into `cat` → print the content
-                if let Some(content) = heredoc_content(redirects) {
-                    if is_single_cat(inner) {
-                        if let IrExpr::Str(text, _) = content {
-                            self.emit(&format!("fmt.Print({});", Self::go_str(text)));
-                            if self.need_st {
-                                self.emit("st = 0;");
+                // heredoc into `cat` → print the content. Only when the
+                // heredoc is the SOLE redirect: `cat > f <<EOF` must write
+                // the file, not the terminal.
+                if redirects.len() == 1 {
+                    if let Some(content) = heredoc_content(redirects) {
+                        if is_single_cat(inner) {
+                            if let IrExpr::Str(text, _) = content {
+                                let interp = redirects
+                                    .iter()
+                                    .any(|r| r.mode == "heredoc" && r.interpolate);
+                                // An unquoted heredoc interpolates
+                                // (`Hello $name`); expand it at runtime.
+                                // A quoted one (`<<'EOF'`) is literal.
+                                let body = if interp {
+                                    format!("expand({})", Self::go_str(text))
+                                } else {
+                                    Self::go_str(text)
+                                };
+                                self.emit(&format!("fmt.Print({body});"));
+                                if self.need_st {
+                                    self.emit("st = 0;");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+                // `cat > f <<EOF … EOF` (or `>> f`): write the (possibly
+                // interpolated) content straight to the file — no child.
+                // REFUSE > GUESS: exactly the heredoc plus one fd-1 file
+                // write/append; anything else keeps the fallback.
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let Some(line) = self.heredoc_to_file(inner, redirects) {
+                        if self.todo == todo {
+                            self.flush_sides();
+                            self.emit(&line);
+                            return;
+                        }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
+                // `mapfile [-t] [-d delim] [array] < file` — native line
+                // read, no child.
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let Some(lines) = self.mapfile_redirect_lines(inner, redirects) {
+                        if self.todo == todo {
+                            for l in lines {
+                                self.emit(&l);
                             }
                             return;
                         }
                     }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
+                // `x=… 2>/dev/null` — a pure assignment with only stderr
+                // discards: the redirect is a no-op (a pure RHS writes no
+                // stderr and every capture helper discards it anyway), so
+                // the assignment lowers natively instead of forcing the
+                // `bash -c` fallback that loses the assigned value.
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    let mut handled = false;
+                    if redirects.iter().all(null_stderr_spec) {
+                        if let [IrStmt::Assign { targets, expr, .. }] = &inner[..] {
+                            if targets.len() == 1 && Self::is_pure_assign_rhs(expr) {
+                                self.stmt_assign(targets, expr);
+                                if self.todo == todo {
+                                    self.emit("st = 0;");
+                                    self.need_st = true;
+                                    handled = true;
+                                }
+                            }
+                        }
+                        // The core also spells assignments as `assign`
+                        // CALLS (`n=$(($1 + 0))`): same pure-RHS rule, via
+                        // the chain operand's assign arm (status "0").
+                        if !handled {
+                            if let [IrStmt::Expr(e)] = &inner[..] {
+                                if let IrExpr::Call { func, args } = e {
+                                    if func == "assign" {
+                                        let value = match args.len() {
+                                            2 => &args[1],
+                                            _ if args.len() > 2 => &args[2],
+                                            _ => &args[0],
+                                        };
+                                        if Self::is_pure_assign_rhs(value) {
+                                            if let Some((stmts, status)) =
+                                                self.chain_operand(e)
+                                            {
+                                                if self.todo == todo && status == "0" {
+                                                    for s in stmts {
+                                                        self.emit(&s);
+                                                    }
+                                                    self.emit("st = 0;");
+                                                    self.need_st = true;
+                                                    handled = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if handled {
+                        return;
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
                 }
                 if let Some(lines) = self.echo_redirect_write(inner, redirects) {
                     for l in lines {
@@ -6118,6 +7019,24 @@ impl Render {
                 // exactly, and `body_single_exec_opt` only a lone external
                 // command, so anything richer keeps the fallback below
                 // (REFUSE > GUESS).
+                // A user FUNCTION with welded redirects runs as the closure
+                // with os.Stdin/Stdout/Stderr temporarily swapped — before
+                // the external-command weld below, which would exec a binary
+                // named after the function and fail.
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let Some(lines) = self.function_redirect_lines(inner, redirects) {
+                        if self.todo == todo {
+                            for l in lines {
+                                self.emit(&l);
+                            }
+                            return;
+                        }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
                 {
                     let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
                     if let Some((cmd, argv)) = self.body_single_exec_opt(inner, true) {
@@ -6157,16 +7076,21 @@ impl Render {
                 }
                 if let Some(text) = self.cmd_text_stmts(inner) {
                     let mut with_redirs = format!("( {text} )");
+                    let mut bodies = String::new();
                     let mut ok = true;
                     for r in redirects {
                         if let Some(rt) = self.redirect_spec_text(r) {
                             with_redirs.push(' ');
                             with_redirs.push_str(&rt);
+                            if let Some(b) = heredoc_body_text(r) {
+                                bodies.push_str(&b);
+                            }
                         } else {
                             ok = false;
                             break;
                         }
                     }
+                    with_redirs.push_str(&bodies);
                     if ok {
                         let env = self.env_lit_for(Some(&with_redirs));
                         self.emit(&format!(
@@ -6222,6 +7146,15 @@ impl Render {
                 if self.in_fn > 0 {
                     // inside a function closure: the value IS the function's
                     // result (bash prints it through the caller's echo).
+                    // An int literal ALSO sets the status (`return 1` fails
+                    // the caller's `if func` exactly like bash) — anything
+                    // else leaves `$?` at the last command's status.
+                    if let Some(IrExpr::Str(s, _)) = e.as_ref() {
+                        if let Ok(n) = s.trim().parse::<i64>() {
+                            self.need_st = true;
+                            self.emit(&format!("st = {n};"));
+                        }
+                    }
                     let v = match e {
                         Some(x) => self.expr_str(x),
                         None => "\"\"".to_string(),
@@ -6366,7 +7299,19 @@ impl Render {
                         }
                     }
                     if ok2 {
-                        let text = parts.join(" | ");
+                        // `cmd_text_stmts`/`cmd_text_expr` keep heredoc
+                        // bodies trailing (NUL-marked) — they already sit
+                        // at the end of the LAST stage's text, which is the
+                        // end of the pipeline.
+                        let mut heads = Vec::new();
+                        let mut tails = String::new();
+                        for p in parts {
+                            let (h, b) = split_heredoc_tail(&p);
+                            heads.push(h);
+                            tails.push_str(&b);
+                        }
+                        let joined = heads.join(" | ");
+                        let text = format!("{joined}{tails}");
                         let env = self.env_lit_for(Some(&text));
                         self.emit(&format!(
                             "st = redirRun({}, {env});",
@@ -6378,10 +7323,71 @@ impl Render {
                     }
                 }
             }
-            IrStmt::Background(_) => {
-                // the gate's bash reference exits before the background job
-                // finishes (stdout pipe), so the visible output matches
-                // when the job is skipped
+            IrStmt::Background(b) => {
+                // `cmd &` runs as a goroutine; `wait` joins them. The
+                // background statements render exactly like foreground
+                // ones (same status/side-effect semantics); only the
+                // execution is concurrent.
+                // Fork isolation: a background job runs on a COPY of the
+                // shell state, so vars it assigns must not leak into the
+                // parent. Snapshot every assigned var before spawning; the
+                // `wait` arm restores them after joining.
+                let mut assigned = BTreeSet::new();
+                let mut stack: Vec<&IrStmt> = b.iter().collect();
+                while let Some(s) = stack.pop() {
+                    match s {
+                        IrStmt::Assign { targets, .. } => {
+                            for t in targets {
+                                let base = t.var.split('[').next().unwrap_or(&t.var);
+                                assigned.insert(base.to_string());
+                            }
+                        }
+                        IrStmt::Block(x) | IrStmt::Subshell(x) | IrStmt::Background(x) => {
+                            stack.extend(x.iter());
+                        }
+                        IrStmt::If { then, elsifs, else_, .. } => {
+                            stack.extend(then.iter());
+                            for (_, bb) in elsifs {
+                                stack.extend(bb.iter());
+                            }
+                            stack.extend(else_.iter());
+                        }
+                        IrStmt::While { body, .. }
+                        | IrStmt::DoWhile { body, .. }
+                        | IrStmt::For { body, .. } => {
+                            stack.extend(body.iter());
+                        }
+                        IrStmt::Case { clauses, .. } => {
+                            for c in clauses {
+                                stack.extend(c.body.iter());
+                            }
+                        }
+                        IrStmt::Pipeline { stages, .. } => {
+                            for st in stages {
+                                stack.extend(st.iter());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.emit("if __wgd == nil { __wgd = &sync.WaitGroup{}; __wgds = append(__wgds, __wgd); }");
+                for v in &assigned {
+                    if self.written.contains(v) {
+                        let m = self.go_ident(v);
+                        let t = format!("__bgv{}", self.new_tmp());
+                        self.emit(&format!("{t} := {m};"));
+                        self.bg_saves.push((m, t));
+                    }
+                }
+                self.emit("__wgd.Add(1);");
+                self.emit("go func() {");
+                self.depth += 1;
+                self.emit("defer __wgd.Done();");
+                for s in b {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.emit("}();");
             }
             IrStmt::Try { .. } => {
                 self.mark_todo("try");
@@ -6405,14 +7411,19 @@ impl Render {
             IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
             IrStmt::Continue => {
                 if self.loop_depth > 0 {
-                    self.emit("continue;");
+                    // `continue`/`break` SUCCEED — bash resets $? to 0
+                    // (a stale failure before them must not leak past the
+                    // loop; the gate compares exit codes).
+                    self.emit("st = 0; continue;");
+                    self.need_st = true;
                 } else {
                     self.mark_todo("continue outside a loop");
                 }
             }
             IrStmt::Break => {
                 if self.loop_depth > 0 {
-                    self.emit("break;");
+                    self.emit("st = 0; break;");
+                    self.need_st = true;
                 } else {
                     self.mark_todo("break outside a loop");
                 }
@@ -6459,6 +7470,29 @@ impl Render {
                     ));
                     return;
                 }
+                // A BAKED assoc-element target (`config["user"]` — the
+                // quotes are part of the core's spelling): strip one layer
+                // of quotes and store into the base's map, which the
+                // `pVal` map lookup reads back (REFUSE > GUESS: a dynamic
+                // key keeps the scalarized spelling below).
+                if !key_text.contains('$') && !key_text.contains('`') {
+                    let key = key_text
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                    self.mark_assoc(base);
+                    self.mark_written(&t.var);
+                    let rhs = self.expr_any(expr);
+                    self.flush_sides();
+                    let m = self.go_ident(base);
+                    let sync = self.sync_inline(base);
+                    self.emit(&format!(
+                        "if {m} == nil {{ {m} = map[string]any{{}} }};{sync}"
+                    ));
+                    let gk = Self::go_str(&key);
+                    self.emit(&format!("{m}[{gk}] = {rhs};{sync}"));
+                    return;
+                }
             }
         }
         // `x=$(( … ))` whose expression bash itself rejects: the arithmetic
@@ -6489,17 +7523,10 @@ impl Render {
         if let IrExpr::Call { func, args } = expr {
             if func == "setArray" || func == "setArrayAppend" {
                 self.mark_arr(&t.var);
-                let elems: Vec<String> = setarray_elems(args)
-                    .iter()
-                    .map(|e| self.expr_any(e))
-                    .collect();
+                let rhs = self.setarray_rhs(&m, func == "setArrayAppend", args);
                 self.flush_sides();
                 let sync = self.sync_inline(&t.var);
-                if func == "setArray" {
-                    self.emit(&format!("{m} = []any{{{}}};{sync}", elems.join(", ")));
-                } else {
-                    self.emit(&format!("{m} = append({m}, {});{sync}", elems.join(", ")));
-                }
+                self.emit(&format!("{m} = {rhs};{sync}"));
                 return;
             }
             if func == "assign" {
@@ -6580,7 +7607,7 @@ impl Render {
                     }
                     return;
                 }
-                ArithAst::IncDec { var, delta, .. } => {
+                ArithAst::IncDec { var, delta, prefix } => {
                     let target = if var == &t.var {
                         m.clone()
                     } else {
@@ -6589,10 +7616,21 @@ impl Render {
                     self.mark_arith(var);
                     self.flush_sides();
                     let sync = self.sync_inline(var);
-                    self.emit(&format!("{target} = {target} + {delta};{sync}"));
-                    if self.need_st {
-                        self.emit("st = 0;");
+                    if *prefix {
+                        // `((++i))` status: 0 iff the NEW value != 0.
+                        let v = if *delta == 1 {
+                            format!("{target} + 1")
+                        } else {
+                            format!("{target} - 1")
+                        };
+                        self.emit(&format!("{target} = {target} + {delta};{sync}"));
+                        self.emit(&format!("st = b2i(({v}) == 0);"));
+                    } else {
+                        // `((i++))` status: 0 iff the OLD value != 0.
+                        self.emit(&format!("st = b2i(({target}) == 0);"));
+                        self.emit(&format!("{target} = {target} + {delta};{sync}"));
                     }
+                    self.need_st = true;
                     return;
                 }
                 _ => {}
@@ -6632,6 +7670,11 @@ impl Render {
     /// (`A && B || C` → `st = A; if st == 0 { st = B; } if st != 0 { st = C; }`),
     /// so operands with side effects (assign/return/break/continue/…) stay
     /// native instead of falling into the expression stub path.
+    ///
+    /// `A && B` leaves `st` at A's status when A FAILS (and at B's when it
+    /// runs), so the guarded form above is exactly bash — unlike a bool
+    /// expression, which would set `st` to the chain's truthiness.
+    #[allow(clippy::question_mark)]
     fn stmt_chain(&mut self, e: &IrExpr) -> bool {
         let mut chain: Vec<(Option<crate::ir::BinOpKind>, &IrExpr)> = Vec::new();
         fn flatten<'a>(e: &'a IrExpr, out: &mut Vec<(Option<crate::ir::BinOpKind>, &'a IrExpr)>) {
@@ -6653,11 +7696,15 @@ impl Render {
         for (op, operand) in chain {
             let (stmts, status) = match self.chain_operand(operand) {
                 Some(x) => x,
-                None => return false,
+                None => {
+                    return false;
+                }
             };
             ops_go.push((op, stmts, status));
         }
         if self.todo != before {
+            if std::env::var_os("SH2_GO_DEBUG").is_some() {
+            }
             return false;
         }
         let (_, first_stmts, first_status) = &ops_go[0];
@@ -6711,6 +7758,33 @@ impl Render {
                     if let Some(r) = self.chain_fs_argcmd(cmd, args) {
                         return Some(r);
                     }
+                    // A user FUNCTION in condition position (`if is_prime
+                    // $n`, `x && func`) — call the closure with its fArgs
+                    // and read the shared `st` it maintains, instead of
+                    // exec'ing a binary named after the function (which
+                    // fails and poisons loops into hanging forever).
+                    if self.functions.contains(cmd) {
+                        let m = self.go_ident(cmd);
+                        self.mark_read(cmd);
+                        self.need_fargs = true;
+                        self.need_st = true;
+                        let vals: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => {
+                                items.iter().map(|i| self.expr_str(i)).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let lines = if vals.is_empty() {
+                            vec![format!("{m}();")]
+                        } else {
+                            vec![
+                                format!("fArgs = []string{{{}}};", vals.join(", ")),
+                                format!("{m}();"),
+                                "fArgs = nil;".to_string(),
+                            ]
+                        };
+                        return Some((lines, "st".to_string()));
+                    }
                     // `test` is not in the shared builtins namespace, so the
                     // arms above never see it — but it lowers through the
                     // same `test_render` as `[ ]` (see `exec_builtin_stmt`).
@@ -6741,6 +7815,38 @@ impl Render {
                     return Some((Vec::new(), format!("runCmd({call})")));
                 }
                 None
+            }
+            // A plain `[ … ]` test is a CONDITION, not a command: as a
+            // chain operand it contributes its status (`0` when true) with
+            // no side effects, and the guard around the next operand then
+            // reproduces bash's short-circuit. The core spells the test as
+            // a bare `Ne`/`Eq` BinOp far more often than as a `test` Call.
+            IrExpr::BinOp { op, .. }
+                if !matches!(
+                    op,
+                    crate::ir::BinOpKind::And
+                        | crate::ir::BinOpKind::Or
+                        | crate::ir::BinOpKind::Concat
+                ) =>
+            {
+                // A test operand is a `test`-like CONDITION, never an
+                // ARITHMETIC comparison: its own failure is the arm's
+                // status (`0` = true), and it has no side effects. Only
+                // the comparison/negation ops qualify -- `+`/`*` operands
+                // stay on the value path below.
+                if !matches!(
+                    op,
+                    crate::ir::BinOpKind::Eq
+                        | crate::ir::BinOpKind::Ne
+                        | crate::ir::BinOpKind::Lt
+                        | crate::ir::BinOpKind::Gt
+                        | crate::ir::BinOpKind::Le
+                        | crate::ir::BinOpKind::Ge
+                        | crate::ir::BinOpKind::Not
+                ) {
+                    return None;
+                }
+                return Some((Vec::new(), format!("b2i(!({}))", self.expr_bool(e))));
             }
             IrExpr::Call { func, args: _ } if func == "test" => {
                 let c = self.expr_bool(e);
@@ -6787,14 +7893,11 @@ impl Render {
                 };
                 let m = self.go_ident(&name);
                 self.mark_arr(&name);
-                let elems: Vec<String> = setarray_elems(args)
-                    .iter()
-                    .map(|e| self.expr_any(e))
-                    .collect();
+                let rhs = self.setarray_rhs(&m, false, args);
                 self.flush_sides();
                 let sync = self.sync_inline(&name);
                 Some((
-                    vec![format!("{m} = []any{{{}}};{sync}", elems.join(", "))],
+                    vec![format!("{m} = {rhs};{sync}")],
                     "0".to_string(),
                 ))
             }
@@ -6846,6 +7949,45 @@ impl Render {
                         }
                     }
                 }
+                // `x=… 2>/dev/null` — a pure assignment with only stderr
+                // discards: the redirect is a no-op, so the assignment
+                // lowers natively instead of forcing the `bash -c` weld
+                // that loses the assigned value (see the statement-level
+                // twin in the Redirect arm).
+                if let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+                    (args.first(), args.get(1))
+                {
+                    if !redirs.is_empty() && redirs.iter().all(null_stderr_obj) {
+                        if let [IrStmt::Expr(IrExpr::Call { func, args })] = &body[..] {
+                            if func == "assign" {
+                                let value = match args.len() {
+                                    2 => &args[1],
+                                    _ if args.len() > 2 => &args[2],
+                                    _ => &args[0],
+                                };
+                                if Self::is_pure_assign_rhs(value) {
+                                    let (todo, sides, tmp) =
+                                        (self.todo, self.sides.len(), self.tmp);
+                                    if let Some((mut stmts, status)) =
+                                        self.chain_operand(&IrExpr::Call {
+                                            func: func.clone(),
+                                            args: args.clone(),
+                                        })
+                                    {
+                                        if self.todo == todo && status == "0" {
+                                            stmts.push("st = 0;".to_string());
+                                            self.need_st = true;
+                                            return Some((stmts, "st".to_string()));
+                                        }
+                                    }
+                                    self.sides.truncate(sides);
+                                    self.tmp = tmp;
+                                    self.todo = todo;
+                                }
+                            }
+                        }
+                    }
+                }
                 // native first: a single external command with stdio-welded
                 // redirects runs under exec.Command, not a reconstructed
                 // `bash -c` string. The lines leave the status in `st`.
@@ -6882,7 +8024,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "break" => {
                 let _ = args;
                 if self.loop_depth > 0 {
-                    Some((vec!["break;".to_string()], "st".to_string()))
+                    Some((vec!["st = 0; break;".to_string()], "st".to_string()))
                 } else {
                     None
                 }
@@ -6890,7 +8032,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "continue" => {
                 let _ = args;
                 if self.loop_depth > 0 {
-                    Some((vec!["continue;".to_string()], "st".to_string()))
+                    Some((vec!["st = 0; continue;".to_string()], "st".to_string()))
                 } else {
                     None
                 }
@@ -7171,9 +8313,29 @@ impl Render {
                     }
                 }
             }
-            IrExpr::BinOp { op, .. }
+            IrExpr::BinOp { lhs, op, .. }
                 if matches!(op, crate::ir::BinOpKind::And | crate::ir::BinOpKind::Or) =>
             {
+                // The chain's guarded form (`stmt_chain`: `st = A; if st
+                // == 0 { B }`) is what makes the RHS CONDITIONAL and keeps
+                // `$?` at the status of the last command run. Take it for
+                // every shape it can lower — the bool expression below is
+                // the fallback, which runs both sides unconditionally.
+                if self.stmt_chain(e) {
+                    return;
+                }
+                // A `&&`/`||` CHAIN in statement position SHORT-CIRCUITS:
+                // `cmd1 && cmd2` runs cmd2 only on success, and bash's
+                // status is that of the last command run. Rendering it as
+                // one bool expression sets `st` to the CHAIN's truthiness
+                // and runs both sides, so `[ 1 = 2 ] && echo hit; echo $?`
+                // prints 0 instead of 1 and prints `hit` unconditionally.
+                //
+                // `stmt_chain` refuses a chain whose FIRST operand is a
+                // `test` (`[ "$?" = 0 ] && …`): `$?` must be read BEFORE
+                // `st` is overwritten with the test's own status, so it
+                // takes the other stmt_chain call site (the `IrStmt::Expr`
+                // head arm) instead of this one.
                 if self.stmt_chain(e) {
                     return;
                 }
@@ -7218,6 +8380,19 @@ impl Render {
         let Some((recursive, force, list)) = rm_native_shape(&expanded) else {
             return false;
         };
+        // Process-substitution desugar cleanup (`rm -f __ps_tmp*`): bash
+        // runs `<(...)` via /dev/fd with NO cleanup command, so this rm
+        // must not disturb `$?` — save and restore the status around it.
+        // (A user `rm -f` of their own temp still reports its own status;
+        // only the core's `__ps_tmp` names take this path.)
+        let desugar_cleanup = force
+            && !recursive
+            && !list.is_empty()
+            && list.iter().all(|e| match e {
+                IrExpr::Str(s, _) => s == "-f" || s == "-rf" || s == "-fr",
+                IrExpr::Var(name, _) | IrExpr::Ident(name) => name.starts_with("__ps_tmp"),
+                _ => false,
+            });
         let ops: Vec<(String, bool)> = list
             .iter()
             .map(|e| {
@@ -7230,8 +8405,17 @@ impl Render {
         // rises to 1 — one failing operand fails the whole command. A glob
         // operand expands at run time (`globArgs`, with the same
         // no-match-passes-literally rule as the shell) and removes each
-        // match under the same per-file semantics.
+        // match under the same per-file semantics. Desugar cleanup (above)
+        // instead preserves the incoming status: plain removes, no status
+        // lines at all.
+        if desugar_cleanup {
+            for (_, (op, _)) in list.iter().zip(ops.iter()) {
+                self.emit(&format!("os.Remove({op});"));
+            }
+            return true;
+        }
         self.emit("st = 0;");
+        self.need_st = true;
         let id = self.new_tmp();
         for (item, (op, glob)) in list.iter().zip(ops.iter()) {
             let one = |target: &str| match (recursive, force) {
@@ -7690,7 +8874,34 @@ impl Render {
                 true
             }
             "shift" => {
-                // positional params are empty in the gate harness
+                // `shift [n]` — drop the first n positional params. In a
+                // function that is the shared fArgs stack; at top level it
+                // is the script-arg offset. n defaults to 1; shifting past
+                // the end (or a negative count) fails with status 1 and
+                // leaves the params unchanged — exactly like bash.
+                let n = match argv.first() {
+                    Some(IrExpr::Str(s, _)) => s.trim().to_string(),
+                    Some(other) => format!("strconv.Itoa(int(s2i({})))", self.expr_str(other)),
+                    None => "1".to_string(),
+                };
+                let n = if n.parse::<i64>().map_or(false, |v| v >= 0) {
+                    n
+                } else if argv.first().is_some_and(|a| matches!(a, IrExpr::Str(..))) {
+                    // a literal bash would reject (`shift foo`, `shift -1`)
+                    self.flush_sides();
+                    self.emit("st = 1;");
+                    self.need_st = true;
+                    return true;
+                } else {
+                    format!("({n})")
+                };
+                self.flush_sides();
+                if self.in_fn > 0 {
+                    self.emit(&format!("st = doShiftF({n});"));
+                } else {
+                    self.emit(&format!("st = doShiftS({n});"));
+                }
+                self.need_st = true;
                 true
             }
             "true" | ":" => {
@@ -7737,12 +8948,43 @@ impl Render {
                 self.todo = todo;
                 false
             }
-            "set" | "umask" | "trap" | "wait" | "return" => true,
+            "set" | "umask" | "trap" | "return" => true,
+            "wait" => {
+                // `wait` joins all background jobs (no operands in the
+                // corpus subset); a bare `wait` with no jobs is status 0.
+                // Fork isolation: restore every var a background body
+                // saved at spawn, oldest save wins (it holds the
+                // pre-background value).
+                self.flush_sides();
+                self.emit("for _, __wgd := range __wgds { __wgd.Wait() }; __wgds = nil;");
+                for (m, t) in std::mem::take(&mut self.bg_saves) {
+                    self.emit(&format!("{m} = {t};"));
+                }
+                self.emit("st = 0;");
+                self.need_st = true;
+                true
+            }
             "eval" => {
                 // eval 'code' — run the code in a bash -c child (native
                 // evaluation is impossible; the child inherits the written
-                // vars via env_lit).
+                // vars via env_lit). EXCEPTION: a lone `name=value …`
+                // assignment lowers natively — the words are already
+                // structured IR, so each value renders through the same
+                // expression paths a direct assignment uses, and the
+                // child's assignments (which would die with it) are
+                // unnecessary. REFUSE > GUESS: anything but words shaped
+                // like assignments (flags, redirections, compound words).
                 if let Some(code) = argv.first() {
+                    if let Some(lines) = self.eval_assign_native(code) {
+                        for l in lines {
+                            self.emit(&l);
+                        }
+                        if self.need_st {
+                            self.emit("st = 0;");
+                        }
+                        self.need_st = true;
+                        return true;
+                    }
                     let text = if let IrExpr::Str(c, _) = code {
                         c.clone()
                     } else if let Some(t) = self.cmd_text_expr(code) {
@@ -7821,6 +9063,52 @@ impl Render {
             }
             "exec" => {
                 // `exec cmd …` — replace the shell: run and exit.
+                // The head word is `exec` itself; the REAL command is the
+                // first argv word. Re-dispatch on it (REFUSE > GUESS: flags
+                // like -c/-a/-l, an empty argv, or a non-literal command
+                // keep the historical shape).
+                if cmd == "exec" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if let Some(IrExpr::Str(real, _)) = items.first() {
+                            if !real.starts_with('-') && real != "exec" {
+                                let mut tail =
+                                    Vec::with_capacity(items.len());
+                                tail.push(items[0].clone());
+                                tail.push(IrExpr::Array(items[1..].to_vec()));
+                                if self.functions.contains(real) {
+                                    self.call_function(real, &tail);
+                                    self.need_st = true;
+                                    self.emit("os.Exit(int(st));");
+                                    return true;
+                                }
+                                let (todo, sides, tmp) =
+                                    (self.todo, self.sides.len(), self.tmp);
+                                self.need_st = true;
+                                if self.exec_builtin_stmt(real, &tail)
+                                    && self.todo == todo
+                                {
+                                    self.emit("os.Exit(int(st));");
+                                    return true;
+                                }
+                                self.sides.truncate(sides);
+                                self.tmp = tmp;
+                                self.todo = todo;
+                                if let Some((cmd_go, argv_go)) =
+                                    self.exec_cmd_argv(&tail)
+                                {
+                                    let call = Self::exec_cmd_call(&cmd_go, &argv_go);
+                                    self.emit(&format!(
+                                        "st = runCmd({call}); os.Exit(int(st));"
+                                    ));
+                                    self.need_st = true;
+                                    return true;
+                                }
+                                self.mark_todo("builtin exec");
+                                return true;
+                            }
+                        }
+                    }
+                }
                 if let Some((cmd_go, argv_go)) = self.exec_cmd_argv(args) {
                     let call = Self::exec_cmd_call(&cmd_go, &argv_go);
                     self.emit(&format!(
@@ -8039,6 +9327,27 @@ impl Render {
                     i += 1;
                 }
                 last_flag.clear();
+            } else if let IrExpr::Call { func, args: ca } = a {
+                // `declare -a arr=(…)` / `typeset -a arr+=(…)` (and the
+                // single-element `declare name=value` shape the core emits
+                // as assign): the values arrive as a nested Call, not as
+                // `name=(…)` text, so lower them exactly like a plain
+                // array assignment.
+                if func == "setArray" || func == "setArrayAppend" {
+                    if let Some(IrExpr::Str(name, _)) = ca.first() {
+                        self.mark_arr(name);
+                        let m = self.go_ident(name);
+                        let rhs =
+                            self.setarray_rhs(&m, func == "setArrayAppend", ca);
+                        self.flush_sides();
+                        let sync = self.sync_inline(name);
+                        self.emit(&format!("{m} = {rhs};{sync}"));
+                        if self.need_st {
+                            self.emit("st = 0;");
+                        }
+                    }
+                }
+                i += 1;
             } else {
                 i += 1;
             }
@@ -8119,6 +9428,9 @@ impl Render {
     fn stmt_for(&mut self, var: &str, iter: &IrExpr, body: &[IrStmt]) {
         let m = self.go_ident(var);
         self.mark_written(var);
+        // Like `while`: an empty iteration leaves $? at 0 in bash.
+        let runflag = format!("__run{}", self.new_tmp());
+        self.emit(&format!("{runflag} := false;"));
         match self.for_list(iter) {
             Some(ForList::Static(items)) => {
                 let (t, inner) = if self.is_num(var) {
@@ -8132,6 +9444,7 @@ impl Render {
                 self.emit(&format!("for _, {m} = range []{t}{{{inner}}} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.emit(&format!("{runflag} = true;"));
                 self.emit_sync(var);
                 for s in body {
                     self.stmt(s);
@@ -8139,6 +9452,8 @@ impl Render {
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
+                self.emit(&format!("if !{runflag} {{ st = 0; }}"));
+                self.need_st = true;
             }
             Some(ForList::Runtime { pre, slice }) => {
                 self.emit(&pre);
@@ -8146,6 +9461,7 @@ impl Render {
                 self.emit(&format!("for _, {vn} := range {slice} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.emit(&format!("{runflag} = true;"));
                 if self.is_num(var) {
                     self.emit(&format!("{m} = s2i({vn});"));
                 } else if self.is_str(var) {
@@ -8160,12 +9476,15 @@ impl Render {
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
+                self.emit(&format!("if !{runflag} {{ st = 0; }}"));
+                self.need_st = true;
             }
             None => {
                 if let IrExpr::Range { start, end } = iter {
                     self.emit(&format!("for {m} = {start}; {m} <= {end}; {m}++ {{"));
                     self.loop_depth += 1;
                     self.depth += 1;
+                    self.emit(&format!("{runflag} = true;"));
                     self.emit_sync(var);
                     for s in body {
                         self.stmt(s);
@@ -8173,6 +9492,8 @@ impl Render {
                     self.depth -= 1;
                     self.loop_depth -= 1;
                     self.emit("}");
+                    self.emit(&format!("if !{runflag} {{ st = 0; }}"));
+                    self.need_st = true;
                     return;
                 }
                 self.mark_todo(&format!("For iter {:?}", iter));
@@ -8213,6 +9534,21 @@ impl Render {
                                     if arr_name.ends_with("[@]") {
                                         self.need_vars = true;
                                         let t = self.new_tmp();
+                                        // `${!map[@]}` iterates the assoc
+                                        // KEYS (or an indexed array's
+                                        // indices), not the values.
+                                        if let Some(base) = arr_name
+                                            .strip_suffix("[@]")
+                                            .and_then(|n| n.strip_prefix('!'))
+                                        {
+                                            return Some(ForList::Runtime {
+                                                pre: format!(
+                                                    "{t} := arrKeys({});",
+                                                    Self::go_str(base)
+                                                ),
+                                                slice: t,
+                                            });
+                                        }
                                         return Some(ForList::Runtime {
                                             pre: format!(
                                                 "{t} := pList({}, {});",
@@ -8507,7 +9843,12 @@ impl Render {
         let mut flags = Render::default();
         scan_flags(&prog.stmts, &mut flags);
         self.need_vars = flags.need_vars;
-        self.need_st = flags.need_st;
+        // The gate compares exit codes, so the status is ALWAYS tracked —
+        // the program exits with the last command's status (see the
+        // epilogue). Unconditional: a `$?` read anywhere, or nowhere, must
+        // agree with bash.
+        self.need_st = true;
+        let _ = flags.need_st;
 
         // Pass 2: render the body first (helper/import flags known before
         // the preamble; st/vars/fArgs decls known before main's header).
@@ -8539,7 +9880,14 @@ impl Render {
         if self.need_st && !self.st_read {
             self.emit("_ = st");
         }
-        self.emit("return;");
+        // rc-faithful exit: the program's status is the last command's,
+        // exactly like bash — the gate compares exit codes, not just
+        // stdout, so falling off the end must not collapse to 0.
+        if self.need_st {
+            self.emit("os.Exit(int(st));");
+        } else {
+            self.emit("return;");
+        }
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
@@ -8559,10 +9907,13 @@ impl Render {
             "\"io\"",
             "\"os\"",
             "\"os/exec\"",
+            "\"path\"",
             "\"path/filepath\"",
             "\"regexp\"",
+            "\"sort\"",
             "\"strconv\"",
             "\"strings\"",
+            "\"sync\"",
             "\"syscall\"",
             "\"time\"",
             "\"unicode/utf8\"",
@@ -8593,8 +9944,8 @@ impl Render {
         let all = [
             "\"bufio\"", "\"crypto/sha256\"", "\"crypto/sha512\"",
             "\"encoding/hex\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
-            "\"path/filepath\"", "\"regexp\"", "\"strconv\"", "\"strings\"",
-            "\"syscall\"", "\"time\"", "\"unicode/utf8\"",
+            "\"path\"", "\"path/filepath\"", "\"regexp\"", "\"sort\"", "\"strconv\"", "\"strings\"",
+            "\"sync\"", "\"syscall\"", "\"time\"", "\"unicode/utf8\"",
         ];
         let full = text.join("\n");
         let keep_paths: Vec<String> = all
@@ -8628,6 +9979,8 @@ impl Render {
             if self.functions.contains(v) {
                 // a user function's value is its output text (see in_fn)
                 out.push(format!("    var {m} func() string"));
+            } else if self.is_assoc(v) {
+                out.push(format!("    var {m} map[string]any"));
             } else if self.is_arr(v) {
                 out.push(format!("    var {m} []any"));
             } else if self.is_num(v) || self.arith_ints.contains(v) {
@@ -9417,8 +10770,75 @@ fn strify(e: String, k: Opnd, _r: &mut Render) -> String {
 }
 
 /// Does a string contain glob metacharacters?
+/// Does a glob word actually EXPAND under bash's pathname-expansion
+/// grammar? `has_glob` answers "is there a glob char", which is what
+/// decides whether the word may be expanded — but a pattern written
+/// inside QUOTES (`grep -E "([a-z]+)([0-9]+)\.([a-z]+)"`) reaches the
+/// renderer with its metacharacters intact, and `grep -E "(foo|bar)[0-9]+"`
+/// must reach grep as ONE argument, not as `globArgs(...)` spread into
+/// whatever the CWD happens to match.
+///
+/// Every `*`, `?` or `[` that appears INSIDE a quote run makes the word
+/// non-expanding: an unquoted metacharacter would have been bare, so a
+/// quoted one is literal by construction. A word with no quote pairing at
+/// all (`*.txt`, `file?.sh`) expands.
+
+/// Drop a word's quote characters, keeping everything inside them: what the
+/// shell hands a command (`"*.txt"` → `*.txt`, `a"b c"d` → `ab cd`).
+fn strip_word_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            '\\' if i + 1 < b.len() => {
+                out.push(b[i + 1]);
+                i += 2;
+            }
+            '"' | '\'' => i += 1,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+fn glob_expands(pat: &str) -> bool {
+    // A word the shell already EXPANDED arrives with its metacharacters
+    // gone; one whose metacharacters are still here was QUOTED in the
+    // source (`grep -E "(foo|bar)[0-9]+"`, `grep -c ".*"`). Quoted
+    // metacharacters are literal to the shell, so such a word must never
+    // be spread through `globArgs` -- measured: spreading `.*` turned
+    // `grep -c ".*"` into `grep -c` plus every file in the CWD and the
+    // count came back empty.
+    // Any metacharacter at all: the word was quoted, so it is literal.
+    !(pat.contains('*') || pat.contains('?') || pat.contains('['))
+}
 fn has_glob(s: &str) -> bool {
-    s.contains('*') || s.contains('?') || s.contains('[')
+    s.contains('*')
+        || s.contains('?')
+        || s.contains('[')
+        || has_extglob(s)
+}
+
+/// An extglob head anywhere in the pattern (`@(…)`, `!(…)`, `?(…)`,
+/// `+(…)`, `*(…)`): a sigil immediately followed by `(`. A literal
+/// `@(`/`?(` (quoted paren in shell) still counts — the renderer treats
+/// it as a pattern, matching bash's unquoted expansion.
+fn has_extglob(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if matches!(b[i], b'@' | b'!' | b'?' | b'+' | b'*')
+            && i + 1 < b.len()
+            && b[i + 1] == b'('
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The core wraps unquoted glob patterns in a `\x01SH2GLOB\x01` marker.
@@ -9621,6 +11041,18 @@ fn scan_flags(stmts: &[IrStmt], r: &mut Render) {
                 scan_flags(body, r);
             }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => scan_flags(b, r),
+            IrStmt::Redirect { inner, redirects } => {
+                // An unquoted heredoc interpolates at render time through
+                // the vars map (`expand`), so its reads need write-syncs —
+                // and the wrapped statements need scanning too.
+                if redirects
+                    .iter()
+                    .any(|rd| rd.mode == "heredoc" && rd.interpolate)
+                {
+                    r.need_vars = true;
+                }
+                scan_flags(inner, r);
+            }
             IrStmt::Case {
                 discriminant,
                 clauses,
@@ -9651,6 +11083,17 @@ fn scan_flags_expr(e: &IrExpr, r: &mut Render) {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if name == "?" {
                         r.need_st = true;
+                    }
+                }
+            }
+            // A `test` condition can be a single shell-text string the
+            // renderer parses at render time (`[ ${x% *} -gt … ]`); any
+            // `${…}` inside reads through the vars map, so flag it here —
+            // the structured scan above cannot see inside the string.
+            if func == "test" {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if s.contains("${") {
+                        r.need_vars = true;
                     }
                 }
             }
@@ -9715,8 +11158,89 @@ fn scan_flags_arith(a: &ArithAst, r: &mut Render) {
 fn setarray_elems(args: &[IrExpr]) -> Vec<&IrExpr> {
     match args {
         [IrExpr::Array(items), ..] => items.iter().collect(),
-        [_, IrExpr::Array(items)] => items.iter().collect(),
+        [_, IrExpr::Array(items), ..] => items.iter().collect(),
         [..] => args.iter().collect(),
+    }
+}
+
+impl Render {
+    /// The RHS Go expression for `arr=(…)` / `arr+=(…)` (and the declare
+    /// forms): `[]any{…}` normally, or `append(…)` for `+=`. Elements that
+    /// are `captureWords` / `split` expand to MULTIPLE items (bash word
+    /// splitting) — they cannot sit in the literal (which would collapse
+    /// them into one joined string, or a single empty string for an empty
+    /// capture), so any splice switches the whole RHS to a builder IIFE
+    /// that appends plain items and `appendFields` splices in order.
+    fn setarray_rhs(&mut self, var_go: &str, is_append: bool, args: &[IrExpr]) -> String {
+        enum Elem {
+            Plain(String),
+            Splice(String),
+        }
+        let mut elems = Vec::new();
+        let mut spliced = false;
+        for e in setarray_elems(args) {
+            if let IrExpr::Call { func, args: ea } = e {
+                if func == "captureWords" {
+                    if let Some(IrExpr::Arrow(body)) = ea.first() {
+                        let cap = self.capture_arrow(body);
+                        elems.push(Elem::Splice(format!("strings.Fields({cap})")));
+                        spliced = true;
+                        continue;
+                    }
+                }
+                if func == "split" {
+                    if let Some(x) = ea.first() {
+                        let v = self.expr_str(x);
+                        elems.push(Elem::Splice(format!("strings.Fields({v})")));
+                        spliced = true;
+                        continue;
+                    }
+                }
+                // `local -a files=("$@")`: the whole positional list.
+                if func == "listVar" {
+                    if let Some(IrExpr::Str(nm, _)) = ea.first() {
+                        if nm == "@" || nm == "*" {
+                            self.need_fargs = true;
+                            elems.push(Elem::Splice("argsList()".to_string()));
+                            spliced = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            elems.push(Elem::Plain(self.expr_any(e)));
+        }
+        if !spliced {
+            let plain: Vec<String> = elems
+                .into_iter()
+                .map(|e| match e {
+                    Elem::Plain(s) => s,
+                    Elem::Splice(_) => unreachable!(),
+                })
+                .collect();
+            if is_append {
+                return format!("append({var_go}, {})", plain.join(", "));
+            }
+            return format!("[]any{{{}}}", plain.join(", "));
+        }
+        let id = self.new_tmp();
+        let mut lines = if is_append {
+            format!("__sa{id} := {var_go};")
+        } else {
+            format!("__sa{id} := []any{{}};")
+        };
+        for e in elems {
+            match e {
+                Elem::Plain(s) => {
+                    lines.push_str(&format!("__sa{id} = append(__sa{id}, {s});"));
+                }
+                Elem::Splice(s) => {
+                    lines.push_str(&format!("__sa{id} = appendStrings(__sa{id}, {s});"));
+                }
+            }
+        }
+        lines.push_str(&format!("return __sa{id};"));
+        format!("func() []any {{ {lines} }}()")
     }
 }
 
@@ -9783,11 +11307,106 @@ fn redirect_op_frag(fd: &str, mode: &str, word: &str) -> Option<String> {
         "r" => "<",
         "r+" => "<> ",
         "herestring" => "<<<",
-        "heredoc" => return Some(format!("{fd}<<'EOF'\n{word}\nEOF")),
-        "heredoc-tabs" => return Some(format!("{fd}<<-'EOF'\n{word}\nEOF")),
+        // Heredocs split: the operator stays inline (`cmd 0<<'EOF'`) but
+        // the BODY must follow the COMPLETE command (`cmd …\nbody\nEOF`) —
+        // an inline body breaks as soon as anything (a subshell close, a
+        // pipe) follows it. `heredoc_body_text` supplies the trailing part;
+        // every site that assembles redirect text must append it at the end.
+        "heredoc" => return Some(format!("{fd}<<'EOF'")),
+        "heredoc-tabs" => return Some(format!("{fd}<<-'EOF'")),
         _ => return None,
     };
     Some(format!("{fd}{op}{word}"))
+}
+
+/// The trailing body of a heredoc redirect (`\nbody\nEOF`), or `None` for
+/// non-heredoc modes. Appended AFTER the complete reconstructed command.
+///
+/// Split a trailing heredoc body off a reconstructed STAGE text: a stage
+/// like `( cat ) 0<<'EOF'\nbody\nEOF` carries its body inline, which breaks
+/// as soon as the pipeline joins it with ` | …`. Returns (head, bodies);
+/// the caller re-appends bodies after the full join.
+fn split_heredoc_tail(text: &str) -> (String, String) {
+    // Bodies already split out by the Redirect builders carry a NUL
+    // marker: `<head>\0<body>`.
+    if let Some(i) = text.find('\u{0}') {
+        let head = text[..i].to_string();
+        let bodies = text[i + 1..].to_string();
+        return (head, bodies);
+    }
+    // Bodies already split out by the Redirect text builder carry a NUL
+    // marker: `<head>\0<body>`.
+    // Bodies end the stage text (`\n<body>\nEOF`, before the closing
+    // paren(s) a subshell wrapper added). Walk back over `<<'EOF'`-opened
+    // blocks; a body never contains a line that is exactly `EOF`.
+    let mut head = text.to_string();
+    let mut bodies = String::new();
+    loop {
+        // Trailing `)`s belong to the wrapper, not to the body: strip them
+        // for the body search and re-append after the head.
+        let trimmed = head.trim_end_matches(')').trim_end();
+        let closers = &head[trimmed.len()..];
+        let eof = match trimmed.rfind("\nEOF") {
+            Some(e) => e,
+            None => break,
+        };
+        if !trimmed[eof + 4..].is_empty() {
+            break;
+        }
+        let mut found: Option<(usize, &str)> = None;
+        for op in ["<<-'EOF'", "<<'EOF'"] {
+            let pos = trimmed[..eof].rfind(op);
+            let nl = pos.map(|p| trimmed[p..].find('\n'));
+            if let Some(pos) = pos {
+                if trimmed[pos..].find('\n').is_some() {
+                    found = Some((pos, op));
+                    break;
+                }
+            }
+        }
+        let Some((op_pos, op)) = found else {
+            break;
+        };
+        let body = trimmed[op_pos + op.len()..eof + 4].to_string();
+        let mut new_head = trimmed[..op_pos + op.len()].to_string();
+        new_head.push_str(closers);
+        head = new_head;
+        bodies = body + &bodies;
+        if !head.contains("<<'EOF'") && !head.contains("<<-'EOF'") {
+            break;
+        }
+    }
+    (head, bodies)
+}
+
+/// The trailing body of a heredoc redirect (`\nbody\nEOF`), or `None` for
+/// non-heredoc modes. Appended AFTER the complete reconstructed command.
+/// The trailing body of a `{fd, mode, target}` redirect OBJECT (the
+/// `redirect`/`builtin` call spelling of [`heredoc_body_text`]).
+fn heredoc_body_spec_text(r: &IrExpr) -> Option<String> {
+    let IrExpr::Object(props) = r else {
+        return None;
+    };
+    let mode = props.iter().find(|(k, _)| k == "mode").map(|(_, v)| v);
+    let target = props.iter().find(|(k, _)| k == "target").map(|(_, v)| v);
+    if !matches!(mode, Some(IrExpr::Str(m, _)) if m == "heredoc" || m == "heredoc-tabs") {
+        return None;
+    }
+    match target {
+        Some(IrExpr::Str(s, _)) => Some(format!("\n{s}\nEOF")),
+        _ => None,
+    }
+}
+
+fn heredoc_body_text(r: &crate::ir::IrRedirect) -> Option<String> {
+    if r.mode != "heredoc" && r.mode != "heredoc-tabs" {
+        return None;
+    }
+    let word = match &r.target {
+        crate::ir::IrExpr::Str(s, _) => s.clone(),
+        _ => return None,
+    };
+    Some(format!("\n{word}\nEOF"))
 }
 
 /// True when a `{fd, mode, target}` redirect object is exactly
@@ -10120,9 +11739,12 @@ fn scan_imports(text: &str) -> Vec<&'static str> {
             ("exec.", "os/exec"),
             ("strings.", "strings"),
             ("strconv.", "strconv"),
+            ("sync.", "sync"),
             ("io.", "io"),
             ("bufio.", "bufio"),
             ("regexp.", "regexp"),
+            ("sort.", "sort"),
+            ("path.", "path"),
             ("filepath.", "path/filepath"),
             ("utf8.", "unicode/utf8"),
             ("syscall.", "syscall"),
@@ -10492,6 +12114,14 @@ fn go_split_helpers() -> Vec<(String, Vec<String>)> {
     segs
 }
 fn go_used_helpers(body: &str) -> Vec<String> {
+    if std::env::var_os("SH2_HELPERS_DUMP").is_some() {
+        let segs = go_split_helpers();
+        for (n, l) in &segs {
+            if n == "globArgs" {
+                for x in l { eprintln!("SEGL {}", x); }
+            }
+        }
+    }
     let segs = go_split_helpers();
     let mut needed: BTreeSet<String> = BTreeSet::new();
     for (name, _) in &segs {
@@ -10609,6 +12239,52 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return nil",
     "}",
     "",
+    "func assocIdx(m map[string]any, k string) any {",
+    "    if m == nil { return nil }",
+    "    return m[k]",
+    "}",
+    "",
+    "func appendStrings(m []any, ss []string) []any {",
+    "    for _, s := range ss { m = append(m, s) }",
+    "    return m",
+    "}",
+    "",
+    "func splitLines(text, delim string, chomp bool) []any {",
+    "    if delim == \"\" { delim = \"\\n\" }",
+    "    if text == \"\" { return []any{} }",
+    "    parts := strings.Split(text, delim)",
+    "    if strings.HasSuffix(text, delim) { parts = parts[:len(parts)-1] }",
+    "    out := make([]any, 0, len(parts))",
+    "    for _, p := range parts {",
+    "        if chomp { out = append(out, p) } else { out = append(out, p+delim) }",
+    "    }",
+    "    return out",
+    "}",
+    "",
+    "func ifsJoin(out []string, isStar bool) string {",
+    "    if !isStar { return strings.Join(out, \" \") }",
+    "    // STAR joins on the first char of IFS (empty IFS joins empty).",
+    "    if ifs, ok := vars[\"IFS\"].(string); ok {",
+    "        if ifs == \"\" { return strings.Join(out, \"\") }",
+    "        return strings.Join(out, string([]rune(ifs)[0]))",
+    "    }",
+    "    return strings.Join(out, \" \")",
+    "}",
+    "",
+    "func arrKeys(name string) []string {",
+    "    if m, ok := pValRaw(name).(map[string]any); ok {",
+    "        out := make([]string, 0, len(m))",
+    "        for k := range m { out = append(out, k) }",
+    "        return out",
+    "    }",
+    "    if a, ok := pValRaw(name).([]any); ok {",
+    "        out := make([]string, 0, len(a))",
+    "        for i := range a { out = append(out, strconv.FormatInt(int64(i), 10)) }",
+    "        return out",
+    "    }",
+    "    return nil",
+    "}",
+    "",
     "func arrSlice(a []any, start, end int64) []any {",
     "    s, e := int(start), int(end)",
     "    if s < 0 { s = len(a) + s }",
@@ -10622,9 +12298,27 @@ const RUNTIME_HELPERS: &[&str] = &[
     "",
     "var fArgs []string",
     "",
+    "var __wgd *sync.WaitGroup",
+    "",
+    "var __wgds []*sync.WaitGroup",
+    "",
+    "var shArgOff int",
+    "",
+    "func doShiftF(n int) int64 {",
+    "    if n < 0 || n > len(fArgs) { return 1 }",
+    "    fArgs = fArgs[n:]",
+    "    return 0",
+    "}",
+    "",
+    "func doShiftS(n int) int64 {",
+    "    if n < 0 || shArgOff+n > len(os.Args)-1 { return 1 }",
+    "    shArgOff += n",
+    "    return 0",
+    "}",
+    "",
     "func argsList() []string {",
     "    if len(fArgs) > 0 { return fArgs }",
-    "    if len(os.Args) > 1 { return os.Args[1:] }",
+    "    if len(os.Args) > 1+shArgOff { return os.Args[1+shArgOff:] }",
     "    return nil",
     "}",
     "",
@@ -10635,6 +12329,10 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func paramAt(i int) string {",
+    "    if i == 0 {",
+    "        if len(os.Args) > 0 { return os.Args[0] }",
+    "        return \"\"",
+    "    }",
     "    a := argsList()",
     "    if i >= 1 && i <= len(a) { return a[i-1] }",
     "    return \"\"",
@@ -10647,60 +12345,85 @@ const RUNTIME_HELPERS: &[&str] = &[
     // The defaults (inherit stdout, drop stderr) apply only where the
     // caller left the field unset — the historical behaviour.
     "func runCmd(c *exec.Cmd) int64 {",
+    "    shStdIn(c)",
+    "    shStdErr(c)",
     "    if c.Stdout == nil { c.Stdout = os.Stdout }",
-    "    if c.Stderr == nil { c.Stderr = io.Discard }",
     "    if err := c.Run(); err != nil {",
     "        if ee, ok := err.(*exec.ExitError); ok { return int64(ee.ExitCode()) }",
-    "        return 1",
+    "        // No ExitError: the program never started (not found,",
+    "        // permission denied) — bash reports 127 for those.",
+    "        return 127",
     "    }",
     "    return 0",
     "}",
     "",
     "func capCmd(c *exec.Cmd) string {",
-    "    c.Stderr = io.Discard",
+    "    shStdIn(c)",
+    "    shStdErr(c)",
     "    out, err := c.Output()",
-    "    if err != nil { return \"\" }",
+    "    // bash keeps what the command WROTE even when it exits nonzero",
+    "    // (`$(grep -c pat f1 f2)` prints the counts and takes status 1), so",
+    "    // Output()'s partial output is the value; a command that never",
+    "    // started simply has none.",
+    "    if err != nil && len(out) == 0 { return \"\" }",
     "    return strings.TrimRight(string(out), \"\\n\")",
     "}",
     "",
     "func capCmdRaw(c *exec.Cmd) string {",
-    "    c.Stderr = io.Discard",
+    "    shStdIn(c)",
+    "    shStdErr(c)",
     "    out, err := c.Output()",
     "    if err != nil { return \"\" }",
     "    return string(out)",
     "}",
     "",
     "func capRun(script string, env []string) string {",
-    "    c := exec.Command(\"bash\", \"-c\", script)",
+    "    c := exec.Command(\"bash\", append([]string{\"-c\", script}, shArgs()...)...)",
+    "    shStdIn(c)",
+    "    shStdErr(c)",
     "    c.Env = append(os.Environ(), env...)",
-    "    c.Stderr = io.Discard",
     "    out, err := c.Output()",
     "    if err != nil { return \"\" }",
     "    return strings.TrimRight(string(out), \"\\n\")",
     "}",
     "",
     "func redirRun(script string, env []string) int64 {",
-    "    c := exec.Command(\"bash\", \"-c\", script)",
+    "    c := exec.Command(\"bash\", append([]string{\"-c\", script}, shArgs()...)...)",
+    "    shStdIn(c)",
+    "    shStdErr(c)",
     "    c.Env = append(os.Environ(), env...)",
-    "    c.Stdout = os.Stdout",
-    "    c.Stderr = io.Discard",
     "    return runCmd(c)",
+    "}",
+    "",
+    "// shArgs: the parent positionals as a `bash -c` argv tail (the",
+    "// parent's $0, then argsList(): fArgs in a function, script args",
+    "// otherwise), so a reconstructed fragment naming `$@` observes the",
+    "// same params the parent does.",
+    "func shArgs() []string {",
+    "    if len(os.Args) > 0 {",
+    "        return append([]string{os.Args[0]}, argsList()...)",
+    "    }",
+    "    return append([]string{\"sh2\"}, argsList()...)",
     "}",
     "",
     "func runPipe(stages [][]string) int64 {",
     "    var cmds []*exec.Cmd",
     "    for _, st := range stages {",
     "        c := exec.Command(st[0], st[1:]...)",
-    "        c.Stderr = io.Discard",
     "        cmds = append(cmds, c)",
     "    }",
     "    if len(cmds) == 0 { return 0 }",
+    "    var pipes []io.Closer",
     "    for i := 0; i < len(cmds)-1; i++ {",
     "        p, err := cmds[i].StdoutPipe()",
     "        if err != nil { return 1 }",
     "        cmds[i+1].Stdin = p",
+    "        pipes = append(pipes, p)",
     "    }",
     "    cmds[len(cmds)-1].Stdout = os.Stdout",
+    "    // After the pipe wiring (StdoutPipe refuses an already-set Stdout):",
+    "    // unwired Stdin ends follow the current process stdin.",
+    "    for _, c := range cmds { if c.Stdin == nil { c.Stdin = os.Stdin } }",
     "    for i, c := range cmds {",
     "        if i < len(cmds)-1 {",
     "            if err := c.Start(); err != nil { return 1 }",
@@ -10709,6 +12432,10 @@ const RUNTIME_HELPERS: &[&str] = &[
     "            return 1",
     "        }",
     "    }",
+    "    // The parent holds a read end of every inter-stage pipe: close",
+    "    // the parent copies after Run so an early-exiting downstream",
+    "    // stage (head) retires the producers instead of deadlocking them.",
+    "    for _, p := range pipes { p.Close() }",
     "    for i := 0; i < len(cmds)-1; i++ { cmds[i].Wait() }",
     "    return 0",
     "}",
@@ -10726,17 +12453,20 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    for _, st := range stages {",
     "        if len(st) == 0 { return \"\" }",
     "        c := exec.Command(st[0], st[1:]...)",
-    "        c.Stderr = io.Discard",
     "        cmds = append(cmds, c)",
     "    }",
     "    if len(cmds) == 0 { return \"\" }",
+    "    var pipes []io.Closer",
     "    for i := 0; i < len(cmds)-1; i++ {",
     "        p, err := cmds[i].StdoutPipe()",
     "        if err != nil { return \"\" }",
     "        cmds[i+1].Stdin = p",
+    "        pipes = append(pipes, p)",
     "    }",
     "    last, err := cmds[len(cmds)-1].StdoutPipe()",
     "    if err != nil { return \"\" }",
+    "    // After the pipe wiring: unwired Stdin ends follow the process stdin.",
+    "    for _, c := range cmds { if c.Stdin == nil { c.Stdin = os.Stdin } }",
     "    for _, c := range cmds {",
     "        if err := c.Start(); err != nil {",
     "            for _, d := range cmds { if d.Process != nil { d.Process.Kill() } }",
@@ -10746,6 +12476,8 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    }",
     "    data, err := io.ReadAll(last)",
     "    if err != nil { data = nil }",
+    "    // Same parent-holds-the-pipe deadlock as runPipe (see above).",
+    "    for _, p := range pipes { p.Close() }",
     "    for _, c := range cmds { c.Wait() }",
     "    return string(data)",
     "}",
@@ -10762,11 +12494,122 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func globMatch(pattern, s string) bool {",
+    "    if hasExtglob(pattern) {",
+    "        re, err := regexp.Compile(\"^(?:\" + globRe(pattern, true) + \")$\")",
+    "        if err != nil { return false }",
+    "        return re.MatchString(s)",
+    "    }",
     "    ok, _ := filepath.Match(pattern, s)",
     "    return ok",
     "}",
     "",
+    "func hasExtglob(s string) bool {",
+    "    bb := []byte(s)",
+    "    for i := 0; i+1 < len(bb); i++ {",
+    "        if (bb[i] == '@' || bb[i] == '!' || bb[i] == '?' || bb[i] == '+' || bb[i] == '*') && bb[i+1] == '(' {",
+    "            return true",
+    "        }",
+    "    }",
+    "    return false",
+    "}",
+    "",
+    "// fsGlob walks the filesystem like the shell's pathname expansion:",
+    "// every component is matched by filepath.Match, a leading dot in a",
+    "// name never matches a wildcard, and the result is sorted. Go's",
+    "// filepath.Glob cannot express `./*.sh` (its Match REFUSES the `.` and",
+    "// `/` components outright), so a recursive walk is the only faithful",
+    "// form.",
+    "func fsGlob(pat string) []string {",
+    "    var out []string",
+    "    if pat == \"\" { return out }",
+    "    var walk func(dir, rest string)",
+    "    walk = func(dir, rest string) {",
+    "        for {",
+    "            i := strings.IndexByte(rest, '/')",
+    "            if i < 0 { break }",
+    "            comp := rest[:i]",
+    "            rest = rest[i+1:]",
+    "            if rest == \"\" { break }",
+    "            if !strings.ContainsAny(comp, \"*?[\\\\\") {",
+    "                if comp == \".\" { continue }",
+    "                if comp == \"..\" {",
+    "                    if dir == \".\" { dir = \"..\" } else { dir = filepath.Dir(dir) }",
+    "                    continue",
+    "                }",
+    "                dir = filepath.Join(dir, comp)",
+    "                continue",
+    "            }",
+    "            ents, _ := os.ReadDir(dir)",
+    "            for _, e := range ents {",
+    "                name := e.Name()",
+    "                if strings.HasPrefix(name, \".\") && !strings.HasPrefix(comp, \".\") { continue }",
+    "                if ok, _ := path.Match(comp, name); ok {",
+    "                    walk(filepath.Join(dir, name), rest)",
+    "                }",
+    "            }",
+    "            return",
+    "        }",
+    "        if !strings.ContainsAny(rest, \"*?[\\\\\") {",
+    "            p := rest",
+    "            if dir != \".\" || strings.HasPrefix(pat, \"./\") { p = filepath.Join(dir, rest) }",
+    "            if _, err := os.Lstat(p); err == nil { out = append(out, p) }",
+    "            return",
+    "        }",
+    "        entries, err := os.ReadDir(dir)",
+    "        if err != nil { return }",
+    "        for _, e := range entries {",
+    "            name := e.Name()",
+    "            if strings.HasPrefix(name, \".\") && !strings.HasPrefix(rest, \".\") { continue }",
+    "            if ok, _ := path.Match(rest, name); ok {",
+    "                p := filepath.Join(dir, name)",
+    "                if dir == \".\" && !strings.HasPrefix(pat, \"./\") { p = name }",
+    "                out = append(out, p)",
+    "            }",
+    "        }",
+    "    }",
+    "    start := \".\"",
+    "    if strings.HasPrefix(pat, \"/\") { start = \"/\"; pat = strings.TrimPrefix(pat, \"/\") }",
+    "    walk(start, pat)",
+    "    sort.Strings(out)",
+    "    return out",
+    "}",
+    "",
+    "// globArgs expands a glob word into argv entries. filepath.Glob is tried",
+    "// FIRST: it is Go's own expansion and handles every pattern shape,",
+    "// including the dotfile rule (`.*` matches dotfiles, `*` does not).",
+    "// fsGlob is the fallback for the shapes filepath refuses outright",
+    "// (`.//x`, `dir/../x`).",
     "func globArgs(pat string) []string {",
+    "    if m, err := filepath.Glob(pat); err == nil {",
+    "        // bash's dotfile rule: a wildcard never matches a LEADING dot",
+    "        // unless the pattern's own component starts with one (`.*`,",
+    "        // `.sh`). Go's filepath.Match has no such rule, so `*` returns",
+    "        // `.sh` where bash's `*` does not -- drop those.",
+    "        out := m[:0:0]",
+    "        for _, x := range m {",
+    "            if globDotOk(pat, x) { out = append(out, x) }",
+    "        }",
+    "        if len(out) > 0 { return out }",
+    "        // a no-match pattern is a LITERAL argument in bash (nullglob off)",
+    "        return []string{pat}",
+    "    }",
+    "    // filepath.Glob refused the pattern outright (a dot path component",
+    "    // or a wildcard in a directory position): walk it ourselves.",
+    "    // A pattern whose FIRST component begins with `.` (`.*`, `.??*`)",
+    "    // matches dotfiles: bash's rule is only that a wildcard never",
+    "    // matches a LEADING dot, and here the pattern asked for one. Without",
+    "    // this the dotfile filter below would UNDO filepath.Glob's correct",
+    "    // answer (measured: `grep -c \".*\"` came back with every file).",
+    "    if p := pat; strings.HasPrefix(p, \".\") && strings.ContainsAny(p, \"*?[\") {",
+    "        if m := fsGlob(pat); len(m) > 0 { return m }",
+    "    }",
+    "    // Absolute and `./`-rooted patterns walk the filesystem (bash can",
+    "    // expand them; filepath.Glob refuses them outright).",
+    "    if strings.HasPrefix(pat, \"./\") || strings.HasPrefix(pat, \"../\") {",
+    "        m := fsGlob(pat)",
+    "        if len(m) == 0 { return []string{pat} }",
+    "        return m",
+    "    }",
     "    m, err := filepath.Glob(pat)",
     "    if err != nil || m == nil { return []string{pat} }",
     "    // bash does not let a wildcard match a leading dot: `*` yields no",
@@ -10775,8 +12618,28 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    // twice (once from `*`, once from the literal). Filter it back out;",
     "    // an all-dotfile match leaves the pattern unexpanded, exactly as",
     "    // bash does with nullglob off.",
+    "    // A pattern whose FIRST component begins with `.` (`.*`, `.??*`)",
+    "    // matches dotfiles: bash's rule is only that a wildcard never",
+    "    // matches a LEADING dot, and here the pattern asked for one. Without",
+    "    // this the dotfile filter below would UNDO filepath.Glob's correct",
+    "    // answer (measured: grep -c on a dotted pattern returned files).",
+    "    if p := pat; strings.HasPrefix(p, \".\") && strings.ContainsAny(p, \"*?[\") {",
+    "        if m := fsGlob(pat); len(m) > 0 { return m }",
+    "    }",
+    "",
+    "    // A pattern whose LAST component begins with `.` (`.sh`, `.*`)",
+    "    // matches dotfiles: bash's dot rule is about a LEADING dot in the",
+    "    // name, and the pattern asked for one explicitly. filepath.Glob",
+    "    // already returned them, so the dotfile filter must leave them.",
     "    last := pat",
     "    if i := strings.LastIndexByte(pat, '/'); i >= 0 { last = pat[i+1:] }",
+    "    // A pattern component that BEGINS with `.` asked for dotfiles (bash",
+    "    // only forbids a wildcard matching a leading dot), so filepath.Glob",
+    "    // already answered correctly -- the filter below must not undo it.",
+    "    if strings.HasPrefix(last, \".\") { return m }",
+    "    for _, comp := range strings.Split(pat, \"/\") {",
+    "        if strings.HasPrefix(comp, \".\") { return m }",
+    "    }",
     "    if !strings.HasPrefix(last, \".\") {",
     "        out := m[:0:0]",
     "        for _, s := range m {",
@@ -10790,12 +12653,77 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return m",
     "}",
     "",
+    "// globDotOk: does `pat` legitimately match the leading-dot path `x`?",
+    "// bash expands a wildcard over a name's leading dot only when the",
+    "// pattern's corresponding component itself starts with a dot.",
+    "func globDotOk(pat, x string) bool {",
+    "    pc := strings.Split(pat, \"/\")",
+    "    xc := strings.Split(x, \"/\")",
+    "    if len(pc) != len(xc) { return true }",
+    "    for i := range pc {",
+    "        if strings.HasPrefix(xc[i], \".\") && !strings.HasPrefix(pc[i], \".\") { return false }",
+    "    }",
+    "    return true",
+    "}",
+    "",
     "func reMatch(pattern, s string) bool {",
     "    ok, _ := regexp.MatchString(pattern, s)",
     "    return ok",
     "}",
     "",
+    "func splitTop(s string) []string {",
+    "    var out []string",
+    "    depth := 0",
+    "    start := 0",
+    "    for i := 0; i < len(s); i++ {",
+    "        if s[i] == '(' { depth++ }",
+    "        if s[i] == ')' { depth-- }",
+    "        if s[i] == '|' && depth == 0 { out = append(out, s[start:i]); start = i+1 }",
+    "    }",
+    "    return append(out, s[start:])",
+    "}",
+    "",
     "func globRe(pat string, greedy bool) string {",
+    "    // An extglob head (`@(a|b)`, `*(x)`, `+(y)`, `?(z)`, `!(w)`) compiles",
+    "    // to its regex directly: `@` = one of, `*`/`+` = repeated, `?` =",
+    "    // optional, `!` = none-of (no lookahead — the caller splits the",
+    "    // `!(X)rest` shape out before calling). Alternation depth is",
+    "    // tracked so nested parens survive.",
+    "    if len(pat) >= 2 && pat[1] == '(' {",
+    "        switch pat[0] {",
+    "        case '@', '*', '+', '?', '!':",
+    "            depth := 0",
+    "            end := -1",
+    "            for i := 1; i < len(pat); i++ {",
+    "                if pat[i] == '(' { depth++ }",
+    "                if pat[i] == ')' { depth--; if depth == 0 { end = i; break } }",
+    "            }",
+    "            if end > 0 {",
+    "                inner := pat[2:end]",
+    "                rest := pat[end+1:]",
+    "                alts := splitTop(inner)",
+    "                var bx strings.Builder",
+    "                bx.WriteString(\"(?:\")",
+    "                for ai, a := range alts {",
+    "                    if ai > 0 { bx.WriteString(\"|\") }",
+    "                    bx.WriteString(globRe(a, true))",
+    "                }",
+    "                bx.WriteString(\")\")",
+    "                switch pat[0] {",
+    "                case '@': {}",
+    "                case '*': bx.WriteString(\"*\")",
+    "                case '+': bx.WriteString(\"+\")",
+    "                case '?': bx.WriteString(\"?\")",
+    "                case '!': {",
+    "                    return \"(?:(?!\" + bx.String()[3:] + \")\" + globRe(rest, greedy) + \")\"",
+    "                }",
+    "                }",
+    "                bx.WriteString(globRe(rest, greedy))",
+    "                return bx.String()",
+    "            }",
+    "        default: {}",
+    "        }",
+    "    }",
     "    var b strings.Builder",
     "    for i := 0; i < len(pat); i++ {",
     "        switch pat[i] {",
@@ -10887,33 +12815,101 @@ const RUNTIME_HELPERS: &[&str] = &[
     "",
     "var vars = map[string]any{}",
     "",
+    "var origStdin = os.Stdin",
+    "",
+    "var origStdout = os.Stdout",
+    "",
+    "var origStderr = os.Stderr",
+    "",
+    "// shStd wires a child to the CURRENT process stdio: a nil Stdin",
+    "    // follows the (possibly swapped) os.Stdin var, and a nil Stderr",
+    "    // follows a swapped os.Stderr but stays discarded otherwise",
+    "    // (native helpers never write stderr by default). Stdout is left",
+    "    // alone: capturers attach their own pipe (pre-setting it breaks",
+    "    // Output), and runners default it explicitly. Function bodies run",
+    "    // with these vars temporarily swapped for welded redirects, so",
+    "    // every spawn site funnels through here instead of inheriting the",
+    "    // raw fds (which the swap does not change).",
+    "func shStdIn(c *exec.Cmd) {",
+    "    if c.Stdin == nil { c.Stdin = os.Stdin }",
+    "}",
+    "",
+    "func shStdErr(c *exec.Cmd) {",
+    "    if c.Stderr == nil {",
+    "        if os.Stderr != origStderr { c.Stderr = os.Stderr } else { c.Stderr = io.Discard }",
+    "    }",
+    "}",
+    "func isDigits(s string) bool {",
+    "    if s == \"\" { return false }",
+    "    for i := 0; i < len(s); i++ {",
+    "        if s[i] < '0' || s[i] > '9' { return false }",
+    "    }",
+    "    return true",
+    "}",
+    "",
+    "func atoi(s string) int {",
+    "    n, _ := strconv.Atoi(s)",
+    "    return n",
+    "}",
+    "",
     "func pValRaw(name string) any {",
     "    if v, ok := vars[name]; ok { return v }",
     "    return os.Getenv(name)",
     "}",
     "",
     "func pVal(name string) string {",
+    "    // A bare positional (`${2:-d}` arrives as name \"2\"): shell vars",
+    "    // are never all-digits, so this is always a positional read — and",
+    "    // the value lives in fArgs/os.Args, never in the vars map.",
+    "    if isDigits(name) { return paramAt(atoi(name)) }",
     "    if strings.HasPrefix(name, \"#\") {",
     "        n := name[1:]",
     "        if strings.HasSuffix(n, \"[@]\") {",
     "            a, _ := pValRaw(n[:len(n)-3]).([]any)",
     "            return strconv.FormatInt(int64(len(a)), 10)",
     "        }",
+    "        if isDigits(n) { return strconv.FormatInt(runeLen(paramAt(atoi(n))), 10) }",
     "        if a, ok := pValRaw(n).([]any); ok {",
     "            return strconv.FormatInt(int64(len(a)), 10)",
     "        }",
     "        return strconv.FormatInt(runeLen(s2s(pValRaw(n))), 10)",
     "    }",
-    "    if strings.HasSuffix(name, \"[@]\") {",
-    "        a, _ := pValRaw(name[:len(name)-3]).([]any)",
+    "    if strings.HasSuffix(name, \"[@]\") || strings.HasSuffix(name, \"[*]\") {",
+    "        isStar := strings.HasSuffix(name, \"[*]\")",
+    "        base := name[:len(name)-3]",
+    "        if m, ok := pValRaw(base).(map[string]any); ok {",
+    "            keys := make([]string, 0, len(m))",
+    "            for k := range m { keys = append(keys, k) }",
+    "            sort.Strings(keys)",
+    "            out := make([]string, 0, len(m))",
+    "            for _, k := range keys { out = append(out, s2s(m[k])) }",
+    "            return ifsJoin(out, isStar)",
+    "        }",
+    "        a, _ := pValRaw(base).([]any)",
     "        out := make([]string, 0, len(a))",
     "        for _, v := range a { out = append(out, s2s(v)) }",
-    "        return strings.Join(out, \" \")",
+    "        return ifsJoin(out, isStar)",
+    "    }",
+    "    // The vars map is keyed by FULL name (`vars[\"map[foo]\"]` is what",
+    "    // the assoc write stores), so consult it before decomposing — the",
+    "    // decomposition below only knows whole-array lookups. A whole",
+    "    // array under its bare name reads as element zero (bash), not the",
+    "    // joined list — the [@]/[*] forms are the ones that join.",
+    "    if v, ok := vars[name]; ok {",
+    "        if a, ok := v.([]any); ok { return s2s(arrIdx(a, 0)) }",
+    "        return s2s(v)",
     "    }",
     "    if i := strings.Index(name, \"[\"); i > 0 && strings.HasSuffix(name, \"]\") {",
     "        a, _ := pValRaw(name[:i]).([]any)",
     "        k, err := strconv.ParseInt(name[i+1:len(name)-1], 0, 64)",
     "        if err != nil {",
+    "            if e := expand(name[i+1 : len(name)-1]); e != name[i+1:len(name)-1] {",
+    "                if k2, err2 := strconv.ParseInt(strings.TrimSpace(e), 0, 64); err2 == nil {",
+    "                    return s2s(arrIdx(a, k2))",
+    "                }",
+    "                m, _ := pValRaw(name[:i]).(map[string]any)",
+    "                return s2s(m[strings.TrimSpace(e)])",
+    "            }",
     "            m, _ := pValRaw(name[:i]).(map[string]any)",
     "            return s2s(m[name[i+1:len(name)-1]])",
     "        }",
@@ -10922,20 +12918,34 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return s2s(pValRaw(name))",
     "}",
     "",
+    "func pSliceIdx(s string) (int64, bool) {",
+    "    if v, err := strconv.ParseInt(strings.TrimSpace(s), 0, 64); err == nil {",
+    "        return v, true",
+    "    }",
+    "    // A dynamic offset: expand it through the live store, then parse.",
+    "    if e := strings.TrimSpace(expand(s)); e != strings.TrimSpace(s) {",
+    "        if v, err := strconv.ParseInt(e, 0, 64); err == nil {",
+    "            return v, true",
+    "        }",
+    "    }",
+    "    return 0, false",
+    "}",
+    "",
     "func pList(op, name string, args ...string) []string {",
     "    if op == \"@\" || op == \"*\" { return argsList() }",
     "    if strings.HasPrefix(name, \"#\") {",
     "        return []string{pVal(name)}",
     "    }",
-    "    if strings.HasSuffix(name, \"[@]\") {",
+    "    if strings.HasSuffix(name, \"[@]\") || strings.HasSuffix(name, \"[*]\") {",
     "        base := name[:len(name)-3]",
     "        a, _ := pValRaw(base).([]any)",
     "        if op == \"slice\" && len(args) >= 1 {",
-    "            st := int64(0)",
-    "            if len(args) > 0 { st, _ = strconv.ParseInt(args[0], 0, 64) }",
-    "            en := int64(len(a))",
-    "            if len(args) > 1 { en, _ = strconv.ParseInt(args[1], 0, 64) }",
-    "            a = arrSlice(a, st, st+en)",
+    "            st, _ := pSliceIdx(args[0])",
+    "            e := int64(len(a))",
+    "            if len(args) > 1 && strings.TrimSpace(args[1]) != \"\" {",
+    "                if ln, ok := pSliceIdx(args[1]); ok { e = st+ln } else { e = st }",
+    "            }",
+    "            a = arrSlice(a, st, e)",
     "        }",
     "        out := make([]string, 0, len(a))",
     "        for _, v := range a { out = append(out, s2s(v)) }",
@@ -10986,15 +12996,31 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    case \"dirname\":",
     "        return filepath.Dir(v)",
     "    case \"slice\":",
+    "        // An array value slices by ELEMENT: the bare name arrives for",
+    "        // both spellings, so branch on the runtime value.",
+    "        if a, ok := pValRaw(name).([]any); ok {",
+    "            rest := args",
+    "            if len(rest) > 0 && (rest[0] == \"@\" || rest[0] == \"*\") { rest = rest[1:] }",
+    "            st, _ := pSliceIdx(\"\")",
+    "            if len(rest) > 0 { st, _ = pSliceIdx(rest[0]) }",
+    "            e := int64(len(a))",
+    "            if len(rest) > 1 && strings.TrimSpace(rest[1]) != \"\" {",
+    "                if ln, ok := pSliceIdx(rest[1]); ok { e = st+ln } else { e = st }",
+    "            }",
+    "            a = arrSlice(a, st, e)",
+    "            out := make([]string, 0, len(a))",
+    "            for _, v := range a { out = append(out, s2s(v)) }",
+    "            return strings.Join(out, \" \")",
+    "        }",
     "        st := int64(0)",
-    "        if len(args) > 0 { st, _ = strconv.ParseInt(args[0], 0, 64) }",
+    "        if len(args) > 0 { st, _ = pSliceIdx(args[0]) }",
     "        if st < 0 { st = int64(runeLen(v)) + st }",
     "        if st > int64(runeLen(v)) { st = int64(runeLen(v)) }",
     "        if st < 0 { st = 0 }",
     "        rs := []rune(v)",
-    "        if len(args) < 2 { return string(rs[st:]) }",
-    "        ln, _ := strconv.ParseInt(args[1], 0, 64)",
-    "        en := st + ln",
+    "        if len(args) < 2 || strings.TrimSpace(args[1]) == \"\" { return string(rs[st:]) }",
+    "        en := st",
+    "        if ln, ok := pSliceIdx(args[1]); ok { en = st + ln }",
     "        if en < 0 { en = int64(len(rs)) + en }",
     "        if en > int64(len(rs)) { en = int64(len(rs)) }",
     "        if en < st { en = st }",
@@ -11024,6 +13050,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func expand(s string) string {",
+    "    // A quoted default arrives with its quotes as data: strip one layer.",
+    "    if len(s) >= 2 {",
+    "        if (s[0] == '\"' && s[len(s)-1] == '\"') || (s[0] == '\\'' && s[len(s)-1] == '\\'') {",
+    "            s = s[1 : len(s)-1]",
+    "        }",
+    "    }",
     "    var out strings.Builder",
     "    for i := 0; i < len(s); {",
     "        if s[i] == '$' && i+1 < len(s) {",
@@ -11041,7 +13073,13 @@ const RUNTIME_HELPERS: &[&str] = &[
     "            }",
     "            if s[i+1] == '{' {",
     "                j := i + 2",
-    "                for j < len(s) && s[j] != '}' { j++ }",
+    "                depth := 1",
+    "                for j < len(s) && depth > 0 {",
+    "                    if s[j] == '$' && j+1 < len(s) && s[j+1] == '{' { depth++; j += 2; continue }",
+    "                    if s[j] == '}' { depth-- };",
+    "                    if depth == 0 { break };",
+    "                    j++",
+    "                }",
     "                if j >= len(s) { out.WriteString(s[i:]); break }",
     "                out.WriteString(pExpStr(s[i+2 : j]))",
     "                i = j + 1",
@@ -11060,10 +13098,32 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func pExpStr(inner string) string {",
-    "    for _, op := range []string{\":-\", \":=\", \":?\", \"##\", \"%%\", \"//\", \"^^\", \",,\", \"#\", \"%\", \"/\", \"^\", \",\"} {",
-    "        if idx := strings.Index(inner, op); idx > 0 {",
-    "            return pExp(op, inner[:idx], inner[idx+len(op):])",
+    "    best := -1",
+    "    depth := 0",
+    "    i := 0",
+    "    for i < len(inner) {",
+    "        if inner[i] == '$' && i+1 < len(inner) && inner[i+1] == '{' { depth++; i += 2; continue }",
+    "        if inner[i] == '}' {",
+    "            if depth > 0 { depth--; i++; continue }",
+    "            break",
     "        }",
+    "        if depth == 0 && i > 0 {",
+    "            for _, op := range []string{\":-\", \":=\", \":?\", \"##\", \"%%\", \"//\", \"^^\", \",,\", \"#\", \"%\", \"/\", \"^\", \",\"} {",
+    "                if strings.HasPrefix(inner[i:], op) { best = i; break }",
+    "            }",
+    "            if best >= 0 { break }",
+    "        }",
+    "        i++",
+    "    }",
+    "    // The table is longest-first within each family, so the first",
+    "    // depth-zero match wins — except `#`/`%`/`/` also prefix their",
+    "    // doubles: prefer the longest op at the winning spot.",
+    "    if best >= 0 {",
+    "        bestOp := \"\"",
+    "        for _, op := range []string{\"##\", \"%%\", \"//\", \"^^\", \",,\", \":-\", \":=\", \":?\", \"#\", \"%\", \"/\", \"^\", \",\"} {",
+    "            if strings.HasPrefix(inner[best:], op) { bestOp = op; break }",
+    "        }",
+    "        return pExp(bestOp, inner[:best], inner[best+len(bestOp):])",
     "    }",
     "    if strings.HasPrefix(inner, \"#\") { return pVal(inner) }",
     "    return pVal(inner)",
