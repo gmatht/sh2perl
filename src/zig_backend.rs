@@ -179,6 +179,14 @@ pub struct Render {
     /// `[]const u8` array + length counter (bash arrays are strings; the
     /// i64 set home only fits all-numeric element lists)
     str_arrays: BTreeSet<String>,
+    /// emit the shArrJoin helper (array read in string context)
+    need_arrjoin: bool,
+    /// emit shDiv/shRem (zero-divisor-safe arithmetic)
+    need_safe_div: bool,
+    /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
+    need_globpat: bool,
+    /// emit shBEscape (printf %b backslash expansion)
+    need_bexpand: bool,
     /// bigint vars (arith beyond i64) — lowered to std.math.big.int.Managed
     bigint_vars: BTreeSet<String>,
     /// user functions whose body uses `try` (bigint/file IO) — they
@@ -410,6 +418,25 @@ impl Render {
     /// `SH2_UU_FFI=0`, on if set to anything else). Off by default so the
     /// emitted program keeps the dependency-free fork/exec path unless the
     /// invoker has built/linked libcoreutils_ffi.so.
+    /// Does this operand text (the ORIGINAL `test` operand token) use glob
+    /// or extglob pattern syntax? bash treats the RHS of `=`/`==`/`!=` in
+    /// `[[ ]]` as a pattern, so `@(foo|bar)`, `*.c`, `[ab]` are patterns.
+    fn lit_is_pattern(tok: &str) -> bool {
+        let t = tok.trim_matches('"');
+        let b = t.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'*' | b'?' | b'[' => return true,
+                b'@' | b'+' | b'!' if i + 1 < b.len() && b[i + 1] == b'(' => return true,
+                b'\\' => i += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn uu_ffi_enabled() -> bool {
         match std::env::var("SH2_UU_FFI") {
             Ok(v) => v != "0",
@@ -431,7 +458,11 @@ impl Render {
                 | "sort"
                 | "sed"
                 | "awk"
-                | "grep"
+                // NO "grep": the pinned libcoreutils_ffi build rejects
+                // common flags (-q, -w) with "grep: unsupported flag",
+                // which turned `grep -q hello <<< …` into rc 2
+                // (parse-herestring.sh). The fork/exec arm runs the
+                // system binary verbatim.
                 | "date"
                 | "sha256sum"
                 | "uname"
@@ -716,6 +747,13 @@ impl Render {
                     if name == "?" {
                         self.need_intstr = true;
                         return "shIntStr(sh_rc)".to_string();
+                    }
+                    // `$-` (checked BEFORE declared(): the mangler turns
+                    // "-" into `underscore`, a bare identifier that printed
+                    // an empty line). The gate's reference bash is a plain
+                    // non-interactive shell: hashall + braceexpand.
+                    if name == "-" {
+                        return Self::zig_str("hB");
                     }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
@@ -1115,6 +1153,9 @@ impl Render {
                         self.need_intstr = true;
                         return ('s', "shIntStr(sh_rc)".to_string());
                     }
+                    if name == "-" {
+                        return ('s', Self::zig_str("hB"));
+                    }
                     self.mark_read(name);
                     if self.bigint_vars.contains(name) {
                         self.need_bigint = true;
@@ -1223,8 +1264,18 @@ impl Render {
                     "||" => format!("@intFromBool(({l} != 0) or ({r} != 0))"),
                     // zig signed ints forbid `%`/`/` truncation operators —
                     // C semantics are truncated division/remainder (@rem)
-                    "/" => format!("@divTrunc({l}, {r})"),
-                    "%" => format!("@rem({l}, {r})"),
+                    // a ZERO divisor must not trap: bash reports
+                    // "division by 0" and the script CONTINUES with an
+                    // empty value (parse-arithmetic-extra-paren.sh), while
+                    // @divTrunc PANICS and kills the program
+                    "/" => {
+                        self.need_safe_div = true;
+                        format!("shDiv({l}, {r})")
+                    }
+                    "%" => {
+                        self.need_safe_div = true;
+                        format!("shRem({l}, {r})")
+                    }
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
                         format!("@intFromBool({l} {op} {r})")
                     }
@@ -1862,6 +1913,32 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             "(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
                         );
                     }
+                    // `$@` / `$*` inside a user function: the positional
+                    // args, space-joined (bash's default IFS). Outside a
+                    // function there are none. Reading the ENVIRONMENT for
+                    // "@" printed nothing ("hello " instead of "hello
+                    // test", generator-system-echo-checkqx.sh).
+                    // `$-`: the shell's option letters. The gate compares
+                    // against a plain non-interactive bash, whose set is
+                    // "hB" (hashall + braceexpand). Nothing else in the
+                    // corpus inspects it.
+                    if name == "-" {
+                        return Self::zig_str("hB");
+                    }
+                    if self.in_function && (name == "@" || name == "*") {
+                        self.need_ext = true;
+                        return "shJoinSp(__args)".to_string();
+                    }
+                    // `$#`: the positional-argument COUNT inside a fn (0 at
+                    // top level). It used to read the environment for "#"
+                    // and printed an empty count.
+                    if name == "#" {
+                        if self.in_function {
+                            self.need_intstr = true;
+                            return "shIntStr(@as(i64, @intCast(__args.len)))".to_string();
+                        }
+                        return Self::zig_str("0");
+                    }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
@@ -2371,16 +2448,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         // a capture records the child's real status in sh_rc (bash:
         // `x=$(false); echo $?` → 1), so the stmt wrapper must not reset it
         self.rc_dirty = true;
-        // Route through the in-process uutils arm only for a command the
-        // linked library actually provides (uu_run returns 127 and prints
-        // NOTHING otherwise, which would silently drop the output).
-        let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(&cmd) {
-            self.need_uu_run = true;
-            "shUuRun"
-        } else {
-            "shRun"
-        };
-        Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
+        // CAPTURE position: always the fork/exec arm. `uu_run` takes no
+        // capture buffer — it returns a status and writes fd 1 — so a
+        // `$(cat "$tmpf")` lowered through it evaluated to "" and lost the
+        // command's output (heredoc-with-redirect-same-line printed
+        // `content=[]`). The FFI arm stays for statement position, where
+        // writing fd 1 is exactly right.
+        let _ = Self::uu_cmd_ok(&cmd);
+        Some(format!("shRun(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
     /// One stage of either pipeline form as a fork/feed unit. None for
@@ -2674,6 +2749,154 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         )
     }
 
+    /// Decode a STATIC printf format + arg list into print_from_parts
+    /// specs. Shared by statement printf, `printf -v`, and the pipeline
+    /// stage decoder. None when the shape is not statically decodable.
+    fn printf_parts_of(&mut self, fmt: &str, rest: &[IrExpr]) -> Option<Vec<(char, String)>> {
+        let mut parts: Vec<(char, String)> = Vec::new();
+        let mut argi = 0;
+        // literal runs accumulate into `lit` and flush as ONE part around
+        // each conversion; a char-wise split made
+        // `printf 'heredoc+same-line-redirect content=[%s]\n'` a 39-argument
+        // print, past zig's 32-argument cap.
+        let mut lit = String::new();
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                // printf decodes backslash escapes in the FORMAT text
+                // (\n \t \r \\ \a \b \f \v). Leaving them raw printed
+                // a literal "\n" (printf-format-and-v.sh).
+                let esc: Option<char> = match chars.peek() {
+                    Some('n') => Some('\n'),
+                    Some('t') => Some('\t'),
+                    Some('r') => Some('\r'),
+                    Some('a') => Some('\u{7}'),
+                    Some('b') => Some('\u{8}'),
+                    Some('f') => Some('\u{c}'),
+                    Some('v') => Some('\u{b}'),
+                    Some('\\') => Some('\\'),
+                    _ => None,
+                };
+                if let Some(e) = esc {
+                    chars.next();
+                    lit.push(e);
+                } else {
+                    lit.push(c);
+                }
+                continue;
+            }
+            if c != '%' {
+                lit.push(c);
+                continue;
+            }
+            if !lit.is_empty() {
+                parts.push(('s', Self::zig_str(&lit)));
+                lit.clear();
+            }
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                parts.push(('s', Self::zig_str("%")));
+                continue;
+            }
+            // skip flags/width/length modifiers (`%lld`, `%5d`, `%-10s`)
+            while let Some(&f) = chars.peek() {
+                if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
+                    || f.is_ascii_digit()
+                    || matches!(f, '-' | '+' | ' ' | '#')
+                {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let spec = match chars.peek() {
+                Some('s') => { chars.next(); 's' }
+                Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
+                Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
+                Some('c') => { chars.next(); 's' }
+                Some('b') => { chars.next(); 'b' }
+                Some('q') => { chars.next(); 'q' }
+                _ => { parts.push(('s', Self::zig_str("%"))); continue; }
+            };
+            let Some(a) = rest.get(argi) else {
+                // missing operand: bash prints nothing for the conversion
+                continue;
+            };
+            argi += 1;
+            if spec == 'b' {
+                // %b: the ARGUMENT carries the backslash escapes (printf
+                // "%b" "a\tb\n" prints a<TAB>b). Expand at render time for a
+                // literal, else fall back to the raw text.
+                let raw = self.expr_str(a);
+                self.need_bexpand = true;
+                parts.push(('s', format!("shBEscape({raw})")));
+                continue;
+            }
+            let pa = self.parts_of(a);
+            if pa.len() == 1 {
+                // the string model prints ids as TEXT: a %d over a string
+                // operand keeps {s} (bash prints the same bytes), and a %s
+                // over an INT operand {d}
+                if spec == 's' && pa[0].0 == 'd' {
+                    parts.push(('d', pa[0].1.clone()));
+                } else if spec == 'd' && pa[0].0 != 'd' {
+                    parts.push(('s', pa[0].1.clone()));
+                } else {
+                    parts.push((spec, pa[0].1.clone()));
+                }
+            } else {
+                // multi-part arg (Interpolate / capture with surrounding
+                // text): splice EVERY piece (keeping only pa[0] dropped the
+                // argument's leading text)
+                for p in pa {
+                    parts.push(p);
+                }
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(('s', Self::zig_str(&lit)));
+        }
+        Some(parts)
+    }
+
+    /// Render already-split printf parts into ONE `[]const u8` expression
+    /// (allocPrint with the matching format). Used by `printf -v NAME …`,
+    /// where the text must go to a VARIABLE instead of stdout.
+    fn parts_to_str(&mut self, parts: Vec<(char, String)>) -> String {
+        let mut fmt = String::new();
+        let mut args: Vec<String> = Vec::new();
+        for (spec, e) in parts {
+            match spec {
+                'q' => {
+                    self.need_shquote = true;
+                    fmt.push_str("{s}");
+                    args.push(format!("shellQuote({e})"));
+                }
+                'd' => {
+                    fmt.push_str("{d}");
+                    args.push(e);
+                }
+                _ => {
+                    fmt.push_str("{s}");
+                    args.push(e);
+                }
+            }
+        }
+        let fmt = Self::zig_str(&fmt);
+        format!(
+            "std.fmt.allocPrint(std.heap.page_allocator, {fmt}, .{{{}}}) catch \"\"",
+            args.join(", ")
+        )
+    }
+
+    /// The statements-side printf format decoder, shared with `printf -v`:
+    /// a static format + arg list → parts. None when the shape is not
+    /// statically decodable.
+    fn printf_text(&mut self, fmt: &str, rest: &[IrExpr]) -> Option<String> {
+        let parts = self.printf_parts_of(fmt, rest)?;
+        Some(self.parts_to_str(parts))
+    }
+
     fn print_from_parts(&mut self, parts: Vec<(char, String)>, newline: bool) -> String {
         self.need_stdout = true;
         if !self.in_function {
@@ -2858,7 +3081,19 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     } else {
                         vb
                     };
-                    if o == "==" {
+                    // RHS with glob/extglob syntax is a PATTERN, not a
+                    // literal: `[[ $x = @(foo|bar) ]]` matched nothing
+                    // before (at-in-test.sh). A plain literal keeps the
+                    // exact-equality fast path.
+                    let is_pat = Self::lit_is_pattern(b);
+                    if is_pat {
+                        self.need_globpat = true;
+                        if o == "==" {
+                            Some(format!("shGlobPat({va}, {vb})"))
+                        } else {
+                            Some(format!("!shGlobPat({va}, {vb})"))
+                        }
+                    } else if o == "==" {
                         Some(format!("std.mem.eql(u8, {va}, {vb})"))
                     } else {
                         Some(format!("!std.mem.eql(u8, {va}, {vb})"))
@@ -3098,6 +3333,26 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     }
                     _ => vec![],
                 };
+                // `eval "NAME=payload"` (a single assignment-shaped word):
+                // bind NAME to payload IN THIS PROCESS. Bash's eval runs in
+                // the current shell, so the assignment must be visible to
+                // the following statements — a `sh -c` re-execution wrote
+                // it into a child and `echo "y=$y"` printed `y=`
+                // (eval-assign.sh). The payload is used LITERALLY (no
+                // re-parse of its text): `eval "y=$x+1"` assigns `5+1`,
+                // which is exactly what bash stores for a plain NAME=word.
+                if let Some(items) = match args.get(1) {
+                    Some(IrExpr::Array(items)) if items.len() == 1 => Some(items),
+                    _ => None,
+                } {
+                    if let Some((ename, payload)) = self.eval_assign_parts(&items[0]) {
+                        self.mark_written(&ename);
+                        let m = self.zig_ident(&ename);
+                        self.emit(&format!("{m} = {payload};"));
+                        self.rc_dirty = true;
+                        return true;
+                    }
+                }
                 self.need_run = true;
                 self.rc_dirty = true;
                 self.need_ext = true;
@@ -3113,9 +3368,105 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
                 true
             }
+            // `. file` / `source file`: bash runs the file IN THE CURRENT
+            // SHELL, so its assignments are visible afterwards. A child
+            // `sh` loses them ("shared=" instead of "shared=secret",
+            // dot-source-lib.sh). When the target is a LITERAL path that
+            // exists at RENDER time, splice its statements in place.
+            "." | "source" => {
+                let target = match args.get(1) {
+                    Some(IrExpr::Array(items)) if !items.is_empty() => match &items[0] {
+                        IrExpr::Str(s, _) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(path) = target {
+                    let cand = if path.starts_with('/') {
+                        Some(std::path::PathBuf::from(&path))
+                    } else {
+                        std::env::var_os("SH2_SOURCE_DIR")
+                            .map(|d| std::path::Path::new(&d).join(&path))
+                    };
+                    if let Some(pb) = cand {
+                        if let Ok(text) = std::fs::read_to_string(&pb) {
+                            if let Ok(cmds) = crate::Parser::new(&text).parse() {
+                                let mut sub = crate::shir::ast_to_ir(&cmds);
+                                crate::transforms::builtin::fallback_builtin_to_exec(&mut sub);
+                                for st in &sub.stmts {
+                                    self.stmt(st);
+                                }
+                            }
+                            self.emit("sh_rc = 0;");
+                            self.rc_dirty = true;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
             _ => false,
         }
+    }
+
+    /// `eval "NAME=rest"`: split the one-word payload into the assignment
+    /// NAME (the literal prefix before the first `=`) and a Zig expression
+    /// for the REST of the word, so the eval'd assignment lands in the
+    /// current process instead of a `sh -c` child. The rest is joined as a
+    /// `++` concatenation of already-rendered string pieces. None for any
+    /// other eval shape (the caller keeps the `sh -c` arm).
+    fn eval_assign_parts(&mut self, word: &IrExpr) -> Option<(String, String)> {
+        let IrExpr::Interpolate(parts) = word else { return None };
+        let mut name = String::new();
+        let mut pieces: Vec<String> = Vec::new();
+        let mut seen_eq = false;
+        for p in parts {
+            match p {
+                InterpPart::Lit(text) if !seen_eq => {
+                    if let Some((head, tail)) = text.split_once('=') {
+                        name.push_str(head);
+                        seen_eq = true;
+                        if !tail.is_empty() {
+                            pieces.push(Self::zig_str(tail));
+                        }
+                    } else {
+                        name.push_str(text);
+                    }
+                }
+                InterpPart::Lit(text) => pieces.push(Self::zig_str(text)),
+                InterpPart::Expr(e) => {
+                    // STRING context by construction (the payload is text):
+                    // an int-homed var must not arrive as `shIntStr(x)`
+                    // inside a `++` chain that the file may never declare —
+                    // render the var directly.
+                    let piece = match e.as_ref() {
+                        IrExpr::Var(v, _) | IrExpr::Ident(v) if self.is_num(v) => {
+                            self.need_intstr = true;
+                            let m = self.zig_ident(v);
+                            self.mark_read(v);
+                            format!("shIntStr({m})")
+                        }
+                        _ => self.expr_str(e),
+                    };
+                    pieces.push(piece);
+                }
+            }
+        }
+        if !seen_eq || !is_ident(&name) {
+            return None;
+        }
+        if pieces.is_empty() {
+            pieces.push(Self::zig_str(""));
+        }
+        // runtime concatenation: `++` needs comptime-known slices, so fold
+        // with the shStrCat helper (same one the string-concat lowering uses)
+        let mut payload = pieces[0].clone();
+        for piece in &pieces[1..] {
+            self.need_cat = true;
+            payload = format!("shStrCat({payload}, {piece})");
+        }
+        Some((name, payload))
     }
 
     /// A `$name`/`${name}`/literal word inside a `local`-family value
@@ -3771,6 +4122,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 self.need_intstr = true;
                 return Some(format!("shIntStr({m})"));
             }
+            // an ARRAY read in SCALAR context (`${LIST:-}`) is element 0
+            // only (verified: bash prints `item1` for a two-element LIST).
+            // The bare home `LIST` is a `[1024][]const u8`, which does not
+            // typecheck against a []const u8 and printed nothing
+            // (parse-array-plusassign.sh). `"${arr[*]}"` joins — that form
+            // routes through arr_star_str, not here.
+            if self.str_arrays.contains(name) || self.set_arrays.contains(name) {
+                return Some(format!(
+                    "(if ({m}_len > 0) {m}[0] else @as([]const u8, \"\"))"
+                ));
+            }
             return Some(m);
         }
         self.need_env = true;
@@ -3926,13 +4288,13 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         let argv: Vec<String> = words.iter().map(|w| Self::zig_str(w)).collect();
         self.need_run = true;
         self.rc_dirty = true;
-        let entry = if Self::uu_ffi_enabled() && Self::uu_cmd_ok(&words[0]) {
-            self.need_uu_run = true;
-            "shUuRun"
-        } else {
-            "shRun"
-        };
-        Some(format!("{entry}(&[_][]const u8{{{}}})", argv.join(", ")))
+        // CAPTURE position: always the fork/exec arm. `uu_run` (the
+        // in-process FFI entry) takes no capture buffer — it returns an
+        // exit code and writes to fd 1 — so a `$(uname -s)` lowered
+        // through it evaluated to "" and the assignment lost the command's
+        // output (uname-in-qx.sh printed an empty line). The FFI arm stays
+        // for STATEMENT position, where writing fd 1 is exactly right.
+        Some(format!("shRun(&[_][]const u8{{{}}})", argv.join(", ")))
     }
 
     /// `y+=2` / `r=$(cmd)` / `x=$y` as an `assign` CALL (the core leaves
@@ -4160,156 +4522,32 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             }
         }
         if cmd == "printf" {
+            // `printf -v NAME fmt args…` assigns the formatted text to NAME
+            // instead of printing (bash). Without this the whole statement
+            // was dropped and the format string leaked into later output
+            // (`%b-vname=` for printf-format-and-v.sh).
             if let Some(IrExpr::Array(items)) = args.get(1) {
-                if let Some(IrExpr::Str(fmt, _)) = items.first() {
-                    let mut parts = Vec::new();
-                    // translate the format's % conversions into
-                    // print_from_parts specs over the arg list
-                    let rest = &items[1..];
-                    let mut argi = 0;
-                    let mut chars = fmt.chars().peekable();
-                    while let Some(c) = chars.next() {
-                        if c == '%' {
-                            if chars.peek() == Some(&'%') {
-                                chars.next();
-                                parts.push(('s', Self::zig_str("%")));
-                                continue;
-                            }
-                            // consume flags/width/length
-                            // modifiers (`%lld`, `%u`,
-                            // `%5d`): the value model is
-                            // int-as-string or i64
-                            while let Some(&f) = chars.peek() {
-                                if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
-                                    || f.is_ascii_digit()
-                                    || matches!(f, '-' | '+' | ' ' | '#')
-                                {
-                                    chars.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                               let spec = match chars.peek() {
-                                Some('s') => { chars.next(); 's' }
-                                Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
-                                Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
-                                Some('c') => { chars.next(); 's' }
-                                Some('q') => { chars.next(); 'q' }
-                                Some('\n') => { chars.next(); 's' }
-                                _ => { parts.push(('s', Self::zig_str("%"))); continue; }
-                            };
-                            if let Some(a) = rest.get(argi) {
-                                argi += 1;
-                                let pa = self.parts_of(a);
-                                if pa.len() == 1 {
-                                    // a %d over a
-                                    // string-model value
-                                    // (the user-fn
-                                    // convention) prints
-                                    // identically with {s}
-                                    if spec == 'd' && pa[0].0 == 's' {
-                                        parts.push(('s', pa[0].1.clone()));
-                                        continue;
-                                    }
-                                    // %s over a numeric (i64) var:
-                                    // use {d} so the typed var
-                                    // compiles and prints its
-                                    // decimal repr (bash parity)
-                                    if spec == 's' && pa[0].0 == 'd' {
-                                        parts.push(('d', pa[0].1.clone()));
-                                        continue;
-                                    }
-                                    // %q shell-quote: wrap the arg
-                                    // in shellQuote(); for numeric
-                                    // args, convert to string first
-                                    if spec == 'q' {
-                                        if pa[0].0 == 'd' {
-                                            let n = &pa[0].1;
-                                            parts.push((
-                                                'q',
-                                                format!(
-                                                    "std.fmt.allocPrint(std.heap.page_allocator, \"{{d}}\", .{{{}}}) catch \"\"",
-                                                    n
-                                                ),
-                                            ));
-                                        } else {
-                                            parts.push(('q', pa[0].1.clone()));
-                                        }
-                                        continue;
-                                    }
-                                    parts.push((spec, pa[0].1.clone()));
-                                } else {
-                                    parts.push(pa[0].clone());
-                                }
-                             } else {
-                                let arg = if spec == 'q' {
-                                    "\"\"".to_string()
-                                } else if spec == 'd' {
-                                    "0".into()
-                                } else {
-                                    "\"\"".into()
-                                };
-                                parts.push((spec, arg));
-                            }
-                        } else if c == '\\' {
-                            // bash printf escape sequences in
-                            // format strings: \n \t \r \\ \a \b \f \v
-                            // \xHH \NNN
-                            let esc: String = match chars.peek() {
-                                Some('n') => { chars.next(); "\n".to_string() }
-                                Some('t') => { chars.next(); "\t".to_string() }
-                                Some('r') => { chars.next(); "\r".to_string() }
-                                Some('\\') => { chars.next(); "\\".to_string() }
-                                Some('a') => { chars.next(); "\u{7}".to_string() }
-                                Some('b') => { chars.next(); "\u{8}".to_string() }
-                                Some('f') => { chars.next(); "\u{c}".to_string() }
-                                Some('v') => { chars.next(); "\u{b}".to_string() }
-                                Some('x') => {
-                                    chars.next();
-                                    let mut hex = String::new();
-                                    for _ in 0..2 {
-                                        if let Some(h) = chars.peek() {
-                                            if h.is_ascii_hexdigit() {
-                                                hex.push(*h);
-                                                chars.next();
-                                            } else { break; }
-                                        } else { break; }
-                                    }
-                                    if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                                        String::from_utf8_lossy(&[b]).to_string()
-                                    } else {
-                                        "\\x".to_string()
-                                    }
-                                }
-                                Some(d) if ('0'..='7').contains(d) => {
-                                    // octal escape \NNN (1-3 digits)
-                                    let mut oct = String::new();
-                                    oct.push(*d);
-                                    chars.next();
-                                    for _ in 0..2 {
-                                        if let Some(o) = chars.peek() {
-                                            if ('0'..='7').contains(o) {
-                                                oct.push(*o);
-                                                chars.next();
-                                            } else { break; }
-                                        } else { break; }
-                                    }
-                                    if let Ok(b) = u8::from_str_radix(&oct, 8) {
-                                        String::from_utf8_lossy(&[b]).to_string()
-                                    } else {
-                                        "\\".to_string()
-                                    }
-                                }
-                                _ => "\\".to_string(),
-                            };
-                            parts.push(('s', Self::zig_str(&esc)));
-                        } else {
-                            parts.push(('s', Self::zig_str(&c.to_string())));
+                if let [IrExpr::Str(flag, _), IrExpr::Str(vname, _), IrExpr::Str(fmt, _), rest @ ..] =
+                    items.as_slice()
+                {
+                    if flag == "-v" && is_ident(vname) {
+                        if let Some(v) = self.printf_text(fmt, rest) {
+                            self.mark_written(vname);
+                            let m = self.zig_ident(vname);
+                            self.emit(&format!("{m} = {v};"));
+                            self.rc_dirty = true;
+                            return;
                         }
                     }
-                    let call = self.print_from_parts(parts, false);
-                    self.emit(&call);
-                    return;
+                }
+            }
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                    if let Some(parts) = self.printf_parts_of(fmt, &items[1..]) {
+                        let call = self.print_from_parts(parts, false);
+                        self.emit(&call);
+                        return;
+                    }
                 }
             }
         }
@@ -4474,6 +4712,39 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
                             if self.stmt_builtin(cmd, args) {
                                 return;
+                            }
+                            // `exec <cmd> <args>` / `builtin <cmd> <args>`:
+                            // the prefix is a CALL FORM, not a command to run
+                            // — `exec echo "$x"` arrived as
+                            // ("exec", Array[echo, …]) and spawning a binary
+                            // literally named `exec` printed NOTHING
+                            // (param-expand-hashhash.sh).
+                            if (cmd == "exec" || cmd == "builtin") && func == "exec" {
+                                if let Some(IrExpr::Array(inner)) = args.get(1) {
+                                    if !inner.is_empty() {
+                                        let mut uargs: Vec<IrExpr> = inner.clone();
+                                        if let Some(IrExpr::Str(sub, _)) = uargs.first() {
+                                            if self.stmt_builtin(sub, &uargs) {
+                                                return;
+                                            }
+                                        }
+                                        // not a builtin → external command
+                                        if let Some(IrExpr::Str(sub, _)) = uargs.first() {
+                                            let _ = sub;
+                                            let mut argv = Vec::new();
+                                            for a in &uargs {
+                                                argv.push(self.expr_str(a));
+                                            }
+                                            self.need_run = true;
+                                            self.rc_dirty = true;
+                                            self.emit(&format!(
+                                                "shRunStmt(&[_][]const u8{{{}}});",
+                                                argv.join(", ")
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                             // a `local`-family builtin the native path
                             // refused is a STUB (never an external: there is
@@ -4756,7 +5027,21 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 } else {
                     self.expr_str(expr)
                 };
-                self.emit(&format!("{m} = {rhs};"));
+                // a zero-divisor arithmetic error ABANDONS the assignment
+                // (bash keeps the previous value and exits 1) — see the
+                // shDiv/shRem helpers
+                let arith_checked = self.need_safe_div;
+                if arith_checked {
+                    // evaluate FIRST, then store: the RHS call itself sets
+                    // sh_arith_err, so a plain `x = f()` would still assign
+                    self.emit(&format!("{{"));
+                    self.emit(&format!("    const __sh_av = {rhs};"));
+                    self.emit(&format!("    if (!sh_arith_err) {{ {m} = __sh_av; }}"));
+                    self.emit(&format!("}}"));
+                    self.emit("if (sh_arith_err) { sh_rc = 1; }");
+                } else {
+                    self.emit(&format!("{m} = {rhs};"));
+                }
             }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -4943,6 +5228,34 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             IrStmt::For { var, iter, body } => {
                 let m = self.zig_ident(var);
                 self.mark_written(var);
+                // `for a in "$@"` inside a fn iterates the POSITIONAL ARGS
+                // individually (listVar("@") in string context is the
+                // space-joined form, which is wrong for iteration)
+                if self.in_function {
+                    if let IrExpr::Array(items) = iter {
+                        if let [IrExpr::Call { func, args }] = items.as_slice() {
+                            if func == "listVar"
+                                && matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "@" || n == "*")
+                            {
+                                // the loop capture must not collide with
+                                // the hoisted `var a_` home (zig: "capture
+                                // shadows declaration")
+                                let v_tmp = self.fresh_tmp("sh_arg");
+                                self.emit(&format!("for (__args) |{v_tmp}| {{"));
+                                self.emit(&format!("{m} = {v_tmp};"));
+                                self.depth += 1;
+                                self.loop_depth += 1;
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.loop_depth -= 1;
+                                self.depth -= 1;
+                                self.emit("}");
+                                return;
+                            }
+                        }
+                    }
+                }
                 match iter {
                     IrExpr::Array(items) => {
                         let elems: Vec<String> = if self.is_num(var) {
@@ -5308,6 +5621,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 // another fn is legal zig but the decls/return machinery
                 // above assumes top level.
                 let id = self.zig_ident(name);
+                // fn-local names must read as DECLARED inside the body
+                // (they are the fn's own stores) but must not leak into the
+                // module-level `written` set afterwards — a leak made a
+                // top-level read of a never-called fn's local emit a bare
+                // undeclared identifier (parse-bare-quote-in-function)
+                let fn_locals_now = function_locals(body);
+                let written_saved = std::mem::take(&mut self.written);
+                self.written = written_saved.clone();
+                for v in &fn_locals_now {
+                    self.written.insert(v.clone());
+                }
                 let prev_in_fn = self.in_function;
                 self.in_function = true;
                 let mut saved = std::mem::take(&mut self.out);
@@ -5338,6 +5662,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
                 std::mem::swap(&mut saved, &mut self.out);
                 self.in_function = prev_in_fn;
+                self.written = written_saved;
                 let mut locals = function_locals(body);
                 // capture-promoted vars stay global (bash dynamic scoping):
                 // a fn-local shadow here would hide the global the nested
@@ -5468,6 +5793,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         // both be invisible to the other side. Nested-fn reads of enclosing
         // locals promote the same way (dynamic scoping). Promoted globals
         // get file-scope-safe manglings (no helper-internal collisions).
+        let mut fn_locals_all: BTreeSet<String> = BTreeSet::new();
         {
             let mut top = BTreeSet::new();
             collect_written(&prog.stmts, &mut top);
@@ -5478,6 +5804,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             for b in bodies {
                 reads_stmts(b, &mut touched);
                 collect_targets(b, &mut touched);
+                fn_locals_all.extend(function_locals(b));
             }
             collect_captured(&prog.stmts, &mut self.globals);
             for v in top {
@@ -5520,8 +5847,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         collect_written(&prog.stmts, &mut written);
         // top-level writes (function bodies are excluded by the walker):
         // functions assigning these names write the shared global
+        // var_types carries fn-LOCAL names too (the core records the type
+        // of every assigned var). A name that is only ever a fn local must
+        // NOT be declared at module level: the decl loop skips it anyway,
+        // so marking it written made top-level reads emit a bare
+        // undeclared identifier.
         for (n, _) in &prog.var_types {
-            written.insert(n.clone());
+            let vt_glob = self.globals.contains(n);
+            let vt_fn_local = fn_locals_all.contains(n) && !vt_glob;
+            if !vt_fn_local {
+                written.insert(n.clone());
+            }
         }
         // `declared()` consults this during rendering (a var reference
         // before its assignment in source order still lowers natively).
@@ -5636,6 +5972,62 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}\", .{ a, b }) catch \"\";");
             self.emit("}");
         }
+        if self.need_arrjoin {
+            self.emit("");
+            self.emit("fn shArrJoin(a: []const []const u8, n: usize) []const u8 {");
+            self.emit("    // string context of an array: elements joined by a SPACE");
+            self.emit("    // (the default IFS; the corpus uses the default)");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var k: usize = 0;");
+            self.emit("    while (k < n) : (k += 1) {");
+            self.emit("        if (k != 0) out.append(std.heap.page_allocator, ' ') catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, a[k]) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
+        if self.need_bexpand {
+            self.emit("");
+            // printf %b: expand \\n \\t \\r \\\\ \\a \\b \\f \\v and \\0NNN in
+            // the ARGUMENT (format-text escapes are decoded at render time)
+            self.emit("fn shBEscape(s: []const u8) []const u8 {");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var i: usize = 0;");
+            self.emit("    while (i < s.len) : (i += 1) {");
+            self.emit("        if (s[i] != '\\\\' or i + 1 >= s.len) { out.append(std.heap.page_allocator, s[i]) catch return \"\"; continue; }");
+            self.emit("        i += 1;");
+            self.emit("        const c = switch (s[i]) { 'n' => @as(u8, '\\n'), 't' => '\\t', 'r' => '\\r', 'a' => 7, 'b' => 8, 'f' => 12, 'v' => 11, '\\\\' => '\\\\', else => 0 };");
+            self.emit("        if (c != 0) { out.append(std.heap.page_allocator, c) catch return \"\"; continue; }");
+            self.emit("        if (s[i] == '0') {");
+            self.emit("            var v: u8 = 0;");
+            self.emit("            var k: usize = 0;");
+            self.emit("            i += 1;");
+            self.emit("            while (i < s.len and k < 3 and s[i] >= '0' and s[i] <= '7') : (i += 1) { v = v * 8 + (s[i] - '0'); k += 1; }");
+            self.emit("            out.append(std.heap.page_allocator, v) catch return \"\";");
+            self.emit("            i -= 1;");
+            self.emit("            continue;");
+            self.emit("        }");
+            self.emit("        out.append(std.heap.page_allocator, s[i]) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
+        if self.need_safe_div {
+            self.emit("");
+            // bash's arithmetic error: message on stderr, the enclosing
+            // assignment is ABANDONED (the variable keeps its old value),
+            // and the shell exits 1 at the end of that command's list. We
+            // approximate the value half exactly (flag + no store).
+            self.emit("var sh_arith_err = false;");
+            self.emit("fn shDiv(a: i64, b: i64) i64 {");
+            self.emit("    if (b == 0) { sh_arith_err = true; return 0; }");
+            self.emit("    return @divTrunc(a, b);");
+            self.emit("}");
+            self.emit("fn shRem(a: i64, b: i64) i64 {");
+            self.emit("    if (b == 0) { sh_arith_err = true; return 0; }");
+            self.emit("    return @rem(a, b);");
+            self.emit("}");
+        }
         if self.need_b2s {
             self.emit("");
             self.emit("fn shB2S(b: bool) []const u8 {");
@@ -5654,8 +6046,8 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("var sh_environ: ?*std.process.Environ.Map = null;");
             self.emit("");
             self.emit("fn shEnv(name: []const u8) []const u8 {");
-            self.emit("    const m = sh_environ orelse return \"\";");
-            self.emit("    return m.get(name) orelse \"\";");
+            self.emit("    const __sh_m = sh_environ orelse return \"\";");
+            self.emit("    return __sh_m.get(name) orelse \"\";");
             self.emit("}");
         }
         if self.need_fexist {
@@ -5674,9 +6066,12 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("");
             self.emit("fn shWriteFile(p: []const u8, data: []const u8, append: bool) void {");
             self.emit("    const io = sh_io orelse return;");
-            self.emit("    const f = std.Io.Dir.cwd().createFile(io, p, .{ .truncate = !append }) catch return;");
-            self.emit("    defer f.close(io);");
-            self.emit("    f.writeStreamingAll(io, data) catch {};");
+            // `__sh_f`: a single-letter helper local shadows a user fn of
+            // the same name declared at file scope ("local constant shadows
+            // declaration of 'f'" — parse-heredoc-in-if.sh has `f()`).
+            self.emit("    const __sh_f = std.Io.Dir.cwd().createFile(io, p, .{ .truncate = !append }) catch return;");
+            self.emit("    defer __sh_f.close(io);");
+            self.emit("    __sh_f.writeStreamingAll(io, data) catch {};");
             self.emit("}");
         }
         if self.need_ext {
@@ -5755,10 +6150,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    // `^`/`,`: convert only the FIRST byte (bash operates on the");
             self.emit("    // first character; byte-wise is exact for ASCII)");
             self.emit("    if (t.len == 0) return t;");
-            self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
-            self.emit("    @memcpy(b, t);");
-            self.emit("    b[0] = if (upper) std.ascii.toUpper(t[0]) else std.ascii.toLower(t[0]);");
-            self.emit("    return b;");
+            self.emit("    const __sh_b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
+            self.emit("    @memcpy(__sh_b, t);");
+            self.emit("    __sh_b[0] = if (upper) std.ascii.toUpper(t[0]) else std.ascii.toLower(t[0]);");
+            self.emit("    return __sh_b;");
             self.emit("}");
             self.emit("fn shJoinWs(t: []const u8) []const u8 {");
             self.emit("    // word-split on IFS whitespace, drop empties, rejoin with");
@@ -5827,14 +6222,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return out.items;");
             self.emit("}");
             self.emit("fn shCase(t: []const u8, upper: bool) []const u8 {");
-            self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
-            self.emit("    for (t, 0..) |c, i| b[i] = if (upper) std.ascii.toUpper(c) else std.ascii.toLower(c);");
-            self.emit("    return b;");
+            self.emit("    const __sh_b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
+            self.emit("    for (t, 0..) |c, i| __sh_b[i] = if (upper) std.ascii.toUpper(c) else std.ascii.toLower(c);");
+            self.emit("    return __sh_b;");
             self.emit("}");
             self.emit("fn shReplaceLit(t: []const u8, pat: []const u8, repl: []const u8, all: bool) []const u8 {");
-            self.emit("    const i = std.mem.indexOf(u8, t, pat) orelse return t;");
+            self.emit("    const __sh_i = std.mem.indexOf(u8, t, pat) orelse return t;");
             self.emit("    if (!all) {");
-            self.emit("        return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}{s}\", .{ t[0..i], repl, t[i + pat.len ..] }) catch \"\";");
+            self.emit("        return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}{s}\", .{ t[0..__sh_i], repl, t[__sh_i + pat.len ..] }) catch \"\";");
             self.emit("    }");
             self.emit("    var n: usize = 0;");
             self.emit("    var j: usize = 0;");
@@ -5856,16 +6251,16 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("}");
             self.emit("fn shFields(allocator: std.mem.Allocator, t: []const u8, d: []const u8, ids: []const usize, suppress: bool) []const u8 {");
             self.emit("    if (!shContains(t, d)) return if (suppress) \"\" else t;");
-            self.emit("    const p = std.heap.page_allocator.alloc([]const u8, std.mem.count(u8, t, d) + 1) catch return \"\";");
+            self.emit("    const __sh_p = std.heap.page_allocator.alloc([]const u8, std.mem.count(u8, t, d) + 1) catch return \"\";");
             self.emit("    var it = std.mem.splitScalar(u8, t, d[0]);");
             self.emit("    var np: usize = 0;");
-            self.emit("    while (it.next()) |part| { p[np] = part; np += 1; }");
+            self.emit("    while (it.next()) |part| { __sh_p[np] = part; np += 1; }");
             self.emit("    var out: std.ArrayList(u8) = .empty;");
             self.emit("    var first = true;");
             self.emit("    for (ids) |id| {");
-            self.emit("        if (id < p.len) {");
+            self.emit("        if (id < __sh_p.len) {");
             self.emit("            if (!first) out.appendSlice(allocator, d) catch return \"\";");
-            self.emit("            out.appendSlice(allocator, p[id]) catch return \"\";");
+            self.emit("            out.appendSlice(allocator, __sh_p[id]) catch return \"\";");
             self.emit("            first = false;");
             self.emit("        }");
             self.emit("    }");
@@ -6144,13 +6539,99 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("");
             self.emit("fn shUuRun(argv: []const []const u8) []const u8 {");
             self.emit("    if (argv.len == 0) return \"\";");
-            self.emit("    const util_z = std.heap.page_allocator.dupeSentinel(u8, argv[0], 0) catch return \"\";");
             self.emit("    const zargs = std.heap.page_allocator.alloc([*:0]const u8, argv.len) catch return \"\";");
             self.emit("    for (argv, 0..) |a, i| {");
             self.emit("        zargs[i] = std.heap.page_allocator.dupeSentinel(u8, a, 0) catch return \"\";");
             self.emit("    }");
-            self.emit("    sh_rc = uu_run(util_z, @intCast(argv.len), zargs.ptr);");
+            self.emit("    sh_rc = uu_run(zargs[0], @intCast(argv.len), zargs.ptr);");
             self.emit("    return \"\";");
+            self.emit("}");
+        }
+        if self.need_globpat {
+            self.emit("");
+            // pattern match for `[[ $x = PAT ]]`: a RECURSIVE matcher over
+            // * ? [set] plus the extglob groups @(a|b) ?(a|b) *(a|b) +(a|b)
+            // !(a|b) — the literal-equality path matched nothing for
+            // `[[ $x = @(foo|bar) ]]` (at-in-test.sh).
+            self.emit("fn shGlobPat(s: []const u8, pat: []const u8) bool {");
+            self.emit("    return shGlob2(s, 0, pat, 0);");
+            self.emit("}");
+            // end index of the `(...)` group opening at `pi`
+            self.emit("fn shGlobGroupEnd(pat: []const u8, pi: usize) usize {");
+            self.emit("    var depth: usize = 0;");
+            self.emit("    var i = pi;");
+            self.emit("    while (i < pat.len) : (i += 1) {");
+            self.emit("        if (pat[i] == '(') depth += 1");
+            self.emit("        else if (pat[i] == ')') { depth -= 1; if (depth == 0) return i; }");
+            self.emit("    }");
+            self.emit("    return pat.len;");
+            self.emit("}");
+            self.emit("fn shGlobAlt(s: []const u8, si: usize, alt: []const u8, pend: usize, pat: []const u8) bool {");
+            self.emit("    var k: usize = 0;");
+            self.emit("    while (k <= s.len - si) : (k += 1) {");
+            self.emit("        if (!shGlob2(s[0..si + k], 0, alt, 0)) continue;");
+            self.emit("        // try the remainder of the pattern after the group");
+            self.emit("        if (shGlob2(s, si + k, pat, pend + 1)) return true;");
+            self.emit("    }");
+            self.emit("    return false;");
+            self.emit("}");
+            self.emit("fn shGlob2(s: []const u8, s0: usize, pat: []const u8, p0: usize) bool {");
+            self.emit("    var si = s0;");
+            self.emit("    var pi = p0;");
+            self.emit("    while (pi < pat.len) {");
+            self.emit("        const pc = pat[pi];");
+            self.emit("        if (pc == '*') {");
+            self.emit("            // plain star: try every suffix");
+            self.emit("            var k: usize = 0;");
+            self.emit("            while (si + k <= s.len) : (k += 1) {");
+            self.emit("                if (shGlob2(s, si + k, pat, pi + 1)) return true;");
+            self.emit("            }");
+            self.emit("            return false;");
+            self.emit("        }");
+            self.emit("        if ((pc == '@' or pc == '+' or pc == '?' or pc == '!') and pi + 1 < pat.len and pat[pi + 1] == '(') {");
+            self.emit("            const pe = shGlobGroupEnd(pat, pi + 1);");
+            self.emit("            const inner = pat[pi + 2 .. pe];");
+            self.emit("            var it = std.mem.splitScalar(u8, inner, '|');");
+            self.emit("            var matched = false;");
+            self.emit("            while (it.next()) |alt| {");
+            self.emit("                var k: usize = 0;");
+            self.emit("                while (si + k <= s.len) : (k += 1) {");
+            self.emit("                    if (!shGlob2(s[0 .. si + k], 0, alt, 0)) continue;");
+            self.emit("                    if (pc == '@' and shGlob2(s, si + k, pat, pe + 1)) { matched = true; break; }");
+            self.emit("                    if (pc == '?' and k >= 1 and shGlob2(s, si + k, pat, pe + 1)) { matched = true; break; }");
+            self.emit("                    if ((pc == '+' or pc == '*') and k >= 1 and shGlob2(s, si + k, pat, pe + 1)) { matched = true; break; }");
+            self.emit("                }");
+            self.emit("                if (matched) break;");
+            self.emit("            }");
+            self.emit("            if (pc == '*' and shGlob2(s, si, pat, pe + 1)) matched = true;");
+            self.emit("            return matched;");
+            self.emit("        }");
+            self.emit("        if (pc == '?') { if (si >= s.len) return false; si += 1; pi += 1; continue; }");
+            self.emit("        if (pc == '[') {");
+            self.emit("            if (si >= s.len) return false;");
+            self.emit("            var i = pi + 1;");
+            self.emit("            var neg = false;");
+            self.emit("            if (i < pat.len and (pat[i] == '!' or pat[i] == '^')) { neg = true; i += 1; }");
+            self.emit("            var hit = false;");
+            self.emit("            var first = true;");
+            self.emit("            while (i < pat.len and (pat[i] != ']' or first)) {");
+            self.emit("                first = false;");
+            self.emit("                if (i + 2 < pat.len and pat[i + 1] == '-' and pat[i + 2] != ']') {");
+            self.emit("                    if (s[si] >= pat[i] and s[si] <= pat[i + 2]) hit = true;");
+            self.emit("                    i += 3;");
+            self.emit("                } else {");
+            self.emit("                    if (s[si] == pat[i]) hit = true;");
+            self.emit("                    i += 1;");
+            self.emit("                }");
+            self.emit("            }");
+            self.emit("            if (i >= pat.len) return false;");
+            self.emit("            if (hit == neg) return false;");
+            self.emit("            si += 1; pi = i + 1; continue;");
+            self.emit("        }");
+            self.emit("        if (si >= s.len or s[si] != pc) return false;");
+            self.emit("        si += 1; pi += 1;");
+            self.emit("    }");
+            self.emit("    return si == s.len;");
             self.emit("}");
         }
         if self.need_glob {
