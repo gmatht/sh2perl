@@ -1314,6 +1314,13 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // but WRONG: it ends the script, while bash keeps running the next
     // statement (measured on tail-standalone: bash prints its next line and
     // exits 0, `exit` exited 1 before it).
+    if body.contains("__sh2_has ") {
+        out.push_str("function __sh2_has\n");
+        out.push_str("    # is COMMAND on the PATH? (fish treats an unknown\n");
+        out.push_str("    # command inside a substitution as a fatal read error)\n");
+        out.push_str("    type -q -- $argv[1]\n");
+        out.push_str("end\n\n");
+    }
     if body.contains("__sh2_setrc ") {
         out.push_str("function __sh2_setrc\n");
         out.push_str("    # re-raise a command's exact exit code as $status\n");
@@ -1959,7 +1966,17 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             }
             indent(out, d);
             out.push_str("switch ");
-            out.push_str(&word_to_fish(discriminant)?);
+            // A `$(cmd)` discriminant whose cmd may NOT EXIST is fatal to fish
+            // ("Unknown command" is a READ error, so the whole file dies and the
+            // script produces no output at all). bash merely reports 127 for the
+            // substitution and CONTINUES, which is why
+            // parse-case-dollarparen-pattern (`case "$(__docker_to_extglob …)"`,
+            // a function the test never defines) exits 0 with no stdout.
+            // Guard the substitution so the missing command degrades the same
+            // way: run it when present, else set the status bash would have
+            // left, without ending the script.
+            let disc = word_to_fish(discriminant)?;
+            out.push_str(&guard_maybe_missing_capture(&disc, discriminant));
             out.push_str("\n");
             for cl in clauses {
                 indent(out, d + 1);
@@ -11193,4 +11210,31 @@ fn regex_escape_fish(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Wrap a rendered `(cmd …)` substitution so a MISSING command cannot kill the
+/// file. fish turns "Unknown command" inside a command substitution into a
+/// read-time error for the WHOLE script; bash reports 127 for that
+/// substitution and keeps going. Only a plain `(NAME …)` whose NAME is not a
+/// fish builtin/known binary is wrapped — everything else is left untouched.
+fn guard_maybe_missing_capture(rendered: &str, _src: &IrExpr) -> String {
+    let t = rendered.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) else {
+        return rendered.to_string();
+    };
+    let inner = inner.trim();
+    let first = inner.split_whitespace().next().unwrap_or("");
+    let plain = !first.is_empty()
+        && first
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if !plain {
+        return rendered.to_string();
+    }
+    // NOTE: no `__sh2_setrc 127` in the else arm. bash reports 127 for the
+    // missing command's substitution, but a `case` built on it still SUCCEEDS,
+    // so the script's final status comes from its last statement -- forcing
+    // 127 here made parse-case-dollarparen-pattern exit 127 where bash exits 0.
+    // An empty substitution is what bash hands `case` in this situation too.
+    format!("(if __sh2_has {first}; {inner}; end)")
 }
