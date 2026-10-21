@@ -664,6 +664,21 @@ impl JavaRender {
             }
             IrStmt::Block(body) => {
                 if body.is_empty() { return Ok(()); }
+                // a block body is COMMAND TEXT (it is a forked group in
+                // bash): rendering it statement-natively would send a
+                // captured nested command back through the text renderers
+                // forever. Text keeps the exact group semantics.
+                let is_ctx = self.in_fn > 0 || self.depth > 2
+                    || body.iter().any(|b| matches!(b, IrStmt::Block(_) | IrStmt::Subshell(_)));
+                let is_target_body = !is_ctx && body.iter().any(|b| matches!(b, IrStmt::Assign { targets, .. }
+                    if targets.first().map(|t| t.var.starts_with("__ps_")).unwrap_or(false)));
+                if is_target_body || (!is_ctx && body.iter().all(|b| matches!(b, IrStmt::Expr(IrExpr::Call { func, .. })
+                        if func == "exec" || func == "builtin" || func == "test" || func == "capture"))) {
+                    let t = self.arrow_expr(body)?;
+                    self.helper("run");
+                    self.emit(&format!("__SH_RC = shRun({t});"));
+                    return Ok(());
+                }
                 self.block_open("{");
                 for b in body { self.stmt(b)?; }
                 self.block_close();
@@ -1046,6 +1061,14 @@ impl JavaRender {
     /// so that a forked child (`( … )`, `x=$(…)`, a pipeline stage) gets the
     /// right fd table. Returns a Java string expression for the command.
     fn redirect_text_arms(&mut self, inner: &[IrStmt], redirects: &[IrRedirect]) -> Result<String, String> {
+        // A Redirect nested in a Redirect body is COMMAND TEXT of the
+        // enclosing command: unwrap it here (the generic body renderers
+        // would send it back through stage_expr/arrow_expr forever).
+        if let [IrStmt::Redirect { inner: ri, redirects: rr }] = inner {
+            let mut t = self.redirect_text_arms(ri, rr)?;
+            t += &self.redirect_ops_text(inner, redirects, &[])?;
+            return Ok(t);
+        }
         // a heredoc/herestring body with NO command in front: bash feeds the
         // body to nothing — `<<EOF` alone still parses `cat` as the sink in
         // a pipeline stage, so render `cat <<EOF`
@@ -1122,25 +1145,13 @@ impl JavaRender {
             // The command (or its forked group) is the TEXT LEFT OF the
             // heredoc operator — a heredoc op is never the whole line.
             let tail = self.redirect_ops_text(inner, redirects, &splits)?;
+            let body = self.arrow_expr(inner)?;
             if !tail.is_empty() {
-                let body = self.arrow_expr(inner)?;
                 return Ok(format!("{body}{tail}"));
             }
-            unreachable!();
+            return Ok(body);
         }
-        let r = self.redirect_ops_text(inner, redirects, &splits);
-        if !inner.is_empty() {
-            if let Ok(t) = &r {
-                if t.trim_start().starts_with(" + ") {
-                    // redirect text never starts with an operator: the body
-                    // must be the command (a forked group keeps `{ …; }`)
-                    let body = self.arrow_expr(inner)?;
-                    let ops: String = t.trim_start_matches(' ').to_string();
-                    return Ok(format!("{body}{ops}"));
-                }
-            }
-        }
-        r
+        self.redirect_ops_text(inner, redirects, &splits)
     }
 
     /// Run a command that carries file redirects as a real child and
@@ -1325,8 +1336,6 @@ impl JavaRender {
     }
 
     fn redirect(&mut self, inner: &[IrStmt], redirects: &[IrRedirect]) -> Result<(), String> {
-        if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("RED n={} reds={:?}", inner.len(), redirects.iter().map(|r| (r.fd, r.mode.clone())).collect::<Vec<_>>()); }
-        if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("RED inner={:?} reds={:?}", inner.iter().map(|x| format!("{x:?}").chars().take(80).collect::<String>()).collect::<Vec<_>>(), redirects.iter().map(|r| (r.fd, r.mode.clone())).collect::<Vec<_>>()); }
         // ONE text decision for the whole redirect statement: a plain body
         // becomes `cmd > f`, a compound/forked one `{ …; } > f`, a headless
         // heredoc (`<<EOF | cmd`) `cat <<EOF | cmd`.
@@ -1638,7 +1647,6 @@ impl JavaRender {
     /// the pipeline via `printf '%s'`. The capture is byte-exact (no
     /// trailing-newline stripping — pipes carry raw bytes).
     fn stage_expr(&mut self, stage: &[IrStmt]) -> Result<String, String> {
-        if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("STG {:?}", stage.iter().map(|x| format!("{x:?}").chars().take(90).collect::<String>()).collect::<Vec<_>>()); }
         self.helper("quote");
         match stage {
             [IrStmt::Expr(IrExpr::Call { func, args, .. })]
@@ -1692,15 +1700,33 @@ impl JavaRender {
                 self.cmd_line_expr(&std::iter::once(cmd.clone()).chain(args.iter().cloned()).collect::<Vec<_>>())
             }
             #[allow(unreachable_patterns)]
-            [IrStmt::Redirect { .. }] => {
-                // a stdin-fed loop carries java-side vars back (sync_pending)
-                // only when it goes native; a text loop has none to carry
-                let r = self.redirect_stage_text(stage);
-                r
+            [IrStmt::Redirect { inner, redirects }] => {
+                // the redirect TEXT for this body. redirect_stage_text is
+                // NOT re-entered here: its body path calls back into
+                // arrow_expr → stage_expr and would recurse forever. A
+                // stdin-fed loop or a java-state body needs the native
+                // runner instead.
+                let stdin_fed = redirects.iter().any(|r| matches!(r.fd, Some(0))
+                    || matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring"));
+                if (stdin_fed && inner.iter().any(|b| matches!(b, IrStmt::While { .. } | IrStmt::For { .. })))
+                    || Self::body_needs_native(inner)
+                {
+                    return self.stage_expr_native_loop(inner, redirects);
+                }
+                let mut t = self.arrow_expr(inner)?;
+                t += &self.redirect_ops_text(inner, redirects, &[])?;
+                Ok(t)
             }
-            [IrStmt::Block(_)] => {
-                // a { … } stage that is not one command: render as text
-                self.arrow_expr(stage)
+            // a `{ … }` stage is its body's command text: routing a
+            // redirect-carrying body back through stage_expr would recurse
+            // (stage_expr → arrow_expr → stage_expr …) forever
+            [IrStmt::Block(b)] => self.arrow_expr(b),
+            // a `( … )` stage is a forked group: render `( body )` — the
+            // body's own text, never back through stage_expr (a nested
+            // subshell would recurse forever)
+            [IrStmt::Subshell(b)] => {
+                let t = self.arrow_expr(b)?;
+                Ok(format!("(\"( \" + {t} + \" )\")"))
             }
             [IrStmt::While { cond, body }] => {
                 // a statement-while stage: bash text when its condition is
@@ -1709,7 +1735,6 @@ impl JavaRender {
                 match self.whileloop_text(std::slice::from_ref(&one), body) {
                     Ok(t) => Ok(t),
                     Err(e) => {
-                        if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("SWHY {e}"); }
                         let _ = e;
                         self.stage_expr_native(stage)
                     }
@@ -1726,11 +1751,9 @@ impl JavaRender {
     /// java input stream and is left to the native runner.
     fn redirect_stage_text(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         if let [IrStmt::Redirect { inner, redirects }] = stage {
-            if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("RST {:?}", redirects.iter().map(|r| (r.fd, r.mode.clone())).collect::<Vec<_>>()); }
             let stdin_fed = redirects.iter().any(|r| matches!(r.fd, Some(0))
                 || matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring"));
             if stdin_fed && inner.iter().any(|b| matches!(b, IrStmt::While { .. } | IrStmt::For { .. })) {
-                if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("SFL"); }
                 // prefer the TEXT loop (parent-seeded, parent-synced)
                 let one = inner.iter().find_map(|b| match b {
                     IrStmt::While { cond, body }
@@ -1843,7 +1866,6 @@ impl JavaRender {
         // helper body only swaps PrintStreams, which would hijack the
         // enclosing helper's own capture. Run bash -c and take its stdout.
         if let [IrStmt::Redirect { inner, redirects }] = stage {
-            if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("RST {:?}", redirects.iter().map(|r| (r.fd, r.mode.clone())).collect::<Vec<_>>()); }
             let stdin_fed = redirects.iter().any(|r| matches!(r.fd, Some(0))
                 || matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring"));
             // loop bodies fed by stdin (`while …; done < <(…)`) need the
@@ -1856,6 +1878,19 @@ impl JavaRender {
                 // must not see the redirect itself: run the body in place
                 let _ = inner;
                 return self.stage_expr_native_loop(inner, redirects);
+            }
+            // the body of a REDIRECT-carrying stage: the ops belong to the
+            // stage (`body > f`), never to the body's own text — routing
+            // back into stage_expr would re-enter redirect_stage_text
+            // forever
+            if inner.len() == 1 {
+                if let Some(r) = self.redirect_subprocess(&inner[0]) { return r; }
+                if let IrStmt::Redirect { .. } = &inner[0] {
+                    self.helper("run");
+                    let mut t = self.arrow_expr(inner)?;
+                    t += &self.redirect_ops_text(inner, redirects, &[])?;
+                    return Ok(t);
+                }
             }
             return self.arrow_expr(stage);
         }
@@ -2420,7 +2455,6 @@ impl JavaRender {
                     other => Self::expr_has_capture(other),
                 });
                 // `typeset -l|-u NAME`: a case attribute on that var
-                if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("TS rest={:?}", rest.iter().map(|x| format!("{x:?}").chars().take(80).collect::<String>()).collect::<Vec<_>>()); }
                 {
                     let flat: Vec<&IrExpr> = rest.iter().flat_map(|w| flatten_words(std::slice::from_ref(w))).collect();
                     let flag = flat.iter().find_map(|w| match w {
@@ -4573,7 +4607,6 @@ impl JavaRender {
     /// `assigned` (body-written vars) render as symbolic `$`-refs (live
     /// across iterations); other vars bake their current java values.
     fn body_stmt_text(&mut self, st: &IrStmt, assigned: &std::collections::BTreeSet<String>) -> Result<String, String> {
-        if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("BST text: {:?}", format!("{st:?}").chars().take(200).collect::<String>()); }
         match st {
             IrStmt::Case { discriminant, clauses } => {
                 // `case … in pat) body ;; … esac` as bash text
@@ -4911,7 +4944,6 @@ impl JavaRender {
         // any node that wants java state refuses (the loop then renders
         // natively — a baked condition would freeze the loop).
         if Self::body_needs_native(cond) {
-            if std::env::var_os("SH2_JDBG3").is_some() { eprintln!("WLT native cond: {:?}", cond.iter().map(|x| format!("{x:?}").chars().take(150).collect::<String>()).collect::<Vec<_>>()); }
             return Err("java-state while condition not in bash text".into());
         }
         // (1) the BODY runs in a child shell: body-assigned vars are the
@@ -5246,7 +5278,15 @@ impl JavaRender {
                         continue;
                     }
                     if Self::body_needs_native(inner) {
-                        parts.push(self.stage_expr_native(std::slice::from_ref(st))?);
+                        // stdin-fed loop bodies keep the java input stream;
+                        // anything else is plain command text with its ops
+                        if stdin_fed && inner.iter().any(|b| matches!(b, IrStmt::While { .. } | IrStmt::For { .. })) {
+                            parts.push(self.redirect_stage_text(std::slice::from_ref(st))?);
+                        } else {
+                            let mut inner_text = self.arrow_expr(inner)?;
+                            inner_text += &self.redirect_ops_text(inner, redirects, &[])?;
+                            parts.push(inner_text);
+                        }
                         continue;
                     }
                     let mut inner_text = self.arrow_expr(inner)?;
@@ -5336,11 +5376,22 @@ impl JavaRender {
                     let sep = if matches!(*op, BinOpKind::And) { " && " } else { " || " };
                     parts.push(format!("{l} + \"{sep}\" + {r}"));
                 }
+                // a redirect/capture node is COMMAND TEXT of its own; sending
+                // it back through stage_expr (whose Redirect arm calls this
+                // function) would recurse forever
+                IrStmt::Redirect { inner, redirects } => {
+                    parts.push(self.redirect_text_arms(inner, redirects)?);
+                }
                 other => {
                     // loops (For/While/whileLoop) inside a captured body:
                     // run natively in a per-site capture helper (same as a
                     // pipeline stage), then feed the bytes as the command.
-                    // Wrap in a single-element stage slice for the helper.
+                    // Redirect nodes are command text — stage_expr would call
+                    // back into THIS function forever for a nested redirect.
+                    if let IrStmt::Redirect { .. } = other {
+                        parts.push(self.redirect_text_arms(std::slice::from_ref(other), &[])?);
+                        continue;
+                    }
                     parts.push(self.stage_expr(std::slice::from_ref(other))?);
                 }
             }
@@ -5495,10 +5546,39 @@ impl JavaRender {
                 }
                 Ok(inner_t)
             }
+            // a COMPARISON operand inside a chain (`[ -n "$v" ] || v=x`)
+            // runs as BASH: `[ lhs op rhs ]`
+            IrExpr::BinOp { ref op, lhs, rhs, .. }
+                if matches!(*op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) =>
+            {
+                let tok = match op {
+                    BinOpKind::Eq => "=", BinOpKind::Ne => "!=",
+                    BinOpKind::Lt => "\\<", BinOpKind::Le => "-le",
+                    BinOpKind::Gt => "\\>", _ => "-ge",
+                };
+                let l = self.expr_str(lhs)?;
+                let r = self.expr_str(rhs)?;
+                self.helper("quote");
+                Ok(format!("(\"[ \" + shQuote({l}) + \" {tok} \" + shQuote({r}) + \" ]\")"))
+            }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
                 if matches!(*op, BinOpKind::And | BinOpKind::Or) =>
             {
                 let sep = if matches!(*op, BinOpKind::And) { " && " } else { " || " };
+                // a COMPARISON operand inside a chain runs as BASH: `[ lhs op rhs ]`
+                match (op, lhs.as_ref(), rhs.as_ref()) {
+                    (BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge, _, _) => {
+                        let tok = match op {
+                            BinOpKind::Eq => "=", BinOpKind::Ne => "!=",
+                            BinOpKind::Lt => "\\<", BinOpKind::Le => "-le",
+                            BinOpKind::Gt => "\\>", _ => "-ge",
+                        };
+                        let l = self.bash_word(lhs)?;
+                        let r = self.bash_word(rhs)?;
+                        return Ok(format!("(\"[ \" + shQuote({l}) + \" {tok} \" + shQuote({r}) + \" ]\")"));
+                    }
+                    _ => {}
+                }
                 let l = self.side_text(lhs)?;
                 let r = self.side_text(rhs)?;
                 Ok(format!("({l} + \"{sep}\" + {r})"))
@@ -5561,6 +5641,20 @@ impl JavaRender {
                     }
                 }
                 Ok(format!("( \"{{ \" + {} + \" ; }}\" )", sub.join(" + \" ; \" + ")))
+            }
+            // A shell VARIABLE in chain-operand position: bash's `[ -n "$v" ]`
+            // idiom — a non-empty value means success.
+            IrExpr::Var(..) | IrExpr::Ident(..) => {
+                self.helper("quote");
+                let v = self.expr_str(e)?;
+                Ok(format!("(({}).isEmpty() ? \"false\" : \"true\")", v))
+            }
+            // a plain word (`[ x ]` with a literal): true iff non-empty
+            IrExpr::Str(t, _) => Ok(jstr(if t.is_empty() { "false" } else { "true" })),
+            IrExpr::Call { func, .. } if func == "getVar" => {
+                self.helper("quote");
+                let v = self.expr_str(e)?;
+                Ok(format!("(({}).isEmpty() ? \"false\" : \"true\")", v))
             }
             other => Err(format!("command-chain side not representable: {other:?}")),
         }
