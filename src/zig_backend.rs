@@ -183,6 +183,8 @@ pub struct Render {
     need_arrjoin: bool,
     /// emit shDiv/shRem (zero-divisor-safe arithmetic)
     need_safe_div: bool,
+    /// emit shShl/shShr (shift amounts normalised to u6)
+    need_shift: bool,
     /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
     need_globpat: bool,
     /// emit shBEscape (printf %b backslash expansion)
@@ -1293,7 +1295,19 @@ impl Render {
                 let l = self.arith(lhs);
                 let r = self.arith(rhs);
                 match op.as_str() {
-                    "**" => format!("std.math.pow(i64, {l}, {r})"),
+                    "**" => {
+                        self.need_shift = true;
+                        format!("shPow({l}, {r})")
+                    },
+                    // zig requires the SHIFT AMOUNT in its own integer type
+                    "<<" => {
+                        self.need_shift = true;
+                        format!("shShl({l}, {r})")
+                    }
+                    ">>" => {
+                        self.need_shift = true;
+                        format!("shShr({l}, {r})")
+                    }
                     "&&" => format!("@intFromBool(({l} != 0) and ({r} != 0))"),
                     "||" => format!("@intFromBool(({l} != 0) or ({r} != 0))"),
                     // zig signed ints forbid `%`/`/` truncation operators —
@@ -1330,8 +1344,38 @@ impl Render {
                 self.arith(then),
                 self.arith(else_)
             ),
-            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
-                // runtime setVar semantics (x=, x+=, x++) — sh2.arith stub
+            ArithAst::IncDec { var, delta, prefix } => {
+                // `i++` / `++i` INSIDE an expression (not the statement
+                // form): a Zig block expression reads the old or the new
+                // value, and the store is the side effect
+                if self.declared(var) {
+                    let m = self.zig_ident(var);
+                    self.mark_read(var);
+                    self.mark_written(var);
+                    if self.is_num(var) {
+                        if *prefix {
+                            format!("blk: {{ {m} += {}; break :blk {m}; }}", delta)
+                        } else {
+                            format!("blk: {{ const __sh_old = {m}; {m} += {}; break :blk __sh_old; }}", delta)
+                        }
+                    } else {
+                        // STRING home: the arithmetic value is shToInt of
+                        // the text, and the store goes back as text
+                        self.need_toint = true;
+                        self.need_intstr = true;
+                        if *prefix {
+                            format!("blk: {{ {m} = shIntStr(shToInt({m}) + {}); break :blk shToInt({m}); }}", delta)
+                        } else {
+                            format!("blk: {{ const __sh_old = shToInt({m}); {m} = shIntStr(__sh_old + {}); break :blk __sh_old; }}", delta)
+                        }
+                    }
+                } else {
+                    self.sh2_calls.insert("arith".into());
+                    "sh2ArithStub()".to_string()
+                }
+            }
+            ArithAst::Assign { .. } => {
+                // runtime setVar semantics (x=, x+=) — sh2.arith stub
                 self.sh2_calls.insert("arith".into());
                 "sh2ArithStub()".to_string()
             }
@@ -1567,11 +1611,17 @@ impl Render {
             })
             .collect();
         let norm = norm.replace('{', " ").replace('}', " ");
+        // the CORE arithmetic parser FIRST: it understands `i++`/`++i` and
+        // every operator; the hand-rolled mf_* chain only covers math
+        // functions and silently read `i++` as `i` (078_arithmetic_double_
+        // paren: `(( j = i++ + ++i ))`).
+        if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+            return Some(self.arith(&ast));
+        }
         if let Some(v) = self.mathfunc_arith_zig(norm.trim()) {
             return Some(v);
         }
-        let ast = crate::shir::parse_arith(norm.trim())?;
-        Some(self.arith(&ast))
+        None
     }
 
     /// zsh-mathfunc arith text → native Zig numeric expression. The
@@ -6254,6 +6304,18 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("        out.append(std.heap.page_allocator, s[i]) catch return \"\";");
             self.emit("    }");
             self.emit("    return out.items;");
+            self.emit("}");
+        }
+        if self.need_shift {
+            self.emit("");
+            self.emit("fn shPow(a: i64, b: i64) i64 { if (b < 0) return 0; return std.math.powi(i64, a, b) catch 0; }");
+            self.emit("fn shShl(a: i64, b: i64) i64 {");
+            self.emit("    const s: u6 = @intCast(@as(u64, @bitCast(b)) & 63);");
+            self.emit("    return a << s;");
+            self.emit("}");
+            self.emit("fn shShr(a: i64, b: i64) i64 {");
+            self.emit("    const s: u6 = @intCast(@as(u64, @bitCast(b)) & 63);");
+            self.emit("    return a >> s;");
             self.emit("}");
         }
         if self.need_safe_div {
