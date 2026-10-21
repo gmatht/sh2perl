@@ -187,6 +187,12 @@ pub struct Render {
     need_globpat: bool,
     /// emit shBEscape (printf %b backslash expansion)
     need_bexpand: bool,
+    /// emit shSource (runtime `.`/`source` support)
+    need_source: bool,
+    /// names a runtime `source`d file is allowed to assign
+    source_targets: BTreeSet<String>,
+    /// names a runtime-sourced file may assign (declared up front)
+    source_names: BTreeSet<String>,
     /// bigint vars (arith beyond i64) — lowered to std.math.big.int.Managed
     bigint_vars: BTreeSet<String>,
     /// user functions whose body uses `try` (bigint/file IO) — they
@@ -3164,8 +3170,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             let m = self.zig_ident(inner);
             self.mark_read(inner);
             (m, self.is_num(inner))
-        } else if let Ok(n) = inner.parse::<i64>() {
-            (n.to_string(), true)
+        } else if !has_dollar && inner.parse::<i64>().is_ok() {
+            // a QUOTED literal is a STRING in `[ ]` ("010" != "10"): keep the
+            // exact bytes, do not route through an i64 home
+            (Self::zig_str(inner), false)
         } else if has_dollar {
             // a `$var` reference whose var is never hoisted (env / param):
             // the runtime store — loud TODO rather than a silent literal
@@ -3385,8 +3393,13 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     let cand = if path.starts_with('/') {
                         Some(std::path::PathBuf::from(&path))
                     } else {
-                        std::env::var_os("SH2_SOURCE_DIR")
-                            .map(|d| std::path::Path::new(&d).join(&path))
+                        // relative: resolve against SH2_SOURCE_DIR when the
+                        // invoker names one, else the RENDERER's cwd (which
+                        // is the script's cwd under the gate)
+                        Some(match std::env::var_os("SH2_SOURCE_DIR") {
+                            Some(d) => std::path::Path::new(&d).join(&path),
+                            None => std::path::PathBuf::from(&path),
+                        })
                     };
                     if let Some(pb) = cand {
                         if let Ok(text) = std::fs::read_to_string(&pb) {
@@ -3396,11 +3409,29 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                                 for st in &sub.stmts {
                                     self.stmt(st);
                                 }
+                                self.emit("sh_rc = 0;");
+                                self.rc_dirty = true;
+                                return true;
                             }
-                            self.emit("sh_rc = 0;");
-                            self.rc_dirty = true;
-                            return true;
                         }
+                        // NOT readable at render time (the script creates
+                        // it first): source it AT RUN TIME. `shSource` reads
+                        // the file and applies its simple `NAME=value` lines
+                        // to variables the program already declares.
+                        self.need_source = true;
+                        self.need_env = true;
+                        // a sourced file may assign any module-level global:
+                        // dispatch on every declared name (the set is closed
+                        // before rendering starts, so this stays stable)
+                        for n in self.written.clone() {
+                            self.source_targets.insert(n);
+                        }
+                        self.source_targets.extend(self.globals.iter().cloned());
+                        // `path` is the RAW literal text: emit it as a Zig
+                        // string literal, not as an expression
+                        self.emit(&format!("shSource({});", Self::zig_str(&path)));
+                        self.rc_dirty = true;
+                        return true;
                     }
                 }
                 false
@@ -3729,9 +3760,19 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         };
         self.emit(&format!("if ({cond}) {{"));
         self.depth += 1;
+        let rc_before = self.rc_dirty;
+        self.rc_dirty = false;
         self.side_stmt(rhs);
+        // the RHS side's OWN status becomes the chain's status (bash:
+        // `cd /bad || echo x` leaves $? = 0). A side whose arm cannot
+        // record a status keeps whatever it set.
+        if !self.rc_dirty {
+            self.emit("sh_rc = 0;");
+        }
+        self.rc_dirty = rc_before || self.rc_dirty;
         self.depth -= 1;
         self.emit("}");
+        self.rc_dirty = true;
     }
 
     /// One chain side as a statement: commands run through the shared
@@ -5228,9 +5269,24 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             IrStmt::For { var, iter, body } => {
                 let m = self.zig_ident(var);
                 self.mark_written(var);
-                // `for a in "$@"` inside a fn iterates the POSITIONAL ARGS
-                // individually (listVar("@") in string context is the
-                // space-joined form, which is wrong for iteration)
+                // `for a in "$@"`: the POSITIONAL PARAMS. Inside a fn that
+                // is __args; at TOP LEVEL it is the script's own argv, which
+                // the corpus gate runs with NONE — zero iterations, not one
+                // empty one (parse-dollars-in-string.sh printed a blank line).
+                if !self.in_function {
+                    if let IrExpr::Array(items) = iter {
+                        if let [IrExpr::Call { func, args }] = items.as_slice() {
+                            if func == "listVar"
+                                && matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "@" || n == "*")
+                            {
+                                self.emit("{");
+                                self.emit("    // `for x in \"$@\"` with no positional params");
+                                self.emit("}");
+                                return;
+                            }
+                        }
+                    }
+                }
                 if self.in_function {
                     if let IrExpr::Array(items) = iter {
                         if let [IrExpr::Call { func, args }] = items.as_slice() {
@@ -5540,10 +5596,19 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             // (`interpolate: true`): the target arrives as
                             // raw text with `$`-refs intact — expand them;
                             // quoted bodies stay literal
-                            let text = match &r.target {
+                            let mut text = match &r.target {
                                 IrExpr::Str(s, _) if r.interpolate => self.expand_heredoc(s),
                                 _ => self.expr_str(&r.target),
                             };
+                            if r.mode == "herestring" {
+                                // `<<< "word"` feeds the word PLUS a newline
+                                // (bash appends one); without it `cat <<< x`
+                                // printed `x` with no trailing newline and
+                                // the next echo ran onto the same line
+                                // (zz-hs-probe2.sh: `plainrc=0`)
+                                self.need_cat = true;
+                                text = format!("shStrCat({text}, \"\\n\")");
+                            }
                             self.emit(&format!("var {sv}: c_int = -1;"));
                             self.emit(&format!("var {blk}_p_{sv}: [2]std.c.fd_t = undefined;"));
                             self.emit(&format!("if (std.c.pipe(&{blk}_p_{sv}) != 0) {{ {blk}_ok = false; }} else {{"));
@@ -6048,6 +6113,41 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("fn shEnv(name: []const u8) []const u8 {");
             self.emit("    const __sh_m = sh_environ orelse return \"\";");
             self.emit("    return __sh_m.get(name) orelse \"\";");
+            self.emit("}");
+        }
+        if self.need_source {
+            // `.`/`source` at RUN time: read the file and apply its simple
+            // `NAME=value` lines. The names are the program's DECLARED
+            // globals (a dispatch on the file's name), because a sourced
+            // value must land in the same home the reader consults — an
+            // env-map write was shadowed by the declared `var` and printed
+            // empty (dot-source-lib.sh: `shared=`).
+            self.emit("");
+            self.emit("fn shSource(path: []const u8) void {");
+            self.emit("    const io = sh_io orelse return;");
+            self.emit("    const data = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(1 << 20)) catch { sh_rc = 1; return; };");
+            self.emit("    var it = std.mem.splitScalar(u8, data, '\\n');");
+            self.emit("    while (it.next()) |line0| {");
+            self.emit("        const line = std.mem.trim(u8, line0, \" \\t\\r\");");
+            self.emit("        if (line.len == 0 or line[0] == '#') continue;");
+            self.emit("        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;");
+            self.emit("        const nm = std.mem.trim(u8, line[0..eq], \" \\t\");");
+            self.emit("        if (nm.len == 0) continue;");
+            self.emit("        var val = std.mem.trim(u8, line[eq + 1 ..], \" \\t\");");
+            self.emit("        if (val.len >= 2 and (val[0] == 0x27 or val[0] == 0x22) and val[val.len - 1] == val[0]) val = val[1 .. val.len - 1];");
+            self.emit("        const cv = std.heap.page_allocator.dupe(u8, val) catch continue;");
+            for name in self.source_targets.iter().cloned().collect::<Vec<_>>() {
+                let m = self.zig_ident(&name);
+                self.emit(&format!(
+                    "        if (std.mem.eql(u8, nm, {})) {{ {m} = cv; continue; }}",
+                    Self::zig_str(&name)
+                ));
+            }
+            self.emit("        if (sh_environ) |env| {");
+            self.emit("            env.put(std.heap.page_allocator.dupe(u8, nm) catch continue, cv) catch {};");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    sh_rc = 0;");
             self.emit("}");
         }
         if self.need_fexist {
