@@ -23,6 +23,11 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     r.render(prog)
 }
 
+/// Child → parent report for one loop-carried variable: appends
+/// `NAME VALUE` to the sync file. Written INLINE (an `export -f`ed helper
+/// function does not survive a Java-spawned child: its `BASH_FUNC_*`
+/// environment entry is dropped on exec).
+const SYNC_REPORT: &str = r#"printf '%s %s\n' "#;
 struct JavaRender {
     in_fn: usize,                  // >0 while rendering a function body
     cur_fn: String,                // name of the function being rendered ("" at top level)
@@ -35,6 +40,7 @@ struct JavaRender {
     temp_setup_done: BTreeSet<String>, // __ps_* temp assigns already pre-run natively
     sync_pending: Vec<String>,
     lower_vars: BTreeSet<String>,  // `typeset -l`: value is lowercased on assign
+    child_sym: BTreeSet<String>,   // vars the CHILD side computes (symbolic in child text)
     upper_vars: BTreeSet<String>,  // `typeset -u`: value is uppercased on assign     // vars a just-rendered child loop assigns (copied back)
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
@@ -79,7 +85,7 @@ impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), assoc: BTreeSet::new(), funcs: BTreeSet::new(),
                      fnvalues: BTreeSet::new(), exit_traps: Vec::new(), temp_setup_done: BTreeSet::new(), sync_pending: Vec::new(), lower_vars: BTreeSet::new(), upper_vars: BTreeSet::new(),
-                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0,
+                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0, child_sym: BTreeSet::new(),
                      out: Vec::new(), depth: 2 }
     }
 
@@ -288,7 +294,9 @@ impl JavaRender {
         // the child-side sync helper (writes NAME VALUE lines a loop can
         // report back to the parent through $SH2_SYNC_FILE)
         self.emit("System.setProperty(\"SH2_SYNC_FILE\", shSyncFile().getAbsolutePath());");
-        self.emit("shRun(\"_sh2_env() { printf '%s %s\\\\n' \\\"$1\\\" \\\"${2-}\\\" >> \\\"$SH2_SYNC_FILE\\\"; }; \" + \"\");");
+        // (`export -f` so a PIPELINE's child shell — not just a direct
+        //   child — can report its loop vars back through the same function)
+        self.emit("shRun(\"_sh2_env() { printf '%s %s\\\\n' \\\"$1\\\" \\\"${2-}\\\" >> \\\"$SH2_SYNC_FILE\\\"; }; export -f _sh2_env; \" + \"\");");
         self.emit("for (String __a : args) __SH_ARGV.add(__a);");
         for st in &prog.stmts {
             if matches!(st, IrStmt::Function { .. }) { continue; }
@@ -1648,6 +1656,13 @@ impl JavaRender {
     /// trailing-newline stripping — pipes carry raw bytes).
     fn stage_expr(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         self.helper("quote");
+        // inside a TEXT-LOOP body the stage is that child shell's text: the
+        // loop's child-computed vars stay symbolic (`$line`), exactly as in
+        // any other child command. (Outside a loop the set is empty.)
+        self.stage_expr_inner(stage)
+    }
+
+    fn stage_expr_inner(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         match stage {
             [IrStmt::Expr(IrExpr::Call { func, args, .. })]
                 if func == "exec" || func == "builtin" || func == "test" =>
@@ -1831,6 +1846,34 @@ impl JavaRender {
     /// loop body runs natively (java input stream), and the captured bytes
     /// are fed onward. Renders `{ ( loop ) ; } ops` as command text.
     fn stage_expr_native_loop(&mut self, inner: &[IrStmt], redirects: &[IrRedirect]) -> Result<String, String> {
+        // stdin-fed loop: PREFER bash text — the child's fd 0 is the feed,
+        // exactly as in bash, and its state stays child-local. Only a body
+        // that cannot render as text (java-state condition) goes native.
+        for b in inner {
+            if let IrStmt::While { cond, body } = b {
+                let one = IrStmt::Expr((*cond).clone());
+                match self.whileloop_text(std::slice::from_ref(&one), body) {
+                  Err(_) => {}
+                  Ok(t) => {
+                    self.helper("quote");
+                    let mut tail = String::from("\"\"");
+                    for r in redirects {
+                        let tg = self.expr_str(&r.target)?;
+                        let op = match (r.fd, r.mode.as_str()) {
+                            (Some(0), "r") | (Some(0), "r+") => "< ",
+                            (None, "w") | (Some(1), "w") | (Some(1), "wc") => "> ",
+                            (None, "a") | (Some(1), "a") => ">> ",
+                            (Some(2), "w") => "2> ",
+                            (Some(2), "a") => "2>> ",
+                            (fd, m) => return Err(format!("redirect {fd:?}/{m} on a loop stage")),
+                        };
+                        tail += &format!(" + \" {op}\" + shQuote({tg})");
+                    }
+                    return Ok(format!(" \"{{ \" + {t} + \" ; }}\" + {tail} + \" \" "));
+                  }
+                }
+            }
+        }
         let body = self.stage_expr_native(inner)?;
         self.helper("quote");
         let mut tail = String::from("\"\"");
@@ -2734,7 +2777,36 @@ impl JavaRender {
         for a in args {
             match a {
                 IrExpr::Array(items) => {
-                    for it in items { out.push(self.expr_str(it)?); }
+                    for it in items {
+                        // `"${arr[@]}"`: the ELEMENT JOIN, expanded into
+                        // separate argv words at runtime (shAslice returns
+                        // one space-joined string)
+                        if let IrExpr::Call { func, .. } = it {
+                            if func == "param" {
+                                if let IrExpr::Call { args, .. } = it {
+                                    if str_arg(args, 2) == Some("@") {
+                                        let t = self.expr_str(it)?;
+                                        self.helper("split");
+                                        out.push(format!("shSplit({t})"));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // a child-computed var stays symbolic in child text
+                        if let (false, IrExpr::Call { func, args, .. }) = (self.child_sym.is_empty(), it) {
+                            if func == "getVar" {
+                                if let Some(n) = str_arg(args, 0) {
+                                    if self.child_sym.contains(n) {
+                                        self.helper("quote");
+                                        out.push(format!("shQuote(\"${n}\")"));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        out.push(self.expr_str(it)?);
+                    }
                 }
                 // command-scoped env object (VAR=x cmd): tracked exports
                 // cover the child-env case; per-command overrides are a
@@ -3978,6 +4050,12 @@ impl JavaRender {
                 // the value splices raw (no shell quoting; spaces stay)
                 // and is baked from the java field.
                 let n = match e { IrExpr::Call { args, .. } => str_arg(args, 0).unwrap_or("").to_string(), _ => String::new() };
+                // a var the CHILD computes (`read line` inside a text loop)
+                // is symbolic: the child shell expands it
+                if !n.is_empty() && self.child_sym.contains(&n) {
+                    self.helper("quote");
+                    return Ok(format!("\"${n}\""));
+                }
                 if !n.is_empty() && self.fields.contains(&sanitize(&n)) {
                     self.getvar_str(&n)
                 } else {
@@ -4283,9 +4361,14 @@ impl JavaRender {
                 {
                     let has_at = args.get(2).and_then(|e| str_arg(std::slice::from_ref(e), 0)) == Some("@");
                     let (oi, li) = if has_at { (3usize, 4usize) } else { (2usize, 3usize) };
+                    // a slice makes the name an ARRAY (its field must exist)
+                    self.arrays.insert(sanitize(&aname));
+                    // an ABSENT offset starts at 0; an empty one is the same
+                    // ("${arr[@]:}" / "${arr[@]::n}") — not shNum("") == 0
                     let off = match args.get(oi) {
-                        Some(e) => self.expr_num(e)?,
                         None => "0L".to_string(),
+                        Some(IrExpr::Str(t, _)) if t.trim().is_empty() => "0L".to_string(),
+                        Some(e) => self.expr_num(e)?,
                     };
                     let len = match args.get(li) {
                         // absent OR empty length means "to the end" (-1);
@@ -4429,6 +4512,31 @@ impl JavaRender {
                     for s in stages {
                         if Self::body_needs_native(s) { return true; }
                     }
+                }
+                // a `mapfile`/`read` fill is java STATE (the array field),
+                // not a child-visible effect: it must run natively
+                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                    if (func == "exec" || func == "builtin")
+                        && str_arg(args, 0).map(|c| matches!(c, "mapfile" | "readarray")).unwrap_or(false) =>
+                {
+                    return true;
+                }
+                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                    if (func == "exec" || func == "builtin")
+                        && str_arg(args, 0) == Some("read")
+                        && flatten_words(&args[1..]).iter().any(|w| matches!(w, IrExpr::Str(t, _) if t == "-a")) =>
+                {
+                    return true;
+                }
+                // a command-scoped env prefix (`IFS= read …`) is bash text:
+                // the CHILD applies it, and `read` on the child's stdin is
+                // exactly the semantics a text loop wants. (A `read` that
+                // FILLS an array is native — that is java state.)
+                IrStmt::Expr(IrExpr::Call { func: f, args, .. })
+                    if (f == "exec" || f == "builtin" || f == "test")
+                        && args.iter().take(1).all(|a| matches!(a, IrExpr::Object(_))) =>
+                {
+                    return false;
                 }
                 IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => {
                     if Self::expr_needs_native(e) { return true; }
@@ -4606,8 +4714,78 @@ impl JavaRender {
     /// One body statement as a JAVA EXPRESSION evaluating to bash text.
     /// `assigned` (body-written vars) render as symbolic `$`-refs (live
     /// across iterations); other vars bake their current java values.
+    /// A word as bash TEXT with the given vars SYMBOLIC (`"$name"`, expanded
+    /// by the child shell) instead of baked from the java fields.
+    fn child_word_str(&mut self, e: &IrExpr, symbolic: &std::collections::BTreeSet<String>) -> Result<String, String> {
+        self.helper("quote");
+        let text = |e: &IrExpr, sym: &std::collections::BTreeSet<String>| -> Option<String> {
+            match e {
+                IrExpr::Str(t, _) if !t.contains('\u{1}') => Some(jstr(t)),
+                IrExpr::Call { func, args, .. } if func == "getVar" => {
+                    let n = str_arg(args, 0)?;
+                    if sym.contains(n) { Some(jstr(&format!("${n}"))) } else { None }
+                }
+                IrExpr::Interpolate(parts) => {
+                    let mut out = String::from("(\"\"");
+                    for p in parts {
+                        match p {
+                            InterpPart::Lit(t) => { out += " + "; out += &jstr(t); }
+                            InterpPart::Expr(x) => {
+                                let part = match x.as_ref() {
+                                    IrExpr::Call { func, args, .. } if func == "getVar" => {
+                                        Some(str_arg(args, 0).map(|n| if sym.contains(n) { format!("${n}") } else { String::new() })?)
+                                    }
+                                    _ => None,
+                                };
+                                match part {
+                                    Some(v) => { out += " + "; out += &jstr(&v); }
+                                    None => return None,
+                                }
+                            }
+                        }
+                    }
+                    out += ")";
+                    Some(out)
+                }
+                _ => None,
+            }
+        };
+        text(e, symbolic).ok_or_else(|| "child word not text".to_string())
+    }
+
     fn body_stmt_text(&mut self, st: &IrStmt, assigned: &std::collections::BTreeSet<String>) -> Result<String, String> {
+        self.body_stmt_text_at(st, assigned, false)
+    }
+
+    /// `in_child`: the text runs inside the loop's CHILD shell, so
+    /// body-assigned vars must stay SYMBOLIC (`$line`) — the parent's java
+    /// field is stale there (it is only written after the loop).
+    fn body_stmt_text_at(&mut self, st: &IrStmt, assigned: &std::collections::BTreeSet<String>, in_child: bool) -> Result<String, String> {
+        // child-side command text: body-assigned vars stay symbolic
+        if in_child && !self.child_sym.is_empty() {
+            // (a nested body keeps the outer loop's symbolic set: a
+            // pipeline stage inside it is still that child shell's text)
+        } else if in_child {
+            self.child_sym = assigned.clone();
+        }
         match st {
+            // a plain command: each WORD as text (a body-assigned var stays
+            // symbolic in the child, a parent var bakes its java value)
+            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                if in_child && (func == "exec" || func == "builtin" || func == "test") =>
+            {
+                let mut ws: Vec<String> = Vec::new();
+                for (ai, a) in args.iter().enumerate() {
+                    for w in flatten_words(std::slice::from_ref(a)) {
+                        if ai == 0 {
+                            if let IrExpr::Str(t, _) = w { ws.push(jstr(t)); continue; }
+                        }
+                        if let Ok(t) = self.child_word_str(w, assigned) { ws.push(t); }
+                        else { ws.push(self.body_word_text(w, ai == 0, assigned)?); }
+                    }
+                }
+                Ok(ws.join(" + \" \" + "))
+            }
             IrStmt::Case { discriminant, clauses } => {
                 // `case … in pat) body ;; … esac` as bash text
                 self.helper("quote");
@@ -4778,7 +4956,8 @@ impl JavaRender {
                     IrExpr::Call { func, .. } if func == "getVar" => {
                         // a word in the command's own text (`echo` is not
                         // run in a child here — the command line IS bash):
-                        // bake the parent value.
+                        // bake the parent value. A word the CHILD assigns is
+                        // symbolic (`"$line"`), expanded by the child shell.
                         if let IrExpr::Call { args, .. } = x {
                             Some(self.body_word_text(x, ai == 0, assigned)?)
                         } else { None }
@@ -4970,7 +5149,10 @@ impl JavaRender {
             let _ = one;
             self.cond_text_list(cond)?
         };
-        let _ = &body_assigned;
+        // a `read VAR` / assign in the loop CONDITION also lands in the child
+        for c in cond {
+            self.body_assigned(c, &mut body_assigned);
+        }
         let body_text = self.body_list_text(body, &body_assigned)?;
         // (2) the parent reads the child's vars back after the loop; the
         // child reports them itself (see body_list_text) and the parent
@@ -4982,7 +5164,7 @@ impl JavaRender {
         let mut prefix = String::new();
         for v in self.sync_pending.clone() {
             let val = self.getvar_str(&v)?;
-            prefix += &format!("\"_sh2_env {v} \" + shQuote({val}) + \" ; \" + ");
+            prefix += &format!("{} + shQuote({val}) + \" >> \\\"$SH2_SYNC_FILE\\\" ; \" + ", jstr(&format!("{SYNC_REPORT}{v} \"")));
         }
         Ok(format!("\"(\" + {prefix}\"while \" + {ct} + \"; do \" + {body_text} + \" ; done\" + \")\""))
     }
@@ -4995,9 +5177,9 @@ impl JavaRender {
         // to the parent after every one of them (so `continue` cannot skip it).
         let mut parts: Vec<String> = Vec::new();
         for st in body {
-            parts.push(self.body_stmt_text(st, assigned)?);
+            parts.push(self.body_stmt_text_at(st, assigned, true)?);
             for v in assigned.iter() {
-                parts.push(format!("\"_sh2_env {v} \\\"${{{v}}}\\\"\""));
+                parts.push(format!("{} + {} + \" >> \\\"$SH2_SYNC_FILE\\\"\"", jstr(&format!("{SYNC_REPORT}{v} ")), jstr(&format!("\"${{{v}}}\"")).to_string()));
             }
         }
         Ok(parts.join(" + \" ; \" + "))
@@ -6228,8 +6410,12 @@ fn helper_src(name: &str) -> Option<&'static str> {
         if (p.isEmpty() || p.startsWith("/")) return p;
         return __SH_CWD + "/" + p;
     }
+    /// A shell variable the JAVA side may not hold (the child sets it):
+    /// an exported/tracked value first, then the process environment.
     static String shEnv(String n) {
-        String v = System.getenv(n);
+        String v = __SH_EXPORTS.get(n);
+        if (v == null) v = __SH_ENV.get(n);
+        if (v == null) v = System.getenv(n);
         return v == null ? "" : v;
     }
 "#,
@@ -6457,6 +6643,28 @@ fn helper_src(name: &str) -> Option<&'static str> {
         if (s.startsWith("SH2EOF", p)) return s.substring(0, z);
         return s;
     }
+    /// The process environment as the KERNEL holds it. `System.getenv()`
+    /// silently drops entries whose names Java cannot represent — notably
+    /// bash's exported-function entries (`BASH_FUNC_name%%=() { … }`), which
+    /// a child `bash -c` needs to see `export -f`ed helpers.
+    static Map<String, String> shRealEnviron() {
+        Map<String, String> m = new LinkedHashMap<>();
+        try {
+            byte[] b = Files.readAllBytes(Paths.get("/proc/self/environ"));
+            int start = 0;
+            for (int i = 0; i <= b.length; i++) {
+                if (i == b.length || b[i] == 0) {
+                    if (i > start) {
+                        String kv = new String(b, start, i - start, StandardCharsets.ISO_8859_1);
+                        int eq = kv.indexOf('=');
+                        if (eq > 0) m.put(kv.substring(0, eq), kv.substring(eq + 1));
+                    }
+                    start = i + 1;
+                }
+            }
+        } catch (Exception e) { m.putAll(System.getenv()); }
+        return m;
+    }
     static long shRun(String cmdline) {
         try {
             if (System.getenv("SH2_JDBG") != null) System.err.println("SH2RUN: " + cmdline);
@@ -6464,8 +6672,16 @@ fn helper_src(name: &str) -> Option<&'static str> {
 
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", shTrimNL(cmdline));
             pb.directory(new File(shCwd()));
-            pb.environment().putAll(__SH_EXPORTS);
-            pb.environment().putAll(__SH_ENV);
+            // ProcessBuilder's environment map starts EMPTY; filling it from
+            // scratch drops the inherited `BASH_FUNC_*` entries (exported
+            // functions — `export -f _sh2_env` must reach the child). Seed
+            // from the real environment, then overlay the shell's vars.
+            Map<String, String> penv = pb.environment();
+            penv.putAll(shRealEnviron());
+            penv.putAll(__SH_EXPORTS);
+            penv.putAll(__SH_ENV);
+            // the loop-var report channel (a java property, not an env var)
+            penv.put("SH2_SYNC_FILE", shSyncFile().getAbsolutePath());
             // child shEnvSet writes land in one file the parent folds back in
             try { File __sf = shSyncFile(); if (__sf.exists()) __sf.delete(); } catch (Exception e) { }
             // every shell variable is visible to a child as if exported, so a
@@ -6503,8 +6719,16 @@ fn helper_src(name: &str) -> Option<&'static str> {
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", shTrimNL(cmdline));
             pb.directory(new File(shCwd()));
-            pb.environment().putAll(__SH_EXPORTS);
-            pb.environment().putAll(__SH_ENV);
+            // ProcessBuilder's environment map starts EMPTY; filling it from
+            // scratch drops the inherited `BASH_FUNC_*` entries (exported
+            // functions — `export -f _sh2_env` must reach the child). Seed
+            // from the real environment, then overlay the shell's vars.
+            Map<String, String> penv = pb.environment();
+            penv.putAll(shRealEnviron());
+            penv.putAll(__SH_EXPORTS);
+            penv.putAll(__SH_ENV);
+            // the loop-var report channel (a java property, not an env var)
+            penv.put("SH2_SYNC_FILE", shSyncFile().getAbsolutePath());
             // child shEnvSet writes land in one file the parent folds back in
             try { File __sf = shSyncFile(); if (__sf.exists()) __sf.delete(); } catch (Exception e) { }
             // stdin MUST be inherited: the default is a never-written pipe,
