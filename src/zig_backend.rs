@@ -6201,10 +6201,19 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         // locals promote the same way (dynamic scoping). Promoted globals
         // get file-scope-safe manglings (no helper-internal collisions).
         let mut fn_locals_all: BTreeSet<String> = BTreeSet::new();
+        let mut targets_all: BTreeSet<String> = BTreeSet::new();
         {
             let mut top = BTreeSet::new();
             collect_written(&prog.stmts, &mut top);
             self.top_written = top.clone();
+            collect_targets(&prog.stmts, &mut targets_all);
+            {
+                let mut fb: Vec<&[IrStmt]> = Vec::new();
+                all_fn_bodies(&prog.stmts, &mut fb);
+                for b in fb {
+                    collect_targets(b, &mut targets_all);
+                }
+            }
             let mut touched = BTreeSet::new();
             let mut bodies: Vec<&[IrStmt]> = Vec::new();
             all_fn_bodies(&prog.stmts, &mut bodies);
@@ -6213,7 +6222,28 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 collect_targets(b, &mut touched);
                 fn_locals_all.extend(function_locals(b));
             }
-            collect_captured(&prog.stmts, &mut self.globals);
+            // capture-promoted GLOBALS are top-level variables a FUNCTION
+            // reads — not every name read anywhere. Taking all reads
+            // promoted environment variables (`$HOME`) and made them
+            // uninitialised declarations (t05_env_read)
+            {
+                let mut reads_all: BTreeSet<String> = BTreeSet::new();
+                collect_captured(&prog.stmts, &mut reads_all);
+                let mut fn_reads: BTreeSet<String> = BTreeSet::new();
+                let mut fb2: Vec<&[IrStmt]> = Vec::new();
+                all_fn_bodies(&prog.stmts, &mut fb2);
+                for b in fb2 {
+                    reads_stmts(b, &mut fn_reads);
+                }
+                for n in fn_reads {
+                    if self.top_written.contains(&n)
+                        || fn_locals_all.contains(&n)
+                        || top.contains(&n)
+                    {
+                        self.globals.insert(n);
+                    }
+                }
+            }
             for v in top {
                 if touched.contains(&v) {
                     self.globals.insert(v);
@@ -6262,7 +6292,11 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         for (n, _) in &prog.var_types {
             let vt_glob = self.globals.contains(n);
             let vt_fn_local = fn_locals_all.contains(n) && !vt_glob;
-            if !vt_fn_local {
+            // a var_types entry only means the ANALYSIS inferred a type — it
+            // does not hoist the name. A name the program NEVER assigns is an
+            // environment read (`$HOME`), and declaring it made the read a
+            // bare identifier that printed an empty line (t05_env_read).
+            if !vt_fn_local && targets_all.contains(n) {
                 written.insert(n.clone());
             }
         }
@@ -8201,9 +8235,10 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 
 fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
-        IrExpr::Var(name, _) => {
-            out.insert(name.clone());
-        }
+        // a bare READ is not a write: marking reads declared made an
+        // environment variable (`$HOME`, t05_env_read) render as an
+        // unemitted identifier and print an empty line
+        IrExpr::Var(_, _) => {}
         IrExpr::Index { var, key } => {
             out.insert(var.clone());
             collect_written_expr(key, out);
