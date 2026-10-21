@@ -2559,7 +2559,14 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
             } else {
                 rw
             };
-            rhs = format!("(math --scale 0 \"{rw}\")");
+            // A pure-number RHS is already the word fish needs:
+            // `x=$((5))` renders `set x 5`, not `set x (math --scale 0 "5")`.
+            let bare = rw.trim().trim_start_matches('$');
+            rhs = if !bare.is_empty() && bare.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                bare.to_string()
+            } else {
+                format!("(math --scale 0 \"{rw}\")")
+            };
         }
         // baked element targets (`arr[1]=x` — the A1 folds the subscript
         // into the var name)
@@ -4087,6 +4094,9 @@ fn arith_print_fish(a: &ArithAst) -> String {
 /// arithmetic is numeric — which is exactly what `-gt`/`-lt` spell.
 fn arith_value_subst_fish(a: &ArithAst) -> String {
     match a {
+        // A constant needs no substitution: bash's `$((10))` is the word `10`
+        // (18 corpus occurrences were `(math --scale 0 "<num>")`).
+        ArithAst::Num(n) => n.to_string(),
         ArithAst::Cond { test, then, else_ } => format!(
             "(if {}; {}; else; {}; end)",
             arith_cond_ast_fish(test),
@@ -7231,7 +7241,15 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             // so the caller's arithmetic expression goes straight through.
             let mut c = format!("string sub --start (math --scale 0 \"{off} + 1\")");
             if !len.is_empty() {
-                c.push_str(&format!(" --length (math --scale 0 \"{len}\")"));
+                // A LITERAL length is already the number `string sub` wants;
+                // only a dynamic one needs the substitution (`${s:$i:1}`
+                // rendered `--length (math --scale 0 "1")`).
+                let ln = len.trim().trim_start_matches('$');
+                if !ln.is_empty() && ln.chars().all(|c| c.is_ascii_digit()) {
+                    c.push_str(&format!(" --length {ln}"));
+                } else {
+                    c.push_str(&format!(" --length (math --scale 0 \"{len}\")"));
+                }
             }
             c.push_str(&format!(" -- \"{subj}\""));
             Ok(format!("({c})"))
@@ -9078,6 +9096,12 @@ fn math_call_to_awk(name: &str, s: &str) -> Option<(String, usize)> {
 /// difference. Every arithmetic value therefore goes through `math`, whose
 /// argument is an expression STRING.
 fn arith_cmd_fish(raw: &str) -> String {
+    // A literal-only expression with no operators is just its value; skip the
+    // process entirely (`(math --scale 0 "10")` -> `10`).
+    let t = raw.trim();
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return t.to_string();
+    }
     format!("(math --scale 0 \"{}\")", arith_rewrite(raw))
 }
 
