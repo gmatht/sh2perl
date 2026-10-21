@@ -721,6 +721,11 @@ impl Render {
                 m
             }
             IrExpr::Ident(name) => {
+                // a name in the renderer's own namespace is declared by the
+                // generated code around it, never hoisted
+                if name.starts_with("__pfs_") {
+                    return name.clone();
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     return "sh2GetVar()".to_string();
@@ -2778,6 +2783,38 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         )
     }
 
+    /// Render already-split printf parts into ONE `[]const u8` expression
+    /// (allocPrint with the matching format).
+    fn parts_to_str(&mut self, parts: Vec<(char, String)>) -> String {
+        let mut fmt = String::new();
+        let mut args: Vec<String> = Vec::new();
+        for (spec, e) in parts {
+            if spec == 'q' {
+                self.need_shquote = true;
+                fmt.push_str("{s}");
+                args.push(format!("shellQuote({e})"));
+            } else if spec == 'd' {
+                fmt.push_str("{d}");
+                args.push(e);
+            } else {
+                fmt.push_str("{s}");
+                args.push(e);
+            }
+        }
+        format!(
+            "std.fmt.allocPrint(std.heap.page_allocator, {}, .{{{}}}) catch \"\"",
+            Self::zig_str(&fmt),
+            args.join(", ")
+        )
+    }
+
+    /// A static format + arg list rendered as ONE `[]const u8` expression
+    /// (`printf -v NAME …`): the text goes to a VARIABLE, not stdout.
+    fn printf_text(&mut self, fmt: &str, rest: &[IrExpr]) -> Option<String> {
+        let parts = self.printf_parts_of(fmt, rest)?;
+        Some(self.parts_to_str(parts))
+    }
+
     /// Decode a STATIC printf format + arg list into print_from_parts
     /// specs. Shared by statement printf, `printf -v`, and the pipeline
     /// stage decoder. None when the shape is not statically decodable.
@@ -2888,44 +2925,6 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         Some(parts)
     }
 
-    /// Render already-split printf parts into ONE `[]const u8` expression
-    /// (allocPrint with the matching format). Used by `printf -v NAME …`,
-    /// where the text must go to a VARIABLE instead of stdout.
-    fn parts_to_str(&mut self, parts: Vec<(char, String)>) -> String {
-        let mut fmt = String::new();
-        let mut args: Vec<String> = Vec::new();
-        for (spec, e) in parts {
-            match spec {
-                'q' => {
-                    self.need_shquote = true;
-                    fmt.push_str("{s}");
-                    args.push(format!("shellQuote({e})"));
-                }
-                'd' => {
-                    fmt.push_str("{d}");
-                    args.push(e);
-                }
-                _ => {
-                    fmt.push_str("{s}");
-                    args.push(e);
-                }
-            }
-        }
-        let fmt = Self::zig_str(&fmt);
-        format!(
-            "std.fmt.allocPrint(std.heap.page_allocator, {fmt}, .{{{}}}) catch \"\"",
-            args.join(", ")
-        )
-    }
-
-    /// The statements-side printf format decoder, shared with `printf -v`:
-    /// a static format + arg list → parts. None when the shape is not
-    /// statically decodable.
-    fn printf_text(&mut self, fmt: &str, rest: &[IrExpr]) -> Option<String> {
-        let parts = self.printf_parts_of(fmt, rest)?;
-        Some(self.parts_to_str(parts))
-    }
-
     fn print_from_parts(&mut self, parts: Vec<(char, String)>, newline: bool) -> String {
         self.need_stdout = true;
         if !self.in_function {
@@ -3009,6 +3008,9 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
             }
             IrExpr::Ident(name) => {
+                if name.starts_with("__pfs_") {
+                    return vec![('s', name.clone())];
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     return vec![('s', "sh2GetVar()".into())];
@@ -4640,6 +4642,38 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             }
             if let Some(IrExpr::Array(items)) = args.get(1) {
                 if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                    // FIELD-SPLIT operand (`printf "<%s>\n" $x`): bash
+                    // runs the format once per SPLIT WORD. Render the
+                    // conversion list with the word bound to a temp name,
+                    // then loop over the runtime tokens.
+                    let split_src = items[1..].iter().find_map(|a| match a {
+                        IrExpr::Call { func, args: sa } if func == "split" => sa.first().cloned(),
+                        _ => None,
+                    });
+                    if let Some(src) = split_src {
+                        let val = self.expr_str(&src);
+                        // a name in the RENDERER's reserved namespace: it is
+                        // declared by the loop below, so it must not collide
+                        // with (or be hoisted as) a program variable
+                        let tmp = "__pfs_word".to_string();
+                        let mut sub: Vec<IrExpr> = vec![IrExpr::Ident(tmp.clone())];
+                        sub.extend(items[1..].iter().filter(|a| {
+                            !matches!(a, IrExpr::Call { func, .. } if func == "split")
+                        }).cloned());
+                        if let Some(parts) = self.printf_parts_of(fmt, &sub) {
+                            let call = self.print_from_parts(parts, false);
+                            self.emit("{");
+                            self.emit(&format!("    var __pfs_it = std.mem.tokenizeAny(u8, {val}, \" \\t\\n\\r\");"));
+                            self.emit("    while (__pfs_it.next()) |__pfs_w| {");
+                            self.emit(&format!("        const {tmp} = __pfs_w;"));
+                            for line in call.lines() {
+                                self.emit(&format!("        {line}"));
+                            }
+                            self.emit("    }");
+                            self.emit("}");
+                            return;
+                        }
+                    }
                     if let Some(parts) = self.printf_parts_of(fmt, &items[1..]) {
                         let call = self.print_from_parts(parts, false);
                         self.emit(&call);
@@ -5366,6 +5400,32 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                                 return;
                             }
                         }
+                    }
+                }
+                // a field-split word in the list (`for w in $x`): bash
+                // iterates the SPLIT words, so expand at run time
+                if let IrExpr::Array(items) = iter {
+                    if let Some(src) = items.iter().find_map(|a| match a {
+                        IrExpr::Call { func, args: sa } if func == "split" => sa.first().cloned(),
+                        _ => None,
+                    }) {
+                        let val = self.expr_str(&src);
+                        let t = self.fresh_tmp("sh_fs");
+                        let v_tmp = self.fresh_tmp("sh_fv");
+                        self.emit("{");
+                        self.emit(&format!("    var {t} = std.mem.tokenizeAny(u8, {val}, \" \\t\\n\\r\");"));
+                        self.emit(&format!("    while ({t}.next()) |{v_tmp}| {{"));
+                        self.emit(&format!("        {m} = {v_tmp};"));
+                        self.depth += 1;
+                        self.loop_depth += 1;
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.loop_depth -= 1;
+                        self.depth -= 1;
+                        self.emit("    }");
+                        self.emit("}");
+                        return;
                     }
                 }
                 // a GLOB-marked word in the list must expand against the
