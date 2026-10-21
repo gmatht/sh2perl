@@ -3530,6 +3530,35 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 // (eval-assign.sh). The payload is used LITERALLY (no
                 // re-parse of its text): `eval "y=$x+1"` assigns `5+1`,
                 // which is exactly what bash stores for a plain NAME=word.
+                // `eval "NAME=$(( arith ))"` with a LITERAL payload: the
+                // arithmetic is evaluated in-process and stored as text
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if let [IrExpr::Str(w, _)] = items.as_slice() {
+                        if let Some(target) = eval_arith_assign(w) {
+                            // the operands are shell variables too — an unset
+                            // one is 0, so give each a home BEFORE rendering
+                            // the arithmetic (declared() gates the read)
+                            let mut ops: BTreeSet<String> = BTreeSet::new();
+                            if let Some(ast) = crate::shir::parse_arith(
+                                target.1.split_whitespace().collect::<Vec<_>>().join(" ").as_str(),
+                            ) {
+                                collect_arith_reads(&ast, &mut ops);
+                            }
+                            for o in &ops {
+                                self.mark_written(o);
+                                self.mark_read(o);
+                            }
+                            if let Some(v) = self.arith_text(&target.1) {
+                                self.mark_written(&target.0);
+                                let m = self.zig_ident(&target.0);
+                                self.need_intstr = true;
+                                self.emit(&format!("{m} = shIntStr({v});"));
+                                self.rc_dirty = true;
+                                return true;
+                            }
+                        }
+                    }
+                }
                 if let Some(items) = match args.get(1) {
                     Some(IrExpr::Array(items)) if items.len() == 1 => Some(items),
                     _ => None,
@@ -8003,6 +8032,56 @@ fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 /// Reads under one expression (Var/Ident/getVar("name") — the names
 /// collect_written_expr cannot see: it only walks values, and a
 /// getVar name is a Str, not a Var)
+/// `NAME=$(( expr ))` inside an eval payload → (NAME, expr).
+fn eval_arith_assign(w: &str) -> Option<(String, String)> {
+    let (name, rest) = w.split_once("=$((")?;
+    if !is_ident(name) {
+        return None;
+    }
+    let expr = rest.trim().strip_suffix("))")?.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    // `${v:-0}` / `${v}` inside the arithmetic: keep the NAME and drop the
+    // default (`${var:-0}` reads var, which is 0 when unset — the corpus
+    // form). `${arr[i]:-0}` becomes `arr` (the element read is a stub).
+    let mut out = String::new();
+    let mut rest2 = expr;
+    while let Some(pos) = rest2.find("${") {
+        out.push_str(&rest2[..pos]);
+        let tail = &rest2[pos + 2..];
+        // NESTED expansions (`${arr[${i:-0}]:-0}`): track depth
+        let mut depth = 1usize;
+        let mut close = 0usize;
+        for (k, c) in tail.char_indices() {
+            match c {
+                '{' if k > 0 && tail.as_bytes()[k - 1] == b'$' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        let body = &tail[..close];
+        let head = body.split(|c| c == ':' || c == '[').next().unwrap_or("");
+        if !head.is_empty() && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            out.push_str(head);
+        } else {
+            return None;
+        }
+        rest2 = &tail[close + 1..];
+    }
+    out.push_str(rest2);
+    Some((name.to_string(), out))
+}
+
 /// Does this emitted line store into the Zig identifier `m`? Word-bounded,
 /// so `sh_rc = 1` is not a store into `c`.
 fn assigns_ident(line: &str, m: &str) -> bool {
