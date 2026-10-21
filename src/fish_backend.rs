@@ -6682,22 +6682,15 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
                         s.push_str(t);
                     }
                 }
-                // quote each field for fish (a field with spaces would
-                // re-split) — the SPLIT already happened here.
-                Ok(s.split(|c: char| c == ' ' || c == '\t' || c == '\n')
-                    .filter(|w| !w.is_empty())
-                    .map(|w| {
-                        if w.contains(['\'', '"', '$', '`', '\\', '(', ')', ';', '&', '|', '*', '?', '#', '~'])
-                            || w.is_empty()
-                        {
-                            format!("'{}'", w.replace('\'', "\\'"))
-                        } else {
-                            w.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "))
+                Ok(split_literal_fish(&s))
             }
+            // split() of a bare LITERAL (`for w in $y` with `y="hello world"`
+            // constant-folded to split("hello world")): same render-time field
+            // split as the all-literal Interpolate arm above. Without it the
+            // Str fell to `word_to_fish`, which single-quotes on spaces, so the
+            // loop ran ONCE over `'hello world'` where bash runs twice
+            // (t04_params printed "word=hello world" for "word=hello"/"word=world").
+            IrExpr::Str(v, _) => Ok(split_literal_fish(v)),
             other => word_to_fish(other),
         },
         "param" => param_to_fish(args, false),
@@ -11055,4 +11048,22 @@ fn bash_quote_fish(v: &str) -> String {
         }
     }
     out
+}
+
+/// A KNOWN string field-split at RENDER time (bash's default IFS), each field
+/// quoted for fish so it cannot re-split.
+fn split_literal_fish(s: &str) -> String {
+    s.split(|c: char| c == ' ' || c == '\t' || c == '\n')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            if w.contains([
+                '\'', '"', '$', '`', '\\', '(', ')', ';', '&', '|', '*', '?', '#', '~',
+            ]) {
+                format!("'{}'", w.replace('\'', "\\'"))
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
