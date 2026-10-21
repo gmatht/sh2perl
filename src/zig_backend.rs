@@ -3599,6 +3599,35 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
                 false
             }
+            "unset" => {
+                // `unset x`: the variable is EMPTY afterwards (`${x:-gone}`
+                // prints "gone"). The name stays declared (a zero home).
+                let mut any = false;
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let IrExpr::Str(n, _) = w {
+                            if is_ident(n) {
+                                let m = self.zig_ident(n);
+                                self.mark_written(n);
+                                if self.is_num(n) {
+                                    self.emit(&format!("{m} = 0;"));
+                                } else if self.str_arrays.contains(n) || self.set_arrays.contains(n) {
+                                    self.emit(&format!("{m}_len = 0;"));
+                                } else {
+                                    self.emit(&format!("{m} = \"\";"));
+                                }
+                                any = true;
+                            }
+                        }
+                    }
+                }
+                if any {
+                    self.emit("sh_rc = 0;");
+                    self.rc_dirty = true;
+                    return true;
+                }
+                false
+            }
             "local" | "declare" | "export" | "readonly" | "typeset" => self.stmt_declare(cmd, args),
             _ => false,
         }
@@ -5191,7 +5220,72 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 };
                 let m = self.zig_ident(&t.var);
                 self.mark_written(&t.var);
+                // the core may deliver an INDEXED target as the literal
+                // name `arr[1]` (indices: []) — parse it out
+                if t.indices.is_empty() {
+                    if let Some((base, idxtext)) = t.var.split_once('[') {
+                        if let Some(idx) = idxtext.strip_suffix(']') {
+                            if is_ident(base) && (self.str_arrays.contains(base)
+                                || self.set_arrays.contains(base))
+                            {
+                                let bm = self.zig_ident(base);
+                                self.mark_written(base);
+                                let ix = if let Ok(n) = idx.trim().parse::<i64>() {
+                                    n.to_string()
+                                } else {
+                                    self.expr_num(&IrExpr::Var(
+                                        idx.trim().to_string(),
+                                        None,
+                                    ))
+                                };
+                                let v = self.expr_str(expr);
+                                let n = format!("{bm}_len");
+                                self.emit("{");
+                                self.emit(&format!("    const __sh_ix: i64 = {ix};"));
+                                self.emit(&format!("    const __sh_n: i64 = @intCast({n});"));
+                                self.emit("    const __sh_j: i64 = if (__sh_ix < 0) __sh_n + __sh_ix else __sh_ix;");
+                                self.emit("    if (__sh_j >= 0) {");
+                                self.emit("        const __sh_u: usize = @intCast(__sh_j);");
+                                self.emit(&format!("        if (__sh_u >= {n}) {{"));
+                                self.emit(&format!("            var __sh_k: usize = {n};"));
+                                self.emit(&format!("            while (__sh_k <= __sh_u) : (__sh_k += 1) {{ {bm}[__sh_k] = \"\"; }}"));
+                                self.emit(&format!("            {n} = __sh_u + 1;"));
+                                self.emit("        }");
+                                self.emit(&format!("        {bm}[__sh_u] = {v};"));
+                                self.emit("    }");
+                                self.emit("}");
+                                self.rc_dirty = true;
+                                return;
+                            }
+                        }
+                    }
+                }
                 if !t.indices.is_empty() {
+                    // `arr[i]=V` on a string-element array: store at the
+                    // (bash: negative wraps from the end)
+                    if self.str_arrays.contains(&t.var) || self.set_arrays.contains(&t.var) {
+                        if let Some(idx) = t.indices.first() {
+                            let ix = self.expr_num(idx);
+                            let v = self.expr_str(expr);
+                            let n = format!("{m}_len");
+                            self.emit("{");
+                            self.emit(&format!("    const __sh_ix: i64 = {ix};"));
+                            self.emit(&format!("    const __sh_n: i64 = @intCast({n});"));
+                            self.emit("    const __sh_j: i64 = if (__sh_ix < 0) __sh_n + __sh_ix else __sh_ix;");
+                            self.emit(&format!("    if (__sh_j >= 0) {{"));
+                            self.emit(&format!("        const __sh_u: usize = @intCast(__sh_j);"));
+                            self.emit(&format!("        if (__sh_u >= {n}) {{"));
+                            self.emit(&format!("            var __sh_k: usize = {n};"));
+                            self.emit(&format!("            while (__sh_k <= __sh_u) : (__sh_k += 1) {m}[__sh_k] = \"\"; }}"));
+                            self.emit(&format!("            {n} = __sh_u + 1;"));
+                            self.emit("        }");
+                            self.emit(&format!("        {m}[__sh_u] = {v};"));
+                            self.emit("    }");
+                            self.emit("}");
+                            self.rc_dirty = true;
+                            return;
+                        }
+                    }
                     self.mark_todo("array-index assign");
                     return;
                 }
@@ -5233,6 +5327,24 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                                             self.emit(&format!("try {m}[{m}_len].setString(10, {v});"));
                                         }
                                     }
+                                } else if let IrExpr::Call { func: sf, args: sa } = it {
+                                    if sf == "split" && self.str_arrays.contains(&t.var) {
+                                        // `arr=($x)`: the unquoted expansion
+                                        // FIELD-SPLITS into elements
+                                        if let Some(inner) = sa.first() {
+                                            let v = self.expr_str(inner);
+                                            let tk = self.fresh_tmp("sh_spk");
+                                            self.emit("{");
+                                            self.emit(&format!("    var {tk} = std.mem.tokenizeAny(u8, {v}, \" \\t\\n\\r\");"));
+                                            self.emit(&format!("    while ({tk}.next()) |{tk}w| {{"));
+                                            self.emit(&format!("        if ({m}_len < {m}.len) {{ {m}[{m}_len] = {tk}w; {m}_len += 1; }}"));
+                                            self.emit("    }");
+                                            self.emit("}");
+                                            continue;
+                                        }
+                                    }
+                                    let v = self.expr_str(it);
+                                    self.emit(&format!("{m}[{m}_len] = {v};"));
                                 } else if self.str_arrays.contains(&t.var) {
                                     let v = self.expr_str(it);
                                     self.emit(&format!("{m}[{m}_len] = {v};"));
