@@ -3154,7 +3154,14 @@ impl JavaRender {
         // bash test words are subject to word splitting unless quoted, so
         // every operand goes through shQuote — and a literal `$`-form the
         // child must expand is double-quoted (`"$line"`), never `${line}`
+        // a `~`-marked token is the REGEX operand: the marker is internal
+        // (the text form carries the `=~` operator, which makes the pattern
+        // a regex for the child shell); emitting it verbatim would quote
+        // it into a glob.
         let parts: Vec<String> = toks.iter().map(|t| match t {
+            // a `~`-marked token is the REGEX operand of `=~`: it goes in
+            // RAW — quoting makes bash compare against a literal string
+            TestTok::S(x) if x.starts_with('~') && x.len() > 1 => jstr(&x[1..]),
             TestTok::S(x) if x.contains('$') => {
                 let esc = x.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("shQuote(\"\\\"{esc}\\\"\")")
@@ -3207,17 +3214,27 @@ impl JavaRender {
                 w.push(TestTok::E(home, false));
                 continue;
             }
-            if piece.starts_with("~/") {
+            // a `~`-marked piece is the REGEX marker, never a home path
+            if piece.starts_with('~') && Self::is_tilde_path(&piece) {
                 let home = self.getvar_str("HOME").unwrap_or_else(|_| "\"\"".to_string());
                 w.push(TestTok::E(format!("({home} + {})", jstr(&piece[1..])), false));
                 continue;
             }
             if piece == "=" || piece == "==" || piece == "!=" {
                 w.push(TestTok::S(piece));
-            } else if piece.starts_with('~') {
-                // regex marker ([[ s =~ ~re ]]) — keep verbatim; the
-                // trailing $ anchor must not be treated as a variable
+            } else if piece == "=~" {
+                // regex operator: the NEXT piece is the pattern, carried
+                // with the `~` marker
                 w.push(TestTok::S(piece));
+            } else if piece.starts_with('~') {
+                // regex marker ([[ s =~ ~re ]]) — a QUOTED marker keeps its
+                // quotes in the raw token (`~"^x$"`); strip them so the
+                // regex never carries literal quote characters
+                let body = piece[1..].trim();
+                let body = if body.len() >= 2 && body.starts_with('"') && body.ends_with('"') {
+                    &body[1..body.len() - 1]
+                } else { body };
+                w.push(TestTok::S(format!("~{body}")));
             } else if piece.contains('$') {
                 // glob-ness judged on the QUOTE-STRIPPED form: "$p"* is an
                 // unquoted glob even though the raw token starts with a quote
@@ -3249,13 +3266,46 @@ impl JavaRender {
         }
     }
 
+    /// `operand=~regex` fused into ONE word (the frontend's `[[ $s =~ re ]]`
+    /// form when the regex has no spaces): split into the three tokens the
+    /// test tokenizer expects, marking the regex with `~`.
+    fn split_fused_regex(t: &str) -> Option<Vec<String>> {
+        let at = t.find("=~")?;
+        if at == 0 { return None; }
+        let (l, r) = (&t[..at], &t[at + 2..]);
+        if l.is_empty() || r.is_empty() { return None; }
+        // the split must not land inside quotes
+        let mut quoted = false;
+        for c in l.chars() { if c == '"' || c == '\'' { quoted = !quoted; } }
+        if quoted { return None; }
+        // mark the regex (`~re`) unless the fused text already carries it
+        let re = if r.starts_with('~') { r.to_string() } else { format!("~{r}") };
+        Some(vec![l.to_string(), "=~".to_string(), re])
+    }
+
+    /// `~` / `~/x` / `~"x"` / `~'x'` — a home-directory path. NOT `~^re`
+    /// (the test tokenizer's regex marker).
+    /// `~` / `~/x` / `~"x"` / `~'x'` — a home-directory path. NOT `~^re`
+    /// (the test tokenizer's regex marker). The raw token may still carry
+    /// its quotes (`"~^re$"`), so judge the UNQUOTED text.
+    fn is_tilde_path(p: &str) -> bool {
+        let t = p.trim();
+        let t = if t.len() >= 2 && ((t.starts_with('"') && t.ends_with('"'))
+            || (t.starts_with('\'') && t.ends_with('\''))) { &t[1..t.len() - 1] } else { t };
+        if !t.starts_with('~') { return false; }
+        let rest = &t[1..];
+        !rest.is_empty() && (rest.starts_with('/') || rest.starts_with('"') || rest.starts_with('\''))
+    }
+
     fn push_test_str(&mut self, w: &mut Vec<TestTok>, s: &str) {
         let mut toks = if s.chars().any(|c| c.is_whitespace()) { split_test_text(s) } else { vec![s.to_string()] };
         // the core sometimes fuses `!` with the operator (`!-e file`
         // arrives as one string): split a leading `!` before tokenizing
         let mut split: Vec<String> = Vec::new();
         for t in toks {
-            if t.len() > 1 && t.starts_with('!') && t[1..].starts_with('-') {
+            if let Some(xs) = Self::split_fused_regex(&t) {
+                split.extend(xs);
+            } else if t.len() > 1 && t.starts_with('!') && t[1..].starts_with('-') {
                 split.push("!".to_string());
                 split.push(t[1..].to_string());
             } else {
@@ -3824,10 +3874,18 @@ impl JavaRender {
                 let sep = if func == "and" { " && " } else { " || " };
                 let mut parts = Vec::new();
                 for a in args.iter() {
-                    if let IrExpr::Arrow(body) = a {
-                        parts.push(self.arrow_expr(body)?);
-                    } else {
-                        parts.push(self.expr_str(a)?);
+                    // a PREDICATE operand (`[[ -n "$s" ]] && cmd`, a suffix
+                    // test) is a command in the chain — its status matters,
+                    // not its value; only a command-ish node is text
+                    match a {
+                        IrExpr::Arrow(body) => parts.push(self.arrow_expr(body)?),
+                        IrExpr::Call { func: f, .. } if f == "exec" || f == "builtin" || f == "test" || f == "redirect" => {
+                            parts.push(self.side_text(a)?)
+                        }
+                        other => match self.predicate_text(other) {
+                            Ok(t) => parts.push(t),
+                            Err(_) => parts.push(self.expr_str(other)?),
+                        },
                     }
                 }
                 self.helper("quote");
@@ -5702,6 +5760,40 @@ impl JavaRender {
         Ok(String::new())
     }
 
+    /// A PREDICATE node (`strHasSuffix`, `[ a = b ]`, `! cmp`, a bare var
+    /// in an `&&` chain) as its bash TEXT: the chain needs the node's
+    /// STATUS in command position.
+    fn predicate_text(&mut self, e: &IrExpr) -> Result<String, String> {
+        match e {
+            IrExpr::Call { func, args, .. } if func == "strHasSuffix" || func == "strHasPrefix" => {
+                let s = self.expr_str(args.first().ok_or("pred: no value")?)?;
+                let p = self.expr_str(args.get(1).ok_or("pred: no pattern")?)?;
+                self.helper("quote");
+                let op = if func == "strHasSuffix" { "*" } else { "*" };
+                Ok(format!("(\"[[ \" + shQuote({s}) + \" == {op}\" + shQuote({p}) + \" ]]\")"))
+            }
+            IrExpr::Call { func, args, .. } if func == "test" => self.bracket_text(args, false),
+            IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => {
+                let t = self.predicate_text(lhs)?;
+                Ok(format!("(\"! \" + {t})"))
+            }
+            IrExpr::BinOp { ref op, lhs, rhs, .. }
+                if matches!(*op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) =>
+            {
+                let tok = match op {
+                    BinOpKind::Eq => "=", BinOpKind::Ne => "!=",
+                    BinOpKind::Lt => "\\<", BinOpKind::Le => "-le",
+                    BinOpKind::Gt => "\\>", _ => "-ge",
+                };
+                let l = self.expr_str(lhs)?;
+                let r = self.expr_str(rhs)?;
+                self.helper("quote");
+                Ok(format!("(\"[ \" + shQuote({l}) + \" {tok} \" + shQuote({r}) + \" ]\")"))
+            }
+            _ => Err("not a predicate".into()),
+        }
+    }
+
     fn side_text(&mut self, e: &IrExpr) -> Result<String, String> {
         match e {
             IrExpr::Call { func, args, .. } if func == "test" => {
@@ -5777,6 +5869,25 @@ impl JavaRender {
                 Ok(parts2.join(" + \" | \" + "))
             }
             IrExpr::Call { func, args, .. } if func == "and" || func == "or" => {
+                // a PREDICATE operand is command text of its own
+                let mut any_pred = false;
+                for a in args.iter() {
+                    if !matches!(a, IrExpr::Arrow(_)) && self.predicate_text(a).is_ok() { any_pred = true; }
+                }
+                if any_pred {
+                    let sep = if func == "and" { " && " } else { " || " };
+                    let mut parts = Vec::new();
+                    for a in args.iter() {
+                        match a {
+                            IrExpr::Arrow(body) => parts.push(self.arrow_expr(body)?),
+                            other => match self.predicate_text(other) {
+                                Ok(t) => parts.push(t),
+                                Err(_) => parts.push(self.expr_str(other)?),
+                            },
+                        }
+                    }
+                    return Ok(format!("({})", parts.join(&format!("){sep}("))));
+                }
                 // pre-run renderer-temp captures so interpolated paths are real
                 for a in args.iter() {
                     if let IrExpr::Arrow(body) = a {
@@ -5838,7 +5949,10 @@ impl JavaRender {
                 let v = self.expr_str(e)?;
                 Ok(format!("(({}).isEmpty() ? \"false\" : \"true\")", v))
             }
-            other => Err(format!("command-chain side not representable: {other:?}")),
+            _ => match self.predicate_text(e) {
+                Ok(t) => Ok(t),
+                Err(_) => Err(format!("command-chain side not representable: {e:?}")),
+            },
         }
     }
 
@@ -7595,6 +7709,13 @@ fn split_eq_ops(t: &str) -> Vec<String> {
                 i += 1;
                 continue;
             }
+            continue;
+        }
+        // `=~` is already tokenized by split_fused_regex — never re-split
+        if ch[i] == '=' && i + 1 < ch.len() && ch[i + 1] == '~' {
+            if !cur.is_empty() { pieces.push(std::mem::take(&mut cur)); }
+            pieces.push("=~".into());
+            i += 2;
             continue;
         }
         if ch[i] == '=' && i + 1 < ch.len() && ch[i + 1] == '=' {
