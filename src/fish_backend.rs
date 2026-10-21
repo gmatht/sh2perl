@@ -3770,6 +3770,23 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
                 let pat = raw_arg(args, 1)?;
                 Ok(format!("printf '%s\\n' {arg} | grep {pat} >/dev/null 2>&1"))
             }
+            // `${s%.txt}`-style AFFIX TESTS (`[[ $s == *.txt ]]`), which the
+            // core lowers to strHasPrefix/strHasSuffix. `string match -r` with
+            // the suffix REGEX-ESCAPED is the correct spelling: a glob
+            // (`string match -- "*$suffix"`) would read a `[` or `*` in the
+            // literal suffix as pattern syntax, and `string match -q` cannot
+            // pin the match to the END. 036_pattern_matching_basic rendered
+            // nothing at all ("command call not renderable: strHasSuffix").
+            "strHasSuffix" => {
+                let val = word_to_fish(arg(args, 0)?)?;
+                let suf = regex_escape_fish(&raw_arg(args, 1)?);
+                Ok(format!("string match -qr -- '{suf}$' {val}"))
+            }
+            "strHasPrefix" => {
+                let val = word_to_fish(arg(args, 0)?)?;
+                let pre = regex_escape_fish(&raw_arg(args, 1)?);
+                Ok(format!("string match -qr -- '^{pre}' {val}"))
+            }
             "fnCall" => {
                 let name = raw_arg(args, 0)?;
                 let mut line = name;
@@ -11163,4 +11180,17 @@ fn var_ref_needs_no_math(name: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_');
     }
     ok
+}
+
+/// Escape regex metacharacters so a LITERAL prefix/suffix can be used as a
+/// `string match -r` pattern.
+fn regex_escape_fish(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
