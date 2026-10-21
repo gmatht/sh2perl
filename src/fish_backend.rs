@@ -1306,6 +1306,20 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // A call is `_num "…"` or `$(_num "…")` — the `$(` prefix defeated the
     // old space-delimited test, so the helper was never emitted and the
     // integer-coercion call sites were "Unknown command: _num".
+    // Set an ARBITRARY exit status without ending the script: fish's `return
+    // N` inside a function does exactly that, and `$status` then reads N for
+    // the next statement -- which is bash's `$?` after a failed command. This
+    // replaces a `/bin/sh -c "exit N"` SPAWN at every failed capture (202
+    // occurrences across 103 corpus files). `exit N` would be spawn-free too
+    // but WRONG: it ends the script, while bash keeps running the next
+    // statement (measured on tail-standalone: bash prints its next line and
+    // exits 0, `exit` exited 1 before it).
+    if body.contains("__sh2_setrc ") {
+        out.push_str("function __sh2_setrc\n");
+        out.push_str("    # re-raise a command's exact exit code as $status\n");
+        out.push_str("    return $argv[1]\n");
+        out.push_str("end\n\n");
+    }
     if body.contains("_num ") || body.contains("_num)") {
         out.push_str("function _num --argument val\n");
         out.push_str("    # bash coerces non-numeric arith values to 0; fish math errors\n");
@@ -2610,9 +2624,12 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
                 // arbitrary status from a compound, so the code is re-raised
                 // through a child shell — and only when it is NONZERO, which
                 // keeps the common (successful) case free of the spawn.
+                // `exit` here would END the script; `sh -c "exit N"` sets the
+                // status but needs a spawn; `__sh2_setrc N` (a `return N` in a
+                // one-line function) sets the status exactly with neither.
                 out.push_str(
                     "; set -l __sh2_rc $pipestatus[1]; \
-                     test $__sh2_rc -eq 0; or sh -c \"exit $__sh2_rc\"",
+                     test $__sh2_rc -eq 0; or __sh2_setrc $__sh2_rc",
                 );
             }
             continue;
