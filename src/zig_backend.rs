@@ -189,6 +189,8 @@ pub struct Render {
     need_pad: bool,
     /// emit shArgv0 ($0)
     need_argv0: bool,
+    /// names that are only ever READ (never a store target)
+    read_only_names: BTreeSet<String>,
     /// shopt -s nocasematch in effect (case-insensitive [[ == ]])
     shopt_nocasematch: bool,
     /// shopt -s extglob in effect
@@ -3859,7 +3861,16 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.mark_written(&name);
             let m = self.zig_ident(&name);
             if val.is_empty() {
-                self.emit(&format!("// {cmd} {m}"));
+                // `export NAME` / `NAME=` with an empty value binds the
+                // name to the EMPTY string (bash); a bare comment left the
+                // home unset AND made the decl "never mutated"
+                if self.is_num(&name) {
+                    self.emit(&format!("{m} = 0;"));
+                } else if self.str_arrays.contains(&name) || self.set_arrays.contains(&name) {
+                    self.emit(&format!("{m}_len = 0;"));
+                } else {
+                    self.emit(&format!("{m} = \"\";"));
+                }
                 continue;
             }
             // rebuild the value expr: a glued `NAME=rest` first word
@@ -5513,7 +5524,16 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         };
                         self.emit(&format!("{m} = {rhs};"));
                     } else {
-                        self.emit(&format!("// declare {m}"));
+                        // `export NAME` / `declare NAME=`: bash binds the
+                        // name to the EMPTY string, so emit a real store
+                        // (a pure comment left it "never mutated")
+                        if self.is_num(&d.name) {
+                            self.emit(&format!("{m} = 0;"));
+                        } else if self.str_arrays.contains(&d.name) || self.set_arrays.contains(&d.name) {
+                            self.emit(&format!("{m}_len = 0;"));
+                        } else {
+                            self.emit(&format!("{m} = \"\";"));
+                        }
                     }
                 }
             }
@@ -6394,17 +6414,28 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             {
                 let mut reads_all: BTreeSet<String> = BTreeSet::new();
                 collect_captured(&prog.stmts, &mut reads_all);
+                for n in &reads_all {
+                    if !targets_all.contains(n) {
+                        self.read_only_names.insert(n.clone());
+                    }
+                }
                 let mut fn_reads: BTreeSet<String> = BTreeSet::new();
                 let mut fb2: Vec<&[IrStmt]> = Vec::new();
                 all_fn_bodies(&prog.stmts, &mut fb2);
                 for b in fb2 {
                     reads_stmts(b, &mut fn_reads);
                 }
+                // a var ANY function writes and another (or the same one)
+                // reads is shared shell state — bash has dynamic scoping, so
+                // a nested fn sees the enclosing fn's assignment
+                let mut fn_writes: BTreeSet<String> = BTreeSet::new();
+                let mut fb3: Vec<&[IrStmt]> = Vec::new();
+                all_fn_bodies(&prog.stmts, &mut fb3);
+                for b in fb3 {
+                    collect_targets(b, &mut fn_writes);
+                }
                 for n in fn_reads {
-                    if self.top_written.contains(&n)
-                        || fn_locals_all.contains(&n)
-                        || top.contains(&n)
-                    {
+                    if self.top_written.contains(&n) || top.contains(&n) || fn_writes.contains(&n) {
                         self.globals.insert(n);
                     }
                 }
@@ -6461,6 +6492,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             // does not hoist the name. A name the program NEVER assigns is an
             // environment read (`$HOME`), and declaring it made the read a
             // bare identifier that printed an empty line (t05_env_read).
+            // A var_types name is normally a REAL assignment (the analysis
+            // seeded it from one). The exception is an env-only read
+            // (`$HOME`): the name has a type entry but the program never
+            // assigns it — hoisting it printed an empty line. `assigned`
+            // records both the static targets and the names the RENDERER
+            // marks written (setVar arms, eval, source, array element
+            // writes), so the check is on static targets only here and
+            // env names without one stay unhoisted.
             if !vt_fn_local && targets_all.contains(n) {
                 written.insert(n.clone());
             }
@@ -7494,12 +7533,13 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
                 continue;
             }
             let m = self.zig_ident(v);
-            let mutated = body_stmts.iter().any(|l| {
-                let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
-                pat.iter().any(|p| l.contains(p.as_str()))
-            // capture-promoted vars are assigned inside functions (their
-            // stores never appear in main's body text) — always mutable
-            }) || self.globals.contains(v);
+            // WORD-BOUNDED: a bare `contains` matched `sh_rc = 1` for the
+            // variable `c` (every decl became `var`, and zig rejects
+            // "never mutated")
+            let mutated = body_stmts.iter().any(|l| assigns_ident(l, &m))
+                // capture-promoted vars are assigned inside functions (their
+                // stores never appear in main's body text) — always mutable
+                || self.globals.contains(v);
             let kw = if mutated
                 || self.bigint_vars.contains(v)
                 || self.set_arrays.contains(v)
@@ -7963,6 +8003,56 @@ fn collect_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 /// Reads under one expression (Var/Ident/getVar("name") — the names
 /// collect_written_expr cannot see: it only walks values, and a
 /// getVar name is a Str, not a Var)
+/// Does this emitted line store into the Zig identifier `m`? Word-bounded,
+/// so `sh_rc = 1` is not a store into `c`.
+fn assigns_ident(line: &str, m: &str) -> bool {
+    let store_ops = [" =", " +=", " -=", " *=", " /=", " %=", "++", "--"];
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(m) {
+        let at = start + pos;
+        let before_ok = at == 0
+            || !(line.as_bytes()[at - 1].is_ascii_alphanumeric() || line.as_bytes()[at - 1] == b'_');
+        let after = &line[at + m.len()..];
+        if before_ok {
+            for op in store_ops {
+                if after.starts_with(op) {
+                    return true;
+                }
+            }
+        }
+        start = at + m.len();
+    }
+    false
+}
+
+/// Variable names an arithmetic tree READS (Var/Ident leaves).
+fn collect_arith_reads(a: &crate::ir::ArithAst, out: &mut BTreeSet<String>) {
+    use crate::ir::ArithAst::*;
+    match a {
+        Var(n) | Ident(n) => {
+            out.insert(n.clone());
+        }
+        Bin { lhs, rhs, .. } => {
+            collect_arith_reads(lhs, out);
+            collect_arith_reads(rhs, out);
+        }
+        Un { arg, .. } | Cast { arg, .. } => collect_arith_reads(arg, out),
+        Cond { test, then, else_ } => {
+            collect_arith_reads(test, out);
+            collect_arith_reads(then, out);
+            collect_arith_reads(else_, out);
+        }
+        Assign { rhs, .. } => collect_arith_reads(rhs, out),
+        IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        Index { var, .. } => {
+            out.insert(var.clone());
+        }
+        Num(_) | Sizeof(_) => {}
+    }
+}
+
 fn reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
@@ -8003,6 +8093,10 @@ fn reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                     reads_expr(x, out);
                 }
             }
+        }
+        // arithmetic operands reference variables too (`a + b` reads both)
+        IrExpr::Arith(a) => {
+            collect_arith_reads(a, out);
         }
         IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => reads_expr(expr, out),
         IrExpr::Arrow(stmts) => reads_stmts(stmts, out),
