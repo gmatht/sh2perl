@@ -47,8 +47,14 @@ for f in "${corpus[@]}"; do
   # `--color=always` emitted 01;31/m/K under real GNU grep vs 0m;1;31 under
   # the wrapper; 016_grep_basic gained a spurious line). The canonical gate
   # runs from systemd, which has no BASH_ENV at all.
-  bo=$(cd "$tmp" && env -u BASH_ENV timeout -k 2 15 bash "$f" 2>/dev/null); brc=$?
-  fo=$(cd "$tmp" && SH2_ARGV0="$f" timeout -k 2 15 fish "$tmp/r.fish" 2>/dev/null); frc=$?
+  # CWD PARITY WITH THE CANONICAL GATE: fish runs from $WORKSPACE, not from a
+  # scratch dir (only perl/c/rust get an eq_scratch there). Running both sides
+  # in a temp dir hid the workspace-glob class entirely -- 058/064 glob
+  # '*.{txt,log,dat}' and the workspace root holds ~77 such files, five of them
+  # written by the pass itself. Measuring from a clean dir is a DIFFERENT
+  # contract from the one the gate scores, so replicate the gate.
+  bo=$(cd "$ROOT" && env -u BASH_ENV timeout -k 2 15 bash "$f" 2>/dev/null); brc=$?
+  fo=$(cd "$ROOT" && SH2_ARGV0="$f" timeout -k 2 15 fish "$tmp/r.fish" 2>/dev/null); frc=$?
   if [ "$frc" = 124 ] || [ "$brc" = 124 ] || [ "$frc" != "$brc" ] || [ "$bo" != "$fo" ]; then
     fail=$((fail+1)); eqfail=$((eqfail+1)); fails="$f $fails"
     if [ "$VERBOSE" = 1 ]; then
