@@ -105,3 +105,7 @@ scratchpad/
 # python bytecode from the runtime tools (fbdev-faces.py, the silhouette oracle)
 __pycache__/
 *.pyc
+
+# build.rs-generated handler registries (emission order is nondeterministic)
+src/render_ext_estree/handlers/mod.rs
+src/render_ext_expr/handlers/mod.rs
