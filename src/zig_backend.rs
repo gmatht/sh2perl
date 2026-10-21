@@ -280,6 +280,29 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     r.out.join("\n")
 }
 
+/// The pattern text of a `\x01SH2GLOB\x01`-marked word (the core's marker
+/// for an UNQUOTED glob), or None.
+fn glob_marked_str(e: &IrExpr) -> Option<String> {
+    const MARK: &str = "\u{1}SH2GLOB\u{1}";
+    match e {
+        IrExpr::Str(s, _) => s.strip_prefix(MARK).map(|p| p.to_string()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => match t.strip_prefix(MARK) {
+                        Some(rest) => out.push_str(rest),
+                        None => return None,
+                    },
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// The Zig format specifier for a statically-typed part.
 /// A bare identifier (no spaces/operators) — used to recognize the
 /// cstyleFor loop var and increment LHS.
@@ -2923,16 +2946,49 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         if newline {
             fmt.push('\n');
         }
-        format!(
-            "try stdout.print({}, .{{{}}});\n{}try stdout.flush();",
-            Self::zig_str(&fmt),
-            args.join(", "),
-            "    ".repeat(self.depth)
-        )
+        // zig caps a format call at 32 ARGUMENTS. A wide argv (a brace
+        // expansion of 54 words) must be printed in CHUNKS — the whole
+        // call failed to compile otherwise (063_17_nested_brace_expansion
+        // and every other brace-expansion example).
+        const CHUNK: usize = 24;
+        if args.len() <= CHUNK {
+            return format!(
+                "try stdout.print({}, .{{{}}});\n{}try stdout.flush();",
+                Self::zig_str(&fmt),
+                args.join(", "),
+                "    ".repeat(self.depth)
+            );
+        }
+        let mut out = String::new();
+        let mut i = 0;
+        while i < args.len() {
+            let end = (i + CHUNK).min(args.len());
+            let seg = &args[i..end];
+            // every chunk is plain {s}/{d} in part order, so the format is
+            // just the segment's specifiers
+            out.push_str(&format!(
+                "try stdout.print(\"{}\", .{{{}}});\n",
+                "{s}".repeat(seg.len()),
+                seg.join(", ")
+            ));
+            i = end;
+        }
+        if newline {
+            out.push_str("try stdout.print(\"\\n\", .{});\n");
+        }
+        out.push_str("try stdout.flush();");
+        out
     }
 
     /// Parts for an echo argument (bash word-splits argv items on spaces).
     fn parts_of(&mut self, e: &IrExpr) -> Vec<(char, String)> {
+        // a GLOB-MARKED word (the core writes \x01SH2GLOB\x01 before an
+        // unquoted pattern) must be EXPANDED against the filesystem: as a
+        // literal it printed "SH2GLOB*.txt" (064_19, 011_brace_expansion).
+        if let Some(pat) = glob_marked_str(e) {
+            self.need_globpat = true;
+            return vec![('s', format!("shGlobExpand({}, ' ')", Self::zig_str(&pat)))];
+        }
         match e {
             IrExpr::Str(s, _) => vec![('s', Self::zig_str(s))],
             IrExpr::Int(i) => vec![('d', i.to_string())],
@@ -5312,6 +5368,69 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         }
                     }
                 }
+                // a GLOB-marked word in the list must expand against the
+                // filesystem FIRST (`for f in *.{txt,log}` — bash expands
+                // brace+glob before iterating)
+                if let IrExpr::Array(items) = iter {
+                    if items.iter().any(|i| glob_marked_str(i).is_some()) {
+                        let mut pats: Vec<String> = Vec::new();
+                        for it in items {
+                            match glob_marked_str(it) {
+                                Some(p) => {
+                                    self.need_globpat = true;
+                                    // a pattern may expand to MANY names —
+                                    // expand at run time and re-split on 0x1f
+                                    pats.push(format!(
+                                        "(shGlobExpand({}, 0x1f))",
+                                        Self::zig_str(&p)
+                                    ));
+                                }
+                                None => {
+                                    let pp = self.parts_of(it);
+                                    pats.push(self.parts_to_str(pp));
+                                }
+                            }
+                        }
+                        // join the per-pattern expansions with the SAME
+                        // 0x1f separator so the split below sees every name
+                        // (a space join merged adjacent results)
+                        let joined = if pats.len() == 1 {
+                            pats[0].clone()
+                        } else {
+                            let mut j = pats[0].clone();
+                            self.need_cat = true;
+                            for q in &pats[1..] {
+                                j = format!("shStrCat({j}, shStrCat(\"\\x1f\", {q}))");
+                            }
+                            j
+                        };
+                        let items_tmp = self.fresh_tmp("sh_gl");
+                        let v_tmp = self.fresh_tmp("sh_gv");
+                        let arr_tmp = self.fresh_tmp("sh_ga");
+                        self.emit("{");
+                        self.depth += 1;
+                        self.emit(&format!("const {items_tmp} = {joined};"));
+                        self.emit(&format!("var {arr_tmp}: std.ArrayList([]const u8) = .empty;"));
+                        self.emit(&format!("var __gsit = std.mem.splitScalar(u8, {items_tmp}, 0x1f);"));
+                        self.emit("while (__gsit.next()) |__gsp| {");
+                        self.emit("    if (__gsp.len == 0) continue;");
+                        self.emit(&format!("    {arr_tmp}.append(std.heap.page_allocator, __gsp) catch {{}};"));
+                        self.emit("}");
+                        self.emit(&format!("for ({arr_tmp}.items) |{v_tmp}| {{"));
+                        self.emit(&format!("    {m} = {v_tmp};"));
+                        self.loop_depth += 1;
+                        self.depth += 1;
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.loop_depth -= 1;
+                        self.emit("}");
+                        self.depth -= 1;
+                        self.emit("}");
+                        return;
+                    }
+                }
                 match iter {
                     IrExpr::Array(items) => {
                         let elems: Vec<String> = if self.is_num(var) {
@@ -6732,6 +6851,35 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("        si += 1; pi += 1;");
             self.emit("    }");
             self.emit("    return si == s.len;");
+            self.emit("}");
+            // FILESYSTEM glob: expand `pat` against the directory part
+            // (bash word expansion). No match → the pattern TEXT (bash's
+            // nullglob-off default); matches are joined by `sep`.
+            self.emit("fn shGlobExpand(pat: []const u8, sep: u8) []const u8 {");
+            self.emit("    const io = sh_io orelse return pat;");
+            self.emit("    const slash = std.mem.lastIndexOfScalar(u8, pat, '/');");
+            self.emit("    const dirname: []const u8 = if (slash) |i| (if (i == 0) \"/\" else pat[0..i]) else \".\";");
+            self.emit("    const base: []const u8 = if (slash) |i| pat[i + 1 ..] else pat;");
+            self.emit("    var dir = std.Io.Dir.cwd().openDir(io, dirname, .{ .iterate = true }) catch return pat;");
+            self.emit("    defer dir.close(io);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var n: usize = 0;");
+            self.emit("    var it = dir.iterate();");
+            self.emit("    while (it.next(io) catch null) |ent| {");
+            self.emit("        const nm = ent.name;");
+            // dotfiles only match an explicit leading dot
+            self.emit("        if (nm.len > 0 and nm[0] == '.' and (base.len == 0 or base[0] != '.')) continue;");
+            self.emit("        if (!shGlobPat(nm, base)) continue;");
+            self.emit("        if (n != 0) out.append(std.heap.page_allocator, sep) catch return pat;");
+            self.emit("        if (slash) |_| {");
+            self.emit("            out.appendSlice(std.heap.page_allocator, dirname) catch return pat;");
+            self.emit("            out.append(std.heap.page_allocator, '/') catch return pat;");
+            self.emit("        }");
+            self.emit("        out.appendSlice(std.heap.page_allocator, nm) catch return pat;");
+            self.emit("        n += 1;");
+            self.emit("    }");
+            self.emit("    if (n == 0) return pat;");
+            self.emit("    return out.items;");
             self.emit("}");
         }
         if self.need_glob {
