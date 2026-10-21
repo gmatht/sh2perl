@@ -185,6 +185,10 @@ pub struct Render {
     need_safe_div: bool,
     /// emit shShl/shShr (shift amounts normalised to u6)
     need_shift: bool,
+    /// emit shPadW (printf field width)
+    need_pad: bool,
+    /// emit shArgv0 ($0)
+    need_argv0: bool,
     /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
     need_globpat: bool,
     /// emit shBEscape (printf %b backslash expansion)
@@ -1192,6 +1196,22 @@ impl Render {
                     if name == "-" {
                         return ('s', Self::zig_str("hB"));
                     }
+                    // `$#` (no positional params under the gate) and `$0`
+                    // BEFORE the declared lookup: the mangler turns '#' into
+                    // `underscore`, which printed an empty line
+                    if name == "#" {
+                        return ('s', if self.in_function {
+                            self.need_intstr = true;
+                            "shIntStr(@as(i64, @intCast(__args.len)))".to_string()
+                        } else {
+                            Self::zig_str("0")
+                        });
+                    }
+                    if name == "0" {
+                        self.need_argv0 = true;
+                        self.need_env = true;
+                        return ('s', "shArgv0()".to_string());
+                    }
                     self.mark_read(name);
                     if self.bigint_vars.contains(name) {
                         self.need_bigint = true;
@@ -2021,7 +2041,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             self.need_intstr = true;
                             return "shIntStr(@as(i64, @intCast(__args.len)))".to_string();
                         }
+                        // top level: the script's own argv count. The gate
+                        // runs with none, so "0" (005_args.sh printed a blank
+                        // line because the value went through the wrong arm).
                         return Self::zig_str("0");
+                    }
+                    // `$0`: the script path the invoker passed (SH2_ARGV0 in
+                    // the gate, argv[0] standalone)
+                    if name == "0" {
+                        self.need_argv0 = true;
+                        self.need_env = true;
+                        return "shArgv0()".to_string();
                     }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
@@ -2914,12 +2944,20 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 parts.push(('s', Self::zig_str("%")));
                 continue;
             }
-            // skip flags/width/length modifiers (`%lld`, `%5d`, `%-10s`)
+            // flags/width/length modifiers (`%lld`, `%5d`, `%-10s`): record
+            // the WIDTH and left-justify flag — printf pads the value
+            let mut left = false;
+            let mut width: usize = 0;
             while let Some(&f) = chars.peek() {
-                if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
-                    || f.is_ascii_digit()
-                    || matches!(f, '-' | '+' | ' ' | '#')
-                {
+                if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L') {
+                    chars.next();
+                } else if f == '-' {
+                    left = true;
+                    chars.next();
+                } else if f.is_ascii_digit() {
+                    width = width * 10 + (f as usize - '0' as usize);
+                    chars.next();
+                } else if matches!(f, '+' | ' ' | '#') {
                     chars.next();
                 } else {
                     break;
@@ -2948,7 +2986,11 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 parts.push(('s', format!("shBEscape({raw})")));
                 continue;
             }
-            let pa = self.parts_of(a);
+            let mut pa = self.parts_of(a);
+            if width > 0 && pa.len() == 1 && spec != 'd' {
+                self.need_pad = true;
+                pa[0].1 = format!("shPadW({}, {width}, {})", pa[0].1, left);
+            }
             if pa.len() == 1 {
                 // the string model prints ids as TEXT: a %d over a string
                 // operand keeps {s} (bash prints the same bytes), and a %s
@@ -3140,6 +3182,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             [one] => {
                 if let Some(idx) = one.find("!=") {
                     vec![&one[..idx], "!=", &one[idx + 2..]]
+                } else if let Some(idx) = one.find("==") {
+                    // `==` BEFORE `=`, or `[[ $a == !(x) ]]` split at the
+                    // first '=' and kept the second in the pattern
+                    vec![&one[..idx], "==", &one[idx + 2..]]
                 } else if let Some(idx) = one.find('=') {
                     vec![&one[..idx], "=", &one[idx + 1..]]
                 } else {
@@ -4739,6 +4785,44 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         // foreground with inherited fds). shRun captures
         // (for `$(…)`); shRunStmt inherits stdio.
         // shUuRun writes to fd 1 in-process either way.
+        // an argv word that must be GLOB-EXPANDED (or brace-split) needs a
+        // shell: the word count is only known at run time, so run the whole
+        // command through `sh -c` with the words quoted
+        if let Some(items) = args.get(1).and_then(|a| match a {
+            IrExpr::Array(items) => Some(items),
+            _ => None,
+        }) {
+            if items.iter().any(|i| glob_marked_str(i).is_some()) {
+                let mut text = String::new();
+                text.push_str(&cmd.replace('\'', "'\\''"));
+                for it in items {
+                    if let Some(pat) = glob_marked_str(it) {
+                        self.need_globpat = true;
+                        text.push(' ');
+                        text.push_str(&pat);
+                    } else if let IrExpr::Str(w, _) = it {
+                        // a literal word: single-quote it for the child shell
+                        text.push(' ');
+                        text.push('\'');
+                        text.push_str(&w.replace('\'', "'\\''"));
+                        text.push('\'');
+                    } else {
+                        // dynamic word: NOT portable through sh -c — stub
+                        text.clear();
+                        break;
+                    }
+                }
+                if !text.is_empty() {
+                    self.need_run = true;
+                    self.rc_dirty = true;
+                    self.emit(&format!(
+                        "shRunStmt(&[_][]const u8{{\"sh\", \"-c\", {}}});",
+                        Self::zig_str(&text)
+                    ));
+                    return;
+                }
+            }
+        }
         let argv = self.build_argv(cmd, args);
         self.need_run = true;
         self.rc_dirty = true;
@@ -6306,6 +6390,32 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return out.items;");
             self.emit("}");
         }
+        if self.need_argv0 {
+            self.emit("");
+            self.emit("fn shArgv0() []const u8 {");
+            self.emit("    // SH2_ARGV0 is what the invoker passed as $0 (the gate sets it to");
+            self.emit("    // the script path so usage lines match bash)");
+            self.emit("    if (sh_environ) |env| return env.get(\"SH2_ARGV0\") orelse \"\";");
+            self.emit("    return \"\";");
+            self.emit("}");
+        }
+        if self.need_pad {
+            self.emit("");
+            self.emit("fn shPadW(s: []const u8, w: usize, left: bool) []const u8 {");
+            self.emit("    if (s.len >= w) return s;");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    if (!left) {");
+            self.emit("        var k: usize = s.len;");
+            self.emit("        while (k < w) : (k += 1) out.append(std.heap.page_allocator, ' ') catch return s;");
+            self.emit("        out.appendSlice(std.heap.page_allocator, s) catch return s;");
+            self.emit("    } else {");
+            self.emit("        out.appendSlice(std.heap.page_allocator, s) catch return s;");
+            self.emit("        var k: usize = s.len;");
+            self.emit("        while (k < w) : (k += 1) out.append(std.heap.page_allocator, ' ') catch return s;");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
         if self.need_shift {
             self.emit("");
             self.emit("fn shPow(a: i64, b: i64) i64 { if (b < 0) return 0; return std.math.powi(i64, a, b) catch 0; }");
@@ -6945,6 +7055,20 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("                if (matched) break;");
             self.emit("            }");
             self.emit("            if (pc == '*' and shGlob2(s, si, pat, pe + 1)) matched = true;");
+            self.emit("            if (pc == '!') {");
+            self.emit("                // `!(alt)` matches anything the alternatives do NOT, then");
+            self.emit("                // the rest of the pattern must match the remainder");
+            self.emit("                var k: usize = 0;");
+            self.emit("                while (si + k <= s.len) : (k += 1) {");
+            self.emit("                    var inner_hit = false;");
+            self.emit("                    var it2 = std.mem.splitScalar(u8, inner, '|');");
+            self.emit("                    while (it2.next()) |alt| {");
+            self.emit("                        if (shGlob2(s[si .. si + k], 0, alt, 0)) { inner_hit = true; break; }");
+            self.emit("                    }");
+            self.emit("                    if (!inner_hit and shGlob2(s, si + k, pat, pe + 1)) return true;");
+            self.emit("                }");
+            self.emit("                return false;");
+            self.emit("            }");
             self.emit("            return matched;");
             self.emit("        }");
             self.emit("        if (pc == '?') { if (si >= s.len) return false; si += 1; pi += 1; continue; }");
