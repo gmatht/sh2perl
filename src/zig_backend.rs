@@ -3702,6 +3702,23 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 }
                 false
             }
+            "wait" => {
+                // `wait`: reap every outstanding background job (there is no
+                // `wait` BINARY — spawning one failed with 127)
+                if self.saw_background {
+                    self.need_run = true;
+                    self.emit("while (true) {");
+                    self.emit("    var __wst: c_int = 0;");
+                    self.emit("    if (waitpid(-1, &__wst, 0) <= 0) break;");
+                    self.emit("}");
+                    self.emit("sh_rc = 0;");
+                    self.rc_dirty = true;
+                    return true;
+                }
+                self.emit("sh_rc = 127;");
+                self.rc_dirty = true;
+                true
+            }
             "trap" => {
                 // `trap 'payload' EXIT` runs the payload when the shell
                 // exits. Capture the payload for the end-of-main hook (other
@@ -6016,6 +6033,11 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 for s in body {
                     self.stmt(s);
                 }
+                // flush what the child buffered before _exit (which does
+                // NOT run atexit handlers or flush stdio)
+                if !self.in_function {
+                    self.emit("stdout.flush() catch {};");
+                }
                 self.emit("std.c._exit(0);");
                 self.depth -= 1;
                 self.emit("}");
@@ -6797,7 +6819,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
-        if self.saw_background {
+        if self.saw_background || self.need_run {
             self.emit("");
             self.emit("extern fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;");
         }
