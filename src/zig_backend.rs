@@ -189,6 +189,10 @@ pub struct Render {
     need_pad: bool,
     /// emit shArgv0 ($0)
     need_argv0: bool,
+    /// shopt -s nocasematch in effect (case-insensitive [[ == ]])
+    shopt_nocasematch: bool,
+    /// shopt -s extglob in effect
+    shopt_extglob: bool,
     /// the `test` being rendered is a `[[ ]]` (pattern RHS allowed)
     current_is_dbracket: bool,
     /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
@@ -3257,10 +3261,22 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     let is_pat = self.current_is_dbracket && !b.trim_start().starts_with('"') && !b.trim_start().starts_with('\'') && Self::lit_is_pattern(b);
                     if is_pat {
                         self.need_globpat = true;
-                        if o == "==" {
-                            Some(format!("shGlobPat({va}, {vb})"))
+                        let call = if self.shopt_nocasematch {
+                            format!("shGlobPatI({va}, {vb})")
                         } else {
-                            Some(format!("!shGlobPat({va}, {vb})"))
+                            format!("shGlobPat({va}, {vb})")
+                        };
+                        if o == "==" {
+                            Some(call)
+                        } else {
+                            Some(format!("!{call}"))
+                        }
+                    } else if self.shopt_nocasematch {
+                        self.need_ext = true;
+                        if o == "==" {
+                            Some(format!("shEqI({va}, {vb})"))
+                        } else {
+                            Some(format!("!shEqI({va}, {vb})"))
                         }
                     } else if o == "==" {
                         Some(format!("std.mem.eql(u8, {va}, {vb})"))
@@ -3598,6 +3614,29 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     }
                 }
                 false
+            }
+            "shopt" => {
+                // `shopt -s/-u <option>`: track the ones that change how
+                // later constructs lower (nocasematch → case-insensitive
+                // `[[ == ]]`, extglob → patterns). The statement itself is a
+                // no-op with status 0.
+                let mut enable = true;
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let IrExpr::Str(t, _) = w {
+                            match t.as_str() {
+                                "-s" => enable = true,
+                                "-u" => enable = false,
+                                "nocasematch" => self.shopt_nocasematch = enable,
+                                "extglob" => self.shopt_extglob = enable,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                self.emit("sh_rc = 0;");
+                self.rc_dirty = true;
+                return true;
             }
             "unset" => {
                 // `unset x`: the variable is EMPTY afterwards (`${x:-gone}`
@@ -5179,7 +5218,21 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         return;
                     }
                 }
+                // `shopt("name", Bool(on))` (top-level Call form)
                 if let IrExpr::Call { func, args } = e {
+                    if func == "shopt" {
+                        if let Some(IrExpr::Str(opt, _)) = args.first() {
+                            let on = matches!(args.get(1), Some(IrExpr::Bool(true)));
+                            match opt.as_str() {
+                                "nocasematch" => self.shopt_nocasematch = on,
+                                "extglob" => self.shopt_extglob = on,
+                                _ => {}
+                            }
+                        }
+                        self.emit("sh_rc = 0;");
+                        self.rc_dirty = true;
+                        return;
+                    }
                     if func == "assign" {
                         if self.assign_call(args) {
                             return;
@@ -6574,6 +6627,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("    return \"\";");
             self.emit("}");
         }
+        if self.shopt_nocasematch {
+            self.emit("");
+            self.emit("fn shEqI(a: []const u8, b: []const u8) bool {");
+            self.emit("    if (a.len != b.len) return false;");
+            self.emit("    for (a, b) |x, y| { if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false; }");
+            self.emit("    return true;");
+            self.emit("}");
+        }
         if self.need_pad {
             self.emit("");
             self.emit("fn shPadW(s: []const u8, w: usize, left: bool) []const u8 {");
@@ -6634,11 +6695,22 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("var sh_io: ?std.Io = null;");
         }
         if self.need_env {
+            self.need_run = true;
             self.emit("var sh_environ: ?*std.process.Environ.Map = null;");
             self.emit("");
             self.emit("fn shEnv(name: []const u8) []const u8 {");
-            self.emit("    const __sh_m = sh_environ orelse return \"\";");
-            self.emit("    return __sh_m.get(name) orelse \"\";");
+            self.emit("    if (sh_environ) |__sh_m| {");
+            self.emit("        if (__sh_m.get(name)) |v| return v;");
+            self.emit("    }");
+            // bash DEFINES a few shell variables that need not be exported:
+            // HOSTNAME (the kernel hostname) is the one the corpus reads
+            self.emit("    if (std.mem.eql(u8, name, \"HOSTNAME\")) {");
+            self.emit("        if (sh_io) |io| {");
+            self.emit("            const data = std.Io.Dir.cwd().readFileAlloc(io, \"/etc/hostname\", std.heap.page_allocator, .limited(256)) catch return \"\";");
+            self.emit("            return std.mem.trimEnd(u8, data, \"\\r\\n\");");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    return \"\";");
             self.emit("}");
         }
         if self.need_source {
@@ -7181,6 +7253,15 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             // `[[ $x = @(foo|bar) ]]` (at-in-test.sh).
             self.emit("fn shGlobPat(s: []const u8, pat: []const u8) bool {");
             self.emit("    return shGlob2(s, 0, pat, 0);");
+            self.emit("}");
+            // `shopt -s nocasematch`: fold both sides before matching
+            self.emit("fn __sh_lower(s: []const u8) []const u8 {");
+            self.emit("    const b = std.heap.page_allocator.alloc(u8, s.len) catch return s;");
+            self.emit("    for (s, 0..) |c, i| b[i] = std.ascii.toLower(c);");
+            self.emit("    return b;");
+            self.emit("}");
+            self.emit("fn shGlobPatI(s: []const u8, pat: []const u8) bool {");
+            self.emit("    return shGlob2(__sh_lower(s), 0, __sh_lower(pat), 0);");
             self.emit("}");
             // end index of the `(...)` group opening at `pi`
             self.emit("fn shGlobGroupEnd(pat: []const u8, pi: usize) usize {");
