@@ -1465,12 +1465,23 @@ fn first_code_newline(s: &str) -> Option<usize> {
     // uu-ffi `.so` at BEGIN and fall back to guarded fork/exec (with a
     // one-time stderr warning) when absent. AFTER the preamble declarations
     // (`our $CHILD_ERROR`) so the strict subs compile.
-    if body.contains("__sh_uu_capture")
-        || body.contains("__sh_uu_run")
-        || body.contains("__sh_pipe_run")
-        || body.contains("__sh_pipe_capture")
-    {
-        out.push_str(SH_RUN_EXT_PREAMBLE);
+    //
+    // SEGMENT GATE (per-helper liveness — the perl arm of rust's
+    // add_helper / preamble_gates_dead_boilerplate contract). The seam used
+    // to be ONE blob on those four coarse markers, so a body calling only
+    // `__sh_uu_capture` embedded the whole pipeline front end and vice
+    // versa: 418 of the 826 embedded `sub` instances across the
+    // 562-example corpus were never called anywhere (measured 2026-10-23;
+    // body families: 44 uu-only, 55 pipe-only, 19 both, 444 none). The
+    // entry markers are UNCHANGED (no new seam can appear), then each
+    // segment is emitted only when the body names it or a live segment
+    // needs it (`__sh_pipe_capture` shares `$__SH_UU_SEQ`, so it drags the
+    // uu SUPPORT segment — globals + BEGIN attach — while the uu subs stay
+    // independently gated). False-POSITIVE markers (the name inside a
+    // string literal) only ever emit MORE, never less — refuse>guess in
+    // the safe direction.
+    if let Some(seg) = sh_run_ext_preamble(&body) {
+        out.push_str(&seg);
         out.push('\n');
     }
     // Append the rendered body (statements + subs + exit).
@@ -12972,6 +12983,62 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// capture, no fork/exec); absent ⇒ the feature-guarded fork/exec
 /// fallback with a one-time stderr warning. check_qx whitelists this
 /// block (the bash -c inside is guarded, never unconditional).
+/// Assemble the external-command seam for THIS program's rendered body.
+///
+/// `None` = none of the four entry markers appears (no seam at all — the
+/// historical gate). Otherwise the blob is split at its segment boundaries
+/// (`split_inclusive('\n')` keeps reassembly byte-exact) and only the
+/// segments the body needs are concatenated: the BEGIN header always,
+/// uu support (globals + BEGIN attach + the shared `$__SH_UU_SEQ`) when a
+/// uu sub or `__sh_pipe_capture` is live, `__sh_q` when the body quotes
+/// argv for a rebuilt command, and each sub on its own call marker.
+/// `# __SH_RUN_EXT_END` is always kept so check_qx's BEGIN..END strip has
+/// its closing anchor.
+fn sh_run_ext_preamble(body: &str) -> Option<String> {
+    // Entry markers — UNCHANGED from the historical whole-blob gate (the
+    // names are parenless on purpose: they are how the gate has always
+    // read, and a false hit only over-emits).
+    let m_uu_run = body.contains("__sh_uu_run");
+    let m_uu_cap = body.contains("__sh_uu_capture");
+    let m_pipe_run = body.contains("__sh_pipe_run");
+    let m_pipe_cap = body.contains("__sh_pipe_capture");
+    if !(m_uu_run || m_uu_cap || m_pipe_run || m_pipe_cap) {
+        return None;
+    }
+    let uu_support = m_uu_run || m_uu_cap || m_pipe_cap;
+    let pipe_sub = m_pipe_run || m_pipe_cap;
+    let q = body.contains("__sh_q");
+    let mut out = String::new();
+    let mut live = true;
+    for piece in SH_RUN_EXT_PREAMBLE.split_inclusive('\n') {
+        if piece.starts_with("my $__SH_UU = 0;") {
+            live = uu_support;
+        } else if piece.starts_with("sub __sh_uu_run {") {
+            live = m_uu_run;
+        } else if piece.starts_with("sub __sh_uu_capture {") {
+            live = m_uu_cap;
+        } else if piece.starts_with("# ── pipeline front end") {
+            live = pipe_sub;
+        } else if piece.starts_with("sub __sh_q {") {
+            live = q;
+        } else if piece.starts_with("sub __sh_pipe_load {") {
+            live = pipe_sub;
+        } else if piece.starts_with("sub __sh_pipe_unsupported_util {") {
+            live = pipe_sub;
+        } else if piece.starts_with("sub __sh_pipe_run {") {
+            live = m_pipe_run;
+        } else if piece.starts_with("sub __sh_pipe_capture {") {
+            live = m_pipe_cap;
+        } else if piece.starts_with("# __SH_RUN_EXT_END") {
+            live = true;
+        }
+        if live {
+            out.push_str(piece);
+        }
+    }
+    Some(out)
+}
+
 const SH_RUN_EXT_PREAMBLE: &str = r#"# __SH_RUN_EXT_BEGIN (UU-FFI.md external-command seam)
 # uu-ffi .so present: in-process coreutils via uu_run (capture = temp-file
 # fd-1 redirect around the in-process call — no pipe, so no concurrent-
@@ -16567,3 +16634,61 @@ mod tests {
 
 
 
+
+#[cfg(test)]
+mod run_ext_preamble_tests {
+    use super::{sh_run_ext_preamble, SH_RUN_EXT_PREAMBLE};
+
+    /// A body naming every entry marker plus `__sh_q` — the all-live case.
+    const ALL: &str =
+        "__sh_uu_run( __sh_uu_capture( __sh_pipe_run( __sh_pipe_capture( __sh_q(";
+
+    #[test]
+    fn no_marker_emits_no_seam() {
+        assert!(sh_run_ext_preamble("print \"hi\";\n").is_none());
+    }
+
+    /// The split is line-based (`split_inclusive`): with every segment
+    /// live the reassembly must be the ORIGINAL blob byte-for-byte — this
+    /// is what makes dropping segments the only possible behavioural delta.
+    #[test]
+    fn all_segments_reassemble_the_blob_byte_exactly() {
+        let got = sh_run_ext_preamble(ALL).expect("gate fires on the four markers");
+        assert_eq!(got, SH_RUN_EXT_PREAMBLE);
+    }
+
+    #[test]
+    fn uu_only_body_drops_the_pipeline_front_end() {
+        let got = sh_run_ext_preamble("__sh_uu_capture($x);\n").expect("gate fires");
+        assert!(got.contains("sub __sh_uu_capture "));
+        assert!(got.contains("BEGIN {"), "uu support carries the FFI attach");
+        assert!(!got.contains("sub __sh_pipe_run "), "44 corpus files are uu-only");
+        assert!(!got.contains("sub __sh_pipe_load "));
+        assert!(got.starts_with("# __SH_RUN_EXT_BEGIN"));
+        assert!(got.contains("# __SH_RUN_EXT_END"), "check_qx strip keeps its anchor");
+    }
+
+    /// `__sh_pipe_capture` writes through `$__SH_UU_SEQ` (its temp files),
+    /// so it must drag the uu SUPPORT segment while the uu subs stay gated
+    /// on their own markers.
+    #[test]
+    fn pipe_capture_drags_uu_support_but_not_uu_subs() {
+        let got = sh_run_ext_preamble("__sh_pipe_capture($cmd, \"pipefail\");\n")
+            .expect("gate fires");
+        assert!(got.contains("my $__SH_UU_SEQ = 0;"));
+        assert!(got.contains("sub __sh_pipe_capture "));
+        assert!(!got.contains("sub __sh_uu_capture "));
+        assert!(!got.contains("sub __sh_uu_run "));
+    }
+
+    /// `__sh_q` is body-level quoting (the pipe subs never call it), so it
+    /// is gated on its OWN name, not on the pipe family.
+    #[test]
+    fn q_is_gated_on_its_own_body_marker() {
+        let with_q =
+            sh_run_ext_preamble("__sh_pipe_run($c); __sh_q($v);").expect("gate fires");
+        assert!(with_q.contains("sub __sh_q "));
+        let without_q = sh_run_ext_preamble("__sh_pipe_run($c);").expect("gate fires");
+        assert!(!without_q.contains("sub __sh_q "));
+    }
+}
